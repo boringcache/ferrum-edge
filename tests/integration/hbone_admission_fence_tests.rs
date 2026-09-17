@@ -1998,8 +1998,20 @@ async fn an_unbounded_leaf_is_not_revoked_by_the_expiry_half() {
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
 }
 
+/// Parity with the inbound verifier, which is what "would still be admitted"
+/// has to mean (issue #5568 review).
+///
+/// `SpiffePeerVerifierCache::build` compiles a candidate trust set ATOMICALLY
+/// and, when it fails, keeps its last-known-good set and carries on admitting
+/// peers. A candidate the fence cannot compile must therefore not replace what
+/// the fence judges against either — classifying per trust domain cut tunnels in
+/// the domains that DID compile while the verifier was still admitting their
+/// peers, and judged every other domain against material the verifier never
+/// adopted. It is reachable without malformed input: a federated trust domain
+/// carrying only `jwtAuthorities` passes mesh config validation and is merged
+/// verbatim into the inbound slot.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_trust_bundle_that_cannot_be_compiled_fails_closed() {
+async fn a_trust_publication_that_does_not_compile_never_takes_force() {
     let gateway = mint_peer_chain(GATEWAY_SPIFFE);
     let peer = mint_peer_chain(CLIENT_SPIFFE);
     let state = credential_state(9605);
@@ -2009,30 +2021,76 @@ async fn a_trust_bundle_that_cannot_be_compiled_fails_closed() {
         &gateway,
         local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
+    let in_force = inbound_trust_revision(&state);
     let fence = &state.hbone_admission_fence;
+    let compilations = fence.trust_anchor_builds();
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
+        peer_credential(&peer, live_expiry(), true, in_force),
     ));
     assert_eq!(tunnel.revoked_reason(), None);
 
-    // The published slot still declares the peer's trust domain, but its
-    // authorities are not usable trust roots, so the sweep can produce no
-    // verdict for anything anchored there.
+    // A federated trust domain declaring no X.509 authority at all: the inbound
+    // verifier refuses the WHOLE candidate on an empty root store.
+    let mut jwt_only = std::collections::HashMap::new();
+    jwt_only.insert(
+        TrustDomain::new(SLICE_TRUST_DOMAIN).expect("slice trust domain"),
+        trust_bundle(SLICE_TRUST_DOMAIN, Vec::new()),
+    );
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        RuntimeTrustBundleSet {
+            local: trust_bundle(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+            federated: jwt_only,
+        },
+    );
+    // ...and authorities that are not usable trust roots at all.
     publish_inbound_trust(
         &state,
         &slot,
         &gateway,
         local_trust(PEER_TRUST_DOMAIN, vec![b"not-a-certificate".to_vec()]),
     );
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(
+        inbound_trust_revision(&state),
+        in_force,
+        "a publication the inbound verifier would reject must not advance the trust in force"
+    );
+    assert_eq!(
+        fence.trust_anchor_builds(),
+        compilations,
+        "a refused candidate must not replace the cached anchors either"
+    );
+    assert_eq!(
+        tunnel.revoked_reason(),
+        None,
+        "the verifier is still admitting this peer under its last-known-good set, so the \
+         fence must not cut its tunnel"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(fence.trust_rechecks(), 0);
+
+    // A withdrawal that DOES compile is still a withdrawal: the fence has not
+    // been turned off, only aligned with what is in force.
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust(SLICE_TRUST_DOMAIN, vec![gateway.ca_der.clone()]),
+    );
 
     wait_for_revocation(&tunnel).await;
     assert_eq!(
         tunnel.revoked_reason(),
-        Some(HboneRevocationReason::ReevaluationFailed),
-        "an unjudgeable trust state cuts the tunnel rather than leaving it serving"
+        Some(HboneRevocationReason::PeerTrust),
+        "a trust set that IS in force and no longer anchors the peer still revokes"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0]);
+    assert!(inbound_trust_revision(&state) > in_force);
 }
 
 /// The guard against a false mass revocation: a mesh inbound listener with no
@@ -2181,6 +2239,98 @@ async fn withdrawing_the_svids_own_trust_domain_revokes_a_real_tunnel() {
     fx.teardown().await;
 }
 
+/// The pooled-session hole the verification re-review of PR #5573 found.
+///
+/// An established inbound HBONE mTLS session is NEVER re-handshaked and many
+/// CONNECTs multiplex over it, so a peer the fence just revoked simply re-opens
+/// a tunnel on the same connection. Seeding the replacement tunnel's
+/// last-verified revision from the revision its CONNECT merely READ admitted it
+/// under trust that had already refused its chain, and then short-circuited
+/// every later sweep for that tunnel's whole life — the fence defeated in its
+/// own primary scenario. The CONNECT now re-verifies the retained chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pooled_connect_after_a_trust_withdrawal_is_refused_not_reseeded() {
+    let mut fx = admit_client_tunnel_with_inbound_trust(vec![allow_client()], true).await;
+    let slot = fx
+        .inbound_trust_slot
+        .clone()
+        .expect("the fixture installed an inbound admission trust slot");
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let compilations_before = fx.state.hbone_admission_fence.trust_anchor_builds();
+
+    // R2 still declares the peer's trust domain and still compiles; only the
+    // root that issued the live peer's leaf is retired. A membership check
+    // alone would see nothing.
+    let replacement = mint_peer_chain(OTHER_SPIFFE);
+    publish_inbound_trust(
+        &fx.state,
+        &slot,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![replacement.ca_der.clone()]),
+    );
+
+    // (i) the live tunnel is revoked for trust...
+    assert_tunnel_closed(&mut fx.tunnel.response_body).await;
+    wait_for_no_live_tunnels(&fx.state).await;
+    assert_eq!(
+        revocation_counts(&fx.state),
+        [0, 0, 1, 0, 0, 0, 0],
+        "exactly one peer_trust revocation"
+    );
+
+    // (ii) ...and the peer's immediate retry, on the SAME never-re-handshaked
+    // inbound mTLS connection, is refused at admission rather than admitted and
+    // never checked again.
+    let refused = open_tunnel(&mut fx.sender).await.err();
+    assert_eq!(
+        refused,
+        Some(StatusCode::FORBIDDEN),
+        "a CONNECT whose chain no longer anchors must be refused, not re-admitted"
+    );
+    assert_eq!(fx.state.hbone_admission_fence.live_tunnels(), 0);
+    assert_eq!(fx.state.hbone_admission_fence.connect_trust_refusals(), 1);
+    assert_eq!(
+        revocation_counts(&fx.state),
+        [0, 0, 1, 0, 0, 0, 0],
+        "a refused CONNECT is never a revocation"
+    );
+    assert_eq!(
+        fx.state.hbone_admission_fence.trust_anchor_builds(),
+        compilations_before + 1,
+        "the publication compiles the anchors once; the CONNECT validates a path against \
+         them and compiles nothing"
+    );
+
+    fx.teardown().await;
+}
+
+/// The chain-only inbound posture must be untouched by the CONNECT-time trust
+/// gate. With no inbound admission trust installed there is nothing in force to
+/// verify against — peers are verified against the operator client-CA bundle,
+/// which `tls::client_trust` bounds separately (issue #3857) — so refusing
+/// would be an outage rather than a fence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_only_posture_still_admits_a_pooled_second_connect() {
+    let mut fx = admit_client_tunnel(vec![allow_client()]).await;
+    let fence = &fx.state.hbone_admission_fence;
+    assert!(
+        fence.inbound_trust_revision().is_none(),
+        "this posture installs no inbound admission trust at all"
+    );
+
+    let mut second = open_tunnel(&mut fx.sender)
+        .await
+        .expect("a chain-only posture admits a second CONNECT on the same connection");
+    echo_round_trip(&mut second, b"chain-only").await;
+
+    assert_eq!(fence.live_tunnels(), 2);
+    assert_eq!(fence.connect_trust_refusals(), 0);
+    assert_eq!(fence.trust_anchor_builds(), 0);
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 0, 0, 0, 0, 0]);
+
+    fx.teardown().await;
+}
+
 /// The credential gate is only as good as the publications that schedule it.
 /// Two writers must each store first and sweep second: the inbound admission
 /// trust (which decides the trust verdict) and the request-facing gateway trust
@@ -2224,29 +2374,158 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     );
 
     let fence = include_str!("../../src/proxy/hbone_admission_fence.rs");
+    let publish_inbound = body(
+        fence,
+        "pub fn publish_inbound_admission_trust(",
+        "\n    /// The inbound admission trust IN FORCE",
+    );
     assert_store_then_sweep(
-        body(
-            fence,
-            "pub fn publish_inbound_admission_trust(",
-            "\n    /// The inbound admission trust as ONE",
-        ),
+        publish_inbound,
         "trust.slot.store(bundle)",
         "self.request_sweep()",
         "publish_inbound_admission_trust",
     );
 
-    // And the mesh writers must reach that publisher rather than storing into
-    // the verifier's slot themselves.
-    let mesh = include_str!("../../src/modes/mesh/mod.rs");
+    // A publication that does not take force is the one failure mode an
+    // operator cannot see from the outside — the verifier keeps admitting and
+    // the fence keeps judging, both against the previous set — so it must reach
+    // the sampled operator warning rather than being silently dropped.
     assert!(
-        !mesh.contains("inbound_slot.store("),
-        "the mesh inbound SPIFFE slot must be published through \
-         ProxyState::publish_mesh_inbound_trust_bundle, never stored into directly"
+        publish_inbound.contains("self.warn_trust_not_in_force("),
+        "a publication the fence refuses to put in force must not do so silently"
     );
+
+    // And the mesh writers must reach that publisher rather than storing into
+    // the verifier's slot themselves. Every `.store(` inside each publisher's
+    // own body is enumerated, because the two writers bind the inbound slot
+    // under DIFFERENT names (`inbound_slot` and, in `publish_staged_spiffe_
+    // bundle`'s `DirectSlot` arm, plain `slot`): pinning one variable name
+    // leaves the other free to regress, and only the sibling call-count
+    // assertion would notice — and only because the call disappeared.
+    let mesh = include_str!("../../src/modes/mesh/mod.rs");
+    for (what, publisher, permitted_stores) in [
+        (
+            "publish_runtime_svid_to_inbound_slot",
+            body(
+                mesh,
+                "fn publish_runtime_svid_to_inbound_slot(",
+                "\nfn start_mesh_inbound_svid_rotation_republisher(",
+            ),
+            &[][..],
+        ),
+        (
+            "publish_staged_spiffe_bundle",
+            body(
+                mesh,
+                "fn publish_staged_spiffe_bundle(",
+                "\n/// Stage the exact effective mesh/federation gateway trust decision",
+            ),
+            // The accepted trust OVERLAY is a different slot with no fence
+            // binding; publishing it is this writer's own job.
+            &["trust_overlay_slot.store(Arc::new(trust_overlay));"][..],
+        ),
+    ] {
+        assert_eq!(
+            publisher.matches(".store(").count(),
+            permitted_stores.len(),
+            "{what}: the mesh inbound SPIFFE slot must be published through \
+             ProxyState::publish_mesh_inbound_trust_bundle, never stored into directly"
+        );
+        for permitted in permitted_stores {
+            assert!(
+                publisher.contains(permitted),
+                "{what}: expected store `{permitted}` is gone; re-derive what this publisher \
+                 is allowed to write before relaxing the count above"
+            );
+        }
+        assert!(
+            publisher.contains("publish_mesh_inbound_trust_bundle(")
+                || publisher.contains("publish_runtime_svid_to_inbound_slot("),
+            "{what}: every inbound-slot publisher must reach the one writer"
+        );
+    }
     assert_eq!(
         mesh.matches("publish_mesh_inbound_trust_bundle(").count(),
         2,
         "exactly the two inbound-slot writers — the runtime SVID republisher and the staged \
          slice publisher — may publish inbound trust"
+    );
+}
+
+/// The residual risk the re-review named: nothing proved that production wires
+/// the SAME slot into the rustls inbound verifier and into the fence. Those
+/// constructors are private to `modes::mesh`, so the chain of custody is pinned
+/// in source instead — every link of it, so a new slot binding cannot quietly
+/// appear between them.
+#[test]
+fn the_inbound_spiffe_verifier_and_the_fence_share_one_trust_slot() {
+    // Collapse runs of whitespace so an assertion survives rustfmt reflow.
+    fn flat(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    // The serving path's ONE inbound SPIFFE slot binding.
+    const SLOT_BINDING: &str =
+        "let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot_with_federation(";
+    // The install that binds exactly that value to the admission fence.
+    const SLOT_INSTALL: &str = "if let Some(slot) = mesh_inbound_spiffe_slot.as_ref() { \
+                                proxy_state.install_mesh_inbound_admission_trust(slot); }";
+    // That same binding is what the inbound TLS state hands every verifier build.
+    const VERIFIER_SLOT: &str = "spiffe_bundle_slot: mesh_inbound_spiffe_slot";
+    const VERIFIER_CALL: &str = "mesh_inbound_spiffe_verifier(spiffe_bundle_slot";
+    const VERIFIER_BUILD: &str = "tls::build_spiffe_client_cert_verifier(";
+    // The CA-backend slot origin, and the carry-through that keeps it the SAME
+    // `Arc` rather than a second slot the fence never saw.
+    const CA_INSTALL: &str = "proxy_state.install_mesh_inbound_admission_trust(&inbound_slot);";
+    const CARRY_THROUGH: &str =
+        "if let Some(slot) = runtime_svid_slot { return Some(slot.clone()); }";
+    const ANY_INSTALL: &str = "install_mesh_inbound_admission_trust(";
+
+    let mesh = flat(include_str!("../../src/modes/mesh/mod.rs"));
+
+    // One slot binding in the serving path, and it is installed on the fence.
+    assert_eq!(
+        mesh.matches(SLOT_BINDING).count(),
+        1,
+        "the serving path must derive its inbound SPIFFE slot exactly once"
+    );
+    assert!(
+        mesh.contains(&flat(SLOT_INSTALL)),
+        "that binding must be the slot installed on the admission fence"
+    );
+
+    // ...and the SAME binding is what every inbound-TLS verifier build reads.
+    assert_eq!(
+        mesh.matches(VERIFIER_SLOT).count(),
+        1,
+        "the inbound TLS state's verifier slot must be that same binding"
+    );
+    assert_eq!(
+        mesh.matches(VERIFIER_CALL).count(),
+        1,
+        "exactly one production site may build the inbound peer verifier"
+    );
+    assert_eq!(
+        mesh.matches(VERIFIER_BUILD).count(),
+        2,
+        "only `mesh_inbound_spiffe_verifier`'s two mTLS-mode arms may build it"
+    );
+
+    // The CA-backend slot reaches that binding as the SAME `Arc`: the builder
+    // returns the runtime slot it was handed rather than constructing a second
+    // one, and it is installed before the first SVID can be published into it.
+    assert!(
+        mesh.contains(CA_INSTALL),
+        "the CA-backend slot must be installed before its first SVID fetch"
+    );
+    assert!(
+        mesh.contains(CARRY_THROUGH),
+        "a runtime SVID slot must be carried through, never rebuilt — a second slot would \
+         give the verifier and the fence different trust"
+    );
+    assert_eq!(
+        mesh.matches(ANY_INSTALL).count(),
+        2,
+        "exactly the two slot origins may bind the fence's inbound admission trust"
     );
 }

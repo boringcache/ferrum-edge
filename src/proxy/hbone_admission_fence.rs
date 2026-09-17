@@ -38,8 +38,22 @@
 //! The fence bounds TWO dimensions, POLICY and CREDENTIALS (issue #5568).
 //! Beside the policy gates, a sweep re-checks the credential the CONNECT was
 //! admitted on: the admitted leaf's `notAfter`, and — when the inbound
-//! admission trust has published new material since admission — whether the
-//! retained peer chain still anchors in it.
+//! admission trust has put new material in force since the chain was last
+//! verified — whether the retained peer chain still anchors in it.
+//!
+//! The CREDENTIAL dimension also runs on the ADMISSION path, and it has to.
+//! Many CONNECTs multiplex over one pooled inbound mTLS session that is never
+//! re-handshaked, so a CONNECT arriving after a trust change has not been
+//! verified against that change by anything: the handshake predates it and the
+//! request path does no chain work. Seeding a tunnel's last-verified revision
+//! from the revision its CONNECT merely READ therefore disabled the trust gate
+//! for exactly the tunnel that needed it — the replacement a revoked peer
+//! opens on the same connection a millisecond later. So
+//! `HbonePeerCredential::from_admitted_connect` re-verifies the retained chain
+//! against the anchors currently in force and REFUSES the CONNECT when it does
+//! not anchor; what a tunnel records as verified is then a verification
+//! that actually happened. The anchors are compiled once per in-force revision
+//! and cached, so the admission cost is one certificate path validation.
 //!
 //! The trust the credential gate reads is the INBOUND ADMISSION TRUST: the very
 //! `tls::SharedBundleSlot` the mesh inbound SPIFFE client-certificate verifier
@@ -61,24 +75,32 @@
 //!
 //! Every publication into that slot goes through
 //! `ProxyState::publish_mesh_inbound_trust_bundle`, which stores, advances the
-//! slot's trust revision when the TRUST material actually changed, and only
-//! then requests a sweep — the same publish-then-recheck ordering
-//! `publish_mesh_inbound_tls_policy` relies on. A bounded expiry watcher runs
-//! the one non-publication sweep, so an expired SVID is revoked on a mesh where
-//! nothing is being republished at all.
+//! trust in force when the TRUST material actually changed AND the candidate
+//! compiles, and only then requests a sweep — the same publish-then-recheck
+//! ordering `publish_mesh_inbound_tls_policy` relies on. A bounded expiry
+//! watcher runs the one non-publication sweep, so an expired SVID is revoked on
+//! a mesh where nothing is being republished at all.
+//!
+//! "In force" is the verifier's own rule, not a second opinion. The inbound
+//! SPIFFE verifier compiles a candidate trust set ATOMICALLY and keeps its
+//! last-known-good set when the candidate fails, so a candidate the fence
+//! cannot compile does not replace what the fence judges against either. Judging
+//! per trust domain instead would have revoked tunnels in the domains that did
+//! compile — and judged every other domain against material the verifier had
+//! not adopted — while the verifier was still admitting those very peers.
 //!
 //! What remains outside the fence is narrow and deliberate: an `action: CUSTOM`
 //! ext_authz delegation is not re-consulted (below), and the mesh inbound CRL
 //! snapshot is not re-applied — it belongs to the inbound TLS reload state, not
-//! to the request epoch a sweep reads, so a CRL that revokes an
-//! already-admitted peer leaf still only takes effect on that peer's next
-//! handshake. See `docs/mesh.md` → "HBONE Admission Fence".
+//! to the trust slot a sweep reads, so a CRL that revokes an already-admitted
+//! peer leaf still only takes effect on that peer's next handshake. See
+//! `docs/mesh.md` → "HBONE Admission Fence".
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
@@ -96,6 +118,7 @@ use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
+use crate::tls::spiffe::{AdmittedPeerTrustAnchors, AdmittedPeerTrustVerdict};
 
 /// Client-visible / log-visible message for a tunnel the fence revoked. A
 /// compiled-in literal: no policy name, principal, or destination.
@@ -118,12 +141,12 @@ pub enum HboneRevocationReason {
     /// established inbound mTLS session is never re-handshaked, so this is the
     /// only thing that ends a tunnel whose credential simply aged out.
     PeerExpired,
-    /// The peer's chain no longer anchors in the trust bundles the inbound
-    /// admission slot publishes — the issuing CA was removed, the federated
-    /// trust domain was retired, or the trust material was withdrawn outright
-    /// (issue #5568). Judged against the anchors the peer's next handshake
-    /// would apply, which is what makes the verdict mean "would no longer be
-    /// admitted".
+    /// The peer's chain no longer anchors in the trust the inbound admission
+    /// slot has IN FORCE — the issuing CA was removed, or the federated trust
+    /// domain was retired (issue #5568). Judged against the anchors the peer's
+    /// next handshake would apply, which is what makes the verdict mean "would
+    /// no longer be admitted"; the same anchors refuse that peer's next CONNECT
+    /// on its existing pooled session.
     PeerTrust,
     /// The authorize-phase chain now denies the admitted CONNECT.
     AuthorizationDenied,
@@ -133,10 +156,13 @@ pub enum HboneRevocationReason {
     /// The relay destination is no longer one this terminator owns.
     RelayDestination,
     /// Re-evaluation itself could not produce a verdict: an authorize plugin
-    /// unwound, the published trust bundle for the peer's trust domain is not
-    /// compilable into a verifier, or the retained peer leaf is not parseable
-    /// at all. Fail closed: an un-judgeable tunnel is cut rather than left
-    /// serving under a generation nothing checked it against.
+    /// unwound, or the retained peer leaf is not parseable (or not retained) at
+    /// all. Fail closed: an un-judgeable tunnel is cut rather than left serving
+    /// under a generation nothing checked it against.
+    ///
+    /// A published trust bundle that does not compile is deliberately NOT one of
+    /// these: such a publication is not in force for the inbound verifier
+    /// either, so it does not replace what the fence judges against.
     ReevaluationFailed,
 }
 
@@ -211,6 +237,10 @@ pub enum HboneRelayDestinationGate {
 /// sweep, and a tunnel rebuilds a certificate path only when the inbound
 /// admission trust it last verified against has actually been replaced.
 ///
+/// Building it is also the CONNECT's own trust gate: `from_admitted_connect`
+/// refuses the CONNECT outright, rather than returning a credential, when the
+/// chain does not anchor under the trust in force.
+///
 /// Carries no private key and no rendered subject/SAN: `spiffe_id` is the
 /// identity the request path already published, and the DER is the peer's own
 /// public chain.
@@ -227,26 +257,57 @@ pub struct HbonePeerCredential {
     pub intermediates_der: Option<Arc<Vec<Vec<u8>>>>,
     /// When the admitted leaf's own `notAfter` ends this credential.
     pub leaf_expiry: AdmittedLeafExpiry,
-    /// Whether the inbound admission trust that admitted this CONNECT
-    /// positively carried a usable X.509 bundle for `spiffe_id`'s trust domain.
+    /// Whether the CONNECT's chain was POSITIVELY VERIFIED against the inbound
+    /// admission trust in force at admission.
     ///
-    /// `false` leaves the TRUST half of the gate inapplicable for this tunnel's
-    /// whole life, and is the guard against a false mass revocation: the fence
-    /// only ever revokes for a trust change it can observe as a REGRESSION from
-    /// a state it saw. A mesh inbound listener with no gateway SVID material
-    /// installs no [`MeshInboundAdmissionTrust`] at all and verifies peers
-    /// chain-only against the operator client-CA bundle — which
-    /// `tls::client_trust` already bounds separately (issue #3857) — so such a
-    /// tunnel must not be judged against bundles that never admitted it. The
-    /// expiry half still applies.
+    /// `true` means exactly that: this CONNECT re-ran a certificate path
+    /// validation against the anchors [`admitted_trust_revision`] names and it
+    /// succeeded. A chain that did not anchor never becomes a tunnel at all —
+    /// the CONNECT is refused.
+    ///
+    /// `false` therefore means only "there was nothing in force to verify
+    /// against": no [`MeshInboundAdmissionTrust`] is installed (a chain-only
+    /// inbound posture, where peers are verified against the operator
+    /// client-CA bundle and `tls::client_trust` already bounds them separately
+    /// — issue #3857), or the installed slot has not yet put any set in force.
+    /// It leaves the TRUST half of the gate inapplicable for this tunnel's
+    /// whole life, which is the guard against a false mass revocation: the
+    /// fence only ever revokes for a trust change it can observe as a
+    /// REGRESSION from a state it saw. The expiry half still applies.
+    ///
+    /// [`admitted_trust_revision`]: Self::admitted_trust_revision
     pub anchored_at_admission: bool,
-    /// The [`MeshInboundAdmissionTrust`] revision as the admission observed it,
-    /// or `0` when no inbound admission trust is installed.
+    /// The [`MeshInboundAdmissionTrust`] revision this CONNECT's chain was
+    /// verified against, or `0` when no inbound admission trust is installed.
     ///
-    /// The initial value of the tunnel's own last-VERIFIED revision, which the
-    /// sweep advances on every `Trusted` verdict — so a tunnel pays certificate
-    /// path building once per trust change, never once per sweep.
+    /// The initial value of the tunnel's own last-VERIFIED revision, and it is
+    /// a value that was genuinely verified rather than merely observed: the
+    /// chain is re-checked at the CONNECT, not at the handshake. That
+    /// distinction is load-bearing. Many CONNECTs multiplex over one pooled
+    /// inbound mTLS session that is NEVER re-handshaked, so seeding this from
+    /// the revision a CONNECT merely read would let a peer whose issuing root
+    /// had just been retired re-open a tunnel, record the current revision as
+    /// "verified", and skip the trust gate for the rest of that tunnel's life.
+    ///
+    /// The sweep advances the tunnel's copy on every later `Trusted` verdict, so
+    /// a tunnel pays certificate path building once per trust change, never once
+    /// per sweep.
     pub admitted_trust_revision: u64,
+}
+
+/// What the credential half of CONNECT admission decided (issue #5568).
+pub(crate) enum HboneConnectCredential {
+    /// Admit the CONNECT. `Some` is the credential the fence retains for the
+    /// tunnel's life; `None` means the CONNECT carries no certificate-derived
+    /// peer credential to bound at all.
+    Admit(Option<HbonePeerCredential>),
+    /// Refuse the CONNECT: the peer's retained chain does not anchor under the
+    /// inbound admission trust currently IN FORCE, so this peer's next
+    /// handshake here would be refused too. Refusing is what makes the trust
+    /// gate survive connection pooling — a revoked tunnel's peer reconnects on
+    /// the same never-re-handshaked mTLS session, and admitting that CONNECT
+    /// would hand it a tunnel seeded as if the current trust had verified it.
+    Refuse,
 }
 
 /// When an admitted peer leaf's own `notAfter` ends the credential (issue
@@ -282,47 +343,80 @@ pub enum AdmittedLeafExpiry {
 }
 
 impl HbonePeerCredential {
-    /// Capture the credential an admitted CONNECT was authorized on, or `None`
-    /// when there is nothing to re-check.
+    /// Decide the credential half of one CONNECT's admission: capture the
+    /// credential a sweep will re-check, or refuse the CONNECT outright.
     ///
-    /// `None` covers every shape with no certificate-derived peer identity to
-    /// bound: a PERMISSIVE plaintext-admitted tunnel, a peer that presented no
-    /// certificate, and a kernel-attested (node-waypoint eBPF) or
+    /// An `Admit(None)` covers every shape with no certificate-derived peer
+    /// identity to bound: a PERMISSIVE plaintext-admitted tunnel, a peer that
+    /// presented no certificate, and a kernel-attested (node-waypoint eBPF) or
     /// HBONE-asserted `peer_spiffe_id`, which carries no leaf and therefore no
     /// validity window — bounding one by a certificate deadline would be a
     /// fiction, exactly as `RequestContext::has_certificate_spiffe_principal`
     /// records.
     ///
-    /// `trust` is the inbound admission trust the mesh SPIFFE verifier reads,
-    /// as [`HboneAdmissionFence::inbound_trust_snapshot`] loaded it — NOT the
-    /// request epoch's gateway trust. `None` means no such slot is installed
-    /// (a chain-only inbound posture), which leaves the trust half inapplicable
-    /// for this tunnel's whole life.
+    /// Otherwise the retained chain is RE-VERIFIED here, against the anchors the
+    /// fence's inbound admission trust currently has in force — not against the
+    /// verdict the mTLS handshake reached, which for a pooled inbound session
+    /// may be arbitrarily old. Those anchors were compiled once, when that trust
+    /// revision was published, so the cost is one certificate path validation
+    /// per CONNECT and no trust-store construction. A chain that does not anchor
+    /// is [`HboneConnectCredential::Refuse`]: the peer's next handshake would be
+    /// refused, so its next CONNECT must be too.
+    ///
+    /// With nothing in force there is nothing to verify against — no inbound
+    /// admission trust installed (a chain-only posture), or an installed slot
+    /// whose publications have not produced a usable set, in which case the
+    /// inbound SPIFFE verifier has no last-known-good cache either and cannot
+    /// be what admitted this peer. The CONNECT is admitted with the trust half
+    /// inapplicable rather than refused for a state the fence never observed as
+    /// good.
     pub(crate) fn from_admitted_connect(
         ctx: &RequestContext,
-        trust: Option<&InboundTrustSnapshot>,
-    ) -> Option<Self> {
+        fence: &HboneAdmissionFence,
+    ) -> HboneConnectCredential {
         if !ctx.has_certificate_spiffe_principal() {
-            return None;
+            return HboneConnectCredential::Admit(None);
         }
-        let spiffe_id = ctx.peer_spiffe_id.clone()?;
-        let leaf_der = Arc::clone(ctx.tls_client_cert_der.as_ref()?);
-        let anchored_at_admission = trust.is_some_and(|trust| {
-            trust
-                .bundle
-                .as_ref()
-                .as_ref()
-                .and_then(|bundle| bundle.trust_bundles.get(spiffe_id.trust_domain()))
-                .is_some_and(|bundle| !bundle.x509_authorities.is_empty())
-        });
-        Some(Self {
+        let (Some(spiffe_id), Some(leaf_der)) =
+            (ctx.peer_spiffe_id.clone(), ctx.tls_client_cert_der.as_ref())
+        else {
+            return HboneConnectCredential::Admit(None);
+        };
+        let leaf_der = Arc::clone(leaf_der);
+        let intermediates_der = ctx.tls_client_cert_chain_der.clone();
+
+        let trust = fence.inbound_trust_snapshot();
+        let anchors = trust.as_ref().and_then(InboundTrustSnapshot::anchors);
+        let anchored_at_admission = match anchors {
+            // Nothing is in force, so there is nothing to verify against: the
+            // trust half stays inapplicable for this tunnel's whole life.
+            None => false,
+            Some(anchors) => {
+                let intermediates: &[Vec<u8>] = intermediates_der
+                    .as_ref()
+                    .map_or(&[], |chain| chain.as_slice());
+                let verdict = anchors.recheck(spiffe_id.trust_domain(), &leaf_der, intermediates);
+                // Fail closed on anything but `Trusted`: a withdrawn anchor and
+                // a chain the fence cannot judge are equally "this peer would
+                // not get through a fresh handshake here".
+                if verdict != AdmittedPeerTrustVerdict::Trusted {
+                    fence.record_connect_trust_refusal();
+                    return HboneConnectCredential::Refuse;
+                }
+                true
+            }
+        };
+        let admitted_trust_revision = trust.map_or(0, |trust| trust.revision());
+
+        let credential = Self {
             spiffe_id,
             leaf_der: Arc::clone(&leaf_der),
-            intermediates_der: ctx.tls_client_cert_chain_der.clone(),
+            intermediates_der,
             leaf_expiry: admitted_leaf_expiry(ctx, leaf_der.as_slice()),
             anchored_at_admission,
-            admitted_trust_revision: trust.map_or(0, |trust| trust.revision),
-        })
+            admitted_trust_revision,
+        };
+        HboneConnectCredential::Admit(Some(credential))
     }
 }
 
@@ -589,9 +683,27 @@ pub struct HboneAdmissionFence {
     sweep_serial: tokio::sync::Mutex<()>,
     revocations: [AtomicU64; HboneRevocationReason::ALL.len()],
     reevaluations: AtomicU64,
-    /// Certificate path builds the credential gate performed. A trust
-    /// publication that changes nothing must not move this.
+    /// Certificate path builds a SWEEP's credential gate performed. A trust
+    /// publication that changes nothing must not move this, and neither may a
+    /// CONNECT — the CONNECT-side path validation is counted separately so this
+    /// stays the observable form of "an ordinary publication costs no path
+    /// building".
     trust_rechecks: AtomicU64,
+    /// CONNECTs refused because the peer's retained chain does not anchor under
+    /// the inbound admission trust in force (issue #5568 review). The
+    /// counterpart of a `peer_trust` revocation on the admission path: a peer
+    /// whose trust was retired is revoked once and then refused on every
+    /// reconnect over its pooled inbound session.
+    connect_trust_refusals: AtomicU64,
+    /// Times the inbound admission trust's anchors were compiled. Advances once
+    /// per in-force revision — never per sweep and never per CONNECT — so a
+    /// contract test can pin that the per-CONNECT cost is one path validation
+    /// against cached verifiers.
+    trust_anchor_builds: AtomicU64,
+    /// Monotonic nanoseconds of the last "publication is not in force" warning,
+    /// [`NO_DEADLINE`] when none has been emitted. A malformed federated bundle
+    /// republished on every slice apply must not print once per apply.
+    trust_not_in_force_warned_at: AtomicU64,
     /// `true` while the bounded expiry watcher task is running. At most one
     /// exists; it exits once no live tunnel carries a finite credential
     /// deadline, so a mesh with no SVID-bearing tunnels runs no timer at all.
@@ -631,6 +743,12 @@ pub struct HboneAdmissionFence {
 /// No expiry watcher is parked on any deadline.
 const NO_DEADLINE: u64 = u64::MAX;
 
+/// Sampling window for the "inbound admission trust publication is not in
+/// force" warning. Long enough that a persistently malformed bundle
+/// republished on every slice apply prints once a minute, short enough that an
+/// operator investigating a rollout sees it.
+const TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS: u64 = 60 * 1_000_000_000;
+
 impl HboneAdmissionFence {
     pub fn new(
         request_epoch: Arc<RequestEpochStore>,
@@ -645,6 +763,9 @@ impl HboneAdmissionFence {
             revocations: Default::default(),
             reevaluations: AtomicU64::new(0),
             trust_rechecks: AtomicU64::new(0),
+            connect_trust_refusals: AtomicU64::new(0),
+            trust_anchor_builds: AtomicU64::new(0),
+            trust_not_in_force_warned_at: AtomicU64::new(NO_DEADLINE),
             expiry_watcher: AtomicBool::new(false),
             expiry_parked_deadline: AtomicU64::new(NO_DEADLINE),
             clock_base: tokio::time::Instant::now(),
@@ -659,28 +780,31 @@ impl HboneAdmissionFence {
     /// Bind the inbound mTLS verifier's trust slot to the fence (issue #5568).
     ///
     /// Mesh startup calls this for the ONE slot the inbound SPIFFE
-    /// client-certificate verifier reads, so the credential gate re-checks live
-    /// tunnels against the anchors their peers' next handshake would actually
-    /// apply. Idempotent for the same slot: re-installing keeps the running
-    /// revision, so a second wiring call cannot make every live tunnel rebuild
-    /// its certificate path.
+    /// client-certificate verifier reads, so the credential gate judges CONNECTs
+    /// and live tunnels against the anchors their peers' next handshake would
+    /// actually apply. Idempotent for the same slot: re-installing keeps the
+    /// running revision and its compiled anchors, so a second wiring call cannot
+    /// make every live tunnel rebuild its certificate path.
     ///
-    /// A DIFFERENT slot replaces the binding and takes a FRESH revision from
-    /// the fence's own sequence, never a restarted per-slot counter — so a
-    /// revision can never name two different sets of anchors and the credential
-    /// gate's inequality comparison stays sound across a rebind.
+    /// A DIFFERENT slot replaces the binding and takes a FRESH revision from the
+    /// fence's own sequence, never a restarted per-slot counter — so a revision
+    /// can never name two different sets of anchors and the credential gate's
+    /// inequality comparison stays sound across a rebind. Whatever the slot
+    /// already carries is compiled here, so a CONNECT arriving before the first
+    /// publication is judged against the material actually installed.
     pub fn install_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {
         if let Some(installed) = self.inbound_trust.load_full()
             && Arc::ptr_eq(&installed.slot, slot)
         {
             return;
         }
-        let revision = self.next_trust_revision();
-        self.inbound_trust
-            .store(Some(Arc::new(MeshInboundAdmissionTrust::wrap(
-                slot.clone(),
-                revision,
-            ))));
+        let current = slot.load_full();
+        let in_force = InForceInboundTrust {
+            revision: self.next_trust_revision(),
+            compiled: self.compile_in_force(current.as_ref().as_ref()).ok(),
+        };
+        let installed = MeshInboundAdmissionTrust::wrap(slot.clone(), in_force);
+        self.inbound_trust.store(Some(Arc::new(installed)));
     }
 
     /// The next value of the fence's single strictly-increasing trust-revision
@@ -689,6 +813,78 @@ impl HboneAdmissionFence {
     /// compare equal to one that has one.
     fn next_trust_revision(&self) -> u64 {
         self.trust_revision_seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Compile a published bundle into the anchors that go IN FORCE, or report
+    /// why the publication takes no force at all.
+    ///
+    /// "In force" means exactly what it means for the inbound SPIFFE verifier,
+    /// which is the whole point (issue #5568 review). That verifier compiles a
+    /// candidate ATOMICALLY and, when it fails, logs
+    /// "candidate trust update rejected; keeping last-known-good set" and keeps
+    /// serving the previous one; an absent bundle is the same story. So a
+    /// candidate this cannot compile must not replace what the fence judges
+    /// against either — otherwise the fence would revoke tunnels the verifier is
+    /// still admitting, and judge every other trust domain against material the
+    /// verifier never adopted.
+    ///
+    /// The `Err` is the operator label for why: the trust-domain CLASS, or
+    /// `absent` for a slot carrying no bundle at all. A trust-domain NAME is a
+    /// CP-supplied value, so the detail stays at `debug!` inside
+    /// `AdmittedPeerTrustAnchors::compile`. Reporting is the caller's, because
+    /// only a PUBLICATION that fails to take force is worth an operator line:
+    /// the same `Err` at install time is just a slot whose first SVID has not
+    /// arrived yet.
+    fn compile_in_force(
+        &self,
+        bundle: Option<&crate::identity::SvidBundle>,
+    ) -> Result<CompiledInboundTrust, &'static str> {
+        let Some(bundle) = bundle else {
+            return Err("absent");
+        };
+        match AdmittedPeerTrustAnchors::compile(&bundle.trust_bundles) {
+            Ok(anchors) => {
+                self.trust_anchor_builds.fetch_add(1, Ordering::Relaxed);
+                Ok(CompiledInboundTrust {
+                    material: bundle.trust_bundles.clone(),
+                    anchors,
+                })
+            }
+            Err(class) => Err(class.as_str()),
+        }
+    }
+
+    /// One CONNECT refused because its retained chain does not anchor under the
+    /// trust in force. Counted here rather than at the call site so the gate and
+    /// the counter cannot drift apart.
+    fn record_connect_trust_refusal(&self) {
+        self.connect_trust_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One sampled operator line per [`TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS`]
+    /// window. A slice apply republishes the inbound slot from unchanged inputs,
+    /// so a set that carries, say, a JWT-only federated trust domain would
+    /// otherwise print on every apply for as long as it is configured.
+    fn warn_trust_not_in_force(&self, trust_domain_class: &'static str) {
+        let now = self.monotonic_nanos(tokio::time::Instant::now());
+        let last = self.trust_not_in_force_warned_at.load(Ordering::Relaxed);
+        let due = last == NO_DEADLINE
+            || now.saturating_sub(last) >= TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS;
+        if !due
+            || self
+                .trust_not_in_force_warned_at
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        warn!(
+            trust_domain_class,
+            "Inbound admission trust publication is not in force: a declared trust domain does \
+             not compile into a usable peer verifier, so the inbound mTLS verifier keeps its \
+             last-known-good set and live HBONE tunnels keep being judged against the trust \
+             revision still in force"
+        );
     }
 
     /// Publish `bundle` into the inbound mTLS verifier's trust slot and re-judge
@@ -701,7 +897,7 @@ impl HboneAdmissionFence {
     ///
     /// Ordering is publish-then-recheck, identical to
     /// `ProxyState::publish_mesh_inbound_tls_policy`: the store and the
-    /// revision advance both land BEFORE the sweep request, so a CONNECT that
+    /// in-force advance both land BEFORE the sweep request, so a CONNECT that
     /// read the superseded trust necessarily captured a stale sweep counter too
     /// and [`Self::admit`] turns that into a fresh sweep.
     ///
@@ -713,7 +909,9 @@ impl HboneAdmissionFence {
     /// The bundle is stored unconditionally even when only the leaf and key
     /// moved: the same slot backs the inbound listener's server identity
     /// (`tls::SvidServerCertResolver`), which must see a rotation immediately.
-    /// Only the REVISION is conditional.
+    /// What goes IN FORCE for the fence is conditional on BOTH the trust
+    /// material actually changing and the candidate compiling as one atomic set
+    /// — see [`Self::compile_in_force`].
     pub fn publish_inbound_admission_trust(
         self: &Arc<Self>,
         slot: &crate::tls::SharedBundleSlot,
@@ -725,44 +923,66 @@ impl HboneAdmissionFence {
                 .publish_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let current = trust.slot.load_full();
-            let changed = !trust_material_eq((*current).as_ref(), (*bundle).as_ref());
+            let in_force = trust.in_force.load_full();
+            let candidate = (*bundle).as_ref().map(|bundle| &bundle.trust_bundles);
+            // Compared against what is IN FORCE, never against the slot's
+            // current bytes: a candidate the fence refused is in the slot but is
+            // not what anything is judged against, so re-publishing the set that
+            // IS in force must stay a no-op.
+            let changed = !trust_material_eq(in_force.material(), candidate);
+            let compiled = if changed {
+                match self.compile_in_force((*bundle).as_ref()) {
+                    Ok(compiled) => Some(compiled),
+                    Err(trust_domain_class) => {
+                        // A publication that silently stops taking effect is the
+                        // one failure mode an operator cannot see from the
+                        // outside: the verifier keeps admitting and the fence
+                        // keeps judging, both against the previous set.
+                        self.warn_trust_not_in_force(trust_domain_class);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             trust.slot.store(bundle);
-            if changed {
+            if compiled.is_some() {
                 // AFTER the store, so a reader that observes this revision is
-                // guaranteed to observe the bundle it names. Drawn from the
-                // fence-wide sequence so the value can never repeat.
-                trust
-                    .revision
-                    .store(self.next_trust_revision(), Ordering::SeqCst);
+                // guaranteed to observe anchors at least as new as it names.
+                // Drawn from the fence-wide sequence so the value can never
+                // repeat.
+                let advanced = InForceInboundTrust {
+                    revision: self.next_trust_revision(),
+                    compiled,
+                };
+                trust.in_force.store(Arc::new(advanced));
             }
         }
         self.request_sweep();
     }
 
-    /// The inbound admission trust as ONE `(revision, bundle)` pair.
+    /// The inbound admission trust IN FORCE, as ONE immutable cell.
     ///
-    /// The revision is read FIRST and that order is load-bearing. A publication
-    /// landing between the two reads then yields the OLD revision beside the
-    /// NEW bundle, which makes a tunnel re-verify once more than it had to; the
-    /// opposite order would yield the NEW revision beside the OLD bundle, and a
-    /// tunnel recording that revision would never be re-checked against the
-    /// material it was never judged against.
+    /// A single `ArcSwap` load: the revision and the anchors it names are
+    /// published together and can never be torn apart. That is not an
+    /// optimization — a new revision paired with old anchors would let a tunnel
+    /// record a revision it was never judged against and skip the material that
+    /// actually replaced it.
     pub(crate) fn inbound_trust_snapshot(&self) -> Option<InboundTrustSnapshot> {
         self.inbound_trust.load_full().map(|trust| trust.snapshot())
     }
 
-    /// The trust revision the inbound admission slot currently publishes, or
+    /// The trust revision the inbound admission slot currently has in force, or
     /// `None` when no slot is installed.
     ///
     /// The credential gate's skip key: it advances only when the published
-    /// X.509 material actually changed, so an operator (or a contract test)
-    /// watching it sees exactly the publications that can cost certificate path
-    /// building.
+    /// X.509 material actually changed AND compiled, so an operator (or a
+    /// contract test) watching it sees exactly the publications that can cost
+    /// certificate path building.
     pub fn inbound_trust_revision(&self) -> Option<u64> {
         self.inbound_trust
             .load_full()
-            .map(|trust| trust.revision.load(Ordering::Acquire))
+            .map(|trust| trust.in_force.load().revision)
     }
 
     /// Apply `inspect` to every live tunnel's admission snapshot.
@@ -1017,14 +1237,35 @@ impl HboneAdmissionFence {
         self.reevaluations.load(Ordering::Relaxed)
     }
 
-    /// Certificate path builds the credential gate performed (issue #5568).
+    /// Certificate path builds a SWEEP's credential gate performed (issue
+    /// #5568).
     ///
     /// The observable form of "no path building on an ordinary publication": a
     /// sweep triggered by a republish that changed no X.509 trust material, and
     /// every sweep after the one that verified a tunnel against the current
-    /// revision, must leave this unchanged.
+    /// revision, must leave this unchanged. CONNECT-time verification is
+    /// deliberately not counted here — see [`Self::connect_trust_refusals`].
     pub fn trust_rechecks(&self) -> u64 {
         self.trust_rechecks.load(Ordering::Relaxed)
+    }
+
+    /// CONNECTs refused because the peer's chain no longer anchors in the
+    /// inbound admission trust in force (issue #5568 review).
+    ///
+    /// A revoked tunnel's peer retries on the SAME pooled inbound mTLS session,
+    /// which is never re-handshaked, so this is what stops the replacement
+    /// CONNECT from being admitted under trust that would refuse its chain.
+    pub fn connect_trust_refusals(&self) -> u64 {
+        self.connect_trust_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Times the inbound admission trust's anchors were compiled.
+    ///
+    /// Once per in-force revision. A burst of CONNECTs, or a sweep over
+    /// thousands of live tunnels, must leave this unchanged: both read the
+    /// cached verifiers that publication built.
+    pub fn trust_anchor_builds(&self) -> u64 {
+        self.trust_anchor_builds.load(Ordering::Relaxed)
     }
 
     /// Sweeps that have run to completion.
@@ -1088,10 +1329,11 @@ impl HboneAdmissionFence {
     async fn sweep_once(&self) {
         let epoch = self.request_epoch.load();
         let policy = self.mesh_inbound_tls_policy.load_full();
-        // Compiled at most ONCE per sweep, and only if some tunnel actually
-        // reaches the chain re-verification — which only happens for a tunnel
-        // whose last-verified trust revision is behind the published one.
-        let trust = SweepTrustView::current(self.inbound_trust_snapshot());
+        // One immutable cell: the anchors were compiled when this revision was
+        // published, so a sweep over thousands of tunnels builds no verifier at
+        // all and a tunnel whose last-verified revision already matches does no
+        // path building either.
+        let trust = self.inbound_trust_snapshot();
         let live: Vec<AdmittedHboneTunnel> = self
             .tunnels
             .iter()
@@ -1115,7 +1357,7 @@ impl HboneAdmissionFence {
             // The shipped `release` profile is `panic = "abort"`, so this is the
             // dev/test-profile net; under `abort` the process is gone and no
             // tunnel is left silently unfenced either way.
-            let reevaluate = self.reevaluate(&tunnel.inner, &epoch, &policy, &trust);
+            let reevaluate = self.reevaluate(&tunnel.inner, &epoch, &policy, trust.as_ref());
             let outcome = std::panic::AssertUnwindSafe(reevaluate)
                 .catch_unwind()
                 .await;
@@ -1184,9 +1426,15 @@ impl HboneAdmissionFence {
     /// `spiffe_identity` before any request exists, so the credential gate
     /// precedes the policy gates. The request path then authorizes in
     /// `handle_proxy_request_inner` BEFORE it branches into
-    /// `handle_hbone_request`, which checks the PeerAuthentication transport
-    /// mode and only then the relay-destination ownership guard — so the order
-    /// here is credential, authorize, transport, destination. The proxy
+    /// `handle_hbone_request`, which re-verifies that credential and then
+    /// checks the PeerAuthentication transport mode and the relay-destination
+    /// ownership guard — so the order here is credential, authorize, transport,
+    /// destination. One asymmetry is deliberate: because the authorize chain
+    /// runs before the HBONE handler, a peer failing BOTH its credential and
+    /// its policy is refused `authorization_denied` on the wire while a sweep
+    /// attributes `peer_trust`. The credential is the narrower, peer-specific
+    /// fact and the one an operator acts on, so the sweep keeps it first rather
+    /// than relabelling every existing diagnostic. The proxy
     /// lifecycle check below is not one of those gates: a withdrawn proxy is
     /// never routed to at all, so it necessarily precedes every one of them.
     async fn reevaluate(
@@ -1194,7 +1442,7 @@ impl HboneAdmissionFence {
         tunnel: &AdmittedHboneTunnelInner,
         epoch: &RequestEpoch,
         policy: &MeshInboundTlsPolicy,
-        trust: &SweepTrustView,
+        trust: Option<&InboundTrustSnapshot>,
     ) -> Option<HboneRevocationReason> {
         let snapshot = &tunnel.snapshot;
         let proxy = &snapshot.proxy;
@@ -1343,100 +1591,137 @@ impl HboneAdmissionFence {
 }
 
 /// The inbound mTLS admission trust: the very `tls::SharedBundleSlot` the mesh
-/// SPIFFE client-certificate verifier reads on every handshake, plus a
-/// monotonic revision of the TRUST material it publishes (issue #5568).
+/// SPIFFE client-certificate verifier reads on every handshake, plus the ONE
+/// cell naming the trust that is currently IN FORCE (issue #5568).
 ///
 /// This is the fence's trust input, and it has to be — the fence's contract is
-/// "a tunnel that would no longer be admitted is revoked", which is defined
-/// relative to what the peer's NEXT handshake would apply, not to what the
-/// request epoch happens to carry. See the module header for the two concrete
-/// failures that follow from reading the epoch instead.
-///
-/// The revision is the credential gate's skip key. It advances only when the
-/// published X.509 trust material actually differs, so an ordinary slice apply
-/// — which republishes this slot from unchanged inputs — and a pure leaf/key
-/// SVID rotation both leave every live tunnel's certificate path untouched.
+/// "a tunnel that would no longer be admitted is revoked, and a CONNECT that
+/// would no longer be admitted is refused", which is defined relative to what
+/// the peer's NEXT handshake would apply, not to what the request epoch happens
+/// to carry. See the module header for the two concrete failures that follow
+/// from reading the epoch instead.
 pub struct MeshInboundAdmissionTrust {
     slot: crate::tls::SharedBundleSlot,
-    /// Always a value drawn from the fence's own `trust_revision_seq`, never a
-    /// per-slot counter. Drawing from ONE strictly increasing sequence is what
-    /// lets the credential gate compare for plain INEQUALITY: a per-slot
-    /// counter would restart at the same low values if the fence were ever
-    /// rebound to a second slot, and a tunnel whose last-verified revision
-    /// happened to match one of them would then skip re-verification against
-    /// entirely different material.
-    revision: AtomicU64,
-    /// Serializes compare → store → revision for this slot, so the revision can
-    /// never name material a losing publisher did not write. Production's two
-    /// writers already serialize on `gateway_svid_update_lock`; this makes the
-    /// invariant the fence's own rather than a caller's.
+    /// The revision, the material it names, and the anchors compiled from that
+    /// material — published together as one immutable cell so nothing can read
+    /// a revision beside anchors it does not name.
+    in_force: ArcSwap<InForceInboundTrust>,
+    /// Serializes compare → store → in-force advance for this slot, so the
+    /// in-force cell can never name material a losing publisher did not write.
+    /// Production's two writers already serialize on `gateway_svid_update_lock`;
+    /// this makes the invariant the fence's own rather than a caller's.
     publish_lock: std::sync::Mutex<()>,
 }
 
+/// One generation of inbound admission trust.
+struct InForceInboundTrust {
+    /// Always a value drawn from the fence's own `trust_revision_seq`, never a
+    /// per-slot counter. Drawing from ONE strictly increasing sequence is what
+    /// lets the credential gate compare for plain INEQUALITY: a per-slot counter
+    /// would restart at the same low values if the fence were ever rebound to a
+    /// second slot, and a tunnel whose last-verified revision happened to match
+    /// one of them would then skip re-verification against entirely different
+    /// material.
+    revision: u64,
+    /// `None` while nothing is in force: no bundle has been published yet, or
+    /// every candidate so far failed to compile as one atomic set. The inbound
+    /// SPIFFE verifier is in exactly that state too (it has no last-known-good
+    /// cache to fall back on), so the trust half of the credential gate stays
+    /// inapplicable rather than refusing peers the fence never saw admitted.
+    compiled: Option<CompiledInboundTrust>,
+}
+
+impl InForceInboundTrust {
+    /// The X.509 material this revision names, or `None` while nothing is in
+    /// force.
+    fn material(&self) -> Option<&crate::identity::TrustBundleSet> {
+        self.compiled.as_ref().map(|compiled| &compiled.material)
+    }
+}
+
+/// The material one in-force revision names, and the verifiers compiled from it.
+struct CompiledInboundTrust {
+    /// The X.509 trust material `anchors` were compiled from, kept as the
+    /// comparison baseline for the next publication. Cloned out of the published
+    /// bundle rather than retaining it, so the in-force cell never holds a
+    /// rotated SVID's leaf or private key alive.
+    material: crate::identity::TrustBundleSet,
+    /// Compiled ONCE, here, at publication — never per sweep and never per
+    /// CONNECT.
+    anchors: AdmittedPeerTrustAnchors,
+}
+
 impl MeshInboundAdmissionTrust {
-    fn wrap(slot: crate::tls::SharedBundleSlot, revision: u64) -> Self {
+    fn wrap(slot: crate::tls::SharedBundleSlot, in_force: InForceInboundTrust) -> Self {
         Self {
             slot,
-            revision: AtomicU64::new(revision),
+            in_force: ArcSwap::from_pointee(in_force),
             publish_lock: std::sync::Mutex::new(()),
         }
     }
 
     fn snapshot(&self) -> InboundTrustSnapshot {
-        // Revision FIRST; see [`InboundTrustSnapshot`] for why the order is not
-        // interchangeable.
-        let revision = self.revision.load(Ordering::SeqCst);
-        InboundTrustSnapshot {
-            revision,
-            bundle: self.slot.load_full(),
-        }
+        InboundTrustSnapshot(self.in_force.load_full())
     }
 }
 
-/// One coherent-enough read of [`MeshInboundAdmissionTrust`].
-///
-/// "Enough" is exact about its direction: the revision is read first, so a
-/// publication landing between the two reads pairs an OLD revision with a NEW
-/// bundle. A tunnel that records that pair re-verifies once more than it had
-/// to. The opposite pairing — a new revision beside an old bundle — would let a
-/// tunnel record a revision it was never judged against and skip the material
-/// that actually replaced it, which is why this order is not interchangeable.
-pub(crate) struct InboundTrustSnapshot {
-    revision: u64,
-    bundle: Arc<Option<crate::identity::SvidBundle>>,
+/// One coherent read of [`MeshInboundAdmissionTrust`]: a single `ArcSwap` load
+/// of an immutable cell, so the revision and the anchors it names are always
+/// the same generation.
+pub(crate) struct InboundTrustSnapshot(Arc<InForceInboundTrust>);
+
+impl InboundTrustSnapshot {
+    /// The revision currently in force. `0` is never one of them — it is
+    /// reserved for "no inbound admission trust installed".
+    fn revision(&self) -> u64 {
+        self.0.revision
+    }
+
+    /// The anchors in force, or `None` when nothing is (see
+    /// [`InForceInboundTrust::compiled`]).
+    fn anchors(&self) -> Option<&AdmittedPeerTrustAnchors> {
+        self.0.compiled.as_ref().map(|compiled| &compiled.anchors)
+    }
 }
 
-/// Whether two published inbound bundles carry the same X.509 trust material.
+/// Whether two published sets carry the same X.509 trust material.
 ///
 /// Only the X.509 authorities and the trust domains that declare them matter:
-/// they are the entire input to
-/// [`crate::tls::spiffe::AdmittedPeerTrustAnchors::compile`]. The SVID's own
-/// leaf, key and JWT authorities are deliberately excluded — rotating them
-/// changes nothing a peer chain anchors in, and treating a leaf rotation as a
-/// trust change would make every live tunnel rebuild its certificate path on
-/// every SVID refresh.
+/// they are the entire input to [`AdmittedPeerTrustAnchors::compile`]. The
+/// SVID's own leaf, key and JWT authorities are deliberately excluded —
+/// rotating them changes nothing a peer chain anchors in, and treating a leaf
+/// rotation as a trust change would make every live tunnel rebuild its
+/// certificate path on every SVID refresh.
 fn trust_material_eq(
-    current: Option<&crate::identity::SvidBundle>,
-    next: Option<&crate::identity::SvidBundle>,
+    current: Option<&crate::identity::TrustBundleSet>,
+    next: Option<&crate::identity::TrustBundleSet>,
 ) -> bool {
     match (current, next) {
         (None, None) => true,
-        (Some(current), Some(next)) => {
-            trust_bundle_eq(&current.trust_bundles.local, &next.trust_bundles.local)
-                && current.trust_bundles.federated.len() == next.trust_bundles.federated.len()
-                && current
-                    .trust_bundles
-                    .federated
-                    .iter()
-                    .all(|(trust_domain, bundle)| {
-                        next.trust_bundles
-                            .federated
-                            .get(trust_domain)
-                            .is_some_and(|other| trust_bundle_eq(bundle, other))
-                    })
-        }
+        (Some(current), Some(next)) => trust_bundle_set_eq(current, next),
         _ => false,
     }
+}
+
+fn trust_bundle_set_eq(
+    current: &crate::identity::TrustBundleSet,
+    next: &crate::identity::TrustBundleSet,
+) -> bool {
+    if !trust_bundle_eq(&current.local, &next.local) {
+        return false;
+    }
+    if current.federated.len() != next.federated.len() {
+        return false;
+    }
+    for (trust_domain, bundle) in &current.federated {
+        let Some(other) = next.federated.get(trust_domain) else {
+            return false;
+        };
+        if !trust_bundle_eq(bundle, other) {
+            return false;
+        }
+    }
+    true
 }
 
 fn trust_bundle_eq(
@@ -1444,54 +1729,6 @@ fn trust_bundle_eq(
     next: &crate::identity::TrustBundle,
 ) -> bool {
     current.trust_domain == next.trust_domain && current.x509_authorities == next.x509_authorities
-}
-
-/// The trust one sweep re-checks peer credentials against: the inbound
-/// admission trust the mesh SPIFFE verifier reads, plus its bundles compiled
-/// into chain verifiers the first time a tunnel actually needs one.
-///
-/// Read from that slot rather than from `RequestEpoch::gateway_trust()`. The
-/// epoch is the right source for gateway-to-mesh EGRESS admission, where
-/// configuration and trust must come from one load; it is the WRONG source
-/// here, because an inbound tunnel is bounded by what its peer's next handshake
-/// would be verified against, and the two sets are built by different code from
-/// different material (module header).
-///
-/// `None` means the fence has no inbound admission trust installed at all — a
-/// non-mesh listener, or a mesh inbound posture verifying peers chain-only
-/// against the operator client-CA bundle. Nothing published there can regress a
-/// state this fence observed, so the trust half stays inapplicable exactly as
-/// [`HbonePeerCredential::anchored_at_admission`] `== false` does.
-struct SweepTrustView {
-    installed: Option<InboundTrustSnapshot>,
-    verifiers: OnceLock<Option<crate::tls::spiffe::AdmittedPeerTrustAnchors>>,
-}
-
-impl SweepTrustView {
-    fn current(installed: Option<InboundTrustSnapshot>) -> Self {
-        Self {
-            installed,
-            verifiers: OnceLock::new(),
-        }
-    }
-
-    /// Compile (once per sweep) the anchors the installed slot publishes.
-    /// `None` means no slot is installed, or the installed slot publishes no
-    /// bundle at all.
-    fn anchors(&self) -> Option<&crate::tls::spiffe::AdmittedPeerTrustAnchors> {
-        self.verifiers
-            .get_or_init(|| {
-                self.installed
-                    .as_ref()?
-                    .bundle
-                    .as_ref()
-                    .as_ref()
-                    .map(|bundle| {
-                        crate::tls::spiffe::AdmittedPeerTrustAnchors::compile(&bundle.trust_bundles)
-                    })
-            })
-            .as_ref()
-    }
 }
 
 impl HboneAdmissionFence {
@@ -1507,7 +1744,7 @@ impl HboneAdmissionFence {
     fn peer_credential_revocation(
         &self,
         tunnel: &AdmittedHboneTunnelInner,
-        trust: &SweepTrustView,
+        trust: Option<&InboundTrustSnapshot>,
     ) -> Option<HboneRevocationReason> {
         let credential = tunnel.snapshot.peer_credential.as_ref()?;
 
@@ -1533,7 +1770,7 @@ impl HboneAdmissionFence {
         if !credential.anchored_at_admission {
             return None;
         }
-        let Some(published) = trust.installed.as_ref() else {
+        let Some(published) = trust else {
             // The slot that anchored this tunnel is no longer bound to the
             // fence. Nothing published can be compared against what admitted
             // it, so there is no regression to observe.
@@ -1543,14 +1780,16 @@ impl HboneAdmissionFence {
         // entirely. Compared against what this tunnel last VERIFIED, not
         // against what admitted it, so a tunnel that survives one trust change
         // does not re-verify on every later sweep.
-        if tunnel.verified_trust_revision.load(Ordering::Acquire) == published.revision {
+        if tunnel.verified_trust_revision.load(Ordering::Acquire) == published.revision() {
             return None;
         }
-        let Some(anchors) = trust.anchors() else {
-            // The slot publishes no bundle at all, while this tunnel was
-            // admitted under material that anchored it. That is a definite
-            // answer — nothing is trusted — not an inability to judge, so it is
-            // a withdrawal rather than a fence failure.
+        let Some(anchors) = published.anchors() else {
+            // Nothing is in force, while this tunnel was verified against
+            // material that anchored it. Only a rebind to a different slot
+            // reaches this (a publication that does not compile leaves the
+            // previous revision in force rather than emptying it), and a
+            // different slot means a different verifier — a definite answer,
+            // nothing is trusted, rather than an inability to judge.
             return Some(HboneRevocationReason::PeerTrust);
         };
         let intermediates: &[Vec<u8>] = credential
@@ -1563,21 +1802,22 @@ impl HboneAdmissionFence {
             &credential.leaf_der,
             intermediates,
         ) {
-            crate::tls::spiffe::AdmittedPeerTrustVerdict::Trusted => {
+            AdmittedPeerTrustVerdict::Trusted => {
                 // Record what was verified, so this tunnel pays for path
                 // building once per trust change rather than once per sweep for
                 // the rest of its life.
                 tunnel
                     .verified_trust_revision
-                    .store(published.revision, Ordering::Release);
+                    .store(published.revision(), Ordering::Release);
                 None
             }
-            crate::tls::spiffe::AdmittedPeerTrustVerdict::Withdrawn => {
+            AdmittedPeerTrustVerdict::Withdrawn => {
                 Some(HboneRevocationReason::PeerTrust)
             }
-            // Fail closed exactly like an authorize plugin that unwound: a
-            // tunnel whose trust cannot be judged is cut, not left serving.
-            crate::tls::spiffe::AdmittedPeerTrustVerdict::Unverifiable => {
+            // Nothing was retained to verify. Fail closed exactly like an
+            // authorize plugin that unwound: a tunnel whose trust cannot be
+            // judged is cut, not left serving.
+            AdmittedPeerTrustVerdict::Unverifiable => {
                 Some(HboneRevocationReason::ReevaluationFailed)
             }
         }

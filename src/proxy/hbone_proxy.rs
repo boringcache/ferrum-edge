@@ -18,8 +18,8 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use super::hbone_admission_fence::{
-    HBONE_ADMISSION_REVOKED_MESSAGE, HboneAdmissionSnapshot, HbonePeerCredential,
-    HboneRelayDestinationGate, HboneRevocationReason,
+    HBONE_ADMISSION_REVOKED_MESSAGE, HboneAdmissionSnapshot, HboneConnectCredential,
+    HbonePeerCredential, HboneRelayDestinationGate, HboneRevocationReason,
 };
 use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
@@ -665,6 +665,66 @@ pub(super) async fn handle_hbone_request(
         return build_response_from_normalized_reject(reject);
     }
 
+    // Credential admission (issue #5568). The peer's retained chain is
+    // re-verified HERE, against the anchors the inbound admission trust has in
+    // force right now — not against the verdict this connection's mTLS
+    // handshake reached, which may predate any number of trust changes: an
+    // established inbound HBONE session is never re-handshaked and many
+    // CONNECTs multiplex over it. Without this, the replacement CONNECT a peer
+    // opens immediately after a `peer_trust` revocation would be admitted and
+    // then recorded as verified against the very revision that had just refused
+    // it. The anchors were compiled once when that revision was published, so
+    // the cost is one certificate path validation, and it runs before any
+    // upstream is selected, dialled, or circuit-breaker-charged — the same
+    // terminal and accounting the peer-identity gate above uses.
+    // Bound before the match so the immutable borrow of `ctx` is finished
+    // before the refusal arm stamps its deny reason on it.
+    let credential_admission =
+        HbonePeerCredential::from_admitted_connect(ctx, &state.hbone_admission_fence);
+    let peer_credential = match credential_admission {
+        HboneConnectCredential::Admit(credential) => credential,
+        HboneConnectCredential::Refuse => {
+            warn!(
+                proxy_id = %proxy.id,
+                "Rejected HBONE CONNECT whose peer chain no longer anchors in the inbound \
+                 admission trust"
+            );
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                "hbone_peer_trust_withdrawn".to_string(),
+            );
+            crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+                false,
+            );
+            // Byte-identical to the unauthenticated-peer body: the refusal must
+            // not tell a peer whether its identity or its trust anchor was the
+            // problem.
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                plugins,
+                ctx,
+                StatusCode::FORBIDDEN,
+                Bytes::from_static(
+                    br#"{"error":"HBONE tunnel requires an authenticated mesh peer"}"#,
+                ),
+                HashMap::new(),
+                false,
+            )
+            .await;
+            log_rejected_request(
+                plugins,
+                ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                "hbone_peer_trust_withdrawn",
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(state, reject.http_status.as_u16());
+            return build_response_from_normalized_reject(reject);
+        }
+    };
+
     let selection = backend_dispatch::select_upstream_target(
         proxy,
         state,
@@ -1061,20 +1121,15 @@ pub(super) async fn handle_hbone_request(
         request_protocol: admission_view.request_protocol,
         grpc_web_request: admission_view.grpc_web_request,
         admission_sweep_epoch: admission_view.sweep_epoch,
-        // Credential dimension (issue #5568). The trust half is read from the
-        // INBOUND ADMISSION SLOT — the bundle this connection's mTLS handshake
-        // was verified against — not from the request epoch, so a sweep judges
-        // the tunnel against the anchors its peer's next CONNECT would face.
-        // Read here, after the request path captured `sweep_epoch`, so the
-        // existing publish-then-recheck contract covers it: every writer of
-        // that slot requests a sweep after storing.
-        peer_credential: HbonePeerCredential::from_admitted_connect(
-            ctx,
-            state
-                .hbone_admission_fence
-                .inbound_trust_snapshot()
-                .as_ref(),
-        ),
+        // Credential dimension (issue #5568), decided by the trust gate above:
+        // the retained chain was re-verified against the INBOUND ADMISSION
+        // TRUST in force — the anchors this peer's next handshake would face —
+        // never against the request epoch's separately-built bundles, and never
+        // against a handshake verdict that may predate the current trust. The
+        // snapshot's `admitted_trust_revision` is therefore a revision this
+        // CONNECT actually verified under, which is what the sweep's skip key
+        // is allowed to be seeded from.
+        peer_credential,
     });
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
@@ -1344,6 +1399,53 @@ pub(super) async fn handle_hbone_udp_request(
         record_request(state, reject.http_status.as_u16());
         return build_response_from_normalized_reject(reject);
     }
+
+    // Same credential admission as the byte-stream relay (issue #5568): a
+    // datagram tunnel rides the same pooled, never-re-handshaked inbound mTLS
+    // session, so its CONNECT is re-verified against the inbound admission
+    // trust in force rather than trusting the handshake's own verdict.
+    // Bound before the match so the immutable borrow of `ctx` is finished
+    // before the refusal arm stamps its deny reason on it.
+    let credential_admission =
+        HbonePeerCredential::from_admitted_connect(ctx, &state.hbone_admission_fence);
+    let peer_credential = match credential_admission {
+        HboneConnectCredential::Admit(credential) => credential,
+        HboneConnectCredential::Refuse => {
+            warn!(
+                proxy_id = %proxy.id,
+                "Rejected datagram-over-HBONE CONNECT whose peer chain no longer anchors in the \
+                 inbound admission trust"
+            );
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                "hbone_udp_peer_trust_withdrawn".to_string(),
+            );
+            // Byte-identical to the unauthenticated-peer body; the refusal
+            // discloses nothing about which half of admission refused it.
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                plugins,
+                ctx,
+                StatusCode::FORBIDDEN,
+                Bytes::from_static(
+                    br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#,
+                ),
+                HashMap::new(),
+                false,
+            )
+            .await;
+            log_rejected_request(
+                plugins,
+                ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                "hbone_udp_peer_trust_withdrawn",
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(state, reject.http_status.as_u16());
+            return build_response_from_normalized_reject(reject);
+        }
+    };
 
     // The CONNECT authority is the destination UDP app addr+port. For the
     // transparent inbound relay it is carried as the synthesized proxy's
@@ -1776,14 +1878,9 @@ pub(super) async fn handle_hbone_udp_request(
         admission_sweep_epoch: admission_view.sweep_epoch,
         // Credential dimension (issue #5568); see the byte-stream relay. A
         // datagram tunnel rides the same inbound mTLS session and is bounded by
-        // the same peer SVID, so it carries the same snapshot fields.
-        peer_credential: HbonePeerCredential::from_admitted_connect(
-            ctx,
-            state
-                .hbone_admission_fence
-                .inbound_trust_snapshot()
-                .as_ref(),
-        ),
+        // the same peer SVID, so it carries the same snapshot fields — already
+        // re-verified by the trust gate above.
+        peer_credential,
     });
     let relay_proxy = proxy.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();
