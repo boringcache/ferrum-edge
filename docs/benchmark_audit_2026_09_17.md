@@ -4,8 +4,9 @@ Ferrum's strongest repeatable losses are HTTPS/1.1 at medium and large payloads,
 1 MiB WebSocket messages, and UDP. Small HTTP/2 and gRPC requests merit attention,
 but correctness problems make several apparent wins and losses provisional.
 The Envoy HTTP/3 stream cap is an unequal workload restriction. Removing it
-passed the local correctness checks described below, without establishing a
-consistent throughput improvement. There is no evidence yet that one change
+passed local and hosted request-correctness checks, without establishing a
+consistent throughput improvement. Hosted transport diagnostics expose further
+questions, including an upstream packet-drop counter bug. There is no evidence yet that one change
 will make Ferrum faster than every competitor.
 
 **Evidence and scope.** [Run 35071334026](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35071334026)
@@ -218,10 +219,83 @@ Local validation used the unchanged benchmark client/backend:
   environment failures. Neither architecture is the hosted x86 runner.
 
 The local rate changes were mixed, without a consistent improvement from
-lifting the cap. These checks justify removing the artificial admission
-restriction; they do **not** prove it accounts for Envoy's throughput deficit
-or guarantee a clean hosted run. A hosted rerun of the candidate remains the
-performance and correctness acceptance check.
+lifting the cap. The completed hosted check below likewise supports removing
+the artificial admission restriction without identifying it as the main cause
+of Envoy's throughput deficit.
+
+**Completed hosted HTTP/3 candidate.**
+[Run 35198436672](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35198436672)
+tested `f2961bf1a9d4c72236e2b06f5473bf945d5f45af` on an x86 EPYC 7763 runner,
+using pinned Envoy 1.33.5 with 100-stream limits on both legs. All **35 expected
+samples** passed: 15 Envoy, 15 Ferrum, and five direct baselines. Every sample
+had positive completed work, zero client errors, and exact expected byte totals;
+all three manifests matched the observed matrix. Every client stderr file was
+empty. All 35 backend logs contained only the startup banner; all 30 gateway
+logs were empty at the configured error log level.
+
+All 15 Envoy stats snapshots were retrieved successfully. At each snapshot,
+cumulative upstream HTTP 200/completed and downstream 2xx/completed counters
+exactly matched cumulative client completions: final totals 34,339 / 34,816 /
+35,273 across iterations. Upstream H1/H2 connection counts, request retries,
+request timeouts, and upstream H3 RX/TX resets were zero throughout. Four
+upstream H3 connections remained pooled, with no requests active or pending
+at the post-sample snapshots. This verifies successful H3 forwarding without
+protocol fallback or retries hiding failed requests.
+
+| Payload | Ferrum mean RPS | Envoy mean RPS | Ferrum / Envoy | Envoy per-iteration p99 range |
+|---|---:|---:|---:|---:|
+| 10 KiB | 9,903 | 1,818 | 5.45× | 160–245 ms |
+| 70 KiB | 1,994 | 379 | 5.26× | 811–1,305 ms |
+| 500 KiB | 309 | 77 | 4.02× | 5.10–5.38 s |
+| 1 MiB | 177 | 38 | 4.62× | 5.74–7.48 s |
+| 5 MiB | 39 | 8 | 4.90× | 14.59–19.84 s |
+
+The current-main H3 runner had the same CPU model, though it was a different
+VM and revision. Relative to that old-cap run, Envoy mean RPS changed by
++1.5%, −8.5%, −0.1%, +1.9%, and +15.5% across ascending payloads. Direct
+rates moved +0.8–2.6% and Ferrum +1.1–2.7%. These are observations, not a
+controlled cap-only A/B. The cap was unequal admission, but lifting it did
+not produce a broad throughput recovery. At 5 MiB, one p99 exceeds the nominal
+15-second duration, underlining the measurement/drain limitation described
+above. Report these as nominal-duration rates until that timing is repaired.
+
+Request success does **not** mean the transport diagnostics were uneventful:
+
+- Cumulative downstream QUIC `TOO_MANY_RTOS` counts finish at 13/8/11;
+  `SILENT_IDLE_TIMEOUT` at 34/51/39. These snapshots span successive payloads
+  in one Envoy process and include earlier client connections. The H3 client
+  does not explicitly close/drain its connection pool before process exit.
+  Post-request teardown is therefore a plausible contributor, not an
+  established explanation. Time-resolved connection events are needed before
+  counting these closures as failed measured requests or dismissing them.
+- The downstream UDP drop counter finishes at 191,187,978 / 176,100,361 /
+  161,008,805. **Those are not credible actual loss totals.** The pinned
+  [v1.33.5 socket implementation](https://github.com/envoyproxy/envoy/blob/v1.33.5/source/common/network/io_socket_handle_impl.cc#L403)
+  adds the kernel's cumulative `SO_RXQ_OVFL` value on every read in both
+  receive paths (also line 528). Upstream
+  [issue #38431](https://github.com/envoyproxy/envoy/issues/38431) and
+  [fix #38652](https://github.com/envoyproxy/envoy/pull/38652) identify and
+  correct this repeated counting. The inspected pin still has the old code.
+  Real receive pressure remains possible; the counter's magnitude cannot
+  quantify it. Obtain kernel/socket drop deltas independently.
+- One worker watchdog miss appears in iteration 1. Empty error-level logs
+  cannot establish that optimized UDP worker routing was available: Envoy's
+  [pinned H3 documentation](https://github.com/envoyproxy/envoy/blob/v1.33.5/docs/root/intro/arch_overview/http/http3.rst)
+  recommends BPF for multiple workers and documents startup warnings if it
+  cannot be used. This harness suppresses warnings.
+
+The next fair-comparison experiments in #5588 should first record actual
+socket receive/send buffer sizes and kernel drops for both gateways, expose
+startup BPF/GRO/GSO diagnostics, and separate timed work from connection
+teardown. Then A/B equivalent socket-buffer budgets and a verified Envoy build
+containing the counter fix, keeping offered concurrency and strict status/body
+validation unchanged. Profile the four upstream connections and worker CPU
+distribution before attributing the remaining gap to forwarding efficiency.
+No transport tuning beyond the stream-cap repair is claimed validated here.
+
+Both requested runs and the candidate are now analyzed. The report and JSON
+retain the findings; #5588 remains open for the correctness fixes, measurement
+repairs, transport verification, and production optimization experiments.
 
 **Hot-path findings and ranked experiments.** These are source-supported
 mechanisms and testable hypotheses, not claims from a CPU profile.
