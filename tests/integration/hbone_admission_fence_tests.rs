@@ -33,17 +33,34 @@
 //! * a revocation never lands on `ferrum_mesh_hbone_relay_failures_total`.
 //!
 //! and the CREDENTIAL dimension (issue #5568), which a sweep re-decides because
-//! an established inbound mTLS session is never re-handshaked:
+//! an established inbound mTLS session is never re-handshaked. Its trust input
+//! is the INBOUND ADMISSION SLOT — the `tls::SharedBundleSlot` the mesh SPIFFE
+//! client-certificate verifier reads — not the request epoch's gateway trust,
+//! because the fence's verdict means "this peer's next CONNECT would be
+//! refused" and that is the verifier which would refuse it:
 //!
-//! * a gateway trust rotation that still anchors the peer revokes nothing;
-//! * withdrawing the peer's trust domain, and rotating away the authority that
-//!   issued its leaf, each revoke with `peer_trust`;
+//! * a trust rotation that still anchors the peer revokes nothing, and costs
+//!   exactly one certificate path build per tunnel;
+//! * a root rotation the inbound verifier ACCEPTED keeps live tunnels, even
+//!   while the request epoch's separately-built bundles never carried that root
+//!   — the false-mass-revocation regression the independent review found;
+//! * withdrawing the peer's trust domain (local or federated), and rotating
+//!   away the authority that issued its leaf, each revoke with `peer_trust`;
+//! * an unchanged republish — including one beneath a rotated gateway leaf —
+//!   revokes nothing and does NO certificate path building, and a tunnel
+//!   already verified against the current revision never rebuilds its path;
 //! * an admitted SVID past its `notAfter` is revoked by the fence's own expiry
-//!   watcher with NO publication of any kind;
+//!   watcher with NO publication of any kind, an unparseable retained leaf
+//!   fails closed as `reevaluation_failed` rather than as `peer_expired`, and
+//!   an unbounded one is not revoked at all;
 //! * a published trust bundle that cannot be compiled into a verifier fails
 //!   closed with `reevaluation_failed`;
-//! * a peer the admitting gateway trust generation never anchored — the
-//!   chain-only inbound posture — is never revoked for trust.
+//! * a peer the admitting inbound trust never anchored — the chain-only inbound
+//!   posture — is never revoked for trust;
+//! * and the production capture itself runs end to end over a REAL mTLS
+//!   handshake: what `HbonePeerCredential::from_admitted_connect` retained is
+//!   read back out of the fence's registry, including the case where the slot's
+//!   local trust domain is the SVID's own and the slice's differs.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -73,13 +90,14 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{MeshTrafficDirection, prepare_gateway_config_for_mesh};
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
-    AdmittedHboneTunnel, HboneAdmissionSnapshot, HbonePeerCredential, HboneRelayDestinationGate,
-    HboneRevocationReason,
+    AdmittedHboneTunnel, AdmittedLeafExpiry, HboneAdmissionSnapshot, HbonePeerCredential,
+    HboneRelayDestinationGate, HboneRevocationReason,
 };
 use ferrum_edge::proxy::{
     ConfigApplyOutcome, MeshInboundTlsPolicy, ProxyState,
     start_proxy_listener_with_bound_listener_and_mesh_direction,
 };
+use ferrum_edge::tls::SharedBundleSlot;
 
 use super::mesh_hbone_tests::{
     connect_hbone_h2_mtls, create_egress_udp_gateway_state, create_mesh_proxy,
@@ -314,7 +332,6 @@ fn synthetic_snapshot(
         // credential-less snapshot leaves the credential gate (and the expiry
         // watcher) inapplicable. `credential_snapshot` is the fixture for that
         // dimension.
-        gateway_trust_generation: 0,
         peer_credential: None,
     }
 }
@@ -352,7 +369,6 @@ fn dual_gate_snapshot(proxy: Arc<Proxy>, admission_sweep_epoch: u64) -> HboneAdm
         request_protocol: ProxyProtocol::Http,
         grpc_web_request: false,
         admission_sweep_epoch,
-        gateway_trust_generation: 0,
         peer_credential: None,
     }
 }
@@ -606,12 +622,48 @@ struct AdmittedFixture {
     backend_handle: tokio::task::JoinHandle<()>,
     backend_port: u16,
     shutdown_tx: watch::Sender<bool>,
+    /// The inbound SPIFFE verifier's trust slot, when this fixture installed
+    /// one. `None` is the chain-only inbound posture: peers are verified
+    /// against the operator client-CA bundle and the fence's trust half is
+    /// inapplicable.
+    inbound_trust_slot: Option<SharedBundleSlot>,
 }
 
 async fn admit_client_tunnel(policies: Vec<MeshPolicy>) -> AdmittedFixture {
+    admit_client_tunnel_with_inbound_trust(policies, false).await
+}
+
+/// One admitted byte-stream tunnel over a REAL inbound mTLS handshake.
+///
+/// With `install_inbound_trust`, the fence is additionally given an inbound
+/// SPIFFE trust slot whose LOCAL bundle is the fixture CA's trust domain — the
+/// peer's — and whose federated map carries the slice's differing local domain.
+/// That is the exact shape `merge_trust_overlay_into_svid_bundle` produces, and
+/// it is the shape under which the request epoch's separately-built bundles
+/// would have reported the peer as unanchored.
+async fn admit_client_tunnel_with_inbound_trust(
+    policies: Vec<MeshPolicy>,
+    install_inbound: bool,
+) -> AdmittedFixture {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
     let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
     let state = build_state(prepared_config(Some(backend_addr.port()), policies));
+    let inbound_trust_slot = install_inbound.then(|| {
+        let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+        let mut federated = std::collections::HashMap::new();
+        federated.insert(
+            TrustDomain::new(SLICE_TRUST_DOMAIN).expect("slice trust domain"),
+            trust_bundle(SLICE_TRUST_DOMAIN, vec![gateway.ca_der.clone()]),
+        );
+        install_inbound_trust(
+            &state,
+            &gateway,
+            RuntimeTrustBundleSet {
+                local: trust_bundle(PEER_TRUST_DOMAIN, vec![certs.ca_der()]),
+                federated,
+            },
+        )
+    });
     let (gateway_addr, shutdown_tx) =
         start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
     let (mut sender, conn_task) =
@@ -632,6 +684,7 @@ async fn admit_client_tunnel(policies: Vec<MeshPolicy>) -> AdmittedFixture {
         backend_handle,
         backend_port: backend_addr.port(),
         shutdown_tx,
+        inbound_trust_slot,
     }
 }
 
@@ -1329,6 +1382,9 @@ async fn a_revoked_tunnels_reason_survives_the_relays_retire() {
 
 /// The peer's trust domain, as it appears in [`CLIENT_SPIFFE`].
 const PEER_TRUST_DOMAIN: &str = "cluster.local";
+/// A second trust domain, used as the domain a slice declares locally when it
+/// differs from the gateway SVID's own.
+const SLICE_TRUST_DOMAIN: &str = "partner.local";
 /// The gateway's own workload identity. Never consulted by the fence, which
 /// reads only the trust bundles, but a real SVID keeps the published slot the
 /// shape every other consumer expects.
@@ -1387,56 +1443,121 @@ fn mint_peer_chain(spiffe: &str) -> PeerChain {
     }
 }
 
-/// Publish one gateway trust generation carrying exactly `authorities` for
-/// `trust_domain`.
+/// One trust domain's bundle.
+fn trust_bundle(trust_domain: &str, authorities: Vec<Vec<u8>>) -> RuntimeTrustBundle {
+    RuntimeTrustBundle {
+        trust_domain: TrustDomain::new(trust_domain).expect("trust domain"),
+        x509_authorities: authorities,
+        jwt_authorities: Vec::new(),
+        refresh_hint_seconds: None,
+    }
+}
+
+/// A trust set whose local bundle is `trust_domain` and which federates
+/// nothing.
+fn local_trust(trust_domain: &str, authorities: Vec<Vec<u8>>) -> RuntimeTrustBundleSet {
+    RuntimeTrustBundleSet {
+        local: trust_bundle(trust_domain, authorities),
+        federated: Default::default(),
+    }
+}
+
+/// An SVID bundle in the shape the mesh inbound SPIFFE verifier's slot carries.
+fn inbound_bundle(gateway: &PeerChain, trust_bundles: RuntimeTrustBundleSet) -> SvidBundle {
+    SvidBundle {
+        spiffe_id: SpiffeId::new(GATEWAY_SPIFFE).expect("gateway spiffe id"),
+        cert_chain_der: vec![gateway.leaf_der.clone()],
+        private_key_pkcs8_der: vec![8, 8, 8].into(),
+        trust_bundles,
+    }
+}
+
+/// Install the inbound mTLS verifier's trust slot — the slot the fence judges
+/// live tunnels against — carrying `trust_bundles`.
+///
+/// Production wires the ONE slot `mesh_inbound_spiffe_verifier` reads; these
+/// fixtures wire an equivalent one, because the fence's contract is defined by
+/// what that verifier would accept on the peer's next handshake.
+fn install_inbound_trust(
+    state: &ProxyState,
+    gateway: &PeerChain,
+    trust_bundles: RuntimeTrustBundleSet,
+) -> SharedBundleSlot {
+    let slot = ferrum_edge::tls::shared_bundle_slot(Some(inbound_bundle(gateway, trust_bundles)));
+    state.install_mesh_inbound_admission_trust(&slot);
+    slot
+}
+
+/// Republish the inbound verifier's trust slot through the one production
+/// writer, which advances the slot's trust revision when the X.509 material
+/// changed and then requests a fence sweep.
+fn publish_inbound_trust(
+    state: &ProxyState,
+    slot: &SharedBundleSlot,
+    gateway: &PeerChain,
+    trust_bundles: RuntimeTrustBundleSet,
+) {
+    state.publish_mesh_inbound_trust_bundle(
+        slot,
+        Arc::new(Some(inbound_bundle(gateway, trust_bundles))),
+    );
+}
+
+/// Publish one REQUEST-EPOCH gateway trust generation carrying exactly
+/// `authorities` for `trust_domain`.
 ///
 /// Goes through `install_gateway_runtime_svid_bundle`, the production SVID
 /// source-rotation entry point, so the publication really is the complete
 /// fence → install → retire → commit transaction that ends at
-/// `publish_live_gateway_trust` — the one writer that schedules the sweep.
+/// `publish_live_gateway_trust`.
+///
+/// Deliberately separate from [`publish_inbound_trust`]: the two really are
+/// different material written by different code, which is the whole point of
+/// the divergence tests below. The epoch's bundles are the CP/database
+/// override; the inbound slot's are what a peer handshake is checked against.
 fn publish_gateway_trust(
     state: &ProxyState,
     gateway: &PeerChain,
     trust_domain: &str,
     authorities: Vec<Vec<u8>>,
 ) {
-    let _withdrew = state.install_gateway_runtime_svid_bundle(SvidBundle {
-        spiffe_id: SpiffeId::new(GATEWAY_SPIFFE).expect("gateway spiffe id"),
-        cert_chain_der: vec![gateway.leaf_der.clone()],
-        private_key_pkcs8_der: vec![8, 8, 8].into(),
-        trust_bundles: RuntimeTrustBundleSet {
-            local: RuntimeTrustBundle {
-                trust_domain: TrustDomain::new(trust_domain).expect("trust domain"),
-                x509_authorities: authorities,
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            },
-            federated: Default::default(),
-        },
-    });
+    let _withdrew = state.install_gateway_runtime_svid_bundle(inbound_bundle(
+        gateway,
+        local_trust(trust_domain, authorities),
+    ));
 }
 
 fn gateway_trust_generation(state: &ProxyState) -> u64 {
     state.request_epoch.load().gateway_trust().generation()
 }
 
+/// The trust revision the fence's installed inbound slot currently publishes.
+fn inbound_trust_revision(state: &ProxyState) -> u64 {
+    state
+        .hbone_admission_fence
+        .inbound_trust_revision()
+        .expect("the credential fixtures install an inbound admission trust slot")
+}
+
 /// A credential deadline far enough out that the expiry half of the gate never
 /// fires, so a test isolates the trust half.
-fn live_deadline() -> Option<tokio::time::Instant> {
-    Some(tokio::time::Instant::now() + Duration::from_secs(3600))
+fn live_expiry() -> AdmittedLeafExpiry {
+    AdmittedLeafExpiry::At(tokio::time::Instant::now() + Duration::from_secs(3600))
 }
 
 fn peer_credential(
     chain: &PeerChain,
-    leaf_not_after: Option<tokio::time::Instant>,
+    leaf_expiry: AdmittedLeafExpiry,
     anchored_at_admission: bool,
+    admitted_trust_revision: u64,
 ) -> HbonePeerCredential {
     HbonePeerCredential {
         spiffe_id: SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"),
         leaf_der: Arc::new(chain.leaf_der.clone()),
         intermediates_der: None,
-        leaf_not_after,
+        leaf_expiry,
         anchored_at_admission,
+        admitted_trust_revision,
     }
 }
 
@@ -1449,7 +1570,6 @@ fn peer_credential(
 /// preparation.
 fn credential_snapshot(
     admission_sweep_epoch: u64,
-    gateway_trust_generation: u64,
     peer_credential: HbonePeerCredential,
 ) -> HboneAdmissionSnapshot {
     let mut snapshot = synthetic_snapshot(
@@ -1458,7 +1578,6 @@ fn credential_snapshot(
         None,
         admission_sweep_epoch,
     );
-    snapshot.gateway_trust_generation = gateway_trust_generation;
     snapshot.peer_credential = Some(peer_credential);
     snapshot
 }
@@ -1476,32 +1595,33 @@ async fn a_trust_rotation_that_keeps_the_peer_anchored_revokes_nothing() {
     let joining = mint_peer_chain(OTHER_SPIFFE);
     let state = credential_state(9601);
 
-    publish_gateway_trust(
+    let slot = install_inbound_trust(
         &state,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![peer.ca_der.clone()],
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
-    let admitted_generation = gateway_trust_generation(&state);
+    let admitted_revision = inbound_trust_revision(&state);
     let fence = &state.hbone_admission_fence;
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        admitted_generation,
-        peer_credential(&peer, live_deadline(), true),
+        peer_credential(&peer, live_expiry(), true, admitted_revision),
     ));
     assert_eq!(tunnel.revoked_reason(), None);
 
-    // A CA rotation that ADDS a root: a real new generation, and the authority
+    // A CA rotation that ADDS a root: a real new revision, and the authority
     // that issued this peer's leaf is still in it.
-    publish_gateway_trust(
+    publish_inbound_trust(
         &state,
+        &slot,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![peer.ca_der.clone(), joining.ca_der.clone()],
+        local_trust(
+            PEER_TRUST_DOMAIN,
+            vec![peer.ca_der.clone(), joining.ca_der.clone()],
+        ),
     );
     assert!(
-        gateway_trust_generation(&state) > admitted_generation,
-        "the rotation must advance the gateway trust generation, or the sweep would \
+        inbound_trust_revision(&state) > admitted_revision,
+        "the rotation must advance the inbound trust revision, or the sweep would \
          legitimately skip the chain re-verification and prove nothing"
     );
     wait_for_settled_sweeps(&state).await;
@@ -1509,6 +1629,11 @@ async fn a_trust_rotation_that_keeps_the_peer_anchored_revokes_nothing() {
     assert_eq!(tunnel.revoked_reason(), None);
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.live_tunnels(), 1);
+    assert_eq!(
+        fence.trust_rechecks(),
+        1,
+        "a trust change costs exactly ONE certificate path build per tunnel"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1517,31 +1642,80 @@ async fn withdrawing_the_peers_trust_domain_revokes_its_live_tunnel() {
     let peer = mint_peer_chain(CLIENT_SPIFFE);
     let state = credential_state(9602);
 
-    publish_gateway_trust(
+    let slot = install_inbound_trust(
         &state,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![peer.ca_der.clone()],
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
     let fence = &state.hbone_admission_fence;
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        gateway_trust_generation(&state),
-        peer_credential(&peer, live_deadline(), true),
+        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
     ));
     assert_eq!(tunnel.revoked_reason(), None);
 
-    // The federated trust domain is retired. The peer's own issuing root is
-    // still in the published material — it simply no longer names a trust
-    // domain this gateway accepts, which is exactly what a fresh handshake
-    // would refuse.
-    publish_gateway_trust(&state, &gateway, "partner.local", vec![peer.ca_der.clone()]);
+    // The trust domain is retired. The peer's own issuing root is still in the
+    // published material — it simply no longer names a trust domain this
+    // gateway accepts, which is exactly what a fresh handshake would refuse.
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust(SLICE_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
 
     wait_for_revocation(&tunnel).await;
     assert_eq!(
         tunnel.revoked_reason(),
         Some(HboneRevocationReason::PeerTrust),
         "a retired trust domain is a credential withdrawal, not a policy denial"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0]);
+}
+
+/// Withdrawing a FEDERATED trust domain is the same withdrawal as withdrawing
+/// the local one, and reaches the peer whose chain anchored there.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawing_a_federated_trust_domain_revokes_its_live_tunnel() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9608);
+
+    // The gateway SVID's own domain is the slice's; the peer's domain rides the
+    // set as a federated entry, exactly as `merge_trust_overlay_into_svid_bundle`
+    // files a cross-domain bundle.
+    let mut federated = std::collections::HashMap::new();
+    federated.insert(
+        TrustDomain::new(PEER_TRUST_DOMAIN).expect("peer trust domain"),
+        trust_bundle(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        RuntimeTrustBundleSet {
+            local: trust_bundle(SLICE_TRUST_DOMAIN, vec![gateway.ca_der.clone()]),
+            federated,
+        },
+    );
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // The federation is dropped; the local domain is untouched.
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust(SLICE_TRUST_DOMAIN, vec![gateway.ca_der.clone()]),
+    );
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::PeerTrust)
     );
     assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0]);
 }
@@ -1553,28 +1727,26 @@ async fn rotating_away_the_issuing_authority_revokes_its_live_tunnel() {
     let replacement = mint_peer_chain(OTHER_SPIFFE);
     let state = credential_state(9603);
 
-    publish_gateway_trust(
+    let slot = install_inbound_trust(
         &state,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![peer.ca_der.clone()],
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
     let fence = &state.hbone_admission_fence;
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        gateway_trust_generation(&state),
-        peer_credential(&peer, live_deadline(), true),
+        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
     ));
     assert_eq!(tunnel.revoked_reason(), None);
 
     // Same trust domain, different root: the retained chain no longer builds a
     // path. Only re-verifying the chain can see this — the trust domain is
     // still present, so a membership check alone would keep the tunnel.
-    publish_gateway_trust(
+    publish_inbound_trust(
         &state,
+        &slot,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![replacement.ca_der.clone()],
+        local_trust(PEER_TRUST_DOMAIN, vec![replacement.ca_der.clone()]),
     );
 
     wait_for_revocation(&tunnel).await;
@@ -1583,6 +1755,165 @@ async fn rotating_away_the_issuing_authority_revokes_its_live_tunnel() {
         Some(HboneRevocationReason::PeerTrust)
     );
     assert_eq!(revocation_counts(&state), [0, 0, 1, 0, 0, 0, 0]);
+}
+
+/// The regression the independent review of #5573 found, in its own words: a
+/// SPIRE CA rotation arrives through the SVID installer, the INBOUND verifier
+/// gains the new root and keeps admitting, and the request epoch's gateway
+/// trust — which a CP/database override replaces wholesale — does not describe
+/// that root at all.
+///
+/// Judging the tunnel by the epoch revoked every such peer as `peer_trust` and
+/// then immediately re-admitted its reconnect, a self-inflicted reconnect storm
+/// that contradicted the fence's own "no false mass revocation" claim. Judging
+/// it by the slot the handshake reads is the fix, and this pins it: the epoch
+/// generation moves twice and never anchors the peer, while the tunnel stays
+/// live because the verifier it would be re-handshaked against still does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_rotation_the_inbound_verifier_accepted_keeps_live_tunnels() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let joining = mint_peer_chain(OTHER_SPIFFE);
+    let cp_override = mint_peer_chain(OTHER_SPIFFE);
+    let state = credential_state(9607);
+
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    // The request epoch carries the CP/database override for the SAME trust
+    // domain, and that override never carried the peer's issuing root.
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![cp_override.ca_der.clone()],
+    );
+    let admitted_epoch_generation = gateway_trust_generation(&state);
+
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // SPIRE rotates: the installer merges the joining root into the inbound
+    // slot additively, and publishes its own (masked) epoch generation.
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust(
+            PEER_TRUST_DOMAIN,
+            vec![peer.ca_der.clone(), joining.ca_der.clone()],
+        ),
+    );
+    publish_gateway_trust(
+        &state,
+        &gateway,
+        PEER_TRUST_DOMAIN,
+        vec![cp_override.ca_der.clone(), joining.ca_der.clone()],
+    );
+    assert!(
+        gateway_trust_generation(&state) > admitted_epoch_generation,
+        "the epoch generation must move, or this proves nothing about which trust the \
+         fence reads"
+    );
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(
+        tunnel.revoked_reason(),
+        None,
+        "a peer the inbound verifier still admits must not be revoked because the request \
+         epoch's separately-built bundles never carried its root"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(fence.live_tunnels(), 1);
+}
+
+/// An ordinary publication is free. A slice apply republishes the inbound slot
+/// from unchanged inputs and a pure leaf/key SVID rotation replaces the slot's
+/// bundle without touching a single anchor; neither may cost a certificate path
+/// build, and a tunnel that has already been verified against the current
+/// revision must not be re-verified by every later sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_republish_revokes_nothing_and_builds_no_certificate_path() {
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let rotated_leaf = mint_peer_chain(GATEWAY_SPIFFE);
+    let state = credential_state(9609);
+
+    let slot = install_inbound_trust(
+        &state,
+        &gateway,
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    let admitted_revision = inbound_trust_revision(&state);
+    let fence = &state.hbone_admission_fence;
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, live_expiry(), true, admitted_revision),
+    ));
+
+    // Byte-identical trust material, republished twice, plus a gateway SVID
+    // whose LEAF rotated while its anchors did not.
+    for _ in 0..2 {
+        publish_inbound_trust(
+            &state,
+            &slot,
+            &gateway,
+            local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+        );
+    }
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &rotated_leaf,
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+    );
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        inbound_trust_revision(&state),
+        admitted_revision,
+        "republishing the same anchors — even beneath a rotated leaf — must not advance \
+         the trust revision"
+    );
+    assert_eq!(
+        fence.trust_rechecks(),
+        0,
+        "an ordinary publication must do no certificate path building at all"
+    );
+
+    // And a real trust change costs exactly one path build per tunnel, not one
+    // per sweep for the rest of the tunnel's life.
+    let joining = mint_peer_chain(OTHER_SPIFFE);
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust(
+            PEER_TRUST_DOMAIN,
+            vec![peer.ca_der.clone(), joining.ca_der.clone()],
+        ),
+    );
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(fence.trust_rechecks(), 1);
+
+    state.publish_mesh_inbound_tls_policy(MeshInboundTlsPolicy::default());
+    state.publish_mesh_inbound_tls_policy(MeshInboundTlsPolicy::default());
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(
+        fence.trust_rechecks(),
+        1,
+        "a tunnel re-verified against the current revision must not rebuild its path on \
+         every later sweep"
+    );
+    assert_eq!(tunnel.revoked_reason(), None);
 }
 
 /// The one revocation nothing publishes. An established inbound mTLS session is
@@ -1600,8 +1931,12 @@ async fn an_expired_peer_svid_is_revoked_with_no_publication_at_all() {
     // without the panic risk of subtracting from a fresh monotonic instant.
     let tunnel = fence.admit(credential_snapshot(
         sweep_epoch_before,
-        gateway_trust_generation(&state),
-        peer_credential(&peer, Some(tokio::time::Instant::now()), false),
+        peer_credential(
+            &peer,
+            AdmittedLeafExpiry::At(tokio::time::Instant::now()),
+            false,
+            0,
+        ),
     ));
 
     wait_for_revocation(&tunnel).await;
@@ -1619,34 +1954,76 @@ async fn an_expired_peer_svid_is_revoked_with_no_publication_at_all() {
     );
 }
 
+/// A leaf the fence cannot parse is a FENCE failure, not a statement about the
+/// peer's SVID lifetime. The `reason` label is the operator's only attribution,
+/// so it must not point at rotation when the problem is a parser.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unparseable_retained_leaf_fails_closed_as_a_reevaluation_failure() {
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9610);
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, AdmittedLeafExpiry::Unparseable, false, 0),
+    ));
+    state.publish_mesh_inbound_tls_policy(MeshInboundTlsPolicy::default());
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::ReevaluationFailed),
+        "an unparseable leaf must not be attributed to the peer's SVID lifetime"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1]);
+}
+
+/// A leaf whose `notAfter` outruns the representable monotonic range carries no
+/// upper bound of its own (issue #5396). It is an admission, not a refusal, and
+/// the expiry half simply has nothing to decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbounded_leaf_is_not_revoked_by_the_expiry_half() {
+    let peer = mint_peer_chain(CLIENT_SPIFFE);
+    let state = credential_state(9611);
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = fence.admit(credential_snapshot(
+        fence.sweep_epoch(),
+        peer_credential(&peer, AdmittedLeafExpiry::Unbounded, false, 0),
+    ));
+    state.publish_mesh_inbound_tls_policy(MeshInboundTlsPolicy::default());
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_trust_bundle_that_cannot_be_compiled_fails_closed() {
     let gateway = mint_peer_chain(GATEWAY_SPIFFE);
     let peer = mint_peer_chain(CLIENT_SPIFFE);
     let state = credential_state(9605);
 
-    publish_gateway_trust(
+    let slot = install_inbound_trust(
         &state,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![peer.ca_der.clone()],
+        local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
     let fence = &state.hbone_admission_fence;
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        gateway_trust_generation(&state),
-        peer_credential(&peer, live_deadline(), true),
+        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
     ));
     assert_eq!(tunnel.revoked_reason(), None);
 
-    // The published generation still declares the peer's trust domain, but its
+    // The published slot still declares the peer's trust domain, but its
     // authorities are not usable trust roots, so the sweep can produce no
     // verdict for anything anchored there.
-    publish_gateway_trust(
+    publish_inbound_trust(
         &state,
+        &slot,
         &gateway,
-        PEER_TRUST_DOMAIN,
-        vec![b"not-a-certificate".to_vec()],
+        local_trust(PEER_TRUST_DOMAIN, vec![b"not-a-certificate".to_vec()]),
     );
 
     wait_for_revocation(&tunnel).await;
@@ -1660,68 +2037,217 @@ async fn a_trust_bundle_that_cannot_be_compiled_fails_closed() {
 
 /// The guard against a false mass revocation: a mesh inbound listener with no
 /// gateway SVID material verifies peers chain-only against the operator client
-/// CA bundle, which the request epoch's gateway trust does not describe at all.
-/// Such a tunnel was never anchored by a gateway trust generation, so the trust
-/// half of the gate must never judge it.
+/// CA bundle, which the inbound SPIFFE slot does not describe at all. Such a
+/// tunnel was never anchored by the inbound admission trust, so the trust half
+/// of the gate must never judge it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_peer_the_admitting_generation_never_anchored_is_not_revoked_for_trust() {
+async fn a_peer_the_admitting_trust_never_anchored_is_not_revoked_for_trust() {
     let gateway = mint_peer_chain(GATEWAY_SPIFFE);
     let peer = mint_peer_chain(CLIENT_SPIFFE);
     let unrelated = mint_peer_chain(OTHER_SPIFFE);
     let state = credential_state(9606);
 
-    // The admitting generation carries a bundle for an unrelated trust domain,
-    // so it never anchored this peer.
-    publish_gateway_trust(
+    // The admitting slot carries a bundle for an unrelated trust domain, so it
+    // never anchored this peer.
+    let slot = install_inbound_trust(
         &state,
         &gateway,
-        "partner.local",
-        vec![unrelated.ca_der.clone()],
+        local_trust(SLICE_TRUST_DOMAIN, vec![unrelated.ca_der.clone()]),
     );
     let fence = &state.hbone_admission_fence;
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        gateway_trust_generation(&state),
-        peer_credential(&peer, live_deadline(), false),
+        peer_credential(&peer, live_expiry(), false, inbound_trust_revision(&state)),
     ));
 
-    publish_gateway_trust(&state, &gateway, "other.local", vec![unrelated.ca_der]);
+    publish_inbound_trust(
+        &state,
+        &slot,
+        &gateway,
+        local_trust("other.local", vec![unrelated.ca_der.clone()]),
+    );
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(tunnel.revoked_reason(), None);
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(fence.live_tunnels(), 1);
+    assert_eq!(fence.trust_rechecks(), 0);
 }
 
-/// The credential gate is only as good as the publication that schedules it.
-/// `publish_live_gateway_trust` is the ONE writer of the request-facing trust
-/// generation, and every trust publisher — an accepted `Replace`/`Clear`, a
-/// SPIRE/file/CA-backend SVID source rotation, and the request-epoch
-/// publication — ends there. Pinning the sweep request inside it is what keeps
-/// a future publisher from growing its own path and silently leaving live
-/// tunnels judged against retired trust.
-#[test]
-fn the_single_gateway_trust_publisher_requests_a_sweep() {
-    let source = include_str!("../../src/proxy/mod.rs");
-    let start = source
-        .find("fn publish_live_gateway_trust(&self) {")
-        .expect("publish_live_gateway_trust must exist");
-    let body = &source[start..];
-    let end = body
-        .find("\n    /// Whether request paths may authenticate gateway-to-mesh peers")
-        .expect("admits_gateway_mesh_identity follows the live-trust publisher");
-    let func = &body[..end];
+// ── End-to-end admission capture (issue #5568) ────────────────────────────
 
-    let store = func
-        .find("self.request_epoch.update_gateway_trust(")
-        .expect("the epoch store is what publishes the trust generation");
-    let sweep = func
-        .find("self.hbone_admission_fence.request_sweep()")
-        .expect("every gateway trust publication must schedule an admission-fence sweep");
+/// `HbonePeerCredential::from_admitted_connect` runs on the real CONNECT path,
+/// against a real mTLS handshake, so what it captured is asserted from the
+/// fence's own registry rather than reconstructed by a fixture.
+///
+/// This is the coverage whose absence let the trust-source divergence ship:
+/// every other credential fixture passes `anchored_at_admission` as a literal,
+/// and the production constructor — the one that decides which trust the tunnel
+/// is judged by — was never executed at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_connect_captures_its_peer_credential_from_the_inbound_trust() {
+    let mut fx = admit_client_tunnel_with_inbound_trust(vec![allow_client()], true).await;
+
+    let captured = fx
+        .state
+        .hbone_admission_fence
+        .inspect_live_tunnels(|snapshot| {
+            snapshot.peer_credential.as_ref().map(|credential| {
+                (
+                    credential.spiffe_id.to_string(),
+                    credential.anchored_at_admission,
+                    matches!(credential.leaf_expiry, AdmittedLeafExpiry::At(_)),
+                )
+            })
+        });
+    assert_eq!(
+        captured,
+        vec![Some((CLIENT_SPIFFE.to_string(), true, true))],
+        "a certificate-authenticated CONNECT must retain its peer SPIFFE id, a finite leaf \
+         deadline, and the anchoring the INBOUND verifier's trust implies"
+    );
+
+    echo_round_trip(&mut fx.tunnel, b"still-flowing").await;
+    fx.teardown().await;
+}
+
+/// The chain-only inbound posture, end to end: no inbound admission trust is
+/// installed, so the credential is still captured — the expiry half applies —
+/// but the trust half stays inapplicable for the tunnel's whole life.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_connect_with_no_inbound_trust_installed_is_never_anchored() {
+    let mut fx = admit_client_tunnel(vec![allow_client()]).await;
+
+    let captured = fx
+        .state
+        .hbone_admission_fence
+        .inspect_live_tunnels(|snapshot| {
+            snapshot
+                .peer_credential
+                .as_ref()
+                .map(|credential| credential.anchored_at_admission)
+        });
+    assert_eq!(
+        captured,
+        vec![Some(false)],
+        "with no inbound SPIFFE slot installed, peers are verified chain-only against the \
+         operator client-CA bundle and must never be judged by the trust gate"
+    );
+
+    echo_round_trip(&mut fx.tunnel, b"still-flowing").await;
+    fx.teardown().await;
+}
+
+/// Scenario B of the independent review, end to end.
+///
+/// The inbound slot's LOCAL domain is the gateway SVID's own — the peer's — and
+/// the slice's differing local domain is filed beside it as federated, which is
+/// exactly what `merge_trust_overlay_into_svid_bundle` produces. Reading the
+/// request epoch instead would find no bundle for the peer's domain at all,
+/// mark the tunnel unanchored, and then never judge it again: withdrawing that
+/// domain would revoke nothing, silently, for the tunnel's whole life.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawing_the_svids_own_trust_domain_revokes_a_real_tunnel() {
+    let fx = admit_client_tunnel_with_inbound_trust(vec![allow_client()], true).await;
+    let slot = fx
+        .inbound_trust_slot
+        .clone()
+        .expect("the fixture installed an inbound admission trust slot");
+    let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+
+    // The peer's trust domain — the SVID's own local domain — loses its
+    // authorities; the slice's domain is untouched.
+    publish_inbound_trust(
+        &fx.state,
+        &slot,
+        &gateway,
+        local_trust(SLICE_TRUST_DOMAIN, vec![gateway.ca_der.clone()]),
+    );
+
+    tokio::time::timeout(DEADLINE, async {
+        while fx
+            .state
+            .hbone_admission_fence
+            .revocations(HboneRevocationReason::PeerTrust)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("withdrawing the peer's trust domain must revoke its live tunnel");
+
+    assert_eq!(revocation_counts(&fx.state), [0, 0, 1, 0, 0, 0, 0]);
+    fx.teardown().await;
+}
+
+/// The credential gate is only as good as the publications that schedule it.
+/// Two writers must each store first and sweep second: the inbound admission
+/// trust (which decides the trust verdict) and the request-facing gateway trust
+/// generation (retained as the defence-in-depth half of the two-publication
+/// step). Pinning both in source is what keeps a future publisher from growing
+/// its own path and silently leaving live tunnels judged against retired trust.
+#[test]
+fn every_trust_publisher_stores_before_it_requests_a_sweep() {
+    fn body<'a>(source: &'a str, signature: &str, end: &str) -> &'a str {
+        let start = source.find(signature).expect("publisher must exist");
+        let rest = &source[start..];
+        let end = rest.find(end).expect("publisher body must terminate");
+        &rest[..end]
+    }
+
+    fn assert_store_then_sweep(func: &str, store: &str, sweep: &str, what: &str) {
+        let store = func.find(store).unwrap_or_else(|| {
+            panic!("{what}: the store is what publishes the material a sweep judges")
+        });
+        let sweep = func
+            .find(sweep)
+            .unwrap_or_else(|| panic!("{what}: every publication must schedule a fence sweep"));
+        assert!(
+            store < sweep,
+            "{what}: publish-then-recheck — the sweep must be requested AFTER the store, or a \
+             CONNECT that read the superseded state could register between them and never be \
+             re-judged"
+        );
+    }
+
+    let proxy = include_str!("../../src/proxy/mod.rs");
+    assert_store_then_sweep(
+        body(
+            proxy,
+            "fn publish_live_gateway_trust(&self) {",
+            "\n    /// Whether request paths may authenticate gateway-to-mesh peers",
+        ),
+        "self.request_epoch.update_gateway_trust(",
+        "self.hbone_admission_fence.request_sweep()",
+        "publish_live_gateway_trust",
+    );
+
+    let fence = include_str!("../../src/proxy/hbone_admission_fence.rs");
+    assert_store_then_sweep(
+        body(
+            fence,
+            "pub fn publish_inbound_admission_trust(",
+            "\n    /// The inbound admission trust as ONE",
+        ),
+        "trust.slot.store(bundle)",
+        "self.request_sweep()",
+        "publish_inbound_admission_trust",
+    );
+
+    // And the mesh writers must reach that publisher rather than storing into
+    // the verifier's slot themselves.
+    let mesh = include_str!("../../src/modes/mesh/mod.rs");
     assert!(
-        store < sweep,
-        "publish-then-recheck: the sweep must be requested AFTER the store, or a CONNECT that \
-         read the superseded trust could register between them and never be re-judged"
+        !mesh.contains("inbound_slot.store("),
+        "the mesh inbound SPIFFE slot must be published through \
+         ProxyState::publish_mesh_inbound_trust_bundle, never stored into directly"
+    );
+    assert_eq!(
+        mesh.matches("publish_mesh_inbound_trust_bundle(").count(),
+        2,
+        "exactly the two inbound-slot writers — the runtime SVID republisher and the staged \
+         slice publisher — may publish inbound trust"
     );
 }
 

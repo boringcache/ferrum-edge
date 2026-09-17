@@ -1051,7 +1051,14 @@ impl HboneConnectionPool {
             .as_ref()
             .and_then(|bundle| bundle.cert_chain_der.first().cloned())
         {
-            Some(leaf) => crate::proxy::hbone_admission_fence::monotonic_leaf_expiry(&leaf),
+            Some(leaf) => {
+                use crate::plugins::utils::auth_flow::CredentialDeadline;
+                match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(&leaf) {
+                    CredentialDeadline::Bounded(deadline) => Some(deadline),
+                    CredentialDeadline::Unbounded => None,
+                    CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
+                }
+            }
             None => Some(tokio::time::Instant::now()),
         };
         Ok(crate::proxy::hbone_inner_pool::HboneSourceCredential {

@@ -1061,11 +1061,20 @@ pub(super) async fn handle_hbone_request(
         request_protocol: admission_view.request_protocol,
         grpc_web_request: admission_view.grpc_web_request,
         admission_sweep_epoch: admission_view.sweep_epoch,
-        // Credential dimension (issue #5568). Read from the SAME epoch the
-        // gates above judged, so the trust generation and the policy generation
-        // this snapshot records can never come from two different loads.
-        gateway_trust_generation: epoch.gateway_trust().generation(),
-        peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
+        // Credential dimension (issue #5568). The trust half is read from the
+        // INBOUND ADMISSION SLOT — the bundle this connection's mTLS handshake
+        // was verified against — not from the request epoch, so a sweep judges
+        // the tunnel against the anchors its peer's next CONNECT would face.
+        // Read here, after the request path captured `sweep_epoch`, so the
+        // existing publish-then-recheck contract covers it: every writer of
+        // that slot requests a sweep after storing.
+        peer_credential: HbonePeerCredential::from_admitted_connect(
+            ctx,
+            state
+                .hbone_admission_fence
+                .inbound_trust_snapshot()
+                .as_ref(),
+        ),
     });
     // Advertise the receiver-side admission fence on the CONNECT `200` (issue
     // #5042 step 2), and ONLY while the fence really holds this tunnel: source
@@ -1780,8 +1789,13 @@ pub(super) async fn handle_hbone_udp_request(
         // Credential dimension (issue #5568); see the byte-stream relay. A
         // datagram tunnel rides the same inbound mTLS session and is bounded by
         // the same peer SVID, so it carries the same snapshot fields.
-        gateway_trust_generation: epoch.gateway_trust().generation(),
-        peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
+        peer_credential: HbonePeerCredential::from_admitted_connect(
+            ctx,
+            state
+                .hbone_admission_fence
+                .inbound_trust_snapshot()
+                .as_ref(),
+        ),
     });
     let relay_proxy = proxy.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();
