@@ -202,14 +202,19 @@ async fn every_subprocess_handoff_avoids_the_linux_source_port_range() {
         ),
         (
             "UDP reservation",
-            ports::reserve_udp_port().await.unwrap().drop_and_take_port(),
+            ports::reserve_udp_port()
+                .await
+                .unwrap()
+                .drop_and_take_port(),
         ),
         ("colocated TCP/UDP", colocated),
         ("pair first", first.drop_and_take_port()),
         ("pair second", second.drop_and_take_port()),
         (
             "future listener",
-            ports::reserve_future_tcp_port().unwrap().drop_and_take_port(),
+            ports::reserve_future_tcp_port()
+                .unwrap()
+                .drop_and_take_port(),
         ),
         (
             "generic spawner",
@@ -226,7 +231,10 @@ async fn every_subprocess_handoff_avoids_the_linux_source_port_range() {
     let mut distinct = BTreeSet::new();
     for (name, port) in cases {
         assert!(port >= 10_240, "{name}: avoid well-known/service ports");
-        assert!(!ephemeral.contains(&port), "{name}: {port} is in {ephemeral:?}");
+        assert!(
+            !ephemeral.contains(&port),
+            "{name}: {port} is in {ephemeral:?}"
+        );
         assert!(distinct.insert(port), "{name}: handoff lease was lost");
     }
     if bounds[0] < bounds[1] {

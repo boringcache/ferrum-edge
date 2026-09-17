@@ -363,8 +363,8 @@ fn bind_unlistened_tcp_port(port: u16) -> io::Result<(u16, socket2::Socket)> {
 /// with the same budget as [`reserve_port`]; this is reservation retry, not
 /// a whole-scenario retry-until-green loop.
 pub fn reserve_refused_tcp_port() -> io::Result<RefusedTcpPort> {
-    let (lease, socket) = process_registry()?
-        .lease_with(std::iter::repeat_n(0, 256), bind_unlistened_tcp_port)?;
+    let (lease, socket) =
+        process_registry()?.lease_with(std::iter::repeat_n(0, 256), bind_unlistened_tcp_port)?;
     Ok(RefusedTcpPort {
         port: lease.port,
         _socket: socket,

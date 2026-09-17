@@ -552,15 +552,11 @@ impl GatewayStartupOutput {
             let key = key.to_string_lossy();
             let value = value.to_string_lossy();
             if LISTENER_PORT_ENV_KEYS.contains(&key.as_ref()) {
-                if report_port
-                    && let Ok(port) = value.parse::<u16>()
-                {
+                if report_port && let Ok(port) = value.parse::<u16>() {
                     ports.push((key.into_owned(), port.to_string()));
                 }
             } else if key == "FERRUM_CP_GRPC_LISTEN_ADDR" {
-                if report_port
-                    && let Some(port) = parse_listen_addr_port(&value)
-                {
+                if report_port && let Some(port) = parse_listen_addr_port(&value) {
                     ports.push((key.into_owned(), port.to_string()));
                 }
             } else if key.contains("SECRET") || key.contains("TOKEN") || key.contains("PASSWORD") {

@@ -144,7 +144,9 @@ async fn exited_child_reports_both_output_tails_and_all_listener_ports() {
     assert!(message.contains("gateway stderr tail"), "{message}");
     assert!(message.contains("gateway stdout tail"), "{message}");
     assert_eq!(
-        message.matches("startup failed: Address already in use").count(),
+        message
+            .matches("startup failed: Address already in use")
+            .count(),
         2
     );
     assert!(message.contains(&http_port.to_string()), "{message}");

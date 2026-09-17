@@ -912,11 +912,9 @@ async fn test_udp_proxy_response_amplification_factor_drops_oversized_backend_da
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     let fixed_response = b"0123456789abcdef".to_vec();
-    let response_server = start_udp_fixed_response_server(
-        backend_reservation.into_socket(),
-        fixed_response.clone(),
-    )
-    .await;
+    let response_server =
+        start_udp_fixed_response_server(backend_reservation.into_socket(), fixed_response.clone())
+            .await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1004,11 +1002,9 @@ async fn test_udp_proxy_without_explicit_factor_bounds_amplification_by_default(
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     let large_response = vec![b'z'; AMPLIFICATION_PROBE_RESPONSE_BYTES];
-    let response_server = start_udp_fixed_response_server(
-        backend_reservation.into_socket(),
-        large_response.clone(),
-    )
-    .await;
+    let response_server =
+        start_udp_fixed_response_server(backend_reservation.into_socket(), large_response.clone())
+            .await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1070,11 +1066,9 @@ async fn test_udp_proxy_zero_factor_sentinel_disables_the_amplification_guard() 
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     let large_response = vec![b'z'; AMPLIFICATION_PROBE_RESPONSE_BYTES];
-    let response_server = start_udp_fixed_response_server(
-        backend_reservation.into_socket(),
-        large_response.clone(),
-    )
-    .await;
+    let response_server =
+        start_udp_fixed_response_server(backend_reservation.into_socket(), large_response.clone())
+            .await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
