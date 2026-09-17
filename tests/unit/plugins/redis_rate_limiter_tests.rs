@@ -4249,7 +4249,10 @@ async fn only_a_request_quota_client_probes_the_server_clock() {
         "no standalone TIME may be sent on behalf of a consumer that reads no clock"
     );
 
-    // The request-quota client, against the very same endpoint.
+    // The request-quota client, against the very same endpoint. The clockless
+    // client above legitimately ran one INCR; only the delta from here on
+    // says whether a policy command ran on an unscreened connection.
+    let incrs_before = server.incrs();
     let quota = keyspace_client(server.port);
     let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
     let charge = quota.window_charge("ip:127.0.0.1", bucket, 3);
@@ -4264,7 +4267,7 @@ async fn only_a_request_quota_client_probes_the_server_clock() {
     );
     assert_eq!(
         server.incrs(),
-        0,
+        incrs_before,
         "no policy command may run on a connection that could not be screened"
     );
 
