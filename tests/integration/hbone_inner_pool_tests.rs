@@ -73,6 +73,14 @@ const NAMESPACE: &str = ferrum_edge::config::types::DEFAULT_NAMESPACE;
 const PROXY_ID: &str = "hbone-inner-pool";
 const UPSTREAM_ID: &str = "orders";
 const DEADLINE: Duration = Duration::from_secs(10);
+/// hyper's `DEFAULT_INITIAL_MAX_SEND_STREAMS` (`hyper-1.9.0`
+/// `src/proto/h2/client.rs`), the value a nested HTTP/2 client reports for
+/// `current_max_send_streams()` until `h2` has APPLIED the peer's SETTINGS —
+/// which it defers until it writes the SETTINGS ACK, strictly later than the
+/// peer's SETTINGS bytes arriving. `h2` then overwrites it with the advertised
+/// MAX_CONCURRENT_STREAMS, or with `usize::MAX` when the peer advertises none,
+/// so "no longer this value" is exactly "the peer's SETTINGS are in force".
+const HYPER_PRE_SETTINGS_MAX_SEND_STREAMS: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Synthetic SPIFFE identity material
@@ -1318,27 +1326,69 @@ async fn open_fresh_h2(fx: &Fixture) -> NestedH2 {
     .expect("timely CONNECT")
     .expect("the peer admits the CONNECT");
     let advertised = tunnel.peer_advertises_inner_reuse();
-    let (sender, mut connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, GrpcBody>(TokioIo::new(tunnel))
         .await
         .expect("nested HTTP/2 handshake");
-    // EXACTLY the production sampling path (`open_hbone_grpc_sender`): the
-    // load is created before the driver is spawned and the driver stores
+    // EXACTLY the production sampling path (`open_hbone_grpc_sender`): the load
+    // is created before the driver is spawned and the driver stores
     // `Connection::current_max_send_streams()` after every poll. The cap lives
     // on hyper's `Connection`, never on the `SendRequest` the pool holds, and
-    // reading it once at spawn time would record hyper's pre-settings default
-    // of 100 for every peer — `h2` does not apply the peer's SETTINGS until it
-    // writes the ACK, which is later than their bytes arriving.
+    // reading it once would record hyper's pre-settings default of 100 for
+    // every peer — `h2` does not apply the peer's SETTINGS until it writes the
+    // ACK, which is later than their bytes arriving.
     let load = HboneInnerH2Load::default();
-    let published_cap = load.clone();
-    tokio::spawn(async move {
-        let _ = std::future::poll_fn(|cx| {
-            let polled = std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
-            published_cap.set_peer_max_streams(connection.current_max_send_streams());
-            polled
-        })
-        .await;
-    });
+    // Production does not hand the connection straight to its driver either: it
+    // first polls it through `h2c_preface::await_peer_settings`, and it is that
+    // PRE-SPAWN driving that makes the cap the first checkout reads the peer's
+    // real one. That helper is crate-private, so drive the same way here, until
+    // `h2` has APPLIED the peer's SETTINGS. "Applied" is observable without
+    // knowing what the app advertises: `h2` overwrites hyper's
+    // `initial_max_send_streams` with the advertised value, or with
+    // `usize::MAX` when the peer advertises none, so the cap simply stops being
+    // hyper's default. Skipping this left a carrier that completed a whole RPC
+    // still reporting 100 — a parked driver is not polled again, so an idle
+    // connection never converges on its own.
+    let mut connection = Box::pin(connection);
+    // A connection that ENDS during the pre-drive must not be handed on: a
+    // completed future may not be polled again.
+    let ended = AtomicBool::new(false);
+    // Scoped so the drive's borrow of `connection` has certainly ended before
+    // the connection is moved into its driver task below.
+    let applied = {
+        let drive = std::future::poll_fn(|cx| {
+            let polled = std::future::Future::poll(connection.as_mut(), cx);
+            load.set_peer_max_streams(connection.current_max_send_streams());
+            if polled.is_ready() {
+                ended.store(true, Ordering::SeqCst);
+                return std::task::Poll::Ready(());
+            }
+            if load.peer_max_streams() == HYPER_PRE_SETTINGS_MAX_SEND_STREAMS {
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(())
+        });
+        tokio::time::timeout(DEADLINE, drive).await
+    };
+    assert!(
+        applied.is_ok(),
+        "the destination app never applied its own HTTP/2 SETTINGS; the nested \
+         carrier would report hyper's pre-settings default forever"
+    );
+    // Hand it to the long-lived driver, which keeps the cap current for the
+    // rest of the carrier's life exactly as production's does — including a
+    // peer that lowers it mid-connection.
+    if !ended.load(Ordering::SeqCst) {
+        let published_cap = load.clone();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| {
+                let polled = std::future::Future::poll(connection.as_mut(), cx);
+                published_cap.set_peer_max_streams(connection.current_max_send_streams());
+                polled
+            })
+            .await;
+        });
+    }
     NestedH2 {
         sender,
         advertised,
@@ -1359,11 +1409,12 @@ impl NestedH2 {
         self.load.peer_max_streams()
     }
 
-    /// Block until the nested peer's SETTINGS have been APPLIED, which is a
-    /// strictly later moment than their bytes arriving: until `h2` writes the
-    /// SETTINGS ACK, `current_max_send_streams()` still reports hyper's own
-    /// `DEFAULT_INITIAL_MAX_SEND_STREAMS`. Polling the recorded value is how a
-    /// test observes the real cap without racing that boundary.
+    /// Block until the recorded cap is `expected`.
+    ///
+    /// `open_fresh_h2` already drove the connection until the peer's SETTINGS
+    /// were applied, so this normally returns on its first read; it stays as
+    /// the assertion that the value the POOL will act on is the value the peer
+    /// advertised, rather than hyper's pre-settings default.
     async fn await_peer_max_streams(&self, expected: usize) {
         let settled = tokio::time::timeout(DEADLINE, async {
             while self.peer_max_streams() != expected {
