@@ -8,6 +8,7 @@
 //!
 //! Run with: cargo test --test functional_load_balancer_test -- --ignored --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::harness::wait_for_spawned_gateway;
 use crate::scaffolding::port_registry::TestSocket;
 use crate::scaffolding::ports::{reserve_port, unbound_port};
@@ -189,7 +190,7 @@ fn start_gateway_in_file_mode(
     http_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     // Build (or verify the prebuilt artifact) via the shared helper so this
     // file shares the `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1`
     // contract used by the [`crate::common::TestGateway`] builder.
@@ -221,27 +222,30 @@ fn start_gateway_in_file_mode(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    Ok(cmd.spawn()?)
+    Ok(GatewayChildGuard::spawn(&mut cmd)?)
 }
 
 /// Poll until this child owns admin `/health` and the proxy listener accepts.
 /// Unauthenticated `/health` and CIDR-granted health detail are not identity
 /// (issue #4253).
 async fn wait_for_owned_gateway(
-    child: &mut std::process::Child,
+    child: &mut GatewayChildGuard,
     admin_port: u16,
     proxy_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
-    if crate::common::wait_for_owned_gateway_identity(
-        child,
+    if let Err(error) = crate::common::wait_for_owned_gateway_identity(
+        child.child_mut(),
         admin_port,
         identity,
         Duration::from_secs(15),
     )
     .await
-    .is_err()
     {
+        eprintln!(
+            "Gateway identity readiness failed: {error}\n{}",
+            child.startup_diagnostics()
+        );
         return false;
     }
     match wait_for_spawned_gateway(child, proxy_port, None).await {
@@ -256,10 +260,10 @@ async fn wait_for_owned_gateway(
 /// Start the gateway with port allocation retry logic.
 /// Allocates fresh proxy and admin ports each attempt.
 /// Returns (child process, proxy_port, admin_port) on success.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        // Allocate fresh ephemeral ports each attempt
+        // Allocate fresh non-ephemeral ports each attempt
         let proxy_port = unbound_port().await.expect("lease gateway proxy port");
         let admin_port = unbound_port().await.expect("lease gateway admin port");
 
@@ -273,8 +277,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
                     "Gateway startup attempt {}/{} failed (readiness timeout on admin port {} / proxy port {})",
                     attempt, MAX_ATTEMPTS, admin_port, proxy_port
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
             }
             Err(e) => {
                 eprintln!(
@@ -449,7 +452,7 @@ plugin_configs: []
     }
 
     // Cleanup
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -565,7 +568,7 @@ plugin_configs: []
         "Light server count {light} should remain near 10"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -658,7 +661,7 @@ plugin_configs: []
         }
     }
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -771,7 +774,7 @@ plugin_configs: []
         counts
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -887,7 +890,7 @@ plugin_configs: []
         good
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -1004,7 +1007,7 @@ plugin_configs: []
         "recovering server should get traffic after recovery"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -1136,7 +1139,7 @@ plugin_configs: []
     // Send SIGHUP to reload config
     #[cfg(unix)]
     {
-        let pid = gateway.id();
+        let pid = gateway.child_mut().id();
         let _ = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output();
@@ -1177,7 +1180,7 @@ plugin_configs: []
         "target-b should NOT get traffic after reload"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1277,7 +1280,7 @@ plugin_configs: []
         "Some requests should succeed via retry to fallback-server"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -1387,7 +1390,7 @@ plugin_configs: []
     let probe_body = probe_resp.text().await.unwrap_or_default();
     assert_eq!(parse_server_name(&probe_body), "initial-target");
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -1492,7 +1495,7 @@ plugin_configs: []
         response_count
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -1639,7 +1642,7 @@ plugin_configs: []
         "api-1 should NOT get /static traffic"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1766,7 +1769,7 @@ plugin_configs: []
         "weight-1 count {w1} should remain near 10"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1888,7 +1891,7 @@ plugin_configs: []
         counts
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1993,7 +1996,7 @@ plugin_configs: []
         "Some requests should succeed by retrying to the reachable server"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
 }
 
@@ -2159,7 +2162,7 @@ plugin_configs: []
         "lb-target-2 should get 5 requests"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -2289,7 +2292,7 @@ plugin_configs: []
         );
     }
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -2402,7 +2405,7 @@ plugin_configs: []
         );
     }
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -2543,7 +2546,7 @@ plugin_configs: []
         counts
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
 }
 
@@ -2690,7 +2693,7 @@ plugin_configs: []
         "flapping-server should get traffic after recovery timer restores it"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }
@@ -2806,7 +2809,7 @@ plugin_configs: []
         "maint-server should get traffic (503 is in healthy codes)"
     );
 
-    let _ = gateway.kill();
+    gateway.shutdown();
     s1.abort();
     s2.abort();
 }

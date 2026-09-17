@@ -25,7 +25,6 @@
 //! allocate no association at all.
 
 use crate::scaffolding::port_registry::TestSocket;
-use crate::scaffolding::ports::bind_dtls_with_limits;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -572,7 +571,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
     );
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_udp_port().await.expect("reserve DTLS port");
-        let listen_port = frontend.drop_and_take_port();
+        let listen_port = frontend.port;
         let frontend_config = FrontendDtlsConfig {
             dimpl_config: Arc::new(
                 dimpl::Config::builder()
@@ -600,8 +599,8 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
             attempt_binding,
             0,
         ));
-        match bind_dtls_with_limits(
-            SocketAddr::from(([127, 0, 0, 1], listen_port)),
+        match ferrum_edge::dtls::DtlsServer::from_socket_with_limits(
+            frontend.into_socket(),
             frontend_config,
             DtlsServerLimits {
                 max_sessions: Some(16),
@@ -611,9 +610,7 @@ async fn authenticated_envelope_drives_the_live_dtls_demux_and_binds_identity() 
                 datagram_client_address_listener: Some((Arc::from(PROXY_ID), listen_port)),
                 ..Default::default()
             },
-        )
-        .await
-        {
+        ) {
             Ok(bound) => {
                 drops = attempt_drops;
                 binding = attempt_binding;

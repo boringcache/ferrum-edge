@@ -342,10 +342,38 @@ The bare-port helpers have the same retention contract. This spans a whole
 nextest test; libtest conservatively retains transferred ports across all tests
 in its process. Do not delete registry files during a test run.
 
+Every reservation that supports a subprocess handoff (`reserve_port`,
+`reserve_port_pair`, `reserve_udp_port`, `reserve_colocated_tcp_udp`, and the
+`unbound_*` helpers) allocates from 10240–65535 excluding the host's ephemeral
+source-port range. Linux reads `/proc/sys/net/ipv4/ip_local_port_range`, falling
+back to 32768–60999 only when that file is absent; other supported hosts use
+49152–65535. Malformed/unreadable range data and allocation exhaustion fail
+explicitly; there is no fallback to `bind(:0)`. `reserve_port_in_range` also
+filters its candidates. The generic harness's historical `ephemeral_port` and
+`hold_ephemeral_port_excluding` names use this same policy. This removes the
+kernel source-port race during release/rebind; explicit binds by unrelated
+processes still require the existing bounded startup retries.
+
+Keep `reserve_refused_tcp_port` bound for unavailable-backend fixtures. A future
+subprocess listener that must refuse connections before it starts instead uses
+`reserve_future_tcp_port`, which retains that behavior outside the source range.
+For native fixture backends, pass `into_listener` / `into_socket` directly.
+The [issue #5579 call-site audit](functional_testing_port_handoffs.md) records
+which handoffs need a rebind and which can retain their socket.
+
 `tests/common/gateway_harness.rs` uses these leases for gateway handoffs and
 keeps its bounded startup retries for unrelated OS users that do not participate
 in the registry. Neither readiness nor a bare TCP accept establishes identity:
 every gateway serves the same unauthenticated `/health` body.
+
+`TestGateway` always captures child stdout/stderr to temporary files. Successful
+runs still expose logs only when `capture_output()` is requested. Bespoke
+spawners using `wait_for_spawned_gateway` call `GatewayChildGuard::spawn` to get
+the same file-backed diagnostics and panic-safe ownership. Readiness failures
+include the child status, requested HTTP/stream ports, configured admin/proxy/CP
+ports, and separate redacted stdout/stderr tails (at most 16 KiB each). The files
+avoid unread-pipe deadlocks and remain owned through child shutdown. Existing
+identity probes and child checks before/after listener probes remain required.
 
 `TestGatewayBuilder::spawn` therefore mints per-spawn-attempt credentials
 (admin JWT secret/issuer plus `FERRUM_METRICS_BEARER_TOKEN`) and treats
@@ -450,7 +478,7 @@ The scripted-backend test harness (`tests/scaffolding/harness.rs`) ships
 two modes:
 
 - **`HarnessMode::Binary`** (default): spawns the built `ferrum-edge`
-  subprocess with `Stdio::null()`. Exercises the full CLI / signal /
+  subprocess with file-backed output capture. Exercises the full CLI / signal /
   process-bootstrap path. Required for tests that assert on captured
   stdout/stderr or rely on kernel-level features that depend on the
   process having its own runtime (kTLS extraction, io_uring submission
@@ -458,7 +486,7 @@ two modes:
 
 - **`HarnessMode::InProcess`**: runs the gateway as a tokio task in the
   test process via `ferrum_edge::modes::file::serve()`. Reserves
-  ephemeral ports via `tests/scaffolding/ports.rs`, hands the live
+  reserved ports via `tests/scaffolding/ports.rs`, hands the live
   `TcpListener`s to `serve()`, and skips subprocess overhead entirely.
   End-to-end harness setup runs in well under 100 ms versus 2-3 s for
   binary mode.

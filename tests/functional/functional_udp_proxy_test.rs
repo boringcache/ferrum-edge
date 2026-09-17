@@ -16,7 +16,7 @@
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
 
 use crate::scaffolding::harness::{StreamListener, wait_for_spawned_gateway};
-use crate::scaffolding::ports::{bind_dtls, unbound_tcp_port, unbound_udp_port};
+use crate::scaffolding::ports::{reserve_udp_port, unbound_tcp_port, unbound_udp_port};
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -32,12 +32,8 @@ use tokio::time::sleep;
 // ============================================================================
 
 /// Start a UDP echo server that reflects all received datagrams back to the sender.
-async fn start_udp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
+async fn start_udp_echo_server(socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(async move {
-        let socket = UdpSocket::bind_test(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind UDP echo server on port {}", port));
-
         let mut buf = vec![0u8; 65535];
         while let Ok((len, src)) = socket.recv_from(&mut buf).await {
             let _ = socket.send_to(&buf[..len], src).await;
@@ -49,14 +45,10 @@ async fn start_udp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 
 /// Start a UDP backend that replies to every datagram with the same payload.
 async fn start_udp_fixed_response_server(
-    port: u16,
+    socket: UdpSocket,
     response: Vec<u8>,
 ) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(async move {
-        let socket = UdpSocket::bind_test(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind UDP response server on port {}", port));
-
         let mut buf = vec![0u8; 65535];
         while let Ok((_len, src)) = socket.recv_from(&mut buf).await {
             let _ = socket.send_to(&response, src).await;
@@ -69,12 +61,8 @@ async fn start_udp_fixed_response_server(
 /// Start a UDP backend that acknowledges a zero-length request with one byte,
 /// then echoes nonempty requests. This exercises the bounded zero-length
 /// amplification exception without weakening ordinary payload accounting.
-async fn start_udp_zero_ack_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
+async fn start_udp_zero_ack_echo_server(socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(async move {
-        let socket = UdpSocket::bind_test(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind UDP zero-ack server on port {}", port));
-
         let mut buf = vec![0u8; 65535];
         while let Ok((len, src)) = socket.recv_from(&mut buf).await {
             let response: &[u8] = if len == 0 { b"x" } else { &buf[..len] };
@@ -88,13 +76,9 @@ async fn start_udp_zero_ack_echo_server(port: u16) -> tokio::task::JoinHandle<()
 /// Start a UDP backend that sends periodic responses after the first datagram
 /// from each client. Used to verify backend-side activity keeps DTLS frontend
 /// sessions alive even when the client is idle.
-async fn start_udp_push_server(port: u16) -> tokio::task::JoinHandle<()> {
+async fn start_udp_push_server(socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(async move {
-        let socket = std::sync::Arc::new(
-            UdpSocket::bind_test(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap_or_else(|_| panic!("Failed to bind UDP push server on port {}", port)),
-        );
+        let socket = std::sync::Arc::new(socket);
 
         let mut buf = vec![0u8; 65535];
         while let Ok((_len, src)) = socket.recv_from(&mut buf).await {
@@ -169,7 +153,7 @@ fn start_gateway_with_extra_env(
     }
     // Owned at the instant of spawn: every path out of a fixture from here on,
     // panic included, kills and reaps this child (issue #4991).
-    Ok(GatewayChildGuard::new(cmd.spawn()?))
+    Ok(GatewayChildGuard::spawn(&mut cmd)?)
 }
 
 fn start_gateway_with_dtls(
@@ -207,7 +191,7 @@ fn start_gateway_with_dtls_and_env(
     }
 
     configure_coverage_gateway_command(&mut cmd);
-    Ok(GatewayChildGuard::new(cmd.spawn()?))
+    Ok(GatewayChildGuard::spawn(&mut cmd)?)
 }
 
 fn write_config(path: &std::path::Path, content: &str) {
@@ -224,11 +208,12 @@ fn write_config(path: &std::path::Path, content: &str) {
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_plain_datagram_forwarding() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -254,7 +239,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -306,11 +291,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_zero_length_request_has_bounded_reply_budget() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let backend = start_udp_zero_ack_echo_server(backend_port).await;
+    let backend = start_udp_zero_ack_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -337,7 +323,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -388,7 +374,8 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_opening_flight_burst_preserved_in_order() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
@@ -398,9 +385,7 @@ async fn test_udp_proxy_opening_flight_burst_preserved_in_order() {
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_server = std::sync::Arc::clone(&received);
     let backend = tokio::spawn(async move {
-        let socket = UdpSocket::bind_test(format!("127.0.0.1:{}", backend_port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind UDP backend on port {}", backend_port));
+        let socket = backend_reservation.into_socket();
         let mut buf = vec![0u8; 65535];
         while let Ok((len, src)) = socket.recv_from(&mut buf).await {
             received_server
@@ -436,7 +421,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -498,11 +483,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_multiple_clients() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -527,7 +513,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -576,11 +562,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_new_source_flood_does_not_stall_established_session() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -606,7 +593,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -664,11 +651,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_max_sessions_env_limits_new_clients() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -698,7 +686,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -757,11 +745,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_session_timeout() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -796,7 +785,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -848,11 +837,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_large_datagram() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -877,7 +867,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -916,13 +906,17 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_response_amplification_factor_drops_oversized_backend_datagram() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     let fixed_response = b"0123456789abcdef".to_vec();
-    let response_server =
-        start_udp_fixed_response_server(backend_port, fixed_response.clone()).await;
+    let response_server = start_udp_fixed_response_server(
+        backend_reservation.into_socket(),
+        fixed_response.clone(),
+    )
+    .await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -948,7 +942,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1004,13 +998,17 @@ const AMPLIFICATION_PROBE_RESPONSE_BYTES: usize = 4096;
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_without_explicit_factor_bounds_amplification_by_default() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     let large_response = vec![b'z'; AMPLIFICATION_PROBE_RESPONSE_BYTES];
-    let response_server =
-        start_udp_fixed_response_server(backend_port, large_response.clone()).await;
+    let response_server = start_udp_fixed_response_server(
+        backend_reservation.into_socket(),
+        large_response.clone(),
+    )
+    .await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1035,7 +1033,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1066,13 +1064,17 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_zero_factor_sentinel_disables_the_amplification_guard() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     let large_response = vec![b'z'; AMPLIFICATION_PROBE_RESPONSE_BYTES];
-    let response_server =
-        start_udp_fixed_response_server(backend_port, large_response.clone()).await;
+    let response_server = start_udp_fixed_response_server(
+        backend_reservation.into_socket(),
+        large_response.clone(),
+    )
+    .await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1098,7 +1100,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1137,12 +1139,13 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_dtls_backend() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     // Start a DTLS echo server with a self-signed certificate
-    let dtls_echo = start_dtls_echo_server(backend_port).await;
+    let dtls_echo = start_dtls_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1168,7 +1171,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1213,11 +1216,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_dtls_backend_multiple_clients() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let dtls_echo = start_dtls_echo_server(backend_port).await;
+    let dtls_echo = start_dtls_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1243,7 +1247,7 @@ plugin_configs: []
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1288,12 +1292,13 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_frontend_dtls_termination() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     // Start plain UDP echo server
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     // Generate ECDSA P-256 cert for the gateway's DTLS frontend
     let temp_dir = TempDir::new().unwrap();
@@ -1330,7 +1335,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1376,11 +1381,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_frontend_dtls_backend_push_keeps_session_alive() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let push_server = start_udp_push_server(backend_port).await;
+    let push_server = start_udp_push_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let (cert_path, key_path) = generate_test_dtls_cert(&temp_dir);
@@ -1417,7 +1423,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1462,12 +1468,13 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_full_dtls_e2e() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
     // Start DTLS echo server as backend
-    let dtls_echo = start_dtls_echo_server(backend_port).await;
+    let dtls_echo = start_dtls_echo_server(backend_reservation.into_socket()).await;
 
     // Generate ECDSA P-256 cert for the gateway's DTLS frontend
     let temp_dir = TempDir::new().unwrap();
@@ -1505,7 +1512,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1544,11 +1551,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_frontend_dtls_refuses_dtls_1_2_when_policy_minimum_is_1_3() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1586,7 +1594,7 @@ plugin_configs: []
     )
     .expect("Failed to start gateway");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1695,7 +1703,7 @@ async fn connect_dtls_client_with_retry(
 /// Start a DTLS echo server using a self-signed ECDSA certificate.
 ///
 /// Accepts DTLS connections and echoes back received datagrams.
-async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
+async fn start_dtls_echo_server(socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     // Ensure rustls crypto provider is installed (needed for cert generation)
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
@@ -1704,7 +1712,6 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
         let cert = dimpl::certificate::generate_self_signed_certificate()
             .expect("Failed to generate self-signed cert");
 
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
             dimpl_config: std::sync::Arc::new(dimpl::Config::default()),
             certificate: cert.into(),
@@ -1712,9 +1719,7 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
             client_trust: None,
         };
 
-        let server = bind_dtls(addr, frontend_config)
-            .await
-            .expect("Failed to start DTLS server");
+        let server = ferrum_edge::dtls::DtlsServer::from_socket(socket, frontend_config);
         let server = std::sync::Arc::new(server);
 
         // Spawn the recv loop
@@ -1746,11 +1751,12 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_fault_injection_abort_drops_datagram() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1787,7 +1793,7 @@ plugin_configs:
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1818,11 +1824,12 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_fault_injection_delay_isolates_peers() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -1859,7 +1866,7 @@ plugin_configs:
     let mut gateway =
         start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -1951,14 +1958,10 @@ fn generate_test_dtls_cert(temp_dir: &TempDir) -> (String, String) {
 /// Start a UDP echo server that prefixes every reply with `tag`, so a client can
 /// tell which backend served its session.
 async fn start_tagged_udp_echo_server(
-    port: u16,
+    socket: UdpSocket,
     tag: &'static [u8],
 ) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(async move {
-        let socket = UdpSocket::bind_test(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind tagged UDP echo server on port {}", port));
-
         let mut buf = vec![0u8; 65535];
         let mut reply = Vec::with_capacity(65535);
         while let Ok((len, src)) = socket.recv_from(&mut buf).await {
@@ -1987,15 +1990,18 @@ async fn start_tagged_udp_echo_server(
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_least_connections_distributes_across_targets() {
-    let backend_a_port = unbound_udp_port().await.expect("lease test port");
-    let backend_b_port = unbound_udp_port().await.expect("lease test port");
-    let backend_c_port = unbound_udp_port().await.expect("lease test port");
+    let backend_a_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_a_port = backend_a_reservation.port;
+    let backend_b_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_b_port = backend_b_reservation.port;
+    let backend_c_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_c_port = backend_c_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let backend_a = start_tagged_udp_echo_server(backend_a_port, b"A:").await;
-    let backend_b = start_tagged_udp_echo_server(backend_b_port, b"B:").await;
-    let backend_c = start_tagged_udp_echo_server(backend_c_port, b"C:").await;
+    let backend_a = start_tagged_udp_echo_server(backend_a_reservation.into_socket(), b"A:").await;
+    let backend_b = start_tagged_udp_echo_server(backend_b_reservation.into_socket(), b"B:").await;
+    let backend_c = start_tagged_udp_echo_server(backend_c_reservation.into_socket(), b"C:").await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -2039,7 +2045,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )
@@ -2104,11 +2110,12 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_per_source_ip_session_limit() {
-    let backend_port = unbound_udp_port().await.expect("lease test port");
+    let backend_reservation = reserve_udp_port().await.expect("reserve backend socket");
+    let backend_port = backend_reservation.port;
     let proxy_port = unbound_udp_port().await.expect("lease test port");
     let gateway_http_port = unbound_tcp_port().expect("lease test port");
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let echo_server = start_udp_echo_server(backend_reservation.into_socket()).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -2141,7 +2148,7 @@ plugin_configs: []
     )
     .expect("Failed to start");
     wait_for_spawned_gateway(
-        gateway.child_mut(),
+        &mut gateway,
         gateway_http_port,
         Some(StreamListener::Udp(proxy_port)),
     )

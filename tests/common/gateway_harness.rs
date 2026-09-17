@@ -1,8 +1,8 @@
 //! Shared functional-test harness for spawning the `ferrum-edge` binary.
 //!
 //! The old per-test `TestHarness` / `AdminTestHarness` / `LoadTestHarness`
-//! structs all implemented the same skeleton: 3-attempt retry → ephemeral
-//! ports → spawn binary with `Stdio::null()` → `wait_for_health` → `Drop`
+//! structs all implemented the same skeleton: 3-attempt retry → allocated
+//! ports → spawn binary → `wait_for_health` → `Drop`
 //! cleanup. See CLAUDE.md "Functional test port allocation — MUST use retry
 //! pattern" for the required behaviour.
 //!
@@ -24,11 +24,10 @@
 //!   When other listener ports are pinned (e.g. `FERRUM_PROXY_HTTPS_PORT` for
 //!   H3), the harness excludes them from its automatic admin/proxy allocations
 //!   within each attempt so plaintext and TLS listeners cannot collide.
-//! - **`Stdio::null()`** on stdin/stdout/stderr unless
-//!   [`TestGatewayBuilder::capture_output`] is enabled. Piped stdout without
-//!   reading causes pipe-buffer deadlock; see CLAUDE.md "Functional test
-//!   subprocess rule". Failed attempts that capture output append a
-//!   secret-scrubbed, size-bounded snapshot to the error.
+//! - **File-backed stdout/stderr** on every attempt, with null stdin. Failed
+//!   attempts include redacted output tails and listener ports. Successful
+//!   log assertions still opt in through [`TestGatewayBuilder::capture_output`].
+//!   No unread pipe can block a child that logs more than a pipe buffer.
 //! - **Backend/echo listeners held** — this struct only owns the gateway's
 //!   own listen ports. Echo servers in `echo_servers.rs` keep their listener.
 //! - **`Drop` cleans up the child** so a panic in a test cannot leave a zombie
@@ -38,7 +37,9 @@
 //! # Process identity (issue #3428)
 //!
 //! [`ephemeral_port`] leases a port across test processes and releases the socket
-//! for the child's own bind. Unrelated OS processes can still claim the port.
+//! for the child's own bind. Despite the historical helper name, handoff ports
+//! exclude the host's ephemeral source range (issue #5579). Unrelated OS
+//! processes explicitly binding a listener can still claim the port.
 //! Readiness alone cannot tell the two apart: a bare TCP accept
 //! proves only that *some* listener answers, and an unauthenticated `/health`
 //! is served identically by every gateway on the box.
@@ -189,6 +190,7 @@ pub struct TestGateway {
     pub config_path: Option<PathBuf>,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
+    startup_output: GatewayStartupOutput,
     /// Environment the child was actually launched with (post-override).
     /// Lets tests read back per-attempt values such as the ports allocated by
     /// [`TestGatewayBuilder::env_ephemeral_port`].
@@ -392,15 +394,7 @@ impl TestGateway {
     /// diagnostics. Never includes the raw JWT secret, observability token, or
     /// basic-auth HMAC material held by this gateway.
     pub fn diagnostic_captured_output(&self) -> String {
-        let raw = self.read_combined_captured_output().unwrap_or_default();
-        scrub_gateway_capture_for_diagnostics(
-            &raw,
-            &[
-                self.jwt_secret.as_str(),
-                self.observability_token.as_str(),
-                self.basic_auth_hmac_secret.as_str(),
-            ],
-        )
+        self.startup_output.diagnostics()
     }
 
     /// Poll [`read_combined_captured_output`](Self::read_combined_captured_output)
@@ -460,12 +454,33 @@ impl Drop for TestGateway {
 /// still gets its SIGTERM grace period rather than an immediate `kill`.
 pub struct GatewayChildGuard {
     child: Option<Child>,
+    startup_output: Option<GatewayStartupOutput>,
 }
 
 impl GatewayChildGuard {
     /// Take ownership of a freshly spawned gateway.
     pub fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            startup_output: None,
+        }
+    }
+
+    /// Spawn with file-backed diagnostics. No unread pipe can block startup;
+    /// the guard retains both files until the child has been shut down.
+    pub fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let startup_output = GatewayStartupOutput::capture(command)?;
+        Ok(Self {
+            child: Some(command.spawn()?),
+            startup_output: Some(startup_output),
+        })
+    }
+
+    pub fn startup_diagnostics(&self) -> String {
+        match &self.startup_output {
+            Some(output) => output.diagnostics(),
+            None => "gateway output capture was not configured".to_string(),
+        }
     }
 
     /// Borrow the child for readiness probes (`try_wait`) and log reads.
@@ -501,6 +516,79 @@ impl GatewayChildGuard {
 impl Drop for GatewayChildGuard {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Files, listener env and redaction material for a single child. Only listener
+/// addresses are printed; the command's arguments/config/environment are not.
+struct GatewayStartupOutput {
+    directory: TempDir,
+    ports: Vec<(String, String)>,
+    secrets: Vec<String>,
+}
+
+impl GatewayStartupOutput {
+    fn capture(command: &mut Command) -> std::io::Result<Self> {
+        let directory = TempDir::new()?;
+        command
+            .stdout(Stdio::from(File::create(directory.path().join("stdout"))?))
+            .stderr(Stdio::from(File::create(directory.path().join("stderr"))?));
+        let mut ports = Vec::new();
+        let mut secrets = Vec::new();
+        // Redact inherited secrets conservatively, even for env_clear commands.
+        // Only report explicit listener overrides: Command cannot reveal
+        // whether env_clear was called, so inherited ports may not be in use.
+        let explicit: HashSet<_> = command.get_envs().map(|(key, _)| key.to_owned()).collect();
+        let mut env: HashMap<_, _> = std::env::vars_os().collect();
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                env.insert(key.to_owned(), value.to_owned());
+            } else {
+                env.remove(key);
+            }
+        }
+        for (key, value) in env {
+            let report_port = explicit.contains(&key);
+            let key = key.to_string_lossy();
+            let value = value.to_string_lossy();
+            if LISTENER_PORT_ENV_KEYS.contains(&key.as_ref()) {
+                if report_port
+                    && let Ok(port) = value.parse::<u16>()
+                {
+                    ports.push((key.into_owned(), port.to_string()));
+                }
+            } else if key == "FERRUM_CP_GRPC_LISTEN_ADDR" {
+                if report_port
+                    && let Some(port) = parse_listen_addr_port(&value)
+                {
+                    ports.push((key.into_owned(), port.to_string()));
+                }
+            } else if key.contains("SECRET") || key.contains("TOKEN") || key.contains("PASSWORD") {
+                secrets.push(value.into_owned());
+            }
+        }
+        ports.sort();
+        Ok(Self {
+            directory,
+            ports,
+            secrets,
+        })
+    }
+
+    fn diagnostics(&self) -> String {
+        let secrets: Vec<_> = self.secrets.iter().map(String::as_str).collect();
+        let mut message = format!("configured listener ports: {:?}", self.ports);
+        for stream in ["stderr", "stdout"] {
+            let output = match std::fs::read(self.directory.path().join(stream)) {
+                Ok(bytes) => scrub_gateway_capture_for_diagnostics(
+                    &String::from_utf8_lossy(&bytes),
+                    &secrets,
+                ),
+                Err(error) => format!("failed to read {stream}: {error}"),
+            };
+            message.push_str(&format!("\n--- gateway {stream} tail ---\n{output}"));
+        }
+        message
     }
 }
 
@@ -590,7 +678,7 @@ pub struct TestGatewayBuilder {
     /// `true` after [`Self::log_level`] — the test requested a specific
     /// filter, so [`HARNESS_GATEWAY_RUST_LOG_OPT_IN`] must not override it.
     log_level_explicit: bool,
-    /// Env var names that receive a FRESH ephemeral port on every spawn
+    /// Env var names that receive a fresh non-ephemeral port on every spawn
     /// attempt (see [`Self::env_ephemeral_port`]).
     ephemeral_port_env: Vec<String>,
     /// Listener ports carried outside `extra_env` (for example, raw stream
@@ -664,7 +752,7 @@ impl TestGatewayBuilder {
     }
 
     /// Control-plane mode with the given DB backend. If `grpc_listen_addr`
-    /// is `None`, the harness picks an ephemeral port.
+    /// is `None`, the harness picks a non-ephemeral port.
     pub fn mode_cp(mut self, db: DbType, grpc_listen_addr: Option<String>) -> Self {
         self.mode = GatewayMode::ControlPlane {
             db,
@@ -762,7 +850,7 @@ impl TestGatewayBuilder {
         self
     }
 
-    /// Set `key` to a FRESH ephemeral port on every spawn attempt.
+    /// Set `key` to a fresh non-ephemeral port on every spawn attempt.
     ///
     /// A caller-side bind-drop reservation passed through [`.env`](Self::env)
     /// keeps its fixed value across the harness's retry loop, so a single
@@ -956,7 +1044,7 @@ impl TestGatewayBuilder {
             env.insert(k.clone(), v.clone());
         }
 
-        // Per-attempt ephemeral env ports (see `env_ephemeral_port`): applied
+        // Per-attempt listener env ports (see `env_ephemeral_port`): applied
         // after caller overrides so every retry gets a genuinely fresh value,
         // allocated against the same exclusion set as this attempt's
         // admin/proxy ports so listeners cannot collide within the attempt.
@@ -971,23 +1059,14 @@ impl TestGatewayBuilder {
         let mut cmd = Command::new(&binary);
         cmd.arg("run");
         apply_builder_env_to_command(&mut cmd, self, &env);
+        let startup_output = GatewayStartupOutput::capture(&mut cmd)?;
         let stdout_path = self
             .capture_output
-            .then(|| temp_dir.path().join("gateway.stdout.log"));
+            .then(|| startup_output.directory.path().join("stdout"));
         let stderr_path = self
             .capture_output
-            .then(|| temp_dir.path().join("gateway.stderr.log"));
+            .then(|| startup_output.directory.path().join("stderr"));
         cmd.stdin(Stdio::null());
-        if let Some(path) = &stdout_path {
-            cmd.stdout(Stdio::from(File::create(path)?));
-        } else {
-            cmd.stdout(Stdio::null());
-        }
-        if let Some(path) = &stderr_path {
-            cmd.stderr(Stdio::from(File::create(path)?));
-        } else {
-            cmd.stderr(Stdio::null());
-        }
 
         // Hand the reserved ports over: release them at the last possible
         // moment so the window in which the child has not yet bound them is
@@ -1035,6 +1114,7 @@ impl TestGatewayBuilder {
             config_path,
             stdout_path,
             stderr_path,
+            startup_output,
             launch_env: env,
         };
 
@@ -1073,14 +1153,14 @@ impl TestGatewayBuilder {
         match identity_result {
             Ok(()) => Ok(gw),
             Err(e) => {
-                let combined_logs = gw.diagnostic_captured_output();
                 // Clean up the failed child so the retry loop starts fresh.
                 gw.shutdown();
-                if combined_logs.is_empty() {
-                    Err(e)
-                } else {
-                    Err(format!("{e}\n--- captured gateway output ---\n{combined_logs}").into())
-                }
+                let combined_logs = gw.diagnostic_captured_output();
+                Err(format!(
+                    "{e}\nreserved stream ports: {:?}\n{combined_logs}",
+                    self.reserved_listener_ports
+                )
+                .into())
             }
         }
     }
@@ -1783,11 +1863,10 @@ fn parse_listen_addr_port(addr: &str) -> Option<u16> {
 /// The `max_attempts` loop still covers residual collisions with OS users that
 /// do not participate in the registry.
 pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
-    let listener = TcpListener::bind_test("127.0.0.1:0").await?;
-    Ok(listener.local_addr()?.port())
+    crate::scaffolding::ports::unbound_tcp_port()
 }
 
-/// An ephemeral port kept bound until the caller hands it over.
+/// A non-ephemeral port kept bound until the caller hands it over.
 ///
 /// The registry lease survives socket release; holding the socket additionally
 /// excludes unrelated OS users until the child's spawn call.
@@ -1804,15 +1883,17 @@ pub async fn hold_ephemeral_port_excluding(
 ) -> Result<HeldEphemeralPort, std::io::Error> {
     const MAX_ATTEMPTS: u32 = 50;
     for _ in 0..MAX_ATTEMPTS {
-        let listener = TcpListener::bind_test("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
+        let reservation = crate::scaffolding::ports::reserve_port().await?;
+        let port = reservation.port;
         if excluded.contains(&port) {
+            // Keep excluded candidates leased so the next attempt advances.
+            reservation.drop_and_take_port();
             continue;
         }
         excluded.insert(port);
         return Ok(HeldEphemeralPort {
             port,
-            _listener: listener,
+            _listener: reservation.into_listener(),
         });
     }
     Err(std::io::Error::new(

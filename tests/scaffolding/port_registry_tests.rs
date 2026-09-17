@@ -157,6 +157,83 @@ async fn socket_handoff_and_wildcard_listener_share_the_registry() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn every_subprocess_handoff_avoids_the_linux_source_port_range() {
+    use super::ports;
+    use crate::common::gateway_harness;
+    use std::collections::HashSet;
+
+    // Read the kernel independently of the allocator so returning bind(:0)
+    // ports, or hard-coding the default on a tuned runner, breaks this test.
+    let raw = match std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "32768 60999".to_string(),
+        Err(error) => panic!("read ephemeral range: {error}"),
+    };
+    let bounds: Vec<u16> = raw.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    assert_eq!(bounds.len(), 2);
+    let ephemeral = bounds[0]..=bounds[1];
+    let (tcp, udp) = ports::reserve_colocated_tcp_udp().await.unwrap();
+    let colocated = tcp.drop_and_take_port();
+    assert_eq!(udp.drop_and_take_port(), colocated);
+    let (first, second) = ports::reserve_port_pair().await.unwrap();
+    let mut excluded = HashSet::new();
+    let held = gateway_harness::hold_ephemeral_port_excluding(&mut excluded)
+        .await
+        .unwrap();
+    let cases = [
+        ("sync TCP", ports::unbound_tcp_port().unwrap()),
+        ("async TCP", ports::unbound_port().await.unwrap()),
+        ("async UDP", ports::unbound_udp_port().await.unwrap()),
+        (
+            "bounded TCP reservation",
+            ports::reserve_port_in_range(10_240..u16::MAX)
+                .unwrap()
+                .drop_and_take_port(),
+        ),
+        (
+            "mesh namespace handoff",
+            super::port_registry::unbound_port_outside(ephemeral.clone()).unwrap(),
+        ),
+        (
+            "TCP reservation",
+            ports::reserve_port().await.unwrap().drop_and_take_port(),
+        ),
+        (
+            "UDP reservation",
+            ports::reserve_udp_port().await.unwrap().drop_and_take_port(),
+        ),
+        ("colocated TCP/UDP", colocated),
+        ("pair first", first.drop_and_take_port()),
+        ("pair second", second.drop_and_take_port()),
+        (
+            "future listener",
+            ports::reserve_future_tcp_port().unwrap().drop_and_take_port(),
+        ),
+        (
+            "generic spawner",
+            gateway_harness::ephemeral_port().await.unwrap(),
+        ),
+        ("held generic spawner", held.port),
+        (
+            "excluding generic spawner",
+            gateway_harness::ephemeral_port_excluding(&mut excluded)
+                .await
+                .unwrap(),
+        ),
+    ];
+    let mut distinct = BTreeSet::new();
+    for (name, port) in cases {
+        assert!(port >= 10_240, "{name}: avoid well-known/service ports");
+        assert!(!ephemeral.contains(&port), "{name}: {port} is in {ephemeral:?}");
+        assert!(distinct.insert(port), "{name}: handoff lease was lost");
+    }
+    if bounds[0] < bounds[1] {
+        assert!(ports::reserve_port_in_range(bounds[0]..bounds[1]).is_err());
+    }
+}
+
 #[test]
 fn functional_and_integration_sockets_use_the_registry() {
     fn inspect(directory: &Path) {

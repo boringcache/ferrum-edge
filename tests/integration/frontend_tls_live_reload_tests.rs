@@ -804,34 +804,22 @@ async fn start_admin_https_listener(
     tokio::sync::watch::Sender<bool>,
     JoinHandle<Result<(), anyhow::Error>>,
 ) {
-    let mut errors = Vec::new();
-    for attempt in 1..=5 {
-        let reservation = reserve_port().await.expect("reserve admin port");
-        let port = reservation.drop_and_take_port();
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let listener = match tokio::net::TcpListener::bind_test(addr).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                errors.push(format!("attempt {attempt}: bind failed: {error}"));
-                continue;
-            }
-        };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = trust_test_admin_state(header_read_timeout_seconds);
-        let listener_slot = slot.clone();
-        let task = tokio::spawn(async move {
-            ferrum_edge::admin::serve_admin_on_listener_with_dynamic_tls(
-                listener,
-                state,
-                shutdown_rx,
-                listener_slot,
-                ferrum_edge::admin::AdminConnLimiter::unlimited(),
-            )
-            .await
-        });
-        return (addr, shutdown_tx, task);
-    }
-    panic!("admin HTTPS listener did not bind: {}", errors.join(" | "));
+    let reservation = reserve_port().await.expect("reserve admin port");
+    let addr = reservation.local_addr().expect("admin address");
+    let listener = reservation.into_listener();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = trust_test_admin_state(header_read_timeout_seconds);
+    let task = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener_with_dynamic_tls(
+            listener,
+            state,
+            shutdown_rx,
+            slot,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+    (addr, shutdown_tx, task)
 }
 
 /// One established admin HTTPS connection that can issue further requests
