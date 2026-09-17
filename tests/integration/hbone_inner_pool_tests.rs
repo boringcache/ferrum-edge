@@ -41,8 +41,8 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::grpc_proxy::GrpcBody;
 use ferrum_edge::proxy::hbone_inner_pool::{
     HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody,
-    HboneInnerH2StreamLease, HboneInnerKeyParts, HboneInnerProtocol, HboneSourceCredential,
-    MAX_IDLE_H1_PER_KEY,
+    HboneInnerH2Publication, HboneInnerH2StreamLease, HboneInnerKeyParts, HboneInnerProtocol,
+    HboneSourceCredential, MAX_IDLE_H1_PER_KEY,
 };
 use ferrum_edge::proxy::hbone_pool::HboneConnectionPool;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
@@ -1265,7 +1265,7 @@ async fn the_per_key_idle_bound_is_enforced() {
 
 /// Open a CONNECT and run a nested HTTP/2 client over it, the way
 /// `open_hbone_grpc_sender` does.
-async fn open_fresh_h2(fx: &Fixture) -> (H2SendRequest<GrpcBody>, bool) {
+async fn open_fresh_h2(fx: &Fixture) -> NestedH2 {
     let proxy = source_proxy();
     let tunnel = tokio::time::timeout(
         DEADLINE,
@@ -1290,28 +1290,62 @@ async fn open_fresh_h2(fx: &Fixture) -> (H2SendRequest<GrpcBody>, bool) {
         .handshake::<_, GrpcBody>(TokioIo::new(tunnel))
         .await
         .expect("nested HTTP/2 handshake");
+    // The nested peer's stream cap lives on hyper's `Connection`, not on the
+    // `SendRequest` the pool holds, and the connection is about to be spawned.
+    // Production reads it once, after `await_peer_settings` and before the
+    // spawn; the fixture instead has the driver publish it after every poll, so
+    // a test can read the value the peer really advertised without having to
+    // time its own read against the SETTINGS frame.
+    let peer_max_streams = Arc::new(AtomicUsize::new(usize::MAX));
+    let published_cap = Arc::clone(&peer_max_streams);
     tokio::spawn(async move {
-        let _ = connection.await;
+        let mut connection = Box::pin(connection);
+        let _ = std::future::poll_fn(|cx| {
+            let polled = std::future::Future::poll(connection.as_mut(), cx);
+            published_cap.store(connection.current_max_send_streams(), Ordering::SeqCst);
+            polled
+        })
+        .await;
     });
-    (sender, advertised)
+    NestedH2 {
+        sender,
+        advertised,
+        peer_max_streams,
+    }
+}
+
+/// One nested HTTP/2 carrier the fixture opened, with the peer's advertised
+/// stream cap kept current by its driver task.
+struct NestedH2 {
+    sender: H2SendRequest<GrpcBody>,
+    advertised: bool,
+    peer_max_streams: Arc<AtomicUsize>,
+}
+
+impl NestedH2 {
+    fn peer_max_streams(&self) -> usize {
+        self.peer_max_streams.load(Ordering::SeqCst)
+    }
 }
 
 /// Publish a freshly established nested carrier exactly as
-/// `open_hbone_grpc_sender` does: source material unchanged, and the
-/// retirement generation read before the dial.
+/// `open_hbone_grpc_sender` does: source material unchanged, the peer's cap as
+/// observed, and the retirement generation read before the dial.
 fn publish_fresh_h2(
     fx: &Fixture,
     parts: &HboneInnerKeyParts<'_>,
-    sender: &H2SendRequest<GrpcBody>,
-    advertised: bool,
+    nested: &NestedH2,
 ) -> HboneInnerH2StreamLease {
     fx.pool.inner_pool().publish_h2(
         parts,
-        sender,
-        advertised,
-        true,
-        fx.identity.credential.leaf_deadline,
-        fx.pool.inner_pool().drain_generation(),
+        &nested.sender,
+        HboneInnerH2Publication {
+            peer_advertises_fence: nested.advertised,
+            source_material_unchanged: true,
+            peer_max_streams: nested.peer_max_streams(),
+            credential_deadline: fx.identity.credential.leaf_deadline,
+            generation: fx.pool.inner_pool().drain_generation(),
+        },
     )
 }
 
@@ -1348,11 +1382,11 @@ async fn a_nested_h2_sender_is_shared_across_rpcs_on_one_connect() {
         fx.pool.inner_pool().checkout_h2(&parts).is_none(),
         "the first RPC cannot be a pool hit"
     );
-    let (mut sender, advertised) = open_fresh_h2(&fx).await;
-    assert!(advertised, "the fixture peer advertises the fence");
-    let first_lease = publish_fresh_h2(&fx, &parts, &sender, advertised);
+    let mut nested = open_fresh_h2(&fx).await;
+    assert!(nested.advertised, "the fixture peer advertises the fence");
+    let first_lease = publish_fresh_h2(&fx, &parts, &nested);
     assert_eq!(
-        send_rpc(&mut sender).await.expect("first rpc"),
+        send_rpc(&mut nested.sender).await.expect("first rpc"),
         StatusCode::OK
     );
     drop(first_lease);
@@ -1383,14 +1417,14 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     let fx = fixture(AppBehaviour::H2c { goaway_after: 1 }, true).await;
     let parts = fx.identity.parts(HboneInnerProtocol::H2);
 
-    let (mut sender, advertised) = open_fresh_h2(&fx).await;
-    let first_lease = publish_fresh_h2(&fx, &parts, &sender, advertised);
+    let mut nested = open_fresh_h2(&fx).await;
+    let first_lease = publish_fresh_h2(&fx, &parts, &nested);
     assert_eq!(
-        send_rpc(&mut sender).await.expect("first rpc"),
+        send_rpc(&mut nested.sender).await.expect("first rpc"),
         StatusCode::OK
     );
     drop(first_lease);
-    drop(sender);
+    drop(nested);
 
     // The application answered one RPC and then went away. Once the connection
     // has drained, the carrier reports closed and the pool must retire it
@@ -1416,9 +1450,9 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     assert!(fx.pool.inner_pool().stats().evictions >= 1);
 
     // The next RPC opens a fresh CONNECT and a fresh nested connection.
-    let (mut fresh, _) = open_fresh_h2(&fx).await;
+    let mut fresh = open_fresh_h2(&fx).await;
     assert_eq!(
-        send_rpc(&mut fresh).await.expect("rpc after goaway"),
+        send_rpc(&mut fresh.sender).await.expect("rpc after goaway"),
         StatusCode::OK
     );
     assert_eq!(fx.peer.connects(), 2);
@@ -1430,13 +1464,16 @@ async fn a_nested_h2_sender_is_never_published_for_a_peer_without_the_capability
     let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, false).await;
     let parts = fx.identity.parts(HboneInnerProtocol::H2);
 
-    let (mut sender, advertised) = open_fresh_h2(&fx).await;
+    let mut nested = open_fresh_h2(&fx).await;
     assert!(
-        !advertised,
+        !nested.advertised,
         "this peer does not advertise the admission fence"
     );
-    let lease = publish_fresh_h2(&fx, &parts, &sender, advertised);
-    assert_eq!(send_rpc(&mut sender).await.expect("rpc"), StatusCode::OK);
+    let lease = publish_fresh_h2(&fx, &parts, &nested);
+    assert_eq!(
+        send_rpc(&mut nested.sender).await.expect("rpc"),
+        StatusCode::OK
+    );
     drop(lease);
 
     assert_eq!(
@@ -2300,18 +2337,21 @@ async fn a_drain_between_the_outer_dial_and_publication_never_pools_the_nested_s
     let parts = fx.identity.parts(HboneInnerProtocol::H2);
 
     let generation = fx.pool.inner_pool().drain_generation();
-    let (mut sender, advertised) = open_fresh_h2(&fx).await;
-    assert!(advertised);
+    let mut nested = open_fresh_h2(&fx).await;
+    assert!(nested.advertised);
 
     fx.pool.force_drain_all();
 
     let lease = fx.pool.inner_pool().publish_h2(
         &parts,
-        &sender,
-        advertised,
-        true,
-        fx.identity.credential.leaf_deadline,
-        generation,
+        &nested.sender,
+        HboneInnerH2Publication {
+            peer_advertises_fence: nested.advertised,
+            source_material_unchanged: true,
+            peer_max_streams: nested.peer_max_streams(),
+            credential_deadline: fx.identity.credential.leaf_deadline,
+            generation,
+        },
     );
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
@@ -2323,7 +2363,10 @@ async fn a_drain_between_the_outer_dial_and_publication_never_pools_the_nested_s
 
     // The RPC the caller already owns is still served on it, which is the whole
     // point of the publication being a hint rather than a gate.
-    assert_eq!(send_rpc(&mut sender).await.expect("rpc"), StatusCode::OK);
+    assert_eq!(
+        send_rpc(&mut nested.sender).await.expect("rpc"),
+        StatusCode::OK
+    );
     drop(lease);
 }
 
@@ -2335,15 +2378,20 @@ async fn source_material_that_moved_during_the_dial_refuses_the_nested_publicati
     // transport.
     let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
     let parts = fx.identity.parts(HboneInnerProtocol::H2);
-    let (mut sender, advertised) = open_fresh_h2(&fx).await;
+    let mut nested = open_fresh_h2(&fx).await;
 
     let lease = fx.pool.inner_pool().publish_h2(
         &parts,
-        &sender,
-        advertised,
-        false,
-        fx.identity.credential.leaf_deadline,
-        fx.pool.inner_pool().drain_generation(),
+        &nested.sender,
+        HboneInnerH2Publication {
+            peer_advertises_fence: nested.advertised,
+            // The gateway's SVID, CRL slot, or leaf fingerprint moved while
+            // this dial was in flight.
+            source_material_unchanged: false,
+            peer_max_streams: nested.peer_max_streams(),
+            credential_deadline: fx.identity.credential.leaf_deadline,
+            generation: fx.pool.inner_pool().drain_generation(),
+        },
     );
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
@@ -2351,7 +2399,10 @@ async fn source_material_that_moved_during_the_dial_refuses_the_nested_publicati
         "a sender whose source material rotated mid-dial is never pooled"
     );
     assert!(fx.pool.inner_pool().stats().discards >= 1);
-    assert_eq!(send_rpc(&mut sender).await.expect("rpc"), StatusCode::OK);
+    assert_eq!(
+        send_rpc(&mut nested.sender).await.expect("rpc"),
+        StatusCode::OK
+    );
     drop(lease);
 }
 
@@ -2411,15 +2462,20 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
     };
     let parts = identity.parts(HboneInnerProtocol::H2);
 
-    let (mut first, advertised) = open_fresh_h2(&fx).await;
+    let mut first = open_fresh_h2(&fx).await;
     // One RPC first, so the nested peer's SETTINGS have certainly arrived
-    // before the carrier is published and its cap is sampled — production gets
+    // before the carrier is published and its cap is read — production gets
     // that from `h2c_preface::await_peer_settings`.
     assert_eq!(
-        send_rpc(&mut first).await.expect("first rpc"),
+        send_rpc(&mut first.sender).await.expect("first rpc"),
         StatusCode::OK
     );
-    let publish_lease = publish_fresh_h2(&fx, &parts, &first, advertised);
+    assert_eq!(
+        first.peer_max_streams(),
+        1,
+        "the application advertised SETTINGS_MAX_CONCURRENT_STREAMS: 1"
+    );
+    let publish_lease = publish_fresh_h2(&fx, &parts, &first);
     drop(publish_lease);
     assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
 
@@ -2438,12 +2494,12 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
     );
 
     // The caller does exactly that, and the key now holds two carriers.
-    let (mut second, advertised) = open_fresh_h2(&fx).await;
+    let mut second = open_fresh_h2(&fx).await;
     assert_eq!(
-        send_rpc(&mut second).await.expect("second rpc"),
+        send_rpc(&mut second.sender).await.expect("second rpc"),
         StatusCode::OK
     );
-    let second_lease = publish_fresh_h2(&fx, &parts, &second, advertised);
+    let second_lease = publish_fresh_h2(&fx, &parts, &second);
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
         2,
@@ -2485,13 +2541,13 @@ async fn a_nested_publication_that_loses_the_width_race_is_accounted_as_a_discar
     };
     let parts = identity.parts(HboneInnerProtocol::H2);
 
-    let (first, advertised) = open_fresh_h2(&fx).await;
-    drop(publish_fresh_h2(&fx, &parts, &first, advertised));
+    let first = open_fresh_h2(&fx).await;
+    drop(publish_fresh_h2(&fx, &parts, &first));
     let discards_after_first = fx.pool.inner_pool().stats().discards;
     assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
 
-    let (second, advertised) = open_fresh_h2(&fx).await;
-    drop(publish_fresh_h2(&fx, &parts, &second, advertised));
+    let second = open_fresh_h2(&fx).await;
+    drop(publish_fresh_h2(&fx, &parts, &second));
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
         1,

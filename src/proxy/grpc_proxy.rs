@@ -3925,6 +3925,13 @@ async fn open_hbone_grpc_sender(
         ));
     }
 
+    // The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, read HERE: hyper
+    // exposes it on the `Connection`, never on the `SendRequest` the pool
+    // holds, so this is the last moment it can be observed — the SETTINGS have
+    // just been awaited above and the connection is about to be spawned. It is
+    // what lets the inner pool widen a key instead of queueing every RPC to one
+    // destination behind one carrier (issue #5042 step 2 review).
+    let inner_peer_max_streams = connection.current_max_send_streams();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);
@@ -3943,10 +3950,13 @@ async fn open_hbone_grpc_sender(
         hbone.pool.inner_pool().publish_h2(
             parts,
             &sender,
-            peer_advertises_fence,
-            source_material_unchanged,
-            inner_credential_deadline,
-            inner_drain_generation,
+            crate::proxy::hbone_inner_pool::HboneInnerH2Publication {
+                peer_advertises_fence,
+                source_material_unchanged,
+                peer_max_streams: inner_peer_max_streams,
+                credential_deadline: inner_credential_deadline,
+                generation: inner_drain_generation,
+            },
         )
     });
     // The socket underneath this sender is the OUTER HBONE session, shared by

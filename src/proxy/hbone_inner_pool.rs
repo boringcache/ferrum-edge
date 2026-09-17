@@ -721,16 +721,20 @@ impl HboneInnerH2Load {
         HboneInnerH2StreamLease(self.clone())
     }
 
-    /// Sample the nested peer's current stream cap.
+    /// Record the nested peer's advertised stream cap.
     ///
-    /// Called once the app's own SETTINGS have been observed
-    /// (`h2c_preface::await_peer_settings`) and again on each checkout, both
-    /// times OUTSIDE every pool lock: the lookup takes the h2 connection's own
-    /// lock, exactly as `HboneConnectionLoad::record_peer_max_streams` does.
-    fn record_peer_max_streams(&self, sender: &HboneInnerH2Sender) {
-        self.0
-            .peer_max_streams
-            .store(sender.current_max_send_streams(), Ordering::Relaxed);
+    /// The value is read by the CALLER, off
+    /// `hyper::client::conn::http2::Connection::current_max_send_streams` —
+    /// hyper exposes it on the connection, not on the `SendRequest` the pool
+    /// holds — once the app's own SETTINGS have been observed
+    /// (`h2c_preface::await_peer_settings`) and before the connection is
+    /// spawned. It is therefore sampled ONCE per carrier: a peer that later
+    /// lowers its cap is not re-observed, which can only make the pool widen
+    /// LATER than ideal and never make it exceed what `h2` will accept, since
+    /// `h2` queues a stream over the peer's real cap pending-open exactly as it
+    /// does today.
+    fn set_peer_max_streams(&self, max: usize) {
+        self.0.peer_max_streams.store(max, Ordering::Relaxed);
     }
 }
 
@@ -746,6 +750,29 @@ impl Drop for HboneInnerH2StreamLease {
     fn drop(&mut self) {
         self.0.0.active_rpcs.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Everything a freshly dialled nested carrier is published under.
+///
+/// A struct rather than five positional arguments because every field is a
+/// fact the CALLER establishes at a specific point in the dial, and getting two
+/// of them the wrong way round would silently disable a fence.
+pub struct HboneInnerH2Publication {
+    /// `H2ConnectTunnel::peer_advertises_inner_reuse` for the CONNECT this
+    /// carrier runs inside, read before the tunnel is consumed.
+    pub peer_advertises_fence: bool,
+    /// Whether the gateway's SVID slot, CRL slot and current leaf fingerprint
+    /// are still the ones this dial started under
+    /// (`HboneConnectionPool::source_dial_fence_intact`).
+    pub source_material_unchanged: bool,
+    /// The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, read off the
+    /// connection after its SETTINGS were observed and before it was spawned.
+    /// `usize::MAX` when the peer advertises none.
+    pub peer_max_streams: usize,
+    /// The earliest SOURCE credential deadline admitting this carrier.
+    pub credential_deadline: Option<tokio::time::Instant>,
+    /// `HboneInnerConnectionPool::drain_generation` read BEFORE the dial.
+    pub generation: u64,
 }
 
 /// One nested HTTP/2 carrier plus the dispatch hold that accounts for it.
@@ -1473,10 +1500,6 @@ impl HboneInnerConnectionPool {
             self.record_miss(HboneInnerProtocol::H2);
             return None;
         };
-        // Re-sample the peer's cap OUTSIDE the shard lock: the lookup takes the
-        // h2 connection's own lock, and `SETTINGS_MAX_CONCURRENT_STREAMS` may
-        // change at any point in the connection's life.
-        load.record_peer_max_streams(&sender);
         let lease = load.lease();
         self.record_hit(HboneInnerProtocol::H2);
         Some(HboneInnerH2Checkout { sender, lease })
@@ -1494,30 +1517,35 @@ impl HboneInnerConnectionPool {
     /// [`Self::shared_h2_width`] all leave the sender UNPOOLED — which is
     /// exactly the per-request behaviour this module replaces.
     ///
-    /// `source_material_unchanged` mirrors the refusal
-    /// `HboneConnectionPool::get_tunnel_via` applies to the OUTER transport: a
-    /// gateway SVID slot, CRL slot, or current leaf fingerprint that moved
-    /// while this dial was in flight means pooling under this key would
-    /// resurrect a connection AFTER its one-shot drain already ran. The nested
-    /// sender rides the very transport the outer pool declined to pool, so it
-    /// must decline for the same reason.
+    /// [`HboneInnerH2Publication::source_material_unchanged`] mirrors the
+    /// refusal `HboneConnectionPool::get_tunnel_via` applies to the OUTER
+    /// transport: a gateway SVID slot, CRL slot, or current leaf fingerprint
+    /// that moved while this dial was in flight means pooling under this key
+    /// would resurrect a connection AFTER its one-shot drain already ran. The
+    /// nested sender rides the very transport the outer pool declined to pool,
+    /// so it must decline for the same reason.
     ///
-    /// `generation` is [`Self::drain_generation`] read BEFORE the dial; see
-    /// [`Self::checkin_h1`] for why the fence is read again after the insert.
+    /// [`HboneInnerH2Publication::generation`] is [`Self::drain_generation`]
+    /// read BEFORE the dial; see [`Self::checkin_h1`] for why the fence is read
+    /// again after the insert.
     pub fn publish_h2(
         &self,
         parts: &HboneInnerKeyParts<'_>,
         sender: &HboneInnerH2Sender,
-        peer_advertises_fence: bool,
-        source_material_unchanged: bool,
-        credential_deadline: Option<tokio::time::Instant>,
-        generation: u64,
+        publication: HboneInnerH2Publication,
     ) -> HboneInnerH2StreamLease {
+        let HboneInnerH2Publication {
+            peer_advertises_fence,
+            source_material_unchanged,
+            peer_max_streams,
+            credential_deadline,
+            generation,
+        } = publication;
         let load = HboneInnerH2Load::default();
-        // Sampled here, where the nested peer's SETTINGS have already been
-        // observed (`h2c_preface::await_peer_settings` ran before this call),
-        // so the first checkout already knows the carrier's real width.
-        load.record_peer_max_streams(sender);
+        // Recorded here, from the cap the caller read off the connection after
+        // its SETTINGS were observed, so the first checkout already knows the
+        // carrier's real width.
+        load.set_peer_max_streams(peer_max_streams);
         let lease = load.lease();
         if !peer_advertises_fence
             || !source_material_unchanged
