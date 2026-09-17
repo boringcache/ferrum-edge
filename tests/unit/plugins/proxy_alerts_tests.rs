@@ -356,7 +356,7 @@ fn rejects_invalid_quiet_hours_time() {
     let mut cfg = minimal_config();
     cfg["quiet_hours_utc"] = json!([{ "from": "25:00", "to": "06:00" }]);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("hour 25"), "got: {err}");
+    assert!(err.contains("hour \"25\""), "got: {err}");
 }
 
 #[test]
@@ -632,7 +632,7 @@ fn rejects_typo_required_name_and_type_keys_with_suggestions() {
                 "threshold_percent": 5.0,
                 "channels": ["ops"]
             }),
-            "did you mean 'name' instead of 'namee'",
+            "did you mean `name` instead of \"namee\"",
         ),
         (
             json!({
@@ -642,7 +642,7 @@ fn rejects_typo_required_name_and_type_keys_with_suggestions() {
                 "threshold_percent": 5.0,
                 "channels": ["ops"]
             }),
-            "did you mean `type` instead of 'typee'",
+            "did you mean `type` instead of \"typee\"",
         ),
     ] {
         let err = ProxyAlerts::new(

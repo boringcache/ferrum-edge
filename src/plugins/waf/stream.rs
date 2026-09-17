@@ -195,7 +195,10 @@ fn compile_stream_signatures(
             // Compile each pattern individually first so the error names the
             // offending signature rather than a combined-set position.
             regex::bytes::Regex::new(&pattern).map_err(|_| {
-                format!("waf: stream.signatures[{idx}].pattern is invalid or too complex")
+                format!(
+                    "waf: `stream.signatures[{idx}].pattern` (signature {id:?}) is invalid \
+                     or too complex"
+                )
             })?;
             let severity = match optional_string(obj, "severity")? {
                 Some(s) => parse_severity(&s).ok_or_else(|| {

@@ -507,9 +507,9 @@ fn missing_required_key_error(
 ) -> String {
     match near_miss_for_missing_key(object, required) {
         Some(typo) => format!(
-            "{context}: '{required}' is required (did you mean '{required}' instead of '{typo}'?)"
+            "{context}: `{required}` is required (did you mean `{required}` instead of {typo:?}?)"
         ),
-        None => format!("{context}: '{required}' is required"),
+        None => format!("{context}: `{required}` is required"),
     }
 }
 
