@@ -11378,65 +11378,48 @@ async fn endpoint_scope_refuses_descendants_in_both_modes() {
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
-#[test]
-fn endpoint_matcher_accepts_only_a_single_trailing_slash() {
-    use ferrum_edge::plugins::utils::endpoint_path::matches_endpoint_path;
-
-    for endpoint in ["/mcp", "/mcp/", "/api/mcp", "/api/mcp/"] {
-        let base = endpoint.trim_end_matches('/');
-        assert!(matches_endpoint_path(base, endpoint));
-        assert!(matches_endpoint_path(&format!("{base}/"), endpoint));
-        for suffix in ["//", "/tools", "/tools/", "%2F", "/.", "/./", "/%2e"] {
-            assert!(!matches_endpoint_path(&format!("{base}{suffix}"), endpoint));
-        }
-        assert!(!matches_endpoint_path(&base.to_uppercase(), endpoint));
-    }
-    assert!(matches_endpoint_path("/", "/"));
-    assert!(!matches_endpoint_path("//", "/"));
-    assert!(!matches_endpoint_path("/", "//"));
-}
-
 #[tokio::test]
-async fn endpoint_alias_uses_transparent_routing_for_post_get_and_delete() {
-    for endpoint in ["/mcp", "/mcp/"] {
+async fn endpoint_spelling_must_match_the_authorized_path_exactly() {
+    for (endpoint, alias) in [("/mcp", "/mcp/"), ("/mcp/", "/mcp")] {
         let mut config = transparent_config("http://upstream.example:8080/canonical/mcp");
         config["endpoint"]["path"] = json!(endpoint);
         let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-        for path in ["/mcp", "/mcp/"] {
-            for method in ["POST", "GET", "DELETE"] {
-                let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
-                ctx.path = path.to_string();
-                ctx.method = method.to_string();
-                headers.insert("mcp-session-id".to_string(), "client-session".to_string());
-                assert_eq!(plugin.should_buffer_request_body(&ctx), method == "POST");
-                assert!(matches!(
-                    plugin.before_proxy(&mut ctx, &mut headers).await,
-                    PluginResult::Continue
-                ));
-                assert_eq!(ctx.path, endpoint);
-                assert_eq!(ctx.route_override_path.as_deref(), Some("/canonical/mcp"));
-                assert!(ctx.route_override_path_is_absolute);
-                assert_eq!(
-                    ctx.route_override_backend_host.as_deref(),
-                    Some("upstream.example")
-                );
-                assert_eq!(headers["mcp-session-id"], "client-session");
-                assert_eq!(ctx.metadata["mcp.route_decision"], "forward");
-            }
+
+        for method in ["POST", "GET", "DELETE"] {
+            let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
+            ctx.path = endpoint.to_string();
+            ctx.method = method.to_string();
+            assert_eq!(plugin.should_buffer_request_body(&ctx), method == "POST");
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            assert_eq!(ctx.path, endpoint);
+            assert_eq!(ctx.route_override_path.as_deref(), Some("/canonical/mcp"));
+
+            let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
+            ctx.path = alias.to_string();
+            ctx.method = method.to_string();
+            assert!(!plugin.should_buffer_request_body(&ctx));
+            let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+            assert_eq!(status, 404);
+            assert_eq!(body["error"]["message"], "Unknown MCP endpoint");
+            assert!(ctx.route_override_backend_host.is_none());
+            assert!(ctx.route_override_path.is_none());
         }
     }
 }
 
 #[tokio::test]
-async fn endpoint_alias_preserves_aggregate_session_and_tool_policy() {
+async fn exact_endpoint_preserves_aggregate_session_and_tool_policy() {
     let upstream = start_mcp_catalog_server().await;
     let config = aggregate_config(&format!("{}/mcp", upstream.uri()));
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    for initialize_path in ["/mcp", "/mcp/"] {
+    for initialize_path in ["/mcp"] {
         let mut owner = caller_as_consumer(initialize_request_body(), "consumer-a", "alice");
         owner.0.path = initialize_path.to_string();
         let session_id = initialize_as(&plugin, owner).await;
-        for path in ["/mcp", "/mcp/"] {
+        for path in ["/mcp"] {
             let mut other = caller_as_consumer(tools_list_body(2), "consumer-b", "mallory");
             other.0.path = path.to_string();
             assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
@@ -11447,7 +11430,7 @@ async fn endpoint_alias_preserves_aggregate_session_and_tool_policy() {
 
             for tool in ["github.merge_pr", "github.create_pr"] {
                 // Denied tool and allowed tool with invalid arguments must
-                // both stop before routing at either spelling.
+                // both stop before routing at the configured spelling.
                 let denied = json!({
                     "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                     "params": {"name": tool, "arguments": {}}
@@ -11513,11 +11496,11 @@ async fn endpoint_alias_preserves_aggregate_session_and_tool_policy() {
 }
 
 #[tokio::test]
-async fn endpoint_alias_attaches_sse_and_deletes_the_same_session() {
+async fn exact_endpoint_attaches_sse_and_deletes_the_same_session() {
     let plugin = mcp_plugin();
     let session_id = initialize(&plugin).await;
     let (mut ctx, mut headers) = sse_get(&session_id);
-    ctx.path = "/mcp/".to_string();
+    ctx.path = "/mcp".to_string();
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Reject {
@@ -11530,7 +11513,7 @@ async fn endpoint_alias_attaches_sse_and_deletes_the_same_session() {
     let mut stream = sse_body(&mut ctx);
 
     let (mut ctx, mut headers) = sse_get(&session_id);
-    ctx.path = "/mcp/".to_string();
+    ctx.path = "/mcp".to_string();
     ctx.method = "DELETE".to_string();
     let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
