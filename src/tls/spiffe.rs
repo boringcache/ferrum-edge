@@ -699,30 +699,19 @@ fn peer_verifier_cache(
                 error = %error,
                 "SPIFFE verifier cache: candidate trust update rejected; keeping last-known-good set"
             );
-            // Record the generation that was ATTEMPTED alongside the retained
-            // verifiers (issue #5574). Without this, an enforced CRL set that
-            // no verifier can be built from would miss the cache on every
-            // subsequent handshake and rebuild every trust domain's root store
-            // — and emit this warning — once per peer, because the generation
-            // never comes to match. Generations are monotonic, so recording a
-            // failed one cannot mask a later good publication: the next one is
-            // strictly higher and misses the cache again. The retained
-            // verifiers are the last set that DID build, which is the same
-            // last-known-good this arm already serves; the admission fence
-            // compiles the enforced CRLs independently and fails those tunnels
-            // closed, so tolerating the bad set here never leaves a revoked
-            // peer's tunnel running.
-            let retained = cached
-                .as_ref()
-                .as_ref()
-                .map(|cache| SpiffePeerVerifierCache {
-                    source: Arc::clone(&cache.source),
-                    crl_generation: crls.generation(),
-                    verifiers: cache.verifiers.clone(),
-                });
-            let retained = Arc::new(retained);
-            cache_slot.store(Arc::clone(&retained));
-            Ok(retained)
+            // The retained set is returned UNCHANGED, including its
+            // `crl_generation` (issue #5574). Recording the attempted
+            // generation on the last-known-good verifiers would be fail-open:
+            // a build can fail because the candidate SVID SOURCE is unusable
+            // while the enforced CRL generation moved with perfectly good
+            // records, and a cache stamped with that generation would keep
+            // serving handshakes under the OLD revocation list — matching on
+            // both halves — until the source itself changed. Retrying the
+            // build on every handshake while a candidate stays rejected is the
+            // same cost a rejected trust source already carried before CRLs
+            // were live, and it is what makes the next good publication take
+            // effect immediately.
+            Ok(cached)
         }
         Err(error) => Err(error),
     }

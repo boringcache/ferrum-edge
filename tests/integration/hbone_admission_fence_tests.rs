@@ -2012,6 +2012,9 @@ async fn a_crl_reload_sweeps_and_reverifies_with_no_trust_generation_change() {
         "publishing new records advances the enforced generation by exactly one"
     );
     wait_for_revocation(&tunnel).await;
+    // The revocation is published from inside the pass; the completed counter
+    // advances only when the pass returns. Let it settle before reading it.
+    wait_for_sweep_after(&state, sweeps_before).await;
 
     assert!(
         fence.sweeps_completed() > sweeps_before,
