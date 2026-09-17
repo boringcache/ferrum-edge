@@ -2506,10 +2506,8 @@ mod inner {
             let lock_id = lock_id.to_string();
             let (connection, connection_generation_guard, persistent_outcome_uncertain) =
                 if guard_owner.is_some() {
-                    let persistent_pin = self
-                        .persistent_admission_pins
-                        .get(&owner)
-                        .ok_or_else(|| {
+                    let persistent_pin =
+                        self.persistent_admission_pins.get(&owner).ok_or_else(|| {
                             anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
                                 "MongoDB {label} guard {lock_id:?} is not active in this admin \
                                  process"
@@ -9763,110 +9761,115 @@ mod inner {
             let identity_values = consumer_identity_values(consumer);
             mtls_lease
                 .run_mutation(async {
-            if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                session
-                    .start_transaction()
-                    .and_run(
-                        (
-                            self,
-                            doc,
-                            consumer.namespace.clone(),
-                            consumer.id.clone(),
-                            identity_values,
-                        ),
-                        |s, (this, doc, namespace, id, identity_values)| {
-                            Box::pin(async move {
-                                // Reserve the merged identity keyspace
-                                // (id ∪ username ∪ custom_id) in the same
-                                // transaction — a duplicate key means another
-                                // consumer owns one of the values (409).
-                                this.insert_consumer_identity_docs_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    id.as_str(),
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        session
+                            .start_transaction()
+                            .and_run(
+                                (
+                                    self,
+                                    doc,
+                                    consumer.namespace.clone(),
+                                    consumer.id.clone(),
                                     identity_values,
-                                )
-                                .await?;
-                                this.consumers()
-                                    .insert_one(doc.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "consumer",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                                Ok(())
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("create_consumer transaction failed")?;
-                self.compact_config_changes_best_effort(&consumer.namespace)
-                    .await;
-            } else {
-                // Standalone: RESERVE FIRST. Inserting the identity docs
-                // before the consumer makes the identity-index `_id` the
-                // atomic admission guard — a duplicate key error (E11000,
-                // "duplicate key") bails before the consumer is written.
-                // Rollback releases only values this attempt newly inserted
-                // (never adopted same-owner reservations of unknown provenance).
-                let newly_inserted_identity_values = self
-                    .reserve_consumer_identity_docs_standalone(
-                        &consumer.namespace,
-                        &consumer.id,
-                        &identity_values,
-                    )
-                    .await?;
-                // Release only values this attempt newly inserted — never adopted
-                // same-owner reservations, whose provenance is unknown.
-                let rollback_identity_values: &[String] = &newly_inserted_identity_values;
-                if let Err(err) = self.consumers().insert_one(doc).await {
-                    self.release_consumer_identity_values_best_effort(
-                        &consumer.namespace,
-                        &consumer.id,
-                        rollback_identity_values,
-                    )
-                    .await;
-                    return Err(err.into());
-                }
-                if let Err(err) = self
-                    .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
-                    .await
-                {
-                    let rollback_confirmed = self
-                        .rollback_standalone_created_document(
-                            "consumers",
-                            &consumer.namespace,
-                            "consumer",
-                            &consumer.id,
-                            &err,
-                        )
-                        .await;
-                    if rollback_confirmed {
-                        self.release_consumer_identity_values_best_effort(
-                            &consumer.namespace,
-                            &consumer.id,
-                            rollback_identity_values,
-                        )
-                        .await;
+                                ),
+                                |s, (this, doc, namespace, id, identity_values)| {
+                                    Box::pin(async move {
+                                        // Reserve the merged identity keyspace
+                                        // (id ∪ username ∪ custom_id) in the same
+                                        // transaction — a duplicate key means another
+                                        // consumer owns one of the values (409).
+                                        this.insert_consumer_identity_docs_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            identity_values,
+                                        )
+                                        .await?;
+                                        this.consumers()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "consumer",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        Ok(())
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("create_consumer transaction failed")?;
+                        self.compact_config_changes_best_effort(&consumer.namespace)
+                            .await;
                     } else {
-                        warn!(
-                            "Retaining MongoDB consumer identity reservations for {:?} in \
+                        // Standalone: RESERVE FIRST. Inserting the identity docs
+                        // before the consumer makes the identity-index `_id` the
+                        // atomic admission guard — a duplicate key error (E11000,
+                        // "duplicate key") bails before the consumer is written.
+                        // Rollback releases only values this attempt newly inserted
+                        // (never adopted same-owner reservations of unknown provenance).
+                        let newly_inserted_identity_values = self
+                            .reserve_consumer_identity_docs_standalone(
+                                &consumer.namespace,
+                                &consumer.id,
+                                &identity_values,
+                            )
+                            .await?;
+                        // Release only values this attempt newly inserted — never adopted
+                        // same-owner reservations, whose provenance is unknown.
+                        let rollback_identity_values: &[String] = &newly_inserted_identity_values;
+                        if let Err(err) = self.consumers().insert_one(doc).await {
+                            self.release_consumer_identity_values_best_effort(
+                                &consumer.namespace,
+                                &consumer.id,
+                                rollback_identity_values,
+                            )
+                            .await;
+                            return Err(err.into());
+                        }
+                        if let Err(err) = self
+                            .record_config_change(
+                                &consumer.namespace,
+                                "consumer",
+                                &consumer.id,
+                                "upsert",
+                            )
+                            .await
+                        {
+                            let rollback_confirmed = self
+                                .rollback_standalone_created_document(
+                                    "consumers",
+                                    &consumer.namespace,
+                                    "consumer",
+                                    &consumer.id,
+                                    &err,
+                                )
+                                .await;
+                            if rollback_confirmed {
+                                self.release_consumer_identity_values_best_effort(
+                                    &consumer.namespace,
+                                    &consumer.id,
+                                    rollback_identity_values,
+                                )
+                                .await;
+                            } else {
+                                warn!(
+                                    "Retaining MongoDB consumer identity reservations for {:?} in \
                              namespace {:?} because create rollback could not be verified",
-                            consumer.id, consumer.namespace
-                        );
+                                    consumer.id, consumer.namespace
+                                );
+                            }
+                            return Err(err);
+                        }
                     }
-                    return Err(err);
-                }
-            }
-            Ok(())
+                    Ok(())
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -10160,8 +10163,7 @@ mod inner {
                                             return Err(mongodb::error::Error::custom(format!(
                                                 "Consumer {:?} is referenced by access_control \
                                                  plugin_config {:?} and cannot be deleted",
-                                                id,
-                                                plugin.id
+                                                id, plugin.id
                                             )));
                                         }
                                         let result = this
@@ -10212,11 +10214,7 @@ mod inner {
                             anyhow::anyhow!("consumer {:?} is missing username: {}", id, error)
                         })?;
                         if let Some(plugin) = self
-                            .find_access_control_consumer_ref_opt_session(
-                                None,
-                                namespace,
-                                username,
-                            )
+                            .find_access_control_consumer_ref_opt_session(None, namespace, username)
                             .await?
                         {
                             anyhow::bail!(
@@ -13153,15 +13151,14 @@ mod inner {
             guard_owner: &str,
         ) -> Result<(), anyhow::Error> {
             let connection = {
-                let persistent_pin = self
-                    .persistent_admission_pins
-                    .get(guard_owner)
-                    .ok_or_else(|| {
+                let persistent_pin = self.persistent_admission_pins.get(guard_owner).ok_or_else(
+                    || {
                         anyhow::anyhow!(
                             "MongoDB mTLS DNS admission guard is not active in this admin process \
                              for namespace {namespace:?}"
                         )
-                    })?;
+                    },
+                )?;
                 if persistent_pin.namespace != namespace {
                     anyhow::bail!(
                         "MongoDB mTLS DNS admission guard belongs to a different namespace than \

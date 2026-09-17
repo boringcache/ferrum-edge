@@ -1048,7 +1048,10 @@ fn mtls_auth_compatibility_escapes_document_ids() {
     assert_eq!(errors.len(), 1);
     let error = &errors[0];
     assert!(error.contains(&format!("Proxy {proxy_id:?}")), "{error}");
-    assert!(error.contains(&format!("PluginConfig {plugin_id:?}")), "{error}");
+    assert!(
+        error.contains(&format!("PluginConfig {plugin_id:?}")),
+        "{error}"
+    );
     let rendered = ferrum_edge::startup::render_startup_error(&anyhow::anyhow!(error.clone()));
     assert!(rendered.contains("`mtls_auth`"), "{rendered}");
     assert!(rendered.contains("`frontend_tls=true`"), "{rendered}");

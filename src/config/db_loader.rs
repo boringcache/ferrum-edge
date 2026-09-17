@@ -1480,10 +1480,12 @@ impl DatabaseStore {
             (None, None) => {}
             (Some(actual), Some(allowed)) if actual == allowed => {}
             (Some(_), _) => {
-                return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                    "mTLS DNS admission is blocked while a guarded operation owns namespace \
+                return Err(
+                    anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
+                        "mTLS DNS admission is blocked while a guarded operation owns namespace \
                      {namespace:?}"
-                )));
+                    )),
+                );
             }
             (None, Some(_)) => {
                 return Err(
