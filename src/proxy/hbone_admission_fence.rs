@@ -957,10 +957,12 @@ impl HboneAdmissionFence {
             .collect();
         live.into_iter()
             .filter(|inner| inner.state.load(Ordering::Acquire) == TUNNEL_LIVE)
-            .filter_map(|inner| match inner.snapshot.peer_credential.as_ref()?.leaf_expiry {
-                AdmittedLeafExpiry::At(deadline) => Some(deadline),
-                AdmittedLeafExpiry::Unbounded | AdmittedLeafExpiry::Unparseable => None,
-            })
+            .filter_map(
+                |inner| match inner.snapshot.peer_credential.as_ref()?.leaf_expiry {
+                    AdmittedLeafExpiry::At(deadline) => Some(deadline),
+                    AdmittedLeafExpiry::Unbounded | AdmittedLeafExpiry::Unparseable => None,
+                },
+            )
             .min()
     }
 

@@ -223,7 +223,9 @@ impl SpiffeIdentityConnectionCache {
             return Some(CredentialDeadline::Bounded(deadline));
         }
         let unix = validity.not_after_unix;
-        Some(auth_flow::try_credential_deadline_from_unix_seconds(unix, 0))
+        Some(auth_flow::try_credential_deadline_from_unix_seconds(
+            unix, 0,
+        ))
     }
 }
 

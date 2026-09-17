@@ -1070,7 +1070,10 @@ pub(super) async fn handle_hbone_request(
         // that slot requests a sweep after storing.
         peer_credential: HbonePeerCredential::from_admitted_connect(
             ctx,
-            state.hbone_admission_fence.inbound_trust_snapshot().as_ref(),
+            state
+                .hbone_admission_fence
+                .inbound_trust_snapshot()
+                .as_ref(),
         ),
     });
     let relay_proxy = proxy.clone();
@@ -1776,7 +1779,10 @@ pub(super) async fn handle_hbone_udp_request(
         // the same peer SVID, so it carries the same snapshot fields.
         peer_credential: HbonePeerCredential::from_admitted_connect(
             ctx,
-            state.hbone_admission_fence.inbound_trust_snapshot().as_ref(),
+            state
+                .hbone_admission_fence
+                .inbound_trust_snapshot()
+                .as_ref(),
         ),
     });
     let relay_proxy = proxy.clone();
