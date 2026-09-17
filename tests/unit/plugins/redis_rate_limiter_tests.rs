@@ -1664,8 +1664,12 @@ fn steady_traffic_pays_the_documented_sub_bucket_quantisation() {
             (measured - predicted).abs() < 0.02,
             "limit {limit}: measured {measured} vs documented {predicted}"
         );
-        // The quota still binds in the fail-closed direction.
-        assert!(admitted <= offered, "limit {limit} must still bind");
+        // The quota still binds: a client at exactly its configured rate is
+        // throttled, which is the whole point of stating the figure.
+        assert!(
+            admitted < offered,
+            "limit {limit}: the quota must still bind ({admitted}/{offered})"
+        );
     }
 
     // A sanity anchor on the sub-bucket width the spacing above rests on.
@@ -1677,9 +1681,10 @@ fn steady_traffic_pays_the_documented_sub_bucket_quantisation() {
 /// `1/s` client every other request as well.
 ///
 /// The weighted estimate still weighs a full `previous` bucket at `0.95` when
-/// the current window is 5% elapsed, so `0.95 + 1 > 1` refuses. Both shapes
-/// settle at half for `limit = 1`; only the sub-bucket ladder keeps the LARGER
-/// limits near their configured rate.
+/// the current window is 5% elapsed, so `0.95 + 1 > 1` refuses — exactly every
+/// other request, indefinitely. The sub-bucket ladder is no worse on the same
+/// timeline, and it is what keeps the LARGER limits near their configured rate,
+/// where `previous + current` would have halved those too.
 #[test]
 fn the_retired_weighted_estimate_halved_small_quotas_too() {
     const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -1716,7 +1721,7 @@ fn the_retired_weighted_estimate_halved_small_quotas_too() {
          {sub_bucket_admitted} vs {weighted_admitted} of {offered}"
     );
     assert!(
-        sub_bucket_admitted <= offered,
+        sub_bucket_admitted < offered,
         "the quota must still bind: {sub_bucket_admitted}/{offered}"
     );
 }
@@ -1760,37 +1765,23 @@ fn a_charge_is_settled_only_within_one_sub_bucket_of_its_selection() {
         RedisRateLimitClient, sub_bucket_charge_is_settled,
     };
 
-    let selected = RedisRateLimitClient::sub_bucket_at(Duration::from_millis(100_000), 1);
+    let ms = Duration::from_millis;
+    let selected = RedisRateLimitClient::sub_bucket_at(ms(100_000), 1);
     assert_eq!(selected.index, 800);
 
     // Same bucket, and the next one: the ladder read `801`, so a peer that
     // charged there is already counted.
-    assert!(sub_bucket_charge_is_settled(
-        selected,
-        Duration::from_millis(100_124)
-    ));
-    assert!(sub_bucket_charge_is_settled(
-        selected,
-        Duration::from_millis(100_249)
-    ));
+    assert!(sub_bucket_charge_is_settled(selected, ms(100_124)));
+    assert!(sub_bucket_charge_is_settled(selected, ms(100_249)));
     // Two buckets on: `802` was neither read nor charged, so a peer there is
     // invisible and the decision cannot be published.
-    assert!(!sub_bucket_charge_is_settled(
-        selected,
-        Duration::from_millis(100_250)
-    ));
-    assert!(!sub_bucket_charge_is_settled(
-        selected,
-        Duration::from_millis(100_600)
-    ));
+    assert!(!sub_bucket_charge_is_settled(selected, ms(100_250)));
+    assert!(!sub_bucket_charge_is_settled(selected, ms(100_600)));
 
     // A clock that stepped BACKWARD is not a staleness problem: the charged
     // bucket is ahead of the fresh one, so the ladder still covers everything a
     // peer could have charged.
-    assert!(sub_bucket_charge_is_settled(
-        selected,
-        Duration::from_millis(99_000)
-    ));
+    assert!(sub_bucket_charge_is_settled(selected, ms(99_000)));
 }
 
 /// One admission decision must cost at most ONE extra wall-clock sample, and
@@ -2017,7 +2008,8 @@ impl KeyspaceState {
                 // response deadline, which is not the behavior under test.
                 let charging = batch
                     .iter()
-                    .any(|command| command.first().is_some_and(|name| name == "INCR"));
+                    .filter_map(|command| command.first())
+                    .any(|name| name.eq_ignore_ascii_case("INCR"));
                 let held = if charging
                     && self.charges.fetch_add(1, Ordering::Relaxed) < self.delayed_charges
                 {
@@ -4003,9 +3995,11 @@ const EXEC_ARG: &[u8] = b"EXEC";
 const INCR_ARG: &[u8] = b"INCR";
 const INFO_ARG: &[u8] = b"INFO";
 
-/// `GET`s one window contributes to a charge: one per older sub-bucket.
+/// `GET`s one window contributes to a charge: one per older sub-bucket, plus
+/// one on the read-only sub-bucket AFTER the charged one. Only the charged
+/// bucket is written, so that is the whole ladder minus one.
 const CHARGE_GETS_PER_WINDOW: usize =
-    ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+    ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKET_KEYS - 1;
 
 /// Commands one window contributes to a charge transaction: every `GET`, plus
 /// `INCR` and `EXPIRE` on the sub-bucket being charged. Only the `EXPIRE` is
@@ -4683,18 +4677,33 @@ fn http_window_admission_is_pooled_plain_resp_and_hands_back_a_refused_charge() 
     let refusal = body
         .find("if let Some(spec) = refused {")
         .expect("admission must have a single refusal branch");
-    let compensation = body
+    // Exactly two hand-backs, and the review of the sub-bucket rework is why
+    // there are two: the staleness rebuild abandons its own pass inside the
+    // charge loop (before any decision is derived), and the refusal branch
+    // hands back after one. An admitted request still reaches neither.
+    let rollover_handback = body
         .find(".spawn_uncharge_rate_limit_windows(charges)")
+        .expect("an abandoned stale pass must hand its charge back");
+    let refusal_handback = body
+        .rfind(".spawn_uncharge_rate_limit_windows(charges)")
         .expect("a refusal must hand the charge back");
+    let pass_bound = body
+        .find("if pass >= MAX_REDIS_CHARGE_PASSES {")
+        .expect("the staleness rebuild must be bounded");
     assert!(
-        charge < refusal && refusal < compensation,
-        "the charge must precede the decision, and the hand-back must sit behind \
-         the refusal branch"
+        charge < rollover_handback && rollover_handback < pass_bound,
+        "the abandoned pass must hand its charge back before the bound refuses"
+    );
+    assert!(
+        pass_bound < refusal && refusal < refusal_handback,
+        "the charge must precede the decision, and the refusal's hand-back must \
+         sit behind the refusal branch"
     );
     assert_eq!(
         body.matches("uncharge_rate_limit_windows").count(),
-        1,
-        "an admitted request must never compensate"
+        2,
+        "only the abandoned pass and the refusal compensate; an admitted request \
+         must never compensate"
     );
     // The hand-back must NOT be tied to the request future. Plugin hooks run
     // under `tokio::time::timeout_at`, so a gRPC deadline or a client
