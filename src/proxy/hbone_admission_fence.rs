@@ -727,14 +727,15 @@ pub struct HboneAdmissionFence {
     /// deadline than the one the watcher is parked on must not wait for that
     /// later deadline to fire.
     expiry_wakeup: tokio::sync::Notify,
-    /// The inbound mTLS admission trust the credential gate judges live tunnels
-    /// against, installed by mesh startup. `None` on every non-mesh listener
-    /// and on a chain-only mesh inbound posture, which leaves the trust half of
-    /// the credential gate inapplicable exactly as
+    /// The inbound mTLS admission trust the credential gate judges CONNECTs and
+    /// live tunnels against, installed by mesh startup. `None` on every
+    /// non-mesh listener and on a chain-only mesh inbound posture, which leaves
+    /// the trust half of the credential gate inapplicable exactly as
     /// [`HbonePeerCredential::anchored_at_admission`] `== false` does.
     inbound_trust: ArcSwapOption<MeshInboundAdmissionTrust>,
-    /// The ONE strictly increasing sequence every inbound trust revision is
-    /// drawn from. See [`MeshInboundAdmissionTrust::revision`].
+    /// The ONE strictly increasing sequence every in-force trust revision is
+    /// drawn from; see `InForceInboundTrust::revision` for why it is fence-wide
+    /// rather than per-slot.
     trust_revision_seq: AtomicU64,
     request_epoch: Arc<RequestEpochStore>,
     mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
@@ -911,7 +912,7 @@ impl HboneAdmissionFence {
     /// (`tls::SvidServerCertResolver`), which must see a rotation immediately.
     /// What goes IN FORCE for the fence is conditional on BOTH the trust
     /// material actually changing and the candidate compiling as one atomic set
-    /// — see [`Self::compile_in_force`].
+    /// — see `compile_in_force`.
     pub fn publish_inbound_admission_trust(
         self: &Arc<Self>,
         slot: &crate::tls::SharedBundleSlot,
