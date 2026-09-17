@@ -262,7 +262,7 @@ fn mesh_ports_reject_zero_on_core_resources() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("endpoints[0].ports['http']")),
+            .any(|e| e.contains("endpoints[0].ports[\"http\"]")),
         "expected endpoint named port error, got: {errors:?}"
     );
 }
@@ -351,11 +351,11 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
 
     for expected in [
         "MeshDestinationRule.name",
-        "MeshDestinationRule ''.namespace",
-        "MeshDestinationRule ''.host",
+        "MeshDestinationRule \"\".namespace",
+        "MeshDestinationRule \"\".host",
         "subsets[0].name",
         "MeshSidecar.name",
-        "MeshSidecar ''.namespace",
+        "MeshSidecar \"\".namespace",
         "egress[0].hosts must not be empty",
         "egress[1].hosts[0]",
         "egress[1].hosts[1]",
@@ -2741,7 +2741,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     let errors = mesh.validate();
     assert!(
         errors.iter().any(|e| {
-            e.contains("MeshTelemetryResource 'telemetry'")
+            e.contains("MeshTelemetryResource \"telemetry\"")
                 && e.contains("sampling_percentage")
                 && e.contains("0 to 100")
         }),
@@ -2749,7 +2749,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     );
     assert!(
         errors.iter().any(|e| {
-            e.contains("MeshProxyConfig 'proxy'")
+            e.contains("MeshProxyConfig \"proxy\"")
                 && e.contains("tracing_sampling")
                 && e.contains("0 to 100")
         }),

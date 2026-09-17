@@ -213,6 +213,23 @@ fn rejects_non_object_json_schema() {
 }
 
 #[test]
+fn invalid_json_schema_does_not_retain_document_values() {
+    let error = try_make(json!({
+        "tools": {"x": {
+            "action": "allow",
+            "json_schema": {"type": "UNREGISTERED_SCHEMA_TOKEN"}
+        }}
+    }))
+    .err()
+    .unwrap();
+    assert!(
+        error.contains("`json_schema` is not a valid JSON Schema"),
+        "{error}"
+    );
+    assert!(!error.contains("UNREGISTERED_SCHEMA_TOKEN"), "{error}");
+}
+
+#[test]
 fn rejects_require_approval_without_endpoint() {
     let err = try_make(json!({ "tools": { "x": { "action": "require_approval" } } }))
         .err()
@@ -12029,7 +12046,7 @@ fn non_string_tool_risk_is_rejected_rather_than_defaulted() {
         let err = try_make(config.clone())
             .err()
             .expect("a present non-string risk must fail admission");
-        assert!(err.contains("'risk'"), "{err}");
+        assert!(err.contains("`risk`"), "{err}");
         assert!(err.contains("must be a string"), "{err}");
         assert!(err.contains("lookup"), "error must name the tool: {err}");
         assert!(!validator.is_valid(&config), "schema must reject {wrong}");
@@ -12334,7 +12351,7 @@ fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
         let err = try_make(config.clone())
             .err()
             .expect("a present non-string action must fail admission");
-        assert!(err.contains("'action'"), "{err}");
+        assert!(err.contains("`action`"), "{err}");
         assert!(err.contains("must be a string"), "{err}");
         assert!(
             err.contains(kind),
@@ -12356,7 +12373,7 @@ fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
     let err = try_make(omitted.clone())
         .err()
         .expect("an omitted action must fail admission");
-    assert!(err.contains("missing required 'action'"), "{err}");
+    assert!(err.contains("missing required `action`"), "{err}");
     assert!(!validator.is_valid(&omitted));
 
     // ...and a non-enum *string* keeps its own distinct diagnostic.

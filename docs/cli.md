@@ -281,13 +281,31 @@ separate and only the bare inner diagnostic's exact leading family is classified
 Diagnostics keep field paths, available line/column positions, expected types,
 and missing/unknown/duplicate field names. Paths and unknown-field messages echo
 document **keys**; they are diagnostic context, not confidential value storage.
-Custom validators use backticks for schema names and Debug-escaped double quotes
-for document values. The custom boundary withholds double- and single-quoted
-spans, through the end if unterminated, and keeps backticked names. This also
-applies to parser-level errors, which are never classified as serde families.
+The second layer is render-time withholding: **each cause** in both `run` and
+`validate` passes through the custom quoted-span sanitizer before the causes are
+joined. Every double- or single-quoted span is withheld, through the end of that
+cause if unterminated; backticks remain. An unmatched quote cannot consume the
+next cause's field path or reason. Validation-pipeline log records use the same
+pass before emission. Validators must use backticks for schema names and
+Debug-escaped double quotes (`{value:?}` for strings) for document values, or
+omit the values. A validator following this convention is safe by construction
+at rendering; interpolating a document scalar bare is a defect, not an exception
+to the convention. Parser errors use custom sanitization; the exact bare YAML
+`duplicate entry with key` family preserves its key as a backticked duplicate
+field, without classifying path-prefixed text.
 For withheld CIDRs, use the field path to locate the value; the reason and prefix
-length remain visible. Localized mesh and stock-xDS policy version rejections
-withhold the supplied `version` and retain the supported version and reason.
+length remain visible. Localized mesh, stock-xDS, gateway migration, and backup
+version rejections withhold the supplied `version` and retain the supported
+version and reason, including migration warnings. Database-mode `validate`
+checks a configured JSON backup through the same loader without a database dial.
+The semantic audit converted mesh service IPs, resource names, hosts, target
+references, CIDRs, ext-authz/JWT-header diagnostics, gateway host/reference
+diagnostics, plugin provider/schema/tag names and numeric bounds. Audited plugin type
+rejections Debug-escape the complete JSON rendering, including numbers, arrays
+and objects, so embedded values cannot escape through another shape. CORS and
+sibling regex validators omit library errors that reproduce patterns; OpenAPI
+and AI tool JSON Schema admission also uses fixed rejection reasons. The owning
+field/index and the fixed rejection reason remain visible.
 Generic object visitors enforce shape; their document/value adapters own error
 sanitization. YAML preserves native admission and original error positions, then
 replays failed typed deserialization through a value tree to separate the error

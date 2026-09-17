@@ -69,7 +69,7 @@ impl SummaryType {
             "stream" => Ok(Self::Stream),
             "both" => Ok(Self::Both),
             other => Err(format!(
-                "schema: 'summary_type' must be 'http', 'stream', or 'both' (got '{other}')"
+                "schema: 'summary_type' must be 'http', 'stream', or 'both' (got {other:?})"
             )),
         }
     }
@@ -180,7 +180,7 @@ impl DerivedKind {
             "summary_kind" => Ok(Self::SummaryKind),
             "outcome" => Ok(Self::Outcome),
             other => Err(format!(
-                "schema: unknown derived kind '{other}' (valid: status_class, backend_host, summary_kind, outcome)"
+                "schema: unknown derived kind {other:?} (valid: status_class, backend_host, summary_kind, outcome)"
             )),
         }
     }
@@ -226,7 +226,7 @@ impl TimestampFormat {
             "epoch_ms" => Ok(Self::EpochMs),
             "epoch_s" => Ok(Self::EpochS),
             other => Err(format!(
-                "schema: 'timestamp_format' must be 'rfc3339', 'epoch_ms', or 'epoch_s' (got '{other}')"
+                "schema: 'timestamp_format' must be 'rfc3339', 'epoch_ms', or 'epoch_s' (got {other:?})"
             )),
         }
     }
@@ -337,7 +337,7 @@ impl SummarySchema {
         for (name, kind) in &derived_fields {
             if !caps.family.supports_derived(*kind) {
                 return Err(format!(
-                    "{plugin_name}: schema derived field '{name}' uses kind '{}', which is not \
+                    "{plugin_name}: schema derived field {name:?} uses kind '{}', which is not \
                      representable from a {} (no source field); remove it or pick a supported kind",
                     kind.label(),
                     caps.family.label()
@@ -592,9 +592,9 @@ fn unknown_field_error(
     let suggestion = fields::levenshtein_suggest(summary_type, caps, name);
     match suggestion {
         Some(s) => format!(
-            "{plugin_name}: schema {section} references unknown field '{name}' (did you mean '{s}'?)"
+            "{plugin_name}: schema {section} references unknown field {name:?} (did you mean '{s}'?)"
         ),
-        None => format!("{plugin_name}: schema {section} references unknown field '{name}'"),
+        None => format!("{plugin_name}: schema {section} references unknown field {name:?}"),
     }
 }
 
@@ -827,12 +827,12 @@ fn parse_derived_fields(
                 )
             })?;
         let kind_str = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
-            format!("{plugin_name}: schema 'derived_fields[{index}]' entry '{name}' missing 'kind'")
+            format!("{plugin_name}: schema 'derived_fields[{index}]' entry {name:?} missing 'kind'")
         })?;
         let kind = DerivedKind::parse(kind_str)?;
         if is_sensitive_metadata_key(name) {
             return Err(format!(
-                "{plugin_name}: schema 'derived_fields' name '{name}' matches a sensitive-data substring and would always be redacted; pick a different name"
+                "{plugin_name}: schema 'derived_fields' name {name:?} matches a sensitive-data substring and would always be redacted; pick a different name"
             ));
         }
         out.push((name.to_string(), kind));
@@ -905,7 +905,7 @@ fn parse_metadata_policy(
             "overwrite" => CollisionMode::Overwrite,
             other => {
                 return Err(format!(
-                    "{plugin_name}: schema 'metadata.on_collision' must be 'skip' or 'overwrite' (got '{other}')"
+                    "{plugin_name}: schema 'metadata.on_collision' must be 'skip' or 'overwrite' (got {other:?})"
                 ));
             }
         },
@@ -1095,7 +1095,7 @@ pub fn resolve_schema(
         if caps == SchemaCapabilities::BASE {
             return registry::lookup_named(name).map(Some).ok_or_else(|| {
                 format!(
-                    "{plugin_name}: 'schema_ref' references unknown schema '{name}' (define it in a 'transaction_log_schema' plugin)"
+                    "{plugin_name}: 'schema_ref' references unknown schema {name:?} (define it in a 'transaction_log_schema' plugin)"
                 )
             });
         }
@@ -1105,7 +1105,7 @@ pub fn resolve_schema(
         // hot path.
         let raw = registry::lookup_named_raw(name).ok_or_else(|| {
             format!(
-                "{plugin_name}: 'schema_ref' references unknown schema '{name}' (define it in a 'transaction_log_schema' plugin)"
+                "{plugin_name}: 'schema_ref' references unknown schema {name:?} (define it in a 'transaction_log_schema' plugin)"
             )
         })?;
         return SummarySchema::compile(&raw, plugin_name, caps).map(Some);

@@ -12,7 +12,35 @@ fn fatal_mesh_startup_preserves_every_cause_in_order() {
 
     assert_eq!(
         message,
-        format!("Fatal error: {context}: invalid mesh configuration document: {cause}")
+        format!(
+            "Fatal error: failed to load localized mesh config from <redacted scalar>: \
+             invalid mesh configuration document: {cause}"
+        )
+    );
+}
+
+#[test]
+fn startup_sanitizes_each_cause_before_joining() {
+    for quote in ['\'', '"'] {
+        let error = anyhow::anyhow!("mesh.services[0].cluster_ips[0]: invalid IP address")
+            .context(format!("validator rejected {quote}UNREGISTERED_TOKEN"))
+            .context("startup rejected `mesh`");
+        assert_eq!(
+            render_startup_error(error, &[]),
+            "startup rejected `mesh`: validator rejected <redacted scalar>: \
+             mesh.services[0].cluster_ips[0]: invalid IP address"
+        );
+    }
+}
+
+#[test]
+fn startup_withholds_debug_escaped_semantic_values() {
+    let value = "prefix'\"UNREGISTERED_TOKEN\\tail\n";
+    let error =
+        anyhow::anyhow!("`host` {value:?}: invalid hostname").context("configuration rejected");
+    assert_eq!(
+        render_startup_error(error, &[]),
+        "configuration rejected: `host` <redacted scalar>: invalid hostname"
     );
 }
 

@@ -1667,7 +1667,8 @@ impl RequestMirror {
                 })?;
                 if v > MAX_MAX_IN_FLIGHT_MIRRORS {
                     return Err(format!(
-                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS} (got {v})"
+                        "request_mirror: `max_in_flight` must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS} (got {v:?})",
+                        v = v.to_string()
                     ));
                 }
                 Ok(v)
@@ -1734,7 +1735,8 @@ impl RequestMirror {
             .map(|v| {
                 if v == 0 || v > MAX_MIRROR_TIMEOUT_MS {
                     Err(format!(
-                        "request_mirror: 'mirror_timeout_ms' must be 1–{MAX_MIRROR_TIMEOUT_MS} (got {v})"
+                        "request_mirror: `mirror_timeout_ms` must be 1–{MAX_MIRROR_TIMEOUT_MS} (got {v:?})",
+                        v = v.to_string()
                     ))
                 } else {
                     Ok(v)

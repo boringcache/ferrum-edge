@@ -315,9 +315,9 @@ fn startup_cause_chain_redacts_external_values_at_every_depth() {
         !rendered.contains(PLAIN_VALUE),
         "secret escaped: {rendered}"
     );
-    assert!(rendered.starts_with("failed to load localized mesh config from '"));
+    assert!(rendered.starts_with("failed to load localized mesh config from <redacted scalar>"));
     assert!(rendered.contains(": invalid mesh configuration document: inner validation rejected "));
-    assert_eq!(rendered.matches(EXTERNAL_SECRET_PLACEHOLDER).count(), 2);
+    assert_eq!(rendered.matches(EXTERNAL_SECRET_PLACEHOLDER).count(), 1);
 }
 
 #[test]

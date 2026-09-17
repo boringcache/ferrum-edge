@@ -1550,18 +1550,18 @@ fn parse_tag_operation<'a>(
             .and_then(Value::as_str)
             .map(ParsedTagOperation::Rename)
             .ok_or_else(|| {
-                format!("workload_metrics: new_name is required to rename metric tag '{name}'")
+                format!("workload_metrics: new_name is required to rename metric tag {name:?}")
             }),
         Some("set") => {
             let value = operation
                 .get("value")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    format!("workload_metrics: value is required to set metric tag '{name}'")
+                    format!("workload_metrics: value is required to set metric tag {name:?}")
                 })?;
             if value.len() > MAX_METRIC_TAG_VALUE_BYTES {
                 return Err(format!(
-                    "workload_metrics: metric tag '{name}' value exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
+                    "workload_metrics: metric tag {name:?} value exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
                 ));
             }
             Ok(ParsedTagOperation::Set(value))
@@ -1571,7 +1571,7 @@ fn parse_tag_operation<'a>(
                 let expression: MetricTagCelExpr = serde_json::from_value(expression.clone())
                     .map_err(|_| {
                         format!(
-                            "workload_metrics: invalid compiled CEL expression for metric tag '{name}'"
+                            "workload_metrics: invalid compiled CEL expression for metric tag {name:?}"
                         )
                     })?;
                 validate_metric_tag_cel_expr_named(name, &expression)?;
@@ -1579,20 +1579,20 @@ fn parse_tag_operation<'a>(
             }
             let cel = operation.get("cel").and_then(Value::as_str).ok_or_else(|| {
                 format!(
-                    "workload_metrics: cel or expression is required for set_expr metric tag '{name}'"
+                    "workload_metrics: cel or expression is required for set_expr metric tag {name:?}"
                 )
             })?;
             let expression = parse_metric_tag_cel_expression(cel).map_err(|message| {
-                format!("workload_metrics: metric tag '{name}' CEL expression rejected: {message}")
+                format!("workload_metrics: metric tag {name:?} CEL expression rejected: {message}")
             })?;
             validate_metric_tag_cel_expr_named(name, &expression)?;
             Ok(ParsedTagOperation::SetExpr(expression))
         }
         Some(operation_type) => Err(format!(
-            "workload_metrics: unsupported operation '{operation_type}' for metric tag '{name}'"
+            "workload_metrics: unsupported operation {operation_type:?} for metric tag {name:?}"
         )),
         None => Err(format!(
-            "workload_metrics: operation type is required for metric tag '{name}'"
+            "workload_metrics: operation type is required for metric tag {name:?}"
         )),
     }
 }
@@ -1603,7 +1603,7 @@ fn validate_metric_tag_cel_expr_named(
 ) -> Result<(), String> {
     crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(
         |message| {
-            format!("workload_metrics: metric tag '{name}' CEL expression rejected: {message}")
+            format!("workload_metrics: metric tag {name:?} CEL expression rejected: {message}")
         },
     )
 }
@@ -1714,7 +1714,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                 }
                 None => {
                     return Err(format!(
-                        "workload_metrics: unsupported disabled metric '{name}'"
+                        "workload_metrics: unsupported disabled metric {name:?}"
                     ));
                 }
             }
@@ -1741,24 +1741,24 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                 .get("operation")
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
-                    format!("workload_metrics: operation is required for metric tag '{name}'")
+                    format!("workload_metrics: operation is required for metric tag {name:?}")
                 })?;
             let operation = parse_tag_operation(name, operation)?;
             let selector = match entry.get("metric") {
                 None | Some(Value::Null) => MetricSelector::All,
                 Some(Value::String(metric)) => metric_selector(metric).ok_or_else(|| {
                     format!(
-                        "workload_metrics: unsupported metric '{metric}' for tag override '{name}'"
+                        "workload_metrics: unsupported metric {metric:?} for tag override {name:?}"
                     )
                 })?,
                 Some(_) => {
                     return Err(format!(
-                        "workload_metrics: metric for tag override '{name}' must be a string"
+                        "workload_metrics: metric for tag override {name:?} must be a string"
                     ));
                 }
             };
             let label = MeshMetricLabel::from_config_name(name)
-                .ok_or_else(|| format!("workload_metrics: unsupported metric tag '{name}'"))?;
+                .ok_or_else(|| format!("workload_metrics: unsupported metric tag {name:?}"))?;
             let operation_stamp_needs = match &operation {
                 ParsedTagOperation::SetExpr(expression) => expression.stamp_needs(),
                 _ => MetricTagCelStampNeeds::default(),
@@ -1785,7 +1785,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                     validate_metric_tag_cel_for_families(expression, includes_tcp).map_err(
                         |message| {
                             format!(
-                                "workload_metrics: metric tag '{name}' CEL expression rejected: {message}"
+                                "workload_metrics: metric tag {name:?} CEL expression rejected: {message}"
                             )
                         },
                     )?;
@@ -1942,7 +1942,7 @@ fn validate_custom_tags(
     for (name, value) in &custom_tags {
         if value.len() > MAX_CUSTOM_TAG_VALUE_BYTES {
             return Err(format!(
-                "workload_metrics: custom tag '{name}' value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
+                "workload_metrics: custom tag {name:?} value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
             ));
         }
     }
@@ -1951,11 +1951,11 @@ fn validate_custom_tags(
     for (name, header) in custom_header_tags {
         let header_name =
             http::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
-                format!("workload_metrics: custom tag '{name}' has invalid header name '{header}'")
+                format!("workload_metrics: custom tag {name:?} has invalid header name {header:?}")
             })?;
         if is_sensitive_metadata_key(header_name.as_str()) {
             return Err(format!(
-                "workload_metrics: custom tag '{name}' cannot copy sensitive header '{header}'"
+                "workload_metrics: custom tag {name:?} cannot copy sensitive header {header:?}"
             ));
         }
         normalized_header_tags.insert(name, header_name.as_str().to_string());
@@ -2328,7 +2328,7 @@ fn validate_custom_tag_name(name: &str) -> Result<(), String> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
     if !allowed {
         return Err(format!(
-            "workload_metrics: invalid custom tag name '{name}'"
+            "workload_metrics: invalid custom tag name {name:?}"
         ));
     }
     let reserved = name.starts_with("mesh.")
@@ -2348,7 +2348,7 @@ fn validate_custom_tag_name(name: &str) -> Result<(), String> {
         );
     if reserved || is_sensitive_metadata_key(name) {
         return Err(format!(
-            "workload_metrics: custom tag name '{name}' is reserved or sensitive"
+            "workload_metrics: custom tag name {name:?} is reserved or sensitive"
         ));
     }
     Ok(())

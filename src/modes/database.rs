@@ -1276,7 +1276,7 @@ pub async fn run(
             {
                 warn!(
                     "Configured startup backup is unusable; continuing with database config: {}",
-                    error
+                    crate::startup::render_startup_error(error, &[])
                 );
             }
             // The lazy offline store can recover after the deferred-migration
@@ -1358,7 +1358,8 @@ pub async fn run(
                 // the configured backup for pod restart resilience.
                 warn!(
                     "Database load failed ({}), attempting backup file: {}",
-                    e, path
+                    crate::util::deserialization::sanitize_custom_message(&e.to_string()),
+                    path
                 );
                 match load_config_backup(path, &env_config.namespace) {
                     // Result-shaped backup loader (#3153); startup seeds
@@ -1373,7 +1374,9 @@ pub async fn run(
                                  starting with backup config, enabling admin writes for in-band \
                                  repair after the recovery migration gate, and publishing \
                                  config_rejected immediately: {}",
-                                e
+                                crate::util::deserialization::sanitize_custom_message(
+                                    &e.to_string(),
+                                )
                             );
                         }
                         // The backup carries no gateway trust state, and cannot:

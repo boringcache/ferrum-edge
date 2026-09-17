@@ -32,7 +32,7 @@ pub async fn resolve_udp_endpoint(
             .await
             .map(|ip| SocketAddr::new(ip, port))
             .map_err(|error| {
-                format!("{plugin_name}: DNS resolution failed for '{host}': {error}")
+                format!("{plugin_name}: DNS resolution failed for {host:?}: {error}")
             });
     }
 

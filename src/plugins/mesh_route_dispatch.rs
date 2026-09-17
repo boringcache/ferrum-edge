@@ -1689,9 +1689,9 @@ fn compile_authority_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex must not be empty"
                 ));
             }
-            let re = compile_full_match_regex(pattern).map_err(|e| {
+            let re = compile_full_match_regex(pattern).map_err(|_| {
                 format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid: {e}"
+                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid or too complex"
                 )
             })?;
             AuthorityMatcher::Regex(re)
@@ -1773,8 +1773,10 @@ fn compile_uri_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
                 ));
             }
-            let re = compile_full_match_regex(pattern).map_err(|e| {
-                format!("mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid: {e}")
+            let re = compile_full_match_regex(pattern).map_err(|_| {
+                format!(
+                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid or too complex"
+                )
             })?;
             UriMatcher::Regex(re)
         }
@@ -1901,10 +1903,10 @@ fn compile_method_matchers(
                          must not be empty"
                     ));
                 }
-                let re = compile_full_match_regex(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
-                         is invalid: {e}"
+                         is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
                 MethodMatcher::Regex(re)
@@ -1948,10 +1950,10 @@ fn compile_header_matchers(
                          must not be empty"
                     ));
                 }
-                let re = compile_full_match_regex(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
-                         is invalid: {e}"
+                         is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
                 HeaderMatcher::Regex(re)

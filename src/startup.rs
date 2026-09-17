@@ -9,15 +9,20 @@ use tokio::sync::oneshot;
 
 /// Render only the ordered startup cause chain, then apply credential redaction.
 ///
-/// Alternate `anyhow` Display includes every cause without Debug's backtrace.
-/// Redact after rendering: a safe outer context may still wrap a raw driver error.
+/// Withhold quoted spans in EACH cause before joining: an unterminated quote in
+/// one cause must not consume the next cause's field path or rejection reason.
 /// Callers supply known database URLs without reading configuration during bootstrap.
-/// Config parsers withhold offending document scalars before retaining their errors.
+/// Config parsers sanitize serde families structurally at admission. Semantic
+/// validators must omit document values or use Debug-escaped double quotes.
 /// TLS/provider loaders remain responsible for withholding key material and source
 /// references at their typed boundaries; arbitrary secret text cannot be inferred here.
 pub fn render_startup_error(error: anyhow::Error, database_urls: &[&str]) -> String {
-    let rendered =
-        crate::config::db_backend::redact_error_text(format!("{error:#}"), database_urls);
+    let rendered = error
+        .chain()
+        .map(|cause| crate::util::deserialization::sanitize_custom_message(&cause.to_string()))
+        .collect::<Vec<_>>()
+        .join(": ");
+    let rendered = crate::config::db_backend::redact_error_text(rendered, database_urls);
     crate::secrets::redact_external_secret_values(&rendered)
 }
 

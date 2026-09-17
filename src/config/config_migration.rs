@@ -79,15 +79,13 @@ impl ConfigMigrator {
                     if steps_applied == 0 {
                         // No migration path found from the current version
                         anyhow::bail!(
-                            "No config migration path from version '{}' to '{}'",
-                            current_version,
+                            "No config migration path from version (<redacted scalar>) to {}",
                             target_version
                         );
                     }
                     // We've applied some steps but can't reach the target
                     anyhow::bail!(
-                        "Config migration chain broken at version '{}' (target: '{}')",
-                        version,
+                        "Config migration chain broken at version (<redacted scalar>) (target: {})",
                         target_version
                     );
                 }
@@ -169,8 +167,8 @@ impl ConfigMigrator {
 
         std::fs::write(file_path, migrated_content)?;
         info!(
-            "Config file migrated from version {} to {} ({} steps)",
-            from_version, target, steps
+            "Config file migrated from version (<redacted scalar>) to {} ({} steps)",
+            target, steps
         );
 
         Ok(ConfigMigrateResult {
@@ -227,9 +225,9 @@ impl ConfigMigrator {
         let steps = Self::migrate_value(value, target)?;
         if steps > 0 {
             warn!(
-                "Config was at version {}, migrated to {} in memory ({} steps). \
+                "Config was at version (<redacted scalar>), migrated to {} in memory ({} steps). \
                  Run FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=config to persist.",
-                current, target, steps
+                target, steps
             );
         }
         Ok(steps)

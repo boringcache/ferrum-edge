@@ -105,7 +105,7 @@ impl TransactionLogSchema {
             }
             if !seen_names.insert(name.clone()) {
                 return Err(format!(
-                    "transaction_log_schema: duplicate schema name '{name}' within the same plugin config"
+                    "transaction_log_schema: duplicate schema name {name:?} within the same plugin config"
                 ));
             }
             // Compile (validates everything). Plugin name uses the schema

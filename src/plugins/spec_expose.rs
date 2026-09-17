@@ -285,7 +285,7 @@ impl SpecExpose {
             "http" | "https" => {}
             other => {
                 return Err(format!(
-                    "spec_expose: 'spec_url' must use http or https scheme, got '{other}'"
+                    "spec_expose: `spec_url` must use http or https scheme, got {other:?}"
                 ));
             }
         }
@@ -337,7 +337,8 @@ impl SpecExpose {
             }
             Some(other) => {
                 return Err(format!(
-                    "spec_expose: 'content_type' must be a string, got: {other}"
+                    "spec_expose: `content_type` must be a string, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };
@@ -347,7 +348,8 @@ impl SpecExpose {
             Some(Value::Bool(value)) => *value,
             Some(other) => {
                 return Err(format!(
-                    "spec_expose: 'tls_no_verify' must be a boolean, got: {other}"
+                    "spec_expose: `tls_no_verify` must be a boolean, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };
@@ -355,7 +357,10 @@ impl SpecExpose {
         let cache_ttl_seconds = match config_object.get("cache_ttl_seconds") {
             None | Some(Value::Null) => DEFAULT_CACHE_TTL_SECONDS,
             Some(v) => v.as_u64().ok_or_else(|| {
-                format!("spec_expose: 'cache_ttl_seconds' must be a non-negative integer, got: {v}")
+                format!(
+                    "spec_expose: `cache_ttl_seconds` must be a non-negative integer, got: {v:?}",
+                    v = v.to_string()
+                )
             })?,
         };
         let cache_ttl = Duration::from_secs(cache_ttl_seconds);

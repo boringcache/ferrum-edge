@@ -12,11 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Startup failures now print the full cause chain (#5589), including mesh field
   paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
   classify serde families from the bare inner error, separately from document
-  paths, and withhold offending scalars before retaining errors. Custom validators
-  withhold double/single-quoted values (including unterminated spans) while keeping
-  backticked schema names. Paths and unknown-field messages echo document keys.
-  Mesh document version rejections withhold the supplied value. Diagnostics also
-  redact credentials in exact configured database URLs and registered external
+  paths, and withhold offending scalars before retaining errors. A second layer
+  sanitizes every cause independently at render time for both `run` and `validate`,
+  withholding double/single-quoted spans (including unterminated tails) while
+  keeping backticked schema names and the following cause. Validators must omit
+  document values or quote strings with Debug escaping; bare interpolation is a
+  defect. Converted mesh IP/host/name/target-reference/CIDR/header diagnostics,
+  gateway host/reference checks, plugin names and bounds follow this convention.
+  Audited plugin type errors quote the complete JSON rendering, including
+  numbers and containers. CORS and sibling regex validators omit pattern-reproducing
+  library errors; OpenAPI and AI tool JSON Schema errors use fixed reasons.
+  YAML duplicate keys retain their field names. Paths and unknown-field messages
+  echo document keys. Mesh, gateway migration (warnings and errors), and backup
+  version rejections withhold the supplied value. Database-mode `validate` also
+  checks the configured JSON backup without connecting to the database. Diagnostics
+  also redact credentials in exact configured database URLs and registered external
   secret values. The URL inventory reads only raw settings, without fetching
   dormant database TLS sources or creating PEM files. Owning loaders remain
   responsible for derived URLs and other provider/driver error payloads.

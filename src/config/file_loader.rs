@@ -236,8 +236,9 @@ pub fn load_config_from_file(
 
     if file_version != CURRENT_CONFIG_VERSION {
         warn!(
-            "Config file is at version {}, current is {}. Migrating in memory.",
-            file_version, CURRENT_CONFIG_VERSION
+            "Config file has a non-current `version` (<redacted scalar>), current is {}. \
+             Migrating in memory.",
+            CURRENT_CONFIG_VERSION
         );
         ConfigMigrator::migrate_in_memory(&mut value)?;
     }

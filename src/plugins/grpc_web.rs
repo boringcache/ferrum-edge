@@ -1220,7 +1220,12 @@ fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
 
     let headers = value
         .as_array()
-        .ok_or_else(|| format!("grpc_web: 'expose_headers' must be an array, got: {value}"))?;
+        .ok_or_else(|| {
+            format!(
+                "grpc_web: `expose_headers` must be an array, got: {value:?}",
+                value = value.to_string()
+            )
+        })?;
 
     let mut seen = HashSet::with_capacity(headers.len());
     let mut parsed = Vec::with_capacity(headers.len());

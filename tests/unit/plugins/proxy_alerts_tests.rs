@@ -79,7 +79,7 @@ fn rejects_non_object_config() {
 #[test]
 fn rejects_missing_channels() {
     let err = ProxyAlerts::new(&json!({ "rules": [] }), http_client()).unwrap_err();
-    assert!(err.contains("'channels' is required"), "got: {err}");
+    assert!(err.contains("`channels` is required"), "got: {err}");
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn rejects_window_seconds_out_of_range() {
     let mut cfg = minimal_config();
     cfg["rules"][0]["window_seconds"] = json!(2);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("'window_seconds' must be"), "got: {err}");
+    assert!(err.contains("`window_seconds` must be"), "got: {err}");
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn rejects_threshold_percent_out_of_range() {
     let mut cfg = minimal_config();
     cfg["rules"][0]["threshold_percent"] = json!(150.0);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("'threshold_percent' must be"), "got: {err}");
+    assert!(err.contains("`threshold_percent` must be"), "got: {err}");
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn rejects_zero_threshold_percent() {
     cfg["rules"][0]["threshold_percent"] = json!(0.0);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
     assert!(
-        err.contains("'threshold_percent' must be in (0.0, 100.0]"),
+        err.contains("`threshold_percent` must be in (0.0, 100.0]"),
         "got: {err}"
     );
 }
@@ -262,7 +262,7 @@ fn rejects_latency_threshold_above_histogram_range() {
         ]
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("'threshold_ms' must be <="), "got: {err}");
+    assert!(err.contains("`threshold_ms` must be <="), "got: {err}");
 }
 
 #[test]
@@ -642,7 +642,7 @@ fn rejects_typo_required_name_and_type_keys_with_suggestions() {
                 "threshold_percent": 5.0,
                 "channels": ["ops"]
             }),
-            "did you mean 'type' instead of 'typee'",
+            "did you mean `type` instead of 'typee'",
         ),
     ] {
         let err = ProxyAlerts::new(
@@ -866,7 +866,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'min_request_count' must be an unsigned integer",
+            "`min_request_count` must be an unsigned integer",
         ),
         (
             json!({
@@ -886,7 +886,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'min_request_count' must be an unsigned integer",
+            "`min_request_count` must be an unsigned integer",
         ),
     ] {
         let err = ProxyAlerts::new(&config, http_client())
@@ -2350,7 +2350,7 @@ fn rejects_unknown_grpc_status_selector_string() {
         }]
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("unknown 'grpc_statuses' entry"), "got: {err}");
+    assert!(err.contains("unknown `grpc_statuses` entry"), "got: {err}");
 }
 
 #[test]
@@ -2368,7 +2368,7 @@ fn rejects_lowercase_other_grpc_status_selector_to_match_openapi() {
         }]
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("unknown 'grpc_statuses' entry"), "got: {err}");
+    assert!(err.contains("unknown `grpc_statuses` entry"), "got: {err}");
 }
 
 #[test]

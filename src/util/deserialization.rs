@@ -171,9 +171,21 @@ pub fn from_yaml_str<T: DeserializeOwned>(input: &str) -> Result<T, serde_yaml::
             // Do not admit it or retain its original, path-bearing diagnostic.
             Ok(_) => "invalid YAML document".to_string(),
         },
-        // Parser errors have no trusted serde family, even when their text or
-        // a document-controlled key happens to start with one.
-        Err(error) => sanitize_custom_message(&error.to_string()),
+        // Value parsing has no path prefix. Its duplicate-key family carries a
+        // document KEY, which may be echoed just like a serde duplicate field.
+        // Never classify the native typed error (it can embed a hostile path).
+        Err(error) => {
+            let message = error.to_string();
+            match message
+                .strip_prefix("duplicate entry with key \"")
+                .and_then(|tail| tail.rsplit_once('"'))
+            {
+                Some((key, suffix)) => {
+                    format!("duplicate field `{key}`{}", sanitize_custom_message(suffix))
+                }
+                None => sanitize_custom_message(&message),
+            }
+        }
     };
     let detail = if let Some(location) = location {
         let position = format!(" at line {} column {}", location.line(), location.column());

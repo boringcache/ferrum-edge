@@ -73,7 +73,10 @@ impl KeyAuth {
         };
         let key_location = match config_obj.get("key_location") {
             Some(value) => value.as_str().ok_or_else(|| {
-                format!("key_auth: 'key_location' must be a string, got: {value}")
+                format!(
+                    "key_auth: `key_location` must be a string, got: {value:?}",
+                    value = value.to_string()
+                )
             })?,
             None => "header:X-API-Key",
         };

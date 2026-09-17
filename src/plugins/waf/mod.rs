@@ -2084,7 +2084,7 @@ fn parse_global_mode(raw: &str) -> Result<GlobalMode, String> {
         "monitor" => Ok(GlobalMode::Monitor),
         "disabled" => Ok(GlobalMode::Disabled),
         other => Err(format!(
-            "waf: 'mode' must be one of enforce, monitor, disabled; got {other:?}"
+            "waf: `mode` must be one of enforce, monitor, disabled; got {other:?}"
         )),
     }
 }
@@ -2277,7 +2277,10 @@ fn parse_rule_modes(value: Option<&Value>) -> Result<HashMap<String, RuleAction>
             }
             Ok(parsed)
         }
-        Some(other) => Err(format!("waf: 'rule_modes' must be an object, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `rule_modes` must be an object, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -2298,7 +2301,10 @@ fn parse_custom_rules(
                 )
             })
             .collect(),
-        Some(other) => Err(format!("waf: 'custom_rules' must be an array, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `custom_rules` must be an array, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -2309,7 +2315,10 @@ fn optional_bool(
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(other) => Err(format!("waf: '{key}' must be a boolean, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be a boolean, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -2321,7 +2330,10 @@ fn optional_string(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
         Some(Value::String(_)) => Err(format!("waf: '{key}' must be non-empty")),
-        Some(other) => Err(format!("waf: '{key}' must be a string, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -2344,7 +2356,10 @@ fn optional_string_vec(
             }
             Ok(Some(parsed))
         }
-        Some(other) => Err(format!("waf: '{key}' must be an array, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an array, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -2376,7 +2391,10 @@ fn optional_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
-        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an integer, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 

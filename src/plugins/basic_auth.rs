@@ -87,7 +87,8 @@ impl BasicAuth {
             }
             other => {
                 return Err(format!(
-                    "basic_auth: config must be an object, got: {other}"
+                    "basic_auth: config must be an object, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };

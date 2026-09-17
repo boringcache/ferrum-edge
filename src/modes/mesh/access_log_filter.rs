@@ -646,26 +646,26 @@ fn merge_min_latency_ms(current: &mut Option<u64>, value: i64) -> Result<(), Str
 
 fn status_code_value(value: i64) -> Result<u16, String> {
     u16::try_from(value).map_err(|_| {
-        format!("Telemetry access log response code filter value {value} is outside 0..=65535")
+        format!("Telemetry access log response code filter value \"{value}\" is outside 0..=65535")
     })
 }
 
 fn duration_value(value: i64) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| {
-        format!("Telemetry access log duration filter value {value} must be non-negative")
+        format!("Telemetry access log duration filter value \"{value}\" must be non-negative")
     })
 }
 
 fn comparison_increment(value: i64) -> Result<i64, String> {
     value
         .checked_add(1)
-        .ok_or_else(|| format!("Telemetry access log comparison value {value} overflows"))
+        .ok_or_else(|| format!("Telemetry access log comparison value \"{value}\" overflows"))
 }
 
 fn comparison_decrement(value: i64) -> Result<i64, String> {
     value
         .checked_sub(1)
-        .ok_or_else(|| format!("Telemetry access log comparison value {value} underflows"))
+        .ok_or_else(|| format!("Telemetry access log comparison value \"{value}\" underflows"))
 }
 
 #[cfg(test)]

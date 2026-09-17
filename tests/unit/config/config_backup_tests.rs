@@ -3,6 +3,18 @@ use ferrum_edge::config::types::CURRENT_CONFIG_VERSION;
 use serde_json::json;
 use std::io::Write;
 
+#[test]
+fn backup_version_rejection_never_retains_the_document_value() {
+    let secret = "UNREGISTERED_BACKUP_VERSION_5589";
+    let (_tmp, path) = write_tmp_file(&json!({"version": secret}).to_string());
+    let error = load_config_backup(&path, "ferrum").unwrap_err();
+    for rendered in [error.to_string(), format!("{error:#}"), format!("{error:?}")] {
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(rendered.contains("version migration"), "{rendered}");
+        assert!(rendered.contains("No config migration path"), "{rendered}");
+    }
+}
+
 fn administrative_backup() -> serde_json::Value {
     json!({
         "version": CURRENT_CONFIG_VERSION,

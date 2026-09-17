@@ -184,7 +184,8 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
             Ok(parsed)
         }
         Some(other) => Err(format!(
-            "waf: global_exemptions.header_present must be an object, got {other}"
+            "waf: global_exemptions.header_present must be an object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -213,7 +214,8 @@ fn optional_string_vec(
             Ok(Some(parsed))
         }
         Some(other) => Err(format!(
-            "waf: global_exemptions.{key} must be an array, got {other}"
+            "waf: global_exemptions.{key} must be an array, got {other:?}",
+            other = other.to_string()
         )),
     }
 }

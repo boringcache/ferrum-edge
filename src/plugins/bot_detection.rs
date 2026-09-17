@@ -170,7 +170,9 @@ fn compile_literal_pattern_set(key: &str, patterns: &[String]) -> Result<Option<
     builder
         .build()
         .map(Some)
-        .map_err(|e| format!("bot_detection: failed to compile '{key}' patterns: {e}"))
+        .map_err(|_| {
+            format!("bot_detection: failed to compile `{key}` patterns (complexity limit exceeded)")
+        })
 }
 
 /// Compile allow-list patterns with word-boundary anchors (`\b…\b`).
@@ -201,7 +203,9 @@ fn compile_word_boundary_pattern_set(
     builder
         .build()
         .map(Some)
-        .map_err(|e| format!("bot_detection: failed to compile '{key}' patterns: {e}"))
+        .map_err(|_| {
+            format!("bot_detection: failed to compile `{key}` patterns (complexity limit exceeded)")
+        })
 }
 
 fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
@@ -215,7 +219,8 @@ fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
             });
             let Some(code) = code else {
                 return Err(format!(
-                    "bot_detection: 'custom_response_code' must be an integer from 400 to 599, got {value}"
+                    "bot_detection: `custom_response_code` must be an integer from 400 to 599, got {value:?}",
+                    value = value.to_string()
                 ));
             };
             if !(400..=599).contains(&code) {

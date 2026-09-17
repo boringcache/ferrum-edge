@@ -234,7 +234,8 @@ impl GraphqlPlugin {
             }
             Some(other) => {
                 return Err(format!(
-                    "graphql: 'limit_by' must be a string, got: {other}"
+                    "graphql: `limit_by` must be a string, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };

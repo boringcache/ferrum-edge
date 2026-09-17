@@ -3615,7 +3615,9 @@ async fn functional_cli_mesh_startup_reports_validation_cause_chain() {
         );
         if subcommand == "run" {
             assert!(
-                stderr.contains("Fatal error: failed to load localized mesh config from '"),
+                stderr.contains(
+                    "Fatal error: failed to load localized mesh config from <redacted scalar>"
+                ),
                 "{diagnostic}"
             );
         }
@@ -3698,6 +3700,156 @@ async fn functional_cli_mesh_versions_are_redacted_without_registration() {
                 }
             }
         }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_semantic_values_are_redacted_without_registration() {
+    for secret in ["UNREGISTERED_TOKEN_5589", "prefix'\"UNREGISTERED_TOKEN_5589\\tail"] {
+        let documents = [
+            (
+                serde_json::json!({"mesh": {"services": [{
+                    "name": secret, "namespace": "ferrum", "cluster_ips": [secret]
+                }]}}),
+                "cluster_ips[0]",
+                "is not a valid IP address",
+            ),
+            (
+                serde_json::json!({"mesh": {"virtual_service_cors_policies": [{
+                    "name": secret, "namespace": "ferrum", "host": "svc",
+                    "cors": {"allowed_origins": [{"regex": format!("{secret}[")}]}
+                }]}}),
+                "cors.allowed_origins[0]",
+                "regex matcher is invalid or exceeds",
+            ),
+        ];
+        for (document, field, reason) in documents {
+            for extension in ["yaml", "json"] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join(format!("mesh-semantic.{extension}"));
+                let content = if extension == "yaml" {
+                    serde_yaml::to_string(&document).unwrap()
+                } else {
+                    serde_json::to_string(&document).unwrap()
+                };
+                std::fs::write(&path, content).unwrap();
+                for subcommand in ["run", "validate"] {
+                    let mut command =
+                        installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+                    command
+                        .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+                        .env("FERRUM_MESH_FILE_CONFIG_PATH", &path)
+                        .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+                        .env("FERRUM_PROXY_HTTP_PORT", "0")
+                        .env("FERRUM_ADMIN_HTTP_PORT", "0");
+                    let output = cli_contract_output(command).await;
+                    let diagnostic = cli_contract_diagnostic(&output);
+                    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+                    assert!(diagnostic.contains(field), "{diagnostic}");
+                    assert!(diagnostic.contains(reason), "{diagnostic}");
+                    assert!(
+                        !diagnostic
+                            .to_ascii_lowercase()
+                            .contains("unregistered_token_5589"),
+                        "{diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_gateway_versions_are_redacted_without_registration() {
+    let secret = "UNREGISTERED_GATEWAY_VERSION_5589";
+    for extension in ["yaml", "json"] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(format!("invalid-version.{extension}"));
+        let document = serde_json::json!({"version": secret});
+        let content = if extension == "yaml" {
+            serde_yaml::to_string(&document).unwrap()
+        } else {
+            serde_json::to_string(&document).unwrap()
+        };
+        std::fs::write(&path, content).unwrap();
+        for subcommand in ["run", "validate"] {
+            let command = installed_cli_command(
+                &directory,
+                &[subcommand, "-m", "file", "-c", path.to_str().unwrap()],
+            );
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+            assert!(
+                diagnostic.contains("No config migration path from version"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("Migrating in memory"), "{diagnostic}");
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_backup_versions_are_redacted_without_registration() {
+    let directory = TempDir::new().unwrap();
+    // Backups are JSON-only. Retain a real held port so no other fixture can
+    // answer the database dial. Pool deadlines also bound Darwin's black hole.
+    let refused = crate::scaffolding::ports::reserve_refused_tcp_port().unwrap();
+    let path = directory.path().join("backup.json");
+    let secret = "UNREGISTERED_BACKUP_VERSION_5589";
+    std::fs::write(&path, serde_json::json!({"version": secret}).to_string()).unwrap();
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "database"]);
+        command
+            .env("FERRUM_DB_TYPE", "postgres")
+            .env(
+                "FERRUM_DB_URL",
+                format!("postgres://fixture@127.0.0.1:{}/fixture", refused.port),
+            )
+            .env("FERRUM_DB_CONFIG_BACKUP_PATH", &path)
+            .env("FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS", "1")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "1")
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-for-backup-test-5589",
+            )
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        for required in ["Config backup", "version migration", "No config migration path"] {
+            assert!(diagnostic.contains(required), "{diagnostic}");
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_yaml_duplicate_version_keeps_field_name() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("duplicate.yaml");
+    std::fs::write(&path, "version: \"1\"\nversion: \"1\"\nmesh: {}\n").unwrap();
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+        assert!(
+            diagnostic.contains("duplicate field `version`"),
+            "{diagnostic}"
+        );
     }
 }
 

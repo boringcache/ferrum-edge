@@ -16,6 +16,25 @@ use super::plugin_utils::{
 
 const UNICODE_API_KEY: &str = "ユニコード-api-key-value-32chars-min";
 
+#[test]
+fn constructor_type_diagnostics_quote_complete_json_values() {
+    for value in [
+        json!(9876543210u64),
+        json!(["prefix'\"UNREGISTERED_TYPE_TOKEN"]),
+        json!({"nested": "prefix'\"UNREGISTERED_TYPE_TOKEN"}),
+    ] {
+        let error = KeyAuth::new(&json!({"key_location": value})).err().unwrap();
+        let diagnostic = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(
+            diagnostic.contains("`key_location` must be a string"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("<redacted scalar>"), "{diagnostic}");
+        assert!(!diagnostic.contains("9876543210"), "{diagnostic}");
+        assert!(!diagnostic.contains("UNREGISTERED_TYPE_TOKEN"), "{diagnostic}");
+    }
+}
+
 fn create_unicode_key_consumer() -> Consumer {
     let mut keyauth = Map::new();
     keyauth.insert(

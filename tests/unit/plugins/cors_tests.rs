@@ -2021,6 +2021,32 @@ fn test_constructor_rejects_uncompilable_regex_origin() {
 }
 
 #[test]
+fn semantic_cors_diagnostics_withhold_unregistered_values() {
+    let token = "prefix'\"UNREGISTERED_CORS_TOKEN\\tail";
+    let regex_error = CorsPlugin::new(&json!({
+        "allowed_origins": [{"exact": "https://example.com"}, {"regex": format!("{token}[")}]
+    }))
+    .err()
+    .unwrap();
+    assert!(regex_error.contains("allowed_origins[1]"), "{regex_error}");
+    assert!(regex_error.contains("invalid or exceeds"), "{regex_error}");
+    assert!(
+        !regex_error.contains("UNREGISTERED_CORS_TOKEN"),
+        "{regex_error}"
+    );
+
+    for field in ["allowed_methods", "allowed_headers", "exposed_headers"] {
+        let mut config = json!({"allowed_origins": ["https://example.com"]});
+        config[field] = json!([token]);
+        let error = CorsPlugin::new(&config).err().unwrap();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains("invalid HTTP"), "{rendered}");
+        assert!(!rendered.contains("UNREGISTERED_CORS_TOKEN"), "{rendered}");
+    }
+}
+
+#[test]
 fn test_constructor_rejects_empty_prefix_origin() {
     // An empty prefix would match every origin — reject it rather than create
     // an accidental allow-all policy.

@@ -121,8 +121,8 @@ pub fn load_config_backup(
         })?;
     if backup_version != CURRENT_CONFIG_VERSION {
         anyhow::bail!(
-            "Config backup at {path} has unsupported version '{backup_version}' \
-             (current is '{CURRENT_CONFIG_VERSION}'); migrate supported older backups \
+            "Config backup at {path} has unsupported version (<redacted scalar>) \
+             (current is {CURRENT_CONFIG_VERSION}); migrate supported older backups \
              or export a current-version snapshot"
         );
     }

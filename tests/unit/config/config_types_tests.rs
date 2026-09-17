@@ -1048,7 +1048,7 @@ fn mtls_auth_compatibility_rejects_plaintext_and_passthrough_streams() {
 
     let errors = config.validate_mtls_auth_compatibility().unwrap_err();
     assert_eq!(errors.len(), 2);
-    assert!(errors.iter().any(|error| error.contains("Proxy 'plain'")));
+    assert!(errors.iter().any(|error| error.contains("Proxy \"plain\"")));
     assert!(
         errors
             .iter()
@@ -1203,7 +1203,7 @@ fn global_mtls_auth_is_screened_across_namespaces() {
 
     let errors = config.validate_mtls_auth_compatibility().unwrap_err();
     assert!(
-        errors.iter().any(|error| error.contains("Proxy 'plain'")),
+        errors.iter().any(|error| error.contains("Proxy \"plain\"")),
         "a cross-namespace global plugin still applies at runtime and must be screened: {errors:?}"
     );
 }
@@ -1732,7 +1732,7 @@ fn test_quarantine_hmac_strips_weak_secret_and_keeps_strong() {
 
     let messages = config.quarantine_invalid_hmac_credentials();
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(messages[0].contains("consumer \"c1\""));
     assert!(!messages[0].contains(weak));
     assert!(!config.consumers[0].has_credential("hmac_auth"));
     assert!(config.consumers[1].has_credential("hmac_auth"));
@@ -1804,8 +1804,8 @@ fn test_quarantine_hmac_duplicate_secret_first_loaded_consumer_wins() {
 
     let messages = config.quarantine_invalid_hmac_credentials();
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("consumer 'c2'"));
-    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(messages[0].contains("consumer \"c2\""));
+    assert!(messages[0].contains("consumer \"c1\""));
     assert!(!messages[0].contains(secret));
     assert!(config.consumers[0].has_credential("hmac_auth"));
     assert!(!config.consumers[1].has_credential("hmac_auth"));
@@ -2585,8 +2585,8 @@ fn test_quarantine_colliding_consumers_keeps_first_loaded() {
     let messages = config.quarantine_colliding_consumer_identities();
 
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("Quarantined consumer 'c2'"));
-    assert!(messages[0].contains("custom_id 'alice'"));
+    assert!(messages[0].contains("Quarantined consumer \"c2\""));
+    assert!(messages[0].contains("custom_id \"alice\""));
     assert_eq!(config.consumers.len(), 1);
     assert_eq!(config.consumers[0].id, "c1");
 }
@@ -2642,7 +2642,7 @@ fn test_quarantine_id_vs_username_collision() {
     let messages = config.quarantine_colliding_consumer_identities();
 
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("Quarantined consumer 'c2'"));
+    assert!(messages[0].contains("Quarantined consumer \"c2\""));
     assert_eq!(config.consumers.len(), 1);
 }
 
@@ -2669,7 +2669,7 @@ fn test_unique_upstream_names_duplicate() {
     config.upstreams = vec![u1, u2];
     let err = config.validate_unique_upstream_names().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate upstream name 'backend-api'"));
+    assert!(err[0].contains("Duplicate upstream name \"backend-api\""));
 }
 
 #[test]
@@ -2705,7 +2705,7 @@ fn test_unique_proxy_names_duplicate() {
     config.proxies = vec![p1, p2];
     let err = config.validate_unique_proxy_names().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate proxy name 'my-proxy'"));
+    assert!(err[0].contains("Duplicate proxy name \"my-proxy\""));
 }
 
 #[test]
@@ -2738,7 +2738,7 @@ fn test_upstream_references_missing() {
     config.proxies = vec![p1];
     let err = config.validate_upstream_references().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("non-existent upstream_id 'nonexistent'"));
+    assert!(err[0].contains("non-existent upstream_id \"nonexistent\""));
 }
 
 #[test]
@@ -4252,7 +4252,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
     let errs = config.validate_plugin_references().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("targeted to proxy 'other-proxy'"))
+            .any(|e| e.contains("targeted to proxy \"other-proxy\""))
     );
 }
 
@@ -4516,7 +4516,7 @@ fn test_validate_unique_resource_ids_duplicate_proxy() {
     config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p1", "/web")];
     let err = config.validate_unique_resource_ids().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate proxy ID 'p1'"));
+    assert!(err[0].contains("Duplicate proxy ID \"p1\""));
     assert!(err[0].contains("namespace"));
 }
 
@@ -4526,7 +4526,7 @@ fn test_validate_unique_resource_ids_duplicate_consumer() {
     config.consumers = vec![make_consumer("c1", "alice"), make_consumer("c1", "bob")];
     let err = config.validate_unique_resource_ids().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate consumer ID 'c1'"));
+    assert!(err[0].contains("Duplicate consumer ID \"c1\""));
 }
 
 #[test]
@@ -4593,7 +4593,7 @@ fn test_validate_upstream_references_rejects_cross_namespace_same_id() {
     let err = config.validate_upstream_references().unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.contains("non-existent upstream_id 'u1'")),
+            .any(|e| e.contains("non-existent upstream_id \"u1\"")),
         "expected dangling same-namespace upstream rejection, got {err:?}"
     );
 }

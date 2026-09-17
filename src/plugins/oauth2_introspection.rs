@@ -2011,7 +2011,8 @@ fn optional_non_empty_string(
     };
     let raw = value.as_str().ok_or_else(|| {
         format!(
-            "oauth2_introspection: 'provider[{provider_idx}].{field}' must be a string, got: {value}"
+            "oauth2_introspection: `provider[{provider_idx}].{field}` must be a string, got: {value:?}",
+            value = value.to_string()
         )
     })?;
     let trimmed = raw.trim();

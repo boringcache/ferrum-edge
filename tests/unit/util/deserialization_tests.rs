@@ -14,6 +14,22 @@ use ferrum_edge::util::json_object::{
 use serde::Deserialize;
 
 #[test]
+fn yaml_duplicate_keys_keep_field_metadata() {
+    let error = from_yaml_str::<ferrum_edge::config::types::GatewayConfig>(
+        "version: \"1\"\nversion: \"1\"\nmesh: {}\n",
+    )
+    .unwrap_err();
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("duplicate field `version`"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains(REDACTED_SCALAR), "{diagnostic}");
+    let rendered = ferrum_edge::startup::render_startup_error(error.into(), &[]);
+    assert!(rendered.contains("duplicate field `version`"), "{rendered}");
+}
+
+#[test]
 fn serde_message_families_keep_structure_without_offending_scalars() {
     let cases = [
         (

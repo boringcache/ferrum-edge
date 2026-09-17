@@ -624,7 +624,7 @@ fn required_positive_usize(config: &Value, key: &str, default: usize) -> Result<
         ));
     }
     usize::try_from(value)
-        .map_err(|_| format!("api_chargeback: '{key}' ({value}) exceeds this platform's usize"))
+        .map_err(|_| format!("api_chargeback: '{key}' (\"{value}\") exceeds this platform's usize"))
 }
 
 /// Resolve enabled chargeback plugin configs that the plugin cache would

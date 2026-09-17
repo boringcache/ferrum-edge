@@ -1,5 +1,6 @@
 use crate::config::BackendEgressPolicy;
 use crate::config::types::{CountryMmdbValidationGeneration, GatewayConfig};
+use crate::util::deserialization::sanitize_custom_message;
 use tracing::{error, warn};
 
 pub(crate) enum ValidationAction<'a> {
@@ -634,7 +635,7 @@ impl<'a> ValidationPipeline<'a> {
                                 backend_allow_ips,
                             ) {
                                 let message = format!(
-                                    "Plugin '{}' (id={}): {}",
+                                    "Plugin {:?} (id={:?}): {}",
                                     plugin_config.plugin_name, plugin_config.id, err
                                 );
                                 if !matches!(&action, ValidationAction::Collect)
@@ -644,7 +645,10 @@ impl<'a> ValidationPipeline<'a> {
                                         crate::plugins::PluginFailurePolicy::OptionalFailOpen,
                                     )
                                 {
-                                    warn!("Optional plugin config validation warning: {}", message);
+                                    warn!(
+                                        "Optional plugin config validation warning: {}",
+                                        sanitize_custom_message(&message)
+                                    );
                                 } else {
                                     errors.push(message);
                                 }
@@ -660,14 +664,17 @@ impl<'a> ValidationPipeline<'a> {
                             )
                         {
                             let message = format!(
-                                "Plugin '{}' (id={}): {}",
+                                "Plugin {:?} (id={:?}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err
                             );
                             if !matches!(&action, ValidationAction::Collect)
                                 && crate::plugins::plugin_failure_policy(&plugin_config.plugin_name)
                                     == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen)
                             {
-                                warn!("Optional plugin config validation warning: {}", message);
+                                warn!(
+                                    "Optional plugin config validation warning: {}",
+                                    sanitize_custom_message(&message)
+                                );
                             } else {
                                 errors.push(message);
                             }
@@ -730,7 +737,7 @@ fn handle_validation_errors(
         }
         ValidationAction::Warn => {
             for message in &errors {
-                warn!("{}", message);
+                warn!("{}", sanitize_custom_message(message));
             }
             Ok(())
         }
@@ -740,7 +747,7 @@ fn handle_validation_errors(
                 "FatalCount template must include a '{{}}' placeholder"
             );
             for message in &errors {
-                error!("{}", message);
+                error!("{}", sanitize_custom_message(message));
             }
             let summary = template.replacen("{}", &errors.len().to_string(), 1);
             anyhow::bail!(summary);

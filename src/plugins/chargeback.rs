@@ -184,7 +184,7 @@ pub mod pricing {
     pub fn checked_mul_quantity(quantity: u64, unit_price: f64) -> Result<f64, String> {
         if !unit_price.is_finite() || unit_price < 0.0 {
             return Err(format!(
-                "chargeback unit price must be a finite non-negative number, got {unit_price}"
+                "chargeback unit price must be a finite non-negative number, got \"{unit_price}\""
             ));
         }
         let product = quantity as f64 * unit_price;
@@ -328,7 +328,7 @@ pub mod pricing {
         if number > MAX_UNIT_PRICE {
             return Err(format!(
                 "{plugin_name}: '{ctx}' must be a finite non-negative number \
-                 no greater than {MAX_UNIT_PRICE}, got {number}"
+                 no greater than {MAX_UNIT_PRICE}, got \"{number}\""
             ));
         }
         // Reject rates whose product with the largest supported counter cannot
@@ -336,7 +336,7 @@ pub mod pricing {
         // (defensive against future bound tweaks / unusual float quirks).
         let _ = checked_mul_quantity(u64::MAX, number).map_err(|_| {
             format!(
-                "{plugin_name}: '{ctx}'={number} overflows when multiplied by \
+                "{plugin_name}: `{ctx}`=\"{number}\" overflows when multiplied by \
                  the maximum supported counter (u64::MAX)"
             )
         })?;

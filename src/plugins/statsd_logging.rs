@@ -611,7 +611,7 @@ impl StatsdLogging {
         };
         if port == 0 || port > 65535 {
             return Err(format!(
-                "statsd_logging: 'port' must be between 1 and 65535 (got {port})"
+                "statsd_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
             ));
         }
 

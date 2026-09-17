@@ -1037,6 +1037,21 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
         )?;
     }
 
+    // Check the configured fallback document without connecting to a database.
+    // Run uses this same loader when database startup falls back to the backup.
+    if env_config.mode == OperatingMode::Database
+        && let Some(path) = env_config.db_config_backup_path.as_deref()
+    {
+        crate::config::config_backup::load_config_backup(path, &env_config.namespace).map_err(
+            |error| {
+                format!(
+                    "Config backup validation failed: {}",
+                    render_startup_error(error, &[])
+                )
+            },
+        )?;
+    }
+
     // Env-level TLS/security surfaces that `run` hard-fails on must also fail
     // `validate`. Shared loaders in `modes::startup_security` are side-effect
     // free (no binds, no servers, no store mutation, no random JWT mint).

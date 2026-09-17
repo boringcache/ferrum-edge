@@ -93,7 +93,12 @@ pub fn parse_claim_headers(
     };
     let object = value
         .as_object()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be an object, got: {value}"))?;
+        .ok_or_else(|| {
+            format!(
+                "{plugin}: `{field}` must be an object, got: {value:?}",
+                value = value.to_string()
+            )
+        })?;
     let mut mappings = Vec::with_capacity(object.len());
     for (claim_path, header_value) in object {
         let parsed_claim_path = parse_claim_path_value(
@@ -141,7 +146,12 @@ pub fn parse_claim_header_list(
     };
     let entries = value
         .as_array()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be an array, got: {value}"))?;
+        .ok_or_else(|| {
+            format!(
+                "{plugin}: `{field}` must be an array, got: {value:?}",
+                value = value.to_string()
+            )
+        })?;
     if entries.len() > MAX_OUTPUT_CLAIM_HEADERS {
         return Err(format!(
             "{plugin}: '{field}' supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
@@ -384,7 +394,12 @@ pub fn parse_separator(
     };
     let raw = value
         .as_str()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be a string, got: {value}"))?;
+        .ok_or_else(|| {
+            format!(
+                "{plugin}: `{field}` must be a string, got: {value:?}",
+                value = value.to_string()
+            )
+        })?;
     if raw.is_empty() {
         return Err(format!("{plugin}: '{field}' must not be empty"));
     }

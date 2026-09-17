@@ -215,7 +215,10 @@ impl CompiledConditions {
                     // semantics because they short-circuit the entire WAF.
                     Regex::new(regex)
                         .map(PathMatcher::Regex)
-                        .map_err(|e| format!("waf: invalid conditions.paths regex: {e}"))
+                        .map_err(|_| {
+                            "waf: invalid conditions.paths regex or complexity limit exceeded"
+                                .to_string()
+                        })
                 } else if let Some(prefix) = pattern.strip_suffix('*') {
                     Ok(PathMatcher::Prefix(prefix.to_string()))
                 } else {
@@ -898,9 +901,10 @@ fn compile_json_path_rule(
             let pattern = rule_pattern(rule);
             Regex::new(&pattern)
                 .map(JsonPathMatcher::Regex)
-                .map_err(|e| {
+                .map_err(|_| {
                     format!(
-                        "waf: failed to compile body_json_path pattern for rule '{}': {e}",
+                        "waf: failed to compile body_json_path pattern for rule {:?} \
+                         (invalid regex or complexity limit exceeded)",
                         rule.id
                     )
                 })?
@@ -1010,7 +1014,8 @@ pub(super) fn parse_rule_overrides(
             Ok(out)
         }
         Some(other) => Err(format!(
-            "waf: 'rule_overrides' must be an object, got {other}"
+            "waf: `rule_overrides` must be an object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -1206,7 +1211,10 @@ fn optional_string(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
         Some(Value::String(_)) => Err(format!("waf: '{key}' must be non-empty")),
-        Some(other) => Err(format!("waf: '{key}' must be a string, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1218,7 +1226,10 @@ fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Opt
             .and_then(|v| u8::try_from(v).ok())
             .map(Some)
             .ok_or_else(|| format!("waf: '{key}' must be an integer from 0 to 255")),
-        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an integer, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1230,7 +1241,10 @@ fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
             .and_then(|v| u32::try_from(v).ok())
             .map(Some)
             .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
-        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an integer, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1253,7 +1267,10 @@ fn optional_string_vec(
             }
             Ok(Some(parsed))
         }
-        Some(other) => Err(format!("waf: '{key}' must be an array, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an array, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 

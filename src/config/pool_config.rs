@@ -181,11 +181,11 @@ fn range_err(
     min: impl std::fmt::Display,
     max: impl std::fmt::Display,
 ) -> String {
-    format!("{key} must be between {min} and {max} (got {value})")
+    format!("{key} must be between {min} and {max} (got \"{value}\")")
 }
 
 fn min_err(key: &str, value: impl std::fmt::Display, min: impl std::fmt::Display) -> String {
-    format!("{key} must be at least {min} (got {value})")
+    format!("{key} must be at least {min} (got \"{value}\")")
 }
 
 impl PoolConfig {

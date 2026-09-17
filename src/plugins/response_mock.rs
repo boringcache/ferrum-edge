@@ -216,8 +216,10 @@ impl ResponseMock {
                     ));
                 }
                 let anchored = crate::config::types::anchor_regex_pattern(pattern);
-                let re = Regex::new(&anchored).map_err(|e| {
-                    format!("response_mock: rule[{i}] invalid regex '{pattern}': {e}")
+                let re = Regex::new(&anchored).map_err(|_| {
+                    format!(
+                        "response_mock: rule[{i}].path: invalid regex or complexity limit exceeded"
+                    )
                 })?;
                 PathMatcher::Regex(re)
             } else {

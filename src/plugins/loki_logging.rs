@@ -711,7 +711,7 @@ fn validate_loki_label_name(name: &str) -> Result<(), String> {
         || name == LOKI_EMITTER_LABEL
     {
         return Err(format!(
-            "loki_logging: invalid or reserved label name '{name}'"
+            "loki_logging: invalid or reserved label name {name:?}"
         ));
     }
     Ok(())

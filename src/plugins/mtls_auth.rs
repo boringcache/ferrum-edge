@@ -988,7 +988,12 @@ fn string_field(
     };
     let raw = value
         .as_str()
-        .ok_or_else(|| format!("mtls_auth: '{context}.{key}' must be a string, got: {value}"))?;
+        .ok_or_else(|| {
+            format!(
+                "mtls_auth: `{context}.{key}` must be a string, got: {value:?}",
+                value = value.to_string()
+            )
+        })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("mtls_auth: '{context}.{key}' must not be empty"));
@@ -1000,10 +1005,11 @@ fn parse_cert_field(config: &Value) -> Result<CertField, String> {
     match config.get("cert_field") {
         None => Ok(CertField::SubjectCn),
         Some(Value::String(value)) => CertField::from_str(value).ok_or_else(|| {
-            format!("mtls_auth: 'cert_field' must be a supported certificate field, got: {value:?}")
+            format!("mtls_auth: `cert_field` must be a supported certificate field, got: {value:?}")
         }),
         Some(other) => Err(format!(
-            "mtls_auth: 'cert_field' must be a string, got: {other}"
+            "mtls_auth: `cert_field` must be a string, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -1016,7 +1022,10 @@ fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
             return Err("mtls_auth: 'allowed_issuers' must be an array, got: null".to_string());
         }
         let arr = value.as_array().ok_or_else(|| {
-            format!("mtls_auth: 'allowed_issuers' must be an array, got: {value}")
+            format!(
+                "mtls_auth: `allowed_issuers` must be an array, got: {value:?}",
+                value = value.to_string()
+            )
         })?;
         if arr.is_empty() {
             return Err(
@@ -1047,7 +1056,10 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
     }
 
     let arr = value.as_array().ok_or_else(|| {
-        format!("mtls_auth: 'allowed_ca_fingerprints_sha256' must be an array, got: {value}")
+        format!(
+            "mtls_auth: `allowed_ca_fingerprints_sha256` must be an array, got: {value:?}",
+            value = value.to_string()
+        )
     })?;
     if arr.is_empty() {
         return Err(
@@ -1059,7 +1071,8 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
     for (idx, entry) in arr.iter().enumerate() {
         let raw = entry.as_str().ok_or_else(|| {
             format!(
-                "mtls_auth: 'allowed_ca_fingerprints_sha256[{idx}]' must be a string, got: {entry}"
+                "mtls_auth: `allowed_ca_fingerprints_sha256[{idx}]` must be a string, got: {entry:?}",
+                entry = entry.to_string()
             )
         })?;
         let trimmed = raw.trim();

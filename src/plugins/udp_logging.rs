@@ -268,7 +268,7 @@ fn parse_udp_logging_config(
     })?;
     if port == 0 || port > 65535 {
         return Err(format!(
-            "udp_logging: 'port' must be between 1 and 65535 (got {port})"
+            "udp_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
         ));
     }
 
@@ -376,7 +376,7 @@ pub(crate) fn materialize_dtls_material(
             roots
         };
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| format!("udp_logging: invalid DTLS server name: {host}"))?;
+            .map_err(|_| format!("udp_logging: invalid DTLS server name: {host:?}"))?;
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
         (

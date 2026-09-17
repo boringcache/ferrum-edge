@@ -4063,7 +4063,7 @@ impl GatewayConfig {
         for proxy in &self.proxies {
             for host in &proxy.hosts {
                 if let Err(msg) = validate_host_entry(host) {
-                    errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+                    errors.push(format!("Proxy {:?}: {}", proxy.id, msg));
                 }
             }
         }
@@ -4093,16 +4093,16 @@ impl GatewayConfig {
             if let Some(pattern) = path.strip_prefix('~') {
                 if pattern.is_empty() {
                     errors.push(format!(
-                        "Proxy '{}': regex listen_path '~' has empty pattern",
+                        "Proxy {:?}: regex listen_path '~' has empty pattern",
                         proxy.id
                     ));
                     continue;
                 }
                 let anchored = anchor_regex_pattern(pattern);
-                if let Err(e) = Regex::new(&anchored) {
+                if Regex::new(&anchored).is_err() {
                     errors.push(format!(
-                        "Proxy '{}': invalid regex listen_path '{}': {}",
-                        proxy.id, path, e
+                        "Proxy {:?}: invalid regex listen_path or complexity limit exceeded",
+                        proxy.id
                     ));
                 }
             }
@@ -4138,7 +4138,7 @@ impl GatewayConfig {
             };
             if let Some(reason) = non_canonical_listen_path_reason(path) {
                 errors.push(format!(
-                    "Proxy '{}': listen_path '{}' is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
+                    "Proxy {:?}: listen_path {:?} is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
                     proxy.id, path, reason
                 ));
             }
@@ -4610,8 +4610,8 @@ impl GatewayConfig {
             match conflict {
                 Some((field, value, other_id, other_field)) => {
                     messages.push(format!(
-                        "Quarantined consumer '{}': its {} '{}' collides with the {} of \
-                         consumer '{}' — the consumer is excluded from this config load to \
+                        "Quarantined consumer {:?}: its {} {:?} collides with the {} of \
+                         consumer {:?} — the consumer is excluded from this config load to \
                          prevent incorrect JWKS/JWT authentication. Repair the stored \
                          consumer records to restore it.",
                         consumer.id, field, value, other_field, other_id
@@ -4641,7 +4641,7 @@ impl GatewayConfig {
                     && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
                 {
                     duplicates.push(format!(
-                        "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                        "Duplicate mtls_auth identity {:?} in consumer {:?} (conflicts with consumer {:?})",
                         identity, consumer.id, existing_id
                     ));
                 }
@@ -4673,7 +4673,7 @@ impl GatewayConfig {
                     && existing_id != consumer.id
                 {
                     duplicates.push(format!(
-                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}' in namespace '{}')",
+                        "Duplicate hmac_auth shared secret in consumer {:?} (conflicts with consumer {:?} in namespace {:?})",
                         consumer.id, existing_id, consumer.namespace
                     ));
                 }
@@ -4738,7 +4738,7 @@ impl GatewayConfig {
             let Some(secrets) = secrets else {
                 consumer.credentials.remove("hmac_auth");
                 messages.push(format!(
-                    "Quarantined hmac_auth credential of consumer '{}': a stored entry \
+                    "Quarantined hmac_auth credential of consumer {:?}: a stored entry \
                      is malformed or its secret has fewer than {} non-whitespace \
                      characters — the credential is excluded from this config load so \
                      the weak secret cannot authenticate. Repair the stored credential \
@@ -4756,9 +4756,9 @@ impl GatewayConfig {
                     let other_id = other_id.clone();
                     consumer.credentials.remove("hmac_auth");
                     messages.push(format!(
-                        "Quarantined hmac_auth credential of consumer '{}': its shared \
-                         secret is also claimed by consumer '{}' in namespace '{}' — the credential is \
-                         excluded from this config load to prevent cross-Consumer \
+                        "Quarantined hmac_auth credential of consumer {:?}: its shared \
+                         secret is also claimed by consumer {:?} in namespace {:?} — the \
+                         credential is excluded from this config load to prevent cross-Consumer \
                          signature forgery. Rotate one of the secrets to restore it.",
                         consumer.id, other_id, consumer.namespace
                     ));
@@ -4810,7 +4810,7 @@ impl GatewayConfig {
                 {
                     // Do NOT include the API key value in the error message for security
                     duplicates.push(format!(
-                        "Duplicate keyauth API key in consumer '{}' (conflicts with consumer '{}')",
+                        "Duplicate keyauth API key in consumer {:?} (conflicts with consumer {:?})",
                         consumer.id, existing_id
                     ));
                 }
@@ -4821,7 +4821,7 @@ impl GatewayConfig {
                 && let Some(existing_id) = seen_basicauth.insert(&consumer.username, &consumer.id)
             {
                 duplicates.push(format!(
-                    "Duplicate basicauth username '{}' in consumer '{}' (conflicts with consumer '{}')",
+                    "Duplicate basicauth username {:?} in consumer {:?} (conflicts with consumer {:?})",
                     consumer.username, consumer.id, existing_id
                 ));
             }
@@ -4860,7 +4860,7 @@ impl GatewayConfig {
                     seen_dns.insert(identity.to_ascii_lowercase(), &consumer.id)
                 {
                     duplicates.push(format!(
-                        "Duplicate mtls_auth DNS identity '{}' (ASCII case-insensitive) in consumer '{}' (conflicts with consumer '{}')",
+                        "Duplicate mtls_auth DNS identity {:?} (ASCII case-insensitive) in consumer {:?} (conflicts with consumer {:?})",
                         identity, consumer.id, existing_id
                     ));
                 }
@@ -4956,7 +4956,7 @@ impl GatewayConfig {
                 && let Some(existing_id) = seen.insert(name.as_str(), &upstream.id)
             {
                 duplicates.push(format!(
-                    "Duplicate upstream name '{}' in upstream '{}' (conflicts with '{}')",
+                    "Duplicate upstream name {:?} in upstream {:?} (conflicts with {:?})",
                     name, upstream.id, existing_id
                 ));
             }
@@ -4982,7 +4982,7 @@ impl GatewayConfig {
                 && let Some(existing_id) = seen.insert(name.as_str(), &proxy.id)
             {
                 duplicates.push(format!(
-                    "Duplicate proxy name '{}' in proxy '{}' (conflicts with '{}')",
+                    "Duplicate proxy name {:?} in proxy {:?} (conflicts with {:?})",
                     name, proxy.id, existing_id
                 ));
             }
@@ -5033,7 +5033,7 @@ impl GatewayConfig {
                             });
                             if !subset_exists {
                                 errors.push(format!(
-                                    "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
+                                    "Proxy {:?} references upstream_subset {:?} that is not defined on upstream_id {:?}",
                                     proxy.id, subset_name, uid
                                 ));
                             }
@@ -5041,7 +5041,7 @@ impl GatewayConfig {
                     }
                     None => {
                         errors.push(format!(
-                            "Proxy '{}' references non-existent upstream_id '{}'",
+                            "Proxy {:?} references non-existent upstream_id {:?}",
                             proxy.id, uid
                         ));
                     }
@@ -5111,13 +5111,13 @@ impl GatewayConfig {
             if plugin.plugin_name == "transaction_log_schema" && plugin.scope != PluginScope::Global
             {
                 errors.push(format!(
-                    "PluginConfig '{}' (transaction_log_schema) must have scope 'global'",
+                    "PluginConfig {:?} (transaction_log_schema) must have scope 'global'",
                     plugin.id
                 ));
             }
             if plugin.plugin_name == "prometheus_metrics" && plugin.scope != PluginScope::Global {
                 errors.push(format!(
-                    "PluginConfig '{}' (prometheus_metrics) must have scope 'global'",
+                    "PluginConfig {:?} (prometheus_metrics) must have scope 'global'",
                     plugin.id
                 ));
             }
@@ -5128,13 +5128,13 @@ impl GatewayConfig {
             if let Some(trigger) = plugin.trigger.as_ref()
                 && let Err(error) = trigger.validate()
             {
-                errors.push(format!("PluginConfig '{}': {}", plugin.id, error));
+                errors.push(format!("PluginConfig {:?}: {}", plugin.id, error));
             }
             match plugin.scope {
                 PluginScope::Global => {
                     if plugin.proxy_id.is_some() {
                         errors.push(format!(
-                            "PluginConfig '{}' with scope 'global' must not have proxy_id",
+                            "PluginConfig {:?} with scope 'global' must not have proxy_id",
                             plugin.id
                         ));
                     }
@@ -5143,20 +5143,20 @@ impl GatewayConfig {
                     Some(proxy_id) => {
                         if !proxy_keys.contains(&(plugin.namespace.as_str(), proxy_id)) {
                             errors.push(format!(
-                                "PluginConfig '{}' references non-existent proxy_id '{}'",
+                                "PluginConfig {:?} references non-existent proxy_id {:?}",
                                 plugin.id, proxy_id
                             ));
                         }
                     }
                     None => errors.push(format!(
-                        "PluginConfig '{}' with scope 'proxy' must have proxy_id",
+                        "PluginConfig {:?} with scope 'proxy' must have proxy_id",
                         plugin.id
                     )),
                 },
                 PluginScope::ProxyGroup => {
                     if plugin.proxy_id.is_some() {
                         errors.push(format!(
-                            "PluginConfig '{}' with scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)",
+                            "PluginConfig {:?} with scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)",
                             plugin.id
                         ));
                     }
@@ -5169,7 +5169,7 @@ impl GatewayConfig {
             for assoc in &proxy.plugins {
                 if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
                     errors.push(format!(
-                        "Proxy '{}' references plugin_config '{}' more than once",
+                        "Proxy {:?} references plugin_config {:?} more than once",
                         proxy.id, assoc.plugin_config_id
                     ));
                 }
@@ -5180,14 +5180,14 @@ impl GatewayConfig {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
+                                "Proxy {:?} references plugin_config {:?} with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
                                 proxy.id, plugin.id,
                             ));
                         }
                         PluginScope::Proxy => {
                             if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) {
                                 errors.push(format!(
-                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    "Proxy {:?} references plugin_config {:?} targeted to proxy {:?}",
                                     proxy.id,
                                     plugin.id,
                                     plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -5200,7 +5200,7 @@ impl GatewayConfig {
                         }
                     },
                     None => errors.push(format!(
-                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        "Proxy {:?} references non-existent plugin_config {:?}",
                         proxy.id, assoc.plugin_config_id
                     )),
                 }
@@ -5230,7 +5230,7 @@ impl GatewayConfig {
                 errors.push(format!("Proxy ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&proxy.namespace) {
-                errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+                errors.push(format!("Proxy {:?}: {}", proxy.id, msg));
             }
         }
         for consumer in &self.consumers {
@@ -5238,7 +5238,7 @@ impl GatewayConfig {
                 errors.push(format!("Consumer ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&consumer.namespace) {
-                errors.push(format!("Consumer '{}': {}", consumer.id, msg));
+                errors.push(format!("Consumer {:?}: {}", consumer.id, msg));
             }
         }
         for pc in &self.plugin_configs {
@@ -5246,7 +5246,7 @@ impl GatewayConfig {
                 errors.push(format!("PluginConfig ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&pc.namespace) {
-                errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+                errors.push(format!("PluginConfig {:?}: {}", pc.id, msg));
             }
         }
         for upstream in &self.upstreams {
@@ -5254,7 +5254,7 @@ impl GatewayConfig {
                 errors.push(format!("Upstream ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&upstream.namespace) {
-                errors.push(format!("Upstream '{}': {}", upstream.id, msg));
+                errors.push(format!("Upstream {:?}: {}", upstream.id, msg));
             }
         }
 
@@ -5279,7 +5279,7 @@ impl GatewayConfig {
         for proxy in &self.proxies {
             if !seen_proxy_ids.insert((&proxy.namespace, &proxy.id)) {
                 errors.push(format!(
-                    "Duplicate proxy ID '{}' in namespace '{}'",
+                    "Duplicate proxy ID {:?} in namespace {:?}",
                     proxy.id, proxy.namespace
                 ));
             }
@@ -5289,7 +5289,7 @@ impl GatewayConfig {
         for consumer in &self.consumers {
             if !seen_consumer_ids.insert((&consumer.namespace, &consumer.id)) {
                 errors.push(format!(
-                    "Duplicate consumer ID '{}' in namespace '{}'",
+                    "Duplicate consumer ID {:?} in namespace {:?}",
                     consumer.id, consumer.namespace
                 ));
             }
@@ -5299,7 +5299,7 @@ impl GatewayConfig {
         for pc in &self.plugin_configs {
             if !seen_plugin_ids.insert((&pc.namespace, &pc.id)) {
                 errors.push(format!(
-                    "Duplicate plugin_config ID '{}' in namespace '{}'",
+                    "Duplicate plugin_config ID {:?} in namespace {:?}",
                     pc.id, pc.namespace
                 ));
             }
@@ -5309,7 +5309,7 @@ impl GatewayConfig {
         for upstream in &self.upstreams {
             if !seen_upstream_ids.insert((&upstream.namespace, &upstream.id)) {
                 errors.push(format!(
-                    "Duplicate upstream ID '{}' in namespace '{}'",
+                    "Duplicate upstream ID {:?} in namespace {:?}",
                     upstream.id, upstream.namespace
                 ));
             }
@@ -5349,14 +5349,14 @@ impl GatewayConfig {
                 match proxy.listen_port {
                     None => {
                         errors.push(format!(
-                            "Stream proxy '{}' (scheme {}) must have a listen_port",
+                            "Stream proxy {:?} (scheme {}) must have a listen_port",
                             proxy.id,
                             proxy.scheme_display()
                         ));
                     }
                     Some(port) if port < 1 => {
                         errors.push(format!(
-                            "Stream proxy '{}' has invalid listen_port {} (must be >= 1)",
+                            "Stream proxy {:?} has invalid listen_port {} (must be >= 1)",
                             proxy.id, port
                         ));
                     }
@@ -5372,7 +5372,7 @@ impl GatewayConfig {
                 // the port. Reject with a field-specific diagnostic instead.
                 if !proxy.hosts.is_empty() && !proxy.joins_opaque_tls_sni_plane() {
                     errors.push(format!(
-                        "Stream proxy '{}' (scheme {}) sets hosts but cannot route by SNI — \
+                        "Stream proxy {:?} (scheme {}) sets hosts but cannot route by SNI — \
                          hosts is a TLS server_name predicate and requires an opaque listener \
                          (passthrough: true, or backend_scheme tcp with frontend_tls: false)",
                         proxy.id,
@@ -5383,7 +5383,7 @@ impl GatewayConfig {
                 && port == 0
             {
                 errors.push(format!(
-                    "HTTP proxy '{}' has invalid listen_port {} (must be >= 1)",
+                    "HTTP proxy {:?} has invalid listen_port {} (must be >= 1)",
                     proxy.id, port
                 ));
             }
@@ -5394,7 +5394,7 @@ impl GatewayConfig {
             // still rejected.
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
-                    "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
+                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
                      valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
                      the client IP from X-Forwarded-For",
                     proxy.id,
@@ -5409,7 +5409,7 @@ impl GatewayConfig {
                 );
                 if !is_tcp_stream {
                     errors.push(format!(
-                        "Proxy '{}' (scheme {}) sets backend_proxy_protocol but outbound PROXY \
+                        "Proxy {:?} (scheme {}) sets backend_proxy_protocol but outbound PROXY \
                          protocol is only valid for tcp/tcps stream proxies",
                         proxy.id,
                         proxy.scheme_display()
@@ -5614,7 +5614,7 @@ impl GatewayConfig {
                         continue;
                     }
                     errors.push(format!(
-                        "SNI-routed proxies '{}' and '{}' on port {} have overlapping hosts — \
+                        "SNI-routed proxies {:?} and {:?} on port {} have overlapping hosts — \
                          each SNI hostname must route to exactly one matcher-free proxy (or ordered stream_match criteria)",
                         a.id, b.id, port
                     ));
@@ -5645,7 +5645,7 @@ impl GatewayConfig {
                 && reserved_ports.contains(&port)
             {
                 errors.push(format!(
-                    "Stream proxy '{}' listen_port {} conflicts with a gateway reserved port \
+                    "Stream proxy {:?} listen_port {} conflicts with a gateway reserved port \
                      (proxy/admin/gRPC listener)",
                     proxy.id, port
                 ));
@@ -5690,7 +5690,7 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     }
     if host.len() > MAX_HOST_LENGTH {
         return Err(format!(
-            "host '{}' must not exceed {} characters (got {})",
+            "host {:?} must not exceed {} characters (got {})",
             host,
             MAX_HOST_LENGTH,
             host.len()
@@ -5698,44 +5698,44 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     }
     if host.trim() != host {
         return Err(format!(
-            "host '{}' must not have leading or trailing whitespace",
+            "host {:?} must not have leading or trailing whitespace",
             host
         ));
     }
     if host.contains("://") {
         return Err(format!(
-            "host '{}' must not contain a scheme (e.g., 'http://')",
+            "host {:?} must not contain a scheme (e.g., 'http://')",
             host
         ));
     }
     if host.contains(':') && !host.starts_with('*') {
-        return Err(format!("host '{}' must not contain a port number", host));
+        return Err(format!("host {:?} must not contain a port number", host));
     }
     if host.contains('/') {
-        return Err(format!("host '{}' must not contain a path", host));
+        return Err(format!("host {:?} must not contain a path", host));
     }
     if host != host.to_lowercase() {
         return Err(format!(
-            "host '{}' must be lowercase (got mixed case)",
+            "host {:?} must be lowercase (got mixed case)",
             host
         ));
     }
     if let Some(wildcard_suffix) = host.strip_prefix("*.") {
         if !WILDCARD_HOST_REGEX.is_match(host) {
             return Err(format!(
-                "wildcard host '{}' is invalid: must be '*.domain.tld' format",
+                "wildcard host {:?} is invalid: must be '*.domain.tld' format",
                 host
             ));
         }
         validate_hostname_labels(wildcard_suffix, host)?;
     } else if host.contains('*') {
         return Err(format!(
-            "host '{}' has invalid wildcard: '*' is only allowed as prefix '*.domain'",
+            "host {:?} has invalid wildcard: '*' is only allowed as prefix '*.domain'",
             host
         ));
     } else if !HOST_REGEX.is_match(host) {
         return Err(format!(
-            "host '{}' is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
+            "host {:?} is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
             host
         ));
     } else {
@@ -5747,11 +5747,11 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
 fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String> {
     for label in hostname.split('.') {
         if label.is_empty() {
-            return Err(format!("host '{}' must not contain empty labels", original));
+            return Err(format!("host {:?} must not contain empty labels", original));
         }
         if label.len() > 63 {
             return Err(format!(
-                "host '{}' contains a label longer than 63 characters",
+                "host {:?} contains a label longer than 63 characters",
                 original
             ));
         }
@@ -5765,7 +5765,7 @@ fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String
             .is_some_and(|b| b.is_ascii_alphanumeric());
         if !starts_alnum || !ends_alnum {
             return Err(format!(
-                "host '{}' labels must start and end with an alphanumeric character",
+                "host {:?} labels must start and end with an alphanumeric character",
                 original
             ));
         }
@@ -6071,7 +6071,7 @@ fn validate_system_trust_roots_source_field(
     }
     if value != crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE {
         return Err(format!(
-            "{field_name} system trust-roots source must be exactly '{}' with no path or query options (got '{value}')",
+            "{field_name} system trust-roots source must be exactly '{}' with no path or query options (got {value:?})",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
         ));
     }

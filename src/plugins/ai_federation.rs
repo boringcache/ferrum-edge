@@ -1213,20 +1213,20 @@ impl AiFederation {
             }
             if !provider_names.insert(name.clone()) {
                 return Err(format!(
-                    "ai_federation: provider name '{name}' is duplicated"
+                    "ai_federation: provider name {name:?} is duplicated"
                 ));
             }
 
             validate_provider_field_types(pv)?;
 
             let provider_type_str = optional_str(pv, "provider_type")?.ok_or(format!(
-                "ai_federation: provider '{name}' missing 'provider_type'"
+                "ai_federation: provider {name:?} missing 'provider_type'"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
 
             let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
             let priority = u32::try_from(priority_u64)
-                .map_err(|_| format!("ai_federation: provider '{name}' priority is too large"))?;
+                .map_err(|_| format!("ai_federation: provider {name:?} priority is too large"))?;
 
             let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
             if model_patterns.len() > MAX_MODEL_PATTERNS_PER_PROVIDER
@@ -1235,7 +1235,7 @@ impl AiFederation {
                     .any(|pattern| !is_valid_model_pattern(pattern))
             {
                 return Err(format!(
-                    "ai_federation: provider '{name}' model_patterns must contain at most {MAX_MODEL_PATTERNS_PER_PROVIDER} bounded model globs"
+                    "ai_federation: provider {name:?} model_patterns must contain at most {MAX_MODEL_PATTERNS_PER_PROVIDER} bounded model globs"
                 ));
             }
 
@@ -1246,7 +1246,7 @@ impl AiFederation {
                     .any(|model| !is_valid_model_identifier(model))
             {
                 return Err(format!(
-                    "ai_federation: provider '{name}' model_mapping must contain at most {MAX_MODEL_MAPPINGS_PER_PROVIDER} valid client model identifiers"
+                    "ai_federation: provider {name:?} model_mapping must contain at most {MAX_MODEL_MAPPINGS_PER_PROVIDER} valid client model identifiers"
                 ));
             }
 
@@ -1259,7 +1259,7 @@ impl AiFederation {
                     .any(|model| !is_valid_model_identifier(model))
             {
                 return Err(format!(
-                    "ai_federation: provider '{name}' has an invalid provider-native model identifier"
+                    "ai_federation: provider {name:?} has an invalid provider-native model identifier"
                 ));
             }
             if provider_embeds_model_in_url(provider_type)
@@ -1271,7 +1271,7 @@ impl AiFederation {
                         .any(|model| !is_valid_url_model_component(model)))
             {
                 return Err(format!(
-                    "ai_federation: provider '{name}' has a model identifier that is unsafe in its endpoint path"
+                    "ai_federation: provider {name:?} has a model identifier that is unsafe in its endpoint path"
                 ));
             }
             let multimodal_mode = match optional_str(pv, "multimodal_mode")? {
@@ -1283,7 +1283,7 @@ impl AiFederation {
             let read_timeout_seconds = optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60);
             if connect_timeout_seconds == 0 || read_timeout_seconds == 0 {
                 return Err(format!(
-                    "ai_federation: provider '{name}' timeout values must be greater than zero"
+                    "ai_federation: provider {name:?} timeout values must be greater than zero"
                 ));
             }
             let connect_timeout = Duration::from_secs(connect_timeout_seconds);
@@ -1498,11 +1498,11 @@ fn parse_provider_response_limit(provider: &Value, name: &str) -> Result<usize, 
             .unwrap_or(DEFAULT_MAX_PROVIDER_RESPONSE_BYTES as u64),
     )
     .map_err(|_| {
-        format!("ai_federation: provider '{name}' max_response_body_bytes is too large")
+        format!("ai_federation: provider {name:?} max_response_body_bytes is too large")
     })?;
     if limit == 0 || limit > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(format!(
-            "ai_federation: provider '{name}' max_response_body_bytes must be between 1 and {MAX_PROVIDER_RESPONSE_BYTES}"
+            "ai_federation: provider {name:?} max_response_body_bytes must be between 1 and {MAX_PROVIDER_RESPONSE_BYTES}"
         ));
     }
     Ok(limit)
@@ -1516,37 +1516,37 @@ fn parse_provider_circuit(
         return Ok(None);
     };
     let object = value.as_object().ok_or_else(|| {
-        format!("ai_federation: provider '{name}' circuit_breaker must be an object")
+        format!("ai_federation: provider {name:?} circuit_breaker must be an object")
     })?;
     reject_unknown_config_keys(
         object,
-        &format!("provider '{name}' circuit_breaker"),
+        &format!("provider {name:?} circuit_breaker"),
         PROVIDER_CIRCUIT_KEYS,
     )?;
 
     let failure_threshold = u32::try_from(optional_u64(value, "failure_threshold")?.unwrap_or(3))
         .map_err(|_| {
-        format!("ai_federation: provider '{name}' circuit failure_threshold is too large")
+        format!("ai_federation: provider {name:?} circuit failure_threshold is too large")
     })?;
     let cooldown_seconds = optional_u64(value, "cooldown_seconds")?.unwrap_or(30);
     let success_threshold = u32::try_from(optional_u64(value, "success_threshold")?.unwrap_or(1))
         .map_err(|_| {
-        format!("ai_federation: provider '{name}' circuit success_threshold is too large")
+        format!("ai_federation: provider {name:?} circuit success_threshold is too large")
     })?;
 
     if failure_threshold == 0 || failure_threshold > 100 {
         return Err(format!(
-            "ai_federation: provider '{name}' circuit failure_threshold must be between 1 and 100"
+            "ai_federation: provider {name:?} circuit failure_threshold must be between 1 and 100"
         ));
     }
     if cooldown_seconds == 0 || cooldown_seconds > 86_400 {
         return Err(format!(
-            "ai_federation: provider '{name}' circuit cooldown_seconds must be between 1 and 86400"
+            "ai_federation: provider {name:?} circuit cooldown_seconds must be between 1 and 86400"
         ));
     }
     if success_threshold == 0 || success_threshold > 100 {
         return Err(format!(
-            "ai_federation: provider '{name}' circuit success_threshold must be between 1 and 100"
+            "ai_federation: provider {name:?} circuit success_threshold must be between 1 and 100"
         ));
     }
 
@@ -1749,7 +1749,7 @@ fn optional_status_code_set(
             ));
         };
         let status = u16::try_from(value)
-            .map_err(|_| format!("ai_federation: '{field}' status code {value} is too large"))?;
+            .map_err(|_| format!("ai_federation: `{field}` status code \"{value}\" is too large"))?;
         if !(100..=599).contains(&status) {
             return Err(format!(
                 "ai_federation: '{field}' contains invalid HTTP status code {status}"
@@ -1782,7 +1782,7 @@ fn validate_static_credential_header(
 ) -> Result<(), String> {
     if reqwest::header::HeaderValue::from_str(value).is_err() {
         return Err(format!(
-            "ai_federation: provider '{provider}' '{field}' is not a valid HTTP header value"
+            "ai_federation: provider {provider:?} '{field}' is not a valid HTTP header value"
         ));
     }
     Ok(())
@@ -1791,7 +1791,7 @@ fn validate_static_credential_header(
 /// Resolve a required static API key and prove it can be sent as a header value.
 fn required_api_key(config: &Value, name: &str) -> Result<String, String> {
     let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
-        "ai_federation: provider '{name}' missing 'api_key'"
+        "ai_federation: provider {name:?} missing 'api_key'"
     ))?;
     // Header-value validity is a per-byte property, so proving the key itself
     // is sendable also proves the `Bearer {api_key}` form the bearer providers
@@ -1835,11 +1835,11 @@ fn build_auth(
 
         ProviderType::GoogleVertex => {
             let sa_json = config_or_env_str(config, "google_service_account_json", None).ok_or(
-                format!("ai_federation: provider '{name}' missing 'google_service_account_json'"),
+                format!("ai_federation: provider {name:?} missing 'google_service_account_json'"),
             )?;
             Ok(AuthMethod::GoogleOAuth2 {
                 cache: Arc::new(OAuth2Cache::new(sa_json).map_err(|error| {
-                    format!("ai_federation: provider '{name}' OAuth configuration failed: {error}")
+                    format!("ai_federation: provider {name:?} OAuth configuration failed: {error}")
                 })?),
             })
         }
@@ -1851,12 +1851,12 @@ fn build_auth(
                 Some(&["AWS_DEFAULT_REGION", "AWS_REGION"]),
             )
             .ok_or(format!(
-                "ai_federation: provider '{name}' missing 'aws_region'"
+                "ai_federation: provider {name:?} missing 'aws_region'"
             ))?;
             let access_key_id =
                 config_or_env_str(config, "aws_access_key_id", Some(&["AWS_ACCESS_KEY_ID"]))
                     .ok_or(format!(
-                        "ai_federation: provider '{name}' missing 'aws_access_key_id'"
+                        "ai_federation: provider {name:?} missing 'aws_access_key_id'"
                     ))?;
             let secret_access_key = config_or_env_str(
                 config,
@@ -1864,7 +1864,7 @@ fn build_auth(
                 Some(&["AWS_SECRET_ACCESS_KEY"]),
             )
             .ok_or(format!(
-                "ai_federation: provider '{name}' missing 'aws_secret_access_key'"
+                "ai_federation: provider {name:?} missing 'aws_secret_access_key'"
             ))?;
             let session_token =
                 config_or_env_str(config, "aws_session_token", Some(&["AWS_SESSION_TOKEN"]));
@@ -1917,24 +1917,24 @@ fn validate_provider_config(
         ProviderType::AzureOpenAi => {
             if config["azure_resource"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider '{name}' (azure_openai) missing 'azure_resource'"
+                    "ai_federation: provider {name:?} (azure_openai) missing 'azure_resource'"
                 ));
             }
             if config["azure_deployment"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider '{name}' (azure_openai) missing 'azure_deployment'"
+                    "ai_federation: provider {name:?} (azure_openai) missing 'azure_deployment'"
                 ));
             }
         }
         ProviderType::GoogleVertex => {
             if config["google_project_id"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider '{name}' (google_vertex) missing 'google_project_id'"
+                    "ai_federation: provider {name:?} (google_vertex) missing 'google_project_id'"
                 ));
             }
             if config["google_region"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider '{name}' (google_vertex) missing 'google_region'"
+                    "ai_federation: provider {name:?} (google_vertex) missing 'google_region'"
                 ));
             }
         }
@@ -2436,7 +2436,7 @@ fn parse_openai_tools(openai_body: &Value) -> Result<Option<Vec<Value>>, String>
             .ok_or_else(|| format!("ai_federation: tools[{index}] has invalid function name"))?;
         if !names.insert(name) {
             return Err(format!(
-                "ai_federation: tools[{index}] repeats function name '{name}'"
+                "ai_federation: tools[{index}] repeats function name {name:?}"
             ));
         }
         let description = match function.get("description") {
@@ -2498,7 +2498,7 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
             .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)))
     {
         return Err(format!(
-            "ai_federation: named tool_choice '{name}' does not match any declared tool"
+            "ai_federation: named tool_choice {name:?} does not match any declared tool"
         ));
     }
     Ok(())
