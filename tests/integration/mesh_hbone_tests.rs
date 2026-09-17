@@ -262,6 +262,15 @@ impl HboneMtlsCerts {
         self.ca_der.to_vec()
     }
 
+    /// The client leaf this fixture's handshake presents, DER-encoded.
+    ///
+    /// Sibling suites need it to drive the production `verify_client_cert` for
+    /// the SAME peer a live tunnel was admitted for, so one assertion can cover
+    /// the handshake and the fence without a second identity.
+    pub(super) fn client_leaf_der(&self) -> Vec<u8> {
+        self.client_cert_der.to_vec()
+    }
+
     /// An in-window CRL from this fixture's own CA revoking `serials`, for the
     /// mesh inbound enforced CRL set (issue #5574).
     ///

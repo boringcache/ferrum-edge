@@ -1569,9 +1569,20 @@ fn handshake_admits(
     verifier: &Arc<dyn rustls::server::danger::ClientCertVerifier>,
     peer: &PeerChain,
 ) -> bool {
+    handshake_admits_leaf(verifier, &peer.leaf_der)
+}
+
+/// [`handshake_admits`] for a leaf whose fixture is not a [`PeerChain`] — the
+/// live HBONE mTLS fixture's own client SVID, so one test can drive the
+/// production `verify_client_cert` for exactly the peer whose tunnel the fence
+/// is judging.
+fn handshake_admits_leaf(
+    verifier: &Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    leaf_der: &[u8],
+) -> bool {
     use rustls::server::danger::ClientCertVerifier;
 
-    let leaf = rustls::pki_types::CertificateDer::from(peer.leaf_der.clone());
+    let leaf = rustls::pki_types::CertificateDer::from(leaf_der.to_vec());
     let now = rustls::pki_types::UnixTime::now();
     let verified = ClientCertVerifier::verify_client_cert(verifier.as_ref(), &leaf, &[], now);
     verified.is_ok()
@@ -2515,9 +2526,17 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     );
     assert_store_then_sweep(
         publish_inbound,
-        "trust.slot.store(bundle)",
+        "slot.store(Arc::clone(&bundle));",
         "self.request_sweep()",
         "publish_inbound_admission_trust",
+    );
+    // The store is the CALLER's slot, never the binding's. They are the same
+    // object in the ordinary case, but a rebind the fence refuses keeps the
+    // previous binding in force — and publishing this bundle into THAT slot
+    // would hand one listener's server identity to another's.
+    assert!(
+        !publish_inbound.contains("trust.slot.store("),
+        "the SVID bundle must be stored into the slot it was published for"
     );
 
     // A publication that does not take force is the one failure mode an
@@ -2591,6 +2610,47 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
         1,
         "exactly ONE lock, owned by the fence itself — a per-installed-trust lock cannot \
          cover the install that creates it"
+    );
+
+    // A REBIND can never leave the shared artifact with nothing in force while
+    // the fence has anchors (issue #5574 verification re-review). Installing a
+    // different slot does not reach an inbound verifier that already exists —
+    // that verifier keeps reading the slot it was built with — so clearing the
+    // artifact would drop the handshake onto its own compile of the OLD slot
+    // while the fence lost its anchors entirely and every arriving CONNECT took
+    // the unanchored path.
+    //
+    // Pinned structurally rather than behaviourally: the artifact cell takes
+    // the anchors themselves, so "clear it" is not expressible at all.
+    let spiffe = include_str!("../../src/tls/spiffe.rs");
+    assert_eq!(
+        spiffe
+            .matches("pub(crate) fn put_in_force(&self, anchors: Arc<AdmittedPeerTrustAnchors>)")
+            .count(),
+        1,
+        "the in-force cell must take the anchors themselves; an `Option` parameter is what \
+         makes clearing it — and stranding both surfaces — representable"
+    );
+    assert_eq!(
+        fence.matches("put_in_force(None)").count(),
+        0,
+        "nothing may clear the anchors in force"
+    );
+    // ...and the installer takes the same last-known-good posture a rejected
+    // trust or CRL candidate takes, rather than binding a slot that compiles
+    // nothing over one that does.
+    let install_locked = body(
+        fence,
+        "fn install_inbound_admission_trust_locked(",
+        "\n    /// The one publication lock,",
+    );
+    assert!(
+        install_locked.contains("bound.filter(|installed| installed.has_anchors_in_force())"),
+        "a rebind must ask whether anchors are already in force before replacing the binding"
+    );
+    assert!(
+        install_locked.contains("self.warn_rebind_not_in_force(trust_domain_class);"),
+        "a refused rebind must not be silent"
     );
 
     // And `ProxyState` must route through it rather than storing the slot.
@@ -3452,6 +3512,151 @@ async fn a_rejected_trust_candidate_never_strands_the_handshake_on_stale_records
     );
 }
 
+/// The rebind half of the same last-known-good rule (issue #5574 verification
+/// re-review). Installing a DIFFERENT trust slot whose material does not
+/// compile must keep the binding already in force rather than replacing it.
+///
+/// Installation does not reach an inbound verifier that already exists — that
+/// verifier keeps reading the slot it was built with — so clearing the shared
+/// anchors would drop the handshake onto its own last-known-good compile of the
+/// OLD slot while the fence lost its anchors entirely: arriving CONNECTs would
+/// take the unanchored path and every credential admitted that way skips trust
+/// reevaluation for the rest of its tunnel's life.
+///
+/// ONE verifier is built here and reused, exactly as a live listener does, and
+/// the peer is the fixture's real client SVID, so the handshake assertions run
+/// through the production `verify_client_cert` for the same peer whose tunnel
+/// the fence is judging. The discriminator is the CRL: a rebind that had
+/// replaced the binding would leave the publisher with no material in force to
+/// recompile, so the records would reach the verifier while the revision never
+/// moved and the live tunnels were never cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebind_to_an_uncompilable_slot_keeps_the_accepted_anchors_in_force() {
+    let mut fx = admit_client_tunnel_with_inbound_trust(vec![allow_client()], true).await;
+    let slot_a = fx
+        .inbound_trust_slot
+        .clone()
+        .expect("the inbound-trust fixture installs a slot");
+    let verifier = inbound_verifier(&fx.state, &slot_a);
+    let peer_leaf = fx.certs.client_leaf_der();
+    assert!(
+        handshake_admits_leaf(&verifier, &peer_leaf),
+        "the peer must be admissible before anything is rebound"
+    );
+
+    let accepted_revision = inbound_trust_revision(&fx.state);
+    let compilations = fx.state.hbone_admission_fence.trust_anchor_builds();
+
+    // A different slot carrying a federated trust domain that declares only JWT
+    // authorities: entirely valid configuration, and a candidate the inbound
+    // verifier compiles ATOMICALLY and therefore refuses as a whole.
+    let rebind_gateway = mint_peer_chain(GATEWAY_SPIFFE);
+    let mut jwt_only = std::collections::HashMap::new();
+    jwt_only.insert(
+        TrustDomain::new(SLICE_TRUST_DOMAIN).expect("slice trust domain"),
+        trust_bundle(SLICE_TRUST_DOMAIN, Vec::new()),
+    );
+    let slot_b = tls::shared_bundle_slot(Some(inbound_bundle(
+        &rebind_gateway,
+        RuntimeTrustBundleSet {
+            local: trust_bundle(PEER_TRUST_DOMAIN, vec![fx.certs.ca_der()]),
+            federated: jwt_only,
+        },
+    )));
+    fx.state.install_mesh_inbound_admission_trust(&slot_b);
+
+    assert_eq!(
+        inbound_trust_revision(&fx.state),
+        accepted_revision,
+        "a rebind that compiles nothing must not advance the in-force revision"
+    );
+    assert_eq!(
+        fx.state.hbone_admission_fence.trust_anchor_builds(),
+        compilations,
+        "and a refused compile builds no anchors, so the only cost is the failed attempt"
+    );
+    assert!(
+        handshake_admits_leaf(&verifier, &peer_leaf),
+        "the handshake must still verify against the anchors that ARE in force"
+    );
+    assert_eq!(fx.state.hbone_admission_fence.live_tunnels(), 1);
+
+    // The CONNECT gate is still judging against those anchors: a second CONNECT
+    // on the same never-re-handshaked session is admitted and relays.
+    let mut second = open_tunnel(&mut fx.sender)
+        .await
+        .expect("a CONNECT judged against the anchors still in force is admitted");
+    echo_round_trip(&mut second, b"after-rebind").await;
+    assert_eq!(fx.state.hbone_admission_fence.live_tunnels(), 2);
+    assert_eq!(fx.state.hbone_admission_fence.connect_trust_refusals(), 0);
+
+    // Now the discriminator. The records are compiled into the material still
+    // in force — slot A's. Had the rebind replaced the binding with one that
+    // compiles nothing, there would be no material to recompile, no revision to
+    // advance, and no tunnel to cut.
+    let revoking = fx.certs.signed_crl(&[HBONE_CLIENT_LEAF_SERIAL]);
+    assert!(publish_crls(&fx.state, vec![revoking]));
+    assert_eq!(
+        inbound_trust_revision(&fx.state),
+        accepted_revision + 1,
+        "the publication recompiles the anchors the refused rebind left in force"
+    );
+    assert_eq!(
+        fx.state.hbone_admission_fence.trust_anchor_builds(),
+        compilations + 1
+    );
+    assert!(
+        !handshake_admits_leaf(&verifier, &peer_leaf),
+        "and the same records reach the handshake"
+    );
+    assert_tunnel_closed(&mut fx.tunnel.response_body).await;
+    assert_tunnel_closed(&mut second.response_body).await;
+    wait_for_no_live_tunnels(&fx.state).await;
+    assert_eq!(
+        revocation_counts(&fx.state),
+        [0, 0, 0, 2, 0, 0, 0, 0],
+        "both tunnels are cut as `peer_revoked`, judged by slot A's anchors"
+    );
+    let refused = open_tunnel(&mut fx.sender).await.err();
+    assert_eq!(refused, Some(StatusCode::FORBIDDEN));
+    assert_eq!(fx.state.hbone_admission_fence.connect_trust_refusals(), 1);
+
+    // Withdrawing the records restores admission, so the next assertion cannot
+    // pass for the wrong reason.
+    assert!(publish_crls(&fx.state, Vec::new()));
+    assert_eq!(
+        inbound_trust_revision(&fx.state),
+        accepted_revision + 2,
+        "an empty publication is a real publication"
+    );
+    assert!(handshake_admits_leaf(&verifier, &peer_leaf));
+
+    // A publication through the REBOUND slot that DOES compile replaces the
+    // binding atomically, with a fresh revision drawn from the same fence-wide
+    // sequence. Its trust set deliberately does not anchor this peer, so the
+    // handshake flipping back to a refusal is what proves slot B's material —
+    // not slot A's — is now what both surfaces verify against.
+    let elsewhere = mint_peer_chain(OTHER_SPIFFE);
+    fx.state.publish_mesh_inbound_trust_bundle(
+        &slot_b,
+        Arc::new(Some(inbound_bundle(
+            &rebind_gateway,
+            local_trust(PEER_TRUST_DOMAIN, vec![elsewhere.ca_der.clone()]),
+        ))),
+    );
+    assert_eq!(
+        inbound_trust_revision(&fx.state),
+        accepted_revision + 3,
+        "a compilable rebind takes a fresh revision"
+    );
+    assert!(
+        !handshake_admits_leaf(&verifier, &peer_leaf),
+        "the rebound slot's material is what verifies now"
+    );
+
+    fx.teardown().await;
+}
+
 /// Removing the enforced records restores admission on BOTH surfaces at once:
 /// the peer's next CONNECT is admitted again and no live tunnel is revoked for
 /// revocation. An empty list is the operator's "revocation rescinded", not an
@@ -3558,6 +3763,24 @@ async fn revoking_the_issuing_intermediate_revokes_the_tunnel_and_the_handshake(
 /// under `peer_expired`. Bounded by the skip key, deliberately — it is observed
 /// on the next publication that moves the revision, not at the instant the
 /// record expires — so this test publishes a trust change to move it.
+///
+/// **Timing budget.** There is no injectable verification clock: `UnixTime::now`
+/// and `OffsetDateTime::now_utc` are read directly by rustls/webpki and by the
+/// record minting, and the repository forbids adding a test-only one to a main
+/// source module. So the record is minted with a generous `nextUpdate` — eight
+/// seconds, far more than signing and publication can plausibly take even on a
+/// loaded runner, where a two-second window left roughly one second after
+/// `nextUpdate`'s second-resolution encoding — and the wait afterwards is
+/// computed FROM that minted instant plus a one-second guard rather than being a
+/// fixed sleep. Total wall time is therefore about nine seconds, and it cannot
+/// race its own setup: the publication assertion is made while the record is
+/// still comfortably in window.
+///
+/// A POSITIVE verification is established before the clock is allowed to run
+/// out, so the final refusal is a state change rather than a first observation:
+/// the tunnel is admitted carrying the revision that was in force BEFORE the
+/// publication, which makes the first sweep genuinely re-verify (asserted
+/// through `trust_rechecks`) and find the peer admissible.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crl_that_ages_out_after_taking_force_fails_closed_on_the_next_revision() {
     let gateway = mint_peer_chain(GATEWAY_SPIFFE);
@@ -3571,29 +3794,52 @@ async fn a_crl_that_ages_out_after_taking_force_fails_closed_on_the_next_revisio
         local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
     let fence = &state.hbone_admission_fence;
+    let revision_before_records = inbound_trust_revision(&state);
 
     // In window now, expired shortly. Naming an unrelated serial on purpose:
     // the tunnel is cut because the list can no longer be evaluated, not
     // because it revokes this peer.
     let now = time::OffsetDateTime::now_utc();
+    let next_update = now + time::Duration::seconds(8);
     let short_lived = signed_crl_in_window(
         &peer,
         &[UNRELATED_LEAF_SERIAL],
         now - time::Duration::hours(1),
-        now + time::Duration::seconds(2),
+        next_update,
     );
     assert!(
         publish_crls(&state, vec![short_lived]),
         "the record is usable at publication, so it takes force"
     );
+    assert_eq!(
+        inbound_trust_revision(&state),
+        revision_before_records + 1,
+        "and taking force is what advances the one in-force revision"
+    );
+
+    // Admitted under the PREVIOUS revision, so the first sweep cannot take the
+    // skip path: it rebuilds the certificate path against the in-force anchors
+    // — with the record still in window — and finds the peer admissible.
     let tunnel = fence.admit(credential_snapshot(
         fence.sweep_epoch(),
-        peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
+        peer_credential(&peer, live_expiry(), true, revision_before_records),
     ));
+    fence.request_sweep();
     wait_for_settled_sweeps(&state).await;
     assert_eq!(tunnel.revoked_reason(), None);
+    assert!(
+        fence.trust_rechecks() > 0,
+        "the tunnel must actually have been re-verified while the record was live, or the \
+         refusal below would be its first verification rather than a state change"
+    );
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait past the minted `nextUpdate` itself, plus a guard — never a fixed
+    // sleep, which would race a runner that was slow to get here.
+    let remaining = next_update - time::OffsetDateTime::now_utc();
+    let past_expiry = tokio::time::Instant::now()
+        + Duration::try_from(remaining).unwrap_or_default()
+        + Duration::from_secs(1);
+    tokio::time::sleep_until(past_expiry).await;
 
     // A trust change that still anchors the peer. It recompiles with the SAME,
     // now-expired records and moves the revision, which is what makes the
@@ -3735,6 +3981,79 @@ async fn a_live_spiffe_mtls_session_stops_being_established_after_a_crl_rotation
     let _ = shutdown_tx.send(true);
 }
 
+/// Both publication orderings the concurrent smoke test below can only sample,
+/// driven DETERMINISTICALLY through the public API.
+///
+/// Production arms the backend CRL watcher before mesh installs its inbound
+/// slot, so a CRL publication really can land BEFORE any trust is installed:
+/// the publisher stores the records with nothing to recompile, and the install
+/// that follows must compile WITH them. The reverse is the ordinary order.
+/// Either way exactly ONE set ends up in force on both surfaces — observable as
+/// the peer the records revoke being cut by the fence, not only refused by the
+/// handshake.
+///
+/// The third case the concurrent tests touch — a byte-identical republish after
+/// a publication compiling nothing and advancing nothing — is already covered
+/// sequentially by
+/// `a_crl_publication_with_unchanged_trust_material_advances_the_revision_exactly_once`,
+/// and is deliberately not duplicated here.
+#[tokio::test(flavor = "multi_thread")]
+async fn either_publication_order_leaves_one_set_in_force_on_both_surfaces() {
+    for crls_first in [true, false] {
+        let gateway = mint_peer_chain(GATEWAY_SPIFFE);
+        let peer = mint_peer_chain(CLIENT_SPIFFE);
+        let state = credential_state(if crls_first { 9666 } else { 9667 });
+        let revoking = signed_crl(&peer, &[PEER_LEAF_SERIAL]);
+        let slot = tls::shared_bundle_slot(Some(inbound_bundle(
+            &gateway,
+            local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
+        )));
+
+        if crls_first {
+            assert!(
+                state.publish_mesh_inbound_crls(Arc::new(vec![revoking])),
+                "records publish with no trust installed; there is simply nothing to recompile"
+            );
+            state.install_mesh_inbound_admission_trust(&slot);
+        } else {
+            state.install_mesh_inbound_admission_trust(&slot);
+            assert!(state.publish_mesh_inbound_crls(Arc::new(vec![revoking])));
+        }
+
+        assert_eq!(
+            state.mesh_inbound_admission.crls().load().crls().len(),
+            1,
+            "the records are enforced in either order"
+        );
+        let verifier = inbound_verifier(&state, &slot);
+        assert!(
+            !handshake_admits(&verifier, &peer),
+            "the handshake polices the published records in either order"
+        );
+
+        // ...and so does the fence. `admitted_trust_revision` 0 never matches a
+        // real revision, so the sweep always re-verifies rather than skipping.
+        let fence = &state.hbone_admission_fence;
+        let tunnel = fence.admit(credential_snapshot(
+            fence.sweep_epoch(),
+            peer_credential(&peer, live_expiry(), true, 0),
+        ));
+        fence.request_sweep();
+        wait_for_revocation(&tunnel).await;
+        assert_eq!(
+            tunnel.revoked_reason(),
+            Some(HboneRevocationReason::PeerRevoked),
+            "the anchors in force must have been compiled WITH the published records; an \
+             install that runs after a publication must not leave the fence judging by an \
+             empty list"
+        );
+        assert_eq!(revocation_counts(&state), [0, 0, 0, 1, 0, 0, 0, 0]);
+    }
+}
+
+/// A SMOKE test for the same invariant under real concurrency, not a proof of
+/// any particular interleaving.
+///
 /// Production arms the backend CRL watcher before mesh installs its inbound
 /// slot, so a CRL publisher really can read "no trust installed" and be
 /// overtaken by the install. Before the fence-owned lock, the publisher then
@@ -3742,10 +4061,20 @@ async fn a_live_spiffe_mtls_session_stops_being_established_after_a_crl_rotation
 /// and the fence's anchors policed another, permanently, because a
 /// byte-identical republish returns early and can never repair it.
 ///
-/// Barrier-released so the two racers start together, and repeated so the
-/// interleaving is actually hit. Whichever order lands, ONE set must be in
-/// force on both surfaces — which is observable as the peer the records revoke
-/// being cut by the fence, not only refused by the handshake.
+/// What this test CANNOT do is force that interleaving. The barrier releases
+/// both threads immediately before their public calls; it cannot suspend the
+/// publisher between its "no trust installed" decision and its store, and there
+/// are no test-only hooks in the fence to do so with (the repository forbids
+/// test-only runtime branches in main source modules). Every iteration may well
+/// execute in a safe order, and the loop is a sampling budget, not a guarantee.
+/// The deterministic coverage of both orders is
+/// `either_publication_order_leaves_one_set_in_force_on_both_surfaces` above.
+///
+/// The final assertions are still worth running under concurrency: whichever
+/// order lands, ONE set must be in force on both surfaces — observable as the
+/// peer the records revoke being cut by the fence, not only refused by the
+/// handshake — and that is what fails if the serialization or the locked
+/// re-check is removed and an unsafe interleaving does occur.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_install_that_races_a_crl_publication_leaves_one_set_in_force() {
     for iteration in 0..12u16 {
@@ -3818,6 +4147,16 @@ async fn an_install_that_races_a_crl_publication_leaves_one_set_in_force() {
 /// publication that moved the in-force revision would charge every live tunnel
 /// a certificate path build for a decision that did not change, which is
 /// exactly what the skip key exists to prevent.
+///
+/// A SMOKE test, like its sibling above: the barrier releases both threads
+/// immediately before `publish_mesh_inbound_crls`, so it cannot force both of
+/// them past the outer equality check before either takes the lock, and no
+/// iteration is guaranteed to reach that interleaving. The
+/// exactly-one-publication, exactly-one-revision and exactly-one-compilation
+/// assertions are what detect removal of the locked re-check or of the
+/// `publish_enforced_crl_set`-gated advance WHEN the interleaving does occur;
+/// the sequential no-op guarantee itself is pinned by
+/// `a_crl_publication_with_unchanged_trust_material_advances_the_revision_exactly_once`.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_identical_concurrent_crl_publications_compile_and_advance_once() {
     for iteration in 0..12u16 {
