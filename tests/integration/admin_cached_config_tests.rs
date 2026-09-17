@@ -6347,6 +6347,73 @@ async fn test_batch_accepts_backup_metadata_keys() {
 }
 
 #[tokio::test]
+async fn test_batch_rejects_schema_invalid_metadata_shapes() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Same three shape mismatches restore now 400s, plus a valid backup
+    // artifact that must still create. Parse failures use restore's
+    // `{"error": "Invalid JSON body: …"}` envelope.
+    for (label, payload) in [
+        ("non-object counts", json!({"counts": []})),
+        ("array api_specs", json!({"api_specs": []})),
+        (
+            "non-array gateway_trust_bundles",
+            json!({"gateway_trust_bundles": {}}),
+        ),
+    ] {
+        let (status, body) = admin_post(&base_url, "/batch", &token, &payload).await;
+        assert_eq!(status, 400, "{label} must 400: {body:?}");
+        let error = body["error"].as_str().unwrap_or("");
+        assert!(
+            error.starts_with("Invalid JSON body:"),
+            "{label} must use restore's parse-error shape: {body:?}"
+        );
+        assert!(
+            body.get("created").is_none(),
+            "{label} must not report a created graph: {body:?}"
+        );
+    }
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "version": "1",
+            "ferrum_version": "0.9.5",
+            "exported_at": "2026-09-16T00:00:00Z",
+            "source": "database",
+            "counts": {
+                "proxies": 1,
+                "consumers": 0,
+                "plugin_configs": 0,
+                "upstreams": 0,
+                "api_specs": 0,
+                "gateway_trust_bundles": 0
+            },
+            "api_specs": {"section_version": "2", "items": []},
+            "gateway_trust_bundles": [],
+            "proxies": [{
+                "id": "from-typed-backup",
+                "listen_path": "/from-typed-backup",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a valid backup artifact must still round-trip through POST /batch: {body:?}"
+    );
+    assert_eq!(body["created"]["proxies"], 1);
+}
+
+#[tokio::test]
 async fn test_proxy_and_batch_accept_upstream_id_without_backend_host() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

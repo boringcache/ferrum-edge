@@ -2913,8 +2913,12 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
     }
 }
 
-const REDIS_URL_DATABASE_SELECTOR_PATTERN: &str =
-    r"^rediss?://[^/?#\s]+(?:/\d{0,10})?(?:\?[^\s#]*)?$";
+const REDIS_URL_DATABASE_SELECTOR_PATTERN: &str = concat!(
+    r"^[rR][eE][dD][iI][sS][sS]?://[^/?#\s]+",
+    r"(?:/(?:0|[1-9][0-9]{0,8}|1[0-9]{9}|20[0-9]{8}|21[0-3][0-9]{7}|",
+    r"214[0-6][0-9]{6}|2147[0-3][0-9]{5}|21474[0-7][0-9]{4}|214748[0-2][0-9]{3}|",
+    r"2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])?)?(?:\?[^\s#]*)?(?![\s\S])",
+);
 
 fn plugin_docs_section<'a>(plugin_docs: &'a str, plugin_name: &str) -> &'a str {
     plugin_docs
@@ -3385,14 +3389,35 @@ fn udp_rate_limiting_schema_matches_constructor_admission() {
     );
 }
 
-/// Issue #5394: the four Redis-backed rate-limit components publish the
-/// constructor's numeric database-selector rule on `redis_url`.
+/// Issues #5394 and #5518: every shared Redis URL schema publishes the same
+/// canonical numeric database-selector rule as the constructor.
 #[test]
 fn redis_url_database_selector_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisConfig;
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let expected_pattern = json!(REDIS_URL_DATABASE_SELECTOR_PATTERN);
     let plugin_docs = include_str!("../../docs/plugins.md");
+    for schema_name in [
+        "RateLimitingConfig",
+        "GraphqlConfig",
+        "GrpcMethodRouterConfig",
+        "AiRateLimiterConfig",
+        "WsRateLimitingConfig",
+        "UdpRateLimitingConfig",
+        "AiSemanticCacheConfig",
+        "RequestDeduplicationConfig",
+        "JwksAuthConfig",
+        "HmacAuthConfig",
+        "SoapWsSecurityConfig",
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][schema_name]["properties"]["redis_url"]["pattern"],
+            expected_pattern,
+            "{schema_name} uses the shared Redis URL parser"
+        );
+    }
     for (schema_name, plugin_name, redis_config) in [
         (
             "RateLimitingConfig",
@@ -3439,6 +3464,50 @@ fn redis_url_database_selector_schema_matches_constructor_admission() {
         );
 
         let validator = component_validator(&spec, schema_name);
+        for (selector, expected) in [
+            ("", true),
+            ("/", true),
+            ("/0", true),
+            ("/15", true),
+            ("/999999999", true),
+            ("/1999999999", true),
+            ("/2099999999", true),
+            ("/2147483646", true),
+            ("/2147483647", true),
+            ("/2147483648", false),
+            ("/9999999999", false),
+            ("/00000000000", false),
+            ("/00", false),
+            ("/01", false),
+            ("/+1", false),
+            ("/-0", false),
+            ("/1/", false),
+            ("//1", false),
+            ("/./1", false),
+            ("/%31", false),
+            ("/0\n", false),
+        ] {
+            for suffix in ["", "?protocol=resp3"] {
+                let mut config = redis_config.clone();
+                config["redis_url"] = json!(format!("redis://localhost{selector}{suffix}"));
+                assert_eq!(
+                    validator.is_valid(&config),
+                    expected,
+                    "{schema_name} schema: {selector}{suffix}"
+                );
+                assert_eq!(
+                    RedisConfig::from_plugin_config(&config, "selector-parity").is_ok(),
+                    expected,
+                    "{schema_name} constructor: {selector}{suffix}"
+                );
+            }
+        }
+        if schema_name == "RateLimitingConfig" {
+            assert_eq!(
+                schema["properties"]["redis_failure_policy"]["default"],
+                "local_fallback"
+            );
+        }
         let mut accepted = redis_config.clone();
         accepted["redis_url"] = json!("redis://cache.internal:6379/0");
         assert!(
@@ -3517,7 +3586,7 @@ fn graphql_config_schema_matches_runtime_validation() {
     assert_eq!(schema["properties"]["redis_pool_size"]["minimum"], 1);
     assert_eq!(
         schema["properties"]["redis_url"]["pattern"],
-        json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
+        json!(REDIS_URL_DATABASE_SELECTOR_PATTERN)
     );
     assert_eq!(
         schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
@@ -3789,7 +3858,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
     assert_eq!(schema["properties"]["redis_url"]["minLength"], json!(1));
     assert_eq!(
         schema["properties"]["redis_url"]["pattern"],
-        json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
+        json!(REDIS_URL_DATABASE_SELECTOR_PATTERN)
     );
     // Issue #5070: the runtime lowercases `sync_mode` before comparing it, so
     // the conditional selects on the same case-insensitive value rather than a
@@ -18210,4 +18279,109 @@ fn restore_request_publishes_the_complete_closed_envelope() {
     let mut proxy_with_id = proxy_body.clone();
     proxy_with_id["id"] = json!("p1");
     assert_component_validity(&spec, "ProxyRestoreItem", &proxy_with_id, true);
+}
+
+/// The published `BatchCreateRequest` must be the complete, closed batch wire
+/// contract (issue #5565). Backup metadata members are typed the same way
+/// restore types them, so a schema-invalid envelope is a `400` with the
+/// same `{"error": "Invalid JSON body: …"}` shape `POST /restore` uses.
+#[test]
+fn batch_create_request_publishes_the_complete_closed_envelope() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let batch = &spec["components"]["schemas"]["BatchCreateRequest"];
+
+    assert_eq!(
+        batch["additionalProperties"],
+        json!(false),
+        "the batch envelope must reject unknown top-level keys"
+    );
+
+    let members: BTreeMap<&str, serde_json::Value> = BTreeMap::from([
+        ("proxies", json!([])),
+        ("consumers", json!([])),
+        ("plugin_configs", json!([])),
+        ("upstreams", json!([])),
+        ("version", json!("1")),
+        ("ferrum_version", json!("0.9.5")),
+        ("exported_at", json!("2026-09-16T00:00:00Z")),
+        ("source", json!("database")),
+        ("counts", json!({})),
+        ("api_specs", json!({"section_version": "2", "items": []})),
+        ("gateway_trust_bundles", json!([])),
+    ]);
+
+    let published: BTreeSet<&str> = batch["properties"]
+        .as_object()
+        .expect("BatchCreateRequest declares properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: BTreeSet<&str> = members.keys().copied().collect();
+    assert_eq!(
+        published, expected,
+        "BatchCreateRequest must publish exactly the members batch accepts"
+    );
+
+    let runtime_names = ferrum_edge::_test_support::batch_envelope_field_names_for_test();
+    let runtime_members: BTreeSet<&str> = runtime_names.iter().map(String::as_str).collect();
+    assert_eq!(
+        runtime_members, published,
+        "BatchCreateRequest.properties must equal the serde-accepted batch members"
+    );
+
+    let mut whole = serde_json::Map::new();
+    for (member, value) in &members {
+        let mut single = serde_json::Map::new();
+        single.insert((*member).to_string(), value.clone());
+        let single = serde_json::Value::Object(single);
+        assert!(
+            ferrum_edge::_test_support::batch_envelope_admits_for_test(
+                single.to_string().as_bytes()
+            ),
+            "runtime batch must accept the published member {member}"
+        );
+        assert_component_validity(&spec, "BatchCreateRequest", &single, true);
+        whole.insert((*member).to_string(), value.clone());
+    }
+    let whole = serde_json::Value::Object(whole);
+    assert!(
+        ferrum_edge::_test_support::batch_envelope_admits_for_test(whole.to_string().as_bytes()),
+        "a complete GET /backup artifact must still round-trip through POST /batch"
+    );
+    assert_component_validity(&spec, "BatchCreateRequest", &whole, true);
+
+    // Schema-invalid metadata is a `400` on POST /batch, same parse restore
+    // uses: non-object `counts`, an array `api_specs`, a non-array
+    // `gateway_trust_bundles`.
+    for rejected in [
+        json!({"counts": []}),
+        json!({"counts": 5}),
+        json!({"counts": "3"}),
+        json!({"counts": true}),
+        json!({"api_specs": []}),
+        json!({"api_specs": ["2", []]}),
+        json!({"api_specs": "not-an-object"}),
+        json!({"gateway_trust_bundles": {}}),
+        json!({"gateway_trust_bundles": "not-an-array"}),
+        json!({"gateway_trust_bundles": 1}),
+        json!({"proxise": []}),
+        json!({"proxies": [], "unknown_top_level": true}),
+        json!([]),
+        json!("a string"),
+        json!(5),
+    ] {
+        assert!(
+            !ferrum_edge::_test_support::batch_envelope_admits_for_test(
+                rejected.to_string().as_bytes()
+            ),
+            "runtime batch must reject {rejected}"
+        );
+        assert_component_validity(&spec, "BatchCreateRequest", &rejected, false);
+    }
+
+    assert!(ferrum_edge::_test_support::batch_envelope_admits_for_test(
+        b"{}"
+    ));
+    assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
 }

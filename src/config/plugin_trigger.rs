@@ -75,6 +75,7 @@ pub const MAX_TRIGGER_REGEX_DFA_BYTES: usize = 256 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct PluginTrigger {
     /// Predicate tree. The instance executes when this evaluates to `true`.
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub when: PluginTriggerNode,
 }
 
@@ -90,9 +91,11 @@ pub struct PluginTriggerNode {
     pub any: Option<Vec<PluginTriggerNode>>,
     /// Logical NOT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub not: Option<Box<PluginTriggerNode>>,
     /// Leaf predicate.
     #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub match_: Option<PluginTriggerMatch>,
 }
 
@@ -106,22 +109,28 @@ pub struct PluginTriggerMatch {
     pub method: Option<Vec<String>>,
     /// Canonical policy path (`crate::policy_path`) — never the raw target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub path: Option<PluginTriggerStringMatch>,
     /// Request authority host. Lowercased, trailing dot and port removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub host: Option<PluginTriggerStringMatch>,
     /// Frontend TLS/QUIC SNI hostname, when the client supplied one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub sni: Option<PluginTriggerStringMatch>,
     /// Request header field. Name is ASCII-case-insensitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub header: Option<PluginTriggerFieldMatch>,
     /// Query parameter of the client's original request target.
     /// Names and values are compared after percent-decoding, case-sensitively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub query: Option<PluginTriggerFieldMatch>,
     /// Cookie from the request `Cookie` header. Names are case-sensitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub cookie: Option<PluginTriggerFieldMatch>,
     /// Authoritative wire protocol identity. The list is an OR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +153,7 @@ pub struct PluginTriggerMatch {
     /// Only authoritative after the authentication boundary — see the module
     /// docs and `docs/plugin_execution_order.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub consumer: Option<PluginTriggerIdentityMatch>,
     /// Successful authentication mechanism name (e.g. `jwt_auth`). Compared
     /// ASCII-case-insensitively; the list is an OR. Post-authentication only.
@@ -151,6 +161,7 @@ pub struct PluginTriggerMatch {
     pub auth_method: Option<Vec<String>>,
     /// Peer SPIFFE ID established by mesh/mTLS identity. Post-authentication only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub spiffe_id: Option<PluginTriggerIdentityMatch>,
 }
 
@@ -205,6 +216,7 @@ pub struct PluginTriggerFieldMatch {
     pub presence: PluginTriggerPresence,
     /// Optional value comparison. Requires `presence: present`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub value: Option<PluginTriggerStringMatch>,
     /// Multi-occurrence semantics for `value`. Defaults to `any`.
     #[serde(default)]
@@ -220,6 +232,7 @@ pub struct PluginTriggerIdentityMatch {
     pub presence: PluginTriggerPresence,
     /// Optional value comparison. Requires `presence: present`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub value: Option<PluginTriggerStringMatch>,
 }
 

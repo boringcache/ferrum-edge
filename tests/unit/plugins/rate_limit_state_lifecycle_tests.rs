@@ -647,16 +647,16 @@ fn a_local_policy_shares_state_across_redis_failure_postures() {
 fn a_redis_backed_policy_isolates_a_changed_failure_posture() {
     let base = redis_backed_policy();
     let mut explicit_default = base.clone();
-    explicit_default["redis_failure_policy"] = json!("fail_closed");
-    let mut fallback = base.clone();
-    fallback["redis_failure_policy"] = json!("local_fallback");
+    explicit_default["redis_failure_policy"] = json!("local_fallback");
+    let mut fail_closed = base.clone();
+    fail_closed["redis_failure_policy"] = json!("fail_closed");
 
     assert!(
         rl_pair("posture-redis", &base, &explicit_default),
         "the effective posture is unchanged, so the live budget is inherited"
     );
     assert!(
-        !rl_pair("posture-redis-b", &base, &fallback),
+        !rl_pair("posture-redis-b", &base, &fail_closed),
         "with Redis enabled the posture decides whether the local map may admit at all"
     );
     assert!(

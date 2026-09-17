@@ -6648,6 +6648,24 @@ impl EnvConfig {
             );
         }
 
+        // `verify-ca` waives the hostname check, so the configured CA is the
+        // ONLY thing that authenticates the server. A configured CA is also
+        // exclusive — it replaces the bundled public roots — so verify-ca with
+        // no CA would verify against an unrelated public root store and pin
+        // nothing at all, which is strictly weaker than `require`. libpq fails
+        // the same way when `sslrootcert` is missing. `verify-full` without a
+        // CA stays valid: the public roots plus the hostname check still bind
+        // the certificate to the database host.
+        if matches!(mode, DbTlsMode::VerifyCa)
+            && matches!(db_type, "postgres" | "mysql")
+            && self.db_tls_ca_cert_path.is_none()
+        {
+            return Err(
+                "FERRUM_DB_TLS_MODE=verify-ca requires FERRUM_DB_TLS_CA_CERT_PATH (or FERRUM_DB_TLS_CA_CERT_SOURCE): verify-ca does not check the database hostname, so without a configured CA nothing authenticates the server. Use verify-full to rely on public roots plus the hostname check."
+                    .into(),
+            );
+        }
+
         Ok(())
     }
 

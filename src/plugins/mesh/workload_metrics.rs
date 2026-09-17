@@ -1475,8 +1475,13 @@ fn string_map_config(config: &Value, key: &str) -> Result<HashMap<String, String
 fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
     match config.get("direction_emit") {
         None | Some(Value::Null) => Ok(DirectionEmit::server_only()),
-        Some(value) => serde_json::from_value::<DirectionEmit>(value.clone())
-            .map_err(|e| format!("workload_metrics: invalid direction_emit config: {e}")),
+        Some(value) => {
+            serde_json::from_value::<crate::util::json_object::JsonObject<DirectionEmit>>(
+                value.clone(),
+            )
+            .map(|object| object.0)
+            .map_err(|e| format!("workload_metrics: invalid direction_emit config: {e}"))
+        }
     }
 }
 

@@ -230,6 +230,9 @@ pub static FERRUM_SOCK_OPS_EVENTS: RingBuf =
 /// SOCK_OPS per-program counters. Index `SOCK_OPS_STATS_EVENTS_DROPPED`
 /// tracks events that could not be reserved on the ringbuf (kernel-side
 /// "overrun" signal that userspace polls for warn/recover state machine).
+/// Indices `SOCK_OPS_STATS_DROP_*` carry one counter per capture-bypass
+/// reason so a decision is accounted even when the ringbuf record that
+/// describes it is discarded by a full ring.
 /// Per-CPU so the kernel-side increment is contention-free; userspace sums
 /// across CPUs when reading.
 #[map]

@@ -857,3 +857,34 @@ fn http_graphql_grpc_shared_windows_select_bounded_sliding_aggregate() {
     let denied = limiter.check_at("hot-key".to_string(), &op, now);
     assert!(!denied.allowed, "shared path must enforce the boundary");
 }
+
+#[test]
+fn http_windows_charge_only_admissions_under_sustained_overload() {
+    for seconds in [1, 6] {
+        let algorithm = DynamicHttpRateLimitAlgorithm::new();
+        let mut state = algorithm.new_state();
+        let op = DynamicRateLimitOp::new(vec![
+            RateLimitWindowSpec {
+                limit: 5,
+                duration: Duration::from_secs(seconds),
+            },
+            RateLimitWindowSpec {
+                limit: 12,
+                duration: Duration::from_secs(60),
+            },
+        ]);
+        let start = Instant::now();
+        let mut admitted = 0;
+        for tick in 0..400 {
+            let now = start + Duration::from_millis(tick * 50);
+            let outcome = algorithm.check_local(&mut state, &op, now);
+            if outcome.allowed {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 12,
+            "window={seconds}: denials must consume no budget"
+        );
+    }
+}

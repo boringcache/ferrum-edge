@@ -33,6 +33,7 @@ pub mod config_change_watch;
 pub mod config_migration;
 pub mod db_backend;
 pub mod db_loader;
+pub(crate) mod db_tls_snapshot;
 pub mod env_config;
 pub mod file_loader;
 /// Namespace-keyed gateway trust-bundle resource (issue #3727).

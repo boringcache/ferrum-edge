@@ -20,7 +20,9 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::EnvConfig;
-use crate::config::db_backend::{DatabaseBackend, redact_error_text, redact_url};
+use crate::config::db_backend::{
+    DatabaseBackend, DbTlsReconnectStage, redact_error_text, redact_url,
+};
 use crate::tls::source::MaterialKind;
 use crate::tls::source::subscription::{
     AsyncMaterialSetReloadConfig, WatchedMaterialSource, material_set_poll_interval,
@@ -103,30 +105,34 @@ async fn reload_db_tls_material(
         .map_err(anyhow::Error::msg)?
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
 
-    db.reconnect(&effective_url).await.map_err(|error| {
-        let safe_error = redact_error_text(&error, &[&effective_url]);
-        anyhow::anyhow!(
-            "database TLS reconnect failed for {}: {}",
-            redact_url(&effective_url),
-            safe_error
-        )
-    })?;
-
-    if let Some(replica_url) = env_config
+    let replica_url = env_config
         .effective_db_read_replica_url()
-        .map_err(anyhow::Error::msg)?
-    {
-        db.reconnect_read_replica(&replica_url)
-            .await
-            .map_err(|error| {
-                let safe_error = redact_error_text(&error, &[&replica_url]);
-                anyhow::anyhow!(
+        .map_err(anyhow::Error::msg)?;
+    db.reconnect_tls(&effective_url, replica_url.as_deref())
+        .await
+        .map_err(|failure| {
+            // Both pools are staged before either is published, so the stage is
+            // the only way to tell an operator which pool refused the candidate
+            // material. Both URLs are redacted from the error text regardless of
+            // which one produced it.
+            let mut urls = vec![effective_url.as_str()];
+            if let Some(replica_url) = replica_url.as_deref() {
+                urls.push(replica_url);
+            }
+            let safe_error = redact_error_text(&failure.error, &urls);
+            match failure.stage {
+                DbTlsReconnectStage::ReadReplica => anyhow::anyhow!(
                     "database TLS admin-read replica reconnect failed for {}: {}",
-                    redact_url(&replica_url),
+                    redact_url(replica_url.as_deref().unwrap_or(&effective_url)),
                     safe_error
-                )
-            })?;
-    }
+                ),
+                DbTlsReconnectStage::Primary => anyhow::anyhow!(
+                    "database TLS reconnect failed for {}: {}",
+                    redact_url(&effective_url),
+                    safe_error
+                ),
+            }
+        })?;
 
     info!(
         db_type = %db.db_type(),

@@ -654,6 +654,30 @@ on a native-gRPC request.
   `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
 - Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
+- HTTP/GraphQL/gRPC quota admission is CHARGE-THEN-COMPENSATE over that
+  algorithm, on the shared pooled multiplexed connections: ONE atomic
+  `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR`
+  current, `EXPIRE` current) so the decision is tied to the caller's own
+  increment, and any refusal issues ONE compensating atomic `MULTI`/`EXEC`
+  (`DECR` + `EXPIRE`) over every window it charged. A refusal therefore leaves
+  no lasting charge on any window (issue #5517) and a tighter window's refusal
+  never consumes a looser window's budget. Never reintroduce `WATCH`, a
+  dedicated per-request connection, a retry budget, or `EVAL`/`EVALSHA`/`SCRIPT`
+  — every command must be plain RESP. Between an `INCR` and its compensating
+  `DECR` the transient charge is visible to concurrent requests, which is a
+  documented conservative refusal, never an over-admit; a negative counter reads
+  as zero usage. The compensation is issued from a DETACHED task holding the
+  shared client `Arc`, so a dropped request future (gRPC deadline under
+  `timeout_at`, client disconnect, reload retiring the instance) cannot strand
+  the charge, and the refused caller does not pay the second round trip inline.
+  A compensation that fails goes through `note_command_failure`
+  so `redis_failure_policy` governs the NEXT decision, and the refusal still
+  stands. The ONLY remaining way a refusal leaves a lasting charge is a process
+  exit between the charge and its compensation. Both transaction helpers carry
+  their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
+  the per-request window and counter buffers are fixed-capacity and inline, not
+  `Vec`s. The local token bucket / 64-bucket sliding aggregate are deliberately
+  NOT replicated in Redis.
 - Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
   are a Redis Cluster hash tag so every key of one atomic operation shares a
   slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
@@ -678,8 +702,16 @@ on a native-gRPC request.
   `rate_limiter_configs_are_closed_and_bounded_in_openapi` and
   `graphql_config_schema_matches_runtime_validation` in
   `tests/unit/openapi_yaml_tests.rs`.
-- Redis outage behavior is `redis_failure_policy` (`fail_closed` default,
-  `local_fallback` opt-in); only the opt-in falls back to in-memory. The client
+- Redis outage behavior is `redis_failure_policy`: `rate_limiting` defaults to
+  `local_fallback`; the other five rate-limit plugins default to `fail_closed`.
+  Explicit settings retain either behavior. `rate_limiting` attributes every
+  decision it serves on the fallback budget — admissions, quota refusals, AND
+  the capacity `429` a previously unseen key gets at `MAX_STATE_ENTRIES` — with
+  `ratelimit_local_fallback: true` metadata plus
+  `ferrum_rate_limit_local_fallback_decisions_total`; `fail_closed` `503`s count
+  in `ferrum_rate_limit_enforcement_unavailable_total`. Fallback is now the
+  DEFAULT posture for this plugin, so the silent case is the common case: do not
+  regress those signals back to the once-per-outage latched warning. The client
   reconnects in the background either way. `request_deduplication` expresses the
   same choice as `on_redis_unavailable` and does NOT accept
   `redis_failure_policy`; `ai_semantic_cache` has neither.

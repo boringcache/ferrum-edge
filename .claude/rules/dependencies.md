@@ -5,9 +5,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 ## Vendored, Patched Crates
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
-  `[patch.crates-io]` in `Cargo.toml`: `reqwest 0.13.3`, `h3 0.0.8` (three
-  patches), `h3-quinn 0.0.10`, `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`,
-  and `dimpl 0.6.1`.
+  `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.3`,
+  `h3 0.0.8` (three patches), `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
+  `tokio-tungstenite 0.29.0`, and `dimpl 0.6.1`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
@@ -267,6 +267,17 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 ## Behavioral Regression Coverage (must survive retirement)
 
+- SQL `verify-ca` exclusive root CA (issue #5534 review): the vendored
+  `--lib tls_rustls::tests` pair in
+  `vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/tls_rustls.rs`
+  (`root_store_with_configured_ca_replaces_the_default_trust_store`,
+  `verify_ca_refuses_a_certificate_from_an_unconfigured_ca`), run by the
+  `test-vendor-patches` job, plus `tests/service_integration/db_tls.rs`.
+  Upstream UNIONS the configured CA with the bundled public roots; combined
+  with the `verify-ca` name waiver that trusts any public certificate for any
+  name, so the store must start from `RootCertStore::empty()` whenever a CA is
+  configured. `EnvConfig::validate` additionally refuses
+  `FERRUM_DB_TLS_MODE=verify-ca` with no configured CA.
 - Per-request connect timeout across shared pool keys:
   `tests/integration/connection_pool_tests.rs`.
 - HTTP/3 graceful close with a buffered response is not a false 502:

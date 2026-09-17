@@ -56,6 +56,7 @@ struct MeshFileDocument {
     /// [`CURRENT_CONFIG_VERSION`]; the mesh model has no file migrations.
     #[serde(default)]
     version: Option<String>,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     mesh: Box<crate::modes::mesh::config::MeshConfig>,
 }
 
@@ -110,7 +111,8 @@ pub fn read_mesh_config_document(
             .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?;
         serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     } else {
-        serde_json::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
+        crate::util::json_object::from_json_object_slice::<MeshFileDocument>(content.as_bytes())
+            .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     };
     // Deserialization owns all retained fields; do not keep the source buffer
     // alive while slice materialization allocates its runtime structures.
