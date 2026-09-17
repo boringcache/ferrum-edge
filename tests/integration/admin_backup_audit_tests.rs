@@ -1411,6 +1411,102 @@ async fn restore_round_trips_a_backup_and_keeps_explicit_empty_semantics() {
 }
 
 #[tokio::test]
+async fn restore_and_batch_reject_positional_collection_elements_before_writing() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("collection-admin", Some("admin"));
+    seed_sentinel_resources(&base, &admin).await;
+    let (status, before, _) = get_backup(&base, "/backup", &admin, None).await;
+    assert_eq!(status, 200);
+
+    // This inner array really is a valid positional Proxy without the
+    // element adapter; it is not merely missing required fields.
+    let positional = json!([
+        {},
+        "replacement",
+        null,
+        "ferrum",
+        [],
+        "/replacement",
+        "http",
+        "127.0.0.1",
+        12345
+    ]);
+    let unguarded: Proxy = serde_json::from_value(positional.clone()).unwrap();
+    assert_eq!(unguarded.id, "replacement");
+    for path in ["/restore?confirm=true", "/batch"] {
+        for field in ["proxies", "consumers", "plugin_configs", "upstreams"] {
+            let element = if field == "proxies" {
+                positional.clone()
+            } else {
+                json!([])
+            };
+            let payload = json!({field: [element]});
+            let error = ferrum_edge::_test_support::restore_envelope_admission_for_test(
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("expected a JSON object"), "{field}: {error}");
+            let (status, body) = post_admin_raw(&base, path, &admin, &payload.to_string()).await;
+            assert_eq!(status, 400, "{path} {field}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected a JSON object"),
+                "{path} {field}: {body}"
+            );
+            let (status, after, _) = get_backup(&base, "/backup", &admin, None).await;
+            assert_eq!(status, 200);
+            for resource in ["proxies", "consumers", "plugin_configs", "upstreams"] {
+                assert_eq!(
+                    after[resource], before[resource],
+                    "{path} changed {resource}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn batch_object_elements_round_trip_through_backup_and_restore() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("collection-admin", Some("admin"));
+    let payload = json!({
+        "proxies": [{
+            "id": "list-proxy", "listen_path": "/list", "backend_scheme": "http",
+            "backend_host": "127.0.0.1", "backend_port": 12345
+        }],
+        "consumers": [{"id": "list-consumer", "username": "list-user"}],
+        "plugin_configs": [{
+            "id": "list-plugin", "plugin_name": "cors", "scope": "global",
+            "config": {"allowed_origins": ["https://example.com"]}
+        }],
+        "upstreams": [{"id": "list-upstream", "targets": [{"host": "127.0.0.1", "port": 12345}]}]
+    });
+    let (status, body) = post_admin_raw(&base, "/batch", &admin, &payload.to_string()).await;
+    assert!((200..300).contains(&status), "batch: {body}");
+    let (status, before, _) = get_backup(&base, "/backup", &admin, None).await;
+    assert_eq!(status, 200);
+    for field in ["proxies", "consumers", "plugin_configs", "upstreams"] {
+        assert_eq!(before[field].as_array().unwrap().len(), 1);
+        assert_eq!(before[field][0]["id"], payload[field][0]["id"]);
+    }
+    let (status, body) =
+        post_admin_raw(&base, "/restore?confirm=true", &admin, &before.to_string()).await;
+    assert!((200..300).contains(&status), "restore: {body}");
+    let (status, mut after, _) = get_backup(&base, "/backup", &admin, None).await;
+    assert_eq!(status, 200);
+    for field in ["proxies", "consumers", "plugin_configs", "upstreams"] {
+        // Restore deliberately stamps a fresh update time on each resource.
+        after[field][0]["updated_at"] = before[field][0]["updated_at"].clone();
+        assert_eq!(after[field], before[field], "round trip changed {field}");
+    }
+}
+
+#[tokio::test]
 async fn backup_resource_filter_decodes_percent_encoded_keys_and_values() {
     let tmp = TempDir::new().unwrap();
     let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;

@@ -379,7 +379,11 @@ pub struct CniNetConfig {
     pub prev_result: Option<serde_json::Value>,
     /// Optional Ferrum-specific tuning carried on the conflist entry.
     /// Defaults to `Default` when missing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
     pub ferrum: Option<FerrumCniOptions>,
     /// Still-valid attachments supplied on GC (CNI 1.1
     /// `cni.dev/valid-attachments`).
@@ -390,7 +394,8 @@ pub struct CniNetConfig {
     #[serde(
         rename = "cni.dev/valid-attachments",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object_vec"
     )]
     pub valid_attachments: Option<Vec<CniValidAttachment>>,
     /// Pass-through for any conflist fields we don't model explicitly

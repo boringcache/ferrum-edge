@@ -1321,8 +1321,10 @@ pub struct UpstreamLocalityLbSetting {
     #[serde(default = "default_true_locality_lb_enabled")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub distribute: Vec<LocalityDistribute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub failover: Vec<LocalityFailover>,
     /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
     /// overrides containing exactly one equals sign (`key=value`). Mutually
@@ -1843,6 +1845,7 @@ pub struct Upstream {
     /// Namespace this resource belongs to. Defaults to "ferrum".
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub targets: Vec<UpstreamTarget>,
     #[serde(default)]
     pub algorithm: LoadBalancerAlgorithm,
@@ -1870,6 +1873,7 @@ pub struct Upstream {
     /// Used for Istio DestinationRule subset routing. Targets whose `tags`
     /// are a superset of a subset's `labels` belong to that subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub subsets: Option<Vec<SubsetDefinition>>,
     /// Per-destination-port traffic policy overrides populated by Istio
     /// `DestinationRule.trafficPolicy.portLevelSettings[]`. Keyed by
@@ -2762,6 +2766,7 @@ pub struct Proxy {
     #[serde(default)]
     pub auth_mode: AuthMode,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugins: Vec<PluginAssociation>,
     // Connection pooling settings (optional - override global defaults)
     // Note: pool_max_idle_per_host is intentionally global-only (FERRUM_POOL_MAX_IDLE_PER_HOST).
@@ -3241,11 +3246,15 @@ pub struct ApiSpec {
 pub struct GatewayConfig {
     /// Configuration schema version.
     pub version: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxies: Vec<Proxy>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub consumers: Vec<Consumer>,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<PluginConfig>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub upstreams: Vec<Upstream>,
     #[serde(default = "Utc::now")]
     pub loaded_at: DateTime<Utc>,
@@ -3283,6 +3292,7 @@ pub struct GatewayConfig {
     /// one into `frontend_tls_*` (which stays the fallback certificate served
     /// when a ClientHello carries no usable SNI).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub frontend_tls_certificate_sources: Vec<FrontendTlsCertificateSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///

@@ -32,11 +32,15 @@
 //! path can also use.
 //!
 //! [`EnforcedCrlSet`] carries an admitted list plus the generation it was
-//! published under (issue #5574). A surface whose verifiers must notice a
-//! rotation — the mesh inbound SPIFFE peer verifier, and the HBONE admission
-//! fence that re-judges already-admitted peers against it — reads the shared
-//! slot rather than a snapshot captured at build time, so both sides of that
-//! decision always police the same records.
+//! published under (issue #5574). The mesh inbound SPIFFE peer verifier reads
+//! that shared slot on every handshake rather than a snapshot captured when its
+//! `ServerConfig` was built, so an operator's rotation reaches the next peer
+//! without rebinding the listener, and the generation is the other half of its
+//! verifier-cache identity beside the SVID source. The same records are
+//! compiled into the HBONE admission fence's in-force anchors, which is what
+//! re-judges peers whose established inbound session is never re-handshaked;
+//! publication for both surfaces goes through
+//! `ProxyState::publish_mesh_inbound_crls`.
 
 use std::sync::Arc;
 
@@ -54,11 +58,10 @@ use crate::tls::CrlList;
 /// generation it was published under (issue #5574).
 ///
 /// A plain [`CrlList`] answers "which records" but not "which publication",
-/// and the HBONE admission fence needs both: it records the generation a
-/// CONNECT was admitted under and re-verifies the retained peer chain only
-/// when that generation has moved, exactly as it does for the gateway trust
-/// generation. Without the tag every sweep would have to rebuild a chain
-/// verifier per live tunnel just to discover the CRL set had not changed.
+/// and the verifier cache needs both: it keeps per-trust-domain chain verifiers
+/// compiled from an SVID source AND a CRL set, and reuses them only while both
+/// halves still match. Without the tag a rotation that changed no SVID material
+/// would keep serving handshakes under the records the listener started with.
 ///
 /// The bytes are shared, never copied: publishing a new generation is one
 /// `Arc` store.
@@ -100,15 +103,16 @@ pub fn enforced_crl_set(crls: CrlList) -> SharedEnforcedCrlSet {
 /// the records are byte-identical to the ones already enforced.
 ///
 /// Returns `true` only when the enforced set actually changed. The comparison
-/// is what keeps a periodic reload of an UNCHANGED CRL file from advancing the
-/// generation: a bumped generation makes every live-tunnel sweep re-verify
-/// every retained peer chain, so an unconditional bump would turn the reload
-/// cadence into per-tunnel certificate path building for no decision at all.
+/// is what keeps a periodic reload of an UNCHANGED CRL file from rebuilding
+/// every cached chain verifier — and, through the admission fence, every live
+/// tunnel's certificate path — for no decision at all.
 ///
 /// This is deliberately a free function rather than a method on the slot: the
 /// caller that owns the surface is the one place allowed to publish, and it
-/// must schedule whatever re-check the change implies (see
-/// `ProxyState::publish_mesh_inbound_crls`).
+/// must recompile and re-check whatever the change implies. For the mesh
+/// inbound set that caller is `HboneAdmissionFence::publish_inbound_admission_crls`,
+/// reached through `ProxyState::publish_mesh_inbound_crls`; nothing else may
+/// store into that slot.
 pub fn publish_enforced_crl_set(slot: &SharedEnforcedCrlSet, crls: CrlList) -> bool {
     let current = slot.load();
     if crl_records_equal(current.crls(), &crls) {
@@ -123,7 +127,12 @@ pub fn publish_enforced_crl_set(slot: &SharedEnforcedCrlSet, crls: CrlList) -> b
 ///
 /// Byte equality on the DER, not pointer equality: each reload parses the
 /// source afresh, so an unchanged file always produces a different allocation.
-fn crl_records_equal(
+///
+/// Shared with the HBONE admission fence (issue #5574), which compares a
+/// candidate against both the records the verifier enforces and the records the
+/// anchors in force were compiled with. One implementation, so "unchanged" can
+/// never mean two different things on the two surfaces.
+pub(crate) fn crl_records_equal(
     left: &[CertificateRevocationListDer<'static>],
     right: &[CertificateRevocationListDer<'static>],
 ) -> bool {
@@ -199,6 +208,42 @@ impl CrlWindowRejection {
             Self::Expired => "has expired (nextUpdate has passed)",
         }
     }
+
+    /// Fixed-cardinality class label for a refusal, for a diagnostic that must
+    /// carry no record contents at all (issue #5574).
+    ///
+    /// Distinct from [`Self::reason`], which is prose for a message that already
+    /// names a record index and a redacted source: this is the closed
+    /// four-value set the admission fence puts on a structured field.
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Unparseable => "unparseable",
+            Self::NotYetValid => "not_yet_valid",
+            Self::MissingNextUpdate => "missing_next_update",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Whether every record in a candidate list is usable as an ENFORCED set right
+/// now, reporting the first refusal's class (issue #5574).
+///
+/// The all-or-nothing form of [`validate_crl_windows`], for a caller that must
+/// decide whether a candidate takes force rather than render an operator
+/// message about a named source: the HBONE admission fence compiles the
+/// enforced records into the anchors it judges live tunnels with, so a record
+/// the verifier cannot use must not become the record the fence judges by. The
+/// first unusable record refuses the whole candidate, exactly as at admission —
+/// publishing the usable subset of a partially invalid source would silently
+/// stop policing an issuer the operator listed.
+pub(crate) fn usable_crl_records(
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<(), &'static str> {
+    let now_unix = ASN1Time::now().timestamp();
+    for crl in crls {
+        classify_crl_window(crl, now_unix).map_err(CrlWindowRejection::class)?;
+    }
+    Ok(())
 }
 
 /// Classify one CRL record's validity window against `now_unix`.

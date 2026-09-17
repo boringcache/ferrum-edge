@@ -8278,21 +8278,32 @@ impl ProxyState {
     /// does not advance, so ordinary reloads and repeated commits are free.
     ///
     /// This is the ONE place the request-facing gateway trust generation
-    /// advances, so it is also where the HBONE admission fence is asked to
-    /// re-check live tunnels' credentials against it (issue #5568). Every trust
-    /// publisher — `commit_gateway_trust_generation_locked` for an accepted
+    /// advances, and every trust publisher —
+    /// `commit_gateway_trust_generation_locked` for an accepted
     /// `Replace`/`Clear`, `install_gateway_runtime_svid_bundle` for a SPIRE /
     /// file / CA-backend source rotation, and the epoch publication above —
-    /// ends here, so one call site covers them all and a new publisher cannot
-    /// forget the sweep.
+    /// ends here, so one call site covers them all.
+    ///
+    /// It requests an HBONE admission-fence sweep, but NOT because it decides
+    /// the credential verdict: since issue #5568's review, the fence judges a
+    /// live tunnel's chain against the inbound mTLS verifier's own trust slot
+    /// (`ProxyState::publish_mesh_inbound_trust_bundle`), because that is the
+    /// material the peer's next handshake would apply and this epoch's bundles
+    /// are not. The sweep stays here as the defence-in-depth half of a
+    /// two-publication step: the gateway trust epoch and the inbound slot are
+    /// written by different code, in that order, so a publication of the first
+    /// without the second must cost one cheap pass rather than a missed one.
+    /// It is cheap precisely because the trust re-verification is keyed on the
+    /// slot's own revision — a sweep from here that the slot did not follow
+    /// does no certificate path building at all.
     ///
     /// The sweep is requested AFTER the store, which is the same
     /// publish-then-recheck ordering `publish_mesh_inbound_tls_policy` relies
-    /// on: a CONNECT that read the superseded trust necessarily captured a
+    /// on: a CONNECT that read the superseded state necessarily captured a
     /// stale sweep counter too, and `HboneAdmissionFence::admit` turns that
     /// into a fresh sweep. [`Self::fence_gateway_trust_generation`] deliberately
     /// does NOT sweep — fencing carries the same material forward, so there is
-    /// nothing a credential re-check could decide differently, and sweeping
+    /// nothing a re-check could decide differently, and sweeping
     /// mid-publication would only judge tunnels against the outgoing
     /// generation.
     fn publish_live_gateway_trust(&self) {
@@ -8836,33 +8847,73 @@ impl ProxyState {
         self.hbone_admission_fence.request_sweep();
     }
 
+    /// Bind the mesh inbound SPIFFE verifier's trust slot to the HBONE
+    /// admission fence (issue #5568).
+    ///
+    /// Mesh startup calls this for the ONE slot
+    /// `mesh_inbound_spiffe_verifier` reads, at the moment it is created and
+    /// before anything can be published into it. The fence's credential gate
+    /// judges both live tunnels and arriving CONNECTs against exactly those
+    /// anchors, because the fence answers "would this still be admitted" and
+    /// admission is what that verifier decides. Idempotent for the same slot.
+    pub fn install_mesh_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {
+        self.hbone_admission_fence
+            .install_inbound_admission_trust(slot);
+    }
+
+    /// Publish the mesh inbound SPIFFE verifier's trust bundle.
+    ///
+    /// This is the ONE way that slot changes: the store is followed by an HBONE
+    /// admission-fence sweep, so a live tunnel whose peer chain no longer
+    /// anchors in the material the next handshake would apply is revoked
+    /// (`peer_trust`) instead of outliving the trust that admitted it, and the
+    /// peer's next CONNECT on that same pooled session is refused rather than
+    /// re-admitted. A direct `slot.store()` skips the sweep AND leaves the
+    /// fence's in-force trust — its skip key for certificate path building, and
+    /// the anchors the CONNECT gate reads — behind the bytes the verifier is
+    /// serving, which would make the gate stop re-checking.
+    ///
+    /// A candidate that does not compile as ONE atomic set is stored (the same
+    /// slot backs the inbound listener's server identity) but does not take
+    /// force: the inbound verifier keeps its last-known-good set in exactly that
+    /// case, so the fence must too.
+    pub fn publish_mesh_inbound_trust_bundle(
+        &self,
+        slot: &crate::tls::SharedBundleSlot,
+        bundle: Arc<Option<SvidBundle>>,
+    ) {
+        self.hbone_admission_fence
+            .publish_inbound_admission_trust(slot, bundle);
+    }
+
     /// Publish the CRL set the mesh inbound SPIFFE peer verifier enforces.
     ///
     /// This is the ONE writer of [`Self::mesh_inbound_crls`], and it exists for
-    /// the same reason [`Self::publish_mesh_inbound_tls_policy`] does: an
+    /// the same reason [`Self::publish_mesh_inbound_trust_bundle`] does: an
     /// established inbound mTLS session is never re-handshaked, so a CRL that
     /// revokes an already-admitted peer leaf would otherwise take effect only
     /// at that peer's NEXT handshake and leave its live tunnels flowing
-    /// (issue #5574). The store is followed by an admission-fence sweep, which
-    /// re-verifies every retained peer chain against the new records and
-    /// revokes a revoked one with `peer_revoked`.
+    /// (issue #5574).
     ///
-    /// Publish-then-recheck, in that order: a CONNECT that read the superseded
-    /// set necessarily captured a stale sweep counter too (the counter is read
-    /// before the generation at the request path), and
-    /// `HboneAdmissionFence::admit` turns that into a fresh sweep.
+    /// It goes through the admission fence's single publisher rather than
+    /// storing the slot directly, because the enforced records are an input to
+    /// the SAME compiled anchors the fence judges live tunnels and arriving
+    /// CONNECTs against. A direct store would leave those anchors policing the
+    /// records they were compiled with while the verifier enforced newer ones —
+    /// the two surfaces deciding the same question from different lists. The
+    /// publication therefore recompiles the in-force anchors WITH the new
+    /// records, advances the one in-force revision, and only then requests the
+    /// sweep that revokes a peer the records now revoke (`peer_revoked`) and
+    /// makes its next CONNECT refuse.
     ///
-    /// Returns whether the enforced set actually changed. A periodic reload
-    /// that re-reads an UNCHANGED CRL file publishes nothing and schedules no
-    /// sweep, so the reload cadence never turns into per-tunnel certificate
-    /// path building.
+    /// Returns whether the enforced set actually changed. Republishing
+    /// byte-identical records publishes nothing and sweeps nothing, so a
+    /// periodic reload of an unchanged CRL file never turns into per-tunnel
+    /// certificate path building; a candidate that is unusable, or that the
+    /// anchors cannot be compiled with, takes no force at all.
     pub fn publish_mesh_inbound_crls(&self, crls: crate::tls::CrlList) -> bool {
-        let changed =
-            crate::tls::crl_policy::publish_enforced_crl_set(&self.mesh_inbound_crls, crls);
-        if changed {
-            self.hbone_admission_fence.request_sweep();
-        }
-        changed
+        self.hbone_admission_fence
+            .publish_inbound_admission_crls(&self.mesh_inbound_crls, crls)
     }
 
     /// Republish only the captured-listener-port → application-port alias table,
@@ -30758,15 +30809,6 @@ async fn handle_proxy_request_inner(
     // HBONE branch below, and no mesh/inbound predicate is available this early
     // that is cheaper than the load it would guard — one uncontended atomic
     // load (a plain `mov` on x86-64, `ldar` on aarch64).
-    // The enforced mesh inbound CRL generation, captured BEFORE the sweep
-    // counter for the same reason (issue #5574): `publish_mesh_inbound_crls`
-    // stores and only then bumps the counter, so reading the generation first
-    // guarantees a CONNECT that records a superseded generation also records a
-    // stale counter. Reading it AFTER would let a CONNECT record the NEW
-    // generation while carrying a stale counter — `admit` would schedule a
-    // sweep, and that sweep's "unchanged ⇒ skip" fast path would then skip the
-    // very tunnel the rotation was published for.
-    let hbone_mesh_inbound_crl_generation = state.mesh_inbound_crls.load().generation();
     let hbone_admission_sweep_epoch = state.hbone_admission_fence.sweep_epoch();
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
@@ -32419,7 +32461,6 @@ async fn handle_proxy_request_inner(
                 request_protocol,
                 grpc_web_request,
                 sweep_epoch: hbone_admission_sweep_epoch,
-                mesh_inbound_crl_generation: hbone_mesh_inbound_crl_generation,
             },
         )
         .await);
@@ -32445,7 +32486,6 @@ async fn handle_proxy_request_inner(
                 request_protocol,
                 grpc_web_request,
                 sweep_epoch: hbone_admission_sweep_epoch,
-                mesh_inbound_crl_generation: hbone_mesh_inbound_crl_generation,
             },
         )
         .await);

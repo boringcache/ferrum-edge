@@ -97,6 +97,7 @@ pub struct MeshRouteDispatchConfig {
     /// Ordered list of rules. First match wins; rules with no match criteria
     /// are rejected at config-load time to avoid silently-overriding catch-alls.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub rules: Vec<RouteRule>,
     /// When `true`, requests that match no rule are rejected with 404 instead
     /// of falling through to the proxy's default backend. The Istio
@@ -820,11 +821,13 @@ pub struct RouteRule {
     /// `VirtualService.http[].headers.request.{set,add,remove}` onto each
     /// emitted dispatch rule. Operators may also configure these directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub request_transform: Vec<RawRouteHeaderTransformRule>,
     /// Optional response-header transforms applied by `response_transformer`
     /// after its own static rules when this rule matches. Counterpart to
     /// `request_transform`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub response_transform: Vec<RawRouteHeaderTransformRule>,
     /// Optional per-rule fault action. Mirrors the proxy-scoped
     /// `fault_injection` plugin's `delay` / `abort` shape but applies only

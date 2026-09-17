@@ -3049,10 +3049,23 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
             value.clone(),
         )
         .map(|object| object.0.mesh_policies)
-        .unwrap_or_default();
+        .unwrap_or_else(|_| {
+            warn!(
+                field = "mesh_slice",
+                "Cannot derive NodeWaypoint scoped policy labels from invalid mesh_authz input"
+            );
+            Vec::new()
+        });
     }
     if let Some(value) = config.get("mesh_policies") {
-        return serde_json::from_value::<Vec<MeshPolicy>>(value.clone()).unwrap_or_default();
+        let policies = crate::util::json_object::deserialize_object_vec(value.clone());
+        return policies.unwrap_or_else(|_| {
+            warn!(
+                field = "mesh_policies",
+                "Cannot derive NodeWaypoint scoped policy labels from invalid mesh_authz input"
+            );
+            Vec::new()
+        });
     }
     Vec::new()
 }
@@ -3979,11 +3992,12 @@ fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, an
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let proxy: Proxy = serde_json::from_value(value.clone()).map_err(|error| {
-                anyhow::anyhow!(
-                    "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
-                )
-            })?;
+            let proxy: Proxy = crate::util::json_object::deserialize_object(value.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Mesh slice VirtualService L4 proxy {index} is malformed: {error}"
+                    )
+                })?;
             if proxy.namespace != slice.namespace
                 || !proxy
                     .id
@@ -4022,12 +4036,13 @@ fn decode_virtual_service_l4_upstreams(
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let upstream: crate::config::types::Upstream = serde_json::from_value(value.clone())
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
-                    )
-                })?;
+            let upstream: crate::config::types::Upstream =
+                crate::util::json_object::deserialize_object(value.clone())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Mesh slice VirtualService L4 upstream {index} is malformed: {error}"
+                        )
+                    })?;
             if upstream.namespace != slice.namespace
                 || !upstream.id.starts_with("istio-vs-l4-upstream-")
                 || !referenced.contains(upstream.id.as_str())
@@ -15394,6 +15409,15 @@ async fn arm_mesh_runtime_startup(
         federation_activation,
         mesh_ca_svid_slot.as_ref(),
     );
+    // The inbound SPIFFE verifier's slot IS the HBONE admission fence's trust
+    // input (issue #5568): the fence revokes a live tunnel whose peer chain
+    // would no longer complete a handshake here, so it must judge against the
+    // anchors this verifier reads, not against the request epoch's gateway
+    // trust — those two are built by different code from different material.
+    // Installed before the first `publish_staged_spiffe_bundle` below.
+    if let Some(slot) = mesh_inbound_spiffe_slot.as_ref() {
+        proxy_state.install_mesh_inbound_admission_trust(slot);
+    }
     if let Some(slice) = initial_applied_mesh_slice.as_deref() {
         let gateway_trust = stage_gateway_active_trust_bundles(
             &proxy_state,
@@ -16624,7 +16648,11 @@ async fn start_mesh_ca_backend_svid_source(
     }
 
     let workload_spiffe_id = configured_mesh_workload_spiffe_id(runtime)?;
-    let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+    let inbound_slot: tls::SharedBundleSlot = tls::shared_bundle_slot(None);
+    // Bind the slot to the HBONE admission fence BEFORE the first SVID is
+    // fetched (issue #5568): the blocking initial fetch publishes into it, and
+    // the fence has to be able to identify that publication's trust revision.
+    proxy_state.install_mesh_inbound_admission_trust(&inbound_slot);
     // The Workload API's rotation signal IS the existing backend SVID rotation
     // channel: one revision counter for the whole runtime authority path, so an
     // X.509 rotation and a JWT key rotation both wake the open streams and no
@@ -17212,6 +17240,13 @@ fn empty_mesh_inbound_trust_overlay_slot() -> SharedMeshInboundTrustOverlaySlot 
 /// snapshot. Without this, a rotation that completes between a slice apply's
 /// staging and publish could be clobbered by the older staged SVID, leaving the
 /// inbound verifier pinned to stale (possibly near-expiry) cert/key + roots.
+///
+/// The store goes through `ProxyState::publish_mesh_inbound_trust_bundle`, the
+/// ONE writer of this slot (issue #5568), which advances the slot's trust
+/// revision when the X.509 material actually changed and then requests an HBONE
+/// admission-fence sweep — so a SPIRE CA rotation that this path merges
+/// additively into the inbound roots is the same material the fence re-judges
+/// live tunnels against.
 fn publish_runtime_svid_to_inbound_slot(
     proxy_state: &ProxyState,
     inbound_slot: &tls::SharedBundleSlot,
@@ -17230,7 +17265,7 @@ fn publish_runtime_svid_to_inbound_slot(
         Some(overlay) => merge_trust_overlay_into_svid_bundle(&mut bundle, overlay),
         None => retain_svid_local_trust_only(&mut bundle),
     }
-    inbound_slot.store(Arc::new(Some(bundle)));
+    proxy_state.publish_mesh_inbound_trust_bundle(inbound_slot, Arc::new(Some(bundle)));
 }
 
 fn start_mesh_inbound_svid_rotation_republisher(
@@ -17415,7 +17450,7 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
         return None;
     }
 
-    Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))))
+    Some(tls::shared_bundle_slot(Some(bundle)))
 }
 
 /// Overlay the effective federated (and any extra local) trust bundles onto the
@@ -19177,10 +19212,16 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// trusts (or stops trusting) peer domains for a slice the runtime rejected.
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
+///
+/// Both arms publish through `ProxyState::publish_mesh_inbound_trust_bundle`
+/// (issue #5568), so every accepted change to inbound trust re-judges live
+/// HBONE tunnels against it. A republish that carries the same X.509 material
+/// costs one coalesced sweep and no certificate path building, because the
+/// slot's trust revision does not move.
 fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedSpiffeBundle>) {
     match staged {
         Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
-            slot.store(bundle);
+            proxy_state.publish_mesh_inbound_trust_bundle(&slot, bundle);
         }
         Some(StagedSpiffeBundle::RuntimeSlot {
             slot,

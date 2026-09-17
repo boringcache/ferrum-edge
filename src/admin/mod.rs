@@ -8046,7 +8046,7 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Whether the closed `POST /restore` envelope admits `body` (issue #5538).
+/// Structural admission of the closed `POST /restore` envelope (issue #5538).
 ///
 /// Lets the OpenAPI contract test prove that the published `RestoreRequest`
 /// property inventory is exactly what serde accepts, without making the
@@ -8056,8 +8056,8 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
 ///
 /// Reached through `_test_support`; the binary target has no consumer.
 #[allow(dead_code)]
-pub(crate) fn restore_envelope_admits_for_test(body: &[u8]) -> bool {
-    crate::util::json_object::from_json_object_slice::<RestorePayload>(body).is_ok()
+pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
+    crate::util::json_object::from_json_object_slice::<RestorePayload>(body).map(|_| ())
 }
 
 /// Whether the closed `POST /batch` envelope admits `body` (issue #5565).
