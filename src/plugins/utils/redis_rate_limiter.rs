@@ -4396,7 +4396,10 @@ impl RedisRateLimitClient {
     /// availability.
     async fn probe_server_time(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
         match screen_connection_server_clock(conn, SCREENED_COMMAND_RESPONSE_TIMEOUT).await {
-            ServerClockScreen::Clock { server_time, sampled_at } => {
+            ServerClockScreen::Clock {
+                server_time,
+                sampled_at,
+            } => {
                 // Seeded before the connection is published, so the first
                 // selection that follows already has a server offset. This
                 // is the only sample not bounded by
