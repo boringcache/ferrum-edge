@@ -268,7 +268,7 @@ pub fn unbound_port_outside(excluded: std::ops::RangeInclusive<u16>) -> io::Resu
         registry.candidates((10_240..=u16::MAX).filter(|port| !excluded.contains(port)));
     let (lease, sockets) = registry.lease_with(candidates, |port| {
         let tcp = bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], port)))?;
-        let udp = UdpSocket::bind(("0.0.0.0", port))?;
+        let udp = bind_udp_socket(SocketAddr::from(([0, 0, 0, 0], port)))?;
         Ok((port, (tcp, udp)))
     })?;
     let port = lease.retain_for_process();
@@ -293,6 +293,20 @@ pub fn bind_tcp_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
 pub fn bind_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = bind_tcp_socket(addr)?;
     socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+/// Keep UDP/DTLS reservations and native fixtures exclusive, just like TCP.
+/// The registry lease must survive any socket release for a gateway handoff.
+pub fn bind_udp_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_reuse_address(false)?;
+    socket.bind(&addr.into())?;
     Ok(socket.into())
 }
 
@@ -339,7 +353,7 @@ impl TestSocket for UdpSocket {
     type Binding = io::Result<Self>;
 
     fn bind_test(addr: impl ToSocketAddrs) -> Self::Binding {
-        bind_registered(addr, Self::bind, Self::local_addr)
+        bind_registered(addr, bind_udp_socket, Self::local_addr)
     }
 }
 

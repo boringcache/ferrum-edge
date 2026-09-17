@@ -455,6 +455,7 @@ impl Drop for TestGateway {
 pub struct GatewayChildGuard {
     child: Option<Child>,
     startup_output: Option<GatewayStartupOutput>,
+    readiness_identity: Option<(u16, SpawnedGatewayIdentity)>,
 }
 
 impl GatewayChildGuard {
@@ -463,6 +464,7 @@ impl GatewayChildGuard {
         Self {
             child: Some(child),
             startup_output: None,
+            readiness_identity: None,
         }
     }
 
@@ -473,7 +475,40 @@ impl GatewayChildGuard {
         Ok(Self {
             child: Some(command.spawn()?),
             startup_output: Some(startup_output),
+            readiness_identity: None,
         })
+    }
+
+    /// Spawn with an admin identity for readiness without touching stream ports.
+    /// The caller supplies fresh credentials for this attempt, which are captured
+    /// for redaction before spawning and retained until the child is reaped.
+    pub fn spawn_with_identity(
+        command: &mut Command,
+        admin_port: u16,
+        identity: SpawnedGatewayIdentity,
+    ) -> std::io::Result<Self> {
+        command.env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string());
+        identity.apply_to_command(command);
+        let mut guard = Self::spawn(command)?;
+        guard.readiness_identity = Some((admin_port, identity));
+        Ok(guard)
+    }
+
+    /// Prove this child's admin ownership and completed listener startup.
+    pub async fn wait_for_owned_ready(&mut self, timeout: Duration) -> std::io::Result<()> {
+        let (admin_port, identity) = self.readiness_identity.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP readiness requires GatewayChildGuard::spawn_with_identity",
+            )
+        })?;
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("gateway child was already reaped"))?;
+        wait_for_owned_gateway_identity(child, *admin_port, identity, timeout)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))
     }
 
     pub fn startup_diagnostics(&self) -> String {

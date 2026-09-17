@@ -1,6 +1,27 @@
 use hdrhistogram::Histogram;
 use serde::Serialize;
 
+/// Merge every worker outcome. A failed task must not become a zero-error row.
+pub async fn collect_results(
+    handles: Vec<tokio::task::JoinHandle<anyhow::Result<BenchMetrics>>>,
+) -> BenchMetrics {
+    let mut combined = BenchMetrics::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(metrics)) => combined.merge(&metrics),
+            Ok(Err(error)) => {
+                eprintln!("  task error: {error}");
+                combined.record_error();
+            }
+            Err(error) => {
+                eprintln!("  join error: {error}");
+                combined.record_error();
+            }
+        }
+    }
+    combined
+}
+
 /// Performance metrics collector with wrk-like reporting.
 pub struct BenchMetrics {
     histogram: Histogram<u64>,
