@@ -1,0 +1,85 @@
+# Hosted execution gate for the multi-protocol benchmark harness's own tests.
+#
+# `tests/performance/multi_protocol/` is a standalone package with its own
+# manifest and lockfile rather than a workspace member, so nothing it contains
+# is ever built or run by the workspace `Tests` aggregate. Without this lane the
+# harness's tests are documentation: the worker-accounting tests in
+# `tests/metrics_tests.rs` and the sample/scenario validity rules in
+# `tests/test_benchmark_validity.py` decide whether a benchmark observation may
+# count as a win, and an unexecuted rule is not evidence.
+#
+# Deliberately a workflow of its own. The benchmark matrix job in
+# `gateways-protocol-benchmark.yml`, and the `test` aggregate and planner job in
+# `ci.yml`, are each held byte-for-byte against the trusted base by the required
+# build-policy check, so a pull request can neither run these tests beside the
+# benchmark nor add a planner gate plus an aggregate row for a new `ci.yml` job.
+# This file adds no executable or configuration surface that policy governs, so
+# it can carry the lane instead.
+#
+# Not a branch-protection-required check: the required set is repository
+# settings, which a pull request cannot change.
+
+name: Benchmark Harness Tests
+
+on:
+  pull_request:
+    paths:
+      - tests/performance/multi_protocol/**
+      - .github/workflows/benchmark-harness-tests.yml
+  push:
+    branches: [main]
+    paths:
+      - tests/performance/multi_protocol/**
+      - .github/workflows/benchmark-harness-tests.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness-tests:
+    name: Benchmark harness tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # `.cargo/config.toml` points every cargo invocation at sccache and mold.
+      # Neither is installed here, so clear both, exactly as the sibling harness
+      # job in `release-profile-study.yml` does. This lane does not pay for them
+      # on purpose: the package's whole `test` profile compiles cold in about a
+      # minute, which is less than installing the tools and carrying a separate
+      # Actions cache entry would cost.
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Install the harness build dependencies
+        # `build.rs` runs `protoc` over `proto/bench.proto`. It only warns when
+        # the compiler is missing, so without this the generated gRPC surface
+        # would be silently absent rather than a failure.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev
+
+      - name: Run the harness worker-accounting tests
+        run: |
+          cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml \
+            --locked --test metrics_tests
+
+      # Last, and unconditional, so a failed compile above still reports the
+      # validity verdict instead of hiding it behind a skipped step.
+      - name: Run the benchmark validity rule tests
+        if: always()
+        run: |
+          python3 -m unittest discover --verbose \
+            --start-directory tests/performance/multi_protocol/tests \
+            --pattern 'test_*.py'

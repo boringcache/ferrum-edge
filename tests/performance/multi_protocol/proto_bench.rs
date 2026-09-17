@@ -13,7 +13,7 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
 use bytes::Buf;
-use multi_protocol_perf::metrics::BenchMetrics;
+use multi_protocol_perf::metrics::{BenchMetrics, collect_results};
 use multi_protocol_perf::tls_utils;
 
 // ── gRPC proto ───────────────────────────────────────────────────────────────
@@ -165,20 +165,6 @@ fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
             metrics.report(protocol, &args.target, args.concurrency, args.duration)
         );
     }
-}
-
-async fn collect_results(
-    handles: Vec<tokio::task::JoinHandle<anyhow::Result<BenchMetrics>>>,
-) -> BenchMetrics {
-    let mut combined = BenchMetrics::new();
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(m)) => combined.merge(&m),
-            Ok(Err(e)) => eprintln!("  task error: {e}"),
-            Err(e) => eprintln!("  join error: {e}"),
-        }
-    }
-    combined
 }
 
 fn record_http_echo_result(
@@ -615,7 +601,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                             metrics.record_error();
                             break;
                         }
-                        let _ = stream.finish().await;
+                        if let Err(e) = stream.finish().await {
+                            eprintln!("  h3 finish error: {e}");
+                            metrics.record_error();
+                            break;
+                        }
                         match stream.recv_response().await {
                             Ok(resp) => {
                                 let status = resp.status();

@@ -70,6 +70,7 @@ adding, removing, or materially changing a workflow.
 | `payload-size-benchmark.yml` | Payload Size Performance Benchmark | Manual | Payload-size benchmark suite for selected refs. |
 | `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
+| `benchmark-harness-tests.yml` | Benchmark Harness Tests | PRs and push to `main` on `tests/performance/multi_protocol/**`, manual | Runs the multi-protocol benchmark harness's own tests: `cargo test --test metrics_tests` for worker/error accounting and `python3 -m unittest` for the `benchmark_validity.py` sample and scenario rules. That package is not a workspace member, so the `Tests` aggregate never builds it. Not a required check. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |

@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dormant database TLS sources or creating PEM files. Owning loaders remain
   responsible for derived URLs and other provider/driver error payloads.
 
+### Security
+
+- Bump the optional `cryptoki` dependency (feature `pkcs11`) from 0.12.0 to 0.12.1 for
+  RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
+  decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
+  change; the manifest's `0.12` requirement already admits the patch release.
+
 ### Changed
 
 - **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash
