@@ -3598,7 +3598,10 @@ async fn a_rebind_to_an_uncompilable_slot_keeps_the_accepted_anchors_in_force() 
         accepted_revision + 1,
         "the publication recompiles the anchors the refused rebind left in force"
     );
-    assert_eq!(fx.state.hbone_admission_fence.trust_anchor_builds(), compilations + 1);
+    assert_eq!(
+        fx.state.hbone_admission_fence.trust_anchor_builds(),
+        compilations + 1
+    );
     assert!(
         !handshake_admits_leaf(&verifier, &peer_leaf),
         "and the same records reach the handshake through the anchors in force"
