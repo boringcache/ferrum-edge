@@ -510,6 +510,7 @@ pub(crate) struct BatchCreateRequest {
     )]
     _api_specs: Option<ApiSpecsBackupSection>,
     #[serde(default, rename = "gateway_trust_bundles")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     _gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
 }
 
