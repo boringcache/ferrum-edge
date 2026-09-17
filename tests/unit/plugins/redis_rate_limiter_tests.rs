@@ -1229,10 +1229,11 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
     use ferrum_edge::_test_support::redis_window_progress_at;
     use ferrum_edge::plugins::utils::rate_limit::FixedWindow;
 
-    // Weighted token-accounting path: prev bucket full (10), current has the
-    // candidate request (1). At fraction 0.0 the old code always denied; with
-    // subsecond decay the mid-window candidate is admitted. Redis request
-    // quotas intentionally use the conservative helper tested below instead.
+    // TOKEN-ACCOUNTING path only (`ai_rate_limiter` budgets, `ws_rate_limiting`
+    // frames): prev bucket full (10), current has the candidate request (1). At
+    // fraction 0.0 the old code always denied; with subsecond decay the
+    // mid-window candidate is admitted. Request quotas moved off this estimate
+    // onto the sub-bucket ladder covered below.
     let window = FixedWindow::new(10, 1);
     let start = redis_window_progress_at(Duration::from_secs(50), 1);
     let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
@@ -1256,35 +1257,340 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
     );
 }
 
-#[test]
-fn redis_request_quota_counts_boundary_clustered_bursts_in_full() {
-    use ferrum_edge::_test_support::conservative_redis_window_count;
+// ── Request-quota sub-bucket ladder ──────────────────────────────────────
+//
+// Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) count a
+// sub-bucketed trailing window in full instead of decaying a previous epoch
+// bucket. Coverage below is pure/deterministic via `sub_bucket_at`,
+// `window_charge`, and `redis_trailing_window_count`.
 
-    // A full burst just before an epoch boundary remains live throughout almost
-    // all of the next exact trailing window. The request-quota path must not
-    // linearly decay it and admit a second burst near the next boundary.
-    assert_eq!(conservative_redis_window_count(100, 1), 101);
-    assert_eq!(conservative_redis_window_count(100, 99), 199);
-    assert!(conservative_redis_window_count(100, 1) > 100);
-    assert_eq!(conservative_redis_window_count(u64::MAX, 1), u64::MAX);
+#[test]
+fn sub_bucket_index_splits_each_window_into_equal_parts() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+    };
+
+    assert_eq!(REDIS_WINDOW_SUB_BUCKETS, 8, "the key layout pins K");
+
+    // One-second window → 125ms sub-buckets.
+    let at = |millis: u64, window: u64| {
+        RedisRateLimitClient::sub_bucket_at(Duration::from_millis(millis), window)
+    };
+    assert_eq!(at(100_000, 1).index, 800);
+    assert_eq!(at(100_124, 1).index, 800);
+    assert_eq!(at(100_125, 1).index, 801);
+    assert_eq!(at(100_999, 1).index, 807);
+    assert_eq!(at(101_000, 1).index, 808);
+
+    // Sixty-second window → 7.5s sub-buckets; a whole window is exactly K of
+    // them, which is what makes `current + K older` cover the trailing window.
+    assert_eq!(at(600_000, 60).index, 80);
+    assert_eq!(at(607_499, 60).index, 80);
+    assert_eq!(at(607_500, 60).index, 81);
+    assert_eq!(at(660_000, 60).index - at(600_000, 60).index, 8);
+
+    // The window travels with the index because it is a key component.
+    assert_eq!(at(100_000, 60).window_seconds, 60);
+    // A zero window is clamped to one second rather than dividing by zero.
+    assert_eq!(at(100_000, 0).window_seconds, 1);
+    assert_eq!(at(100_000, 0).index, 800);
+}
+
+#[test]
+fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
+    use ferrum_edge::plugins::utils::rate_limit::two_window_ttl_seconds;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+    };
+
+    let client = redis_rate_limit_client_for_test(make_config("redis://127.0.0.1:6379/0", false));
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
+    let charge = client.window_charge("ip:127.0.0.1", bucket, two_window_ttl_seconds(1));
+
+    // `%`, braces, and `:` are percent-escaped inside the tag so a
+    // caller-controlled identity cannot terminate it early.
+    let tag = "{ferrum%3Atest:ip%3A127.0.0.1}";
+    let trailing: Vec<&str> = charge.trailing_keys().collect();
+    assert_eq!(trailing.len(), REDIS_WINDOW_SUB_BUCKETS);
+    assert_eq!(trailing[0], format!("{tag}:1:792"));
+    assert_eq!(trailing[7], format!("{tag}:1:799"));
+    assert_eq!(charge.charged_key(), format!("{tag}:1:800"));
+
+    // Retention outlives the `window + one sub-bucket` of history the ladder
+    // reads back, so the oldest bucket a decision needs is never expired first.
+    assert_eq!(charge.ttl_seconds(), 3);
+
+    // Every key of one transaction hashes to the same slot.
+    let charged = charge.charged_key();
+    for key in trailing.iter().copied().chain(std::iter::once(charged)) {
+        assert!(key.starts_with(tag), "{key} must carry the shared hash tag");
+    }
+
+    // Two windows of one policy are disjoint ladders because the key names the
+    // window, not only its index.
+    let minute = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 60);
+    let minute_charge = client.window_charge("ip:127.0.0.1", minute, two_window_ttl_seconds(60));
+    assert_eq!(minute_charge.charged_key(), format!("{tag}:60:13"));
+    assert_ne!(minute_charge.charged_key(), charge.charged_key());
+}
+
+#[test]
+fn trailing_window_count_sums_every_sub_bucket_in_full() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_SUB_BUCKETS, redis_trailing_window_count,
+    };
+
+    // No decay term: a burst clustered in the OLDEST sub-bucket of a full
+    // ladder still counts for everything it is worth.
+    let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
+    ladder[0] = Some(100);
+    ladder[REDIS_WINDOW_SUB_BUCKETS] = Some(1);
+    assert_eq!(redis_trailing_window_count(&ladder), 101);
+
+    // A missing key is zero usage, not an error.
+    assert_eq!(redis_trailing_window_count(&[None, None, Some(7)]), 7);
+
+    // A counter can only go negative when a compensating DECR raced its key's
+    // expiry. Flooring each bucket on its own keeps that stale key from
+    // cancelling a live burst in another bucket.
+    let raced = [Some(-5), Some(100), Some(1)];
+    assert_eq!(redis_trailing_window_count(&raced), 101);
+
+    // Saturating, because a wrapped total would read as spare budget. Two
+    // `i64::MAX` buckets land one short of `u64::MAX`; the third proves the
+    // clamp rather than a wrap back to a tiny, admissible total.
+    let huge = [Some(i64::MAX), Some(i64::MAX)];
+    assert_eq!(redis_trailing_window_count(&huge), u64::MAX - 1);
+    let huger = [Some(i64::MAX), Some(i64::MAX), Some(i64::MAX)];
+    assert_eq!(redis_trailing_window_count(&huger), u64::MAX);
+
+    assert_eq!(redis_trailing_window_count(&[]), 0);
+}
+
+/// Deterministic model of ONE identity's Redis request-quota decisions, driven
+/// by synthetic timestamps through the production sub-bucket derivation and the
+/// production fold.
+///
+/// `buckets` stands in for the Redis keyspace; admission is charge-then-compare
+/// and a refusal hands its own charge straight back, exactly like
+/// `check_http_windows_redis`.
+fn model_sub_bucket_admits(
+    buckets: &mut std::collections::HashMap<u64, i64>,
+    now: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> bool {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+        redis_trailing_window_count,
+    };
+
+    let charged = RedisRateLimitClient::sub_bucket_at(now, window_seconds).index;
+    *buckets.entry(charged).or_insert(0) += 1;
+    let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
+    for (slot, value) in ladder.iter_mut().enumerate() {
+        let back = (REDIS_WINDOW_SUB_BUCKETS - slot) as u64;
+        *value = buckets.get(&charged.saturating_sub(back)).copied();
+    }
+    if redis_trailing_window_count(&ladder) > limit {
+        *buckets.entry(charged).or_insert(0) -= 1;
+        return false;
+    }
+    true
+}
+
+/// The retired two-window weighted estimate, for the same synthetic timeline.
+fn model_weighted_admits(
+    windows: &mut std::collections::HashMap<u64, i64>,
+    now: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> bool {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    let progress = redis_window_progress_at(now, window_seconds);
+    let index = progress.index;
+    *windows.entry(index).or_insert(0) += 1;
+    let previous = windows.get(&index.saturating_sub(1)).copied().unwrap_or(0);
+    let current = windows.get(&index).copied().unwrap_or(0);
+    let weighted = previous as f64 * (1.0 - progress.elapsed_fraction) + current as f64;
+    if weighted > limit as f64 {
+        *windows.entry(index).or_insert(0) -= 1;
+        return false;
+    }
+    true
+}
+
+/// The retired bare `previous + current` sum, for the same synthetic timeline.
+fn model_two_bucket_admits(
+    windows: &mut std::collections::HashMap<u64, i64>,
+    now: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> bool {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    let index = redis_window_progress_at(now, window_seconds).index;
+    *windows.entry(index).or_insert(0) += 1;
+    let previous = windows.get(&index.saturating_sub(1)).copied().unwrap_or(0);
+    let current = windows.get(&index).copied().unwrap_or(0);
+    let usage = previous.max(0) as u64 + current.max(0) as u64;
+    if usage > limit {
+        *windows.entry(index).or_insert(0) -= 1;
+        return false;
+    }
+    true
+}
+
+#[test]
+fn boundary_clustered_burst_stays_counted_inside_the_trailing_window() {
+    // 100/second. The attacker spends its whole quota at the very END of epoch
+    // second 10, then comes back half a second later. The exact trailing second
+    // at t = 11.5s still contains all 100 of those requests, so nothing more may
+    // be admitted until they age out.
+    let mut buckets = std::collections::HashMap::new();
+    let mut weighted = std::collections::HashMap::new();
+    for offset in 0..100_u64 {
+        let at = Duration::from_micros(10_900_000 + offset);
+        assert!(
+            model_sub_bucket_admits(&mut buckets, at, 1, 100),
+            "the burst itself is within budget"
+        );
+        assert!(model_weighted_admits(&mut weighted, at, 1, 100));
+    }
+
+    assert!(
+        !model_sub_bucket_admits(&mut buckets, Duration::from_millis(11_500), 1, 100),
+        "a burst still inside the exact trailing second must be counted in full"
+    );
+    // The vulnerability this replaces: the weighted estimate assumed the burst
+    // was spread evenly through second 10, so at half-elapsed it discounted
+    // half of it and re-opened the budget while every request was still live.
+    assert!(
+        model_weighted_admits(&mut weighted, Duration::from_millis(11_500), 1, 100),
+        "the retired weighted estimate admitted a second burst here"
+    );
+
+    // Once the burst has aged past the trailing window the budget is free
+    // again: this is a trailing-window limiter, not a lockout.
+    assert!(
+        model_sub_bucket_admits(&mut buckets, Duration::from_millis(12_200), 1, 100),
+        "a burst outside the trailing window must stop counting"
+    );
+}
+
+#[test]
+fn steady_traffic_at_the_configured_rate_is_not_halved() {
+    // Exactly 20 requests per second against a 20/second quota, for six
+    // seconds. The sub-bucket ladder over-refuses by at most one sub-bucket of
+    // history, so the client keeps `K / (K + 1)` of its rate; the bare
+    // `previous + current` sum this replaces counts up to two whole windows and
+    // settles at half.
+    let offered = 120_u64;
+    let mut buckets = std::collections::HashMap::new();
+    let mut two_bucket = std::collections::HashMap::new();
+    let mut sub_bucket_admitted = 0_u64;
+    let mut two_bucket_admitted = 0_u64;
+    for attempt in 0..offered {
+        let at = Duration::from_millis(600_000 + attempt * 50);
+        if model_sub_bucket_admits(&mut buckets, at, 1, 20) {
+            sub_bucket_admitted += 1;
+        }
+        if model_two_bucket_admits(&mut two_bucket, at, 1, 20) {
+            two_bucket_admitted += 1;
+        }
+    }
+
+    // Steady state is 20 * 8/9 ≈ 17.8 per second after the first window fills.
+    assert!(
+        sub_bucket_admitted >= 95,
+        "steady traffic at the configured rate must not be throttled: \
+         {sub_bucket_admitted}/{offered}"
+    );
+    assert!(
+        sub_bucket_admitted <= offered,
+        "the quota must still bind: {sub_bucket_admitted}/{offered}"
+    );
+    // Root's finding: `previous + current` refuses for a whole window after any
+    // window that reached its limit, which is about half the configured quota.
+    assert!(
+        two_bucket_admitted <= 75,
+        "the retired two-bucket sum halves a well-behaved client: \
+         {two_bucket_admitted}/{offered}"
+    );
+    assert!(
+        sub_bucket_admitted > two_bucket_admitted + 20,
+        "{sub_bucket_admitted} vs {two_bucket_admitted}"
+    );
+}
+
+#[test]
+fn sub_bucket_ladder_never_admits_more_than_the_exact_trailing_window() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+    };
+
+    // Fail-closed property, swept across every sub-bucket phase of a one-second
+    // window: whatever the arrival pattern, the admissions inside ANY exact
+    // trailing second never exceed the configured cap.
+    let limit = 20_u64;
+    for phase in 0..REDIS_WINDOW_SUB_BUCKETS as u64 {
+        let mut buckets = std::collections::HashMap::new();
+        let mut admitted_at: Vec<u64> = Vec::new();
+        for attempt in 0..400_u64 {
+            // Bursty arrivals: eight back-to-back requests every 40ms, offset
+            // into the ladder by `phase` sub-buckets.
+            let millis = 600_000 + phase * 125 + (attempt / 8) * 40;
+            if model_sub_bucket_admits(&mut buckets, Duration::from_millis(millis), 1, limit) {
+                admitted_at.push(millis);
+            }
+        }
+        for window_end in &admitted_at {
+            let inside = admitted_at
+                .iter()
+                .filter(|at| **at > window_end.saturating_sub(1_000) && *at <= window_end)
+                .count() as u64;
+            assert!(
+                inside <= limit,
+                "phase {phase}: {inside} admissions inside the second ending at {window_end}"
+            );
+        }
+        assert!(!admitted_at.is_empty(), "phase {phase} must still admit traffic");
+    }
+
+    // The derivation the sweep rests on: `current + K older` sub-buckets always
+    // span at least one whole window.
+    let width = Duration::from_secs(1).as_nanos() / REDIS_WINDOW_SUB_BUCKETS as u128;
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_millis(600_000), 1);
+    let oldest_start = (bucket.index - REDIS_WINDOW_SUB_BUCKETS as u64) as u128 * width;
+    assert!(Duration::from_millis(600_000).as_nanos() - oldest_start >= 1_000_000_000);
 }
 
 #[test]
 fn shared_consumers_use_same_window_progress_helper() {
     // rate_limiting, GraphQL type/named-operation limits, and grpc_method_router
-    // per-method limits all reach check_http_windows_redis → window_progress.
-    // Prove the shared helper (not a per-plugin copy) is what the test support
-    // and live clock path expose.
+    // per-method limits all reach check_http_windows_redis → sub_bucket, and the
+    // token-accounting paths (`ai_rate_limiter`, `ws_rate_limiting`) all reach
+    // window_progress. Prove the shared helpers (not per-plugin copies) are what
+    // the test support and live clock paths expose.
     use ferrum_edge::_test_support::{redis_window_progress, redis_window_progress_at};
-    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+    };
 
     let at = redis_window_progress_at(Duration::from_millis(1_250), 1);
     let direct = RedisRateLimitClient::window_progress_at(Duration::from_millis(1_250), 1);
     assert_eq!(at, direct);
     assert!((at.elapsed_fraction - 0.25).abs() < 1e-12);
 
+    // The quota ladder is derived from the same wall clock. Sample the window
+    // first: a sub-bucket taken no earlier than it can never precede that
+    // window's first sub-bucket.
     let live = redis_window_progress(1);
     assert!(live.elapsed_fraction >= 0.0 && live.elapsed_fraction < 1.0);
+    let live_bucket = RedisRateLimitClient::sub_bucket(1);
+    assert_eq!(live_bucket.window_seconds, 1);
+    assert!(live_bucket.index >= live.index * REDIS_WINDOW_SUB_BUCKETS as u64);
 }
 
 // ── Redis health-task lifecycle (issue #2305) ─────────────────────────────
@@ -2927,9 +3233,18 @@ const EXEC_ARG: &[u8] = b"EXEC";
 const INCR_ARG: &[u8] = b"INCR";
 const INFO_ARG: &[u8] = b"INFO";
 
+/// `GET`s one window contributes to a charge: one per older sub-bucket.
+const CHARGE_GETS_PER_WINDOW: usize =
+    ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+
+/// Commands one window contributes to a charge transaction: every `GET`, plus
+/// `INCR` and `EXPIRE` on the sub-bucket being charged. Only the `EXPIRE` is
+/// `.ignore()`d, so the client pairs `CHARGE_COMMANDS_PER_WINDOW - 1` values.
+const CHARGE_COMMANDS_PER_WINDOW: usize = CHARGE_GETS_PER_WINDOW + 2;
+
 /// How the fake server answers the limiter's two transactions.
 ///
-/// A charge is `MULTI` / `GET` / `INCR` / `EXPIRE` / `EXEC` per window; the
+/// A charge is `MULTI` / `GET` × K / `INCR` / `EXPIRE` / `EXEC` per window; the
 /// compensating transaction a refusal issues is `MULTI` / `DECR` / `EXPIRE` /
 /// `EXEC` per window. The server tells them apart by the queued commands, so a
 /// script never has to hardcode a reply length.
@@ -2951,16 +3266,19 @@ enum TransactionScript {
     ChargeReplyIsUnpairable,
 }
 
-/// `EXEC` array for a charge: per window `GET` (nil or an exhausted count),
-/// `INCR` (the post-increment count) and `EXPIRE`.
+/// `EXEC` array for a charge: per window one `GET` per older sub-bucket (nil or
+/// an exhausted count), then `INCR` (the post-increment count) and `EXPIRE`.
 fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
-    let mut reply = format!("*{}\r\n", windows * 3).into_bytes();
+    let values = windows * CHARGE_COMMANDS_PER_WINDOW;
+    let mut reply = format!("*{values}\r\n").into_bytes();
+    let older: &[u8] = if exhausted { b":9\r\n" } else { b"$-1\r\n" };
+    // The charged sub-bucket's post-increment `INCR`, then its ignored `EXPIRE`.
+    let charged: &[u8] = if exhausted { b":9\r\n:1\r\n" } else { b":1\r\n:1\r\n" };
     for _ in 0..windows {
-        if exhausted {
-            reply.extend_from_slice(b":9\r\n:9\r\n:1\r\n");
-        } else {
-            reply.extend_from_slice(b"$-1\r\n:1\r\n:1\r\n");
+        for _ in 0..CHARGE_GETS_PER_WINDOW {
+            reply.extend_from_slice(older);
         }
+        reply.extend_from_slice(charged);
     }
     reply
 }
@@ -3089,7 +3407,7 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                         .iter()
                                         .any(|command| command.eq_ignore_ascii_case(INCR_ARG));
                                     let windows = if charge {
-                                        queued.len() / 3
+                                        queued.len() / CHARGE_COMMANDS_PER_WINDOW
                                     } else {
                                         queued.len() / 2
                                     };
@@ -3114,10 +3432,11 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                             // filters the ignored `EXPIRE`
                                             // slots by index, so the surviving
                                             // count no longer divides into
-                                            // (previous, current) pairs.
+                                            // whole sub-bucket ladders.
+                                            let values = windows * CHARGE_COMMANDS_PER_WINDOW + 1;
                                             let mut unpairable =
-                                                format!("*{}\r\n", windows * 3 + 1).into_bytes();
-                                            for _ in 0..windows * 3 + 1 {
+                                                format!("*{values}\r\n").into_bytes();
+                                            for _ in 0..values {
                                                 unpairable.extend_from_slice(b":1\r\n");
                                             }
                                             reply.extend(unpairable);

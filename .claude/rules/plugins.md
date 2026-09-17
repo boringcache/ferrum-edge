@@ -653,17 +653,33 @@ on a native-gRPC request.
 - `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
   `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
-- Request quotas conservatively count the previous and current epoch buckets in
-  full with pipelined `INCR`/`GET`/`EXPIRE`; no Lua. Token-accounting paths may
-  still use the two-window weighted estimate.
+- Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) count a
+  SUB-BUCKETED TRAILING WINDOW: each configured window is split into
+  `REDIS_WINDOW_SUB_BUCKETS` (8, a `const`, never configurable — it is part of
+  the shared key layout) equal sub-buckets, and the count is the FULL sum of the
+  charged sub-bucket plus the 8 before it, every bucket at face value
+  (`redis_trailing_window_count`). No decay term, no Lua. Those 9 counters span
+  `window + f * (window / K)`, which is why the error is bounded BOTH ways: the
+  exact trailing window is always covered in full (fail closed against a
+  boundary-clustered burst) and at most one sub-bucket of older history is
+  over-counted, so a client at exactly its configured rate keeps `K / (K + 1)`
+  of it. Do NOT replace this with `previous + current`: that counts up to two
+  whole windows and refuses a well-behaved client for a whole window after every
+  window it fills — roughly half its quota, permanently. Token-accounting paths
+  (`ai_rate_limiter` `INCRBY` budgets, `ws_rate_limiting` frame budgets) keep
+  the two-window weighted estimate and the `{tag}:{window_index}` layout,
+  because they reserve under one window index and reconcile against that same
+  index; their residual boundary-burst exposure is documented in
+  `docs/plugins.md`, not silently shared with the quota path. `udp_rate_limiting`
+  is a plain fixed window with no previous-window term.
 - HTTP/GraphQL/gRPC quota admission is CHARGE-THEN-COMPENSATE over that
   algorithm, on the shared pooled multiplexed connections: ONE atomic
-  `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR`
-  current, `EXPIRE` current) so the decision is tied to the caller's own
-  increment, and any refusal issues ONE compensating atomic `MULTI`/`EXEC`
-  (`DECR` + `EXPIRE`) over every window it charged. A refusal therefore leaves
-  no lasting charge on any window (issue #5517) and a tighter window's refusal
-  never consumes a looser window's budget. Never reintroduce `WATCH`, a
+  `MULTI`/`EXEC` charges every configured window (`GET` each of the 8 older
+  sub-buckets, `INCR` the charged sub-bucket, `EXPIRE` it) so the decision is
+  tied to the caller's own increment, and any refusal issues ONE compensating
+  atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over the one sub-bucket it charged
+  per window. A refusal therefore leaves no lasting charge on any window (issue
+  #5517) and a tighter window's refusal never consumes a looser window's budget. Never reintroduce `WATCH`, a
   dedicated per-request connection, a retry budget, or `EVAL`/`EVALSHA`/`SCRIPT`
   — every command must be plain RESP. Between an `INCR` and its compensating
   `DECR` the transient charge is visible to concurrent requests, which is a
@@ -678,13 +694,23 @@ on a native-gRPC request.
   exit between the charge and its compensation. Both transaction helpers carry
   their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
   the per-request window and counter buffers are fixed-capacity and inline, not
-  `Vec`s. Counting both request buckets in full prevents boundary-clustered
-  bursts from being decayed while still live, at the cost of conservative
-  refusals for up to one window. The local token bucket / 64-bucket sliding
-  aggregate are deliberately NOT replicated in Redis.
-- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
-  are a Redis Cluster hash tag so every key of one atomic operation shares a
-  slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
+  `Vec`s, so one transaction touches at most
+  `MAX_REDIS_ADMISSION_WINDOWS * (REDIS_WINDOW_SUB_BUCKETS + 1)` keys. Each
+  window packs its whole key ladder into ONE `String` allocation
+  (`RedisRateLimitClient::window_charge`) — fewer allocations than the two
+  `make_slot_key` calls it replaced, and the accessors slice on ranges the
+  builder itself recorded. The local token bucket / 64-bucket sliding aggregate
+  are deliberately NOT replicated in Redis.
+- Request-quota key format is
+  `{escaped-prefix:escaped-rate-key}:{window_seconds}:{sub_index}`; every other
+  Redis rate-limit family stays on
+  `{escaped-prefix:escaped-rate-key}:{window_index}` (plus `datagrams`/`bytes`
+  for UDP). The braces are a Redis Cluster hash tag so every key of one atomic
+  operation shares a slot; `%`, braces, and `:` are percent-escaped inside it.
+  Naming the window in the quota key keeps two windows of one policy on provably
+  disjoint ladders. Changing this layout restarts counters on an in-place
+  upgrade, so it needs a CHANGELOG note; it needs no Redis ACL change, because
+  the command set is unchanged. Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while
   replicas of the same policy keep sharing a budget. An explicit

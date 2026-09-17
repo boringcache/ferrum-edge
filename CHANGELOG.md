@@ -14,25 +14,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   during a Redis outage. Set `fail_closed` explicitly to require centralized
   enforcement. Other rate-limit plugins retain their existing defaults (#5519).
 - Redis HTTP, GraphQL, and gRPC method quotas now admit through
-  charge-then-compensate accounting. One atomic `MULTI`/`EXEC` charges every
-  configured window (`GET` previous, `INCR` current, `EXPIRE` current) so the
-  decision is still tied to the caller's own increment, and any refusal issues
-  one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it
-  charged. A refused request no longer leaves a lasting charge on any window, so
-  sustained overload can no longer lock a client out, and a tighter window's
-  refusal no longer consumes a looser window's budget — the previously
-  documented multi-window "phantom increment" is retired (#5517). Admission
-  stays native RESP on the existing pooled connections: no Lua, no `WATCH`, no
-  per-request connection, and no retry budget. The key layout is unchanged, so
-  an in-place upgrade keeps its counters and no Redis ACL change is required.
-  Request quotas now count the previous and current epoch buckets in full,
-  preventing a boundary-clustered burst from decaying while it remains inside
-  the configured trailing window; this deliberately prefers conservative
-  refusals to over-admission. Between a refused attempt's
-  `INCR` and its compensating `DECR` the transient charge is visible to
-  concurrent requests for the same identity, which can refuse slightly early
+  charge-then-compensate accounting over a **sub-bucketed trailing window**.
+  Each configured window is split into eight equal sub-buckets, and a window's
+  count is the full sum of the sub-bucket a request lands in plus the eight
+  before it — every bucket at face value, no decay term. One atomic
+  `MULTI`/`EXEC` per request reads those older sub-buckets and charges the
+  current one for every configured window, so the decision is still tied to the
+  caller's own increment, and any refusal issues one compensating atomic
+  `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it charged. A refused
+  request no longer leaves a lasting charge on any window, so sustained overload
+  can no longer lock a client out, and a tighter window's refusal no longer
+  consumes a looser window's budget — the previously documented multi-window
+  "phantom increment" is retired (#5517). The new counting closes the
+  boundary-burst under-enforcement of the two-window weighted estimate: those
+  nine counters always span at least one whole window, so a burst clustered at
+  the end of an epoch bucket is counted in full for as long as it is inside the
+  exact trailing window instead of being discounted as the next window runs.
+  They span at most one sub-bucket more than a window, so the limiter
+  over-refuses by at most one eighth of a window of history and a client sending
+  at exactly its configured rate keeps eight ninths of that rate in steady
+  state. Admission stays native RESP on the existing pooled connections: no Lua,
+  no `WATCH`, no per-request connection, and no retry budget. Between a refused
+  attempt's `INCR` and its compensating `DECR` the transient charge is visible
+  to concurrent requests for the same identity, which can refuse slightly early
   under contention and never over-admits; a refused request costs two round trips
   instead of one.
+- **Redis request-quota key layout changed** (`rate_limiting`, `graphql`,
+  `grpc_method_router`): counters now live at
+  `{prefix:rate-key}:{window_seconds}:{sub_index}` instead of
+  `{prefix:rate-key}:{window_index}`. **No Redis ACL change is required** — the
+  command set (`GET`, `INCR`, `DECR`, `EXPIRE`, `MULTI`, `EXEC`) and the key
+  prefix are unchanged — but an in-place upgrade starts new counters: expect up
+  to one window of reduced enforcement while the ladder fills, and during a
+  rolling upgrade old and new replicas count against separate keys until every
+  replica is on the new build. Abandoned counters expire on their own TTL.
+  `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` are token or
+  datagram accounting rather than request quotas; their key layouts and counting
+  are unchanged.
 - Redis URL database selectors now require canonical decimal integers in
   `0..=2147483647`, without zero-padding, signs, or extra path segments. Runtime
   admission and all shared-parser OpenAPI URL fields use the same rule (#5518).

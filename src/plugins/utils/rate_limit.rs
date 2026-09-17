@@ -14,8 +14,7 @@ use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{
-    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharge,
-    RedisWindowCharges,
+    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharges,
 };
 
 /// Root config keys every Redis-backed rate-limit plugin accepts.
@@ -1676,22 +1675,20 @@ pub struct FixedWindow {
 /// The documented two-window weighted approximation
 /// (`previous * (1 - elapsed_fraction) + current`).
 ///
-/// One definition shared by [`FixedWindow::weighted_count`] and the Redis
-/// admission path, which reads its counters out of a fixed-capacity buffer and
-/// never materializes a `FixedWindow` per request.
+/// This is the TOKEN-ACCOUNTING estimate. It backs [`FixedWindow`], which the
+/// `ai_rate_limiter` `INCRBY` budgets and the `ws_rate_limiting` frame budget
+/// reason in: those paths reserve an estimate under one window index and
+/// reconcile it against that same index after the response, so the count has to
+/// be a continuous function of one `(previous, current)` pair.
+///
+/// Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) do NOT use
+/// it. They count a sub-bucketed trailing window in full
+/// (`check_http_windows_redis`), because linear decay assumes the previous
+/// bucket's traffic was spread evenly through it and therefore discounts a
+/// burst clustered at its end while that burst is still inside the exact
+/// trailing window.
 fn weighted_window_count(previous: u64, current: u64, elapsed_fraction: f64) -> f64 {
     previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
-}
-
-/// Conservatively account Redis request quotas across the previous and current
-/// epoch-aligned buckets.
-///
-/// Counting both buckets in full can refuse requests whose exact trailing
-/// window has already shed part of the previous bucket, but it cannot discard
-/// a boundary-clustered burst that is still live. This is the fail-closed
-/// counterpart to the weighted estimate used by token-accounting paths.
-pub(crate) fn conservative_redis_window_count(previous: u64, current: u64) -> u64 {
-    previous.saturating_add(current)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2072,10 +2069,11 @@ fn check_http_windows(
 /// Lua, no `EVAL*`, no `WATCH`, no per-request connection, and no retry budget
 /// a hot key can exhaust:
 ///
-/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window
-///    (`GET previous`, `INCR current`, `EXPIRE current`) and returns each
-///    window's counters. The decision is read off the caller's own increment,
-///    never off a stale read two gateways could both act on.
+/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window (`GET` on each
+///    older sub-bucket, `INCR` + `EXPIRE` on the sub-bucket this request lands
+///    in) and returns each window's trailing-window count. The decision is read
+///    off the caller's own increment, never off a stale read two gateways could
+///    both act on.
 /// 2. If every window fits, the request is admitted and the tightest window's
 ///    remaining budget is reported.
 /// 3. If ANY window refuses, ONE compensating atomic `MULTI`/`EXEC` hands back
@@ -2115,14 +2113,32 @@ fn check_http_windows(
 ///
 /// # Algorithm
 ///
-/// Every window counts the previous and current epoch-aligned buckets in full
-/// over `{prefix:key}:{window_index}` counters. This can refuse conservatively
-/// for up to one window after a boundary, but never decays a still-live burst
-/// below its actual contribution to the trailing window. Local mode's token
-/// bucket and 64-bucket sliding aggregate are deliberately NOT replicated in
-/// Redis: reproducing them centrally costs either a server-side script or a
-/// read-modify-write per request. Both modes nevertheless remain fail-closed
-/// relative to an exact trailing-window request cap.
+/// A **sub-bucketed trailing window**. Every configured window is split into
+/// `REDIS_WINDOW_SUB_BUCKETS` (`K`, currently 8) equal sub-buckets keyed
+/// `{prefix:key}:{window_seconds}:{sub_index}`, and a window's count is the
+/// FULL sum of the sub-bucket this request lands in plus the `K` before it —
+/// every bucket at face value, no decay term.
+///
+/// Those `K + 1` counters span `window + f * (window / K)` of wall clock, where
+/// `f` is how far into its own sub-bucket the request arrived. That bounds the
+/// error in both directions against an exact trailing-window cap:
+///
+/// - **Never under-counts.** The span always covers the whole trailing window,
+///   so a burst clustered anywhere inside it is counted whole. The retired
+///   `previous * (1 - elapsed_fraction) + current` estimate assumed the
+///   previous bucket's traffic was spread evenly through it, so a burst at that
+///   bucket's END was discounted in proportion to how far the current window
+///   had run — admitting a second burst while the first was still live.
+/// - **Over-counts by at most one sub-bucket** of older history (`1 / K` of a
+///   window). A bare `previous + current` sum would instead count up to two
+///   whole windows, which refuses a client sending at exactly its configured
+///   rate for every other window — roughly half its quota, indefinitely. Here
+///   the steady state is `K / (K + 1)` of the configured rate.
+///
+/// Local mode's token bucket and 64-bucket sliding aggregate are deliberately
+/// NOT replicated in Redis: reproducing them centrally costs either a
+/// server-side script or a read-modify-write per request. Both modes remain
+/// fail-closed relative to an exact trailing-window request cap.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
     redis: &Arc<RedisRateLimitClient>,
@@ -2145,20 +2161,19 @@ async fn check_http_windows_redis(
     }
 
     // Fixed-capacity, allocated inline: at most `MAX_REDIS_ADMISSION_WINDOWS`
-    // windows by construction, on a proxy hot path.
+    // windows by construction, on a proxy hot path. Each window packs its whole
+    // `REDIS_WINDOW_SUB_BUCKETS + 1` key ladder into one allocation.
     let mut charges = RedisWindowCharges::default();
     for spec in specs {
         let window_seconds = spec.duration.as_secs().max(1);
-        // Capture the epoch bucket once so the previous/current keys always
-        // describe adjacent windows even when the request crosses a boundary.
-        let progress = RedisRateLimitClient::window_progress(window_seconds);
-        let current_index = progress.index.to_string();
-        let previous_index = progress.index.saturating_sub(1).to_string();
-        let charge = RedisWindowCharge {
-            previous_key: redis.make_slot_key(key, &[&previous_index]),
-            current_key: redis.make_slot_key(key, &[&current_index]),
-            ttl_seconds: two_window_ttl_seconds(window_seconds),
-        };
+        // ONE timestamp sample per window, so the charged sub-bucket and the
+        // older ones read beside it always come from the same instant even when
+        // the request crosses a sub-bucket boundary.
+        let bucket = RedisRateLimitClient::sub_bucket(window_seconds);
+        // Two windows' retention is comfortably longer than the `window + one
+        // sub-bucket` of history the ladder reads back, so the oldest bucket a
+        // decision needs is never expired out from under it.
+        let charge = redis.window_charge(key, bucket, two_window_ttl_seconds(window_seconds));
         if !charges.push(charge) {
             // Unreachable behind the bound above; still fail closed rather than
             // charge a subset of the configured windows.
@@ -2177,12 +2192,11 @@ async fn check_http_windows_redis(
     let mut tightest: Option<(u64, u64, u64)> = None;
     let mut refused: Option<&RateLimitWindowSpec> = None;
     for (index, spec) in specs.iter().enumerate() {
-        let (previous, current) = counts[index];
-        // A counter can only be negative when a compensation raced this key's
-        // expiry; read that as zero usage rather than as negative budget.
-        let previous = previous.max(0) as u64;
-        let current = current.max(0) as u64;
-        let usage = conservative_redis_window_count(previous, current);
+        // Already the full trailing-window sum, with each sub-bucket floored at
+        // zero (a counter can only be negative when a compensation raced its
+        // expiry). Integer throughout: `remaining` decorates `x-ratelimit-*`, so
+        // it must never be a rounded float.
+        let usage = counts[index];
         if usage > spec.limit {
             refused = Some(spec);
             break;

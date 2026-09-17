@@ -1191,12 +1191,93 @@ async fn test_rate_limiting_redis_centralized() {
     println!("test_rate_limiting_redis_centralized PASSED");
 }
 
-/// A full previous one-second Redis bucket must decay during the current
-/// bucket. The old whole-second fraction stayed at zero and rejected this
-/// candidate for the entire second.
+/// Wait until the current instant sits comfortably inside a one-second Redis
+/// sub-bucket, and return that sub-bucket's index.
+///
+/// An eight-second policy window splits into eight one-second sub-buckets, so
+/// the index is just the epoch second. Landing 300-500ms in leaves a busy
+/// hosted runner room to seed a counter and issue one HTTP request without the
+/// two straddling a sub-bucket boundary.
+async fn aligned_one_second_sub_bucket() -> u64 {
+    loop {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch");
+        if (300_000_000..=500_000_000).contains(&now.subsec_nanos()) {
+            return now.as_secs();
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn current_one_second_sub_bucket() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_secs()
+}
+
+/// Wire key of one request-quota sub-bucket: `{tag}:{window_seconds}:{index}`.
+fn sub_bucket_key(prefix: &str, window_seconds: u64, index: u64) -> String {
+    redis_bucket_key(
+        prefix,
+        "ip:127.0.0.1",
+        &[&window_seconds.to_string(), &index.to_string()],
+    )
+}
+
+/// Poll until the route answers `200` with rate-limit headers.
+///
+/// A file-mode gateway can accept a connection before its plugin cache is
+/// published. Timing assertions below must not spend their first request
+/// proving readiness, so this absorbs that and leaves the quota to be reset by
+/// the caller.
+async fn wait_for_rate_limited_route(client: &reqwest::Client, url: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(response) = client.get(url).send().await
+            && response.status().as_u16() == 200
+            && response.headers().contains_key("x-ratelimit-limit")
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Redis-backed rate-limited route never became ready"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Block until the wall clock sits inside `offset` nanoseconds of the current
+/// `window_nanos` epoch window.
+///
+/// Epoch windows are shared by every gateway, so aligning here is what makes a
+/// "clustered at the end of a window" scenario reproducible.
+async fn await_epoch_window_offset(window_nanos: u128, offset: std::ops::Range<u128>) {
+    loop {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch");
+        if offset.contains(&(now.as_nanos() % window_nanos)) {
+            return;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Request quotas count their whole sub-bucket ladder at face value: a counter
+/// inside the trailing window binds in FULL, and only a counter that has aged
+/// past the ladder stops binding.
+///
+/// This replaces the old "a full previous one-second bucket must decay"
+/// assertion. That decay is exactly what let a burst clustered at the end of an
+/// epoch bucket be discounted while every one of its requests was still inside
+/// the exact trailing window; it now survives only on the token-accounting
+/// paths, which have their own reservation/reconciliation contract.
 #[tokio::test]
 #[ignore]
-async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
+async fn test_rate_limiting_redis_trailing_sub_bucket_counts_in_full() {
     if !redis_is_available().await {
         return;
     }
@@ -1212,27 +1293,29 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
     let _backend = start_header_echo_backend(backend_port).await.unwrap();
 
     let client = reqwest::Client::new();
-    let unique_prefix = format!("ferrum:test:rl-decay:{}", Uuid::new_v4().simple());
+    let unique_prefix = format!("ferrum:test:rl-ladder:{}", Uuid::new_v4().simple());
     setup_proxy_with_plugins(
         &harness,
         &client,
-        "proxy-redis-rl-decay",
-        "/redis-rl-decay",
+        "proxy-redis-rl-ladder",
+        "/redis-rl-ladder",
         backend_port,
         "http",
         vec![json!({
-            "id": "plugin-redis-rl-decay",
+            "id": "plugin-redis-rl-ladder",
             "plugin_name": "rate_limiting",
             "scope": "proxy",
-            "proxy_id": "proxy-redis-rl-decay",
+            "proxy_id": "proxy-redis-rl-ladder",
             "enabled": true,
             "config": {
                 "expose_headers": true,
-                "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 10}],
+                // Eight seconds splits into eight one-second sub-buckets, so
+                // the seeded index below is just an epoch second.
+                "limits": [{"scope": "default", "window_seconds": 8, "max_requests": 10}],
                 "sync_mode": "redis",
                 "redis_url": REDIS_URL,
                 "redis_key_prefix": unique_prefix,
-                // The decay assertions read the seeded centralized buckets; a
+                // These assertions read the seeded centralized buckets; a
                 // per-process fallback budget would answer from a map this test
                 // never seeded. See `test_rate_limiting_redis_centralized`.
                 "redis_failure_policy": "fail_closed"
@@ -1242,61 +1325,56 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
     .await
     .unwrap();
     harness
-        .wait_for_response_header("/redis-rl-decay/test", "x-ratelimit-limit")
+        .wait_for_response_header("/redis-rl-ladder/test", "x-ratelimit-limit")
         .await;
 
-    let url = format!("{}/redis-rl-decay/test", harness.proxy_base_url);
+    let url = format!("{}/redis-rl-ladder/test", harness.proxy_base_url);
     let mut verified_without_boundary_cross = false;
-    for _ in 0..3 {
+    for _ in 0..4 {
+        // Seven sub-buckets back is inside the ladder (`current` plus the eight
+        // before it), so a full counter there must bind at face value.
         delete_redis_keys_by_prefix(&unique_prefix).await;
-
-        // Leave at least ~450ms before the next boundary so the Redis seed and
-        // HTTP request use the same current bucket even on a busy hosted runner.
-        let current_index = loop {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock after Unix epoch");
-            let fraction_nanos = now.subsec_nanos();
-            if (300_000_000..=500_000_000).contains(&fraction_nanos) {
-                break now.as_secs();
-            }
-            sleep(Duration::from_millis(5)).await;
-        };
-
-        let previous_key = redis_bucket_key(
-            &unique_prefix,
-            "ip:127.0.0.1",
-            &[&current_index.saturating_sub(1).to_string()],
-        );
-        let current_key = redis_bucket_key(
-            &unique_prefix,
-            "ip:127.0.0.1",
-            &[&current_index.to_string()],
-        );
-        set_redis_counter(&previous_key, 10, 3).await;
-
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .expect("one-second Redis decay request");
-        let finished_index = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_secs();
-        if finished_index != current_index {
+        let index = aligned_one_second_sub_bucket().await;
+        set_redis_counter(&sub_bucket_key(&unique_prefix, 8, index - 7), 10, 60).await;
+        let refused = client.get(&url).send().await.expect("in-ladder probe");
+        if current_one_second_sub_bucket() != index {
             continue;
         }
-
         assert_eq!(
-            redis_counter_value(&current_key).await,
-            Some(1),
-            "request must increment the expected current Redis identity bucket"
+            refused.status().as_u16(),
+            429,
+            "a full counter inside the trailing window must not be decayed away"
+        );
+        // The hand-back runs on a detached task, so settle it before reading
+        // the charged sub-bucket: only the seeded 10 may remain.
+        wait_for_redis_counter_sum(&unique_prefix, 10).await;
+        assert_eq!(
+            redis_counter_value(&sub_bucket_key(&unique_prefix, 8, index))
+                .await
+                .unwrap_or(0),
+            0,
+            "the refused probe must charge its own sub-bucket and hand it straight back"
+        );
+
+        // Nine sub-buckets back has aged past the ladder. The same counter must
+        // stop binding, or the limiter is a lockout rather than a trailing
+        // window.
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+        let index = aligned_one_second_sub_bucket().await;
+        set_redis_counter(&sub_bucket_key(&unique_prefix, 8, index - 9), 10, 60).await;
+        let admitted = client.get(&url).send().await.expect("aged-out probe");
+        if current_one_second_sub_bucket() != index {
+            continue;
+        }
+        assert_eq!(
+            admitted.status().as_u16(),
+            200,
+            "a counter older than the trailing window must stop binding"
         );
         assert_eq!(
-            response.status().as_u16(),
-            200,
-            "a full prior bucket must decay enough to admit a mid-window candidate"
+            redis_counter_value(&sub_bucket_key(&unique_prefix, 8, index)).await,
+            Some(1),
+            "the admitted request must charge the expected sub-bucket"
         );
         verified_without_boundary_cross = true;
         break;
@@ -1304,25 +1382,23 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
 
     assert!(
         verified_without_boundary_cross,
-        "could not complete the Redis decay assertion without crossing a one-second boundary"
+        "could not complete the sub-bucket assertions without crossing a boundary"
     );
     delete_redis_keys_by_prefix(&unique_prefix).await;
 }
 
-/// Issue #5517: sustained excess traffic must keep being throttled at the
-/// configured rate instead of locking the client out until it stops trying.
+/// A burst clustered at the END of an epoch window stays counted for the whole
+/// trailing window that follows it.
 ///
-/// A refused attempt hands its charge straight back, so a one-second budget
-/// keeps admitting close to the configured rate for as long as the client keeps
-/// pushing. Before the fix the Redis route admitted its first allowance and then
-/// nothing at all, while the `local` route driven side by side with it kept
-/// throttling — that is the comparison this test makes. The two are NOT
-/// expected to admit the same number: local mode uses a token bucket that
-/// starts full, Redis uses the two-window weighted approximation, so Redis
-/// trails local by roughly one window's worth of burst.
+/// This is the over-admission the retired two-window weighted estimate allowed:
+/// it assumed the previous bucket's traffic was spread evenly through it, so
+/// half a window later it discounted half the burst and re-opened the budget
+/// while every one of those requests was still inside the exact trailing
+/// window. Black box on purpose — no seeded counters, just a client behaving
+/// like the attacker.
 #[tokio::test]
 #[ignore]
-async fn test_rate_limiting_redis_sustained_load_keeps_admitting_at_the_configured_rate() {
+async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
     if !redis_is_available().await {
         return;
     }
@@ -1331,133 +1407,191 @@ async fn test_rate_limiting_redis_sustained_load_keeps_admitting_at_the_configur
         .unwrap();
     let backend_port = listener.local_addr().unwrap().port();
     let backend = start_header_echo_backend_on(listener).await.unwrap();
-    let prefix = format!("ferrum:test:sustained:{}", Uuid::new_v4().simple());
-    let mut config = json!({
-        "version": "1", "proxies": [], "consumers": [], "plugin_configs": []
-    });
-    for mode in ["local", "redis"] {
-        config["proxies"].as_array_mut().unwrap().push(json!({
-            "id": mode, "listen_path": format!("/{mode}"),
+    let prefix = format!("ferrum:test:boundary-burst:{}", Uuid::new_v4().simple());
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "burst", "listen_path": "/burst",
             "backend_scheme": "http", "backend_host": "127.0.0.1",
             "backend_port": backend_port, "strip_listen_path": true,
-            "plugins": [{"plugin_config_id": mode}]
-        }));
-        let mut policy = json!({
-            "expose_headers": true, "sync_mode": mode,
-            "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 5}]
-        });
-        if mode == "redis" {
-            policy["redis_url"] = json!(REDIS_URL);
-            policy["redis_key_prefix"] = json!(prefix);
-            // A healthy store may never answer through the fallback budget.
-            policy["redis_failure_policy"] = json!("fail_closed");
-        }
-        config["plugin_configs"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "id": mode, "plugin_name": "rate_limiting", "scope": "proxy",
-                "proxy_id": mode, "enabled": true, "config": policy
-            }));
-    }
+            "plugins": [{"plugin_config_id": "burst"}]
+        }],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "burst", "plugin_name": "rate_limiting", "scope": "proxy",
+            "proxy_id": "burst", "enabled": true,
+            "config": {
+                "expose_headers": true, "sync_mode": "redis",
+                "limits": [{"scope": "default", "window_seconds": 4, "max_requests": 5}],
+                "redis_url": REDIS_URL, "redis_key_prefix": prefix,
+                // A healthy store may never answer through the fallback budget.
+                "redis_failure_policy": "fail_closed"
+            }
+        }]
+    });
     let mut gateway = spawn_file_gateway(config.to_string(), vec![]).await;
     let client = reqwest::Client::new();
-    let seconds = 6;
-    let mut admitted = vec![vec![0_u64; seconds]; 2];
-    let start = tokio::time::Instant::now();
-    for attempt in 0..seconds * 20 {
-        tokio::time::sleep_until(start + Duration::from_millis(attempt as u64 * 50)).await;
-        for (index, mode) in ["local", "redis"].into_iter().enumerate() {
-            let response = client
-                .get(format!("{}/{mode}/test", gateway.proxy_base_url))
-                .send()
-                .await
-                .unwrap();
-            let status = response.status().as_u16();
-            // 503 would mean the limiter never reached a decision; this store
-            // is healthy and both routes are quota-enforced.
-            assert!(matches!(status, 200 | 429), "{mode}: {status}");
-            if status == 200 {
-                admitted[index][attempt / 20] += 1;
-            }
-        }
+    let url = format!("{}/burst/test", gateway.proxy_base_url);
+
+    // Prove the route and the Redis-backed policy are live, then start the
+    // measurement from an empty budget.
+    wait_for_rate_limited_route(&client, &url).await;
+    delete_redis_keys_by_prefix(&prefix).await;
+
+    // Cluster the whole quota into the last ~500ms of a four-second epoch
+    // window, which is where the retired estimate discounted it hardest.
+    await_epoch_window_offset(4_000_000_000, 3_400_000_000..3_800_000_000).await;
+    let burst = tokio::time::Instant::now();
+    for attempt in 1..=5 {
+        let status = client
+            .get(&url)
+            .send()
+            .await
+            .expect("burst request")
+            .status()
+            .as_u16();
+        assert_eq!(status, 200, "burst request {attempt} is within budget");
     }
-    let local: u64 = admitted[0].iter().sum();
-    let redis: u64 = admitted[1].iter().sum();
-    // 120 attempts per route at 5/second. Local keeps its documented full-bucket
-    // burst; Redis sustains roughly four per second once its previous window is
-    // full, and must never approach the 120 attempts it was offered.
-    assert!(local >= 30, "local admissions: {admitted:?}");
-    assert!(redis >= 18, "Redis must keep admitting: {admitted:?}");
-    assert!(redis <= 36, "Redis must keep throttling: {admitted:?}");
-    for count in admitted[1].iter().skip(1) {
-        assert!(
-            *count >= 3,
-            "Redis must keep admitting during overload: {admitted:?}"
-        );
-    }
+    // Every probe below is scheduled from the burst's START, so the assertions
+    // only need the burst itself to be short relative to the window.
+    let spent = burst.elapsed();
+    assert!(
+        spent < Duration::from_millis(1_500),
+        "the burst must stay clustered to be a boundary burst: {spent:?}"
+    );
+
+    // Half a window past the epoch boundary the burst is still inside the exact
+    // trailing four seconds. The weighted estimate admitted here.
+    tokio::time::sleep_until(burst + Duration::from_millis(2_200)).await;
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .expect("mid-window probe")
+        .status()
+        .as_u16();
+    assert_eq!(status, 429, "a burst still inside the trailing window must keep binding");
+
+    // Once it ages out the budget is free again: a trailing window, not a
+    // lockout for whoever bursts once. The refused probe hands its own charge
+    // back from a detached task, so settle that first.
+    wait_for_redis_counter_sum(&prefix, 5).await;
+    tokio::time::sleep_until(burst + Duration::from_millis(7_000)).await;
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .expect("aged-out probe")
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "a burst that aged past the trailing window must stop binding");
+
     gateway.shutdown();
     backend.abort();
     delete_redis_keys_by_prefix(&prefix).await;
 }
 
-/// Issue #5517 across two windows: a refused attempt must charge neither the
-/// tight nor the loose window. Before the fix every attempt — admitted or not —
-/// incremented the per-minute counter, so a client sending above its per-second
-/// rate exhausted a 20/minute budget within the first second and then received
-/// nothing at all.
+/// A client that spends its quota must be admitted again as soon as that spend
+/// leaves the trailing window — it must not lose the whole next window.
+///
+/// This is the regression for the review finding on the first shape of this
+/// change. A bare `previous + current` sum leaves `previous` sitting at the cap
+/// for the entire epoch window after any window that reached it, so a client
+/// sending exactly its configured rate is admitted for one window and refused
+/// for the next, forever — about half its quota, permanently. The sub-bucket
+/// ladder ages the spend out continuously instead.
+///
+/// A one-request quota keeps the timing crisp: one round trip fills the window,
+/// so the assertions depend only on how long a single request takes.
 #[tokio::test]
 #[ignore]
-async fn test_rate_limiting_redis_sustained_multi_window_keeps_admitting() {
-    use ferrum_edge::plugins::utils::rate_limit::{
-        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
-    };
-    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-
+async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
     if !redis_is_available().await {
         return;
     }
-    let prefix = format!("ferrum:test:sustained-windows:{}", Uuid::new_v4().simple());
-    let config = RedisConfig::from_plugin_config(
-        &json!({"sync_mode": "redis", "redis_url": REDIS_URL}),
-        &prefix,
-    )
-    .unwrap()
-    .unwrap();
-    let redis = Arc::new(RedisRateLimitClient::new(config, None, false, None).unwrap());
-    let algorithm = DynamicHttpRateLimitAlgorithm::new();
-    let op = DynamicRateLimitOp::new(vec![
-        RateLimitWindowSpec {
-            limit: 5,
-            duration: Duration::from_secs(1),
-        },
-        RateLimitWindowSpec {
-            limit: 20,
-            duration: Duration::from_secs(60),
-        },
-    ]);
-    let seconds = 4;
-    let mut admitted = vec![0_u64; seconds];
-    let start = tokio::time::Instant::now();
-    for attempt in 0..seconds * 20 {
-        tokio::time::sleep_until(start + Duration::from_millis(attempt as u64 * 50)).await;
-        let decision = algorithm.check_redis(&redis, "client", &op).await;
-        if decision.unwrap().allowed {
-            admitted[attempt / 20] += 1;
-        }
-    }
-    let total: u64 = admitted.iter().sum();
-    for count in admitted.iter().skip(1).take(2) {
-        assert!(
-            *count >= 3,
-            "refused attempts must not consume the per-minute budget: {admitted:?}"
-        );
-    }
-    assert!(total >= 12, "sustained admissions: {admitted:?}");
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend = start_header_echo_backend_on(listener).await.unwrap();
+    let prefix = format!("ferrum:test:next-window:{}", Uuid::new_v4().simple());
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "steady", "listen_path": "/steady",
+            "backend_scheme": "http", "backend_host": "127.0.0.1",
+            "backend_port": backend_port, "strip_listen_path": true,
+            "plugins": [{"plugin_config_id": "steady"}]
+        }],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "steady", "plugin_name": "rate_limiting", "scope": "proxy",
+            "proxy_id": "steady", "enabled": true,
+            "config": {
+                "expose_headers": true, "sync_mode": "redis",
+                "limits": [{"scope": "default", "window_seconds": 2, "max_requests": 1}],
+                "redis_url": REDIS_URL, "redis_key_prefix": prefix,
+                // A healthy store may never answer through the fallback budget.
+                "redis_failure_policy": "fail_closed"
+            }
+        }]
+    });
+    let mut gateway = spawn_file_gateway(config.to_string(), vec![]).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/steady/test", gateway.proxy_base_url);
+
+    wait_for_rate_limited_route(&client, &url).await;
+    delete_redis_keys_by_prefix(&prefix).await;
+
+    // Start just after an epoch-window boundary so the spend lands in one
+    // two-second epoch window and the next round lands in the FOLLOWING one —
+    // the exact shape `previous + current` refuses outright.
+    await_epoch_window_offset(2_000_000_000, 0..200_000_000).await;
+    let spent_at = tokio::time::Instant::now();
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .expect("first-window request")
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "the first request is the whole quota");
+    let spent = spent_at.elapsed();
     assert!(
-        total <= 24,
-        "the looser per-minute window must still bind: {admitted:?}"
+        spent < Duration::from_millis(1_000),
+        "the spend must be clustered for the ladder arithmetic below: {spent:?}"
     );
+
+    // Three and a half seconds is past the whole ladder for a two-second window
+    // (eight 250ms sub-buckets plus the partial current one), and still inside
+    // the NEXT epoch window.
+    tokio::time::sleep_until(spent_at + Duration::from_millis(3_500)).await;
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .expect("next-window request")
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 200,
+        "the next window must hand back the full configured rate, not a window \
+         of refusals"
+    );
+
+    // The quota still binds: the request just admitted is itself inside the
+    // trailing window.
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .expect("over-quota request")
+        .status()
+        .as_u16();
+    assert_eq!(status, 429, "the configured rate must still be enforced");
+
+    gateway.shutdown();
+    backend.abort();
     delete_redis_keys_by_prefix(&prefix).await;
 }
 
