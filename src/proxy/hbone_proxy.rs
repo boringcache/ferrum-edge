@@ -686,16 +686,14 @@ pub(super) async fn handle_hbone_request(
         HboneConnectCredential::Admit(credential) => credential,
         HboneConnectCredential::Refuse(refusal) => {
             let deny_reason = refusal.connect_reason();
+            let deny_policy = deny_reason.to_string();
             warn!(
                 proxy_id = %proxy.id,
                 reason = deny_reason,
                 "Rejected HBONE CONNECT whose peer chain no longer survives the inbound \
                  admission trust in force"
             );
-            ctx.metadata.insert(
-                "mesh_authz.deny_policy".to_string(),
-                deny_reason.to_string(),
-            );
+            ctx.metadata.insert("mesh_authz.deny_policy".to_string(), deny_policy);
             crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
                 crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
                 false,
@@ -1417,16 +1415,14 @@ pub(super) async fn handle_hbone_udp_request(
         HboneConnectCredential::Admit(credential) => credential,
         HboneConnectCredential::Refuse(refusal) => {
             let deny_reason = refusal.udp_connect_reason();
+            let deny_policy = deny_reason.to_string();
             warn!(
                 proxy_id = %proxy.id,
                 reason = deny_reason,
                 "Rejected datagram-over-HBONE CONNECT whose peer chain no longer survives the \
                  inbound admission trust in force"
             );
-            ctx.metadata.insert(
-                "mesh_authz.deny_policy".to_string(),
-                deny_reason.to_string(),
-            );
+            ctx.metadata.insert("mesh_authz.deny_policy".to_string(), deny_policy);
             // Byte-identical to the unauthenticated-peer body; the refusal
             // discloses nothing about which half of admission refused it.
             let reject = finalize_reject_response_with_after_proxy_hooks(

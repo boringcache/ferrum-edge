@@ -142,6 +142,10 @@ use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
+use crate::tls::CrlList;
+use crate::tls::crl_policy::{
+    SharedEnforcedCrlSet, crl_records_equal, publish_enforced_crl_set, usable_crl_records,
+};
 use crate::tls::spiffe::{AdmittedPeerTrustAnchors, AdmittedPeerTrustVerdict};
 
 /// Client-visible / log-visible message for a tunnel the fence revoked. A
@@ -871,7 +875,7 @@ pub struct HboneAdmissionFence {
     /// The CRL set the mesh inbound SPIFFE peer verifier enforces, read live so
     /// a sweep re-checks retained chains against exactly the records the next
     /// handshake would police (issue #5574). The same slot the verifier holds.
-    mesh_inbound_crls: crate::tls::crl_policy::SharedEnforcedCrlSet,
+    mesh_inbound_crls: SharedEnforcedCrlSet,
 }
 
 /// No expiry watcher is parked on any deadline.
@@ -887,7 +891,7 @@ impl HboneAdmissionFence {
     pub fn new(
         request_epoch: Arc<RequestEpochStore>,
         mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
-        mesh_inbound_crls: crate::tls::crl_policy::SharedEnforcedCrlSet,
+        mesh_inbound_crls: SharedEnforcedCrlSet,
     ) -> Self {
         Self {
             tunnels: DashMap::new(),
@@ -936,10 +940,7 @@ impl HboneAdmissionFence {
         }
         let current = slot.load_full();
         let crls = self.enforced_crl_records();
-        let material = current
-            .as_ref()
-            .as_ref()
-            .map(|bundle| &bundle.trust_bundles);
+        let material = current.as_ref().as_ref().map(|svid| &svid.trust_bundles);
         let in_force = InForceInboundTrust {
             revision: self.next_trust_revision(),
             compiled: self.compile_in_force(material, &crls).ok(),
@@ -955,7 +956,7 @@ impl HboneAdmissionFence {
     /// configuration generation: the enforced revocation list is the operator's
     /// standing list, not part of an accepted config, and the whole point of
     /// issue #5574 is that both surfaces police the same records.
-    fn enforced_crl_records(&self) -> crate::tls::CrlList {
+    fn enforced_crl_records(&self) -> CrlList {
         Arc::clone(self.mesh_inbound_crls.load().crls())
     }
 
@@ -999,7 +1000,7 @@ impl HboneAdmissionFence {
     fn compile_in_force(
         &self,
         material: Option<&crate::identity::TrustBundleSet>,
-        crls: &crate::tls::CrlList,
+        crls: &CrlList,
     ) -> Result<CompiledInboundTrust, &'static str> {
         let Some(material) = material else {
             return Err("absent");
@@ -1101,10 +1102,10 @@ impl HboneAdmissionFence {
             // a CRL rotation that landed before any trust was in force, so it
             // had no anchors to recompile — must pick them up rather than
             // compile the new material against the old list.
-            let changed = !trust_material_eq(in_force.material(), candidate)
-                || in_force.crls().is_some_and(|in_force_crls| {
-                    !crate::tls::crl_policy::crl_records_equal(in_force_crls, &crls)
-                });
+            let crls_changed = in_force
+                .crls()
+                .is_some_and(|current| !crl_records_equal(current, &crls));
+            let changed = !trust_material_eq(in_force.material(), candidate) || crls_changed;
             let compiled = if changed {
                 match self.compile_in_force(candidate, &crls) {
                     Ok(compiled) => Some(compiled),
@@ -1173,16 +1174,16 @@ impl HboneAdmissionFence {
     /// too and [`Self::admit`] turns that into a fresh pass.
     pub fn publish_inbound_admission_crls(
         self: &Arc<Self>,
-        slot: &crate::tls::crl_policy::SharedEnforcedCrlSet,
-        crls: crate::tls::CrlList,
+        slot: &SharedEnforcedCrlSet,
+        crls: CrlList,
     ) -> bool {
         // Compared against what the VERIFIER enforces, which is also the
         // baseline `enforced_crl_records` hands every compile: a republish of
         // the live records changes nothing on either surface.
-        if crate::tls::crl_policy::crl_records_equal(slot.load().crls(), &crls) {
+        if crl_records_equal(slot.load().crls(), &crls) {
             return false;
         }
-        if let Err(class) = crate::tls::crl_policy::usable_crl_records(&crls) {
+        if let Err(class) = usable_crl_records(&crls) {
             self.warn_crls_not_in_force(class);
             return false;
         }
@@ -1192,7 +1193,7 @@ impl HboneAdmissionFence {
             // is inapplicable for every live tunnel. Publishing them for the
             // verifier is the whole job; the sweep still runs because the
             // policy gates are re-applied on every publication.
-            let changed = crate::tls::crl_policy::publish_enforced_crl_set(slot, crls);
+            let changed = publish_enforced_crl_set(slot, crls);
             if changed {
                 self.request_sweep();
             }
@@ -1218,7 +1219,7 @@ impl HboneAdmissionFence {
                     }
                 },
             };
-            let changed = crate::tls::crl_policy::publish_enforced_crl_set(slot, crls);
+            let changed = publish_enforced_crl_set(slot, crls);
             if let Some(compiled) = compiled {
                 // AFTER the store, exactly as the trust publication orders it,
                 // so a reader that observes this revision observes records at
@@ -1256,7 +1257,9 @@ impl HboneAdmissionFence {
         }
         warn!(
             record_class,
-            "Mesh inbound CRL publication is not in force: a candidate record is not usable, so              the inbound mTLS verifier keeps enforcing the records already published and live              HBONE tunnels keep being judged against the trust revision still in force"
+            "Mesh inbound CRL publication is not in force: a candidate record is not usable, so \
+             the inbound mTLS verifier keeps enforcing the records already published and live \
+             HBONE tunnels keep being judged against the trust revision still in force"
         );
     }
 
@@ -1940,7 +1943,7 @@ impl InForceInboundTrust {
 
     /// The enforced CRL records this revision's anchors were compiled with, or
     /// `None` while nothing is in force (issue #5574).
-    fn crls(&self) -> Option<&crate::tls::CrlList> {
+    fn crls(&self) -> Option<&CrlList> {
         self.compiled.as_ref().map(|compiled| &compiled.crls)
     }
 }
@@ -1955,7 +1958,7 @@ struct CompiledInboundTrust {
     /// The enforced CRL records `anchors` were compiled WITH (issue #5574),
     /// kept as the other half of that comparison baseline. One `Arc` clone of
     /// the records the verifier's slot holds, never a copy of the DER.
-    crls: crate::tls::CrlList,
+    crls: CrlList,
     /// Compiled ONCE, here, at publication — never per sweep and never per
     /// CONNECT.
     anchors: AdmittedPeerTrustAnchors,

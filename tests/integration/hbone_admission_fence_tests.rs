@@ -1524,29 +1524,39 @@ fn publish_crls(state: &ProxyState, records: Vec<CertificateRevocationListDer<'s
     state.publish_mesh_inbound_crls(Arc::new(records))
 }
 
-/// Whether the inbound SPIFFE peer verifier the mesh listener builds from
-/// `state`'s LIVE enforced CRL slot still accepts `peer`'s leaf.
+/// The inbound SPIFFE peer verifier the mesh listener builds, reading `state`'s
+/// LIVE enforced CRL slot.
 ///
-/// This is the "next handshake" half of issue #5574: the fence cuts the live
-/// tunnel, and the same published CRL must also refuse the peer's next
-/// handshake — otherwise a revoked workload simply reconnects.
-fn inbound_handshake_admits(
+/// Built ONCE per test and reused across publications on purpose: the listener
+/// is not rebound when an operator rotates a CRL, so reusing one verifier is
+/// what pins the half of issue #5574 that lives in the verifier cache — its
+/// identity has to include the enforced set's generation, not just the SVID
+/// source.
+fn inbound_verifier(
     state: &ProxyState,
     slot: &SharedBundleSlot,
-    peer: &PeerChain,
-) -> bool {
-    let verifier = tls::build_spiffe_client_cert_verifier_with_enforced_crls(
+) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    tls::build_spiffe_client_cert_verifier_with_enforced_crls(
         slot.clone(),
         true,
         Arc::clone(&state.mesh_inbound_crls),
-    );
-    rustls::server::danger::ClientCertVerifier::verify_client_cert(
-        verifier.as_ref(),
-        &rustls::pki_types::CertificateDer::from(peer.leaf_der.clone()),
-        &[],
-        rustls::pki_types::UnixTime::now(),
     )
-    .is_ok()
+}
+
+/// Whether `verifier` still accepts `peer`'s leaf — the "next handshake" half
+/// of issue #5574: the fence cuts the live tunnel, and the same published CRL
+/// must also refuse the peer's next handshake, or a revoked workload simply
+/// reconnects.
+fn handshake_admits(
+    verifier: &Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    peer: &PeerChain,
+) -> bool {
+    use rustls::server::danger::ClientCertVerifier;
+
+    let leaf = rustls::pki_types::CertificateDer::from(peer.leaf_der.clone());
+    let now = rustls::pki_types::UnixTime::now();
+    let verified = ClientCertVerifier::verify_client_cert(verifier.as_ref(), &leaf, &[], now);
+    verified.is_ok()
 }
 
 /// One trust domain's bundle.
@@ -2483,7 +2493,7 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     let publish_inbound = body(
         fence,
         "pub fn publish_inbound_admission_trust(",
-        "\n    /// The inbound admission trust IN FORCE",
+        "\n    /// Publish the CRL records the mesh inbound SPIFFE verifier enforces",
     );
     assert_store_then_sweep(
         publish_inbound,
@@ -2499,6 +2509,43 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     assert!(
         publish_inbound.contains("self.warn_trust_not_in_force("),
         "a publication the fence refuses to put in force must not do so silently"
+    );
+
+    // The enforced CRL records are the OTHER input to the same compiled anchors
+    // (issue #5574), so their publisher owes the same two guarantees: the
+    // records reach the verifier's slot before the sweep that judges live
+    // tunnels against them, and a candidate that takes no force says so.
+    let publish_crls = body(
+        fence,
+        "pub fn publish_inbound_admission_crls(",
+        "\n    /// One sampled operator line for an enforced-CRL candidate",
+    );
+    assert_store_then_sweep(
+        publish_crls,
+        "publish_enforced_crl_set(slot, crls)",
+        "self.request_sweep()",
+        "publish_inbound_admission_crls",
+    );
+    assert!(
+        publish_crls.contains("self.warn_crls_not_in_force("),
+        "an unusable CRL candidate must not take no force silently"
+    );
+
+    // And `ProxyState` must route through it rather than storing the slot.
+    let publish_state_crls = body(
+        proxy,
+        "pub fn publish_mesh_inbound_crls(&self, crls: crate::tls::CrlList) -> bool {",
+        "\n    /// Republish only the captured-listener-port",
+    );
+    assert!(
+        publish_state_crls.contains(".publish_inbound_admission_crls("),
+        "the enforced mesh inbound CRL slot must be published through the fence's one \
+         publisher, which recompiles the anchors it is an input to"
+    );
+    assert!(
+        !publish_state_crls.contains(".store("),
+        "a direct store leaves the verifier and the fence's cached anchors policing \
+         different records"
     );
 
     // And the mesh writers must reach that publisher rather than storing into
@@ -2579,7 +2626,11 @@ fn the_inbound_spiffe_verifier_and_the_fence_share_one_trust_slot() {
     // That same binding is what the inbound TLS state hands every verifier build.
     const VERIFIER_SLOT: &str = "spiffe_bundle_slot: mesh_inbound_spiffe_slot";
     const VERIFIER_CALL: &str = "mesh_inbound_spiffe_verifier(spiffe_bundle_slot";
-    const VERIFIER_BUILD: &str = "tls::build_spiffe_client_cert_verifier(";
+    // The LIVE-CRL builder, not the snapshot one: the mesh inbound listener has
+    // to read the enforced set on every handshake (issue #5574), and the
+    // snapshot form pins a list for the verifier's lifetime.
+    const VERIFIER_BUILD: &str = "tls::build_spiffe_client_cert_verifier_with_enforced_crls(";
+    const PINNED_CRL_BUILD: &str = "tls::build_spiffe_client_cert_verifier(";
     // The CA-backend slot origin, and the carry-through that keeps it the SAME
     // `Arc` rather than a second slot the fence never saw.
     const CA_INSTALL: &str = "proxy_state.install_mesh_inbound_admission_trust(&inbound_slot);";
@@ -2613,8 +2664,15 @@ fn the_inbound_spiffe_verifier_and_the_fence_share_one_trust_slot() {
     );
     assert_eq!(
         mesh.matches(VERIFIER_BUILD).count(),
-        2,
-        "only `mesh_inbound_spiffe_verifier`'s two mTLS-mode arms may build it"
+        1,
+        "exactly one production site — `mesh_inbound_spiffe_verifier` — may build it, and the \
+         mTLS mode selects `peer_required` rather than forking the call"
+    );
+    assert_eq!(
+        mesh.matches(PINNED_CRL_BUILD).count(),
+        0,
+        "the mesh inbound verifier must read the LIVE enforced CRL slot; the snapshot form \
+         pins a revocation list for the verifier's lifetime, which a rotation can never reach"
     );
 
     // The CA-backend slot reaches that binding as the SAME `Arc`: the builder
@@ -2730,7 +2788,8 @@ async fn a_crl_revoking_a_different_serial_revokes_nothing() {
         peer_credential(&peer, live_expiry(), true, inbound_trust_revision(&state)),
     ));
 
-    assert!(publish_crls(&state, vec![signed_crl(&peer, &[UNRELATED_LEAF_SERIAL])]));
+    let unrelated = signed_crl(&peer, &[UNRELATED_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![unrelated]));
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(
@@ -2849,29 +2908,18 @@ async fn an_unusable_crl_never_takes_force() {
     // Both are refused at admission by exactly the rule
     // `crl_policy::validate_crl_windows` applies everywhere else.
     let now = time::OffsetDateTime::now_utc();
-    let candidates: Vec<Vec<CertificateRevocationListDer<'static>>> = vec![
-        vec![CertificateRevocationListDer::from(vec![
-            0x30, 0x03, 0x02, 0x01, 0x00,
-        ])],
-        vec![signed_crl_in_window(
-            &peer,
-            &[PEER_LEAF_SERIAL],
-            now - time::Duration::days(30),
-            now - time::Duration::days(1),
-        )],
-        // A partially invalid multi-record source: the usable subset must not
-        // be published either, or an issuer the operator listed would silently
-        // stop being policed.
-        vec![
-            signed_crl(&peer, &[UNRELATED_LEAF_SERIAL]),
-            signed_crl_in_window(
-                &peer,
-                &[PEER_LEAF_SERIAL],
-                now - time::Duration::days(30),
-                now - time::Duration::days(1),
-            ),
-        ],
-    ];
+    let garbage = CertificateRevocationListDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+    let expired = signed_crl_in_window(
+        &peer,
+        &[PEER_LEAF_SERIAL],
+        now - time::Duration::days(30),
+        now - time::Duration::days(1),
+    );
+    let usable = signed_crl(&peer, &[UNRELATED_LEAF_SERIAL]);
+    // The third candidate is a partially invalid multi-record source: the
+    // usable subset must not be published either, or an issuer the operator
+    // listed would silently stop being policed.
+    let candidates = vec![vec![garbage], vec![expired.clone()], vec![usable, expired]];
 
     for candidate in candidates {
         assert!(
@@ -2918,26 +2966,25 @@ async fn a_published_crl_refuses_the_peers_next_handshake() {
         &gateway,
         local_trust(PEER_TRUST_DOMAIN, vec![peer.ca_der.clone()]),
     );
+    // ONE verifier for the whole test: the listener is never rebound when an
+    // operator rotates a CRL, so this is the object that has to notice.
+    let verifier = inbound_verifier(&state, &slot);
     assert!(
-        inbound_handshake_admits(&state, &slot, &peer),
+        handshake_admits(&verifier, &peer),
         "the peer's credential must be admissible before anything revokes it"
     );
 
-    assert!(publish_crls(
-        &state,
-        vec![signed_crl(&peer, &[UNRELATED_LEAF_SERIAL])]
-    ));
+    let unrelated = signed_crl(&peer, &[UNRELATED_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![unrelated]));
     assert!(
-        inbound_handshake_admits(&state, &slot, &peer),
+        handshake_admits(&verifier, &peer),
         "a CRL that does not name this leaf leaves the handshake admitting it"
     );
 
-    assert!(publish_crls(
-        &state,
-        vec![signed_crl(&peer, &[PEER_LEAF_SERIAL])]
-    ));
+    let revoking = signed_crl(&peer, &[PEER_LEAF_SERIAL]);
+    assert!(publish_crls(&state, vec![revoking]));
     assert!(
-        !inbound_handshake_admits(&state, &slot, &peer),
+        !handshake_admits(&verifier, &peer),
         "the published CRL must refuse the peer's next handshake, or a revoked workload \
          just reconnects — the verifier cache identity has to include the CRL generation"
     );

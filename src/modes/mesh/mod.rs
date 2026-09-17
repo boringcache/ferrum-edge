@@ -17691,16 +17691,17 @@ fn mesh_inbound_spiffe_verifier(
     crls: crate::tls::crl_policy::SharedEnforcedCrlSet,
 ) -> Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let slot = slot?;
-    match mtls_mode {
-        config::MtlsMode::Strict => Some(
-            tls::build_spiffe_client_cert_verifier_with_enforced_crls(slot.clone(), true, crls),
-        ),
-        config::MtlsMode::Permissive => Some(
-            tls::build_spiffe_client_cert_verifier_with_enforced_crls(slot.clone(), false, crls),
-        ),
+    let peer_required = match mtls_mode {
+        config::MtlsMode::Strict => true,
+        config::MtlsMode::Permissive => false,
         // DISABLE has no TLS; client-side DR modes never reach here.
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(tls::build_spiffe_client_cert_verifier_with_enforced_crls(
+        slot.clone(),
+        peer_required,
+        crls,
+    ))
 }
 
 fn mesh_inbound_tls_reload_snapshot(
@@ -34966,41 +34967,30 @@ mod tests {
 
     #[test]
     fn mesh_inbound_spiffe_verifier_respects_mode_and_slot() {
+        let crls = no_enforced_crls();
         // No slot → no verifier regardless of mode.
-        assert!(
-            mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, no_enforced_crls())
-                .is_none()
-        );
+        let no_slot = mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, crls.clone());
+        assert!(no_slot.is_none());
 
         // A present (even empty) slot yields a verifier for STRICT/PERMISSIVE
         // with the correct client-auth-mandatory posture, and none for DISABLE.
         let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-        let strict =
-            mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Strict, no_enforced_crls())
-                .expect("STRICT yields a verifier");
+        let strict_mode = config::MtlsMode::Strict;
+        let strict = mesh_inbound_spiffe_verifier(Some(&slot), strict_mode, crls.clone())
+            .expect("STRICT yields a verifier");
         assert!(
             rustls::server::danger::ClientCertVerifier::client_auth_mandatory(strict.as_ref()),
             "STRICT must mandate client auth"
         );
-        let permissive = mesh_inbound_spiffe_verifier(
-            Some(&slot),
-            config::MtlsMode::Permissive,
-            no_enforced_crls(),
-        )
-        .expect("PERMISSIVE yields a verifier");
+        let permissive_mode = config::MtlsMode::Permissive;
+        let permissive = mesh_inbound_spiffe_verifier(Some(&slot), permissive_mode, crls.clone())
+            .expect("PERMISSIVE yields a verifier");
         assert!(
             !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(permissive.as_ref()),
             "PERMISSIVE must not mandate client auth"
         );
-        assert!(
-            mesh_inbound_spiffe_verifier(
-                Some(&slot),
-                config::MtlsMode::Disable,
-                no_enforced_crls()
-            )
-            .is_none(),
-            "DISABLE has no TLS, so no verifier"
-        );
+        let disabled = mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Disable, crls);
+        assert!(disabled.is_none(), "DISABLE has no TLS, so no verifier");
     }
 
     #[tokio::test(flavor = "current_thread")]
