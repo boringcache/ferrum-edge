@@ -3568,7 +3568,10 @@ async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse
         registry_only_runtime(),
     );
     assert_registry_only_gate_is_injected(&registry_only);
-    assert_eq!(state.update_config(registry_only), ConfigApplyOutcome::Applied);
+    assert_eq!(
+        state.update_config(registry_only),
+        ConfigApplyOutcome::Applied
+    );
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(
@@ -3728,8 +3731,7 @@ async fn a_connect_racing_the_withdrawing_publication_is_never_left_reusable() {
         // is what closes the window when the publication's sweep read the
         // registry before the insert.
         assert_eq!(
-            reuse_withdrawn,
-            1,
+            reuse_withdrawn, 1,
             "a tunnel whose 200 advertised reuse across a withdrawing publication must be \
              revoked by the sweep that publication requested"
         );
@@ -3744,8 +3746,7 @@ async fn a_connect_racing_the_withdrawing_publication_is_never_left_reusable() {
         // State (2): admitted under the new generation, so there was never
         // anything to withdraw and nothing to cut.
         assert_eq!(
-            reuse_withdrawn,
-            0,
+            reuse_withdrawn, 0,
             "a tunnel that never recorded the advertisement cannot lose it"
         );
         assert_eq!(
