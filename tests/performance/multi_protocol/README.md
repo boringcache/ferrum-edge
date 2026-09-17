@@ -182,14 +182,21 @@ JSON output (`--json`):
 
 For the September 2026 multi-gateway investigation, see the
 [benchmark audit](../../../docs/benchmark_audit_2026_09_17.md). The gateway
-workflow now reports validity across every iteration: errors, zero successful
-work, missing iterations, or inconsistent echo byte totals exclude a scenario
-from the scoreboard. Raw rates remain diagnostic. Each run records its expected
-matrix before startup and saves backend/gateway logs plus Envoy counters under
-`diagnostics/` after the timed samples. A green workflow alone does not certify
-an error-free benchmark; inspect the validity tables.
+workflow's **combined** summary now reports validity across every iteration:
+errors, zero successful work, missing iterations, or inconsistent echo byte
+totals exclude a scenario from the scoreboard. Raw rates remain diagnostic.
+Each run records its expected matrix before startup (`manifest.json`) and saves
+backend/gateway logs plus Envoy counters under `diagnostics/` after the timed
+samples. A green workflow alone does not certify an error-free benchmark;
+inspect the validity tables.
 
-Focused harness checks:
+The per-protocol summary rendered inside the matrix job still shows raw
+throughput only. `Trusted Cross Build Policy` freezes that job's bytes against
+the trusted base, so a pull request cannot add the validity table (or a test
+step) there; read the combined summary, or the rules below, for validity.
+
+Validity rules live in `benchmark_validity.py` so the workflow and these checks
+share one definition. Run them before relying on a benchmark result:
 
 ```bash
 python3 -m unittest discover -s tests/performance/multi_protocol/tests -p 'test_*.py'

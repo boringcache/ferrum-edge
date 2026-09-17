@@ -756,7 +756,9 @@ run_bench() {
     # below a subdirectory so summary globs cannot mistake stats for samples.
     local diagnostics="$OUTPUT_DIR/diagnostics"
     mkdir -p "$diagnostics"
-    cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log"
+    # `set -e` is on: a best-effort capture must never abort the matrix that
+    # the capture exists to diagnose.
+    cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
         docker logs "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [ "$gateway" = "envoy" ]; then

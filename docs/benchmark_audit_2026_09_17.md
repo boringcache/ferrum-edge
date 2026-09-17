@@ -383,6 +383,14 @@ the JSON summary glob, so future failures can be diagnosed. The Envoy H3 cap
 is lifted as described above. These are harness changes; the proxy performance
 experiments and the production relay fix remain follow-up work.
 
+The validity reporting lands in the combined-summary job only. `Trusted Cross
+Build Policy` compares each Cross-sensitive job in a workflow by its whole-job
+digest, so a pull request cannot change the per-protocol matrix job at all —
+neither to render the validity table there nor to run the new harness checks as
+a pre-flight step. Both remain available from `benchmark_validity.py` and the
+commands in `tests/performance/multi_protocol/README.md`; wiring them into the
+matrix job needs a direct-to-`main` change.
+
 Acceptance for performance work: reproduce the failure first, preserve strict
 status/body/trailer validation, run at least three interleaved baseline/candidate
 measurements on the same runner, retain all errors, and record proxy/client/

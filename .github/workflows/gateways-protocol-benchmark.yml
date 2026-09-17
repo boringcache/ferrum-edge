@@ -260,8 +260,6 @@ jobs:
           ITERATIONS: ${{ inputs.iterations }}
           FERRUM_IMAGE: ferrum-edge:bench
         run: |
-          python3 -m unittest discover -s tests/performance/multi_protocol/tests -p 'test_*.py'
-          cargo test --locked --release --manifest-path tests/performance/multi_protocol/Cargo.toml --test metrics_tests
           mkdir -p results/${{ matrix.protocol }}
           for run in $(seq 1 "$ITERATIONS"); do
             echo ""
@@ -275,8 +273,8 @@ jobs:
             # After the first iteration: reuse already-built binaries + images
             # (--skip-build) and skip the direct-backend baseline since it's
             # gateway-independent and doesn't change across iterations.
-            extra_flags=()
-            if [ "$run" -gt 1 ]; then extra_flags=(--skip-build --skip-direct); fi
+            extra_flags=""
+            if [ "$run" -gt 1 ]; then extra_flags="--skip-build --skip-direct"; fi
 
             bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
               "${{ matrix.protocol }}" \
@@ -285,7 +283,7 @@ jobs:
               --duration "${{ inputs.duration }}" \
               --concurrency "${{ inputs.concurrency }}" \
               --output-dir "$run_dir" \
-              "${extra_flags[@]}" \
+              $extra_flags \
               2>&1 | tee "$run_dir/run.log"
           done
 
@@ -307,10 +305,8 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency }}
         run: |
           python3 - <<'PYEOF'
-          import os, json, glob, math, sys
+          import os, json, glob, math
           from pathlib import Path
-          sys.path.insert(0, "tests/performance/multi_protocol")
-          from benchmark_validity import bucket_issues, expected_rows, throughput_value
 
           protocol = os.environ["PROTOCOL"]
           iterations = int(os.environ.get("ITERATIONS", "1"))
@@ -324,24 +320,18 @@ jobs:
 
           # {(gateway, size): [rps, rps, ...]}  across runs
           rps_agg = {}
-          samples = {}
           # Most-recent-run details for latency/errors
           latest = {}
 
           for run_dir in sorted(proto_dir.glob("run_*")):
-              for key in expected_rows(run_dir):
-                  samples.setdefault(key, [])
-                  rps_agg.setdefault(key, [])
               for f in sorted(run_dir.glob(f"*_{protocol}_*.json")):
                   try:
                       d = json.loads(f.read_text())
                   except Exception:
-                      d = {"error": "unparseable result"}
+                      continue
                   gw = d.get("gateway") or f.stem.split(f"_{protocol}_")[0]
                   size = int(d.get("payload_size") or f.stem.rsplit("_", 1)[1])
-                  d.setdefault("payload_size", size)
-                  samples.setdefault((gw, size), []).append(d)
-                  rps = throughput_value(d)
+                  rps = float(d.get("rps") or 0)
                   rps_agg.setdefault((gw, size), []).append(rps)
                   latest[(gw, size)] = d
 
@@ -377,15 +367,6 @@ jobs:
                   mean = sum(vals) / len(vals) if vals else 0
                   row.append(fmt_rps(mean))
               lines.append("| " + " | ".join(row) + " |")
-
-          lines.append("\n### Validity across all iterations\n")
-          lines.append("Samples with errors, no completed work, incomplete iterations, or incorrect echo byte totals are invalid for ranking. Throughput above remains diagnostic.\n")
-          lines.append("| Gateway | Payload | Validity |")
-          lines.append("|---------|---------|----------|")
-          for g in gateways:
-              for s in sizes:
-                  issues = bucket_issues(samples.get((g, s), []), 1 if g == "direct" else iterations)
-                  lines.append(f"| {g} | {fmt_bytes(s)} | " + ("; ".join(issues) if issues else "clean") + " |")
 
           # Gateway overhead vs direct
           if "direct" in gateways:
@@ -548,7 +529,8 @@ jobs:
                   contenders = [(g, sum(buckets[(g, s)]) / len(buckets[(g, s)]))
                                 for g in ("ferrum", "envoy", "kong", "tyk", "krakend")
                                 if (g, s) in buckets and buckets[(g, s)]]
-                  expected_gateways = {g for g, _ in buckets if g != "direct"}
+                  expected_gateways = {g for g, size in buckets
+                                       if g != "direct" and size == s}
                   if len(expected_gateways) < 2:
                       if expected_gateways:
                           unopposed += 1
