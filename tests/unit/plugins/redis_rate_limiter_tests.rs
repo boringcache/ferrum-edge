@@ -1555,7 +1555,10 @@ fn sub_bucket_ladder_never_admits_more_than_the_exact_trailing_window() {
                 "phase {phase}: {inside} admissions inside the second ending at {window_end}"
             );
         }
-        assert!(!admitted_at.is_empty(), "phase {phase} must still admit traffic");
+        assert!(
+            !admitted_at.is_empty(),
+            "phase {phase} must still admit traffic"
+        );
     }
 
     // The derivation the sweep rests on: `current + K older` sub-buckets always
@@ -3273,7 +3276,11 @@ fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
     let mut reply = format!("*{values}\r\n").into_bytes();
     let older: &[u8] = if exhausted { b":9\r\n" } else { b"$-1\r\n" };
     // The charged sub-bucket's post-increment `INCR`, then its ignored `EXPIRE`.
-    let charged: &[u8] = if exhausted { b":9\r\n:1\r\n" } else { b":1\r\n:1\r\n" };
+    let charged: &[u8] = if exhausted {
+        b":9\r\n:1\r\n"
+    } else {
+        b":1\r\n:1\r\n"
+    };
     for _ in 0..windows {
         for _ in 0..CHARGE_GETS_PER_WINDOW {
             reply.extend_from_slice(older);

@@ -1470,7 +1470,10 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         .expect("mid-window probe")
         .status()
         .as_u16();
-    assert_eq!(status, 429, "a burst still inside the trailing window must keep binding");
+    assert_eq!(
+        status, 429,
+        "a burst still inside the trailing window must keep binding"
+    );
 
     // Once it ages out the budget is free again: a trailing window, not a
     // lockout for whoever bursts once. The refused probe hands its own charge
@@ -1484,7 +1487,10 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
         .expect("aged-out probe")
         .status()
         .as_u16();
-    assert_eq!(status, 200, "a burst that aged past the trailing window must stop binding");
+    assert_eq!(
+        status, 200,
+        "a burst that aged past the trailing window must stop binding"
+    );
 
     gateway.shutdown();
     backend.abort();
