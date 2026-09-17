@@ -86,6 +86,24 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Build the inner HTTP/1.1 request body the Ambient HBONE dispatch
+    /// constructs, so an external test can drive a real pooled inner exchange
+    /// end to end (issue #5042 step 2).
+    ///
+    /// This is the `Replayable` arm of
+    /// [`crate::proxy::hbone_inner_pool::HboneInnerH1RequestBody`], built with
+    /// no backend write watermark — `write_timeout_ms = 0` is the documented
+    /// allocation-, task-, and timer-free direct path — so the body a test
+    /// sends is byte-identical in shape to a buffered dispatch's, with no pump
+    /// for the test to own.
+    pub fn hbone_inner_h1_request_body_for_test(
+        data: bytes::Bytes,
+    ) -> crate::proxy::hbone_inner_pool::HboneInnerH1RequestBody {
+        let (body, _no_pump) =
+            crate::proxy::body::ReplayableRequestBody::with_gateway_upload_pump(data, None, 0);
+        http_body_util::Either::Right(body)
+    }
+
     /// Structural admission of a `POST /restore` envelope (issue #5538).
     ///
     /// `true` when the body is a JSON object whose keys are all recognized

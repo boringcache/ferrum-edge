@@ -80,6 +80,10 @@ pub const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST: u8 =
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
 pub(crate) mod h2c_preface;
 pub mod hbone_admission_fence;
+/// Source-side reuse of the APPLICATION connection inside a fenced HBONE
+/// tunnel (issue #5042 step 2). Owned by [`hbone_pool::HboneConnectionPool`],
+/// so every source-side trust drain reaches these connections too.
+pub mod hbone_inner_pool;
 pub mod hbone_pool;
 mod hbone_proxy;
 #[allow(unused_imports)]
@@ -9741,6 +9745,11 @@ impl ProxyState {
             route_generation: 1,
             lb_generation: 1,
         }));
+        // Issue #5042 step 2: inner HBONE application leases are keyed by the
+        // admitting proxy's lifecycle generation, which the pool resolves from
+        // the published epoch rather than from a threaded dispatch argument, so
+        // the plain-HTTP and native-gRPC paths cannot key it differently.
+        hbone_pool.attach_request_epoch(Arc::clone(&request_epoch));
         {
             let initial_epoch = request_epoch.load();
             router_cache.store_route_epoch_snapshot(
@@ -39993,7 +40002,8 @@ async fn handle_proxy_request_inner(
             }
         }
         ResponseBody::StreamingH2(mut resp) => {
-            // Issue #3731: a sidecar-ingress Unix HTTP/1.1 dispatch parks its
+            // Issues #3731 and #5042: a sidecar-ingress Unix HTTP/1.1 dispatch
+            // and an Ambient HBONE inner HTTP/1.1 dispatch both park their
             // exclusive connection lease in the response extensions. Take it
             // BEFORE `resp.into_body()` (which drops the extension map) and
             // re-attach it below to the body that OWNS the backend
@@ -49323,6 +49333,217 @@ fn native_grpc_mesh_mtls_buffering_conflict_known(
     )
 }
 
+/// The complete source-side identity of ONE reusable inner application
+/// connection inside an HBONE tunnel, plus everything needed to open a fresh
+/// one (issue #5042 step 2).
+///
+/// Resolved ONCE per dispatch, above the checkout, so the key a lease is
+/// looked up under and the CONNECT a miss would open are built from the same
+/// values. Borrowed from the dispatch frame; building a key allocates nothing.
+struct HboneInnerDispatchPlan<'a> {
+    namespace: &'a str,
+    proxy_id: &'a str,
+    upstream_id: Option<&'a str>,
+    /// The admitting proxy's lifecycle generation. A proxy withdrawn and
+    /// recreated is a new incarnation and must inherit no pooled connection.
+    proxy_lifecycle_generation: Option<u64>,
+    /// CONNECT `:authority` host — the REAL destination the peer's relay dials.
+    app_host: &'a str,
+    app_port: u16,
+    /// Per-port dispatch policy port, for the connect-timeout override.
+    app_policy_port: u16,
+    /// The host the OUTER HTTP/2 session is dialled to. Differs from
+    /// `app_host` on NodeWaypoint secured egress and cross-cluster east-west.
+    dial_host: &'a str,
+    hbone_port: u16,
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
+    expected_trust_domain: Option<&'a crate::identity::spiffe::TrustDomain>,
+    sni_override: Option<&'a str>,
+    /// The frontend workload identity asserted in the CONNECT baggage, when
+    /// the frontend authenticated one. `None` means this gateway's own SVID
+    /// acts as itself — a DIFFERENT admission fact at the destination, which
+    /// is why the key carries both the principal and whether it was asserted.
+    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+    credential: hbone_inner_pool::HboneSourceCredential,
+    pool_config: PoolConfig,
+    /// The dispatch's effective `pool_enable_http_keep_alive`. With it off
+    /// nothing is ever checked in, so nothing is ever checked out.
+    keep_alive: bool,
+    /// The earliest SOURCE credential deadline admitting this request: the
+    /// request's own accepted-credential minimum folded with this gateway's
+    /// SVID leaf `notAfter`. A lease can never outlive it.
+    credential_deadline: Option<tokio::time::Instant>,
+}
+
+impl HboneInnerDispatchPlan<'_> {
+    /// The pool key identity for `protocol`.
+    fn key_parts(
+        &self,
+        protocol: hbone_inner_pool::HboneInnerProtocol,
+    ) -> hbone_inner_pool::HboneInnerKeyParts<'_> {
+        hbone_inner_pool::HboneInnerKeyParts {
+            protocol,
+            namespace: self.namespace,
+            proxy_id: self.proxy_id,
+            upstream_id: self.upstream_id,
+            proxy_lifecycle_generation: self.proxy_lifecycle_generation,
+            app_host: self.app_host,
+            app_port: self.app_port,
+            dial_host: self.dial_host,
+            hbone_port: self.hbone_port,
+            expected_peer: self.expected_peer,
+            expected_trust_domain: self.expected_trust_domain,
+            sni_override: self.sni_override,
+            source_principal: self
+                .asserted_source_identity
+                .unwrap_or(&self.credential.identity),
+            source_principal_asserted: self.asserted_source_identity.is_some(),
+            credential: &self.credential,
+            pool_config: &self.pool_config,
+        }
+    }
+}
+
+/// Why opening a FRESH inner HTTP/1.1 connection inside a new HBONE CONNECT
+/// failed (issue #5042 step 2).
+///
+/// Two arms because the two failures are classified differently and always
+/// have been: an outer dial failure can be a capability downgrade signal, the
+/// inner cleartext handshake never is.
+enum HboneInnerOpenError {
+    /// The outer SVID-mTLS dial or the CONNECT itself failed.
+    Pool(hbone_pool::HbonePoolError),
+    /// The outer CONNECT succeeded and the inner HTTP/1.1 handshake failed.
+    Handshake(hyper::Error),
+}
+
+/// Open ONE new HBONE CONNECT and run a fresh inner HTTP/1.1 client over it,
+/// returning it as an inner lease (issue #5042 step 2).
+///
+/// This is exactly the pre-#5042 per-request path, factored out so the cold
+/// miss and the at-most-one idle-race replay share it byte for byte. Every
+/// CONNECT-time check still runs in full: the pooled outer transport, the
+/// SVID-mTLS dial, the pinned peer identity / SNI / trust-domain scope, and —
+/// at the destination — the authenticated-peer gate, the PeerAuthentication
+/// transport mode, the relay-destination ownership guard, and the authorize
+/// chain. There is no plaintext fallback on this path.
+///
+/// `plan` decides only whether the resulting lease may EVER be pooled. `None`
+/// (this gateway has no resolvable SVID identity, so there is no key to file
+/// it under) produces an unpooled lease and the dial below reports the same
+/// refusal it always did.
+async fn open_hbone_inner_h1(
+    state: &ProxyState,
+    proxy: &Proxy,
+    plan: Option<&HboneInnerDispatchPlan<'_>>,
+    dial_host: &str,
+    app_host: &str,
+    app_port: u16,
+    app_policy_port: u16,
+    hbone_port: u16,
+    expected_peer: Option<&crate::identity::SpiffeId>,
+    expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+    sni_override: Option<&str>,
+    asserted_source_identity: Option<&crate::identity::SpiffeId>,
+) -> Result<hbone_inner_pool::HboneInnerH1Checkout, HboneInnerOpenError> {
+    // The outer dial stays boxed inside this coroutine too: without it this
+    // frame would hold the TLS + CONNECT handshake AND the inner HTTP/1.1
+    // handshake at once. See `boxed_hbone_pool_get_tunnel_via`.
+    let tunnel = boxed_hbone_pool_get_tunnel_via(
+        state,
+        proxy,
+        dial_host,
+        app_host,
+        app_port,
+        app_policy_port,
+        hbone_port,
+        expected_peer,
+        expected_trust_domain,
+        sni_override,
+        asserted_source_identity,
+    )
+    .await
+    .map_err(HboneInnerOpenError::Pool)?;
+    // Read the destination's fence advertisement BEFORE the tunnel is consumed
+    // by the handshake. It is a capability flag and nothing else: the only
+    // thing it decides is whether this connection may be held open across
+    // requests.
+    let peer_advertises_fence = tunnel.peer_advertises_inner_reuse();
+    let io = TokioIo::new(tunnel);
+    let (sender, connection) = hyper::client::conn::http1::Builder::new()
+        .handshake(io)
+        .await
+        .map_err(HboneInnerOpenError::Handshake)?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("hbone_pool: tunneled HTTP/1 connection closed: {}", e);
+        }
+    });
+    Ok(match plan {
+        Some(plan) => state.hbone_pool.inner_pool().fresh_h1(
+            &plan.key_parts(hbone_inner_pool::HboneInnerProtocol::Http1),
+            sender,
+            peer_advertises_fence,
+            plan.keep_alive,
+            plan.credential_deadline,
+        ),
+        None => hbone_inner_pool::HboneInnerConnectionPool::unpooled_h1(sender),
+    })
+}
+
+type BoxedHboneInnerH1OpenFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<hbone_inner_pool::HboneInnerH1Checkout, HboneInnerOpenError>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// [`open_hbone_inner_h1`], constructed out of line and returned boxed.
+///
+/// Same stack-budget invariant as [`boxed_hbone_pool_get_tunnel_via`], which
+/// this supersedes on the plain-HTTP path: the outer TLS + CONNECT handshake
+/// AND the inner HTTP/1.1 handshake are now one coroutine, and materializing
+/// it inline in the acquire frame is what overflows an unoptimized Tokio
+/// worker under the H3 plain Ambient HBONE bridge. The thin `async move`
+/// trampoline is what is boxed — `Box::pin(open_hbone_inner_h1(..))` would
+/// still build the concrete state machine as a stack temporary here.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_open_hbone_inner_h1<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    plan: Option<&'a HboneInnerDispatchPlan<'a>>,
+    dial_host: &'a str,
+    app_host: &'a str,
+    app_port: u16,
+    app_policy_port: u16,
+    hbone_port: u16,
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
+    expected_trust_domain: Option<&'a crate::identity::spiffe::TrustDomain>,
+    sni_override: Option<&'a str>,
+    asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+) -> BoxedHboneInnerH1OpenFuture<'a> {
+    Box::pin(async move {
+        open_hbone_inner_h1(
+            state,
+            proxy,
+            plan,
+            dial_host,
+            app_host,
+            app_port,
+            app_policy_port,
+            hbone_port,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
+            asserted_source_identity,
+        )
+        .await
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_hbone(
     state: &ProxyState,
@@ -49556,57 +49777,118 @@ async fn proxy_to_backend_hbone(
         sni_override = sni_override.unwrap_or(""),
         "Proxying request via gateway HBONE tunnel"
     );
-    // Constructed out of line — see `boxed_hbone_pool_get_tunnel_via`.
-    // A bare `.await` of `get_tunnel_via` here still materializes the TLS +
-    // CONNECT handshake in this acquire coroutine's `opt-level = 0` poll
-    // frame. Under the H3 plain bridge that stacks on `handle_h3_request` /
-    // `dispatch_plain`, that handshake is the difference between a healthy
-    // Sidecar attempt (already boxed) and a healthy Ambient HBONE attempt.
-    let tunnel = match boxed_hbone_pool_get_tunnel_via(
-        state,
-        proxy,
-        dial_host,
-        // The inner CONNECT `:authority` host = the REAL pod addr (= the
-        // synthetic-host cross-cluster target's `mesh.hbone_authority_host`,
-        // else `target.host`); the network dial uses `dial_host` (gateway).
-        app_host,
-        target.port,
-        target.dispatch_policy_port(),
-        hbone_port,
-        expected_peer.as_ref(),
-        expected_trust_domain.as_ref(),
-        sni_override,
-        source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref()),
-    )
-    .await
-    {
-        Ok(tunnel) => tunnel,
-        Err(err) => {
-            if err.is_capability_failure() {
-                debug!(
-                    proxy_id = %proxy.id,
-                    error = %err,
-                    "HBONE capability establishment failed; downgrading cached capability so subsequent requests skip the tunnel"
-                );
-                // `proxy` here is already the effective proxy resolved by
-                // `proxy_to_backend`; the helper's re-resolution is idempotent
-                // and keeps this downgrade on the same target-effective key the
-                // probes and `can_attempt_hbone_backend` use.
-                mark_hbone_unsupported_for_backend_target(
-                    state.backend_capabilities.as_ref(),
-                    proxy,
-                    Some(target),
+    // The source-side inner-lease identity for this dispatch (issue #5042 step
+    // 2). `None` means this gateway has no resolvable SVID identity — nothing
+    // to key a reusable connection under — and the dial below then reports the
+    // same refusal it always did.
+    let asserted_source_identity = source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref());
+    let inner_pool_config = state.hbone_pool.pool_config_for(proxy);
+    let inner_plan = state
+        .hbone_pool
+        .source_credential_identity()
+        .ok()
+        .map(|credential| HboneInnerDispatchPlan {
+            namespace: proxy.namespace.as_str(),
+            proxy_id: proxy.id.as_str(),
+            upstream_id: proxy.upstream_id.as_deref(),
+            proxy_lifecycle_generation: state.hbone_pool.proxy_lifecycle_generation(proxy),
+            app_host,
+            app_port: target.port,
+            app_policy_port: target.dispatch_policy_port(),
+            dial_host,
+            hbone_port,
+            expected_peer: expected_peer.as_ref(),
+            expected_trust_domain: expected_trust_domain.as_ref(),
+            sni_override,
+            asserted_source_identity,
+            // A lease is bounded by the earliest SOURCE credential that
+            // admitted it: the request's own accepted-credential minimum (SVID
+            // and JWT alike) folded with this gateway's SVID leaf `notAfter`.
+            // Reuse must never prolong a credential's lifetime.
+            credential_deadline:
+                hbone_inner_pool::HboneInnerConnectionPool::earliest_deadline(
+                    ctx.and_then(|ctx| ctx.credential_deadline_at),
+                    credential.leaf_deadline,
+                ),
+            keep_alive: inner_pool_config.enable_http_keep_alive,
+            pool_config: inner_pool_config.clone(),
+            credential,
+        });
+
+    // Reuse the inner APPLICATION connection when one is pooled for exactly
+    // this identity (issue #5042 step 2): no CONNECT, no inner handshake, and
+    // no `accept(2)` at the destination application. A miss opens exactly one
+    // fresh connection — precisely the pre-#5042 cost.
+    //
+    // Constructed out of line — see `boxed_open_hbone_inner_h1`. A bare
+    // `.await` here still materializes the TLS + CONNECT + inner HTTP/1.1
+    // handshake in this acquire coroutine's `opt-level = 0` poll frame. Under
+    // the H3 plain bridge that stacks on `handle_h3_request` / `dispatch_plain`,
+    // that handshake is the difference between a healthy Sidecar attempt
+    // (already boxed) and a healthy Ambient HBONE attempt.
+    let pooled = inner_plan.as_ref().and_then(|plan| {
+        state.hbone_pool.inner_pool().checkout_h1(
+            &plan.key_parts(hbone_inner_pool::HboneInnerProtocol::Http1),
+            plan.keep_alive,
+            plan.credential_deadline,
+        )
+    });
+    let checkout = match pooled {
+        Some(checkout) => checkout,
+        None => match boxed_open_hbone_inner_h1(
+            state,
+            proxy,
+            inner_plan.as_ref(),
+            dial_host,
+            // The inner CONNECT `:authority` host = the REAL pod addr (= the
+            // synthetic-host cross-cluster target's `mesh.hbone_authority_host`,
+            // else `target.host`); the network dial uses `dial_host` (gateway).
+            app_host,
+            target.port,
+            target.dispatch_policy_port(),
+            hbone_port,
+            expected_peer.as_ref(),
+            expected_trust_domain.as_ref(),
+            sni_override,
+            asserted_source_identity,
+        )
+        .await
+        {
+            Ok(checkout) => checkout,
+            Err(HboneInnerOpenError::Pool(err)) => {
+                if err.is_capability_failure() {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        error = %err,
+                        "HBONE capability establishment failed; downgrading cached capability so subsequent requests skip the tunnel"
+                    );
+                    // `proxy` here is already the effective proxy resolved by
+                    // `proxy_to_backend`; the helper's re-resolution is idempotent
+                    // and keeps this downgrade on the same target-effective key the
+                    // probes and `can_attempt_hbone_backend` use.
+                    mark_hbone_unsupported_for_backend_target(
+                        state.backend_capabilities.as_ref(),
+                        proxy,
+                        Some(target),
+                    );
+                }
+                return (
+                    hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                    None,
+                    None,
                 );
             }
-            return (
-                hbone_pool_error_response(state, proxy, &err, resolved_ip),
-                None,
-                None,
-            );
-        }
+            Err(HboneInnerOpenError::Handshake(err)) => {
+                return (
+                    hbone_hyper_error_response(proxy, err, resolved_ip, false),
+                    None,
+                    None,
+                );
+            }
+        },
     };
 
-    // Tunnel checkout complete. The inner HTTP/1.1 send + collect states are a
+    // Inner lease acquired. The inner HTTP/1.1 send + collect states are a
     // second large coroutine; box them out of this acquire frame so an
     // unoptimized H3 plain Ambient HBONE attempt does not hold CONNECT
     // handshake and dispatch poll slots at once. See
@@ -49631,17 +49913,19 @@ async fn proxy_to_backend_hbone(
         effective_max_response_body_size_bytes,
         app_host,
         cross_cluster,
-        tunnel,
+        checkout,
+        inner_plan.as_ref(),
     )
     .await
 }
 
-/// Post-tunnel HBONE dispatch, constructed out of line so inner HTTP/1.1
-/// handshake, send, and collect are not frame slots in [`proxy_to_backend_hbone`].
+/// Post-lease HBONE dispatch, constructed out of line so the inner HTTP/1.1
+/// send and collect are not frame slots in [`proxy_to_backend_hbone`].
 ///
-/// CONNECT checkout stays in the acquire coroutine. Buffering, forwarding
-/// headers, and the authorization-composed read window are unchanged; only
-/// the poll-frame boundary moves.
+/// Lease acquisition — a pool hit, or a CONNECT plus inner handshake on a
+/// miss — stays in the acquire coroutine. Buffering, forwarding headers, and
+/// the authorization-composed read window are unchanged; only the poll-frame
+/// boundary moves.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_proxy_to_backend_hbone_after_ready<'a>(
@@ -49664,7 +49948,8 @@ fn boxed_proxy_to_backend_hbone_after_ready<'a>(
     effective_max_response_body_size_bytes: usize,
     app_host: &'a str,
     cross_cluster: bool,
-    tunnel: hbone_pool::H2ConnectTunnel,
+    checkout: hbone_inner_pool::HboneInnerH1Checkout,
+    inner_plan: Option<&'a HboneInnerDispatchPlan<'a>>,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_hbone_after_ready(
@@ -49687,7 +49972,8 @@ fn boxed_proxy_to_backend_hbone_after_ready<'a>(
             effective_max_response_body_size_bytes,
             app_host,
             cross_cluster,
-            tunnel,
+            checkout,
+            inner_plan,
         )
         .await
     })
@@ -49714,32 +50000,13 @@ async fn proxy_to_backend_hbone_after_ready(
     effective_max_response_body_size_bytes: usize,
     app_host: &str,
     cross_cluster: bool,
-    tunnel: hbone_pool::H2ConnectTunnel,
+    mut checkout: hbone_inner_pool::HboneInnerH1Checkout,
+    inner_plan: Option<&HboneInnerDispatchPlan<'_>>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
     Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    let io = TokioIo::new(tunnel);
-    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
-        .handshake(io)
-        .await
-    {
-        Ok(parts) => parts,
-        Err(err) => {
-            return (
-                hbone_hyper_error_response(proxy, err, resolved_ip, false),
-                None,
-                None,
-            );
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            debug!("hbone_pool: tunneled HTTP/1 connection closed: {}", e);
-        }
-    });
-
     // `backend_url` was built by the caller with `target.host` as the authority.
     // For a CROSS-CLUSTER target that host is a SCOPED SYNTHETIC identity (with
     // `|` separators) that is NOT a valid URI authority, so the parse below would
@@ -49965,118 +50232,107 @@ async fn proxy_to_backend_hbone_after_ready(
         );
     }
 
-    let backend_req = Request::from_parts(parts, body);
+    // Send on the leased inner connection.
+    //
+    // `try_send_request` (not `send_request`) so a PRE-WIRE failure hands the
+    // untouched request back: when the lease came from the idle set, a closed
+    // inner connection is the ordinary reuse race — the destination reaped its
+    // side, or a fence sweep cut the tunnel and the close has not propagated
+    // yet — not an application fault. Replay it EXACTLY ONCE on a freshly
+    // opened CONNECT, which the destination admits under the CURRENT policy and
+    // credential generation, and never for a lease that was already fresh, so a
+    // genuinely failing application still surfaces its error after one dial.
+    //
+    // This does NOT change retry semantics. `take_message()` returns `Some`
+    // only when hyper never put the request on the wire, so a non-idempotent
+    // request cannot be duplicated here; every post-wire failure is classified
+    // and surfaced exactly as before, and `retry::should_retry` with its
+    // `retryable_methods` guard remains the only thing that may replay one.
+    let mut backend_req = Request::from_parts(parts, body);
+    let mut replayed_idle_race = false;
     // Authorization lifetime for the response-header wait (#3815). With
     // `backend_read_timeout_ms = 0` this wait is otherwise unbounded, and the
     // upload adapter installed above has nothing to fire on for a bodyless or
-    // already-ended request.
+    // already-ended request. Absolute, so the at-most-one idle-race replay
+    // below cannot re-arm it.
     let send_auth_deadline = request_upload_auth_deadline(
         ctx,
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    let read_deadline = if proxy.backend_read_timeout_ms > 0 {
-        tokio::time::Instant::now()
-            .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
-    } else {
-        None
-    };
-    let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
-    let send_fut = sender.send_request(backend_req);
-    let response = if let Some(send_deadline) = send_bound.at {
-        let bounded = await_upload_write_watermark_first(
-            crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
-            upload_pump.as_mut(),
-        )
-        .await;
-        match bounded {
-            Ok(Ok(Ok(response))) => Some(response),
-            Ok(Ok(Err(err))) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        hbone_request_body_too_large_response(
-                            proxy,
-                            resolved_ip,
+    let response = loop {
+        // `send_fut` borrows `checkout.sender` mutably, so it lives in an inner
+        // scope: the idle-race arm below REPLACES `checkout`, which cannot
+        // compile while that borrow is still live.
+        let send_result = {
+            let read_deadline = if proxy.backend_read_timeout_ms > 0 {
+                tokio::time::Instant::now()
+                    .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+            } else {
+                None
+            };
+            let send_bound =
+                compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
+            let send_fut = checkout.sender.try_send_request(backend_req);
+            if let Some(send_deadline) = send_bound.at {
+                let bounded = await_upload_write_watermark_first(
+                    crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
+                    upload_pump.as_mut(),
+                )
+                .await;
+                match bounded {
+                    Ok(Ok(result)) => Some(result),
+                    Ok(Err(_)) => {
+                        if body_size_exceeded.load(Ordering::Acquire) {
+                            return (
+                                hbone_request_body_too_large_response(
+                                    proxy,
+                                    resolved_ip,
+                                    None,
+                                    effective_request_body_size_limit,
+                                ),
+                                None,
+                                None,
+                            );
+                        }
+                        // The gateway's own security decision; health-neutral,
+                        // and the pre-commitment terminal owns the
+                        // client-visible shape. The lease is dropped without
+                        // check-in because the framing state is unknown.
+                        if dispatch_phase_authorization_expiry(
+                            send_bound,
+                            send_auth_deadline.as_ref(),
+                        )
+                        .is_some()
+                        {
+                            return (
+                                authorization_expired_dispatch_placeholder(resolved_ip),
+                                None,
+                                None,
+                            );
+                        }
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "HBONE tunneled HTTP read timeout ({}ms) waiting for backend response",
+                            proxy.backend_read_timeout_ms
+                        );
+                        return (
+                            http_backend_dispatch_error_response(
+                                retry::ErrorClass::ReadWriteTimeout,
+                                resolved_ip,
+                            ),
                             None,
-                            effective_request_body_size_limit,
-                        ),
-                        None,
-                        None,
-                    );
-                }
-                return (
-                    hbone_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
-                    None,
-                    None,
-                );
-            }
-            Ok(Err(_)) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        hbone_request_body_too_large_response(
-                            proxy,
-                            resolved_ip,
                             None,
-                            effective_request_body_size_limit,
-                        ),
-                        None,
-                        None,
-                    );
+                        );
+                    }
+                    Err(()) => None,
                 }
-                // The gateway's own security decision; health-neutral, and the
-                // pre-commitment terminal owns the client-visible shape.
-                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
-                    .is_some()
-                {
-                    return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
-                        None,
-                        None,
-                    );
-                }
-                warn!(
-                    proxy_id = %proxy.id,
-                    "HBONE tunneled HTTP read timeout ({}ms) waiting for backend response",
-                    proxy.backend_read_timeout_ms
-                );
-                return (
-                    http_backend_dispatch_error_response(
-                        retry::ErrorClass::ReadWriteTimeout,
-                        resolved_ip,
-                    ),
-                    None,
-                    None,
-                );
+            } else {
+                await_upload_write_watermark_first(send_fut, upload_pump.as_mut())
+                    .await
+                    .ok()
             }
-            Err(()) => None,
-        }
-    } else {
-        match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
-            Ok(Ok(response)) => Some(response),
-            Ok(Err(err)) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        hbone_request_body_too_large_response(
-                            proxy,
-                            resolved_ip,
-                            None,
-                            effective_request_body_size_limit,
-                        ),
-                        None,
-                        None,
-                    );
-                }
-                return (
-                    hbone_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
-                    None,
-                    None,
-                );
-            }
-            Err(()) => None,
-        }
-    };
-    let response = match response {
-        Some(response) => response,
-        None => {
+        };
+        let Some(send_result) = send_result else {
             if let Some(pump) = upload_pump.take() {
                 pump.cancel_and_join().await;
             }
@@ -50105,10 +50361,87 @@ async fn proxy_to_backend_hbone_after_ready(
                 None,
                 None,
             );
+        };
+        match send_result {
+            Ok(response) => break response,
+            Err(mut try_err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            effective_request_body_size_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                if checkout.reused()
+                    && !replayed_idle_race
+                    && let Some(plan) = inner_plan
+                    && let Some(unsent) = try_err.take_message()
+                {
+                    replayed_idle_race = true;
+                    backend_req = unsent;
+                    checkout = match boxed_open_hbone_inner_h1(
+                        state,
+                        proxy,
+                        Some(plan),
+                        plan.dial_host,
+                        plan.app_host,
+                        plan.app_port,
+                        plan.app_policy_port,
+                        plan.hbone_port,
+                        plan.expected_peer,
+                        plan.expected_trust_domain,
+                        plan.sni_override,
+                        plan.asserted_source_identity,
+                    )
+                    .await
+                    {
+                        Ok(checkout) => checkout,
+                        Err(HboneInnerOpenError::Pool(err)) => {
+                            if err.is_capability_failure() {
+                                mark_hbone_unsupported_for_backend_target(
+                                    state.backend_capabilities.as_ref(),
+                                    proxy,
+                                    Some(target),
+                                );
+                            }
+                            return (
+                                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                                None,
+                                None,
+                            );
+                        }
+                        Err(HboneInnerOpenError::Handshake(err)) => {
+                            return (
+                                hbone_hyper_error_response(proxy, err, resolved_ip, false),
+                                None,
+                                None,
+                            );
+                        }
+                    };
+                    continue;
+                }
+                return (
+                    hbone_hyper_error_response(
+                        proxy,
+                        try_err.into_error(),
+                        resolved_ip,
+                        request_body_replayable,
+                    ),
+                    None,
+                    None,
+                );
+            }
         }
     };
 
     let status = response.status().as_u16();
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
     if let Some(len) = declared_response_length_exceeds_limit(
@@ -50138,8 +50471,65 @@ async fn proxy_to_backend_hbone_after_ready(
         status,
         &resp_headers,
     );
+    // Mesh dispatch defaults to `ResponseBodyMode::Stream`, so a small
+    // Content-Length response would otherwise ride the EOF-anchored streaming
+    // lease — and a frontend that closes after writing the response can drop
+    // that body without the terminal poll, which retires the exclusive carrier
+    // and forces one CONNECT per request. Exactly the contract
+    // `proxy_to_backend_unix` states, applied here for the same reason
+    // (issue #5042 step 2).
+    //
+    // The gate is the SAME eager-buffer contract every other transport applies
+    // (`FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`, and never for a stream-mandated
+    // content type), not "any declared length". It is additionally gated on
+    // `poolable()`, so a destination that does NOT advertise the admission
+    // fence keeps byte-for-byte today's streaming behaviour: reuse may change
+    // how this gateway buffers only where reuse is actually in effect.
+    let stream_response = if stream_response
+        && checkout.poolable()
+        && state.response_buffer_cutoff_bytes > 0
+        && content_length.is_some_and(|len| len <= state.response_buffer_cutoff_bytes)
+        && !is_streaming_content_type(&resp_headers)
+    {
+        false
+    } else {
+        stream_response
+    };
 
     if stream_response {
+        // A streaming response hands the body out of this function, so this
+        // function cannot itself observe the last body byte — and hyper's
+        // HTTP/1.1 readiness signal is NOT that observation: `can_write_head()`
+        // is already true while a response body is still being read, so
+        // awaiting `SendRequest::ready()` here would re-pool the connection
+        // mid-body and let the next request pipeline onto it.
+        //
+        // So the lease travels WITH the body. Either hyper already knows there
+        // is no body to read (a 204/304, a `HEAD` response, `Content-Length: 0`)
+        // and the exchange is complete right here, or the lease is wrapped as a
+        // `PooledBackendLease` carried in the response extensions to the
+        // streaming-body builder, which anchors it to the `ProxyBody` that OWNS
+        // the backend `Incoming`. That body returns it only after a proven
+        // clean backend end and drops it — retiring the inner connection AND
+        // the CONNECT tunnel under it — on a body error, a truncation, a client
+        // disconnect, an early drop, a fired deadline, or shutdown. If the
+        // response never reaches the body builder, the extension drops with it
+        // and the connection is retired. Every direction is fail-closed.
+        let mut response = response;
+        if http_body::Body::is_end_stream(response.body()) {
+            hbone_inner_pool::HboneInnerConnectionPool::checkin_h1_when_idle(
+                state.hbone_pool.inner_pool(),
+                checkout,
+            );
+        } else {
+            let lease = hbone_inner_pool::HboneInnerConnectionPool::streaming_lease(
+                state.hbone_pool.inner_pool(),
+                checkout,
+            );
+            response
+                .extensions_mut()
+                .insert(body::PooledBackendLeaseSlot::new(lease));
+        }
         (
             retry::BackendResponse {
                 status_code: status,
@@ -50233,6 +50623,20 @@ async fn proxy_to_backend_hbone_after_ready(
                 );
             }
         };
+        // The ENTIRE response body has now been read, so — and only so — the
+        // inner connection is eligible for reuse. `checkin_h1_when_idle` still
+        // waits for hyper's own "dispatcher is idle" signal (the body read
+        // completing here does not synchronously re-arm it) and re-checks
+        // `is_closed()` and the credential deadline before the sender re-enters
+        // the idle set, which covers a `Connection: close` response, a peer
+        // that hung up, a fence sweep that cut the tunnel, and a credential
+        // that expired while this exchange was in flight. Every error arm above
+        // returns WITHOUT checking in, so a truncated or failed body read drops
+        // the lease and retires the tunnel.
+        hbone_inner_pool::HboneInnerConnectionPool::checkin_h1_when_idle(
+            state.hbone_pool.inner_pool(),
+            checkout,
+        );
         (
             retry::BackendResponse {
                 status_code: status,

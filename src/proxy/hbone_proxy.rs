@@ -1067,6 +1067,14 @@ pub(super) async fn handle_hbone_request(
         gateway_trust_generation: epoch.gateway_trust().generation(),
         peer_credential: HbonePeerCredential::from_admitted_connect(ctx, epoch.gateway_trust()),
     });
+    // Advertise the receiver-side admission fence on the CONNECT `200` (issue
+    // #5042 step 2), and ONLY while the fence really holds this tunnel: source
+    // -side reuse of the application connection inside it is admissible only
+    // because a later policy or credential generation can still reach the
+    // tunnel and cut it. Read BEFORE the relay task takes ownership of the
+    // handle, and never assumed from `admit()` having returned — see
+    // `AdmittedHboneTunnel::fence_in_force`.
+    let advertise_tunnel_reuse = tunnel.fence_in_force();
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
     let relay_backend_target = backend_target.clone();
@@ -1249,16 +1257,20 @@ pub(super) async fn handle_hbone_request(
 
     record_request(state, StatusCode::OK.as_u16());
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(ProxyBody::empty())
-        .unwrap_or_else(|err| {
-            error!(error = %err, "Failed to build HBONE CONNECT response");
-            build_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"Internal server error"}"#,
-            )
-        })
+    let mut response = Response::builder().status(StatusCode::OK);
+    if advertise_tunnel_reuse {
+        response = response.header(
+            crate::modes::mesh::hbone::TUNNEL_REUSE_HEADER,
+            crate::modes::mesh::hbone::TUNNEL_REUSE_FENCED,
+        );
+    }
+    response.body(ProxyBody::empty()).unwrap_or_else(|err| {
+        error!(error = %err, "Failed to build HBONE CONNECT response");
+        build_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"Internal server error"}"#,
+        )
+    })
 }
 
 /// Destination-side handler for a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4).

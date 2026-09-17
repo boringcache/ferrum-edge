@@ -276,7 +276,7 @@ impl HbonePeerCredential {
 /// against a verifier that did parse it, so a parse failure here means the
 /// fence cannot bound the credential and must fail closed rather than leave the
 /// tunnel unbounded.
-fn monotonic_leaf_expiry(leaf_der: &[u8]) -> Option<tokio::time::Instant> {
+pub(crate) fn monotonic_leaf_expiry(leaf_der: &[u8]) -> Option<tokio::time::Instant> {
     use crate::plugins::utils::auth_flow::{
         CredentialDeadline, try_credential_deadline_from_unix_seconds,
     };
@@ -413,6 +413,38 @@ impl AdmittedHboneTunnel {
     /// for a leaf whose `notAfter` is beyond the representable monotonic range.
     fn credential_deadline(&self) -> Option<tokio::time::Instant> {
         self.inner.snapshot.peer_credential.as_ref()?.leaf_not_after
+    }
+
+    /// Whether this tunnel is REGISTERED with a live fence right now: the
+    /// registry holds exactly this entry, and neither a sweep nor the relay has
+    /// claimed it (issue #5042 step 2).
+    ///
+    /// This is the predicate the CONNECT `200` advertises through
+    /// [`crate::modes::mesh::hbone::TUNNEL_REUSE_HEADER`]. Source-side reuse of
+    /// the application connection inside a tunnel is admissible ONLY because a
+    /// later policy or credential generation can still reach that tunnel and
+    /// cut it; a tunnel nothing can reach is judged by nothing, so it must not
+    /// advertise the capability and the source keeps per-request behaviour for
+    /// it.
+    ///
+    /// Deliberately an observation of the REGISTRY rather than of the fact that
+    /// [`HboneAdmissionFence::admit`] returned: the entry is a `Weak`, the
+    /// fence itself is held by `ProxyState` behind an `Arc`, and both
+    /// `retire()` and `Drop` deregister. Asking the registry is the only form of
+    /// the question that stays true to what a sweep would actually find, and it
+    /// costs one `DashMap` lookup per CONNECT — off the byte-relay path.
+    pub fn fence_in_force(&self) -> bool {
+        let Some(fence) = self.inner.fence.upgrade() else {
+            return false;
+        };
+        if self.inner.state.load(Ordering::Acquire) != TUNNEL_LIVE {
+            return false;
+        }
+        let ptr = Arc::as_ptr(&self.inner);
+        fence
+            .tunnels
+            .get(&self.inner.id)
+            .is_some_and(|entry| std::ptr::eq(entry.value().as_ptr(), ptr))
     }
 
     /// Whether a sweep revoked this tunnel, and why. `None` for a tunnel that

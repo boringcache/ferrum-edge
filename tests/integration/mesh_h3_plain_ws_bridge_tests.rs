@@ -444,9 +444,26 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
     assert!(
         src.contains("#[inline(never)]\nfn boxed_hbone_pool_get_tunnel_via<'a>(")
             && src.contains("boxed_hbone_pool_get_tunnel_via(")
+            && src.contains("#[inline(never)]\nfn boxed_open_hbone_inner_h1<'a>(")
+            && src.contains("boxed_open_hbone_inner_h1(")
             && src.contains("#[inline(never)]\nfn boxed_proxy_to_backend_hbone_after_ready<'a>(")
             && src.contains("boxed_proxy_to_backend_hbone_after_ready("),
-        "HBONE acquire must box CONNECT checkout and post-tunnel send/collect"
+        "HBONE acquire must box CONNECT checkout, inner-lease open, and post-tunnel send/collect"
+    );
+    // Issue #5042 step 2 folded the outer CONNECT dial and the inner HTTP/1.1
+    // handshake into ONE coroutine, so that coroutine must keep the dial boxed
+    // as well — otherwise its frame carries both handshakes at once.
+    let inner_open = src
+        .split("async fn open_hbone_inner_h1(")
+        .nth(1)
+        .expect("inner-lease open function")
+        .split("fn boxed_open_hbone_inner_h1<'a>(")
+        .next()
+        .expect("bounded inner-lease open body");
+    assert!(
+        inner_open.contains("boxed_hbone_pool_get_tunnel_via(")
+            && !inner_open.contains("state.hbone_pool.get_tunnel_via("),
+        "inner-lease open must not await the outer CONNECT dial inline"
     );
     let acquire = src
         .split("async fn proxy_to_backend_mesh_mtls(")
@@ -468,11 +485,12 @@ fn shared_mesh_plain_helper_never_plaintext_falls_back() {
         .next()
         .expect("bounded hbone acquire");
     assert!(
-        hbone_acquire.contains("boxed_hbone_pool_get_tunnel_via(")
+        hbone_acquire.contains("boxed_open_hbone_inner_h1(")
             && !hbone_acquire.contains("state.hbone_pool.get_tunnel_via(")
             && hbone_acquire.contains("boxed_proxy_to_backend_hbone_after_ready(")
             && !hbone_acquire.contains("TokioIo::new(tunnel)"),
-        "HBONE acquire must not await get_tunnel_via or inner HTTP/1.1 send inline"
+        "HBONE acquire must not await the CONNECT dial, the inner handshake, or the \
+         inner HTTP/1.1 send inline"
     );
     let pool = include_str!("../../src/proxy/mesh_mtls_pool.rs");
     let get_or_create = pool

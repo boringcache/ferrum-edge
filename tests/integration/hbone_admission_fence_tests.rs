@@ -1724,3 +1724,125 @@ fn the_single_gateway_trust_publisher_requests_a_sweep() {
          read the superseded trust could register between them and never be re-judged"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #5042 step 2: the fence's CAPABILITY ADVERTISEMENT.
+//
+// Source-side reuse of the application connection inside a tunnel is
+// admissible only because a later policy or credential generation can still
+// reach that tunnel and cut it. The destination therefore SAYS so, on the
+// CONNECT `200`, and only while the fence really holds the tunnel. These tests
+// pin both directions of that contract; the source-side half — what a peer
+// does with the header — lives in `hbone_inner_pool_tests.rs`.
+// ---------------------------------------------------------------------------
+
+/// The advertised value, read off the CONNECT response head.
+fn tunnel_reuse_advertisement(response: &hyper::Response<h2::RecvStream>) -> Option<String> {
+    response
+        .headers()
+        .get(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admitted_connect_advertises_the_fence_capability_on_its_200() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response).as_deref(),
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "an admitted tunnel the fence holds must advertise that the receiver \
+         re-evaluates it, so the source may reuse the application connection"
+    );
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        1,
+        "the advertisement must describe a tunnel that is actually registered"
+    );
+    // The advertisement is a capability flag, never an authorization: the
+    // admission counters are untouched by it.
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0]);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_connect_never_advertises_the_fence_capability() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    // DENY for the connecting principal: the CONNECT is refused at admission,
+    // so no tunnel is ever registered and nothing may be advertised.
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![deny_client()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "a refusal must carry no capability: there is no tunnel for a later \
+         generation to reach, so there is nothing a source may reuse"
+    );
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 0);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_capability_is_not_advertised_once_the_fence_has_revoked_the_tunnel() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (admitted, _first_body) = send_connect(&mut sender, None).await;
+    assert_eq!(admitted.status(), StatusCode::OK);
+    assert!(tunnel_reuse_advertisement(&admitted).is_some());
+
+    // Tighten: the live tunnel is revoked and the same principal's next CONNECT
+    // is refused. The refusal carries no advertisement, which is exactly what
+    // stops a source from re-establishing a reusable lease under a policy that
+    // no longer admits it.
+    let outcome = state.update_config(prepared_config(
+        Some(backend_addr.port()),
+        vec![deny_client()],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_no_live_tunnels(&state).await;
+
+    let (refused, _second_body) = send_connect(&mut sender, None).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(tunnel_reuse_advertisement(&refused), None);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}

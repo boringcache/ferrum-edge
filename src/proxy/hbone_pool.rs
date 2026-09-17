@@ -861,6 +861,28 @@ pub struct HboneConnectionPool {
     /// [`HBONE_DEFAULT_MAX_HEADER_LIST_SIZE`] — hyper's own 16 KiB — rather than
     /// `h2`'s 16 MiB default.
     max_header_list_size: OnceLock<u32>,
+    /// Source-side pool of APPLICATION connections held open inside fenced
+    /// HBONE tunnels (issue #5042 step 2).
+    ///
+    /// Owned HERE rather than beside the transport pools on `ProxyState`
+    /// because an inner connection is only ever as trustworthy as the outer
+    /// session it rides: every drain this pool already performs — the SVID
+    /// rotation drain by retired leaf fingerprint, a CRL reload, a committed
+    /// gateway trust withdrawal — must reach the inner connections too, and
+    /// ownership is what makes that structural rather than a list of call
+    /// sites somebody has to remember to extend.
+    inner_pool: Arc<crate::proxy::hbone_inner_pool::HboneInnerConnectionPool>,
+    /// The published request epoch, installed once by `ProxyState` via
+    /// [`HboneConnectionPool::attach_request_epoch`] (issue #5042 step 2).
+    ///
+    /// Read for ONE thing: the admitting proxy's lifecycle generation, which
+    /// every inner lease key carries so a proxy that was withdrawn and
+    /// recreated inherits no pooled connection. Held here rather than threaded
+    /// through the dispatch signatures so the plain-HTTP and native-gRPC paths
+    /// resolve it the SAME way and cannot drift. Unset for focused tests and
+    /// standalone callers, where it reads as `None` — a key component that is
+    /// constant, never one that is wrong.
+    request_epoch: OnceLock<Arc<crate::request_epoch::RequestEpochStore>>,
 }
 
 struct HboneSvidIdentityCache {
@@ -962,7 +984,82 @@ impl HboneConnectionPool {
             backend_conn_limit: OnceLock::new(),
             mesh_trust_registry: OnceLock::new(),
             max_header_list_size: OnceLock::new(),
+            inner_pool: Arc::new(
+                crate::proxy::hbone_inner_pool::HboneInnerConnectionPool::new(shard_amount),
+            ),
+            request_epoch: OnceLock::new(),
         }
+    }
+
+    /// Install the published request epoch so inner leases can be keyed by the
+    /// admitting proxy's lifecycle generation (issue #5042 step 2). Idempotent;
+    /// later calls are ignored.
+    pub fn attach_request_epoch(&self, epoch: Arc<crate::request_epoch::RequestEpochStore>) {
+        let _ = self.request_epoch.set(epoch);
+    }
+
+    /// The admitting proxy's lifecycle generation in the published epoch, or
+    /// `None` when no epoch is attached or the proxy is absent from the current
+    /// generation (a synthesized relay proxy is absent by design).
+    pub fn proxy_lifecycle_generation(&self, proxy: &Proxy) -> Option<u64> {
+        self.request_epoch
+            .get()?
+            .load()
+            .plugin_cache
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id)
+    }
+
+    /// The source-side inner application-connection pool (issue #5042 step 2).
+    pub fn inner_pool(&self) -> &Arc<crate::proxy::hbone_inner_pool::HboneInnerConnectionPool> {
+        &self.inner_pool
+    }
+
+    /// The gateway SVID facts every inner lease is keyed and bounded by
+    /// (issue #5042 step 2).
+    ///
+    /// Resolved from the SAME cached identity snapshot
+    /// [`Self::get_tunnel_via`] dials with, so a lease's key can never name a
+    /// credential generation different from the one its outer session actually
+    /// presented. `Err` is the ordinary "this gateway has no usable SVID"
+    /// refusal, which is already fatal for the dial itself.
+    pub fn source_credential_identity(
+        &self,
+    ) -> Result<crate::proxy::hbone_inner_pool::HboneSourceCredential, HbonePoolError> {
+        let (identity, fingerprint) = self.current_svid_identity_cached()?;
+        // The leaf's own `notAfter`, on the monotonic clock, parsed from the
+        // same bundle the dial presents, by the SAME parser the receiver-side
+        // fence bounds an inbound tunnel with — so the two halves of issue
+        // #5042 cannot disagree about when a credential ends.
+        //
+        // Its three-way result is preserved exactly: a real `notAfter` bounds
+        // the lease, an unparseable or incoherent leaf yields an ALREADY-ELAPSED
+        // deadline (a credential the gateway cannot read the expiry of must
+        // never be the basis for holding a connection open across requests),
+        // and a `notAfter` beyond the representable monotonic range yields
+        // `None` — `CredentialDeadline::Unbounded`, which is "no representable
+        // bound", NOT "expired". Collapsing that to elapsed would disable reuse
+        // outright for long-dated credentials; the idle timeout and the pool
+        // bounds still apply to it.
+        //
+        // A bundle with no leaf at all cannot dial in the first place
+        // (`current_svid_identity_cached` above already fingerprints it), so
+        // the arm exists only to fail closed rather than to be reached.
+        let leaf_deadline = match self
+            .gateway_svid
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .and_then(|bundle| bundle.cert_chain_der.first().cloned())
+        {
+            Some(leaf) => crate::proxy::hbone_admission_fence::monotonic_leaf_expiry(&leaf),
+            None => Some(tokio::time::Instant::now()),
+        };
+        Ok(crate::proxy::hbone_inner_pool::HboneSourceCredential {
+            identity,
+            fingerprint,
+            generation: self.backend_svid_generation.load(Ordering::Acquire),
+            leaf_deadline,
+        })
     }
 
     /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter so
@@ -1216,6 +1313,11 @@ impl HboneConnectionPool {
         });
         self.creation_locks
             .retain(|key, _| !fingerprint_retired(key));
+        // The inner APPLICATION connections established under those leaves
+        // stop being reachable at exactly the moment the outer sessions built
+        // from them do (issue #5042 step 2). Their keys embed the same leaf
+        // fingerprint, so the two drains resolve the same set.
+        self.inner_pool.retire_svid_fingerprints(retired);
         record_hbone_evictions(evicted);
     }
 
@@ -1276,6 +1378,11 @@ impl HboneConnectionPool {
         self.entries.clear();
         self.creation_locks.clear();
         self.retired_svid_fingerprints.clear();
+        // An inner application connection is only ever as trustworthy as the
+        // tunnel it rides, so a whole-pool retirement — a CRL reload, a
+        // committed gateway trust withdrawal, an SVID slot with nothing in it —
+        // clears them too (issue #5042 step 2).
+        self.inner_pool.drain_all();
         record_hbone_evictions(evicted);
     }
 
@@ -2371,6 +2478,29 @@ pub struct H2ConnectTunnel {
     /// Keeps this stream counted against its connection's measured load for
     /// exactly as long as the tunnel exists (issue #5465).
     _stream_lease: HboneStreamLease,
+    /// Whether the destination advertised the receiver-side admission fence on
+    /// this CONNECT's `200` (issue #5042 step 2).
+    ///
+    /// A capability advertisement, never an authorization: the ONLY thing the
+    /// source may do with it is keep the application connection it runs inside
+    /// this tunnel alive across requests. `false` — an absent header, an
+    /// unrecognized value, or a tunnel this pool opened for a transport with no
+    /// inner application connection at all — keeps today's per-request
+    /// behaviour.
+    reuse_advertised: bool,
+}
+
+impl H2ConnectTunnel {
+    /// Whether the destination advertised the receiver-side admission fence on
+    /// this CONNECT's `200` (issue #5042 step 2), which is what makes
+    /// source-side reuse of the inner application connection admissible.
+    ///
+    /// Never consult this for anything else. It grants no authorization, and a
+    /// peer that lies about it gains nothing beyond what holding one long-lived
+    /// tunnel open would already give it.
+    pub fn peer_advertises_inner_reuse(&self) -> bool {
+        self.reuse_advertised
+    }
 }
 
 impl AsyncRead for H2ConnectTunnel {
@@ -2910,6 +3040,10 @@ pub(crate) async fn open_h2_connect_stream(
             status: response.status().as_u16(),
         });
     }
+    // Read the capability BEFORE `into_body()` consumes the response (issue
+    // #5042 step 2). An absent or unrecognized value is "not advertised".
+    let reuse_advertised =
+        crate::modes::mesh::hbone::connect_response_advertises_tunnel_reuse(response.headers());
     Ok(H2ConnectTunnel {
         recv_stream: response.into_body(),
         send_stream,
@@ -2918,6 +3052,7 @@ pub(crate) async fn open_h2_connect_stream(
         write_reservation: 0,
         gate,
         _stream_lease: stream_lease,
+        reuse_advertised,
     })
 }
 
@@ -3117,6 +3252,10 @@ pub(crate) async fn open_h2_ws_connect_stream(
             write_reservation: 0,
             gate,
             _stream_lease: stream_lease,
+            // An RFC 8441 Extended CONNECT carries a WebSocket frame stream,
+            // not an inner HTTP request/response exchange, so there is nothing
+            // to reuse and the capability is deliberately not read here.
+            reuse_advertised: false,
         },
         negotiated_subprotocol,
     })

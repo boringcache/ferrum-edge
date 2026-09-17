@@ -2256,6 +2256,56 @@ Every gate above is applied when the CONNECT arrives, but an HBONE tunnel can ou
 
 Operationally: a tightened `AuthorizationPolicy`, a `PeerAuthentication` mode change, a workload leaving this terminator's inventory, the admitting proxy being withdrawn, a retired CA or federated trust domain, and an expired peer SVID all now close affected live tunnels within one sweep rather than at the tunnel's natural end, and the next CONNECT from that peer is refused by the same gate. Watch `ferrum_mesh_hbone_tunnel_revocations_total` by `reason` when rolling out changes; a burst of `authorization_denied` during a policy rollout or of `peer_trust` during a CA rotation is the fence doing its job, `peer_expired` on a steady-state mesh points at SVID rotation that is not keeping up with the issued lifetime, and `proxy_withdrawn` there indicates the admitting proxy's identity is churning across applies.
 
+### HBONE Inner Application Connection Reuse
+
+The outer HBONE HTTP/2 transport has always been pooled (see [HBONE Outbound Pool](#hbone-outbound-pool)), but until issue #5042 step 2 the connection the gateway ran *inside* it was built per request: one CONNECT stream, one inner HTTP/1.1 handshake for plain HTTP, and for native gRPC an entire nested HTTP/2 preface/SETTINGS exchange through the destination relay — every time. The destination application saw one `accept(2)` per request, and a warm intra-cluster call paid one extra round trip (HTTP: the CONNECT `200`) or two (gRPC: CONNECT plus nested SETTINGS) before its first request byte left. Ferrum now holds that inner connection open across requests.
+
+**Reuse is opt-in from the destination, and the [HBONE Admission Fence](#hbone-admission-fence) is what makes it admissible.** Pooling an application tunnel changes how often the destination authorizes: without the fence, a tunnel admitted under one policy generation kept flowing under every later one, so a reused tunnel would carry later requests under a stale decision with nothing able to notice. With the fence, a later policy, PeerAuthentication, trust, or credential generation can still reach a live tunnel and cut it.
+
+- **The capability header.** A destination stamps `x-ferrum-mesh-tunnel-reuse: fenced` on the CONNECT `200` — and only while the fence really holds that tunnel (it is registered with `ProxyState.hbone_admission_fence` and neither the relay nor a sweep has claimed it). A tunnel that for any reason is not registered advertises nothing.
+- **An absent or unrecognized header means today's behaviour, exactly.** The source then opens one CONNECT and one inner connection per request, as it always did. Interop with Istio ztunnel/waypoint, and with any Ferrum older than this change, is therefore unchanged.
+- **The header grants nothing.** It authorizes no request, names no policy, and carries no identity. The source reads it for one binary decision — may this inner connection be kept — and for nothing else. A peer that forges it gains no more than it already gets by holding one long-lived tunnel open, which the fence bounds identically.
+
+**What is pooled.** Two shapes, matching the two source-side dispatch paths:
+
+| inner protocol | shape | used by |
+|---|---|---|
+| HTTP/1.1 | an **exclusive** lease; a bounded set of idle senders per key | the plain-HTTP HBONE dispatch |
+| HTTP/2 | **one shared** multiplexed sender per key, cloned per RPC | the native-gRPC HBONE dispatch |
+
+Nothing else is pooled. Raw-TCP-over-HBONE, WebSocket-over-HBONE (RFC 8441 Extended CONNECT), and datagram-over-HBONE carry a byte or frame stream rather than an inner request/response exchange, so they have nothing to reuse and are untouched.
+
+**The key is the complete transport and admission identity.** Nothing that changes who is talking to whom, under what credential, or over what wire settings can share a pooled connection. A key carries:
+
+- the inner wire protocol (HTTP/1.1 and nested HTTP/2 never share a connection);
+- the application endpoint as dialled — the CONNECT `:authority` host and port — and the dial peer's host and HBONE listener port, which differ for NodeWaypoint secured egress and cross-cluster east-west;
+- the peer verification scope: pinned peer SPIFFE id, ClientHello SNI override, and the remote trust domain a cross-cluster session was verified against;
+- the **asserted source principal** and its scope — the identity stamped into the CONNECT baggage, plus whether it was asserted on behalf of an authenticated frontend peer or is this gateway's own SVID acting as itself. Two principals never share an inner connection, and "the gateway acting as itself" is a different key from "the gateway asserting that same identity for a peer", because they are different admission facts at the destination;
+- the route/policy generation: namespace, proxy id, effective upstream id, and the admitting proxy's lifecycle generation, so a proxy that was withdrawn and recreated inherits nothing;
+- the source credential generation: the gateway SVID leaf fingerprint and the shared backend SVID/trust generation, so a rotation partitions the pool rather than laundering a connection across it;
+- the effective connection policy that configures the constructed client — keep-alive, protocol selection, and the HTTP/2 SETTINGS.
+
+Per-request policy is deliberately excluded, exactly as the sibling pools exclude it: `backend_connect_timeout_ms`, `backend_read_timeout_ms`, `backend_write_timeout_ms`, and route-scoped body ceilings are applied per dispatch on every request, reused connection or not. They change nothing about the connection that was constructed, so keying on them would fragment the pool without bounding anything.
+
+**A lease never prolongs a credential.** Every pooled connection records the earliest monotonic deadline across the credentials that admitted it — the admitting request's own accepted-credential minimum (SVID and JWT alike) folded with the gateway SVID leaf's `notAfter` — and a checkout that finds an elapsed deadline evicts the connection instead of handing it out. A leaf the gateway cannot parse the expiry of collapses to an already-elapsed deadline and is never poolable.
+
+**What retires a lease.** Four independent paths, all fail-closed:
+
+1. **The destination revoked the tunnel.** A fence sweep resets the CONNECT stream, which the inner sender observes as a terminal transport error; the next checkout evicts it. If the close has not propagated yet, the HTTP/1.1 path's *pre-wire* send hands the untouched request back and replays it once on a fresh CONNECT that the destination judges under the **current** policy and credential generation.
+2. **Source trust changed.** The inner pool is owned by the outer `HboneConnectionPool`, so every drain that already reaches the outer transports reaches these too: the SVID rotation drain (matched on the retired leaf fingerprint every key embeds) and every whole-pool retirement, including a committed gateway trust withdrawal.
+3. **Credential expiry.** The recorded deadline above.
+4. **Ordinary pool maintenance.** An idle timeout (the effective `pool_idle_timeout_seconds`, floored at 15 s so a `0` "never expire" transport setting cannot make an inner application connection immortal) and an amortised sweep that runs on checkout, never on a timer and never on the byte path.
+
+An HTTP/1.1 sender returns to the idle set **only** after a clean, fully consumed response — headers *and* the complete body, with no truncation, no body error, no `Connection: close`, no early client cancel, no fired deadline, and no size-limit refusal. Receiving response headers is never sufficient. A streaming response carries its lease with the body, anchored to the `ProxyBody` that owns the backend stream, and that body returns it only on a proven clean end and drops it — retiring the inner connection *and* the CONNECT tunnel under it — on every other terminal. An HTTP/2 sender whose connection has ended, including after a peer GOAWAY, is evicted on the next checkout and never handed out again.
+
+**Retry semantics are unchanged.** The only replay reuse enables is the pre-wire handback above: it is taken at most once per dispatch, only for a lease that came from the idle set, and only when nothing was written to the wire — so a non-idempotent request cannot be duplicated. Every post-wire failure is classified and surfaced exactly as before, and the ordinary retry path, with its `retryable_methods` guard, remains the only thing that may replay one.
+
+**Every new CONNECT is still fully judged.** Reuse skips only the *repeated* CONNECT and the *repeated* inner handshake. A miss runs the full source-side dial — SVID-mTLS to the peer, pinned peer identity, SNI and trust-domain scope — and the destination still applies the authenticated-peer gate, the PeerAuthentication transport mode, the relay-destination ownership guard, and the authorize chain. There is no plaintext fallback anywhere on this path: a peer that does not advertise the fence gets *more* connections, never a weaker one.
+
+**Bounds.** Fixed defaults rather than new operator knobs: at most 8 idle HTTP/1.1 connections per key, at most 1024 pooled inner connections in total across every key and both protocols, and the floored idle timeout above. Over-cap is never an error — the connection simply is not pooled, which is the pre-reuse behaviour. A pooled connection holds one outer HTTP/2 stream for as long as it is pooled (the CONNECT stream *is* the inner connection), so it counts against the destination's `http2MaxRequests` exactly as an in-flight tunnel does; the per-key and global caps are what bound that.
+
+**Observability.** `ferrum_mesh_hbone_inner_pool_events_total{protocol, event, namespace}` counts `hit`, `miss`, `eviction`, and `discard` per inner wire protocol (`http1`, `h2`). A `hit` is one CONNECT and one destination `accept(2)` that were not paid for. Both labels are compiled-in, so the family is at most eight series. A steady `miss` rate on a warm mesh means the destination is not advertising the fence, keep-alive is off for that route, or the key is partitioning more finely than expected — most often because the asserted source principal varies per request.
+
 ### Trust Domain Aliasing
 
 `FERRUM_MESH_TRUST_DOMAIN_ALIASES` configures additional trust domains accepted as equivalent to the peer certificate's trust domain when validating HBONE baggage `source.principal`. By default (empty), strict same-trust-domain matching applies. This mirrors Istio's `MeshConfig.trustDomainAliases`.
@@ -4731,6 +4781,8 @@ sample value, log field, or client-visible error carries trust material.
 When an upstream target is tagged with `mesh.hbone=true` metadata, the gateway routes requests through an HBONE HTTP/2 CONNECT pool (`HboneOutboundPool`) instead of direct HTTP. The pool uses the gateway's SPIFFE identity for mTLS and keys connections by SVID fingerprint so certificate rotation triggers fresh connections. DNS resolution uses the shared `DnsCacheResolver`. A target may optionally carry `mesh.hbone_dial_host` to separate the outer TCP/TLS destination from the inner CONNECT authority host, and `mesh.hbone_peer_spiffe_id` to pin a waypoint/relay peer identity while leaving `mesh.spiffe_id` as destination workload metadata.
 
 On HBONE connect failure or malformed HBONE target metadata, tagged dispatch fails closed with an HBONE error response instead of falling back to plain HTTP.
+
+This pool is the OUTER transport only. The application connection the gateway runs *inside* a CONNECT tunnel is pooled separately and under a stricter contract — see [HBONE Inner Application Connection Reuse](#hbone-inner-application-connection-reuse).
 
 **Response header-block bound.** The outbound HBONE HTTP/2 client advertises a receive-side `SETTINGS_MAX_HEADER_LIST_SIZE` derived from `FERRUM_MAX_HEADER_SIZE_BYTES` (floored at 16 KiB), so a peer holding a valid SVID cannot answer a CONNECT with a multi-megabyte HEADERS/CONTINUATION block. A pool built without that policy still defaults to 16 KiB — parity with hyper's own default, which is what every other backend transport rides — never the raw `h2` crate's 16 MiB. Enforcement is stream-level: an oversized response block refuses that CONNECT stream and the tunnel connection stays up. The Sidecar mesh-mTLS CONNECT pool shares the same dial path and therefore the same 16 KiB bound.
 
