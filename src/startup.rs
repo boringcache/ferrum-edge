@@ -7,6 +7,19 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+/// Render only the ordered startup cause chain, then apply credential redaction.
+///
+/// Alternate `anyhow` Display includes every cause without Debug's backtrace.
+/// Redact after rendering: a safe outer context may still wrap a raw driver error.
+/// Callers supply known database URLs without reading configuration during bootstrap.
+/// TLS/provider loaders remain responsible for withholding key material and source
+/// references at their typed boundaries; arbitrary secret text cannot be inferred here.
+pub fn render_startup_error(error: anyhow::Error, database_urls: &[&str]) -> String {
+    let rendered =
+        crate::config::db_backend::redact_error_text(format!("{error:#}"), database_urls);
+    crate::secrets::redact_external_secret_values(&rendered)
+}
+
 /// Publish stream settings from the executable's accepted startup configuration.
 ///
 /// Call after `EnvConfig::from_env()` succeeds and before mode dispatch or any

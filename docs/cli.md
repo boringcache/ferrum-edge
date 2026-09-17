@@ -273,6 +273,16 @@ Spec (/etc/ferrum/resources.yaml): OK
 Error: Startup security validation failed: Invalid TLS configuration: ...
 ```
 
+Startup and validation failures include the full cause chain, from the outer
+operation to the underlying failure, with credential redaction applied before
+emission. For example, `run -m mesh` with a localized mesh file missing a workload
+selector reports the file-loading context followed by
+`invalid mesh configuration document: mesh.workloads[0]`, the missing `selector`
+field, and `at line 3 column 7`.
+`validate -m mesh` reports the same field and position under its validation
+context. The diagnostic includes neither the configuration document nor a
+backtrace; `-v` is not required to see the causes.
+
 ## reload
 
 Send SIGHUP to a running gateway instance. Only supported on Unix platforms (Linux, macOS, BSDs). SIGHUP triggers a hot config reload **in file mode**, and in mesh mode when the config source is a local file or xDS consumer. In every other mode (`database`, `cp`, `dp`, `injector`, `node_agent`, `migrate`, and mesh with native `MeshSubscribe`) the gateway logs the signal and ignores it — it is not a reload mechanism there; use database polling (`FERRUM_DB_POLL_INTERVAL`), control-plane push, or a rolling restart instead. The signal is delivered regardless of the target's mode, so `reload` exits `0` either way and prints a second line naming this scope; because every mode registers a hangup handler, a SIGHUP to a non-reloading gateway is a logged no-op rather than an undrained termination. In file mode, SIGHUP re-reads the spec under the same fail-closed stability contract as startup (byte-identical consecutive probes; rejects non-atomic/torn updates), then atomically swaps a valid candidate without dropping connections. An unstable or invalid candidate keeps the last known-good live generation and marks authenticated `/health` as `degraded` with `config_rejected: true` until a later successful (Applied or Unchanged) reload clears it.

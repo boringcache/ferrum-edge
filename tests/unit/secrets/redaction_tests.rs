@@ -301,6 +301,21 @@ fn arm_redaction() {
 }
 
 #[test]
+fn startup_cause_chain_redacts_external_values_at_every_depth() {
+    arm_redaction();
+    let error = anyhow::anyhow!("inner validation rejected {PLAIN_VALUE}")
+        .context("invalid mesh configuration document")
+        .context(format!("failed to load localized mesh config from '{PLAIN_VALUE}'"));
+
+    let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+
+    assert!(!rendered.contains(PLAIN_VALUE), "secret escaped: {rendered}");
+    assert!(rendered.starts_with("failed to load localized mesh config from '"));
+    assert!(rendered.contains(": invalid mesh configuration document: inner validation rejected "));
+    assert_eq!(rendered.matches(EXTERNAL_SECRET_PLACEHOLDER).count(), 2);
+}
+
+#[test]
 fn records_only_the_named_keys() {
     arm_redaction();
     assert!(is_external_secret_key(PLAIN_KEY));

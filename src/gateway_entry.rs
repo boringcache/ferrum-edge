@@ -1,6 +1,7 @@
 // Included at the binary root; shared gateway modules are imported from the library.
 use clap::Parser;
 use config::{AdminHttpExposure, EnvConfig, OperatingMode};
+use startup::render_startup_error;
 use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
@@ -79,7 +80,7 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
         // otherwise echo the fetched value; before it, this is a no-op.
         event.insert(
             (*key).to_string(),
-            serde_json::Value::String(secrets::redact_external_secret_values(value)),
+            serde_json::Value::String(render_startup_error(anyhow::anyhow!(value.clone()), &[])),
         );
     }
 
@@ -130,7 +131,10 @@ unsafe fn run_gateway_cli() {
                 Err(e) => {
                     emit_bootstrap_error(
                         "admin CLI reload failed",
-                        &[("command", "reload".to_string()), ("error", e.to_string())],
+                        &[
+                            ("command", "reload".to_string()),
+                            ("error", render_startup_error(anyhow::anyhow!(e), &[])),
+                        ],
                     );
                     std::process::exit(1);
                 }
@@ -143,7 +147,10 @@ unsafe fn run_gateway_cli() {
                 Err(e) => {
                     emit_bootstrap_error(
                         "admin CLI health check failed",
-                        &[("command", "health".to_string()), ("error", e.to_string())],
+                        &[
+                            ("command", "health".to_string()),
+                            ("error", render_startup_error(anyhow::anyhow!(e), &[])),
+                        ],
                     );
                     std::process::exit(1);
                 }
@@ -195,7 +202,7 @@ unsafe fn run_gateway_cli() {
         Err(e) => {
             emit_bootstrap_error(
                 "failed to initialize the cryptographic provider",
-                &[("error", e.to_string())],
+                &[("error", render_startup_error(anyhow::anyhow!(e), &[]))],
             );
             std::process::exit(1);
         }
@@ -296,10 +303,20 @@ fn init_logging() -> Result<LoggingGuards, String> {
     };
     let (stdout_writer, stdout_guard) =
         logging::NonBlockingSink::spawn(logging::SinkName::Stdout, std::io::stdout(), options)
-            .map_err(|error| format!("failed to start stdout logging worker: {error}"))?;
+            .map_err(|error| {
+                render_startup_error(
+                    anyhow::anyhow!(error).context("failed to start stdout logging worker"),
+                    &[],
+                )
+            })?;
     let (stderr_writer, stderr_guard) =
         logging::NonBlockingSink::spawn(logging::SinkName::Stderr, std::io::stderr(), options)
-            .map_err(|error| format!("failed to start stderr logging worker: {error}"))?;
+            .map_err(|error| {
+                render_startup_error(
+                    anyhow::anyhow!(error).context("failed to start stderr logging worker"),
+                    &[],
+                )
+            })?;
     stdout_writer.set_failure_fallback(stderr_writer.clone())?;
     // Hand the access-log sink (the `stdout_logging` plugin) a clone of the
     // non-blocking stdout writer so per-transaction JSON lines go through the
@@ -464,7 +481,12 @@ fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| format!("failed to create secret resolution runtime: {}", e))?;
+            .map_err(|e| {
+                render_startup_error(
+                    anyhow::anyhow!(e).context("failed to create secret resolution runtime"),
+                    &[],
+                )
+            })?;
 
         rt.block_on(secrets::resolve_all_env_secrets())?
     };
@@ -634,7 +656,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 // fetched secret material.
                 error!(
                     "Validation error: {}",
-                    secrets::redact_external_secret_values(&e)
+                    render_startup_error(anyhow::anyhow!(e), &[])
                 );
                 return 1;
             }
@@ -744,7 +766,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             // externally resolved variable names the variable, never its value.
             error!(
                 "Configuration error: {}",
-                secrets::redact_external_secret_values(&e)
+                render_startup_error(anyhow::anyhow!(e), &[])
             );
             return 1;
         }
@@ -771,7 +793,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     ) {
         error!(
             "Configuration error: {}",
-            secrets::redact_external_secret_values(&e)
+            render_startup_error(anyhow::anyhow!(e), &[])
         );
         return 1;
     }
@@ -787,7 +809,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     ) {
         error!(
             "Configuration error: {}",
-            secrets::redact_external_secret_values(&e)
+            render_startup_error(anyhow::anyhow!(e), &[])
         );
         return 1;
     }
@@ -926,7 +948,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     let rt = match rt_builder.build() {
         Ok(rt) => rt,
         Err(e) => {
-            error!("Failed to create tokio runtime: {}", e);
+            error!(
+                "Failed to create tokio runtime: {}",
+                render_startup_error(anyhow::anyhow!(e), &[])
+            );
             return 1;
         }
     };
@@ -940,7 +965,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // unwritable spool refuses to start rather than discovering the problem on
     // its first committed mutation.
     if let Err(error) = admin::audit::initialize(env_config.admin_audit_pipeline.clone()) {
-        error!("Failed to initialize the admin audit pipeline: {}", error);
+        error!(
+            "Failed to initialize the admin audit pipeline: {}",
+            render_startup_error(anyhow::anyhow!(error), &[])
+        );
         return 1;
     }
     // Process-wide retained-byte ceiling for observability sink instances.
@@ -1008,7 +1036,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 let mut sigterm = match signal(SignalKind::terminate()) {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("Failed to register SIGTERM handler: {}", e);
+                        error!(
+                            "Failed to register SIGTERM handler: {}",
+                            render_startup_error(anyhow::anyhow!(e), &[])
+                        );
                         return;
                     }
                 };
@@ -1017,7 +1048,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 let mut sigint = match signal(SignalKind::interrupt()) {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("Failed to register SIGINT handler: {}", e);
+                        error!(
+                            "Failed to register SIGINT handler: {}",
+                            render_startup_error(anyhow::anyhow!(e), &[])
+                        );
                         return;
                     }
                 };
@@ -1034,8 +1068,11 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             #[cfg(not(unix))]
             {
                 loop {
-                    if tokio::signal::ctrl_c().await.is_err() {
-                        error!("Failed to await Ctrl+C notification");
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        error!(
+                            "Failed to await Ctrl+C notification: {}",
+                            render_startup_error(anyhow::anyhow!(e), &[])
+                        );
                         return;
                     }
                     observed = observed.saturating_add(1);
@@ -1099,7 +1136,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 let mut sighup = match signal(SignalKind::hangup()) {
                     Ok(s) => s,
                     Err(e) => {
-                        error!("Failed to register SIGHUP handler: {}", e);
+                        error!(
+                            "Failed to register SIGHUP handler: {}",
+                            render_startup_error(anyhow::anyhow!(e), &[])
+                        );
                         return;
                     }
                 };
@@ -1117,6 +1157,33 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 }
             });
         }
+
+        // Retain URL redaction inputs before mode dispatch consumes the config.
+        // Some database errors retain raw causes below a redacted outer context.
+        let mut database_urls: Vec<String> = env_config
+            .db_url
+            .iter()
+            .chain(env_config.db_read_replica_url.iter())
+            .chain(env_config.db_failover_urls.iter())
+            .cloned()
+            .collect();
+        // Include canonical TLS-augmented spellings that drivers receive. This
+        // only inventories successful derivations; mode admission still returns
+        // any derivation failure through the same fatal diagnostic below.
+        if let Ok(Some(url)) = env_config.effective_db_url() {
+            database_urls.push(url);
+        }
+        if let Ok(Some(url)) = env_config.effective_db_read_replica_url() {
+            database_urls.push(url);
+        }
+        if let Ok(urls) = env_config.effective_db_failover_urls() {
+            database_urls.extend(urls);
+        }
+        database_urls.retain(|url| !url.is_empty());
+        database_urls.sort_unstable();
+        database_urls.dedup();
+        // Replace a complete augmented URL before its shorter configured prefix.
+        database_urls.sort_unstable_by_key(|url| std::cmp::Reverse(url.len()));
 
         // Run the appropriate mode
         let result = match env_config.mode {
@@ -1146,7 +1213,8 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 // The bounded worker guards are held in `run_gateway`;
                 // returning drains them before `main` may exit. Inline
                 // `std::process::exit` would bypass that accounting.
-                error!("Fatal error: {}", e);
+                let database_urls: Vec<&str> = database_urls.iter().map(String::as_str).collect();
+                error!("Fatal error: {}", render_startup_error(e, &database_urls));
                 1
             }
         }
@@ -1190,7 +1258,7 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
         Err(error) => {
             error!(
                 "FIPS verification failed: {}",
-                secrets::redact_external_secret_values(&error)
+                render_startup_error(anyhow::anyhow!(error), &[])
             );
             return 1;
         }
@@ -1201,7 +1269,7 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
         Err(error) => {
             error!(
                 "Ambient UDP node preflight failed: {}",
-                secrets::redact_external_secret_values(&error)
+                render_startup_error(anyhow::anyhow!(error), &[])
             );
             1
         }

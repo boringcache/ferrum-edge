@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Startup failures now print the full sanitized cause chain (#5589), including
+  the offending mesh field and YAML position beneath a localized-file context.
+  `run` and `validate` retain external-secret and database-URL redaction.
+
 ### Changed
 
 - **MCP trailing-slash alias withdrawn** (#5582). The single-trailing-slash

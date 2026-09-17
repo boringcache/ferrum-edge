@@ -3584,6 +3584,82 @@ fn cli_contract_diagnostic(output: &std::process::Output) -> String {
 
 #[ignore]
 #[tokio::test]
+async fn functional_cli_mesh_startup_reports_validation_cause_chain() {
+    let directory = TempDir::new().unwrap();
+    let mesh_path = directory.path().join("mesh-invalid.yaml");
+    // Exact three-line reproduction from #5589; position is part of the diagnostic.
+    let document =
+        "mesh:\n  workloads:\n    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/qa-svc\n";
+    std::fs::write(&mesh_path, document).unwrap();
+
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh", "-v"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
+        assert!(
+            stderr.contains("invalid mesh configuration document: mesh.workloads[0]: "),
+            "{subcommand}: {diagnostic}"
+        );
+        assert!(
+            stderr.contains("missing field `selector` at line 3 column 7"),
+            "{subcommand}: {diagnostic}"
+        );
+        if subcommand == "run" {
+            assert!(
+                stderr.contains("Fatal error: failed to load localized mesh config from '"),
+                "{diagnostic}"
+            );
+        }
+        assert!(!diagnostic.contains("spiffe://cluster.local/ns/ferrum/sa/qa-svc"));
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_startup_redacts_secret_in_inner_cause() {
+    let directory = TempDir::new().unwrap();
+    let mesh_path = directory.path().join("mesh-invalid-version.yaml");
+    let secret_path = directory.path().join("synthetic-secret.txt");
+    let secret = "synthetic-startup-chain-secret";
+    std::fs::write(&secret_path, secret).unwrap();
+    std::fs::write(&mesh_path, format!("version: {secret}\nmesh: {{}}\n")).unwrap();
+
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_STARTUP_DIAGNOSTIC_FIXTURE_FILE", &secret_path)
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
+        assert!(!diagnostic.contains(secret), "{subcommand}: {diagnostic}");
+        assert!(
+            diagnostic.contains("mesh configuration file declares version '"),
+            "{subcommand}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(ferrum_edge::secrets::EXTERNAL_SECRET_PLACEHOLDER),
+            "{subcommand}: {diagnostic}"
+        );
+    }
+}
+
+#[ignore]
+#[tokio::test]
 async fn functional_cli_bare_invocation_requires_subcommand() {
     let directory = TempDir::new().unwrap();
     let output = cli_contract_output(installed_cli_command(&directory, &[])).await;

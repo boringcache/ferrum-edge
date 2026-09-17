@@ -38,6 +38,46 @@ use ferrum_edge::tls::backend::SvidGenerationMatcher;
 use ferrum_edge::util::sharding::pool_shard_amount;
 use serde_json::json;
 
+#[test]
+fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
+    let entry = source("src/gateway_entry.rs");
+    let diagnostics: Vec<&str> = entry
+        .split("error!(")
+        .skip(1)
+        .map(|invocation| invocation.split(';').next().unwrap())
+        .collect();
+
+    for sibling in [
+        "Validation error:",
+        "Configuration error:",
+        "Failed to create tokio runtime:",
+        "Failed to initialize the admin audit pipeline:",
+        "Failed to register SIGTERM handler:",
+        "Failed to register SIGINT handler:",
+        "Failed to await Ctrl+C notification:",
+        "Failed to register SIGHUP handler:",
+        "Fatal error:",
+        "FIPS verification failed:",
+        "Ambient UDP node preflight failed:",
+    ] {
+        assert!(
+            diagnostics.iter().any(|site| site.contains(sibling)),
+            "startup diagnostic inventory lost {sibling}"
+        );
+    }
+    for diagnostic in diagnostics {
+        assert!(
+            diagnostic.contains("render_startup_error("),
+            "startup errors must share cause-chain rendering and redaction: {diagnostic}"
+        );
+    }
+    assert!(
+        item_body(&entry, "fn emit_bootstrap_error(", "\n}\n")
+            .contains("render_startup_error("),
+        "bootstrap failures bypass tracing and must use the same redaction boundary"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared source-inventory helpers
 // ---------------------------------------------------------------------------
