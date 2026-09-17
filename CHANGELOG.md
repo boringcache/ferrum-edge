@@ -99,13 +99,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `prometheus_metrics`, `otel_tracing`, `proxy_alerts`. Explicitly
   non-reusable: `rate_limiting` (a token per operation, in every `limit_by`
   mode), `adaptive_concurrency` (a permit), `request_mirror` (a shadow
-  dispatch). Datagram-over-HBONE tunnels never advertise at all. Three
-  *mesh-injected* plugins are unclassified and so withhold the capability
-  wherever they are injected: `jwks_auth` (a `RequestAuthentication` is in play,
-  and the fence bounds the mTLS leaf rather than a bearer token's own lifetime),
-  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`), and
-  `__mesh_bpf_metrics`. The last two have not been reviewed for reuse safety;
-  until they are, such deployments pay one CONNECT per operation.
+  dispatch). Datagram-over-HBONE tunnels never advertise at all. Of the
+  *mesh-injected* plugins: `jwks_auth` withholds the capability wherever a
+  `RequestAuthentication` is in play (correct and permanent — the fence bounds
+  the mTLS leaf, not a bearer token's own lifetime); `__mesh_bpf_metrics` is
+  classified reusable (it implements no request hook at all); and
+  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) is injected
+  only on outbound-direction listeners, which never receive an HBONE CONNECT,
+  so it cannot withhold the capability from an inbound tunnel.
 - **A live HBONE tunnel loses inner reuse when its chain stops permitting it**
   (issue #5583). The admission snapshot records whether reuse was advertised —
   the same value the header was stamped from — and every admission-fence sweep

@@ -106,6 +106,7 @@ const EXPECTED_CLASSIFICATION: &[(&str, &str)] = &[
     ("access_control.rs", "true"),
     ("adaptive_concurrency.rs", "false"),
     ("mesh/authz.rs", "self.ext_authz.is_none()"),
+    ("mesh/bpf_metrics.rs", "true"),
     ("mesh/spiffe_identity.rs", "true"),
     ("mesh/workload_metrics.rs", "true"),
     ("otel_tracing.rs", "true"),
