@@ -726,10 +726,14 @@ on a native-gRPC request.
   still holds for failed commands. Do NOT "fix" reordering by refusing every
   straddler: that throttles legitimate traffic at ordinary Redis latency. The
   late trigger is phase-dependent (one to two sub-buckets: 62.5–125ms for a
-  one-second policy, 3.75–7.5s for a one-minute one), so a store slower than one
-  sub-bucket degrades a sub-minute policy into `redis_failure_policy` territory
-  — an unavailable store, not a quota refusal. That is deliberate and
-  documented.
+  one-second policy, 3.75–7.5s for a one-minute one) and it is EXECUTION delay,
+  never response delay: a transaction applied inside its own sub-bucket settles
+  on the `TIME` it carried however late the response lands. A store whose
+  EXECUTION is slower than one sub-bucket degrades a sub-minute policy into
+  `redis_failure_policy` territory — an unavailable store, not a quota refusal.
+  A store that merely REPLIES slowly does not roll over at all; it stops
+  teaching the offset instead (see the stale-reply rule below). That is
+  deliberate and documented.
 - CLOCK CONTRACT: sub-buckets are selected on the REDIS SERVER's clock, not on
   each gateway's. Every charge transaction ends with a `TIME` inside the same
   `MULTI`/`EXEC` (no extra round trip), and `RedisServerClock` keeps a per-client
@@ -760,7 +764,14 @@ on a native-gRPC request.
   client-lifetime min/max bookkeeping, which was a lost-update hazard and is
   gone. The standalone probe's sample is the one exception (it is the seed,
   there is no previous offset, and it is bounded by the screened per-command
-  deadline).
+  deadline). Do NOT write that permanently starved learning necessarily degrades
+  through the failure policy — it does not. A connection that EXECUTES promptly
+  and ANSWERS late settles every charge correctly, forever, on a frozen offset.
+  The cost is deferred: the base stops tracking the server, so a later
+  server-side clock change or a wall-clock step is never learned, and once the
+  drift passes the settlement band every request mis-settles, rebuilds, and —
+  when the rebuilt pass mis-settles too — refuses through
+  `redis_failure_policy`.
 - `TIME` IS REQUIRED FOR REQUEST QUOTAS. THERE IS NO LOCAL-CLOCK MODE. It is
   probed ONCE per established connection with a plain standalone `TIME`
   (`probe_server_time`, called from `screen_and_arm`) — never trialled inside
@@ -779,6 +790,17 @@ on a native-gRPC request.
   is an ordinary command failure and the reconnect re-probes.
   `docs/plugins.md` and the CHANGELOG must keep listing `TIME` as
   mandatory for the quota roots.
+  THE BACKGROUND RECOVERY CHECKER PROVES THE SAME THING. It publishes this
+  client's availability, so it screens everything the connect path screens:
+  `PING`, topology, retention when required, and — for a `Required` client — a
+  bounded, well-formed `TIME` through the SAME
+  `screen_connection_server_clock` the connect-path probe uses. A `PING`-only
+  recovery republished availability (and logged "centralized Redis access
+  restored") on an endpoint that still denied the clock. None of the clock
+  refusals is terminal there (an ACL can be granted under a live gateway), and
+  the recovery sample is DISCARDED rather than seeded: it is bounded only by the
+  connect timeout, far past one sub-bucket. A `NotUsed` client still sends zero
+  clock probes, in recovery as at connect.
 - THE REQUIREMENT IS SCOPED TO THE CONSUMERS THAT READ THE CLOCK, not to the
   socket. It is a construction-time property (`ServerClockRequirement`,
   alongside `RedisClientLogPolicy` and `RedisRetentionRequirement`) chosen by

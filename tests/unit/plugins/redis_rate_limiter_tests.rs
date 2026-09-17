@@ -4540,6 +4540,283 @@ async fn a_reply_held_past_one_sub_bucket_does_not_move_the_learned_offset() {
     let _ = server.shutdown.send(());
 }
 
+/// Background recovery must re-prove the SERVER CLOCK, not just reachability.
+///
+/// Review finding (MINOR 1): the recovery checker screened `PING`, topology and
+/// retention and then republished availability, so a request-quota client whose
+/// endpoint still denied `TIME` was advertised as recovered — and logged as
+/// "centralized Redis access restored" — while every request would still fail
+/// its connection probe and fall to `redis_failure_policy`. With no traffic at
+/// all the false healthy state simply persisted.
+///
+/// Driven through the ACTUAL background checker, across denial AND restoration:
+/// the transition tests elsewhere in this file publish reachability by hand,
+/// which is exactly the step that could not have caught this.
+#[tokio::test]
+async fn background_recovery_waits_for_time_before_republishing_a_quota_client() {
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let mut config = keyspace_config(server.port);
+    // The real checker, probing once a second.
+    config.health_check_interval_seconds = 1;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    // The outage a denied `TIME` produces: the connection is never published,
+    // the store is unavailable, and recovery is armed.
+    assert!(
+        !client.connect_cached_for_test().await,
+        "a connection that cannot answer TIME must never be published"
+    );
+    assert!(!client.is_available());
+    assert!(client.health_checker_started_for_test());
+
+    // `PING` and `INFO CLUSTER` both succeed on this endpoint, so a checker
+    // that screened only reachability would republish within one interval.
+    let probes_at_outage = server.clock_probes();
+    tokio::time::sleep(Duration::from_millis(2_600)).await;
+    let probes_after_interval = server.clock_probes();
+    assert!(
+        probes_after_interval > probes_at_outage,
+        "the recovery probe must ask this endpoint for the server clock: \
+         {probes_at_outage} -> {probes_after_interval}"
+    );
+    assert!(
+        !client.is_available(),
+        "an endpoint that still denies TIME is not a recovered quota store"
+    );
+    assert!(
+        !client.observer_sees_available_for_test(),
+        "no false recovery may be advertised to a failover health observer"
+    );
+
+    // Restoration, through the same checker: a clock refusal is retryable, not
+    // terminal the way a proven Cluster topology is, so granting the ACL under
+    // the live gateway is picked up on an ordinary interval.
+    server.set_time_mode(ServerTimeMode::RealClock);
+    let mut restored = false;
+    for _ in 0..60 {
+        if client.is_available() {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        restored,
+        "granting TIME again must restore availability through the background checker"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The scope survives into recovery: a client that reads no server clock sends
+/// no `TIME` there either, and recovers on reachability alone.
+///
+/// The sibling of the finding above. Requiring the clock of every recovery
+/// probe would take a replay or cache deployment on a restrictive ACL out of
+/// service over a command it never sends — the same mistake, moved from the
+/// connect path into the background task.
+#[tokio::test]
+async fn background_recovery_never_probes_the_clock_for_a_clockless_client() {
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let mut config = keyspace_config(server.port);
+    config.health_check_interval_seconds = 1;
+    config.pool_size = 1;
+    let client = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+
+    // Enter the state an outage produces and let the real checker run.
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+
+    let mut restored = false;
+    for _ in 0..60 {
+        if client.is_available() {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        restored,
+        "a consumer that reads no clock recovers on PING and the topology screen alone"
+    );
+    assert_eq!(
+        server.clock_probes(),
+        0,
+        "a NotUsed client must spend no round trip on TIME anywhere: an ACL that \
+         withholds +time must not take a replay or cache deployment out of service"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Starved offset learning does NOT by itself degrade through the failure
+/// policy — and this is where the real boundary is.
+///
+/// Review finding (MINOR 2): the earlier wording said a store whose replies are
+/// never prompt is "already past the settlement rollover threshold", so its
+/// decisions are going through `redis_failure_policy` anyway. They are not.
+/// Response delay and execution delay are different failures, and only one of
+/// them rolls a ladder over. The whole boundary, on one fixture:
+///
+/// 1. Every transaction EXECUTES inside the sub-bucket it was keyed to and
+///    answers 200ms later — more than three sub-buckets of a one-second window.
+///    Learning stops (no reply is prompt enough to move the offset) and every
+///    charge still settles, because settlement is judged on the `TIME` that same
+///    transaction carried. No rebuild, no hand-back, no refusal, indefinitely.
+/// 2. The server's clock then steps ten minutes ahead under the live client.
+///    The frozen base cannot learn it, so every request now mis-settles on its
+///    FIRST pass, hands its charge back and rebuilds from the server instant —
+///    and is still admitted. That cost is permanent while replies stay slow.
+/// 3. A repeat mis-settlement is what reaches the failure policy. The clock
+///    steps back while pass 1's reply is still held, so the ladder rebuilt from
+///    the ten-minute-ahead instant lands in the FUTURE, the bounded rebuild is
+///    spent, and the decision refuses.
+#[tokio::test]
+async fn starved_offset_learning_settles_until_the_server_clock_drifts_under_it() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const DRIFT: Duration = Duration::from_secs(600);
+    // Held AFTER applying: the server executes promptly and only the response
+    // is late. 200ms is more than three sub-buckets of a one-second window and
+    // still inside the 500ms screened per-command response deadline.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(200),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::AfterApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+    // EVERY pooled slot is established (and screened, and probed) up front, on
+    // the undrifted clock. A slot opened after the step below would seed the
+    // new clock from its own probe and there would be no drift left to observe
+    // — including one opened by a detached hand-back racing its rebuild.
+    assert_eq!(
+        client.warm_pool_for_test().await,
+        4,
+        "every pooled slot must be screened before the clock moves"
+    );
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    // Roomy enough that nothing below is a quota refusal; the assertions are
+    // about placement, not about the budget.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 100,
+        duration: Duration::from_secs(1),
+    }]);
+
+    // 1. Learning is starved and every decision still stands.
+    for _ in 0..6 {
+        assert!(
+            algorithm
+                .check_redis(&client, "ip:127.0.0.1", &op)
+                .await
+                .expect("a late RESPONSE is not a stale ladder")
+                .allowed
+        );
+    }
+    let frozen = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the connections' own probes seeded the offset");
+    assert_eq!(
+        server.incrs(),
+        6,
+        "a transaction executed inside its own sub-bucket settles however late \
+         its response is: no pass may be abandoned"
+    );
+    assert_eq!(
+        server.decrs(),
+        0,
+        "and nothing is handed back, so nothing reaches redis_failure_policy"
+    );
+
+    // 2. The clock steps under the live client. Nothing can re-teach the offset
+    //    while replies stay slow, so the rebuild is not a one-off.
+    server.set_time_mode(ServerTimeMode::Ahead(DRIFT));
+    for round in 0..2 {
+        let charges_before = server.incrs();
+        let handbacks_before = server.decrs();
+        assert!(
+            algorithm
+                .check_redis(&client, "ip:127.0.0.1", &op)
+                .await
+                .expect("one rebuild is still a decision")
+                .allowed,
+            "round {round}: a single mis-settlement rebuilds and admits"
+        );
+        await_compensations(&client).await;
+        assert_eq!(
+            server.incrs() - charges_before,
+            2,
+            "round {round}: the drifted base mis-settles once and rebuilds once"
+        );
+        assert_eq!(
+            server.decrs() - handbacks_before,
+            1,
+            "round {round}: the abandoned pass hands its own charge back"
+        );
+    }
+    let still_frozen = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the offset is still known");
+    assert_eq!(
+        still_frozen, frozen,
+        "no reply was prompt enough to teach the ten-minute step, so the base \
+         stays exactly where the probes left it: frozen={frozen} now={still_frozen}"
+    );
+
+    // 3. A repeat mis-settlement refuses through the failure policy. The
+    //    fixture applies every queued command — the `TIME` included — in one
+    //    synchronous span before the AfterApply hold, so an observed `INCR`
+    //    means pass 1 has already read the ten-minute-ahead clock and the step
+    //    back cannot race it.
+    let charges_before = server.incrs();
+    let handbacks_before = server.decrs();
+    let charge = algorithm.check_redis(&client, "ip:127.0.0.1", &op);
+    let step_back = async {
+        loop {
+            if server.incrs() > charges_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        server.set_time_mode(ServerTimeMode::RealClock);
+    };
+    let (refused, ()) = tokio::join!(charge, step_back);
+    assert!(
+        refused.is_err(),
+        "a second mis-settlement must refuse through redis_failure_policy rather \
+         than publish a decision from a ladder it could not place: {refused:?}"
+    );
+    await_compensations(&client).await;
+    assert_eq!(
+        server.incrs() - charges_before,
+        2,
+        "the bounded rebuild still stops at two transactions"
+    );
+    assert_eq!(
+        server.decrs() - handbacks_before,
+        2,
+        "both abandoned passes hand their charges back"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
 /// The rule itself: a sample is adopted only while its own reply latency is
 /// under one sub-bucket of the narrowest window the transaction charged.
 #[test]
@@ -4643,14 +4920,38 @@ fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
     );
     let probe = method_body(redis, "async fn probe_server_time(");
     assert!(
-        probe.contains("redis::cmd(\"TIME\").query_async(conn)"),
-        "the probe must be a plain standalone TIME, never a trial run inside MULTI"
+        probe.contains("screen_connection_server_clock(conn, SCREENED_COMMAND_RESPONSE_TIMEOUT)"),
+        "the connect-path probe must go through the ONE shared screen, bounded by the \
+         per-command deadline armed on the connection it just screened: {probe}"
+    );
+
+    // The wire work itself is that one shared screen, so the connect path and
+    // the background recovery checker cannot drift apart.
+    let clock_screen = redis
+        .split("async fn screen_connection_server_clock(")
+        .nth(1)
+        .expect("the shared TIME screen must exist")
+        .split("\n/// ")
+        .next()
+        .expect("the body ends before the next item's doc comment");
+    assert!(
+        clock_screen.contains("redis::cmd(\"TIME\").query_async::<redis::Value>(conn)"),
+        "the screen must be a plain standalone TIME, never a trial run inside MULTI"
+    );
+    assert!(
+        clock_screen.contains("tokio::time::timeout(") && clock_screen.contains("probe_timeout"),
+        "an endpoint that accepts and then never answers TIME must cost one bounded \
+         probe, not a wedged caller: {clock_screen}"
+    );
+    assert!(
+        clock_screen.contains("parse_redis_server_time(value)"),
+        "one parser decides what counts as a clock"
     );
     // EVERY unsuccessful arm rejects the connection. The two recognised
     // refusals pick the diagnostic, never the outcome.
     assert!(
-        probe.contains("is_permission_denied_error(&e)")
-            && probe.contains("is_unknown_command_error(&e)"),
+        clock_screen.contains("is_permission_denied_error(&error)")
+            && clock_screen.contains("is_unknown_command_error(&error)"),
         "a NOPERM and an unknown command still name themselves in the diagnostic"
     );
     assert_eq!(
@@ -4674,6 +4975,27 @@ fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
         1,
         "only a well-formed clock may publish the connection: {probe}"
     );
+    // Recovery publishes THIS client's availability, so it must screen what the
+    // client's own connections screen. A PING/topology-only recovery advertised
+    // a restored quota store — and logged one — on an endpoint that still
+    // denied the clock (review finding MINOR 1).
+    let recovery = method_body(redis, "pub(crate) fn start_health_checker_if_needed(");
+    assert!(
+        recovery.contains("let requires_server_clock = self.requires_server_clock();"),
+        "the recovery task must carry the client's clock requirement: {recovery}"
+    );
+    assert!(
+        recovery.contains("if requires_server_clock {")
+            && recovery.contains("screen_connection_server_clock(&mut conn, connect_timeout)"),
+        "a Required client's recovery must obtain a bounded, well-formed TIME before \
+         availability may be republished, through the same screen the probe uses"
+    );
+    assert!(
+        !recovery.contains("record_reply"),
+        "a recovery sample is bounded only by the connect timeout, far past one \
+         sub-bucket: it must never move the learned offset"
+    );
+
     assert!(
         !redis.contains("fn degrade_to_local_clock")
             && !redis.contains("fn begin_clock_quarantine")

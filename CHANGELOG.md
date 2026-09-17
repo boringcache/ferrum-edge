@@ -131,11 +131,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-bucket of the tightest window it charged, and otherwise the previous
   offset stands while settlement still judges the charge against the server
   instant the reply carried.
+  A connection whose replies are never prompt therefore stops learning and keeps
+  the offset its own `TIME` probe seeded; that is not by itself a degradation,
+  because settlement still judges every charge on the server instant its
+  transaction carried. The cost is deferred: the frozen base no longer tracks
+  the server, so a later server-side clock change or a wall-clock step on the
+  gateway is never learned, and once that drift passes the settlement band every
+  request mis-settles, rebuilds, and — when its rebuilt pass mis-settles too —
+  refuses through `redis_failure_policy`.
   **Operational note:** the late rebuild triggers when the server applies a
   transaction a whole sub-bucket after its bucket was selected — phase-dependent,
   so one to two sub-buckets (roughly 62.5–125ms for a one-second window, half
-  what the earlier eight-sub-bucket layout allowed) — so a
-  badly overloaded Redis will rebuild on most sub-minute-window requests and
+  what the earlier eight-sub-bucket layout allowed). The stall that matters is
+  EXECUTION delay, not response delay: a transaction the server applies inside
+  its own sub-bucket settles correctly however late its response arrives, so a
+  Redis that merely answers slowly does not rebuild. A Redis whose execution
+  regularly stalls that long will rebuild on most sub-minute-window requests and
   eventually refuse; those refusals are routed as an unavailable centralized
   store through `redis_failure_policy`, not as quota refusals.
 - **Redis request quotas: `TIME` is REQUIRED, and there is no local-clock
@@ -159,7 +170,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   revoked mid-flight needs no special case, because the aborted `EXEC` is an
   ordinary command failure whose reconnect re-probes and refuses to publish the
   socket. Grant `+time` (or the `@slow`/`@fast` category that already contains
-  it) on the Redis these three plugins use before upgrading.
+  it) on the Redis these three plugins use before upgrading. The background
+  recovery checker proves the clock too: for a request-quota client a successful
+  `PING` and topology screen are not a recovery until a bounded, well-formed
+  `TIME` also answers, so an endpoint that is reachable but still withholds the
+  clock is never republished as available and never logs a restored-access
+  message. Those clock refusals stay retryable — an ACL granted under a live
+  gateway is picked up on the next interval — and the recovery probe's sample is
+  discarded rather than adopted as an offset, because it is bounded only by
+  `redis_connect_timeout_seconds`.
   **The requirement stops at request quotas.** It follows what a consumer
   computes, not what a connection is, so it is declared at construction and
   enforced at both ends: only a request-quota client probes, and the ladder

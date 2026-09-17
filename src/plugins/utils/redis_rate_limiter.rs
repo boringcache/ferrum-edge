@@ -733,10 +733,24 @@ impl RedisServerClock {
 /// settlement against the server instant itself, not against the offset.
 ///
 /// A store whose replies are NEVER prompt therefore keeps the offset its
-/// connection's probe seeded until a reconnect re-probes. That is the right
-/// trade: a store slower than one sub-bucket is already past the settlement
-/// rollover threshold, so its decisions are going through
-/// `redis_failure_policy` rather than resting on the offset at all.
+/// connection's probe seeded until a reconnect re-probes. Learning stops;
+/// SETTLEMENT does not, and the two failures are not the same failure.
+/// EXECUTION delay is what rolls a ladder over: a transaction the server
+/// applied inside its own sub-bucket settles correctly however late its
+/// RESPONSE arrives, because settlement is judged on the `TIME` that same
+/// transaction carried. A connection that executes promptly and answers late
+/// therefore keeps admitting indefinitely on a frozen offset, correctly, and
+/// does NOT necessarily degrade through `redis_failure_policy`. Do not write
+/// that it does.
+///
+/// What a frozen offset costs is real but deferred: the base stops tracking the
+/// server, so a later server-side clock change — or a wall-clock step on this
+/// host — is never learned. Once that drift passes the settlement band every
+/// request mis-settles on its first pass, hands its charge back and rebuilds
+/// from the server instant, permanently, because nothing can re-teach the
+/// offset while replies stay slow; and a request whose REBUILT pass also
+/// mis-settles refuses through `redis_failure_policy`. A store slow enough to
+/// stall execution past one sub-bucket reaches that second pass on its own.
 pub fn clock_sample_is_prompt(reply_latency: Duration, narrowest_window_seconds: u64) -> bool {
     reply_latency.as_nanos() < redis_sub_bucket_nanos(narrowest_window_seconds)
 }
@@ -1782,6 +1796,102 @@ async fn screen_connection_topology(
         // Accepted and authenticated but never answered INFO.
         Err(_elapsed) => TopologyScreen::ProbeFailed,
     }
+}
+
+/// Verdict of one standalone `TIME` screen on an established connection.
+///
+/// Shared by the connect-path probe
+/// ([`RedisRateLimitClient::probe_server_time`]) and by the background recovery
+/// checker, so the two cannot drift apart: a client whose admission selects
+/// sub-buckets on the Redis server's clock must never be republished as
+/// recovered on a weaker screen than the one its own connections have to pass.
+enum ServerClockScreen {
+    /// A well-formed clock. `server_time` is the instant the server reported;
+    /// `sampled_at` is this process's clock when the reply landed, which is the
+    /// other half of the offset the connect path learns.
+    Clock {
+        server_time: Duration,
+        sampled_at: Duration,
+    },
+    /// The command was ALLOWED and answered something that is not a clock — a
+    /// server replying `+OK` to `TIME`. An endpoint this code cannot pair with
+    /// a clock cannot order one budget across gateways.
+    Unreadable,
+    /// `NOPERM`: the ACL withholds `+time`.
+    Denied,
+    /// `ERR unknown command`: this RESP server has no `TIME` at all.
+    Unimplemented,
+    /// A timeout, a transport failure, or any other server error.
+    Failed(redis::RedisError),
+}
+
+/// Ask a connection for the Redis server's clock under a hard `probe_timeout`.
+///
+/// Deliberately a STANDALONE command rather than a trial `TIME` inside a real
+/// transaction: a denied command queued in `MULTI` aborts the whole `EXEC`, so
+/// a probe that guessed wrong would fail an admission instead of rejecting a
+/// socket. The reply goes through [`parse_redis_server_time`] — the one parser
+/// — and the local sample is taken immediately after it lands, because the
+/// offset a caller may learn from it is `server_time − local_time_at_reply`.
+///
+/// The two recognised refusals are separated here only so a caller can pick the
+/// DIAGNOSTIC an operator can act on; neither changes an outcome.
+async fn screen_connection_server_clock(
+    conn: &mut impl redis::aio::ConnectionLike,
+    probe_timeout: Duration,
+) -> ServerClockScreen {
+    let probed = tokio::time::timeout(
+        probe_timeout,
+        redis::cmd("TIME").query_async::<redis::Value>(conn),
+    )
+    .await;
+    let sampled_at = redis_epoch_now();
+    match probed {
+        Ok(Ok(value)) => match parse_redis_server_time(value) {
+            Some(server_time) => ServerClockScreen::Clock {
+                server_time,
+                sampled_at,
+            },
+            None => ServerClockScreen::Unreadable,
+        },
+        Ok(Err(error)) if is_permission_denied_error(&error) => ServerClockScreen::Denied,
+        Ok(Err(error)) if is_unknown_command_error(&error) => ServerClockScreen::Unimplemented,
+        Ok(Err(error)) => ServerClockScreen::Failed(error),
+        // Accepted, authenticated, and silent past the admitted bound.
+        Err(_elapsed) => ServerClockScreen::Failed(incomplete_clock_probe_error()),
+    }
+}
+
+const CLOCK_PROBE_UNPROVEN_DETAIL: &str = "Redis TIME probe did not complete";
+
+fn incomplete_clock_probe_error() -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Io, CLOCK_PROBE_UNPROVEN_DETAIL))
+}
+
+fn is_incomplete_clock_probe_error(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::Io && error.to_string().contains(CLOCK_PROBE_UNPROVEN_DETAIL)
+}
+
+/// Recovery-probe failure for an endpoint that answered `TIME` with something
+/// this code cannot read as a clock.
+fn unreadable_clock_probe_error() -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::Io,
+        "Redis endpoint answered TIME with something that is not a clock",
+    ))
+}
+
+/// Recovery-probe failure for an endpoint that refuses or does not implement
+/// `TIME`.
+///
+/// Classified as I/O, not as a client-config fault: an ACL can be granted under
+/// a live gateway, so this must stay retryable rather than terminal the way a
+/// proven Cluster topology is.
+fn denied_clock_probe_error() -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::Io,
+        "Redis endpoint does not permit or implement TIME",
+    ))
 }
 
 /// Recovery-probe failure for an endpoint proven to be an unsupported topology.
@@ -4273,39 +4383,39 @@ impl RedisRateLimitClient {
     /// `TIME` at all and cannot back a request quota. Neither changes the
     /// outcome.
     ///
-    /// The reply is bounded by the per-command deadline armed just above, so a
-    /// silent server costs one screened timeout at connect rather than hanging
-    /// the slot.
+    /// The reply is bounded twice over: by the per-command deadline armed just
+    /// above, and by the same value passed explicitly to the shared screen, so
+    /// a silent server costs one screened timeout at connect rather than
+    /// hanging the slot.
+    ///
+    /// The wire work itself — the standalone command, the one parser, and the
+    /// classification of each refusal — lives in
+    /// [`screen_connection_server_clock`], which the background recovery
+    /// checker calls with the same discipline. This method is only what a
+    /// verdict means for THIS client: its offset, its diagnostics, and its
+    /// availability.
     async fn probe_server_time(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
-        let probed: Result<redis::Value, redis::RedisError> =
-            redis::cmd("TIME").query_async(conn).await;
-        let sampled_at = redis_epoch_now();
-        match probed {
-            Ok(value) => match parse_redis_server_time(value) {
-                Some(server_time) => {
-                    // Seeded before the connection is published, so the first
-                    // selection that follows already has a server offset. This
-                    // is the only sample not bounded by
-                    // [`clock_sample_is_prompt`]: it is the seed, there is no
-                    // previous offset to preserve, and the standalone command
-                    // is bounded by the screened per-command deadline.
-                    self.server_clock.record_reply(server_time, sampled_at);
-                    true
-                }
-                None => {
-                    // The command was ALLOWED and answered a non-clock. An
-                    // endpoint this code cannot pair with a clock cannot order
-                    // one budget across gateways.
-                    self.reject_unclocked_connection(
-                        "server_clock_unreadable",
-                        "Redis endpoint answered TIME with something that is not a clock; \
-                         the connection cannot be screened, so redis_failure_policy governs",
-                    );
-                    self.mark_unavailable();
-                    false
-                }
-            },
-            Err(e) if is_permission_denied_error(&e) => {
+        match screen_connection_server_clock(conn, SCREENED_COMMAND_RESPONSE_TIMEOUT).await {
+            ServerClockScreen::Clock { server_time, sampled_at } => {
+                // Seeded before the connection is published, so the first
+                // selection that follows already has a server offset. This
+                // is the only sample not bounded by
+                // [`clock_sample_is_prompt`]: it is the seed, there is no
+                // previous offset to preserve, and the standalone command
+                // is bounded by the screened per-command deadline.
+                self.server_clock.record_reply(server_time, sampled_at);
+                true
+            }
+            ServerClockScreen::Unreadable => {
+                self.reject_unclocked_connection(
+                    "server_clock_unreadable",
+                    "Redis endpoint answered TIME with something that is not a clock; \
+                     the connection cannot be screened, so redis_failure_policy governs",
+                );
+                self.mark_unavailable();
+                false
+            }
+            ServerClockScreen::Denied => {
                 self.reject_unclocked_connection(
                     "server_clock_denied",
                     "Redis endpoint does not permit TIME; centralized request quotas need the \
@@ -4315,7 +4425,7 @@ impl RedisRateLimitClient {
                 self.mark_unavailable();
                 false
             }
-            Err(e) if is_unknown_command_error(&e) => {
+            ServerClockScreen::Unimplemented => {
                 self.reject_unclocked_connection(
                     "server_clock_denied",
                     "Redis endpoint does not implement TIME; centralized request quotas need \
@@ -4325,7 +4435,7 @@ impl RedisRateLimitClient {
                 self.mark_unavailable();
                 false
             }
-            Err(e) => {
+            ServerClockScreen::Failed(e) => {
                 // Timeout, transport failure, or any other server error: the
                 // connection is not screened successfully, so it must not be
                 // published. `note_command_failure` also keeps the Cluster
@@ -4434,6 +4544,14 @@ impl RedisRateLimitClient {
     /// transitions keep the same diagnostic; retries while already
     /// unavailable stay silent. Operational clients keep the historical
     /// sleep-then-probe cadence and warn only on an availability drop.
+    ///
+    /// A probe proves everything the client's own connect path proves, because
+    /// what it publishes is that client's availability: `PING`, the topology
+    /// screen, the retention screen when the consumer requires one, and — for a
+    /// [`ServerClockRequirement::Required`] client — a bounded, well-formed
+    /// `TIME`. A recovery that skipped the last one would advertise a restored
+    /// quota store on an endpoint that still cannot answer the clock its
+    /// admission selects on.
     pub(crate) fn start_health_checker_if_needed(&self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -4462,6 +4580,17 @@ impl RedisRateLimitClient {
         // cached-socket generation would otherwise never re-screen.
         let key_prefix = self.config.key_prefix.clone();
         let requires_no_eviction = self.requires_no_eviction();
+        // And recovery must re-prove the SERVER CLOCK for the clients whose
+        // admission selects on it. `PING` and the topology screen say nothing
+        // about `TIME`, so a checker that stopped there would republish
+        // availability — and log a recovery an observer relays — while the ACL
+        // still withholds `+time`, the server still has no `TIME`, or the
+        // command still does not answer; every request until the next interval
+        // would then pay another failed connect-and-probe before reaching its
+        // failure policy, and with no traffic at all the false healthy state
+        // would simply persist. A `ServerClockRequirement::NotUsed` client
+        // sends no clock probe here either, exactly as its connections do not.
+        let requires_server_clock = self.requires_server_clock();
 
         let handle = runtime.spawn(async move {
             let mut delay_before_probe = !probe_immediately;
@@ -4594,6 +4723,32 @@ impl RedisRateLimitClient {
                             }
                         }
                     }
+                    if requires_server_clock {
+                        // Bounded by the same configured connect timeout as the
+                        // screens above, because this connection is dialled
+                        // with redis-rs' inner response cap disabled. The
+                        // sample it returns is deliberately DISCARDED rather
+                        // than seeded: a recovery reply is bounded only by that
+                        // connect timeout, which is far past one sub-bucket, so
+                        // adopting it would walk the base backwards exactly as
+                        // `clock_sample_is_prompt` refuses to let a late
+                        // transaction reply do. The next request establishes
+                        // its own connection, and that probe seeds.
+                        //
+                        // None of these refusals is terminal: an ACL can be
+                        // granted under a live gateway, so the endpoint is
+                        // re-screened on the next interval.
+                        match screen_connection_server_clock(&mut conn, connect_timeout).await {
+                            ServerClockScreen::Clock { .. } => {}
+                            ServerClockScreen::Unreadable => {
+                                return Err(unreadable_clock_probe_error());
+                            }
+                            ServerClockScreen::Denied | ServerClockScreen::Unimplemented => {
+                                return Err(denied_clock_probe_error());
+                            }
+                            ServerClockScreen::Failed(error) => return Err(error),
+                        }
+                    }
                     Ok::<(), redis::RedisError>(())
                 }
                 .await;
@@ -4640,6 +4795,7 @@ impl RedisRateLimitClient {
                                 "memory_policy_unproven"
                             } else if is_incomplete_topology_probe_error(&error)
                                 || is_incomplete_ping_probe_error(&error)
+                                || is_incomplete_clock_probe_error(&error)
                             {
                                 "connection_timeout"
                             } else {
