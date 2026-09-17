@@ -1978,7 +1978,10 @@ fn a_straddling_reader_counts_a_peer_older_than_the_retired_history_claim() {
         Some(2),
         "B must count A's still-live charge plus its own"
     );
-    assert!(!decision.admitted, "a 1/s quota already spent must refuse B");
+    assert!(
+        !decision.admitted,
+        "a 1/s quota already spent must refuse B"
+    );
 
     // And the age that makes this the correction rather than a restatement.
     let age = b_executes.saturating_sub(a_executes);
@@ -4424,7 +4427,10 @@ fn a_clock_sample_is_prompt_only_inside_one_sub_bucket_of_the_tightest_window() 
     // exactly the production sub-bucket width.
     let minute = Duration::from_nanos(redis_sub_bucket_nanos(60) as u64);
     assert_eq!(minute, Duration::from_millis(3_750));
-    assert!(clock_sample_is_prompt(minute.saturating_sub(Duration::from_nanos(1)), 60));
+    assert!(clock_sample_is_prompt(
+        minute.saturating_sub(Duration::from_nanos(1)),
+        60
+    ));
     assert!(!clock_sample_is_prompt(minute, 60));
 
     // A zero window clamps to one second rather than dividing by zero.
