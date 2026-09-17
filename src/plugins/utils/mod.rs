@@ -20,7 +20,6 @@ pub mod claim_header_fanout;
 pub mod claim_resolver;
 pub mod content_encoding;
 pub mod dpop;
-pub mod endpoint_path;
 pub mod fault_delay;
 pub mod fault_roll;
 pub mod header_extract;

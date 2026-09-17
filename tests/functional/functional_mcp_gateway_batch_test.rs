@@ -193,7 +193,7 @@ plugin_configs:
 
 #[tokio::test]
 #[ignore]
-async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation() {
+async fn functional_mcp_gateway_batch_rejects_trailing_slash_alias() {
     let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
@@ -209,7 +209,8 @@ async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation
             "clientInfo": {"name": "slash-test", "version": "1"}
         }
     });
-    for path in ["/mcp", "/mcp/"] {
+    {
+        let path = "/mcp";
         let response = client
             .post(gateway.proxy_url(path))
             .json(&initialize)
@@ -224,8 +225,7 @@ async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation
         assert_eq!(headers.lines().next(), Some("POST /mcp HTTP/1.1"));
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), initialize);
 
-        // A request rejected by exact-path mediation must also be rejected at
-        // the alias, rather than being forwarded to the echo server raw.
+        // Exact-path admission still validates JSON-RPC before forwarding.
         let response = client
             .post(gateway.proxy_url(path))
             .header("content-type", "application/json")
@@ -237,7 +237,14 @@ async fn functional_mcp_gateway_batch_endpoint_alias_keeps_transparent_mediation
         assert_eq!(body["error"]["code"], -32600);
         assert!(requests.try_recv().is_err());
     }
-    for path in ["/mcp//", "/mcp/tools", "/mcp/tools/", "/MCP", "/mCp/"] {
+    for path in [
+        "/mcp/",
+        "/mcp//",
+        "/mcp/tools",
+        "/mcp/tools/",
+        "/MCP",
+        "/mCp/",
+    ] {
         let response = client
             .post(gateway.proxy_url(path))
             .json(&initialize)
