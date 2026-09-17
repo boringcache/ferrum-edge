@@ -1,6 +1,6 @@
 //! Tests for rate_limiting plugin
 
-use ferrum_edge::config::BackendScheme;
+use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, StreamConnectionContext,
