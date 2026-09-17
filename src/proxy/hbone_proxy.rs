@@ -665,41 +665,44 @@ pub(super) async fn handle_hbone_request(
         return build_response_from_normalized_reject(reject);
     }
 
-    // Credential admission (issue #5568). The peer's retained chain is
-    // re-verified HERE, against the anchors the inbound admission trust has in
-    // force right now — not against the verdict this connection's mTLS
-    // handshake reached, which may predate any number of trust changes: an
-    // established inbound HBONE session is never re-handshaked and many
-    // CONNECTs multiplex over it. Without this, the replacement CONNECT a peer
-    // opens immediately after a `peer_trust` revocation would be admitted and
-    // then recorded as verified against the very revision that had just refused
-    // it. The anchors were compiled once when that revision was published, so
-    // the cost is one certificate path validation, and it runs before any
-    // upstream is selected, dialled, or circuit-breaker-charged — the same
-    // terminal and accounting the peer-identity gate above uses.
+    // Credential admission (issues #5568 and #5574). The peer's retained chain
+    // is re-verified HERE, against the anchors the inbound admission trust has
+    // in force right now — not against the verdict this connection's mTLS
+    // handshake reached, which may predate any number of trust or revocation
+    // changes: an established inbound HBONE session is never re-handshaked and
+    // many CONNECTs multiplex over it. Without this, the replacement CONNECT a
+    // peer opens immediately after a `peer_trust` or `peer_revoked` revocation
+    // would be admitted and then recorded as verified against the very revision
+    // that had just refused it. Those anchors carry the enforced CRL records
+    // (issue #5574), so one certificate path validation answers both halves;
+    // they were compiled once when that revision was published, and this runs
+    // before any upstream is selected, dialled, or circuit-breaker-charged —
+    // the same terminal and accounting the peer-identity gate above uses.
     // Bound before the match so the immutable borrow of `ctx` is finished
     // before the refusal arm stamps its deny reason on it.
     let credential_admission =
         HbonePeerCredential::from_admitted_connect(ctx, &state.hbone_admission_fence);
     let peer_credential = match credential_admission {
         HboneConnectCredential::Admit(credential) => credential,
-        HboneConnectCredential::Refuse => {
+        HboneConnectCredential::Refuse(refusal) => {
+            let deny_reason = refusal.connect_reason();
+            let deny_policy = deny_reason.to_string();
             warn!(
                 proxy_id = %proxy.id,
-                "Rejected HBONE CONNECT whose peer chain no longer anchors in the inbound \
-                 admission trust"
+                reason = deny_reason,
+                "Rejected HBONE CONNECT whose peer chain no longer survives the inbound \
+                 admission trust in force"
             );
-            ctx.metadata.insert(
-                "mesh_authz.deny_policy".to_string(),
-                "hbone_peer_trust_withdrawn".to_string(),
-            );
+            ctx.metadata
+                .insert("mesh_authz.deny_policy".to_string(), deny_policy);
             crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
                 crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
                 false,
             );
             // Byte-identical to the unauthenticated-peer body: the refusal must
-            // not tell a peer whether its identity or its trust anchor was the
-            // problem.
+            // not tell a peer whether its identity, its trust anchor, or its
+            // revocation status was the problem. The distinction is an OPERATOR
+            // fact and stays on the gateway's own log and reason surfaces.
             let reject = finalize_reject_response_with_after_proxy_hooks(
                 plugins,
                 ctx,
@@ -716,7 +719,7 @@ pub(super) async fn handle_hbone_request(
                 ctx,
                 reject.http_status.as_u16(),
                 start_time,
-                "hbone_peer_trust_withdrawn",
+                deny_reason,
                 plugin_execution_ns,
             )
             .await;
@@ -1413,26 +1416,28 @@ pub(super) async fn handle_hbone_udp_request(
         return build_response_from_normalized_reject(reject);
     }
 
-    // Same credential admission as the byte-stream relay (issue #5568): a
-    // datagram tunnel rides the same pooled, never-re-handshaked inbound mTLS
-    // session, so its CONNECT is re-verified against the inbound admission
-    // trust in force rather than trusting the handshake's own verdict.
+    // Same credential admission as the byte-stream relay (issues #5568 and
+    // #5574): a datagram tunnel rides the same pooled, never-re-handshaked
+    // inbound mTLS session, so its CONNECT is re-verified against the inbound
+    // admission trust in force — anchors plus enforced revocation records —
+    // rather than trusting the handshake's own verdict.
     // Bound before the match so the immutable borrow of `ctx` is finished
     // before the refusal arm stamps its deny reason on it.
     let credential_admission =
         HbonePeerCredential::from_admitted_connect(ctx, &state.hbone_admission_fence);
     let peer_credential = match credential_admission {
         HboneConnectCredential::Admit(credential) => credential,
-        HboneConnectCredential::Refuse => {
+        HboneConnectCredential::Refuse(refusal) => {
+            let deny_reason = refusal.udp_connect_reason();
+            let deny_policy = deny_reason.to_string();
             warn!(
                 proxy_id = %proxy.id,
-                "Rejected datagram-over-HBONE CONNECT whose peer chain no longer anchors in the \
-                 inbound admission trust"
+                reason = deny_reason,
+                "Rejected datagram-over-HBONE CONNECT whose peer chain no longer survives the \
+                 inbound admission trust in force"
             );
-            ctx.metadata.insert(
-                "mesh_authz.deny_policy".to_string(),
-                "hbone_udp_peer_trust_withdrawn".to_string(),
-            );
+            ctx.metadata
+                .insert("mesh_authz.deny_policy".to_string(), deny_policy);
             // Byte-identical to the unauthenticated-peer body; the refusal
             // discloses nothing about which half of admission refused it.
             let reject = finalize_reject_response_with_after_proxy_hooks(
@@ -1451,7 +1456,7 @@ pub(super) async fn handle_hbone_udp_request(
                 ctx,
                 reject.http_status.as_u16(),
                 start_time,
-                "hbone_udp_peer_trust_withdrawn",
+                deny_reason,
                 plugin_execution_ns,
             )
             .await;

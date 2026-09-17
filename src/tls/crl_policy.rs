@@ -30,13 +30,125 @@
 //! create/update — using exactly the boundary semantics rustls applies at
 //! handshake time, so a candidate that admission accepts is one the handshake
 //! path can also use.
+//!
+//! [`EnforcedCrlSet`] carries an admitted list plus the generation it was
+//! published under (issue #5574). The mesh inbound SPIFFE peer verifier reads
+//! that shared slot on every handshake rather than a snapshot captured when its
+//! `ServerConfig` was built, so an operator's rotation reaches the next peer
+//! without rebinding the listener, and the generation is the other half of that
+//! verifier's own cache identity beside the SVID source.
+//!
+//! For the mesh inbound surface the slot does not stand alone: it lives inside
+//! [`crate::tls::InboundAdmissionArtifact`], beside the compiled peer anchors
+//! the HBONE admission fence has put IN FORCE — the same records, compiled into
+//! the same verifiers. That is what lets the handshake, the CONNECT credential
+//! gate, and the fence's sweep answer one question from one artifact instead of
+//! from three independently retained histories; the verifier's own compile
+//! above is its startup fallback, for a listener whose fence has not published
+//! yet. Publication for every one of those surfaces goes through
+//! `ProxyState::publish_mesh_inbound_crls`.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use rustls::client::ServerCertVerifierBuilder;
 use rustls::pki_types::CertificateRevocationListDer;
 use rustls::server::ClientCertVerifierBuilder;
 use x509_parser::prelude::FromDer;
 use x509_parser::revocation_list::CertificateRevocationList;
 use x509_parser::time::ASN1Time;
+
+use crate::tls::CrlList;
+
+/// The CRL set a verifier surface ENFORCES right now, tagged with the
+/// generation it was published under (issue #5574).
+///
+/// A plain [`CrlList`] answers "which records" but not "which publication",
+/// and the verifier cache needs both: it keeps per-trust-domain chain verifiers
+/// compiled from an SVID source AND a CRL set, and reuses them only while both
+/// halves still match. Without the tag a rotation that changed no SVID material
+/// would keep serving handshakes under the records the listener started with.
+///
+/// The bytes are shared, never copied: publishing a new generation is one
+/// `Arc` store.
+#[derive(Debug)]
+pub struct EnforcedCrlSet {
+    crls: CrlList,
+    generation: u64,
+}
+
+impl EnforcedCrlSet {
+    /// The records this generation enforces. Empty means revocation checking
+    /// is off, which is the unchanged behavior of a deployment with no CRL
+    /// source configured.
+    pub fn crls(&self) -> &CrlList {
+        &self.crls
+    }
+
+    /// The publication this set came from. Monotonic within a process; the
+    /// first published set is generation 1, so `0` can never collide with a
+    /// real generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// A hot-swappable [`EnforcedCrlSet`], read lock-free by verifiers and by the
+/// admission fence's sweep.
+pub type SharedEnforcedCrlSet = Arc<ArcSwap<EnforcedCrlSet>>;
+
+/// The first generation of an enforced CRL set.
+pub fn enforced_crl_set(crls: CrlList) -> SharedEnforcedCrlSet {
+    Arc::new(ArcSwap::new(Arc::new(EnforcedCrlSet {
+        crls,
+        generation: 1,
+    })))
+}
+
+/// Publish `crls` as the next generation of `slot`, or leave it untouched when
+/// the records are byte-identical to the ones already enforced.
+///
+/// Returns `true` only when the enforced set actually changed. The comparison
+/// is what keeps a periodic reload of an UNCHANGED CRL file from rebuilding
+/// every cached chain verifier — and, through the admission fence, every live
+/// tunnel's certificate path — for no decision at all.
+///
+/// This is deliberately a free function rather than a method on the slot: the
+/// caller that owns the surface is the one place allowed to publish, and it
+/// must recompile and re-check whatever the change implies. For the mesh
+/// inbound set that caller is `HboneAdmissionFence::publish_inbound_admission_crls`,
+/// reached through `ProxyState::publish_mesh_inbound_crls` and holding the
+/// fence's single publication lock while it does; nothing else may store into
+/// that slot.
+pub fn publish_enforced_crl_set(slot: &SharedEnforcedCrlSet, crls: CrlList) -> bool {
+    let current = slot.load();
+    if crl_records_equal(current.crls(), &crls) {
+        return false;
+    }
+    let generation = current.generation().saturating_add(1);
+    slot.store(Arc::new(EnforcedCrlSet { crls, generation }));
+    true
+}
+
+/// Whether two CRL candidate lists carry the same records in the same order.
+///
+/// Byte equality on the DER, not pointer equality: each reload parses the
+/// source afresh, so an unchanged file always produces a different allocation.
+///
+/// Shared with the HBONE admission fence (issue #5574), which compares a
+/// candidate against both the records the verifier enforces and the records the
+/// anchors in force were compiled with. One implementation, so "unchanged" can
+/// never mean two different things on the two surfaces.
+pub(crate) fn crl_records_equal(
+    left: &[CertificateRevocationListDer<'static>],
+    right: &[CertificateRevocationListDer<'static>],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a.as_ref() == b.as_ref())
+}
 
 /// Apply the shared CRL policy to a client-certificate verifier builder.
 ///
@@ -103,6 +215,42 @@ impl CrlWindowRejection {
             Self::Expired => "has expired (nextUpdate has passed)",
         }
     }
+
+    /// Fixed-cardinality class label for a refusal, for a diagnostic that must
+    /// carry no record contents at all (issue #5574).
+    ///
+    /// Distinct from [`Self::reason`], which is prose for a message that already
+    /// names a record index and a redacted source: this is the closed
+    /// four-value set the admission fence puts on a structured field.
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Unparseable => "unparseable",
+            Self::NotYetValid => "not_yet_valid",
+            Self::MissingNextUpdate => "missing_next_update",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Whether every record in a candidate list is usable as an ENFORCED set right
+/// now, reporting the first refusal's class (issue #5574).
+///
+/// The all-or-nothing form of [`validate_crl_windows`], for a caller that must
+/// decide whether a candidate takes force rather than render an operator
+/// message about a named source: the HBONE admission fence compiles the
+/// enforced records into the anchors it judges live tunnels with, so a record
+/// the verifier cannot use must not become the record the fence judges by. The
+/// first unusable record refuses the whole candidate, exactly as at admission —
+/// publishing the usable subset of a partially invalid source would silently
+/// stop policing an issuer the operator listed.
+pub(crate) fn usable_crl_records(
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<(), &'static str> {
+    let now_unix = ASN1Time::now().timestamp();
+    for crl in crls {
+        classify_crl_window(crl, now_unix).map_err(CrlWindowRejection::class)?;
+    }
+    Ok(())
 }
 
 /// Classify one CRL record's validity window against `now_unix`.
