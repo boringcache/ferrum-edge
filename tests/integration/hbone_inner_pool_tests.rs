@@ -437,6 +437,10 @@ struct Peer {
     /// does: the relay ends, its `SendStream` drops, and the peer resets the
     /// CONNECT stream.
     live: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Accepted mTLS connection tasks, so a test can take the whole session
+    /// away — what a destination that restarts, or reaps its idle
+    /// connections, really does to a source that still has one pooled.
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
     handle: JoinHandle<()>,
 }
 
@@ -456,6 +460,24 @@ impl Peer {
             task.abort();
         }
     }
+
+    /// Take every accepted session away and WAIT for it to be gone.
+    ///
+    /// Aborting the relay tasks alone is not a reap: the tunnel's receive half
+    /// lives in a child task, so the CONNECT stream can stay half-open and a
+    /// source that writes into it is answered by nobody. Dropping the accepted
+    /// connection task drops the TLS stream and its socket, so the source gets
+    /// a real EOF on the transport under its pooled inner connection. Each
+    /// handle is AWAITED after the abort, so when this returns the sockets are
+    /// closed rather than merely scheduled to be.
+    async fn reap_sessions(&self) {
+        let relays: Vec<JoinHandle<()>> = self.live.lock().await.drain(..).collect();
+        let sessions: Vec<JoinHandle<()>> = self.connections.lock().await.drain(..).collect();
+        for task in relays.into_iter().chain(sessions) {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for Peer {
@@ -473,11 +495,13 @@ async fn start_peer(peer_slot: SharedSvidBundle, app_addr: SocketAddr, advertise
     let advertise = Arc::new(AtomicBool::new(advertise));
     let refuse = Arc::new(AtomicBool::new(false));
     let live: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
     let connects_for_task = Arc::clone(&connects);
     let advertise_for_task = Arc::clone(&advertise);
     let refuse_for_task = Arc::clone(&refuse);
     let live_for_task = Arc::clone(&live);
+    let connections_for_task = Arc::clone(&connections);
 
     let handle = tokio::spawn(async move {
         let inbound = build_spiffe_inbound_config(peer_slot, true, Arc::new(Vec::new()))
@@ -492,7 +516,7 @@ async fn start_peer(peer_slot: SharedSvidBundle, app_addr: SocketAddr, advertise
             let advertise = Arc::clone(&advertise_for_task);
             let refuse = Arc::clone(&refuse_for_task);
             let live = Arc::clone(&live_for_task);
-            tokio::spawn(async move {
+            let session = tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
@@ -529,6 +553,7 @@ async fn start_peer(peer_slot: SharedSvidBundle, app_addr: SocketAddr, advertise
                     live.lock().await.push(task);
                 }
             });
+            connections_for_task.lock().await.push(session);
         }
     });
 
@@ -537,6 +562,7 @@ async fn start_peer(peer_slot: SharedSvidBundle, app_addr: SocketAddr, advertise
         connects,
         refuse,
         live,
+        connections,
         handle,
     }
 }
@@ -2054,8 +2080,15 @@ async fn a_peer_that_silently_reaps_a_pooled_tunnel_costs_one_extra_connect_and_
     assert_eq!(fx.peer.connects(), 1);
     assert_eq!(fx.app.requests(), 1);
 
-    // The peer reaps the tunnel underneath the pooled connection.
-    fx.peer.revoke_all().await;
+    // The destination takes the whole session away — and this returns only
+    // once its sockets are actually closed, so the source's pooled inner
+    // connection is riding a transport that has really ended rather than one
+    // whose stream is half-open and swallows writes.
+    fx.peer.reap_sessions().await;
+    // Let the source's own transport tasks observe the EOF. Everything that
+    // has to happen is in-process and takes microseconds; this is three orders
+    // of magnitude more than it needs, and either arm below is correct anyway.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let (status, body) = fx.get("/").await;
     assert_eq!(
