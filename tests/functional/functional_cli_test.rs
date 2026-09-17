@@ -3407,7 +3407,7 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
     for (contents, expected) in [
         (None, "Configuration file not found"),
         (Some("version: ["), "Migration config validation failed"),
-        (Some("proxies: []"), "missing required 'version' field"),
+        (Some("proxies: []"), "missing required `version` field"),
         (Some("version: \"1\"\nproxies: []\n"), "Validation passed."),
     ] {
         if let Some(contents) = contents {

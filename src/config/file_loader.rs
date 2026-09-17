@@ -204,7 +204,7 @@ pub fn load_config_from_file(
     // migration value and, for YAML, in the retained YAML tree before
     // `GatewayConfig` deserialization (which expects `version: String`).
     let file_version = match value.get_mut("version") {
-        None => anyhow::bail!("Configuration file missing required 'version' field"),
+        None => anyhow::bail!("Configuration file missing required `version` field"),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => {
             if let Some(n) = other.as_u64() {
@@ -497,7 +497,7 @@ pub fn decode_and_validate_config_document(
     strip_resource_counts_from_yaml(&mut yaml_value);
 
     let file_version = match value.get_mut("version") {
-        None => anyhow::bail!("Configuration file missing required 'version' field"),
+        None => anyhow::bail!("Configuration file missing required `version` field"),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => {
             if let Some(n) = other.as_u64() {

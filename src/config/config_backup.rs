@@ -117,7 +117,7 @@ pub fn load_config_backup(
         .get("version")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!("Config backup at {path} is missing required 'version' field")
+            anyhow::anyhow!("Config backup at {path} is missing required `version` field")
         })?;
     if backup_version != CURRENT_CONFIG_VERSION {
         anyhow::bail!(
@@ -231,7 +231,7 @@ pub fn load_config_backup(
 /// Reject every other JSON type with a precise diagnostic.
 fn normalize_backup_version_field(value: &mut serde_json::Value) -> Result<(), anyhow::Error> {
     match value.get_mut("version") {
-        None => anyhow::bail!("Config backup missing required 'version' field"),
+        None => anyhow::bail!("Config backup missing required `version` field"),
         Some(serde_json::Value::String(_)) => Ok(()),
         Some(other) => {
             if let Some(n) = other.as_u64() {

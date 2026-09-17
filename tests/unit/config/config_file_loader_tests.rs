@@ -2609,7 +2609,7 @@ plugin_configs: []
     .expect_err("absent version must still fail");
     let msg = err.to_string();
     assert!(
-        msg.contains("missing required 'version' field"),
+        msg.contains("missing required `version` field"),
         "expected missing-field diagnostic, got: {msg}"
     );
 }
