@@ -2275,7 +2275,13 @@ async fn a_whole_pool_drain_discards_a_lease_that_was_checked_out_across_it() {
     // under the very same key and the drain would be a fail-open.
     let fx = fixture(AppBehaviour::Ok, true).await;
 
+    let before = fx.pool.inner_pool().drain_generation();
     let lease = fx.open_fresh_h1().await;
+    assert_eq!(
+        lease.drain_generation(),
+        before,
+        "a lease records the generation current when its CONNECT was dialled"
+    );
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
         0,
@@ -2283,7 +2289,6 @@ async fn a_whole_pool_drain_discards_a_lease_that_was_checked_out_across_it() {
     );
     assert_eq!(fx.peer.connects(), 1);
 
-    let before = fx.pool.inner_pool().drain_generation();
     fx.pool.force_drain_all();
     assert_ne!(
         fx.pool.inner_pool().drain_generation(),
