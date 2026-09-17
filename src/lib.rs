@@ -5608,6 +5608,7 @@ pub mod _test_support {
     pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+    pub use crate::plugins::utils::redis_rate_limiter::RedisSubBucket;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
     pub use crate::plugins::utils::redis_rate_limiter::{
         MemoryPolicyScreen, ReplaySetNxReplyError, classify_memory_info,
@@ -5963,6 +5964,20 @@ pub mod _test_support {
     /// Live-clock Redis sliding-window progress (single timestamp sample).
     pub fn redis_window_progress(window_seconds: u64) -> RedisWindowProgress {
         RedisRateLimitClient::window_progress(window_seconds)
+    }
+
+    /// Deterministic Redis request-quota sub-bucket for a captured epoch offset.
+    ///
+    /// Wall-clock functional coverage places its requests with THIS derivation
+    /// rather than a hand-rolled epoch division, so a scenario cannot claim a
+    /// placement the limiter does not actually use.
+    pub fn redis_sub_bucket_at(now: std::time::Duration, window_seconds: u64) -> RedisSubBucket {
+        RedisRateLimitClient::sub_bucket_at(now, window_seconds)
+    }
+
+    /// Live-clock Redis request-quota sub-bucket (single timestamp sample).
+    pub fn redis_sub_bucket(window_seconds: u64) -> RedisSubBucket {
+        RedisRateLimitClient::sub_bucket(window_seconds)
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────

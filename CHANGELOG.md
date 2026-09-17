@@ -25,9 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redis HTTP, GraphQL, and gRPC method quotas now admit through
   charge-then-compensate accounting over a **sub-bucketed trailing window**.
   Each configured window is split into eight equal sub-buckets, and a window's
-  count is the full sum of the sub-bucket a request lands in plus the eight
-  before it — every bucket at face value, no decay term. One atomic
-  `MULTI`/`EXEC` per request reads those older sub-buckets and charges the
+  count is the full sum of the sub-bucket a request lands in, the eight before
+  it, and the one after it — every bucket at face value, no decay term. One
+  atomic `MULTI`/`EXEC` per request reads those nine sub-buckets and charges the
   current one for every configured window, so the decision is still tied to the
   caller's own increment, and any refusal issues one compensating atomic
   `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it charged. A refused
@@ -35,19 +35,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can no longer lock a client out, and a tighter window's refusal no longer
   consumes a looser window's budget — the previously documented multi-window
   "phantom increment" is retired (#5517). The new counting closes the
-  boundary-burst under-enforcement of the two-window weighted estimate: those
-  nine counters always span at least one whole window, so a burst clustered at
-  the end of an epoch bucket is counted in full for as long as it is inside the
-  exact trailing window instead of being discounted as the next window runs.
-  They span at most one sub-bucket more than a window, so the limiter
-  over-refuses by at most one eighth of a window of history and a client sending
-  at exactly its configured rate keeps eight ninths of that rate in steady
-  state. Admission stays native RESP on the existing pooled connections: no Lua,
-  no `WATCH`, no per-request connection, and no retry budget. Between a refused
-  attempt's `INCR` and its compensating `DECR` the transient charge is visible
-  to concurrent requests for the same identity, which can refuse slightly early
-  under contention and never over-admits; a refused request costs two round trips
-  instead of one.
+  boundary-burst under-enforcement of the two-window weighted estimate: the
+  trailing nine counters always span at least one whole window, so a burst
+  clustered at the end of an epoch bucket is counted in full for as long as it
+  is inside the exact trailing window instead of being discounted as the next
+  window runs. Admission stays native RESP on the existing pooled connections:
+  no Lua, no `WATCH`, no per-request connection, and no retry budget for failed
+  commands. Between a refused attempt's `INCR` and its compensating `DECR` the
+  transient charge is visible to concurrent requests for the same identity,
+  which can refuse slightly early under contention and never over-admits; a
+  refused request costs two round trips instead of one.
+- **Redis request quotas: what the trailing-window over-count costs.** Counting
+  the oldest sub-bucket at face value means the ladder covers slightly more than
+  the exact trailing window, so a client sending at *exactly* its configured
+  rate is throttled. The extra history counted is at most one sub-bucket — up to
+  `ceil(limit / 8)` requests — so the steady-state admitted fraction at exactly
+  the configured rate is about `limit / (limit + ceil(limit / 8))`: roughly 50%
+  at a limit of 1, 67% at 2, 89% (8/9) at 8, and 89% at 100. There is **no
+  unconditional 8/9**; the quantisation falls hardest on small quotas. This is
+  not a regression — the two-window weighted estimate this replaced refused a
+  `1/s` client polling every `1.05s` every other request as well — and it is
+  deliberately not addressed by decaying the oldest sub-bucket, which would
+  reopen the boundary-burst over-admission. A client spaced `window + window/8`
+  apart is admitted in full at every limit. Operators who need a small quota to
+  admit its full nominal rate should configure it over a longer window (`10` per
+  `10s` rather than `1` per `1s`).
+- **Redis request quotas: reordering fence and a clock requirement.** Bucket
+  selection samples the clock before the pooled connection is acquired, so a
+  charge always executes a little after it was built. Each window's transaction
+  therefore also reads the sub-bucket immediately *after* the one it charges:
+  a request that selected bucket `b` and a peer that selected `b + 1` are both
+  inside one trailing window, and whichever transaction reaches Redis second now
+  observes the other, so they can no longer both be admitted against a
+  one-request quota. Beyond one sub-bucket that cover is gone, so the gateway
+  samples the clock once more after `EXEC`; a charge whose bucket rolled past
+  `b + 1` is handed back and the ladder is rebuilt for exactly one more
+  transaction, and a second rollover refuses (fail closed) with a sampled
+  warning. That bounded rebuild happens on a *successful* transaction and is not
+  a retry budget for failed commands, which remain one round trip and are never
+  retried. **Upgrade requirement:** gateways sharing one Redis quota must now
+  keep their clocks within one sub-bucket of each other (`window_seconds / 8`;
+  125ms for a one-second window) — run NTP on every gateway host. The retired
+  `{prefix:key}:{window_index}` layout tolerated a full `window_seconds` of
+  skew. **Operational note:** the rebuild triggers on a stall longer than one
+  sub-bucket, so a badly overloaded Redis will rebuild on most
+  sub-minute-window requests and eventually refuse; those refusals are routed
+  as an unavailable centralized store through `redis_failure_policy`, not as
+  quota refusals.
+- **Documentation correction:** `rate_limiting` local mode was described as
+  fail-closed relative to an exact trailing-window cap alongside Redis mode. It
+  is not. Local windows of five seconds or less use a token bucket with
+  continuous refill — a burst-plus-refill contract that can admit more than
+  `max_requests` inside one trailing window (a `10`/second bucket admits ten
+  immediately and another every 100ms). Only the local sliding aggregate
+  (windows over five seconds) and Redis mode are trailing-window caps, and each
+  has its own documented over-count bound. `docs/plugins.md` now describes the
+  three contracts separately.
 - **Redis request-quota key layout changed** (`rate_limiting`, `graphql`,
   `grpc_method_router`): counters now live at
   `{prefix:rate-key}:{window_seconds}:{sub_index}` instead of

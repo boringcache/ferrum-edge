@@ -99,17 +99,39 @@
 //! **Request quotas** (`rate_limiting`, `graphql`, `grpc_method_router`) use a
 //! **sub-bucketed trailing window**. Each configured window is split into
 //! [`REDIS_WINDOW_SUB_BUCKETS`] equal sub-buckets, and the effective count is
-//! the FULL sum of the sub-bucket a request lands in plus the
-//! [`REDIS_WINDOW_SUB_BUCKETS`] sub-buckets before it — every bucket at face
-//! value, never decayed ([`redis_trailing_window_count`]). Those `K + 1`
-//! counters span `window + f * (window / K)` of wall clock, where `f` is how
-//! far into its own sub-bucket the request arrived, so the sum always covers
-//! the exact trailing window in full and over-counts by at most one sub-bucket
-//! of older history. That bounds the error in BOTH directions: a burst
-//! clustered anywhere inside the trailing window is counted whole (fail
-//! closed), while a client sending at exactly its configured rate still keeps
-//! `K / (K + 1)` of that rate in steady state instead of the half a bare
-//! previous-plus-current sum would leave it.
+//! the FULL sum of the sub-bucket a request lands in, the
+//! [`REDIS_WINDOW_SUB_BUCKETS`] sub-buckets before it, and the one after it —
+//! every bucket at face value, never decayed
+//! ([`redis_trailing_window_count`]). The trailing `K + 1` of those counters
+//! span `window + f * (window / K)` of wall clock, where `f` is how far into
+//! its own sub-bucket the request arrived, so the sum always covers the exact
+//! trailing window in full and over-counts by at most one sub-bucket of older
+//! history. (The forward counter is empty except under reordering or clock
+//! skew; see [`REDIS_WINDOW_SUB_BUCKET_KEYS`].)
+//!
+//! That bounds the error in BOTH directions, and the over-count side has a
+//! real, quantifiable cost that is stated here rather than rounded away.
+//! Counting the oldest sub-bucket in full means the ladder covers MORE than the
+//! exact trailing window, so a client sending at EXACTLY its configured rate is
+//! throttled: the extra history counted is at most one sub-bucket, i.e. up to
+//! `ceil(L / K)` requests for a limit of `L`, so the steady-state admitted
+//! fraction at exactly the configured rate is about `L / (L + ceil(L / K))`.
+//! For `K = 8` that is `1/2` at `L = 1`, `2/3` at `L = 2`, `8/9` at `L = 8`,
+//! and about 89% at `L = 100` — the quantisation hurts small quotas hardest,
+//! and it is inherent to any bucketed counter that counts its oldest bucket at
+//! face value. It is NOT a regression: the retired two-window weighted estimate
+//! had the same small-quota behaviour (a `1/s` client polling every `1.05s` was
+//! refused every other request there too, because `previous` still weighed
+//! `0.95` at elapsed fraction `0.05`). It is deliberately NOT fixed by decaying
+//! the oldest sub-bucket on a timestamp: that reopens exactly the
+//! boundary-burst over-admission this layout exists to close, because a burst
+//! clustered at the END of the oldest sub-bucket would be discounted while
+//! every one of its requests is still live.
+//!
+//! What the sub-buckets DO fix is the other end of the same trade: a bare
+//! `previous + current` sum counts up to two whole windows, which settles at
+//! about half the configured rate for EVERY limit, large or small, instead of
+//! only for small ones.
 //!
 //! **Token accounting** (`ai_rate_limiter`'s `INCRBY` budgets and
 //! `ws_rate_limiting`'s frame budget) keeps the **two-window weighted
@@ -128,15 +150,26 @@
 //! admission on top of the sub-bucket ladder
 //! ([`RedisRateLimitClient::charge_rate_limit_windows`] /
 //! [`RedisRateLimitClient::uncharge_rate_limit_windows`]): one atomic
-//! `MULTI`/`EXEC` reads every configured window's `K` older sub-buckets and
-//! charges its current one, so the decision is tied to the caller's own
-//! increment, and a refusal issues one compensating `MULTI`/`EXEC` that hands
-//! the charge back on every window it touched. A refused request therefore
-//! leaves no lasting charge and cannot re-arm its own exhaustion (issue #5517),
-//! while the charge still precedes the decision so racing gateways can never
-//! both admit against one stale read. Both transactions run on the ordinary
-//! pooled multiplexed connections: no `WATCH`, no per-request connection, no
-//! retry budget, and still no scripting.
+//! `MULTI`/`EXEC` reads every configured window's `K` older sub-buckets and the
+//! one after its current one, and charges that current one, so the decision is
+//! tied to the caller's own increment, and a refusal issues one compensating
+//! `MULTI`/`EXEC` that hands the charge back on every window it touched. A
+//! refused request therefore leaves no lasting charge and cannot re-arm its own
+//! exhaustion (issue #5517), while the charge still precedes the decision so
+//! racing gateways can never both admit against one stale read. Both
+//! transactions run on the ordinary pooled multiplexed connections: no `WATCH`,
+//! no per-request connection, no retry budget, and still no scripting.
+//!
+//! **Bucket staleness has a bounded rebuild, and it is not a retry budget.**
+//! Bucket selection precedes connection acquisition, so a charge is always
+//! slightly stale when it lands. One sub-bucket of that is covered by the
+//! forward `GET`. Past that the caller samples the clock ONCE after `EXEC`
+//! ([`sub_bucket_charge_is_settled`]) and, if the clock has reached `b + 2` or
+//! later, hands its charge back and rebuilds the ladder from that same sample
+//! for exactly ONE more transaction; a second rollover fails closed with a
+//! sampled warning. That is a staleness rebuild on a SUCCESSFUL transaction,
+//! not a retry of a failed command — a Redis error still costs exactly one
+//! round trip and is never retried.
 //!
 //! # DNS
 //!
@@ -274,14 +307,20 @@ pub struct RedisWindowProgress {
 
 /// Equal sub-buckets each Redis request-quota window is split into.
 ///
-/// The admission count is the FULL sum of the sub-bucket a request lands in
-/// plus the `REDIS_WINDOW_SUB_BUCKETS` before it, so those `K + 1` counters
-/// always cover the exact trailing window and over-count by at most one
-/// sub-bucket of older history. Eight holds that over-count to one eighth of a
-/// window while the whole ladder still fits in ONE `MULTI`/`EXEC` of nine
-/// commands per configured window, so the widest policy
-/// ([`MAX_REDIS_ADMISSION_WINDOWS`] windows) stays a single round trip on the
-/// admission hot path.
+/// The admission count is the FULL sum of the sub-bucket a request lands in,
+/// the `REDIS_WINDOW_SUB_BUCKETS` before it, and the one after it, so those
+/// trailing `K + 1` counters always cover the exact trailing window and
+/// over-count by at most one sub-bucket of older history. Eight holds that
+/// over-count to one eighth of a window while the whole ladder still fits in
+/// ONE `MULTI`/`EXEC` of eleven commands over ten keys per configured window,
+/// so the widest policy ([`MAX_REDIS_ADMISSION_WINDOWS`] windows) stays a
+/// single round trip on the admission hot path.
+///
+/// `K` is also what the over-count costs a well-behaved client: a client at
+/// exactly its configured rate `L` keeps about `L / (L + ceil(L / K))` of it,
+/// so raising `K` would narrow that penalty and widen the transaction. Eight is
+/// the chosen point on that trade; the penalty it leaves on small quotas is
+/// stated in this module's `Algorithm` section rather than rounded away.
 ///
 /// It is deliberately NOT configurable. The value is part of the shared key
 /// layout, so two gateways that disagreed about it would count two different
@@ -289,9 +328,20 @@ pub struct RedisWindowProgress {
 /// configured one.
 pub const REDIS_WINDOW_SUB_BUCKETS: usize = 8;
 
-/// Counters one window's admission decision reads: the `K` older sub-buckets
-/// plus the one the request charges.
-pub const REDIS_WINDOW_SUB_BUCKET_KEYS: usize = REDIS_WINDOW_SUB_BUCKETS + 1;
+/// Counters one window's admission decision reads: the `K` older sub-buckets,
+/// the one the request charges, and the one immediately AFTER it.
+///
+/// The extra forward counter is what makes the decision independent of the
+/// order two concurrent transactions happen to reach the server in. Bucket
+/// selection samples the clock before the connection is acquired, so a request
+/// that selected bucket `b` can execute after a peer that selected `b + 1` has
+/// already charged; without the forward read the later-executing request would
+/// see a ladder that stops at `b` and both would be admitted although both lie
+/// inside one trailing window. Reading `b + 1` as well means whichever
+/// transaction executes SECOND always observes the other, and the direction is
+/// conservative: in the ordinary case nothing has charged a bucket the clock
+/// has not reached yet, so the forward counter is empty and costs nothing.
+pub const REDIS_WINDOW_SUB_BUCKET_KEYS: usize = REDIS_WINDOW_SUB_BUCKETS + 2;
 
 /// The sub-bucket one request falls in, derived from a single epoch timestamp.
 ///
@@ -299,7 +349,7 @@ pub const REDIS_WINDOW_SUB_BUCKET_KEYS: usize = REDIS_WINDOW_SUB_BUCKETS + 1;
 /// windows of one policy (per-second and per-minute, say) subdivide the epoch
 /// differently, and naming the window in the key makes their ladders provably
 /// disjoint instead of resting on the indexes never coinciding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RedisSubBucket {
     /// `floor(epoch_nanos / (window_nanos / REDIS_WINDOW_SUB_BUCKETS))`.
     pub index: u64,
@@ -307,10 +357,53 @@ pub struct RedisSubBucket {
     pub window_seconds: u64,
 }
 
+/// Whether a ladder built for `bucket` is still usable after its transaction
+/// executed, judged against ONE wall-clock sample taken after `EXEC`.
+///
+/// Bucket selection necessarily precedes connection acquisition and execution,
+/// so a charge is always slightly stale by the time it lands. One sub-bucket of
+/// staleness is covered by construction, because the ladder also reads the
+/// bucket immediately after the charged one (see
+/// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]): a peer that selected `b + 1` is visible
+/// to a request that selected `b`, and vice versa.
+///
+/// Beyond that the cover is gone. If the clock has reached `b + 2` or later —
+/// a stall longer than a whole sub-bucket, which the 500ms screened response
+/// timeout still admits for a one-second window — a peer may have charged a
+/// bucket this ladder neither read nor charged, and the decision derived from
+/// it could over-admit. That is what this reports, so the caller can hand its
+/// charge back and rebuild once rather than publish an admission it cannot
+/// stand behind.
+///
+/// A clock that moved BACKWARD is not a staleness problem: the charged bucket
+/// is then ahead of the fresh one and the ladder still covers everything a
+/// peer could have charged, so only forward travel is rejected.
+/// The ONE wall-clock sample an admission decision derives its whole ladder
+/// from.
+///
+/// Every window of one request shares this sample, so a policy mixing a
+/// per-second and a per-minute window cannot pair one window's bucket with
+/// another window's instant. A pre-epoch clock reads as the epoch rather than
+/// panicking; admission never panics.
+pub fn redis_epoch_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+pub fn sub_bucket_charge_is_settled(bucket: RedisSubBucket, now: Duration) -> bool {
+    let fresh = RedisRateLimitClient::sub_bucket_at(now, bucket.window_seconds);
+    fresh.index <= bucket.index.saturating_add(1)
+}
+
 /// Fold ONE window's sub-bucket replies into its trailing-window count.
 ///
 /// Every sub-bucket is added at face value — there is no decay term — so a
-/// burst clustered anywhere inside the trailing window is counted whole. Each
+/// burst clustered anywhere inside the trailing window is counted whole. That
+/// is deliberate and is what the boundary-burst fix rests on: decaying the
+/// oldest bucket on a timestamp would discount a burst clustered at its END
+/// while every one of those requests is still inside the exact trailing window.
+/// Each
 /// counter is floored at zero on its own first: a counter can only be negative
 /// when a compensating `DECR` raced its key's expiry, and folding that negative
 /// into the total would let one stale bucket cancel a live burst in another.
@@ -2251,7 +2344,9 @@ pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ReplayS
 }
 
 /// The sub-bucket counters of ONE configured rate-limit window: the `K` older
-/// buckets the decision reads, plus the bucket this charge increments.
+/// buckets the decision reads, the bucket this charge increments, and the one
+/// bucket AFTER it that the decision also reads (see
+/// [`REDIS_WINDOW_SUB_BUCKET_KEYS`] for why the forward counter is there).
 ///
 /// The `K + 1` keys are packed end to end into a SINGLE allocation instead of
 /// one `String` each. Admission is a proxy hot path, and the retired two-bucket
@@ -2268,7 +2363,8 @@ pub fn classify_replay_set_nx_reply(reply: Option<&str>) -> Result<bool, ReplayS
 /// space with the request rate instead of with the configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedisWindowCharge {
-    /// `{tag}:{window_seconds}:{sub_index}` keys, packed oldest first.
+    /// `{tag}:{window_seconds}:{sub_index}` keys, packed oldest first: the `K`
+    /// older buckets, then the charged bucket, then the one after it.
     keys: String,
     /// `(start, end)` byte range of each key inside [`Self::keys`].
     ///
@@ -2278,6 +2374,10 @@ pub struct RedisWindowCharge {
     ranges: [(usize, usize); REDIS_WINDOW_SUB_BUCKET_KEYS],
     /// Retention asserted on [`Self::charged_key`] by both transactions.
     ttl_seconds: u64,
+    /// The sub-bucket this charge selected, kept so the caller can judge after
+    /// `EXEC` whether the ladder is still usable
+    /// ([`sub_bucket_charge_is_settled`]).
+    bucket: RedisSubBucket,
 }
 
 impl RedisWindowCharge {
@@ -2296,9 +2396,26 @@ impl RedisWindowCharge {
         &self.keys[start..end]
     }
 
+    /// The sub-bucket immediately AFTER the charged one; read, never written.
+    ///
+    /// Empty unless a peer's transaction that selected the next bucket reached
+    /// the server first, or a peer's clock runs ahead of this one. Reading it
+    /// is what makes the pair of decisions order-independent; see
+    /// [`REDIS_WINDOW_SUB_BUCKET_KEYS`].
+    pub fn next_key(&self) -> &str {
+        let (start, end) = self.ranges[REDIS_WINDOW_SUB_BUCKETS + 1];
+        &self.keys[start..end]
+    }
+
     /// Retention asserted on [`Self::charged_key`] by both transactions.
     pub fn ttl_seconds(&self) -> u64 {
         self.ttl_seconds
+    }
+
+    /// The sub-bucket this charge selected, for the post-`EXEC` staleness
+    /// judgement in [`sub_bucket_charge_is_settled`].
+    pub fn bucket(&self) -> RedisSubBucket {
+        self.bucket
     }
 }
 
@@ -2356,8 +2473,8 @@ impl RedisWindowCharges {
 
 /// Per-window trailing-window counts returned by one
 /// [`RedisRateLimitClient::charge_rate_limit_windows`]: for each configured
-/// window, the FULL sum of the sub-bucket this request charged and the `K`
-/// sub-buckets before it.
+/// window, the FULL sum of the sub-bucket this request charged, the `K`
+/// sub-buckets before it, and the one after it.
 ///
 /// The fold happens here rather than at the caller so the decision surface is
 /// one number per window and no caller can reintroduce a decay term on its own.
@@ -4431,17 +4548,23 @@ impl RedisRateLimitClient {
 
     /// Charge one request against EVERY configured rate-limit window in a
     /// single atomic `MULTI`/`EXEC`, returning each window's trailing-window
-    /// count (the charged sub-bucket plus the `K` sub-buckets before it, summed
-    /// in full).
+    /// count (the charged sub-bucket, the `K` sub-buckets before it, and the one
+    /// after it, summed in full).
     ///
     /// One round trip on the ordinary pooled multiplexed slots: no `WATCH`, no
     /// dedicated per-request connection, no optimistic-retry budget, and no
     /// server-side scripting — every command is plain RESP any Redis-compatible
     /// server accepts. Per window the transaction issues `GET` on each of the
-    /// [`REDIS_WINDOW_SUB_BUCKETS`] older sub-buckets, then `INCR` and `EXPIRE`
-    /// on the sub-bucket this request lands in, so the admission decision the
-    /// caller derives is tied to its own mutation and can never be a stale read
-    /// that two gateways both act on.
+    /// [`REDIS_WINDOW_SUB_BUCKETS`] older sub-buckets and on the one after the
+    /// charged bucket, then `INCR` and `EXPIRE` on the sub-bucket this request
+    /// lands in, so the admission decision the caller derives is tied to its own
+    /// mutation and can never be a stale read that two gateways both act on.
+    ///
+    /// The forward `GET` is what makes the pair of decisions independent of the
+    /// order two concurrent transactions reach the server in; see
+    /// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]. It does NOT cover a stall longer than
+    /// one whole sub-bucket — that is the caller's post-`EXEC` check
+    /// ([`sub_bucket_charge_is_settled`]).
     ///
     /// Charging before deciding is what keeps concurrent gateways honest, and
     /// it is why a caller that then REFUSES must hand the charge back with
@@ -4481,11 +4604,13 @@ impl RedisRateLimitClient {
         let mut pipeline = redis::pipe();
         pipeline.atomic();
         for window in windows {
-            // The `K` older sub-buckets are read-only; only the bucket this
-            // request lands in is mutated and retained.
+            // The `K` older sub-buckets and the one forward sub-bucket are
+            // read-only; only the bucket this request lands in is mutated and
+            // retained.
             for key in window.trailing_keys() {
                 pipeline.cmd("GET").arg(key);
             }
+            pipeline.cmd("GET").arg(window.next_key());
             pipeline
                 .cmd("INCR")
                 .arg(window.charged_key())
@@ -4853,8 +4978,9 @@ impl RedisRateLimitClient {
         key
     }
 
-    /// Build the `K + 1` sub-bucket keys of one trailing window, packed into a
-    /// single allocation.
+    /// Build the `K + 2` sub-bucket keys of one trailing window, packed into a
+    /// single allocation: the `K` older buckets, the charged bucket, and the
+    /// one after it.
     ///
     /// Key layout is
     /// `{escaped-prefix:escaped-rate-key}:{window_seconds}:{sub_index}`: the
@@ -4877,13 +5003,21 @@ impl RedisRateLimitClient {
         let mut keys = String::with_capacity(key_len.saturating_mul(REDIS_WINDOW_SUB_BUCKET_KEYS));
         let mut ranges = [(0_usize, 0_usize); REDIS_WINDOW_SUB_BUCKET_KEYS];
         for (slot, range) in ranges.iter_mut().enumerate() {
-            // Oldest first: the last slot is the bucket this charge increments.
-            // `saturating_sub` only clamps within the first `K` sub-buckets of
-            // the Unix epoch, where repeating a key would double-count and so
-            // refuse conservatively.
-            let index = bucket
-                .index
-                .saturating_sub((REDIS_WINDOW_SUB_BUCKETS - slot) as u64);
+            // Oldest first: slot `K` is the bucket this charge increments and
+            // slot `K + 1` is the read-only bucket after it. `saturating_sub`
+            // only clamps within the first `K` sub-buckets of the Unix epoch,
+            // and `saturating_add` only at the end of the `u64` index space;
+            // both repeat a key, which double-counts and so refuses
+            // conservatively.
+            let index = if slot > REDIS_WINDOW_SUB_BUCKETS {
+                bucket
+                    .index
+                    .saturating_add((slot - REDIS_WINDOW_SUB_BUCKETS) as u64)
+            } else {
+                bucket
+                    .index
+                    .saturating_sub((REDIS_WINDOW_SUB_BUCKETS - slot) as u64)
+            };
             let start = keys.len();
             keys.push('{');
             push_slot_tag_component(&mut keys, &self.config.key_prefix);
@@ -4899,6 +5033,7 @@ impl RedisRateLimitClient {
             keys,
             ranges,
             ttl_seconds,
+            bucket,
         }
     }
 
@@ -4959,10 +5094,7 @@ impl RedisRateLimitClient {
     /// but it can never pair a charged bucket from one instant with older
     /// buckets read from another.
     pub fn sub_bucket(window_seconds: u64) -> RedisSubBucket {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        Self::sub_bucket_at(now, window_seconds)
+        Self::sub_bucket_at(redis_epoch_now(), window_seconds)
     }
 
     /// Deterministic sub-bucket for a captured epoch offset.

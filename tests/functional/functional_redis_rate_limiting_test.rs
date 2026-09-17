@@ -1204,17 +1204,16 @@ async fn aligned_one_second_sub_bucket() -> u64 {
             .duration_since(UNIX_EPOCH)
             .expect("system clock after Unix epoch");
         if (300_000_000..=500_000_000).contains(&now.subsec_nanos()) {
-            return now.as_secs();
+            // Derived by the production helper, not by an epoch division that
+            // merely happens to agree with it today.
+            return ferrum_edge::_test_support::redis_sub_bucket_at(now, 8).index;
         }
         sleep(Duration::from_millis(5)).await;
     }
 }
 
 fn current_one_second_sub_bucket() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after Unix epoch")
-        .as_secs()
+    live_sub_bucket(8)
 }
 
 /// Wire key of one request-quota sub-bucket: `{tag}:{window_seconds}:{index}`.
@@ -1264,6 +1263,41 @@ async fn await_epoch_window_offset(window_nanos: u128, offset: std::ops::Range<u
         }
         sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// The request-quota sub-bucket the limiter would charge for `window_seconds`
+/// right now, derived by the PRODUCTION helper.
+///
+/// Wall-clock assertions below record this before and after the traffic they
+/// generate, so a runner slow enough to move the traffic out of the window the
+/// scenario needs is reported as a skip rather than passing vacuously.
+fn live_sub_bucket(window_seconds: u64) -> u64 {
+    ferrum_edge::_test_support::redis_sub_bucket(window_seconds).index
+}
+
+/// Issue one bounded GET and return its status.
+///
+/// A hosted runner that stalls a request past the window under test would
+/// otherwise turn a timing scenario into an assertion about whatever window the
+/// reply eventually landed in. `None` means the request did not answer inside
+/// `budget`, which callers report as a skip.
+async fn bounded_status(
+    client: &reqwest::Client,
+    url: &str,
+    budget: Duration,
+    what: &str,
+) -> Option<u16> {
+    match tokio::time::timeout(budget, client.get(url).send()).await {
+        Ok(Ok(response)) => Some(response.status().as_u16()),
+        Ok(Err(error)) => panic!("{what} failed: {error}"),
+        Err(_) => None,
+    }
+}
+
+/// Report a wall-clock scenario the runner was too slow to place, without
+/// asserting anything the traffic never exercised.
+fn skip_too_slow(what: &str, detail: String) {
+    eprintln!("SKIP {what}: the runner could not place the scenario ({detail})");
 }
 
 /// Request quotas count their whole sub-bucket ladder at face value: a counter
@@ -1438,63 +1472,117 @@ async fn test_rate_limiting_redis_boundary_clustered_burst_keeps_counting() {
     wait_for_rate_limited_route(&client, &url).await;
     delete_redis_keys_by_prefix(&prefix).await;
 
-    // Cluster the whole quota into the last ~500ms of a four-second epoch
-    // window, which is where the retired estimate discounted it hardest.
-    await_epoch_window_offset(4_000_000_000, 3_400_000_000..3_800_000_000).await;
-    let burst = tokio::time::Instant::now();
-    for attempt in 1..=5 {
-        let status = client
-            .get(&url)
-            .send()
-            .await
-            .expect("burst request")
-            .status()
-            .as_u16();
-        assert_eq!(status, 200, "burst request {attempt} is within budget");
+    // Everything timing-sensitive runs inside one block that reports an
+    // unplaceable scenario as `Err(reason)` instead of asserting on traffic it
+    // never managed to place. Teardown then runs once, on every path.
+    let placement: Result<(), String> = async {
+        // Cluster the whole quota into the last second of a four-second epoch
+        // window, which is where the retired estimate discounted it hardest.
+        // A four-second window has 500ms sub-buckets, eight to an epoch window.
+        await_epoch_window_offset(4_000_000_000, 2_800_000_000..3_200_000_000).await;
+        let burst = tokio::time::Instant::now();
+        let first_bucket = live_sub_bucket(4);
+        for attempt in 1..=5 {
+            let what = format!("burst request {attempt}");
+            let Some(status) =
+                bounded_status(&client, &url, Duration::from_secs(2), &what).await
+            else {
+                return Err(format!("{what} did not answer within 2s"));
+            };
+            assert_eq!(status, 200, "burst request {attempt} is within budget");
+        }
+        let last_bucket = live_sub_bucket(4);
+        let spent = burst.elapsed();
+
+        // The regression only exists when the whole burst lands in ONE epoch
+        // window and the probe below lands in the NEXT one: that is the
+        // boundary across which the retired weighted estimate decayed a live
+        // burst. A burst that straddled the boundary would have been refused by
+        // the retired estimate for its own reasons, and the assertion would
+        // prove nothing. `/ 8` is the epoch window a sub-bucket belongs to.
+        if first_bucket / 8 != last_bucket / 8 {
+            return Err(format!(
+                "the burst spanned epoch windows {}..={} (sub-buckets \
+                 {first_bucket}..={last_bucket}) in {spent:?}; it must sit wholly in one",
+                first_bucket / 8,
+                last_bucket / 8
+            ));
+        }
+
+        // Half a window past the epoch boundary the burst is still inside the
+        // exact trailing four seconds. The weighted estimate admitted here.
+        tokio::time::sleep_until(burst + Duration::from_millis(2_200)).await;
+        // Placement FIRST, outcome second. A probe in sub-bucket `p` counts the
+        // ladder `p - 8 ..= p + 1`, so the burst still binds exactly while
+        // `p <= first_bucket + 8`, and the probe has to sit in the epoch window
+        // immediately after the burst's — the boundary the retired estimate
+        // decayed across.
+        let probe_bucket = live_sub_bucket(4);
+        if probe_bucket > first_bucket + 8 {
+            return Err(format!(
+                "the mid-window probe was scheduled into sub-bucket {probe_bucket}, past \
+                 the trailing window of a burst in {first_bucket}"
+            ));
+        }
+        if probe_bucket / 8 != last_bucket / 8 + 1 {
+            return Err(format!(
+                "the mid-window probe was scheduled into epoch window {}, not the one \
+                 immediately after the burst's ({})",
+                probe_bucket / 8,
+                last_bucket / 8
+            ));
+        }
+        let Some(status) =
+            bounded_status(&client, &url, Duration::from_secs(2), "mid-window probe").await
+        else {
+            return Err("the mid-window probe did not answer within 2s".to_string());
+        };
+        // The request itself must also have been SERVED inside that ladder.
+        let served_bucket = live_sub_bucket(4);
+        if served_bucket > first_bucket + 8 {
+            return Err(format!(
+                "the mid-window probe was served in sub-bucket {served_bucket}, past the \
+                 trailing window of a burst in {first_bucket}"
+            ));
+        }
+        assert_eq!(
+            status, 429,
+            "a burst still inside the trailing window must keep binding"
+        );
+
+        // Once it ages out the budget is free again: a trailing window, not a
+        // lockout for whoever bursts once. The refused probe hands its own
+        // charge back from a detached task, so settle that first.
+        wait_for_redis_counter_sum(&prefix, 5).await;
+        tokio::time::sleep_until(burst + Duration::from_millis(7_000)).await;
+        // The whole burst must be OUT of this probe's ladder, so the bound is
+        // taken against the LATEST request of the burst.
+        let aged_bucket = live_sub_bucket(4);
+        if aged_bucket <= last_bucket + 8 {
+            return Err(format!(
+                "the aged-out probe was scheduled into sub-bucket {aged_bucket}, still \
+                 inside the ladder of a burst ending in {last_bucket}"
+            ));
+        }
+        let Some(status) =
+            bounded_status(&client, &url, Duration::from_secs(2), "aged-out probe").await
+        else {
+            return Err("the aged-out probe did not answer within 2s".to_string());
+        };
+        assert_eq!(
+            status, 200,
+            "a burst that aged past the trailing window must stop binding"
+        );
+        Ok(())
     }
-    // Every probe below is scheduled from the burst's START, so the assertions
-    // only need the burst itself to be short relative to the window.
-    let spent = burst.elapsed();
-    assert!(
-        spent < Duration::from_millis(1_500),
-        "the burst must stay clustered to be a boundary burst: {spent:?}"
-    );
-
-    // Half a window past the epoch boundary the burst is still inside the exact
-    // trailing four seconds. The weighted estimate admitted here.
-    tokio::time::sleep_until(burst + Duration::from_millis(2_200)).await;
-    let status = client
-        .get(&url)
-        .send()
-        .await
-        .expect("mid-window probe")
-        .status()
-        .as_u16();
-    assert_eq!(
-        status, 429,
-        "a burst still inside the trailing window must keep binding"
-    );
-
-    // Once it ages out the budget is free again: a trailing window, not a
-    // lockout for whoever bursts once. The refused probe hands its own charge
-    // back from a detached task, so settle that first.
-    wait_for_redis_counter_sum(&prefix, 5).await;
-    tokio::time::sleep_until(burst + Duration::from_millis(7_000)).await;
-    let status = client
-        .get(&url)
-        .send()
-        .await
-        .expect("aged-out probe")
-        .status()
-        .as_u16();
-    assert_eq!(
-        status, 200,
-        "a burst that aged past the trailing window must stop binding"
-    );
+    .await;
 
     gateway.shutdown();
     backend.abort();
     delete_redis_keys_by_prefix(&prefix).await;
+    if let Err(reason) = placement {
+        skip_too_slow("boundary-clustered burst", reason);
+    }
 }
 
 /// A client that spends its quota must be admitted again as soon as that spend
@@ -1549,56 +1637,109 @@ async fn test_rate_limiting_redis_full_window_does_not_lock_out_the_next() {
     wait_for_rate_limited_route(&client, &url).await;
     delete_redis_keys_by_prefix(&prefix).await;
 
-    // Start just after an epoch-window boundary so the spend lands in one
-    // two-second epoch window and the next round lands in the FOLLOWING one —
-    // the exact shape `previous + current` refuses outright.
-    await_epoch_window_offset(2_000_000_000, 0..200_000_000).await;
-    let spent_at = tokio::time::Instant::now();
-    let status = client
-        .get(&url)
-        .send()
-        .await
-        .expect("first-window request")
-        .status()
-        .as_u16();
-    assert_eq!(status, 200, "the first request is the whole quota");
-    let spent = spent_at.elapsed();
-    assert!(
-        spent < Duration::from_millis(1_000),
-        "the spend must be clustered for the ladder arithmetic below: {spent:?}"
-    );
+    // Everything timing-sensitive runs inside one block that reports an
+    // unplaceable scenario as `Err(reason)` rather than asserting on traffic it
+    // never managed to place. Teardown then runs once, on every path.
+    let placement: Result<(), String> = async {
+        // Start just after an epoch-window boundary so the spend lands in one
+        // two-second epoch window and the next round lands in the FOLLOWING one
+        // — the exact shape `previous + current` refuses outright. A two-second
+        // window has 250ms sub-buckets, eight to an epoch window, so `/ 8` is
+        // the epoch window a sub-bucket belongs to.
+        await_epoch_window_offset(2_000_000_000, 0..200_000_000).await;
+        let spent_at = tokio::time::Instant::now();
+        let spend_bucket = live_sub_bucket(2);
+        let Some(status) =
+            bounded_status(&client, &url, Duration::from_secs(2), "first-window request").await
+        else {
+            return Err("the first-window request did not answer within 2s".to_string());
+        };
+        assert_eq!(status, 200, "the first request is the whole quota");
+        // The charge landed somewhere in `spend_bucket..=served_bucket`; every
+        // bound below is taken against the LATEST of those, so an imprecise
+        // placement can only make this test stricter, never vacuous.
+        let served_bucket = live_sub_bucket(2);
+        let spent = spent_at.elapsed();
+        if spend_bucket / 8 != served_bucket / 8 {
+            return Err(format!(
+                "the spend spanned epoch windows {}..={} (sub-buckets \
+                 {spend_bucket}..={served_bucket}) in {spent:?}; it must sit wholly in one",
+                spend_bucket / 8,
+                served_bucket / 8
+            ));
+        }
 
-    // Three and a half seconds is past the whole ladder for a two-second window
-    // (eight 250ms sub-buckets plus the partial current one), and still inside
-    // the NEXT epoch window.
-    tokio::time::sleep_until(spent_at + Duration::from_millis(3_500)).await;
-    let status = client
-        .get(&url)
-        .send()
-        .await
-        .expect("next-window request")
-        .status()
-        .as_u16();
-    assert_eq!(
-        status, 200,
-        "the next window must hand back the full configured rate, not a window \
-         of refusals"
-    );
+        // Three and a half seconds is past the whole ladder for a two-second
+        // window (the charged sub-bucket plus the eight before it), and still
+        // inside the NEXT epoch window — which is exactly where `previous +
+        // current` refuses and a trailing window must not.
+        tokio::time::sleep_until(spent_at + Duration::from_millis(3_500)).await;
+        // Placement FIRST. The spend must be OUT of this probe's ladder
+        // (`p - 8 > served_bucket`) and the probe must sit in the epoch window
+        // that immediately follows the spend's, or the scenario is not the one
+        // `previous + current` fails.
+        let probe_bucket = live_sub_bucket(2);
+        if probe_bucket <= served_bucket + 8 {
+            return Err(format!(
+                "the next-window probe was scheduled into sub-bucket {probe_bucket}, still \
+                 inside the ladder of a spend no later than {served_bucket}"
+            ));
+        }
+        if probe_bucket / 8 != served_bucket / 8 + 1 {
+            return Err(format!(
+                "the next-window probe was scheduled into epoch window {}, not the one \
+                 immediately after the spend's ({})",
+                probe_bucket / 8,
+                served_bucket / 8
+            ));
+        }
+        let Some(status) =
+            bounded_status(&client, &url, Duration::from_secs(2), "next-window request").await
+        else {
+            return Err("the next-window request did not answer within 2s".to_string());
+        };
+        // `sleep_until` schedules the probe; it does not guarantee the reply
+        // came back before the window moved on. Re-read the placement and only
+        // then assert.
+        let served_probe = live_sub_bucket(2);
+        if served_probe / 8 != served_bucket / 8 + 1 {
+            return Err(format!(
+                "the next-window probe was served in epoch window {}, not the one \
+                 immediately after the spend's ({})",
+                served_probe / 8,
+                served_bucket / 8
+            ));
+        }
+        assert_eq!(
+            status, 200,
+            "the next window must hand back the full configured rate, not a window \
+             of refusals"
+        );
 
-    // The quota still binds: the request just admitted is itself inside the
-    // trailing window.
-    let status = client
-        .get(&url)
-        .send()
-        .await
-        .expect("over-quota request")
-        .status()
-        .as_u16();
-    assert_eq!(status, 429, "the configured rate must still be enforced");
+        // The quota still binds: the request just admitted is itself inside the
+        // trailing window.
+        let Some(status) =
+            bounded_status(&client, &url, Duration::from_secs(2), "over-quota request").await
+        else {
+            return Err("the over-quota request did not answer within 2s".to_string());
+        };
+        if live_sub_bucket(2) > served_probe + 8 {
+            return Err(format!(
+                "the over-quota request landed past the ladder of the admission in \
+                 sub-bucket {served_probe}"
+            ));
+        }
+        assert_eq!(status, 429, "the configured rate must still be enforced");
+        Ok(())
+    }
+    .await;
 
     gateway.shutdown();
     backend.abort();
     delete_redis_keys_by_prefix(&prefix).await;
+    if let Err(reason) = placement {
+        skip_too_slow("full window does not lock out the next", reason);
+    }
 }
 
 // ============================================================================

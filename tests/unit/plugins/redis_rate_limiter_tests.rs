@@ -1300,7 +1300,7 @@ fn sub_bucket_index_splits_each_window_into_equal_parts() {
 fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
     use ferrum_edge::plugins::utils::rate_limit::two_window_ttl_seconds;
     use ferrum_edge::plugins::utils::redis_rate_limiter::{
-        REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
     };
 
     let client = redis_rate_limit_client_for_test(make_config("redis://127.0.0.1:6379/0", false));
@@ -1315,6 +1315,14 @@ fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
     assert_eq!(trailing[0], format!("{tag}:1:792"));
     assert_eq!(trailing[7], format!("{tag}:1:799"));
     assert_eq!(charge.charged_key(), format!("{tag}:1:800"));
+    // The forward counter: read, never written, and what makes two reordered
+    // transactions on either side of a boundary see each other.
+    assert_eq!(charge.next_key(), format!("{tag}:1:801"));
+    assert_eq!(
+        charge.bucket(),
+        RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1),
+        "the charge carries the bucket it selected, for the post-EXEC check"
+    );
 
     // Retention outlives the `window + one sub-bucket` of history the ladder
     // reads back, so the oldest bucket a decision needs is never expired first.
@@ -1322,9 +1330,20 @@ fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
 
     // Every key of one transaction hashes to the same slot.
     let charged = charge.charged_key();
-    for key in trailing.iter().copied().chain(std::iter::once(charged)) {
+    for key in trailing.iter().copied().chain([charged, charge.next_key()]) {
         assert!(key.starts_with(tag), "{key} must carry the shared hash tag");
     }
+
+    // Ten distinct keys, never a repeat that would double-count one counter.
+    let mut distinct: Vec<&str> = trailing
+        .iter()
+        .copied()
+        .chain([charged, charge.next_key()])
+        .collect();
+    assert_eq!(distinct.len(), REDIS_WINDOW_SUB_BUCKET_KEYS);
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), REDIS_WINDOW_SUB_BUCKET_KEYS);
 
     // Two windows of one policy are disjoint ladders because the key names the
     // window, not only its index.
@@ -1387,10 +1406,20 @@ fn model_sub_bucket_admits(
 
     let charged = RedisRateLimitClient::sub_bucket_at(now, window_seconds).index;
     *buckets.entry(charged).or_insert(0) += 1;
+    // Same ladder shape production builds: the `K` older sub-buckets, the
+    // charged one, and the one after it. A single-client ordered timeline never
+    // charges ahead of the clock, so the forward counter is always empty here —
+    // it exists for concurrent/reordered execution, which
+    // `a_reordered_transaction_across_a_sub_bucket_boundary_cannot_double_admit`
+    // covers against a real server.
     let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
     for (slot, value) in ladder.iter_mut().enumerate() {
-        let back = (REDIS_WINDOW_SUB_BUCKETS - slot) as u64;
-        *value = buckets.get(&charged.saturating_sub(back)).copied();
+        let index = if slot > REDIS_WINDOW_SUB_BUCKETS {
+            charged.saturating_add((slot - REDIS_WINDOW_SUB_BUCKETS) as u64)
+        } else {
+            charged.saturating_sub((REDIS_WINDOW_SUB_BUCKETS - slot) as u64)
+        };
+        *value = buckets.get(&index).copied();
     }
     if redis_trailing_window_count(&ladder) > limit {
         *buckets.entry(charged).or_insert(0) -= 1;
@@ -1483,9 +1512,12 @@ fn boundary_clustered_burst_stays_counted_inside_the_trailing_window() {
 fn steady_traffic_at_the_configured_rate_is_not_halved() {
     // Exactly 20 requests per second against a 20/second quota, for six
     // seconds. The sub-bucket ladder over-refuses by at most one sub-bucket of
-    // history, so the client keeps `K / (K + 1)` of its rate; the bare
-    // `previous + current` sum this replaces counts up to two whole windows and
-    // settles at half.
+    // history — up to `ceil(limit / K)` = 3 requests here — so the client keeps
+    // about `20 / 23` of its rate. The bare `previous + current` sum this
+    // replaces counts up to two whole windows and settles at half for EVERY
+    // limit. The exact per-limit quantisation, including the small quotas where
+    // it costs most, is pinned by
+    // `steady_traffic_pays_the_documented_sub_bucket_quantisation`.
     let offered = 120_u64;
     let mut buckets = std::collections::HashMap::new();
     let mut two_bucket = std::collections::HashMap::new();
@@ -1501,7 +1533,8 @@ fn steady_traffic_at_the_configured_rate_is_not_halved() {
         }
     }
 
-    // Steady state is 20 * 8/9 ≈ 17.8 per second after the first window fills.
+    // Steady state is about 20 * 20/23 ≈ 17.4 per second after the first window
+    // fills; 95/120 is the floor that separates it from the halved shape.
     assert!(
         sub_bucket_admitted >= 95,
         "steady traffic at the configured rate must not be throttled: \
@@ -1569,6 +1602,261 @@ fn sub_bucket_ladder_never_admits_more_than_the_exact_trailing_window() {
     assert!(Duration::from_millis(600_000).as_nanos() - oldest_start >= 1_000_000_000);
 }
 
+/// The honest steady-state cost of counting the oldest sub-bucket in full.
+///
+/// Any bucketed counter that counts its oldest bucket at face value covers MORE
+/// than the exact trailing window, so a client sending at EXACTLY its
+/// configured rate is throttled. The extra history counted is at most one
+/// sub-bucket — up to `ceil(limit / K)` requests — so the steady-state admitted
+/// fraction is about `limit / (limit + ceil(limit / K))`. For `K = 8` that is
+/// one half at `limit = 1`, two thirds at `limit = 2`, and eight ninths at
+/// `limit = 8`: the quantisation falls hardest on small quotas, and nothing in
+/// this design claims an unconditional eight ninths.
+///
+/// Every arrival below lands exactly on a sub-bucket edge, which is the worst
+/// phase for the oldest bucket and the one a "roughly" argument would skip.
+#[test]
+fn steady_traffic_pays_the_documented_sub_bucket_quantisation() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    let sub_bucket_nanos = NANOS_PER_SECOND / REDIS_WINDOW_SUB_BUCKETS as u64;
+
+    // (limit, requests offered, admissions the ladder actually grants)
+    //
+    // The start is epoch second 100, which is sub-bucket 800 exactly, so the
+    // first arrival of every case sits on a bucket edge. Counts are the closed
+    // form of the steady-state cycle, verified below against the fraction the
+    // doc comment and `docs/plugins.md` promise.
+    let cases: [(u64, u64, u64); 3] = [
+        // 1/s: admit, refuse, admit, refuse … — exactly half.
+        (1, 20, 10),
+        // 2/s: admit, admit, refuse … — exactly two thirds.
+        (2, 21, 14),
+        // 8/s: eight admissions then one refusal — exactly eight ninths.
+        (8, 36, 32),
+    ];
+
+    for (limit, offered, expected_admitted) in cases {
+        // Exactly the configured rate: `limit` arrivals per second, evenly
+        // spaced, every one on a sub-bucket edge.
+        let spacing_nanos = NANOS_PER_SECOND / limit;
+        let mut buckets = std::collections::HashMap::new();
+        let mut admitted = 0_u64;
+        for attempt in 0..offered {
+            let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+            if model_sub_bucket_admits(&mut buckets, at, 1, limit) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, expected_admitted,
+            "limit {limit}: {admitted}/{offered} admitted"
+        );
+
+        // The closed form the documentation states: at most `ceil(limit / K)`
+        // requests of extra history are counted, so the admitted fraction is
+        // `limit / (limit + ceil(limit / K))`.
+        let excess = limit.div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64);
+        let predicted = limit as f64 / (limit + excess) as f64;
+        let measured = admitted as f64 / offered as f64;
+        assert!(
+            (measured - predicted).abs() < 0.02,
+            "limit {limit}: measured {measured} vs documented {predicted}"
+        );
+        // The quota still binds in the fail-closed direction.
+        assert!(admitted <= offered, "limit {limit} must still bind");
+    }
+
+    // A sanity anchor on the sub-bucket width the spacing above rests on.
+    assert_eq!(sub_bucket_nanos, 125_000_000);
+}
+
+/// The small-quota quantisation is NOT a regression introduced by the
+/// sub-bucket ladder: the two-window weighted estimate it replaced refused a
+/// `1/s` client every other request as well.
+///
+/// The weighted estimate still weighs a full `previous` bucket at `0.95` when
+/// the current window is 5% elapsed, so `0.95 + 1 > 1` refuses. Both shapes
+/// settle at half for `limit = 1`; only the sub-bucket ladder keeps the LARGER
+/// limits near their configured rate.
+#[test]
+fn the_retired_weighted_estimate_halved_small_quotas_too() {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+    // A well-behaved `1/s` poller, deliberately a touch SLOWER than its quota.
+    let spacing_nanos = 1_050_000_000_u64;
+    let offered = 20_u64;
+
+    let mut weighted = std::collections::HashMap::new();
+    let mut weighted_admitted = 0_u64;
+    let mut buckets = std::collections::HashMap::new();
+    let mut sub_bucket_admitted = 0_u64;
+    for attempt in 0..offered {
+        let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+        if model_weighted_admits(&mut weighted, at, 1, 1) {
+            weighted_admitted += 1;
+        }
+        if model_sub_bucket_admits(&mut buckets, at, 1, 1) {
+            sub_bucket_admitted += 1;
+        }
+    }
+
+    // Exactly alternating: a refusal rolls its own increment back, so the next
+    // request sees `previous = 0` and is admitted, and that admission makes the
+    // one after it refuse. `previous` still weighs 0.95 at 5% elapsed, so the
+    // odd requests never squeeze in.
+    assert_eq!(
+        weighted_admitted, 10,
+        "the retired weighted estimate admitted only every other request"
+    );
+    assert!(
+        sub_bucket_admitted >= weighted_admitted,
+        "the sub-bucket ladder must be no worse than what it replaced at limit 1: \
+         {sub_bucket_admitted} vs {weighted_admitted} of {offered}"
+    );
+    assert!(
+        sub_bucket_admitted <= offered,
+        "the quota must still bind: {sub_bucket_admitted}/{offered}"
+    );
+}
+
+/// A client one sub-bucket slower than its configured rate is admitted in full.
+///
+/// This is the other side of the quantisation bound, and it is what makes the
+/// cost a *known* one rather than an unbounded throttle: spacing arrivals by
+/// `W + W / K` pushes every prior arrival out of the ladder, so the limiter
+/// admits 100% at every limit — including the small ones the exact-rate case
+/// throttles.
+#[test]
+fn traffic_one_sub_bucket_slower_than_the_configured_rate_is_fully_admitted() {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    // One window plus one sub-bucket, divided across the limit.
+    let cycle_nanos = NANOS_PER_SECOND + NANOS_PER_SECOND / 8;
+
+    for limit in [1_u64, 2, 8] {
+        let spacing_nanos = cycle_nanos / limit;
+        let offered = 40_u64;
+        let mut buckets = std::collections::HashMap::new();
+        let mut admitted = 0_u64;
+        for attempt in 0..offered {
+            let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+            if model_sub_bucket_admits(&mut buckets, at, 1, limit) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, offered,
+            "limit {limit}: a client spaced W + W/K apart must never be refused"
+        );
+    }
+}
+
+/// The post-`EXEC` staleness judgement: one sub-bucket of drift is covered by
+/// the forward `GET`, anything beyond it is not.
+#[test]
+fn a_charge_is_settled_only_within_one_sub_bucket_of_its_selection() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        RedisRateLimitClient, sub_bucket_charge_is_settled,
+    };
+
+    let selected = RedisRateLimitClient::sub_bucket_at(Duration::from_millis(100_000), 1);
+    assert_eq!(selected.index, 800);
+
+    // Same bucket, and the next one: the ladder read `801`, so a peer that
+    // charged there is already counted.
+    assert!(sub_bucket_charge_is_settled(
+        selected,
+        Duration::from_millis(100_124)
+    ));
+    assert!(sub_bucket_charge_is_settled(
+        selected,
+        Duration::from_millis(100_249)
+    ));
+    // Two buckets on: `802` was neither read nor charged, so a peer there is
+    // invisible and the decision cannot be published.
+    assert!(!sub_bucket_charge_is_settled(
+        selected,
+        Duration::from_millis(100_250)
+    ));
+    assert!(!sub_bucket_charge_is_settled(
+        selected,
+        Duration::from_millis(100_600)
+    ));
+
+    // A clock that stepped BACKWARD is not a staleness problem: the charged
+    // bucket is ahead of the fresh one, so the ladder still covers everything a
+    // peer could have charged.
+    assert!(sub_bucket_charge_is_settled(
+        selected,
+        Duration::from_millis(99_000)
+    ));
+}
+
+/// One admission decision must cost at most ONE extra wall-clock sample, and
+/// the rebuild must reuse the sample that proved the rollover.
+#[test]
+fn a_quota_decision_takes_one_clock_sample_per_pass_and_reuses_the_rollover_sample() {
+    let source = include_str!("../../../src/plugins/utils/rate_limit.rs");
+    let body = source
+        .split("async fn check_http_windows_redis(")
+        .nth(1)
+        .expect("check_http_windows_redis must exist");
+    let body = body
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("function body ends before the test-only items");
+
+    // Exactly two samples in the source: the one that builds the first ladder
+    // and the one taken after EXEC. The rebuild reuses the second, so a
+    // rolled-over request costs no third read.
+    assert_eq!(
+        body.matches("redis_epoch_now()").count(),
+        2,
+        "one sample builds the ladder and one judges it after EXEC"
+    );
+    // Per-window live sampling is what the shared sample replaced.
+    assert!(
+        !body.contains("RedisRateLimitClient::sub_bucket("),
+        "every window must derive its bucket from the shared sample"
+    );
+    assert!(
+        body.contains("RedisRateLimitClient::sub_bucket_at(sampled_at, window_seconds)"),
+        "the ladder must be derived from the captured sample"
+    );
+    assert!(
+        body.contains("sub_bucket_charge_is_settled(charge.bucket(), sampled_at)"),
+        "the post-EXEC check must use the shared staleness helper"
+    );
+}
+
+/// Every production token-accounting path reasons in the ONE shared weighted
+/// formula, so a change to it cannot leave one caller behind with a green test.
+///
+/// The `ai_rate_limiter` `Check`/`Reserve`/`AdjustUsage` arms and the
+/// `ws_rate_limiting` frame budget each used to spell the estimate out inline;
+/// the retained `FixedWindow` decay coverage then proved nothing about them.
+#[test]
+fn token_accounting_paths_share_the_one_weighted_formula() {
+    let source = include_str!("../../../src/plugins/utils/rate_limit.rs");
+
+    assert!(
+        source.contains("pub(crate) fn weighted_window_count("),
+        "the weighted estimate must live in one shared helper"
+    );
+    // Three ai_rate_limiter arms, the ws_rate_limiting frame budget, and
+    // FixedWindow::weighted_count.
+    assert_eq!(
+        source.matches("weighted_window_count(").count(),
+        6,
+        "every weighted caller must route through the shared helper"
+    );
+    assert!(
+        !source.contains("as f64 * (1.0 - elapsed_fraction)"),
+        "no caller may keep its own inline copy of the weighted formula"
+    );
+}
+
 #[test]
 fn shared_consumers_use_same_window_progress_helper() {
     // rate_limiting, GraphQL type/named-operation limits, and grpc_method_router
@@ -1594,6 +1882,485 @@ fn shared_consumers_use_same_window_progress_helper() {
     let live_bucket = RedisRateLimitClient::sub_bucket(1);
     assert_eq!(live_bucket.window_seconds, 1);
     assert!(live_bucket.index >= live.index * REDIS_WINDOW_SUB_BUCKETS as u64);
+}
+
+// ── Reordered / stalled quota transactions (review of PR #5584) ───────────
+//
+// Bucket selection samples the clock BEFORE the pooled connection is acquired,
+// so a charge always executes slightly after it was built. Two properties have
+// to hold under that:
+//
+// 1. Two requests on either side of a sub-bucket boundary must not both be
+//    admitted against a one-request quota, whichever transaction reaches the
+//    server first. The forward `GET` is what makes that order-independent.
+// 2. A stall longer than a whole sub-bucket is not covered by the forward
+//    `GET`, so the caller must hand its charge back and rebuild once, and fail
+//    closed if that rebuild rolls over as well.
+//
+// Both are exercised against a fake RESP server that keeps a REAL keyspace, so
+// `GET`/`INCR`/`DECR` answer with the values the ladder actually wrote.
+
+/// Parse one complete RESP command array out of `buf`, returning every
+/// argument.
+///
+/// Framing is exact for the same reason [`parse_resp_command`] is: a server
+/// that guesses at chunk boundaries answers a split or coalesced write with the
+/// wrong number of replies and drives the client's multiplexed connection into
+/// an accounting underflow instead of the behavior under test.
+fn parse_resp_command_args(buf: &[u8]) -> Option<(Vec<String>, usize)> {
+    fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+        let rest = buf.get(from..)?;
+        let idx = rest.windows(2).position(|w| w == b"\r\n")?;
+        Some((&rest[..idx], from + idx + 2))
+    }
+
+    if *buf.first()? != b'*' {
+        return None;
+    }
+    let (count_line, mut cursor) = read_line(buf, 1)?;
+    let argc: usize = std::str::from_utf8(count_line).ok()?.parse().ok()?;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if *buf.get(cursor)? != b'$' {
+            return None;
+        }
+        let (len_line, after_len) = read_line(buf, cursor + 1)?;
+        let len: usize = std::str::from_utf8(len_line).ok()?.parse().ok()?;
+        let end = after_len.checked_add(len)?;
+        let payload = buf.get(after_len..end)?;
+        if buf.get(end..end + 2)? != b"\r\n" {
+            return None;
+        }
+        args.push(String::from_utf8_lossy(payload).to_string());
+        cursor = end + 2;
+    }
+    Some((args, cursor))
+}
+
+/// Shared keyspace and counters of the fake server, cloned into each
+/// connection task.
+#[derive(Clone)]
+struct KeyspaceState {
+    keys: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    incrs: Arc<AtomicUsize>,
+    decrs: Arc<AtomicUsize>,
+    charges: Arc<AtomicUsize>,
+    charge_delay: Duration,
+    delayed_charges: usize,
+}
+
+impl KeyspaceState {
+    /// Apply ONE command to the fake keyspace and return its RESP reply.
+    fn apply(&self, args: &[String]) -> Vec<u8> {
+        let name = args
+            .first()
+            .map(|arg| arg.to_uppercase())
+            .unwrap_or_default();
+        let key = args.get(1).cloned().unwrap_or_default();
+        let mut store = self.keys.lock().expect("keyspace mutex");
+        match name.as_str() {
+            "GET" => match store.get(&key) {
+                Some(value) => {
+                    let rendered = value.to_string();
+                    format!("${}\r\n{rendered}\r\n", rendered.len()).into_bytes()
+                }
+                None => b"$-1\r\n".to_vec(),
+            },
+            "INCR" => {
+                self.incrs.fetch_add(1, Ordering::Relaxed);
+                let slot = store.entry(key).or_insert(0);
+                *slot += 1;
+                let value = *slot;
+                format!(":{value}\r\n").into_bytes()
+            }
+            "DECR" => {
+                self.decrs.fetch_add(1, Ordering::Relaxed);
+                let slot = store.entry(key).or_insert(0);
+                *slot -= 1;
+                let value = *slot;
+                format!(":{value}\r\n").into_bytes()
+            }
+            "EXPIRE" => b":1\r\n".to_vec(),
+            _ => b"+OK\r\n".to_vec(),
+        }
+    }
+
+    /// Handle one received command, append its reply, and report how long the
+    /// whole batch's reply must be held before it is written.
+    fn handle(
+        &self,
+        queued: &mut Option<Vec<Vec<String>>>,
+        args: Vec<String>,
+        reply: &mut Vec<u8>,
+    ) -> Duration {
+        let name = args
+            .first()
+            .map(|arg| arg.to_uppercase())
+            .unwrap_or_default();
+        match name.as_str() {
+            "INFO" => {
+                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                let bulk = format!("${}\r\n{text}\r\n", text.len());
+                reply.extend_from_slice(bulk.as_bytes());
+                Duration::ZERO
+            }
+            "MULTI" => {
+                *queued = Some(Vec::new());
+                reply.extend_from_slice(b"+OK\r\n");
+                Duration::ZERO
+            }
+            "EXEC" => {
+                let batch = queued.take().unwrap_or_default();
+                // Only CHARGE transactions are held. Holding a compensation as
+                // well would serialize behind the charge on a shared
+                // connection and could push it past the client's 500ms
+                // response deadline, which is not the behavior under test.
+                let charging = batch
+                    .iter()
+                    .any(|command| command.first().is_some_and(|name| name == "INCR"));
+                let held = if charging
+                    && self.charges.fetch_add(1, Ordering::Relaxed) < self.delayed_charges
+                {
+                    self.charge_delay
+                } else {
+                    Duration::ZERO
+                };
+                reply.extend_from_slice(format!("*{}\r\n", batch.len()).as_bytes());
+                for command in &batch {
+                    reply.extend_from_slice(&self.apply(command));
+                }
+                held
+            }
+            _ => {
+                match queued.as_mut() {
+                    Some(batch) => {
+                        batch.push(args);
+                        reply.extend_from_slice(b"+QUEUED\r\n");
+                    }
+                    None => reply.extend_from_slice(&self.apply(&args)),
+                }
+                Duration::ZERO
+            }
+        }
+    }
+}
+
+struct KeyspaceServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    state: KeyspaceState,
+}
+
+impl KeyspaceServer {
+    fn counter(&self, key: &str) -> i64 {
+        self.state
+            .keys
+            .lock()
+            .expect("keyspace mutex")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn incrs(&self) -> usize {
+        self.state.incrs.load(Ordering::Relaxed)
+    }
+
+    fn decrs(&self) -> usize {
+        self.state.decrs.load(Ordering::Relaxed)
+    }
+
+    fn charged_total(&self) -> i64 {
+        self.state
+            .keys
+            .lock()
+            .expect("keyspace mutex")
+            .values()
+            .copied()
+            .sum()
+    }
+}
+
+/// Minimal RESP server with a REAL integer keyspace and working `MULTI`/`EXEC`.
+///
+/// `GET` answers the stored value (or nil), `INCR`/`DECR` mutate and answer the
+/// new value, `EXPIRE` answers `:1`, `INFO` reports a non-Cluster server, and
+/// anything else answers `+OK`. Inside a transaction every queued command
+/// answers `+QUEUED` and `EXEC` answers the array of their results, which is the
+/// shape `redis::pipe().atomic()` decodes.
+///
+/// `delayed_charges` holds the reply to the FIRST `delayed_charges` CHARGE
+/// transactions for `charge_delay`, so a test can land a charge whose
+/// sub-bucket has rolled over by the time the caller sees the reply. The count
+/// is per server, not per connection; compensations are never held.
+async fn spawn_keyspace_redis_server(
+    charge_delay: Duration,
+    delayed_charges: usize,
+) -> KeyspaceServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let state = KeyspaceState {
+        keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        incrs: Arc::new(AtomicUsize::new(0)),
+        decrs: Arc::new(AtomicUsize::new(0)),
+        charges: Arc::new(AtomicUsize::new(0)),
+        charge_delay,
+        delayed_charges,
+    };
+    let accept_state = state.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break; };
+                    tokio::spawn(serve_keyspace_connection(stream, accept_state.clone()));
+                }
+            }
+        }
+    });
+
+    KeyspaceServer {
+        port,
+        shutdown: shutdown_tx,
+        state,
+    }
+}
+
+/// One connection's read/reply loop: exactly one reply per fully received
+/// command, so the client's in-flight accounting always matches.
+async fn serve_keyspace_connection(mut stream: tokio::net::TcpStream, state: KeyspaceState) {
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    // Commands queued by the current MULTI, if any.
+    let mut queued: Option<Vec<Vec<String>>> = None;
+    loop {
+        let n = match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&buf[..n]);
+        let mut reply = Vec::new();
+        let mut hold = Duration::ZERO;
+        while let Some((args, consumed)) = parse_resp_command_args(&pending) {
+            pending.drain(..consumed);
+            hold = hold.max(state.handle(&mut queued, args, &mut reply));
+        }
+        if reply.is_empty() {
+            continue;
+        }
+        if !hold.is_zero() {
+            tokio::time::sleep(hold).await;
+        }
+        if stream.write_all(&reply).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn keyspace_client(port: u16) -> RedisRateLimitClient {
+    let url = format!("redis://127.0.0.1:{port}/0");
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = 5;
+    // Long enough that no background recovery dial happens during a test.
+    config.health_check_interval_seconds = 3600;
+    // Four pooled slots so a held charge cannot serialize an unrelated
+    // transaction behind it on one socket; the timing under test is the
+    // client's, not the fake server's read loop.
+    config.pool_size = 4;
+    redis_rate_limit_client_for_test(config)
+}
+
+/// Two requests that select adjacent sub-buckets must not both be admitted
+/// against a one-request quota, even when the NEWER ladder executes first.
+///
+/// Review finding (MAJOR 2): A samples `100.124s` and selects bucket `800`,
+/// then stalls behind connection acquisition; B samples `100.126s`, selects
+/// `801`, and executes first. Both timestamps are inside one trailing second.
+/// With a trailing-only ladder A would read `792..=800`, never see B's charge in
+/// `801`, and be admitted alongside it. Reading `801` as well makes whichever
+/// transaction lands SECOND observe the other.
+#[tokio::test]
+async fn a_reordered_transaction_across_a_sub_bucket_boundary_cannot_double_admit() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, RedisWindowCharges,
+    };
+
+    let server = spawn_keyspace_redis_server(Duration::ZERO, 0).await;
+    let client = keyspace_client(server.port);
+
+    let earlier = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
+    let later = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_126_000), 1);
+    assert_eq!(earlier.index, 800);
+    assert_eq!(
+        later.index,
+        earlier.index + 1,
+        "the two samples must straddle exactly one sub-bucket boundary"
+    );
+
+    let mut stalled = RedisWindowCharges::default();
+    assert!(stalled.push(client.window_charge("ip:127.0.0.1", earlier, 3)));
+    let mut newer = RedisWindowCharges::default();
+    assert!(newer.push(client.window_charge("ip:127.0.0.1", later, 3)));
+    let stalled_ladder: Vec<String> = stalled.as_slice()[0]
+        .trailing_keys()
+        .map(str::to_string)
+        .collect();
+    let stalled_charged = stalled.as_slice()[0].charged_key().to_string();
+
+    // The NEWER ladder executes FIRST — the reordering the finding describes.
+    let newer_counts = client
+        .charge_rate_limit_windows(newer.as_slice())
+        .await
+        .expect("the newer transaction must execute");
+    let stalled_counts = client
+        .charge_rate_limit_windows(stalled.as_slice())
+        .await
+        .expect("the stalled transaction must execute");
+
+    let limit = 1_u64;
+    let admitted = [newer_counts, stalled_counts]
+        .iter()
+        .filter(|counts| counts.as_slice()[0] <= limit)
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "exactly one of two requests inside one trailing second may be admitted; \
+         newer={newer_counts:?} stalled={stalled_counts:?}"
+    );
+    assert_eq!(
+        newer_counts.as_slice()[0],
+        1,
+        "the transaction that landed first sees only itself"
+    );
+    assert_eq!(
+        stalled_counts.as_slice()[0],
+        2,
+        "the transaction that landed second must see the peer one bucket ahead"
+    );
+
+    // What the trailing-only ladder would have read: its own increment and
+    // nothing else, so BOTH would have been admitted. This is the arithmetic
+    // the forward `GET` changes, read straight off the fake keyspace.
+    let trailing_only: i64 = stalled_ladder
+        .iter()
+        .map(|key| server.counter(key))
+        .sum::<i64>()
+        + server.counter(&stalled_charged);
+    assert_eq!(
+        trailing_only, 1,
+        "without the forward counter the stalled ladder sums to 1 and over-admits"
+    );
+    assert_eq!(stalled_ladder.len(), REDIS_WINDOW_SUB_BUCKETS);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A charge whose sub-bucket rolled past `b + 1` before the reply arrived is
+/// handed back and rebuilt exactly once.
+///
+/// Beyond one sub-bucket the forward `GET` no longer covers the drift: a peer
+/// may have charged a bucket the ladder neither read nor charged. The decision
+/// is therefore not published — the charge is compensated and the ladder is
+/// rebuilt from the same post-`EXEC` sample for one more transaction.
+#[tokio::test]
+async fn a_charge_that_rolls_past_its_sub_bucket_is_handed_back_and_rebuilt_once() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    // A one-second window has 125ms sub-buckets, so holding the first reply for
+    // 250ms guarantees the clock has reached at least `b + 2`. It stays inside
+    // the 500ms screened per-command response deadline.
+    let server = spawn_keyspace_redis_server(Duration::from_millis(250), 1).await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let outcome = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the rebuilt pass must produce a decision");
+    assert!(
+        outcome.allowed,
+        "an empty quota admits once the rebuilt ladder lands"
+    );
+
+    // Two charges: the rolled-over pass and the rebuild. One compensation: the
+    // rolled-over pass handing its own charge back. The hand-back is detached,
+    // so settle it before reading the counters.
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.incrs(),
+        2,
+        "the rolled-over pass and the rebuild are two charges, and no more"
+    );
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the abandoned pass must hand its own charge back"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A second consecutive rollover fails closed rather than publishing a decision
+/// derived from a ladder that provably missed part of its own window.
+#[tokio::test]
+async fn a_second_sub_bucket_rollover_fails_closed() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    // Every CHARGE is held, so the rebuild rolls over as well.
+    let server = spawn_keyspace_redis_server(Duration::from_millis(250), usize::MAX).await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "two consecutive rollovers must fail closed, not admit: {result:?}"
+    );
+
+    // Both passes handed their own charge back, so nothing is stranded.
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.incrs(),
+        2,
+        "the bounded rebuild must stop at two transactions"
+    );
+    assert_eq!(
+        server.decrs(),
+        2,
+        "both abandoned passes must hand their charges back"
+    );
+    assert_eq!(
+        server.charged_total(),
+        0,
+        "a fail-closed refusal leaves no lasting charge"
+    );
+
+    let _ = server.shutdown.send(());
 }
 
 // ── Redis health-task lifecycle (issue #2305) ─────────────────────────────

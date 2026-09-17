@@ -657,15 +657,52 @@ on a native-gRPC request.
   SUB-BUCKETED TRAILING WINDOW: each configured window is split into
   `REDIS_WINDOW_SUB_BUCKETS` (8, a `const`, never configurable — it is part of
   the shared key layout) equal sub-buckets, and the count is the FULL sum of the
-  charged sub-bucket plus the 8 before it, every bucket at face value
-  (`redis_trailing_window_count`). No decay term, no Lua. Those 9 counters span
-  `window + f * (window / K)`, which is why the error is bounded BOTH ways: the
-  exact trailing window is always covered in full (fail closed against a
-  boundary-clustered burst) and at most one sub-bucket of older history is
-  over-counted, so a client at exactly its configured rate keeps `K / (K + 1)`
-  of it. Do NOT replace this with `previous + current`: that counts up to two
-  whole windows and refuses a well-behaved client for a whole window after every
-  window it fills — roughly half its quota, permanently. Token-accounting paths
+  charged sub-bucket, the 8 before it, and the ONE AFTER it, every bucket at
+  face value (`redis_trailing_window_count`). No decay term, no Lua. The
+  trailing 9 of those counters span `window + f * (window / K)`, which is why
+  the error is bounded BOTH ways: the exact trailing window is always covered in
+  full (fail closed against a boundary-clustered burst) and at most one
+  sub-bucket of older history is over-counted. Do NOT replace this with
+  `previous + current`: that counts up to two whole windows and refuses a
+  well-behaved client for a whole window after every window it fills — roughly
+  half its quota at EVERY limit, permanently.
+- The over-count has a real, per-limit cost and every document must state it,
+  never an unconditional "8/9". A client at exactly its configured rate `L`
+  keeps about `L / (L + ceil(L / K))`: `1/2` at `L = 1`, `2/3` at `L = 2`, `8/9`
+  at `L = 8`, ~89% at `L = 100`. The quantisation is inherent to counting the
+  oldest bucket in full and is NOT a regression (the retired weighted estimate
+  halved `L = 1` too). Do NOT "fix" it by decaying the oldest sub-bucket on a
+  timestamp — that reopens the boundary-burst over-admission this layout exists
+  to close, because a burst clustered at the END of the oldest sub-bucket would
+  be discounted while still live. The deterministic models in
+  `tests/unit/plugins/redis_rate_limiter_tests.rs` pin the exact figures for
+  `L = 1, 2, 8` on sub-bucket edges.
+- The FORWARD sub-bucket read is a correctness requirement, not padding. Bucket
+  selection precedes connection acquisition, so a request that selected `b` can
+  execute after a peer that selected `b + 1`; without reading `b + 1` both are
+  admitted although both lie inside one trailing window. Whichever transaction
+  lands second must see the other. Beyond one sub-bucket the cover is gone, so
+  `check_http_windows_redis` samples the clock ONCE after `EXEC`
+  (`sub_bucket_charge_is_settled`) and, on a roll past `b + 1`, compensates and
+  rebuilds the ladder from that same sample for exactly one more transaction
+  (`MAX_REDIS_CHARGE_PASSES = 2`); a second rollover fails closed with a sampled
+  warning. That is a staleness rebuild on a SUCCESSFUL transaction — the "no
+  retry budget" rule still holds for failed commands. Do NOT "fix" reordering by
+  refusing every straddler: that throttles legitimate traffic at ordinary Redis
+  latency. The rebuild's trigger scales with the window (125ms for a one-second
+  policy, 7.5s for a one-minute one), so a store slower than one sub-bucket
+  degrades a sub-minute policy into `redis_failure_policy` territory — an
+  unavailable store, not a quota refusal. That is deliberate and documented.
+- CLOCK CONTRACT: gateways sharing one Redis quota must keep their clocks within
+  `window_seconds / K` (125ms for a one-second window). The forward read
+  tolerates a peer up to one sub-bucket AHEAD; a peer BEHIND charges buckets
+  this gateway's ladder still covers. The retired `{tag}:{window_index}` layout
+  tolerated a full `window_seconds` of skew, so this is a documented upgrade
+  requirement in `docs/plugins.md`, not an implicit assumption.
+- One admission decision takes at most ONE extra `SystemTime` sample (after
+  `EXEC`); every configured window derives its bucket from the SAME sample, and
+  the rebuild reuses the post-`EXEC` sample rather than reading the clock again.
+  No `f64` anywhere on the quota path. Token-accounting paths
   (`ai_rate_limiter` `INCRBY` budgets, `ws_rate_limiting` frame budgets) keep
   the two-window weighted estimate and the `{tag}:{window_index}` layout,
   because they reserve under one window index and reconcile against that same
@@ -695,12 +732,25 @@ on a native-gRPC request.
   their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
   the per-request window and counter buffers are fixed-capacity and inline, not
   `Vec`s, so one transaction touches at most
-  `MAX_REDIS_ADMISSION_WINDOWS * (REDIS_WINDOW_SUB_BUCKETS + 1)` keys. Each
+  `MAX_REDIS_ADMISSION_WINDOWS * (REDIS_WINDOW_SUB_BUCKETS + 2)` keys — nine
+  `GET`s, one `INCR`, and one ignored `EXPIRE` per window. Each
   window packs its whole key ladder into ONE `String` allocation
   (`RedisRateLimitClient::window_charge`) — fewer allocations than the two
   `make_slot_key` calls it replaced, and the accessors slice on ranges the
   builder itself recorded. The local token bucket / 64-bucket sliding aggregate
-  are deliberately NOT replicated in Redis.
+  are deliberately NOT replicated in Redis, and their contracts are NOT the
+  Redis one: short (<= 5s) local windows are a token bucket with CONTINUOUS
+  refill, a burst-plus-refill contract that can admit `limit + refill` inside a
+  trailing window, while the > 5s sliding aggregate is a trailing-window cap
+  over-counting by at most `ceil(window / 63)`. Never document a single
+  "fail-closed relative to an exact trailing window" guarantee across local and
+  Redis modes.
+- `weighted_window_count` in `src/plugins/utils/rate_limit.rs` is the ONLY place
+  the two-window weighted estimate is written down. `FixedWindow`, all three
+  `ai_rate_limiter` `INCRBY` arms, and the `ws_rate_limiting` frame budget route
+  through it; do not re-inline the formula, or a test on one path stops proving
+  anything about the others
+  (`token_accounting_paths_share_the_one_weighted_formula`).
 - Request-quota key format is
   `{escaped-prefix:escaped-rate-key}:{window_seconds}:{sub_index}`; every other
   Redis rate-limit family stays on
