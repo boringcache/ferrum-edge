@@ -196,7 +196,12 @@ the trusted base, so a pull request cannot add the validity table (or a test
 step) there; read the combined summary, or the rules below, for validity.
 
 Validity rules live in `benchmark_validity.py` so the workflow and these checks
-share one definition. Run them before relying on a benchmark result:
+share one definition. This package is not a workspace member, so the workspace
+`Tests` aggregate never builds it; the **Benchmark Harness Tests** workflow
+(`.github/workflows/benchmark-harness-tests.yml`) is the hosted lane that runs
+these tests, on every pull request and `main` push touching
+`tests/performance/multi_protocol/**`. It is not a branch-protection-required
+check. The same two commands run locally:
 
 ```bash
 python3 -m unittest discover -s tests/performance/multi_protocol/tests -p 'test_*.py'
