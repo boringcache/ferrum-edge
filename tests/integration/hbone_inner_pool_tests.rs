@@ -40,7 +40,7 @@ use ferrum_edge::modes::mesh::hbone::{TUNNEL_REUSE_FENCED, TUNNEL_REUSE_HEADER};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::grpc_proxy::GrpcBody;
 use ferrum_edge::proxy::hbone_inner_pool::{
-    HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody,
+    HboneInnerConnectionPool, HboneInnerH1Checkout, HboneInnerH1RequestBody, HboneInnerH2Load,
     HboneInnerH2Publication, HboneInnerH2StreamLease, HboneInnerKeyParts, HboneInnerProtocol,
     HboneSourceCredential, MAX_IDLE_H1_PER_KEY,
 };
@@ -1232,8 +1232,14 @@ async fn an_unrelated_fingerprint_retirement_leaves_the_pool_alone() {
     assert_eq!(
         fx.pool.inner_pool().pooled_connections(),
         1,
-        "a drain for a leaf this connection was never built under must not touch it"
+        "the retain pass matches on the key's own leaf fingerprint, so a drain \
+         for a leaf this connection was never built under does not REMOVE it"
     );
+    // It is nonetheless SUPERSEDED: a rotation advances the entry fence for the
+    // whole pool, deliberately, because the pass walks the map shard by shard
+    // and a concurrent checkout can win a shard it has not reached. The cost is
+    // one extra CONNECT on the next checkout under an unrelated fingerprint.
+    // See `an_entry_a_retirement_superseded_is_evicted_at_checkout_not_served`.
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1312,23 +1318,23 @@ async fn open_fresh_h2(fx: &Fixture) -> NestedH2 {
     .expect("timely CONNECT")
     .expect("the peer admits the CONNECT");
     let advertised = tunnel.peer_advertises_inner_reuse();
-    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+    let (sender, mut connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, GrpcBody>(TokioIo::new(tunnel))
         .await
         .expect("nested HTTP/2 handshake");
-    // The nested peer's stream cap lives on hyper's `Connection`, not on the
-    // `SendRequest` the pool holds, and the connection is about to be spawned.
-    // Production reads it once, after `await_peer_settings` and before the
-    // spawn; the fixture instead has the driver publish it after every poll, so
-    // a test can read the value the peer really advertised without having to
-    // time its own read against the SETTINGS frame.
-    let peer_max_streams = Arc::new(AtomicUsize::new(usize::MAX));
-    let published_cap = Arc::clone(&peer_max_streams);
+    // EXACTLY the production sampling path (`open_hbone_grpc_sender`): the
+    // load is created before the driver is spawned and the driver stores
+    // `Connection::current_max_send_streams()` after every poll. The cap lives
+    // on hyper's `Connection`, never on the `SendRequest` the pool holds, and
+    // reading it once at spawn time would record hyper's pre-settings default
+    // of 100 for every peer — `h2` does not apply the peer's SETTINGS until it
+    // writes the ACK, which is later than their bytes arriving.
+    let load = HboneInnerH2Load::default();
+    let published_cap = load.clone();
     tokio::spawn(async move {
-        let mut connection = Box::pin(connection);
         let _ = std::future::poll_fn(|cx| {
-            let polled = std::future::Future::poll(connection.as_mut(), cx);
-            published_cap.store(connection.current_max_send_streams(), Ordering::SeqCst);
+            let polled = std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
+            published_cap.set_peer_max_streams(connection.current_max_send_streams());
             polled
         })
         .await;
@@ -1336,7 +1342,7 @@ async fn open_fresh_h2(fx: &Fixture) -> NestedH2 {
     NestedH2 {
         sender,
         advertised,
-        peer_max_streams,
+        load,
     }
 }
 
@@ -1345,18 +1351,38 @@ async fn open_fresh_h2(fx: &Fixture) -> NestedH2 {
 struct NestedH2 {
     sender: H2SendRequest<GrpcBody>,
     advertised: bool,
-    peer_max_streams: Arc<AtomicUsize>,
+    load: HboneInnerH2Load,
 }
 
 impl NestedH2 {
     fn peer_max_streams(&self) -> usize {
-        self.peer_max_streams.load(Ordering::SeqCst)
+        self.load.peer_max_streams()
+    }
+
+    /// Block until the nested peer's SETTINGS have been APPLIED, which is a
+    /// strictly later moment than their bytes arriving: until `h2` writes the
+    /// SETTINGS ACK, `current_max_send_streams()` still reports hyper's own
+    /// `DEFAULT_INITIAL_MAX_SEND_STREAMS`. Polling the recorded value is how a
+    /// test observes the real cap without racing that boundary.
+    async fn await_peer_max_streams(&self, expected: usize) {
+        let settled = tokio::time::timeout(DEADLINE, async {
+            while self.peer_max_streams() != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "the nested peer's SETTINGS_MAX_CONCURRENT_STREAMS never settled at \
+             {expected}; last observed {}",
+            self.peer_max_streams()
+        );
     }
 }
 
 /// Publish a freshly established nested carrier exactly as
-/// `open_hbone_grpc_sender` does: source material unchanged, the peer's cap as
-/// observed, and the retirement generation read before the dial.
+/// `open_hbone_grpc_sender` does: source material unchanged, the carrier's own
+/// driver-maintained load, and the retirement generation read before the dial.
 fn publish_fresh_h2(
     fx: &Fixture,
     parts: &HboneInnerKeyParts<'_>,
@@ -1368,7 +1394,7 @@ fn publish_fresh_h2(
         HboneInnerH2Publication {
             peer_advertises_fence: nested.advertised,
             source_material_unchanged: true,
-            peer_max_streams: nested.peer_max_streams(),
+            load: nested.load.clone(),
             credential_deadline: fx.identity.credential.leaf_deadline,
             generation: fx.pool.inner_pool().drain_generation(),
         },
@@ -2066,12 +2092,19 @@ async fn the_production_dispatch_reuses_one_inner_connection_across_requests() {
 async fn a_peer_that_silently_reaps_a_pooled_tunnel_costs_one_extra_connect_and_no_duplicate() {
     // The reuse race the at-most-once PRE-WIRE `try_send_request` handback
     // exists for: the destination's side of a POOLED tunnel is gone, and the
-    // source has not necessarily learned it yet. Whether this particular run
-    // takes the handback arm (the close has not propagated) or the eviction arm
-    // (it has) is a genuine timing race, and the contract is that BOTH produce
-    // the same observable outcome — which is what this pins: the client is
-    // served, exactly one extra CONNECT is opened, and the application sees one
-    // request per client request and never a duplicate.
+    // source has not necessarily learned it yet. Whether a given run takes the
+    // handback arm (the close has not propagated, so the lease IS handed out
+    // and the unsent request comes back) or the eviction arm (it has, so
+    // `take_idle_h1` drops it) is a genuine scheduler race, and the contract is
+    // that BOTH produce the same observable outcome.
+    //
+    // So the cycle is run REPEATEDLY with no sleep between the reap and the
+    // next request, and the contract is asserted after every iteration. A sleep
+    // here would settle the race in the eviction arm's favour every time and
+    // leave the replay arm — the highest-risk new code on this path —
+    // unexecuted; over this many iterations the scheduler takes both.
+    const CYCLES: usize = 24;
+
     let fx = gateway_fixture(AppBehaviour::Ok, true).await;
 
     let (status, _) = fx.get("/").await;
@@ -2080,36 +2113,44 @@ async fn a_peer_that_silently_reaps_a_pooled_tunnel_costs_one_extra_connect_and_
     assert_eq!(fx.peer.connects(), 1);
     assert_eq!(fx.app.requests(), 1);
 
-    // The destination takes the whole session away — and this returns only
-    // once its sockets are actually closed, so the source's pooled inner
-    // connection is riding a transport that has really ended rather than one
-    // whose stream is half-open and swallows writes.
-    fx.peer.reap_sessions().await;
-    // Let the source's own transport tasks observe the EOF. Everything that
-    // has to happen is in-process and takes microseconds; this is three orders
-    // of magnitude more than it needs, and either arm below is correct anyway.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    for cycle in 1..=CYCLES {
+        let connects_before = fx.peer.connects();
+        // The destination takes the whole session away — and this returns only
+        // once its sockets are actually closed, so the source's pooled inner
+        // connection is riding a transport that has really ended rather than
+        // one whose stream is half-open and swallows writes.
+        fx.peer.reap_sessions().await;
 
-    let (status, body) = fx.get("/").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a reaped pooled tunnel must not be visible to the client"
-    );
-    assert_eq!(body.as_ref(), b"ok");
-    assert_eq!(
-        fx.peer.connects(),
-        2,
-        "recovering from the reap must cost EXACTLY one extra CONNECT — the \
-         replay is at most once"
-    );
-    assert_eq!(fx.app.accepts(), 2);
-    assert_eq!(
-        fx.app.requests(),
-        2,
-        "a pre-wire handback replays a request nothing wrote to the wire, so \
-         the application must never see it twice"
-    );
+        let (status, body) = fx.get("/").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "cycle {cycle}: a reaped pooled tunnel must not be visible to the client"
+        );
+        assert_eq!(body.as_ref(), b"ok");
+        assert_eq!(
+            fx.peer.connects(),
+            connects_before + 1,
+            "cycle {cycle}: recovering from the reap must cost EXACTLY one \
+             extra CONNECT — the replay is at most once"
+        );
+        assert_eq!(
+            fx.app.requests(),
+            cycle + 1,
+            "cycle {cycle}: a pre-wire handback replays a request nothing wrote \
+             to the wire, so the application must never see it twice"
+        );
+        assert_eq!(
+            fx.app.accepts(),
+            cycle + 1,
+            "cycle {cycle}: one reaped tunnel is one new application connection"
+        );
+        // The replacement is pooled again, so the next cycle starts from the
+        // same state this one did.
+        wait_for_pooled(fx.inner_pool(), 1).await;
+    }
+
+    assert_eq!(fx.peer.connects(), CYCLES + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2366,6 +2407,98 @@ async fn an_svid_rotation_drain_also_fences_a_lease_that_was_checked_out_across_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_entry_a_retirement_superseded_is_evicted_at_checkout_not_served() {
+    // The ENTRY half of the drain fence (the lease half is the two tests
+    // above). A whole-pool retirement advances the generation FIRST and then
+    // walks the map shard by shard, so a checkout that reads the LEASE
+    // generation after the bump can still win a shard the walk has not reached
+    // and find the entry sitting there. Without a per-entry stamp it would be
+    // handed out, serve a request on material the drain retired, and be filed
+    // straight back under the same key with the CURRENT generation — which both
+    // check-in fence reads then accept, and every later hit refreshes its idle
+    // clock. Nothing else catches it: a CRL reload changes neither the key's
+    // leaf fingerprint nor its recorded credential deadline.
+    //
+    // `retire_svid_fingerprints` with a fingerprint this key does NOT carry
+    // reproduces exactly that state through the production API: the fence is
+    // advanced for the whole pool, and the retain pass leaves this entry
+    // resident because its key names another leaf.
+    let fx = fixture(AppBehaviour::Ok, true).await;
+    let parts = fx.identity.parts(HboneInnerProtocol::Http1);
+
+    fx.request().await.expect("first request");
+    wait_for_pooled(fx.pool.inner_pool(), 1).await;
+
+    fx.pool
+        .inner_pool()
+        .retire_svid_fingerprints(&[Arc::from("some-other-leaf-fingerprint")]);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        1,
+        "the entry is still resident — which is precisely the state the entry \
+         stamp has to catch"
+    );
+
+    let evictions_before = fx.pool.inner_pool().stats().evictions;
+    assert!(
+        fx.pool
+            .inner_pool()
+            .checkout_h1(&parts, true, fx.identity.credential.leaf_deadline)
+            .is_none(),
+        "an entry a retirement superseded must be EVICTED at checkout — never \
+         handed out, and never laundered by adopting the caller's generation"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "and it must leave the pool rather than stay reachable"
+    );
+    assert!(
+        fx.pool.inner_pool().stats().evictions > evictions_before,
+        "the refusal is an eviction, not a silent skip"
+    );
+
+    // The next request therefore pays a fresh CONNECT the destination judges
+    // under the CURRENT policy, which is the whole point of the fence.
+    fx.request().await.expect("request after the retirement");
+    assert_eq!(fx.peer.connects(), 2);
+    assert_eq!(fx.app.accepts(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_carrier_a_retirement_superseded_is_evicted_at_checkout() {
+    // The nested-HTTP/2 half of the same fence. Milder than H1 — a checkout
+    // clones and leaves the carrier resident, so a drain's own clear still
+    // removes it — but a carrier taken out of a shard the walk has not reached
+    // would still carry RPCs under retired material for as long as it lived.
+    let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    let parts = fx.identity.parts(HboneInnerProtocol::H2);
+
+    let nested = open_fresh_h2(&fx).await;
+    drop(publish_fresh_h2(&fx, &parts, &nested));
+    assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
+
+    fx.pool
+        .inner_pool()
+        .retire_svid_fingerprints(&[Arc::from("some-other-leaf-fingerprint")]);
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        1,
+        "the retain pass leaves a carrier filed under another leaf resident"
+    );
+
+    assert!(
+        fx.pool.inner_pool().checkout_h2(&parts).is_none(),
+        "a nested carrier a retirement superseded must be evicted, not cloned"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "and it must leave the pool rather than stay reachable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drain_between_the_outer_dial_and_publication_never_pools_the_nested_sender() {
     // `open_hbone_grpc_sender` snapshots the retirement generation BEFORE
     // `get_tunnel_via`, so a drain that lands while the CONNECT and the nested
@@ -2386,7 +2519,7 @@ async fn a_drain_between_the_outer_dial_and_publication_never_pools_the_nested_s
         HboneInnerH2Publication {
             peer_advertises_fence: nested.advertised,
             source_material_unchanged: true,
-            peer_max_streams: nested.peer_max_streams(),
+            load: nested.load.clone(),
             credential_deadline: fx.identity.credential.leaf_deadline,
             generation,
         },
@@ -2426,7 +2559,7 @@ async fn source_material_that_moved_during_the_dial_refuses_the_nested_publicati
             // The gateway's SVID, CRL slot, or leaf fingerprint moved while
             // this dial was in flight.
             source_material_unchanged: false,
-            peer_max_streams: nested.peer_max_streams(),
+            load: nested.load.clone(),
             credential_deadline: fx.identity.credential.leaf_deadline,
             generation: fx.pool.inner_pool().drain_generation(),
         },
@@ -2508,13 +2641,15 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
         send_rpc(&mut first.sender).await.expect("first rpc"),
         StatusCode::OK
     );
-    // Whatever the nested peer advertised is what the pool must respect; the
-    // test drives itself from the observed value rather than assuming one.
+    // The fixture application advertises `SETTINGS_MAX_CONCURRENT_STREAMS: 1`,
+    // and the pool must see exactly that — not hyper's pre-settings default of
+    // 100, which a one-shot sample taken at spawn time records for every peer
+    // and which silently disables the widen decision this test is about.
+    first.await_peer_max_streams(1).await;
     let cap = first.peer_max_streams();
-    assert!(
-        (1..=256).contains(&cap),
-        "the nested peer must advertise a small finite \
-         SETTINGS_MAX_CONCURRENT_STREAMS for a carrier to be saturable; got {cap}"
+    assert_eq!(
+        cap, 1,
+        "the carrier must record the cap the nested peer really advertised"
     );
     let publish_lease = publish_fresh_h2(&fx, &parts, &first);
     drop(publish_lease);
@@ -2544,6 +2679,7 @@ async fn nested_h2_carriers_widen_when_every_incumbent_is_at_the_peers_stream_ca
         send_rpc(&mut second.sender).await.expect("second rpc"),
         StatusCode::OK
     );
+    second.await_peer_max_streams(cap).await;
     // The publication itself is this dispatch's first hold on the sibling.
     let second_lease = publish_fresh_h2(&fx, &parts, &second);
     assert_eq!(
@@ -2614,6 +2750,91 @@ async fn a_nested_publication_that_loses_the_width_race_is_accounted_as_a_discar
         fx.pool.inner_pool().stats().discards,
         discards_after_first + 1,
         "and the losing sender is accounted as a healthy-but-unpooled discard"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_alive_off_never_publishes_a_nested_carrier_and_fences_no_lease() {
+    // The nested-HTTP/2 half of `keep_alive_off_never_consults_or_fills_the_idle_set`.
+    //
+    // The asymmetry would be worse than an inconsistency. A keep-alive-off
+    // proxy is SKIPPED by `collect_live_hbone_inner_routes`, so its key is
+    // never in the live set any publication is compared against; a carrier
+    // resident under it would therefore be retired on EVERY publication, and
+    // every retirement advances the drain generation, which fences every
+    // outstanding lease POOL-WIDE. One route with keep-alive off would cost one
+    // extra CONNECT per in-flight plain-HTTP HBONE request on every other key,
+    // once per config publication.
+    let mut fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    // A route the published generation CAN name, so the retention pass below is
+    // allowed to speak about it at all.
+    fx.identity.proxy_lifecycle_generation = Some(5);
+
+    let mut off = base_identity(
+        fx.identity.credential.clone(),
+        fx.identity.peer_id.clone(),
+        &fx.identity.app_host,
+        fx.identity.app_port,
+        fx.identity.hbone_port,
+    );
+    off.proxy_id = "hbone-inner-pool-no-keep-alive".to_string();
+    off.proxy_lifecycle_generation = Some(6);
+    off.pool_config = PoolConfig {
+        enable_http_keep_alive: false,
+        ..PoolConfig::default()
+    };
+    let off_parts = off.parts(HboneInnerProtocol::H2);
+
+    assert!(
+        fx.pool.inner_pool().checkout_h2(&off_parts).is_none(),
+        "keep-alive off never reuses a nested carrier"
+    );
+
+    let nested = open_fresh_h2(&fx).await;
+    let discards_before = fx.pool.inner_pool().stats().discards;
+    drop(publish_fresh_h2(&fx, &off_parts, &nested));
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "a nested carrier under a route with keep-alive off is never published"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().stats().discards,
+        discards_before + 1,
+        "and the unpooled sender is accounted as a discard, which is the \
+         pre-reuse cost — never an error"
+    );
+
+    // A carrier under an ordinary keep-alive-ON route IS pooled, so the pool is
+    // not empty for the publication below to walk.
+    let on_parts = fx.identity.parts(HboneInnerProtocol::H2);
+    let live_carrier = open_fresh_h2(&fx).await;
+    drop(publish_fresh_h2(&fx, &on_parts, &live_carrier));
+    assert_eq!(fx.pool.inner_pool().pooled_connections(), 1);
+
+    // Because nothing is resident under the keep-alive-off route, a publication
+    // that omits it — as EVERY publication does, since
+    // `collect_live_hbone_inner_routes` skips a keep-alive-off proxy — retires
+    // nothing, and therefore does not advance the drain generation that fences
+    // every outstanding lease pool-wide.
+    let mut live = std::collections::HashSet::new();
+    live.insert(route_of(&on_parts));
+    assert!(
+        !live.contains(&route_of(&off.parts(HboneInnerProtocol::H2))),
+        "the keep-alive-off route is deliberately absent from the live set"
+    );
+    let before = fx.pool.inner_pool().drain_generation();
+    fx.pool.inner_pool().retain_live_routes(&live);
+    assert_eq!(
+        fx.pool.inner_pool().drain_generation(),
+        before,
+        "a keep-alive-off route must not make every publication fence every \
+         outstanding lease pool-wide"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        1,
+        "and the live route's own carrier must survive the publication"
     );
 }
 

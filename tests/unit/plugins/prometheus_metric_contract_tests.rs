@@ -749,6 +749,13 @@ fn representative_exposition() -> String {
         ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolProtocol::H2,
         ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolEvent::Miss,
     );
+    // A check-in a retirement refused carries its OWN `event` value, so an
+    // operator can tell "the destination stopped advertising the fence" apart
+    // from "a trust drain cut live leases".
+    registry.record_hbone_inner_pool_event(
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolProtocol::Http1,
+        ferrum_edge::plugins::prometheus_metrics::HboneInnerPoolEvent::Fenced,
+    );
     let mut stream_err = make_stream_summary("stream-proxy", "tcp");
     stream_err.error_class = Some(ferrum_edge::retry::ErrorClass::DnsLookupError);
     registry.record_stream(&stream_err);

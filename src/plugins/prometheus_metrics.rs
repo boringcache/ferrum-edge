@@ -233,6 +233,17 @@ pub enum HboneInnerPoolEvent {
     /// does not advertise the admission fence, keep-alive is off, the source
     /// credential deadline had elapsed, or a bound was reached.
     Discard,
+    /// A check-in or publication a RETIREMENT refused: a trust drain, an SVID
+    /// rotation, or a publication that withdrew the route ran while the lease
+    /// was outstanding, so the connection was dropped rather than filed back
+    /// under its old key.
+    ///
+    /// Deliberately its own label value rather than part of [`Self::Discard`]
+    /// (issue #5042 step 2 re-review): a discard says the destination did not
+    /// offer reuse or a bound was reached, while this is the security-relevant
+    /// event — revocation reached a live lease. An operator cannot act on the
+    /// second without being able to see it apart from the first.
+    Fenced,
 }
 
 impl HboneInnerPoolEvent {
@@ -242,6 +253,7 @@ impl HboneInnerPoolEvent {
             Self::Miss => "miss",
             Self::Eviction => "eviction",
             Self::Discard => "discard",
+            Self::Fenced => "fenced",
         }
     }
 }
@@ -252,7 +264,8 @@ impl HboneInnerPoolEvent {
 /// Deliberately NOT keyed by proxy or namespace: the pool is process-wide and
 /// bounded globally, so the useful operator question is "is reuse working on
 /// this gateway", not "on this route". Both labels are compiled-in constants,
-/// so the family is eight series at most.
+/// so the family is ten series at most — two inner wire protocols times the
+/// five [`HboneInnerPoolEvent`] values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HboneInnerPoolEventKey {
     pub protocol: &'static str,
@@ -1955,8 +1968,8 @@ impl MetricsRegistry {
     /// Record one inner-application-connection pool event inside a fenced
     /// HBONE tunnel (issue #5042 step 2).
     ///
-    /// Both labels are compiled-in constants, so this family is bounded at
-    /// eight series regardless of traffic, principals, or destinations.
+    /// Both labels are compiled-in constants, so this family is bounded at ten
+    /// series regardless of traffic, principals, or destinations.
     pub fn record_hbone_inner_pool_event(
         &self,
         protocol: HboneInnerPoolProtocol,
@@ -4661,7 +4674,7 @@ impl MetricsRegistry {
 
         if !self.hbone_inner_pool_event_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_mesh_hbone_inner_pool_events_total Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome.\n",
+                "# HELP ferrum_mesh_hbone_inner_pool_events_total Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome (hit, miss, eviction, discard, fenced).\n",
             );
             output.push_str("# TYPE ferrum_mesh_hbone_inner_pool_events_total counter\n");
             for entry in self.hbone_inner_pool_event_counter.iter() {

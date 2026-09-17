@@ -121,7 +121,7 @@
 //!
 //!   The set is bounded the way the OUTER pool bounds its own
 //!   (`hbone_pool::select_least_loaded` + `record_peer_max_streams`, issue
-//!   #5465): every carrier records the nested peer's
+//!   #5465): every carrier tracks the nested peer's
 //!   `SETTINGS_MAX_CONCURRENT_STREAMS` and counts the dispatches holding it,
 //!   checkout picks the LEAST LOADED carrier with room under that cap, and a
 //!   key whose carriers are all at their cap opens another — up to
@@ -134,6 +134,23 @@
 //!   outer stream budget; a deployment that needs more concurrent RPCs to one
 //!   destination than `cap x width` must raise
 //!   `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` (see `docs/mesh.md`).
+//!
+//!   That cap is kept CURRENT by the carrier's own connection driver, not
+//!   sampled once (issue #5042 step 2 re-review). hyper exposes
+//!   `current_max_send_streams()` on the `Connection`, never on the
+//!   `SendRequest` the pool holds, and the value it reports right after
+//!   `h2c_preface::await_peer_settings` is still hyper's
+//!   `DEFAULT_INITIAL_MAX_SEND_STREAMS` (100): observing the peer's SETTINGS
+//!   BYTES is not the same as `h2` having applied them, which it defers until
+//!   it writes the SETTINGS ACK. A single sample therefore recorded 100 for a
+//!   destination advertising 8, `is_saturated()` never fired, and RPCs 9..100
+//!   queued pending-open behind the peer's real cap — the head-of-line
+//!   queueing the width exists to avoid. The dial in
+//!   `grpc_proxy::open_hbone_grpc_sender` instead creates the
+//!   [`HboneInnerH2Load`] BEFORE spawning the driver and wraps the connection
+//!   future so every poll stores the connection's current value into it, so
+//!   the pool reads whatever the peer last advertised — including a cap the
+//!   peer lowers mid-connection.
 //!
 //! # Revocation reaches a pooled connection
 //!
@@ -168,6 +185,28 @@
 //!    dialled), and the check-in compares that value before AND after its
 //!    insert. A lease that straddled a drain is discarded and the next request
 //!    pays a fresh CONNECT the destination judges under the CURRENT policy.
+//!
+//!    Clearing the maps is not the whole of the ENTRY side either, because the
+//!    clear takes each shard lock in turn: a checkout can win a shard the pass
+//!    has not reached yet and take a pre-drain entry. The two whole-pool
+//!    retirements therefore also advance
+//!    [`HboneInnerConnectionPool::entry_drain_generation`], which every entry
+//!    is stamped with at insert and every checkout re-reads INSIDE the shard
+//!    guard — evicting a superseded entry rather than handing it out, and never
+//!    laundering it by adopting the caller's generation. That counter is
+//!    deliberately NOT advanced by `retain_live_routes`, which removes the keys
+//!    it retires by name and would otherwise evict every resident entry on any
+//!    publication that withdrew anything.
+//!
+//!    The sibling that already carries this exact rule is
+//!    `unix_backend_pool::take_idle_h1`, which reads its publication
+//!    generation inside the shard guard and refuses a mismatch rather than
+//!    re-stamping it. The EXCLUSIVE-lease shape is what makes the stamp
+//!    load-bearing on the H1 leg: the entry is REMOVED from the map at
+//!    checkout, so a drain's own pass can never reach it again. The outer
+//!    [`super::hbone_pool`] and [`super::mesh_mtls_pool`] instead hand out
+//!    clones and leave their entries resident — the milder shape this module's
+//!    H2 leg has — and neither is changed by this issue.
 //!    The nested-HTTP/2 publication carries the same fence, plus the outer
 //!    pool's own mid-dial refusal: a gateway SVID slot, CRL slot, or leaf
 //!    fingerprint that moved during the dial means the outer pool declined to
@@ -361,7 +400,10 @@ pub struct HboneSourceCredential {
 /// allocations. A lease that is actually handed out owns one `String` copy of
 /// the key — it has to outlive the borrowed dispatch frame to be filed back
 /// under the same identity — which is one allocation per dispatch that reaches
-/// a lease, against the CONNECT plus inner handshake it replaces.
+/// a lease, against the CONNECT plus inner handshake it replaces. The check-in
+/// itself adds none: it reaches an already-resident key through
+/// `DashMap::get_mut`, and only a genuine FIRST insert under a key pays the
+/// second copy `DashMap::entry` requires.
 pub struct HboneInnerKeyParts<'a> {
     pub protocol: HboneInnerProtocol,
     pub namespace: &'a str,
@@ -642,6 +684,11 @@ struct IdleH1 {
     /// Process-unique id, so the check-in's second fence read withdraws exactly
     /// the entry it inserted and never a newer replacement under the same key.
     id: u64,
+    /// [`HboneInnerConnectionPool::entry_drain_generation`] when this entry was
+    /// inserted. Read again INSIDE the shard guard on checkout; a mismatch is
+    /// an eviction, never a hand-out. See
+    /// [`HboneInnerConnectionPool::entry_drain_generation`].
+    entry_generation: u64,
     sender: HboneInnerH1Sender,
     last_used_at: AtomicU64,
     idle_timeout_seconds: u64,
@@ -665,16 +712,26 @@ pub struct HboneInnerH2Load(Arc<HboneInnerH2LoadInner>);
 struct HboneInnerH2LoadInner {
     /// Dispatches currently holding a clone of this carrier's sender.
     ///
-    /// An APPROXIMATION of in-flight streams, deliberately: it is incremented
-    /// when a dispatch takes the sender and decremented when that dispatch
-    /// drops it, which brackets the request send and the response headers but
-    /// not necessarily the last body frame. Erring low only delays growth, and
-    /// a burst above the peer's real cap still queues inside `h2` exactly as it
-    /// does today — so the counter can never make the transport WORSE than the
-    /// unbounded shape it replaces.
+    /// An APPROXIMATION of in-flight streams, and the approximation is
+    /// specific: the hold is the `GrpcPooledSender` the gRPC dispatch owns, so
+    /// it is released when that dispatch function RETURNS — which for a
+    /// streaming RPC is at the RESPONSE HEADERS, not at stream end. A
+    /// server-streaming or bidirectional RPC whose response body and trailers
+    /// keep flowing for minutes therefore stops being counted long before its
+    /// `h2` stream closes, so a carrier can read as idle while it is still
+    /// carrying streams and `is_saturated()` under-reports saturation on
+    /// exactly the long-lived shapes where it would matter most. The
+    /// consequence is bounded and one-directional: the key widens LATER than
+    /// ideal, and a burst above the peer's real cap still queues pending-open
+    /// inside `h2` exactly as the unpooled path did — never an error, and never
+    /// more streams than the peer will accept. Making it exact means carrying
+    /// the hold on the response body and trailers the way the H1 streaming
+    /// lease travels on `ProxyBody`, which `GrpcStreamingResponse` has no seam
+    /// for today.
     active_rpcs: AtomicUsize,
-    /// The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last
-    /// sample; `usize::MAX` until sampled or when the peer advertises none.
+    /// The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as the carrier's
+    /// connection driver last observed it; `usize::MAX` before the first poll
+    /// and when the peer advertises none.
     peer_max_streams: AtomicUsize,
 }
 
@@ -703,8 +760,10 @@ impl HboneInnerH2Load {
         self.0.active_rpcs.load(Ordering::Relaxed)
     }
 
+    /// The nested peer's advertised stream cap as of the driver's last poll.
+    /// `usize::MAX` before the peer's SETTINGS have been applied.
     #[inline]
-    fn peer_max_streams(&self) -> usize {
+    pub fn peer_max_streams(&self) -> usize {
         self.0.peer_max_streams.load(Ordering::Relaxed)
     }
 
@@ -723,17 +782,20 @@ impl HboneInnerH2Load {
 
     /// Record the nested peer's advertised stream cap.
     ///
-    /// The value is read by the CALLER, off
-    /// `hyper::client::conn::http2::Connection::current_max_send_streams` —
-    /// hyper exposes it on the connection, not on the `SendRequest` the pool
-    /// holds — once the app's own SETTINGS have been observed
-    /// (`h2c_preface::await_peer_settings`) and before the connection is
-    /// spawned. It is therefore sampled ONCE per carrier: a peer that later
-    /// lowers its cap is not re-observed, which can only make the pool widen
-    /// LATER than ideal and never make it exceed what `h2` will accept, since
-    /// `h2` queues a stream over the peer's real cap pending-open exactly as it
-    /// does today.
-    fn set_peer_max_streams(&self, max: usize) {
+    /// Called by the carrier's CONNECTION DRIVER after every poll, with
+    /// `hyper::client::conn::http2::Connection::current_max_send_streams()`.
+    /// hyper exposes that only on the `Connection`, never on the `SendRequest`
+    /// the pool holds, so the driver is the only place the value stays
+    /// current — and it has to stay current, because the value right after
+    /// `h2c_preface::await_peer_settings` is still hyper's pre-settings default
+    /// of 100 (`h2` defers applying the peer's SETTINGS until it writes the
+    /// ACK). A one-shot sample there recorded 100 for every destination and
+    /// silently disabled the widen decision; see the module doc.
+    ///
+    /// `Relaxed` is sufficient: the value only steers a widen heuristic, and a
+    /// stale read costs at most one late widen, never a stream `h2` will not
+    /// accept.
+    pub fn set_peer_max_streams(&self, max: usize) {
         self.0.peer_max_streams.store(max, Ordering::Relaxed);
     }
 }
@@ -765,10 +827,12 @@ pub struct HboneInnerH2Publication {
     /// are still the ones this dial started under
     /// (`HboneConnectionPool::source_dial_fence_intact`).
     pub source_material_unchanged: bool,
-    /// The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, read off the
-    /// connection after its SETTINGS were observed and before it was spawned.
-    /// `usize::MAX` when the peer advertises none.
-    pub peer_max_streams: usize,
+    /// The carrier's live load accounting, created by the dial BEFORE the
+    /// connection driver was spawned and kept current by that driver: every
+    /// poll stores `Connection::current_max_send_streams()` into it. Passing
+    /// the shared load rather than a one-shot `usize` is what keeps the widen
+    /// decision wired to the cap the peer actually advertised.
+    pub load: HboneInnerH2Load,
     /// The earliest SOURCE credential deadline admitting this carrier.
     pub credential_deadline: Option<tokio::time::Instant>,
     /// `HboneInnerConnectionPool::drain_generation` read BEFORE the dial.
@@ -786,6 +850,8 @@ pub struct HboneInnerH2Checkout {
 struct SharedH2 {
     sender: HboneInnerH2Sender,
     load: HboneInnerH2Load,
+    /// See [`IdleH1::entry_generation`].
+    entry_generation: u64,
     last_used_at: AtomicU64,
     idle_timeout_seconds: u64,
     credential_deadline: Option<tokio::time::Instant>,
@@ -815,6 +881,37 @@ impl KeySlot {
     fn is_empty(&self) -> bool {
         self.h1_idle.is_empty() && self.h2.is_empty()
     }
+
+    /// File `entry` unless this key already holds [`MAX_IDLE_H1_PER_KEY`] idle
+    /// senders. Returns the entry back when it was refused, so the caller
+    /// gives its residency slot back and accounts a discard.
+    fn try_push_h1(&mut self, entry: IdleH1) -> Option<IdleH1> {
+        if self.h1_idle.len() >= MAX_IDLE_H1_PER_KEY {
+            return Some(entry);
+        }
+        self.h1_idle.push(entry);
+        None
+    }
+
+    /// File `entry` unless this key already holds `width` live carriers. A
+    /// live incumbent set already at its width WINS: a concurrent cold miss
+    /// must not evict a carrier other RPCs are already multiplexed on.
+    fn try_push_h2(&mut self, entry: SharedH2, width: usize) -> Option<SharedH2> {
+        if self.h2.len() >= width {
+            return Some(entry);
+        }
+        self.h2.push(entry);
+        None
+    }
+
+    /// Drop every carrier whose connection has ended, and report how many
+    /// left. A closed incumbent is an EVICTION, not a silent replacement: it
+    /// leaves the pool and its residency slot goes back to the ceiling.
+    fn retire_closed_h2(&mut self) -> usize {
+        let before = self.h2.len();
+        self.h2.retain(|entry| !entry.sender.is_closed());
+        before.saturating_sub(self.h2.len())
+    }
 }
 
 /// A snapshot of this pool's own process-lifetime counters.
@@ -836,8 +933,11 @@ pub struct HboneInnerPoolStats {
     /// Connections that finished their exchange healthy but were NOT pooled: a
     /// peer that did not advertise the fence, keep-alive off, an elapsed
     /// credential deadline, source TLS material that moved during the dial, a
-    /// retirement that fenced the lease out, a key already at its width, or the
-    /// global ceiling.
+    /// key already at its width, or the global ceiling. A check-in a
+    /// RETIREMENT refused is counted separately — see
+    /// [`HboneInnerConnectionPool::fenced_checkins`] — because "the destination
+    /// stopped advertising the fence" and "a trust drain cut live leases" are
+    /// different operator questions.
     pub discards: u64,
     /// Inner connections currently resident in the pool.
     pub pooled: u64,
@@ -858,7 +958,35 @@ pub struct HboneInnerConnectionPool {
     /// lease that is CHECKED OUT — and therefore not in `entries` for any pass
     /// to reach — is fenced out at check-in instead of being re-inserted under
     /// its old key. See [`HboneInnerH1Checkout::generation`].
+    ///
+    /// This is the OUTSTANDING-LEASE half of the fence. The RESIDENT-ENTRY
+    /// half is [`Self::entry_drain_generation`]; the two are separate counters
+    /// on purpose.
     drain_generation: AtomicU64,
+    /// Monotonic ENTRY retirement generation, stamped onto every resident
+    /// entry at insert and re-read inside the shard guard on checkout.
+    ///
+    /// Deliberately a SECOND counter rather than [`Self::drain_generation`],
+    /// which [`Self::retain_live_routes`] also advances: stamping entries
+    /// against that value would evict every resident entry on any publication
+    /// that retired anything. This one is advanced ONLY by the two whole-pool
+    /// retirements — [`Self::drain_all`] and [`Self::retire_svid_fingerprints`]
+    /// — which are rare and for which the module already accepts over-broad
+    /// fencing.
+    ///
+    /// It closes the ENTRY-side half of the drain race (issue #5042 step 2
+    /// re-review). Both retirements bump FIRST and then walk `entries` shard by
+    /// shard; a checkout that read the lease fence after the bump and won the
+    /// shard race before the walk reached that shard would otherwise take a
+    /// pre-drain entry, serve a request on it, and stamp the CURRENT lease
+    /// generation onto its check-in — re-pooling, under its old key, a
+    /// connection built on CRL-revoked or rotated-out material, with every
+    /// later hit refreshing its idle clock. Stamping the entry is the only
+    /// thing that catches it: reading the generation after the take does not.
+    /// The sibling `unix_backend_pool::take_idle_h1` carries the same stamp and
+    /// the same rule — never hand it out, and never launder it by adopting the
+    /// caller's generation.
+    entry_drain_generation: AtomicU64,
     /// Source of [`IdleH1::id`].
     next_entry_id: AtomicU64,
     last_idle_prune_unix_secs: AtomicU64,
@@ -879,6 +1007,7 @@ impl HboneInnerConnectionPool {
             entries: DashMap::with_shard_amount(shard_amount.max(1)),
             pooled: AtomicUsize::new(0),
             drain_generation: AtomicU64::new(0),
+            entry_drain_generation: AtomicU64::new(0),
             next_entry_id: AtomicU64::new(0),
             last_idle_prune_unix_secs: AtomicU64::new(0),
             h1_hits: AtomicU64::new(0),
@@ -906,9 +1035,32 @@ impl HboneInnerConnectionPool {
         self.drain_generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// The current ENTRY retirement generation. Stamped onto an entry at
+    /// insert and compared against inside the shard guard on checkout.
     #[inline]
-    fn record_fenced_checkin(&self) {
+    fn entry_drain_generation(&self) -> u64 {
+        self.entry_drain_generation.load(Ordering::Acquire)
+    }
+
+    /// Supersede every RESIDENT entry. Called by the two whole-pool
+    /// retirements BEFORE their map pass, so an entry a concurrent checkout
+    /// snatches out of a shard the pass has not reached yet is still refused.
+    #[inline]
+    fn advance_entry_drain_generation(&self) {
+        self.entry_drain_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Account one check-in or publication a RETIREMENT refused.
+    ///
+    /// Deliberately its OWN `event` label value rather than folding into
+    /// `discard`: a discard says the destination did not offer reuse or a bound
+    /// was reached, while this says a revocation ran while a lease was
+    /// outstanding. An operator cannot act on the second without being able to
+    /// see it apart from the first.
+    #[inline]
+    fn record_fenced_checkin(&self, protocol: HboneInnerProtocol) {
         self.fenced_checkins.fetch_add(1, Ordering::Relaxed);
+        self.record(protocol, HboneInnerPoolEvent::Fenced);
     }
 
     pub fn stats(&self) -> HboneInnerPoolStats {
@@ -1111,7 +1263,17 @@ impl HboneInnerConnectionPool {
     /// deadline it was pooled under.
     ///
     /// Every entry the scan rejects is EVICTED rather than skipped: a closed,
-    /// idle-expired, or credential-expired connection must not stay reachable.
+    /// idle-expired, credential-expired, or drain-superseded connection must
+    /// not stay reachable.
+    ///
+    /// The ENTRY retirement generation is read INSIDE the shard guard, after
+    /// the guard is taken — the sibling `unix_backend_pool::take_idle_h1` reads
+    /// it in exactly that position and for exactly this reason. A whole-pool
+    /// retirement bumps it and then walks the shards; holding this shard's
+    /// guard means the walk has either already passed here (and this entry
+    /// would be gone) or has not reached here yet (and the bump is visible in
+    /// this read). Either way an entry stamped with an older value is dropped,
+    /// never handed out and never re-stamped with the caller's generation.
     fn take_idle_h1(
         &self,
         key: &str,
@@ -1122,15 +1284,18 @@ impl HboneInnerConnectionPool {
         let mut taken = None;
         let mut emptied = false;
         if let Some(mut slot) = self.entries.get_mut(key) {
+            let entry_generation = self.entry_drain_generation();
             while let Some(entry) = slot.h1_idle.pop() {
-                if Self::entry_live(
-                    entry.sender.is_closed(),
-                    entry.last_used_at.load(Ordering::Relaxed),
-                    entry.idle_timeout_seconds,
-                    entry.credential_deadline,
-                    now,
-                    now_mono,
-                ) {
+                if entry.entry_generation == entry_generation
+                    && Self::entry_live(
+                        entry.sender.is_closed(),
+                        entry.last_used_at.load(Ordering::Relaxed),
+                        entry.idle_timeout_seconds,
+                        entry.credential_deadline,
+                        now,
+                        now_mono,
+                    )
+                {
                     taken = Some((entry.sender, entry.credential_deadline));
                     break;
                 }
@@ -1287,8 +1452,7 @@ impl HboneInnerConnectionPool {
         // connection that can never be pooled. `checkin_h1` re-evaluates the
         // fence in full; this only avoids the task.
         if pool.drain_generation() != checkout.generation {
-            pool.record_fenced_checkin();
-            pool.record_discard(HboneInnerProtocol::Http1);
+            pool.record_fenced_checkin(HboneInnerProtocol::Http1);
             return;
         }
         if checkout.sender.is_ready() {
@@ -1343,8 +1507,7 @@ impl HboneInnerConnectionPool {
         // Fence, first read.
         if self.drain_generation() != generation {
             drop(sender);
-            self.record_fenced_checkin();
-            self.record_discard(HboneInnerProtocol::Http1);
+            self.record_fenced_checkin(HboneInnerProtocol::Http1);
             return;
         }
         if !self.reserve_pooled() {
@@ -1352,34 +1515,47 @@ impl HboneInnerConnectionPool {
             return;
         }
         let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
-        let over_key_cap = {
+        let mut pending = Some(IdleH1 {
+            id: entry_id,
+            // The ENTRY fence, stamped at insert. A whole-pool retirement that
+            // already ran makes this stamp stale on arrival and the next
+            // checkout evicts instead of serving; one that runs afterwards is
+            // caught by the second read below or by its own map pass.
+            entry_generation: self.entry_drain_generation(),
+            sender,
+            last_used_at: AtomicU64::new(unix_secs()),
+            idle_timeout_seconds,
+            credential_deadline,
+        });
+        // Fast path: a key that is already resident needs no second copy of the
+        // key string, so a steady-state check-in allocates nothing. Only a
+        // genuine first insert pays `entry(key.clone())`.
+        let mut resident = false;
+        if let Some(mut slot) = self.entries.get_mut(key.as_str()) {
+            resident = true;
+            if let Some(entry) = pending.take() {
+                pending = slot.try_push_h1(entry);
+            }
+            // The shard guard is released HERE, before the second fence read.
+        }
+        if !resident {
             let mut slot = self
                 .entries
                 .entry(key.clone())
                 .or_insert_with(|| KeySlot::new(spans));
-            if slot.h1_idle.len() >= MAX_IDLE_H1_PER_KEY {
-                true
-            } else {
-                slot.h1_idle.push(IdleH1 {
-                    id: entry_id,
-                    sender,
-                    last_used_at: AtomicU64::new(unix_secs()),
-                    idle_timeout_seconds,
-                    credential_deadline,
-                });
-                false
+            if let Some(entry) = pending.take() {
+                pending = slot.try_push_h1(entry);
             }
             // The shard guard is released HERE, before the second fence read.
-        };
-        if over_key_cap {
+        }
+        if pending.is_some() {
             self.release_pooled(1);
             self.record_discard(HboneInnerProtocol::Http1);
             return;
         }
         // Fence, second read.
         if self.drain_generation() != generation && self.withdraw_h1_entry(&key, entry_id) {
-            self.record_fenced_checkin();
-            self.record_discard(HboneInnerProtocol::Http1);
+            self.record_fenced_checkin(HboneInnerProtocol::Http1);
         }
     }
 
@@ -1434,7 +1610,20 @@ impl HboneInnerConnectionPool {
     /// HTTP/2 carrier; a busy-but-live multiplexed sender is deliberately kept,
     /// since retiring one for transient stream backpressure would replace
     /// multiplexing with a connection per RPC.
+    ///
+    /// The dispatch's effective `pool_enable_http_keep_alive` gates this
+    /// exactly as it gates [`Self::checkout_h1`] (issue #5042 step 2
+    /// re-review). With it off nothing is ever published under this key, so
+    /// there is nothing to find — and, more importantly, an entry that DID
+    /// exist would be retired on every publication, because
+    /// `collect_live_hbone_inner_routes` skips a keep-alive-off proxy and
+    /// [`Self::retain_live_routes`] fences every outstanding lease POOL-WIDE
+    /// each time it retires anything.
     pub fn checkout_h2(&self, parts: &HboneInnerKeyParts<'_>) -> Option<HboneInnerH2Checkout> {
+        if !parts.pool_config.enable_http_keep_alive {
+            self.record_miss(HboneInnerProtocol::H2);
+            return None;
+        }
         self.maybe_prune();
         let now = unix_secs();
         let now_mono = tokio::time::Instant::now();
@@ -1444,25 +1633,32 @@ impl HboneInnerConnectionPool {
         with_hbone_inner_pool_key(parts, |key, _| {
             let mut emptied = false;
             if let Some(mut slot) = self.entries.get_mut(key) {
+                // The ENTRY retirement generation, read INSIDE the shard guard
+                // for the reason `take_idle_h1` states: a carrier a whole-pool
+                // drain has superseded is evicted here rather than cloned out
+                // of a shard the drain's walk has not reached yet.
+                let entry_generation = self.entry_drain_generation();
                 let before = slot.h2.len();
                 slot.h2.retain(|entry| {
-                    Self::entry_live(
-                        entry.sender.is_closed(),
-                        entry.last_used_at.load(Ordering::Relaxed),
-                        entry.idle_timeout_seconds,
-                        // The ENTRY's own bound, deliberately not folded with
-                        // the current request's. The two answer different
-                        // questions: whether this carrier may still exist (the
-                        // pool's job), and whether this request may still be
-                        // served (the request authorization lifetime's job,
-                        // decided before dispatch). Folding them would evict a
-                        // healthy multiplexed carrier — and every other RPC on
-                        // it — because ONE caller arrived with a short-lived
-                        // JWT.
-                        entry.credential_deadline,
-                        now,
-                        now_mono,
-                    )
+                    entry.entry_generation == entry_generation
+                        && Self::entry_live(
+                            entry.sender.is_closed(),
+                            entry.last_used_at.load(Ordering::Relaxed),
+                            entry.idle_timeout_seconds,
+                            // The ENTRY's own bound, deliberately not folded
+                            // with the current request's. The two answer
+                            // different questions: whether this carrier may
+                            // still exist (the pool's job), and whether this
+                            // request may still be served (the request
+                            // authorization lifetime's job, decided before
+                            // dispatch). Folding them would evict a healthy
+                            // multiplexed carrier — and every other RPC on
+                            // it — because ONE caller arrived with a
+                            // short-lived JWT.
+                            entry.credential_deadline,
+                            now,
+                            now_mono,
+                        )
                 });
                 evicted = before.saturating_sub(slot.h2.len());
                 // Least-loaded with room under the nested peer's stream cap,
@@ -1513,11 +1709,12 @@ impl HboneInnerConnectionPool {
     /// Never an error and never a refusal to the CALLER: it already owns the
     /// sender and serves its RPC on it either way, and the returned lease is
     /// its accounting hold whether or not the carrier was pooled. A peer that
-    /// did not advertise the fence, source TLS material that moved during the
-    /// dial, a retirement that landed during the dial, an elapsed credential
-    /// deadline, the global ceiling, and a key already at its
-    /// [`Self::shared_h2_width`] all leave the sender UNPOOLED — which is
-    /// exactly the per-request behaviour this module replaces.
+    /// did not advertise the fence, a dispatch with keep-alive off, source TLS
+    /// material that moved during the dial, a retirement that landed during
+    /// the dial, an elapsed credential deadline, the global ceiling, and a key
+    /// already at its [`Self::shared_h2_width`] all leave the sender
+    /// UNPOOLED — which is exactly the per-request behaviour this module
+    /// replaces.
     ///
     /// [`HboneInnerH2Publication::source_material_unchanged`] mirrors the
     /// refusal `HboneConnectionPool::get_tunnel_via` applies to the OUTER
@@ -1539,17 +1736,17 @@ impl HboneInnerConnectionPool {
         let HboneInnerH2Publication {
             peer_advertises_fence,
             source_material_unchanged,
-            peer_max_streams,
+            load,
             credential_deadline,
             generation,
         } = publication;
-        let load = HboneInnerH2Load::default();
-        // Recorded here, from the cap the caller read off the connection after
-        // its SETTINGS were observed, so the first checkout already knows the
-        // carrier's real width.
-        load.set_peer_max_streams(peer_max_streams);
+        // The caller's own hold on the carrier, taken whether or not the
+        // publication is accepted. The cap inside `load` is maintained by the
+        // carrier's connection driver, so it is already current here and stays
+        // current for as long as the carrier lives.
         let lease = load.lease();
         if !peer_advertises_fence
+            || !parts.pool_config.enable_http_keep_alive
             || !source_material_unchanged
             || sender.is_closed()
             || credential_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -1559,8 +1756,7 @@ impl HboneInnerConnectionPool {
         }
         // Fence, first read.
         if self.drain_generation() != generation {
-            self.record_fenced_checkin();
-            self.record_discard(HboneInnerProtocol::H2);
+            self.record_fenced_checkin(HboneInnerProtocol::H2);
             return lease;
         }
         if !self.reserve_pooled() {
@@ -1569,32 +1765,43 @@ impl HboneInnerConnectionPool {
         }
         let idle_timeout_seconds = Self::idle_timeout_seconds(parts.pool_config);
         let width = Self::shared_h2_width(parts.pool_config);
+        // The ENTRY fence, stamped at insert; see `checkin_h1`.
+        let entry_generation = self.entry_drain_generation();
         let (key, published, evicted) = with_hbone_inner_pool_key(parts, |key, spans| {
             let key = key.to_string();
-            let mut slot = self
-                .entries
-                .entry(key.clone())
-                .or_insert_with(|| KeySlot::new(spans));
-            // A closed incumbent is an EVICTION, not a silent replacement: it
-            // leaves the pool and its residency slot goes back to the ceiling.
-            let before = slot.h2.len();
-            slot.h2.retain(|entry| !entry.sender.is_closed());
-            let evicted = before.saturating_sub(slot.h2.len());
-            if slot.h2.len() >= width {
-                // A live incumbent set already at its width wins: a concurrent
-                // cold miss must not evict a carrier other RPCs are already
-                // multiplexed on.
-                return (key, false, evicted);
-            }
-            slot.h2.push(SharedH2 {
+            let mut pending = Some(SharedH2 {
                 sender: sender.clone(),
                 load: load.clone(),
+                entry_generation,
                 last_used_at: AtomicU64::new(unix_secs()),
                 idle_timeout_seconds,
                 credential_deadline,
             });
-            (key, true, evicted)
-            // The shard guard is released HERE, before the second fence read.
+            let mut evicted = 0usize;
+            // Fast path: a key that is already resident needs no second copy of
+            // the key string. Only a genuine first insert pays
+            // `entry(key.clone())`.
+            let mut resident = false;
+            if let Some(mut slot) = self.entries.get_mut(key.as_str()) {
+                resident = true;
+                evicted = slot.retire_closed_h2();
+                if let Some(entry) = pending.take() {
+                    pending = slot.try_push_h2(entry, width);
+                }
+                // The shard guard is released HERE, before the second fence read.
+            }
+            if !resident {
+                let mut slot = self
+                    .entries
+                    .entry(key.clone())
+                    .or_insert_with(|| KeySlot::new(spans));
+                evicted = slot.retire_closed_h2();
+                if let Some(entry) = pending.take() {
+                    pending = slot.try_push_h2(entry, width);
+                }
+                // The shard guard is released HERE, before the second fence read.
+            }
+            (key, pending.is_none(), evicted)
         });
         self.record_evictions(HboneInnerProtocol::H2, evicted);
         if !published {
@@ -1604,8 +1811,7 @@ impl HboneInnerConnectionPool {
         }
         // Fence, second read.
         if self.drain_generation() != generation && self.withdraw_h2_entry(&key, &load) {
-            self.record_fenced_checkin();
-            self.record_discard(HboneInnerProtocol::H2);
+            self.record_fenced_checkin(HboneInnerProtocol::H2);
         }
         lease
     }
@@ -1641,18 +1847,29 @@ impl HboneInnerConnectionPool {
     /// established under a rotated-out leaf stops being reachable at exactly
     /// the moment the outer sessions built from it do.
     ///
-    /// The retirement generation is advanced FIRST, deliberately for the WHOLE
-    /// pool rather than for the retired fingerprints alone: a lease that is
-    /// checked out right now is not in `entries` for this pass to examine, and
-    /// there is nothing on the pool side to compare it against without
-    /// re-deriving its key. A rotation is rare and the cost of the over-broad
-    /// fence is that concurrently-outstanding leases under OTHER fingerprints
-    /// pay one extra CONNECT each.
+    /// BOTH retirement generations are advanced FIRST, deliberately for the
+    /// WHOLE pool rather than for the retired fingerprints alone.
+    ///
+    /// The LEASE generation ([`Self::drain_generation`]) because a lease that
+    /// is checked out right now is not in `entries` for this pass to examine,
+    /// and there is nothing on the pool side to compare it against without
+    /// re-deriving its key. The ENTRY generation
+    /// ([`Self::entry_drain_generation`]) because this pass takes each shard
+    /// lock in turn, so a concurrent checkout can win a shard the pass has not
+    /// reached yet; without the stamp it would take a pre-retirement entry,
+    /// serve a request on it, and file it back under its old key.
+    ///
+    /// A rotation is rare, and the cost of the over-broad fence is that
+    /// concurrently-outstanding leases AND resident entries under OTHER
+    /// fingerprints pay one extra CONNECT each. Resident entries under another
+    /// fingerprint are left in the map by the retain below — nothing scans them
+    /// eagerly — and are evicted the next time a checkout examines them.
     pub fn retire_svid_fingerprints(&self, retired: &[Arc<str>]) {
         if retired.is_empty() {
             return;
         }
         self.advance_drain_generation();
+        self.advance_entry_drain_generation();
         let mut h1_dropped = 0usize;
         let mut h2_dropped = 0usize;
         self.entries.retain(|key, slot| {
@@ -1704,6 +1921,12 @@ impl HboneInnerConnectionPool {
     /// by design), so the published configuration cannot speak about it and
     /// treating its absence as a withdrawal would retire it on every
     /// publication. Those stay bounded by the idle timeout.
+    ///
+    /// This pass advances the LEASE generation only, never
+    /// [`Self::entry_drain_generation`]. It removes the keys it retires by
+    /// name, so it has no shard-walk race to close — and stamping entries
+    /// against a counter a publication advances would evict every RESIDENT
+    /// entry, on every key, each time any route was withdrawn.
     pub fn retain_live_routes(&self, live: &std::collections::HashSet<String>) {
         // Read-only first pass: a publication that withdraws nothing must not
         // advance the generation and fence every outstanding lease.
@@ -1750,14 +1973,28 @@ impl HboneInnerConnectionPool {
     /// clear the outer HBONE transports whole, and an inner connection is only
     /// ever as trustworthy as the tunnel it rides.
     ///
-    /// The retirement generation is advanced FIRST and that is what makes the
-    /// drain terminal. In-flight exchanges are NOT in `entries` — an exclusive
-    /// H1 lease is checked out precisely so that it is not — so clearing the
-    /// map cannot reach them; every lease outstanding right now is already
-    /// bound to a superseded generation and its check-in is fenced out,
-    /// whether it lands before or after the clear.
+    /// BOTH retirement generations are advanced FIRST, and that is what makes
+    /// the drain terminal. Clearing the map is only half of it, on both sides:
+    ///
+    /// * **Lease side.** In-flight exchanges are NOT in `entries` — an
+    ///   exclusive H1 lease is checked out precisely so that it is not — so
+    ///   clearing the map cannot reach them. Every lease outstanding at the
+    ///   instant of the bump is bound to a superseded
+    ///   [`Self::drain_generation`], so its check-in is refused whether it
+    ///   lands before or after the clear.
+    /// * **Entry side.** The clear takes each DashMap shard lock in turn, so a
+    ///   checkout that reads the lease generation after the bump can still win
+    ///   a shard the clear has not reached and take a PRE-DRAIN entry. It would
+    ///   then serve a request on material the drain retired and stamp its
+    ///   check-in with the CURRENT generation, which both fence reads accept —
+    ///   re-pooling it under its old key, with every later hit refreshing its
+    ///   idle clock. Nothing else catches that: a CRL reload changes neither
+    ///   the key's leaf fingerprint nor its recorded credential deadline. The
+    ///   per-entry [`Self::entry_drain_generation`] stamp does, inside the
+    ///   shard guard, by evicting rather than serving.
     pub fn drain_all(&self) {
         self.advance_drain_generation();
+        self.advance_entry_drain_generation();
         let mut h1_dropped = 0usize;
         let mut h2_dropped = 0usize;
         self.entries.retain(|_, slot| {

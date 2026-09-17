@@ -2944,7 +2944,7 @@
   {
     "name": "ferrum_mesh_hbone_inner_pool_events_total",
     "type": "counter",
-    "help": "Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome.",
+    "help": "Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome (hit, miss, eviction, discard, fenced).",
     "labels": [
       "protocol",
       "event",

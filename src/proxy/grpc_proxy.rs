@@ -3764,8 +3764,13 @@ fn hbone_dispatch_authority<'a>(
 /// The returned sender carries its carrier's load hold for the lifetime of this
 /// dispatch, which is how the pool knows a carrier has reached the nested
 /// peer's `SETTINGS_MAX_CONCURRENT_STREAMS` and must be widened rather than
-/// queued on. The width ceiling is `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`
-/// clamped by `hbone_inner_pool::MAX_SHARED_H2_PER_KEY`; see `docs/mesh.md`.
+/// queued on. That cap is not sampled once: the load is created here BEFORE the
+/// connection driver is spawned and the driver refreshes it from
+/// `Connection::current_max_send_streams()` after every poll, because the value
+/// available immediately after `await_peer_settings` is still hyper's
+/// pre-settings default. The width ceiling is
+/// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` clamped by
+/// `hbone_inner_pool::MAX_SHARED_H2_PER_KEY`; see `docs/mesh.md`.
 ///
 /// HTTP/2 PING keepalive is still deliberately NOT enabled on the inner
 /// connection. It is a stream on the outer pooled HBONE connection, which
@@ -3925,15 +3930,31 @@ async fn open_hbone_grpc_sender(
         ));
     }
 
-    // The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, read HERE: hyper
-    // exposes it on the `Connection`, never on the `SendRequest` the pool
-    // holds, so this is the last moment it can be observed — the SETTINGS have
-    // just been awaited above and the connection is about to be spawned. It is
-    // what lets the inner pool widen a key instead of queueing every RPC to one
-    // destination behind one carrier (issue #5042 step 2 review).
-    let inner_peer_max_streams = connection.current_max_send_streams();
+    // The nested peer's `SETTINGS_MAX_CONCURRENT_STREAMS` is what lets the
+    // inner pool widen a key instead of queueing every RPC to one destination
+    // behind one carrier, and it has to stay CURRENT (issue #5042 step 2
+    // re-review). hyper exposes `current_max_send_streams()` on the
+    // `Connection`, never on the `SendRequest` the pool holds, so the driver
+    // task below is the only place that can keep reading it — and a single
+    // sample taken right here would be wrong: `await_peer_settings` proves only
+    // that the peer's SETTINGS BYTES arrived, while `h2` defers applying them
+    // until it writes the SETTINGS ACK, so this early read still reports
+    // hyper's pre-settings `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100. Recording
+    // 100 for a destination advertising 8 left `is_saturated()` permanently
+    // false and queued RPCs 9..100 pending-open inside `h2`.
+    //
+    // The load is therefore created BEFORE the spawn and shared with the pool,
+    // and the driver stores the connection's current value after every poll.
+    let inner_h2_load = crate::proxy::hbone_inner_pool::HboneInnerH2Load::default();
+    let inner_h2_cap = inner_h2_load.clone();
     tokio::spawn(async move {
-        if let Err(e) = connection.await {
+        let driven = std::future::poll_fn(|cx| {
+            let polled = std::future::Future::poll(Pin::new(&mut connection), cx);
+            inner_h2_cap.set_peer_max_streams(connection.current_max_send_streams());
+            polled
+        })
+        .await;
+        if let Err(e) = driven {
             debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);
         }
     });
@@ -3953,7 +3974,7 @@ async fn open_hbone_grpc_sender(
             crate::proxy::hbone_inner_pool::HboneInnerH2Publication {
                 peer_advertises_fence,
                 source_material_unchanged,
-                peer_max_streams: inner_peer_max_streams,
+                load: inner_h2_load.clone(),
                 credential_deadline: inner_credential_deadline,
                 generation: inner_drain_generation,
             },
