@@ -12,6 +12,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use super::redis_resp::{
+    TIME_CMD, TIME_DENIED_REPLY, TIME_UNKNOWN_COMMAND_REPLY, encode_server_time,
+    host_clock_time_reply,
+};
+
 fn make_config(url: &str, tls: bool) -> RedisConfig {
     RedisConfig {
         url: url.to_string(),
@@ -774,10 +779,16 @@ fn recovery_ping_is_bounded_by_the_connect_timeout() {
     );
 }
 
-/// Accept TCP, optionally delay, then answer every RESP array command with +OK.
+/// Accept TCP, optionally delay, then answer every RESP array command with
+/// `+OK` — except the standalone `TIME` probe, which gets this host's clock.
 ///
 /// Used to simulate a Redis endpoint whose protocol handshake is delayed after
 /// TCP accept (the failure mode in issue #2310).
+///
+/// Framing is exact rather than a `*`-byte count, because `TIME` now has to be
+/// told apart from the rest: a `+OK` answer to it is a reply the client cannot
+/// pair with a clock, so it drops the connection unpublished and no pool slot
+/// is ever established. See [`super::redis_resp`].
 async fn spawn_delayed_redis_handshake_server(
     handshake_delay: Option<Duration>,
 ) -> (u16, oneshot::Sender<()>, Arc<AtomicUsize>) {
@@ -800,21 +811,30 @@ async fn spawn_delayed_redis_handshake_server(
                             tokio::time::sleep(delay).await;
                         }
                         let mut buf = vec![0_u8; 4096];
+                        let mut pending: Vec<u8> = Vec::new();
                         loop {
-                            match stream.read(&mut buf).await {
+                            let n = match stream.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    // Rough RESP command count: each top-level array
-                                    // begins with '*'. Enough for CLIENT SETINFO pipelines.
-                                    let commands = buf[..n].iter().filter(|&&b| b == b'*').count().max(1);
-                                    let mut reply = Vec::new();
-                                    for _ in 0..commands {
-                                        reply.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    if stream.write_all(&reply).await.is_err() {
-                                        break;
-                                    }
+                                Ok(n) => n,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            let mut reply = Vec::new();
+                            // Exactly one reply per fully received command, so
+                            // the client's in-flight accounting always matches
+                            // even when the redis crate pipelines its setup.
+                            while let Some((name, consumed)) = parse_resp_command(&pending) {
+                                pending.drain(..consumed);
+                                if name == "TIME" {
+                                    reply.extend_from_slice(&host_clock_time_reply());
+                                } else {
+                                    reply.extend_from_slice(b"+OK\r\n");
                                 }
+                            }
+                            if reply.is_empty() {
+                                continue;
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
                             }
                         }
                     });
@@ -2110,25 +2130,6 @@ fn batch_contains(batch: &[Vec<String>], command: &str) -> bool {
         .iter()
         .filter_map(|queued| queued.first())
         .any(|name| name.eq_ignore_ascii_case(command))
-}
-
-/// What a restrictive Redis ACL answers when `TIME` is not granted.
-const TIME_DENIED_REPLY: &[u8] = b"-NOPERM this user has no permissions to run 'time'\r\n";
-
-/// What a RESP-compatible server that does not implement `TIME` answers.
-const TIME_UNKNOWN_COMMAND_REPLY: &[u8] = b"-ERR unknown command 'TIME'\r\n";
-
-/// RESP encoding of a Redis `TIME` reply: Unix seconds and the microseconds
-/// inside that second, both as bulk strings.
-fn encode_server_time(now: Duration) -> Vec<u8> {
-    let seconds = now.as_secs().to_string();
-    let micros = now.subsec_micros().to_string();
-    format!(
-        "*2\r\n${}\r\n{seconds}\r\n${}\r\n{micros}\r\n",
-        seconds.len(),
-        micros.len()
-    )
-    .into_bytes()
 }
 
 /// Shared keyspace and counters of the fake server, cloned into each
@@ -4572,8 +4573,16 @@ async fn spawn_watch_then_drop_redis_server() -> (u16, oneshot::Sender<()>, Arc<
                             let commands =
                                 pending.iter().filter(|&&b| b == b'*').count().max(1);
                             let mut reply = Vec::new();
-                            for _ in 0..commands {
-                                reply.extend_from_slice(b"+OK\r\n");
+                            if chunk_contains(&pending, TIME_CMD) {
+                                // The standalone screening probe. `+OK` here is
+                                // not a clock, so the connection would never be
+                                // published and the WATCH sequence under test
+                                // would never run.
+                                reply.extend_from_slice(&host_clock_time_reply());
+                            } else {
+                                for _ in 0..commands {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
                             }
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -4667,8 +4676,15 @@ async fn spawn_set_then_drop_redis_server() -> (u16, oneshot::Sender<()>) {
                             }
                             let commands = buf[..n].iter().filter(|&&b| b == b'*').count().max(1);
                             let mut reply = Vec::new();
-                            for _ in 0..commands {
-                                reply.extend_from_slice(b"+OK\r\n");
+                            if chunk_contains(&buf[..n], TIME_CMD) {
+                                // The standalone screening probe: without a
+                                // clock the connection is dropped unpublished
+                                // and the `SET` under test never arrives.
+                                reply.extend_from_slice(&host_clock_time_reply());
+                            } else {
+                                for _ in 0..commands {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
                             }
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -5142,8 +5158,10 @@ fn parse_resp_command(buf: &[u8]) -> Option<(String, usize)> {
 /// `info_payload` as a bulk string. Once `after_info_reply` is set, every later
 /// command receives that raw reply instead of `+OK` — except `MULTI`, which is
 /// still answered `+OK` because that is what a real Cluster node does: it opens
-/// the transaction and redirects the keyed commands queued inside it. Counts
-/// accepted TCP connections and observed `INCR` commands.
+/// the transaction and redirects the keyed commands queued inside it. The
+/// standalone `TIME` screening probe gets this host's clock unless
+/// `after_info_reply` has claimed it. Counts accepted TCP connections and
+/// observed `INCR` commands.
 async fn spawn_topology_redis_server(
     info_payload: &'static str,
     after_info_reply: Option<&'static str>,
@@ -5193,6 +5211,11 @@ async fn spawn_topology_redis_server(
                                     && name != "MULTI"
                                 {
                                     reply.extend_from_slice(raw.as_bytes());
+                                } else if name == "TIME" {
+                                    // The standalone screening probe, answered
+                                    // only where `after_info_reply` has not
+                                    // already claimed every post-screen command.
+                                    reply.extend_from_slice(&host_clock_time_reply());
                                 } else {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }
@@ -5355,9 +5378,10 @@ fn command_count(chunk: &[u8]) -> usize {
 }
 
 /// Minimal RESP server: `+OK` to every command except `INFO` (per
-/// [`InfoBehavior`]) and `GET` (always a nil bulk string). `info_delay` /
-/// `get_delay` hold the corresponding reply *after* counting it, so a test can
-/// land a concurrent topology rejection while that exact operation is in flight.
+/// [`InfoBehavior`]), the standalone `TIME` screening probe (this host's
+/// clock), and `GET` (always a nil bulk string). `info_delay` / `get_delay`
+/// hold the corresponding reply *after* counting it, so a test can land a
+/// concurrent topology rejection while that exact operation is in flight.
 async fn spawn_screened_redis_server(
     info: InfoBehavior,
     info_delay: Duration,
@@ -5442,6 +5466,13 @@ async fn spawn_screened_redis_server_with_drop(
                                     // Accepted, authenticated, silent.
                                     InfoBehavior::Never => continue,
                                 }
+                            } else if chunk_contains(chunk, TIME_CMD) {
+                                // The standalone screening probe that follows a
+                                // usable `INFO`. A `+OK` is not a clock, so the
+                                // connection would be dropped unpublished and
+                                // every case below would observe a refused
+                                // endpoint instead of the behaviour under test.
+                                reply.extend_from_slice(&host_clock_time_reply());
                             } else if chunk_contains(chunk, GET_CMD) {
                                 gets.fetch_add(1, Ordering::Relaxed);
                                 conn_gets += 1;
@@ -5911,6 +5942,7 @@ const MULTI_ARG: &[u8] = b"MULTI";
 const EXEC_ARG: &[u8] = b"EXEC";
 const INCR_ARG: &[u8] = b"INCR";
 const INFO_ARG: &[u8] = b"INFO";
+const TIME_ARG: &[u8] = b"TIME";
 
 /// `GET`s one window contributes to a charge: one per older sub-bucket, plus
 /// one on the read-only sub-bucket AFTER the charged one. Only the charged
@@ -5925,10 +5957,11 @@ const CHARGE_COMMANDS_PER_WINDOW: usize = CHARGE_GETS_PER_WINDOW + 2;
 
 /// How the fake server answers the limiter's two transactions.
 ///
-/// A charge is `MULTI` / `GET` × K / `INCR` / `EXPIRE` / `EXEC` per window; the
-/// compensating transaction a refusal issues is `MULTI` / `DECR` / `EXPIRE` /
-/// `EXEC` per window. The server tells them apart by the queued commands, so a
-/// script never has to hardcode a reply length.
+/// A charge is `MULTI` / (`GET` × K / `INCR` / `EXPIRE`) per window / one
+/// trailing `TIME` for the whole transaction / `EXEC`; the compensating
+/// transaction a refusal issues is `MULTI` / `DECR` / `EXPIRE` / `EXEC` per
+/// window and carries no clock. The server tells them apart by the queued
+/// commands, so a script never has to hardcode a reply length.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionScript {
     /// The FIRST charge fails with a plain server error; every later charge
@@ -5948,9 +5981,15 @@ enum TransactionScript {
 }
 
 /// `EXEC` array for a charge: per window one `GET` per older sub-bucket (nil or
-/// an exhausted count), then `INCR` (the post-increment count) and `EXPIRE`.
+/// an exhausted count), then `INCR` (the post-increment count) and `EXPIRE`,
+/// and finally the one trailing `TIME` the charge queues once per transaction.
+///
+/// The trailing clock is there because this fixture answers the standalone
+/// probe with a clock, so the client is in server-clock mode and queues `TIME`
+/// last. Only the `EXPIRE`s are `.ignore()`d, so the client pairs
+/// `windows * REDIS_WINDOW_SUB_BUCKET_KEYS` counters plus that clock.
 fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
-    let values = windows * CHARGE_COMMANDS_PER_WINDOW;
+    let values = windows * CHARGE_COMMANDS_PER_WINDOW + 1;
     let mut reply = format!("*{values}\r\n").into_bytes();
     let older: &[u8] = if exhausted { b":9\r\n" } else { b"$-1\r\n" };
     // The charged sub-bucket's post-increment `INCR`, then its ignored `EXPIRE`.
@@ -5965,6 +6004,7 @@ fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
         }
         reply.extend_from_slice(charged);
     }
+    reply.extend_from_slice(&host_clock_time_reply());
     reply
 }
 
@@ -6046,8 +6086,10 @@ fn take_resp_command(pending: &mut Vec<u8>) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
-/// Screens clean on every connection and answers each `MULTI`/`EXEC` the
-/// limiter sends according to `script`.
+/// Screens clean on every connection — including the standalone `TIME` probe,
+/// which gets this host's clock so the client runs in the server-clock mode a
+/// real Redis puts it in — and answers each `MULTI`/`EXEC` the limiter sends
+/// according to `script`.
 async fn spawn_transaction_redis_server(script: TransactionScript) -> TransactionServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
@@ -6091,8 +6133,16 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                     let charge = queued
                                         .iter()
                                         .any(|command| command.eq_ignore_ascii_case(INCR_ARG));
+                                    let clocked = queued
+                                        .iter()
+                                        .any(|command| command.eq_ignore_ascii_case(TIME_ARG));
+                                    // A charge queues one trailing `TIME` for the
+                                    // whole transaction, not one per window, so
+                                    // it is excluded before the per-window
+                                    // commands are counted.
+                                    let ladder = queued.len() - usize::from(clocked);
                                     let windows = if charge {
-                                        queued.len() / CHARGE_COMMANDS_PER_WINDOW
+                                        ladder / CHARGE_COMMANDS_PER_WINDOW
                                     } else {
                                         queued.len() / 2
                                     };
@@ -6113,17 +6163,21 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                             reply.extend(compensation_reply(windows));
                                         }
                                         (TransactionScript::ChargeReplyIsUnpairable, true) => {
-                                            // One extra integer: the client
+                                            // One extra integer beyond the
+                                            // charge's own commands: the client
                                             // filters the ignored `EXPIRE`
                                             // slots by index, so the surviving
                                             // count no longer divides into
-                                            // whole sub-bucket ladders.
+                                            // whole sub-bucket ladders even
+                                            // after the trailing server clock
+                                            // is accounted for.
                                             let values = windows * CHARGE_COMMANDS_PER_WINDOW + 1;
                                             let mut unpairable =
-                                                format!("*{values}\r\n").into_bytes();
+                                                format!("*{}\r\n", values + 1).into_bytes();
                                             for _ in 0..values {
                                                 unpairable.extend_from_slice(b":1\r\n");
                                             }
+                                            unpairable.extend_from_slice(&host_clock_time_reply());
                                             reply.extend(unpairable);
                                         }
                                         (_, true) => reply.extend(charge_reply(windows, true)),
@@ -6140,8 +6194,19 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                     let bulk = format!("${len}\r\n{text}\r\n");
                                     reply.extend_from_slice(bulk.as_bytes());
                                 } else if in_transaction {
+                                    // Including the `TIME` a charge queues last:
+                                    // inside `MULTI` it is `+QUEUED` like every
+                                    // other command and answered by the `EXEC`
+                                    // array that `charge_reply` builds.
                                     queued.push(name);
                                     reply.extend_from_slice(b"+QUEUED\r\n");
+                                } else if name.eq_ignore_ascii_case(TIME_ARG) {
+                                    // The standalone screening probe. Answering
+                                    // a clock is what a real Redis does, and it
+                                    // is what puts the client in the
+                                    // server-clock mode `charge_reply` is
+                                    // shaped for.
+                                    reply.extend_from_slice(&host_clock_time_reply());
                                 } else {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }

@@ -34,6 +34,8 @@ use ferrum_edge::plugins::utils::replay_authority::{
     shared_health_snapshot, validate_scope_backend,
 };
 
+use super::redis_resp::{TIME_CMD, host_clock_time_reply};
+
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
 const RETENTION: Duration = Duration::from_secs(600);
 
@@ -2248,6 +2250,18 @@ fn replay_info_reply(chunk: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// The standalone `TIME` screening probe every established connection runs
+/// after its `INFO` screens, answered from the one shared fixture definition.
+///
+/// The replay authority never reads the server clock — it claims markers with
+/// `SET NX EX` — but it shares `RedisRateLimitClient`'s connection screening,
+/// and a connection that cannot answer `TIME` with a clock is dropped
+/// unpublished. A catch-all `+OK` therefore refuses the endpoint before any
+/// claim reaches it. See [`super::redis_resp`].
+fn replay_time_reply(chunk: &[u8]) -> Option<Vec<u8>> {
+    resp_contains(chunk, TIME_CMD).then(host_clock_time_reply)
+}
+
 fn resp_contains(chunk: &[u8], command: &[u8]) -> bool {
     chunk.windows(command.len()).any(|window| window == command)
 }
@@ -2328,6 +2342,8 @@ async fn spawn_claim_redis_server(
                                 }
                             } else if let Some(reply) = replay_info_reply(chunk) {
                                 reply
+                            } else if let Some(reply) = replay_time_reply(chunk) {
+                                reply
                             } else {
                                 // The redis crate pipelines connection setup, so
                                 // reply once per command array in the chunk.
@@ -2394,6 +2410,8 @@ async fn spawn_ping_silent_then_healthy_redis(
                                 continue;
                             }
                             let reply: Vec<u8> = if let Some(reply) = replay_info_reply(chunk) {
+                                reply
+                            } else if let Some(reply) = replay_time_reply(chunk) {
                                 reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
@@ -2957,6 +2975,8 @@ async fn spawn_ttl_observing_redis_server() -> (
                                 b"+OK\r\n".to_vec()
                             } else if let Some(reply) = replay_info_reply(chunk) {
                                 reply
+                            } else if let Some(reply) = replay_time_reply(chunk) {
+                                reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
                             };
@@ -3076,6 +3096,11 @@ async fn spawn_logging_redis_server(
                                 _ if resp_contains(chunk, INFO_CMD) => {
                                     replay_info_reply(chunk).expect("INFO chunk")
                                 }
+                                // Only after the shape-specific arms above: an
+                                // `AuthReject` peer rejects `TIME` like every
+                                // other command, and `ClusterInfo` is terminal
+                                // at `INFO` before the probe ever runs.
+                                _ if resp_contains(chunk, TIME_CMD) => host_clock_time_reply(),
                                 _ => b"+OK\r\n".repeat(resp_command_count(chunk)),
                             };
                             if stream.write_all(&reply).await.is_err() {
@@ -3297,6 +3322,8 @@ async fn spawn_memory_policy_redis(
                                 }
                             } else if resp_contains(chunk, INFO_CMD) {
                                 resp_bulk(CLUSTER_DISABLED_INFO)
+                            } else if let Some(reply) = replay_time_reply(chunk) {
+                                reply
                             } else {
                                 b"+OK\r\n".repeat(resp_command_count(chunk))
                             };

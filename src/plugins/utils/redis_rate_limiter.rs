@@ -220,6 +220,17 @@
 //! ordinary availability handling so `redis_failure_policy` decides
 //! ([`RedisRateLimitClient::probe_server_time`]).
 //!
+//! The probe is part of connection screening, so it runs for every consumer of
+//! this client, including the ones that never read the clock — the shared
+//! replay authority and `request_deduplication` claim markers with `SET NX EX`
+//! and order nothing on sub-buckets. That costs those deployments exactly one
+//! `TIME` per established connection, and an ACL that does not grant `TIME`
+//! simply selects local-clock mode, which they never consult. Keeping one
+//! screening path is deliberate: the screen is a property of the connection
+//! rather than of the caller that happens to open it, and a per-consumer
+//! exemption would add a second admission rule to audit for no availability
+//! the `NOPERM` / unknown-command verdicts do not already provide.
+//!
 //! **Changing clock mode moves the bucket base, and that is quarantined.**
 //! Local-clock mode has exactly one base (raw local) and server-clock mode has
 //! exactly one (local plus the learned offset), so a downgrade CLEARS the
