@@ -14,7 +14,6 @@
 //! replies live in exactly one place across the unit, integration, and
 //! functional targets.
 
-
 use std::time::{Duration, SystemTime};
 
 /// RESP bulk string of the `TIME` command name, as it appears on the wire.
