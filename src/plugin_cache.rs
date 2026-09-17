@@ -1142,6 +1142,23 @@ impl Plugin for PluginInstanceWrapper {
     fn is_authorize_plugin(&self) -> bool {
         self.inner.is_authorize_plugin()
     }
+    /// Both halves of the HBONE live-admission contract must be forwarded, and
+    /// together (issues #5042, #5583). Both trait defaults are `false`, so an
+    /// unforwarded pair resolves against THIS wrapper and silently reclassifies
+    /// whatever it wraps. Neither direction of that is acceptable, and they are
+    /// not symmetric: dropping `reevaluates_live_admission` would take a wrapped
+    /// `mesh_authz` out of every fence sweep — the stranded-decision failure the
+    /// reuse classification exists to prevent, and one the reuse half could not
+    /// see, because a wrapper reports on its own behalf — while dropping
+    /// `allows_hbone_inner_reuse` would fail closed but turn the capability off
+    /// for every route an operator happens to have given a `priority_override`
+    /// or a trigger. Neither may depend on how a plugin row was configured.
+    fn reevaluates_live_admission(&self) -> bool {
+        self.inner.reevaluates_live_admission()
+    }
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        self.inner.allows_hbone_inner_reuse()
+    }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }

@@ -2776,6 +2776,36 @@ impl Plugin for MeshAuthz {
         true
     }
 
+    /// Reusable exactly while no external authorization executor is bound
+    /// (issue #5583).
+    ///
+    /// The LOCAL ALLOW/DENY/AUDIT verdict is a pure evaluation of the request
+    /// context against the published slice, and every published generation
+    /// requests a fence sweep that re-runs it — that is what
+    /// `reevaluates_live_admission` above declares, and it is what makes the
+    /// elided CONNECTs safe: the one input that can change for a live tunnel is
+    /// the slice, and a slice change re-issues the verdict.
+    ///
+    /// CUSTOM delegation is the opposite. Its verdict comes from an external
+    /// service that can change its mind at any instant with no generation
+    /// change behind it, and a sweep deliberately does NOT re-consult it
+    /// ([`MESH_AUTHZ_REEVALUATION_METADATA_KEY`]) — the admission-time verdict
+    /// stands. Reuse would therefore buy one external `allow` and honour it for
+    /// an unbounded number of later operations.
+    ///
+    /// `ext_authz.is_none()` is the fail-closed reading of that. `Some` means
+    /// this workload is selected by at least one CUSTOM policy, so reuse is
+    /// refused for the whole generation even when this particular CONNECT
+    /// matched no CUSTOM rule. `None` means no executor exists at all: either
+    /// no CUSTOM policy is in play, or one is but its provider never bound — in
+    /// which case `run_custom_delegation` refuses every MATCHING request with
+    /// `ProviderUnbound`, so a CONNECT that matched one was rejected and no
+    /// such tunnel is alive to reuse. Either way no external verdict was ever
+    /// issued for a live tunnel under this generation, and none can be.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        self.ext_authz.is_none()
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
         // outbound capture leg is not judged at all (issue #4158). This is the

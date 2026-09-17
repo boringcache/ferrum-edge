@@ -288,6 +288,33 @@ impl Plugin for SpiffeIdentity {
         true
     }
 
+    /// Reusable (issue #5583) — the one credential-bearing plugin that is, and
+    /// only because the credential it reads is the exact one the HBONE
+    /// admission fence bounds.
+    ///
+    /// This plugin takes one per-request decision: derive the peer principal
+    /// from the connection's mTLS leaf and re-decide that leaf's time validity,
+    /// rejecting `403` once it is no longer current. Everything but the clock
+    /// is fixed for the tunnel's whole life — an established inbound mTLS
+    /// session is never re-handshaked, so every CONNECT on it carries the same
+    /// leaf and derives the same principal. The clock half is precisely what
+    /// the fence's credential gate re-issues (issue #5568): it retains that
+    /// leaf's `notAfter` as a monotonic `AdmittedLeafExpiry` and revokes the
+    /// tunnel `peer_expired` when it elapses (a bounded expiry watcher parks on
+    /// the earliest live deadline, so the revocation does not wait for a
+    /// publication), and it re-verifies the retained chain against the inbound
+    /// admission anchors in force, revoking `peer_trust` when it no longer
+    /// anchors. So the decision reuse elides is re-issued for the tunnel's
+    /// whole life, by the deadline AND by the trust change — case (2) of the
+    /// trait contract.
+    ///
+    /// This is NOT a precedent for bearer-credential plugins. The fence tracks
+    /// the mTLS leaf and nothing else; a `jwt_auth`/`oidc`/`key_auth` token's
+    /// own expiry reaches no live tunnel, and those plugins must keep refusing.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         if ctx.peer_spiffe_id.is_some() {
             return PluginResult::Continue;

@@ -6872,6 +6872,19 @@ pub struct ProxyState {
     /// effective-mode snapshot. Captured traffic selects before the handshake;
     /// direct traffic checks the resolved app-port mode after routing.
     pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
+    /// The ONE accepted mesh inbound admission artifact (issue #5574): the
+    /// enforced CRL records the inbound SPIFFE peer verifier polices, tagged
+    /// with the generation they were published under, PLUS the compiled peer
+    /// anchors the HBONE admission fence has put in force.
+    ///
+    /// Distinct from [`Self::shared_crls`], which is the BACKEND list outbound
+    /// pools read: this is the inbound half, and it is one object rather than
+    /// two so the handshake verifier, the CONNECT credential gate, and the
+    /// fence's sweep cannot decide the same question from different compiled
+    /// sets. Written only by [`Self::publish_mesh_inbound_crls`] and
+    /// [`Self::publish_mesh_inbound_trust_bundle`], which schedule the sweep a
+    /// rotation implies.
+    pub mesh_inbound_admission: crate::tls::SharedInboundAdmissionArtifact,
     /// Registry of live admitted HBONE tunnels and the sweep that re-applies
     /// their CONNECT admission gates on every epoch publication and inbound
     /// PeerAuthentication swap (issue #5042 step 1). Publication paths must
@@ -8914,6 +8927,37 @@ impl ProxyState {
             .publish_inbound_admission_trust(slot, bundle);
     }
 
+    /// Publish the CRL set the mesh inbound SPIFFE peer verifier enforces.
+    ///
+    /// This is the ONE writer of the enforced records inside
+    /// [`Self::mesh_inbound_admission`], and it exists for
+    /// the same reason [`Self::publish_mesh_inbound_trust_bundle`] does: an
+    /// established inbound mTLS session is never re-handshaked, so a CRL that
+    /// revokes an already-admitted peer leaf would otherwise take effect only
+    /// at that peer's NEXT handshake and leave its live tunnels flowing
+    /// (issue #5574).
+    ///
+    /// It goes through the admission fence's single publisher rather than
+    /// storing the slot directly, because the enforced records are an input to
+    /// the SAME compiled anchors the fence judges live tunnels and arriving
+    /// CONNECTs against. A direct store would leave those anchors policing the
+    /// records they were compiled with while the verifier enforced newer ones —
+    /// the two surfaces deciding the same question from different lists. The
+    /// publication therefore recompiles the in-force anchors WITH the new
+    /// records, advances the one in-force revision, and only then requests the
+    /// sweep that revokes a peer the records now revoke (`peer_revoked`) and
+    /// makes its next CONNECT refuse.
+    ///
+    /// Returns whether the enforced set actually changed. Republishing
+    /// byte-identical records publishes nothing and sweeps nothing, so a
+    /// periodic reload of an unchanged CRL file never turns into per-tunnel
+    /// certificate path building; a candidate that is unusable, or that the
+    /// anchors cannot be compiled with, takes no force at all.
+    pub fn publish_mesh_inbound_crls(&self, crls: crate::tls::CrlList) -> bool {
+        self.hbone_admission_fence
+            .publish_inbound_admission_crls(crls)
+    }
+
     /// Republish only the captured-listener-port → application-port alias table,
     /// carrying every other field of the live snapshot forward.
     ///
@@ -9197,6 +9241,12 @@ impl ProxyState {
         // candidate never reaches this store, so previous verifiers,
         // generation, and probe tasks stay in service.
         self.shared_crls.store(active_crls);
+        // The same admitted generation on the INBOUND half: the mesh inbound
+        // SPIFFE peer verifier reads this slot on every handshake, and the
+        // HBONE admission fence re-judges already-admitted peers against it
+        // (issue #5574). Published from the candidate this method just
+        // validated, so a refused candidate never reaches either surface.
+        self.publish_mesh_inbound_crls(self.shared_crls.load_full());
         let pools = self.backend_pool_family();
         pools.clear_tls_config_caches();
         pools.force_drain_all();
@@ -9631,6 +9681,11 @@ impl ProxyState {
             env_config.tls_crl_expiry_warning_days,
         )?;
         let shared_crls = crate::tls::shared_crl_list(crls.clone());
+        // The inbound half of the same startup snapshot (issue #5574). It
+        // advances independently of `shared_crls` because only a rotation that
+        // changes the ENFORCED records may bump the generation: the fence
+        // treats a bump as "re-verify every live tunnel's chain".
+        let mesh_inbound_admission = crate::tls::inbound_admission_artifact(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
         let (backend_svid_rotation_tx, backend_svid_rotation_rx) =
             tokio::sync::watch::channel(0u64);
@@ -10116,6 +10171,7 @@ impl ProxyState {
         let hbone_admission_fence = Arc::new(hbone_admission_fence::HboneAdmissionFence::new(
             Arc::clone(&request_epoch),
             Arc::clone(&mesh_inbound_tls_policy),
+            Arc::clone(&mesh_inbound_admission),
         ));
 
         let state = Self {
@@ -10224,6 +10280,7 @@ impl ProxyState {
             mesh_trust_registry,
             mesh_inbound_tls,
             mesh_inbound_tls_policy,
+            mesh_inbound_admission,
             hbone_admission_fence,
             mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,

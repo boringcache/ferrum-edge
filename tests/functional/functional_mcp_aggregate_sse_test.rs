@@ -286,10 +286,10 @@ struct SseFixture {
 
 impl SseFixture {
     async fn start() -> Self {
-        Self::start_mode("aggregate_router").await
+        Self::start_mode("aggregate_router", "/mcp").await
     }
 
-    async fn start_mode(mode: &str) -> Self {
+    async fn start_mode(mode: &str, listen_path: &str) -> Self {
         // Pre-bound fixture listener: the socket is never dropped and rebound,
         // so it cannot race a port the gateway is about to claim.
         let upstream_listener = TcpListener::bind_test("127.0.0.1:0")
@@ -308,6 +308,7 @@ impl SseFixture {
         ));
 
         let mut config = aggregate_sse_config(upstream_port);
+        config.proxies[0].listen_path = Some(listen_path.to_string());
         if mode == "transparent_proxy" {
             config.plugin_configs[0].config = json!({
                 "mode": "transparent_proxy",
@@ -1511,43 +1512,61 @@ async fn post_raw_jsonrpc(
 #[ignore]
 async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants() {
     for mode in ["aggregate_router", "transparent_proxy"] {
-        let mut fixture = SseFixture::start_mode(mode).await;
+        // Route every variant to the plugin, including case variants that a
+        // narrower proxy route would reject before MCP dispatch.
+        let mut fixture = SseFixture::start_mode(mode, "/").await;
         let port = fixture.http_port();
         let client = reqwest::Client::builder()
             .timeout(READ_TIMEOUT)
             .build()
             .unwrap();
-        // A single trailing slash is the endpoint's alias (issue #5536) and is
-        // covered by the positive controls below; repeated slashes and
-        // descendants stay unknown endpoints.
-        for suffix in ["//", "/child"] {
+        let session = if mode == "aggregate_router" {
+            initialize_session(&client, port).await
+        } else {
+            "transparent-session".to_string()
+        };
+        // Even with a valid session, only the configured spelling is served.
+        // Aliases and descendants must not route, attach SSE, or delete it.
+        for path in [
+            "/mcp/",
+            "/mcp//",
+            "/mcp/child",
+            "/mcp/tools",
+            "/mcp/tools/",
+            "/MCP",
+            "/mCp/",
+            "/MCP/tools",
+        ] {
             for method in [
                 reqwest::Method::POST,
                 reqwest::Method::GET,
                 reqwest::Method::DELETE,
             ] {
                 let response = client
-                    .request(method, format!("{}{suffix}", mcp_url(port)))
+                    .request(method, format!("http://127.0.0.1:{port}{path}"))
                     .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header(SESSION_HEADER, &session)
+                    .header("mcp-protocol-version", PROTOCOL_VERSION)
                     .body(r#"{"jsonrpc":"2.0","id":1,"method":"session/echo"}"#)
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(response.status().as_u16(), 404, "{mode} {suffix}");
+                assert_eq!(response.status().as_u16(), 404, "{mode} {path}");
                 let body: Value = response.json().await.unwrap();
                 assert_eq!(body["error"]["code"], -32600);
+                assert_eq!(body["error"]["message"], "Unknown MCP endpoint");
+                assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    fixture.arrivals.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
             }
         }
-        assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
         // Positive controls use the same gateway and backend. A query does
-        // not alter endpoint selection, the exact endpoint still routes, and
-        // the single-trailing-slash alias routes through the same mediation.
-        let session = if mode == "aggregate_router" {
-            initialize_session(&client, port).await
-        } else {
-            "transparent-session".to_string()
-        };
-        for query in ["", "?x=1", "/"] {
+        // not alter endpoint selection, and the exact endpoint still routes
+        // with the session that the refused variants could not delete.
+        for query in ["", "?x=1"] {
             let post = tokio::spawn({
                 let client = client.clone();
                 let session = session.clone();
@@ -1568,7 +1587,11 @@ async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants(
             assert_eq!(response.status().as_u16(), 200);
             assert_eq!(wire_id(&response.text().await.unwrap()), "\"path-control\"");
         }
-        assert_eq!(fixture.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            fixture.arrivals.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         fixture.shutdown().await;
     }
 }
