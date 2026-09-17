@@ -150,7 +150,9 @@ shares.
 
 ## Functional Test Rules
 
-- Use `Stdio::null()` for gateway stdout/stderr unless the test reads the pipe. `Stdio::piped()` without reading can deadlock.
+- Capture startup output to files through `TestGateway` or `GatewayChildGuard::spawn`
+  for spawners using `wait_for_spawned_gateway`. Other spawners use `Stdio::null()`
+  unless they read their pipes. `Stdio::piped()` without reading can deadlock.
 - All functional/integration listener ports must use the cross-process registry
   in `tests/scaffolding/port_registry.rs`, including TCP, UDP/H3/DTLS, gRPC,
   stream listeners, raw backends and deliberately held wildcard listeners.
@@ -164,6 +166,11 @@ shares.
   preserve the bound socket and extend the lease until test-process exit.
   `drop_and_take_port` / `unbound_port` / `unbound_tcp_port` release only the
   socket for a consumer that binds itself; the lease survives the handoff.
+  These reservations and bare-port helpers exclude the host's ephemeral source
+  range (Linux `/proc/sys/net/ipv4/ip_local_port_range`, default 32768–60999 when
+  absent) from candidates 10240–65535. The generic harness uses the same policy.
+  Keep `reserve_refused_tcp_port` held for refused-connect fixtures; use
+  `reserve_future_tcp_port` for a future subprocess listener that starts refused.
   Native fixture sockets use `TestSocket::bind_test` with `127.0.0.1:0` (or the
   required wildcard/IPv6 address) and stay bound until their consumer finishes.
   Nonzero `bind_test` ports must already belong to the calling process.

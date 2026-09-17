@@ -115,6 +115,31 @@ where
     }
 }
 
+/// Deserialize an array of objects, rejecting positional arrays and scalars
+/// at every element. Each element retains `T`'s own field deserializers.
+pub fn deserialize_object_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Vec::<JsonObject<T>>::deserialize(deserializer)
+        .map(|objects| objects.into_iter().map(|object| object.0).collect())
+}
+
+/// Optional counterpart to [`deserialize_object_vec`]. Use `serde(default)`
+/// on the field to preserve absence; explicit `null` remains `None` and an
+/// empty array remains `Some(Vec::new())`.
+pub fn deserialize_optional_object_vec<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<JsonObject<T>>>::deserialize(deserializer)
+        .map(|objects| objects.map(|objects| objects.into_iter().map(|object| object.0).collect()))
+}
+
 /// `serde_json::from_slice` for a request body that must be a JSON object.
 ///
 /// A top-level array, string, number, boolean, or `null` is a parse error

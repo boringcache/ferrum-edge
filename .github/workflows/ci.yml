@@ -6029,11 +6029,17 @@ jobs:
         # Keep all-target lint below the hosted runner's peak-memory limit on
         # cold caches. Large integration targets can otherwise overlap several
         # clippy-driver processes and starve the runner heartbeat before Cargo
-        # has a chance to emit a diagnostic. Clippy does not need DWARF, so
-        # omit debuginfo (same as the test-artifact archives) to lower per-
-        # process RSS and allow modest parallel compilation again.
+        # has a chance to emit a diagnostic (the step then dies with exit 143
+        # and no output). Clippy does not need DWARF, so omit debuginfo (same
+        # as the test-artifact archives) to lower per-process RSS. Two parallel
+        # jobs were still enough to overlap two large integration targets on a
+        # cold cache once the test tree grew (2026-09-17: four consecutive
+        # kills on one branch, none on branches with a warm `ci-lint` cache),
+        # and the cache is only saved on success, so a cold branch never
+        # warmed. One job removes the overlap entirely; the cost is wall
+        # clock, not coverage.
         env:
-          CARGO_BUILD_JOBS: 2
+          CARGO_BUILD_JOBS: 1
         run: |
           cargo clippy \
             --config profile.test.debug=0 \

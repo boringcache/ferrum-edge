@@ -524,9 +524,10 @@ fn start_gateway(
         .stdout(stdout)
         .stderr(stderr);
 
-    // Release both ports only now, immediately before the child binds them.
-    drop(gateway);
-    drop(admin);
+    // Release only the sockets immediately before spawn. Retained leases keep
+    // a failed attempt's ports out of every subsequent reservation in this process.
+    gateway.drop_and_take_port();
+    admin.drop_and_take_port();
 
     let child = command.spawn()?;
     Ok((child, http_port, admin_port))
@@ -627,9 +628,8 @@ async fn start_gateway_with_retry(
 ) -> (std::process::Child, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        // `reserve_port_pair` fails only by being unable to bind a free
-        // ephemeral loopback port, which is the same contention this retry loop
-        // exists for — so it is retried, and exhausting the attempts is fatal.
+        // Each attempt gets fresh non-ephemeral ports: start_gateway retains
+        // earlier attempts' leases even after their sockets and children exit.
         let reserved = reserve_port_pair().await;
         let (gateway_reservation, admin_reservation) = match reserved {
             Ok(pair) => pair,
