@@ -91,7 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `redis_failure_policy` territory. Residual exposure is one sub-bucket of
   over-admission, bounded by the concurrent in-flight requests of a single
   gateway whose offset is stale (its first request after start, or one issued
-  after the offset went unrefreshed for longer than a sub-bucket). Run NTP on
+  after the offset went unrefreshed for longer than a sub-bucket) — and a
+  materially skewed gateway's first request is itself caught by the settlement
+  check, so it rebuilds once on the server clock and then self-corrects. Run NTP on
   every gateway host as ordinary hygiene; the request-quota ladder no longer
   rests on it. **If the endpoint's ACL refuses `TIME`** the client falls back to
   local-clock mode with a sampled warning, and the weaker contract applies:

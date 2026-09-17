@@ -2267,6 +2267,30 @@ impl KeyspaceServer {
     }
 }
 
+/// Every sub-bucket the fake keyspace holds, as `(sub_index, counter)`, oldest
+/// first.
+///
+/// Placement assertions read this rather than recomputing the expected index,
+/// so a sub-bucket boundary crossing between the traffic and the assertion
+/// cannot decide the result.
+fn charged_sub_buckets(server: &KeyspaceServer) -> Vec<(u64, i64)> {
+    let mut charged: Vec<(u64, i64)> = server
+        .keys()
+        .into_iter()
+        .map(|key| {
+            let index: u64 = key
+                .rsplit(':')
+                .next()
+                .expect("the key names its sub-bucket last")
+                .parse()
+                .expect("sub-bucket index");
+            (index, server.counter(&key))
+        })
+        .collect();
+    charged.sort_by_key(|(index, _)| *index);
+    charged
+}
+
 /// Minimal RESP server with a REAL integer keyspace and working `MULTI`/`EXEC`.
 ///
 /// `GET` answers the stored value (or nil), `INCR`/`DECR` mutate and answer the
@@ -2853,6 +2877,11 @@ async fn a_charge_transaction_teaches_the_client_the_server_clock() {
         limit: 5,
         duration: Duration::from_secs(1),
     }]);
+    // The FIRST request of a client's life has no offset yet, so it selects
+    // from the raw local clock — here 4800 sub-buckets from where this server
+    // orders charges. That is the documented first-request behaviour, and the
+    // settlement check is exactly what catches it: the ladder is handed back
+    // and rebuilt on the server clock the transaction returned.
     assert!(
         algorithm
             .check_redis(&client, "ip:127.0.0.1", &op)
@@ -2871,37 +2900,56 @@ async fn a_charge_transaction_teaches_the_client_the_server_clock() {
         "the learned offset must be the server's ten-minute lead, not zero: {offset}"
     );
 
-    // And the selection USED it: the one key the charge wrote names a
-    // sub-bucket ten minutes ahead of this process's clock. Read the index off
-    // the keyspace rather than recomputing it, so a sub-bucket boundary
-    // crossing between the charge and this assertion cannot decide the result.
-    let keys = server.keys();
+    let charged = charged_sub_buckets(&server);
     assert_eq!(
-        keys.len(),
-        1,
-        "exactly one sub-bucket was charged: {keys:?}"
+        charged.len(),
+        2,
+        "the local-clock pass and its rebuild on the server clock: {charged:?}"
     );
-    let sub_index: u64 = keys[0]
-        .rsplit(':')
-        .next()
-        .expect("the key names its sub-bucket last")
-        .parse()
-        .expect("sub-bucket index");
-    let server_bucket = RedisRateLimitClient::sub_bucket_at(client.server_clock().now(), 1);
-    let local_bucket = RedisRateLimitClient::sub_bucket_at(redis_epoch_now(), 1);
-    assert!(
-        sub_index.abs_diff(server_bucket.index) <= 1,
-        "the charge must sit in the SERVER-clock sub-bucket: charged={sub_index} \
-         server={}",
-        server_bucket.index
+    let (local_index, local_count) = charged[0];
+    let (server_index, server_count) = charged[1];
+    assert_eq!(
+        local_count,
+        0,
+        "the local-clock pass handed its charge back"
     );
+    assert_eq!(server_count, 1, "the rebuilt charge is the one that stands");
     // Ten minutes is 4800 sub-buckets of a one-second window, so a bucket
     // chosen on this process's own clock could never be mistaken for it.
     assert!(
-        sub_index.abs_diff(local_bucket.index) > 4_000,
-        "the charge must NOT sit in this process's own sub-bucket: \
-         charged={sub_index} local={}",
-        local_bucket.index
+        server_index - local_index > 4_000,
+        "the rebuilt bucket must be the SERVER's: local={local_index} \
+         server={server_index}"
+    );
+
+    // The offset is known now, so the NEXT request selects on the server clock
+    // straight away: one charge, no rollover, no rebuild.
+    let charges_before = server.incrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the second charge must land")
+            .allowed
+    );
+    assert_eq!(
+        server.incrs() - charges_before,
+        1,
+        "a learned offset means the next selection needs no rebuild"
+    );
+    let charged = charged_sub_buckets(&server);
+    let newest = charged.last().copied().expect("a charged sub-bucket");
+    assert!(
+        newest.0.abs_diff(server_index) <= 1,
+        "the second request must charge on the SERVER clock too: \
+         first={server_index} second={}",
+        newest.0
+    );
+    assert!(
+        newest.0.abs_diff(local_index) > 4_000,
+        "and never back on this process's own clock: local={local_index} \
+         second={}",
+        newest.0
     );
 
     let _ = server.shutdown.send(());
@@ -3164,11 +3212,13 @@ async fn a_charge_reply_with_an_extra_element_is_refused_in_server_clock_mode() 
         limit: 5,
         duration: Duration::from_secs(1),
     }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    // The probe runs when the pool slot is established — inside that first
+    // charge — so the mode is observable only afterwards.
     assert!(
         client.server_clock().server_time_permitted(),
         "this coverage is about the SERVER-CLOCK reply shape"
     );
-    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
     assert!(
         result.is_err(),
         "a reply one element longer than the ladder plus its clock must refuse: {result:?}"
@@ -3207,11 +3257,12 @@ async fn a_transaction_clock_this_code_cannot_read_fails_closed() {
         limit: 5,
         duration: Duration::from_secs(1),
     }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    // The probe runs on connect, inside that first charge.
     assert!(
         client.server_clock().server_time_permitted(),
         "the standalone probe must have succeeded for this to be the case under test"
     );
-    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
     assert!(
         result.is_err(),
         "an unreadable server clock must refuse, not read as a local instant: {result:?}"

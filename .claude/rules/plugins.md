@@ -709,7 +709,10 @@ on a native-gRPC request.
   `MULTI`/`EXEC` (no extra round trip), and `RedisServerClock` keeps a per-client
   `AtomicI64` offset (`server_time − local_time_at_reply`) refreshed by every
   successful `EXEC`; the NEXT request selects from `local_now + offset`. The
-  first request of a client's life has no offset and uses the raw local clock.
+  first request of a client's life has no offset and uses the raw local clock;
+  a materially skewed gateway therefore pays ONE rollover rebuild at startup and
+  self-corrects (covered by
+  `a_charge_transaction_teaches_the_client_the_server_clock`).
   Do NOT reintroduce a local post-`EXEC` sample: reply latency after `EXEC` is
   harmless (a later peer reads this request's own increment) while execution
   latency before it is the hazard, and conflating them rebuilt ladders for

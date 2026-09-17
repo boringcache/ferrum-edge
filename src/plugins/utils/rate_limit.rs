@@ -2288,7 +2288,10 @@ fn check_http_windows(
 /// successful `EXEC`, no extra round trip). Bucket selection and settlement are
 /// judged on the Redis server clock; the local clock is used only through that
 /// continuously corrected offset. The first request of a client's life has no
-/// offset yet and selects from the raw local clock.
+/// offset yet and selects from the raw local clock; if this process's clock is
+/// more than a sub-bucket from the server's, the settlement check below catches
+/// that first request, hands its charge back and rebuilds on the server clock,
+/// and every request after it selects correctly.
 ///
 /// That removes clock skew from the ladder's error budget entirely. What is
 /// left is the offset's own staleness — one Redis round trip plus jitter per

@@ -171,7 +171,12 @@
 //! and settlement are therefore judged on the Redis server clock; the local
 //! clock is used only through that continuously corrected offset. Before the
 //! first transaction of a client's life there is no offset yet, so that one
-//! request selects from the raw local clock.
+//! request selects from the raw local clock — and if this process's clock is
+//! more than a sub-bucket from the server's, the settlement check below catches
+//! it: that first request hands its charge back and rebuilds on the server
+//! clock, and every request after it selects correctly. A badly skewed gateway
+//! therefore pays one rebuild at startup and then self-corrects, rather than
+//! charging a ladder nobody else shares.
 //!
 //! Residual inter-gateway skew is then bounded by each gateway's own Redis
 //! round trip rather than by NTP discipline: the offset is learned from a reply
