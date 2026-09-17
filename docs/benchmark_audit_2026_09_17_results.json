@@ -1,0 +1,4222 @@
+{
+  "run_id": 35071334026,
+  "commit": "ff96f30468517706695538ffc74bc6770014ab07",
+  "duration_seconds": 15,
+  "base_concurrency": 200,
+  "iterations": 3,
+  "sample_count": 359,
+  "rows": [
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 10240,
+      "gateway": "direct",
+      "mean_rps": 33139.2,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 33139.2,
+          "total_requests": 497088,
+          "total_errors": 0,
+          "total_bytes": 5090181120,
+          "p99_us": 13983
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 10240,
+      "gateway": "envoy",
+      "mean_rps": 13854.977777777778,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 13461.8,
+          "total_requests": 201927,
+          "total_errors": 0,
+          "total_bytes": 2067732480,
+          "p99_us": 31711
+        },
+        {
+          "iteration": 2,
+          "rps": 14316.133333333333,
+          "total_requests": 214742,
+          "total_errors": 0,
+          "total_bytes": 2198958080,
+          "p99_us": 28623
+        },
+        {
+          "iteration": 3,
+          "rps": 13787.0,
+          "total_requests": 206805,
+          "total_errors": 0,
+          "total_bytes": 2117683200,
+          "p99_us": 36543
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 10240,
+      "gateway": "ferrum",
+      "mean_rps": 11493.644444444444,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 11680.866666666667,
+          "total_requests": 175213,
+          "total_errors": 0,
+          "total_bytes": 1794181120,
+          "p99_us": 35423
+        },
+        {
+          "iteration": 2,
+          "rps": 10856.666666666666,
+          "total_requests": 162850,
+          "total_errors": 159,
+          "total_bytes": 1667584000,
+          "p99_us": 21519
+        },
+        {
+          "iteration": 3,
+          "rps": 11943.4,
+          "total_requests": 179151,
+          "total_errors": 0,
+          "total_bytes": 1834506240,
+          "p99_us": 34079
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 10240,
+      "gateway": "kong",
+      "mean_rps": 10137.4,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 10105.8,
+          "total_requests": 151587,
+          "total_errors": 0,
+          "total_bytes": 1552250880,
+          "p99_us": 37055
+        },
+        {
+          "iteration": 2,
+          "rps": 10324.466666666667,
+          "total_requests": 154867,
+          "total_errors": 0,
+          "total_bytes": 1585838080,
+          "p99_us": 35903
+        },
+        {
+          "iteration": 3,
+          "rps": 9981.933333333332,
+          "total_requests": 149729,
+          "total_errors": 0,
+          "total_bytes": 1533224960,
+          "p99_us": 37055
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 10240,
+      "gateway": "tyk",
+      "mean_rps": 6573.955555555555,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 6418.8,
+          "total_requests": 96282,
+          "total_errors": 0,
+          "total_bytes": 985927680,
+          "p99_us": 49503
+        },
+        {
+          "iteration": 2,
+          "rps": 6620.6,
+          "total_requests": 99309,
+          "total_errors": 0,
+          "total_bytes": 1016924160,
+          "p99_us": 43007
+        },
+        {
+          "iteration": 3,
+          "rps": 6682.466666666666,
+          "total_requests": 100237,
+          "total_errors": 0,
+          "total_bytes": 1026426880,
+          "p99_us": 40351
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 71680,
+      "gateway": "direct",
+      "mean_rps": 10123.533333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 10123.533333333333,
+          "total_requests": 151853,
+          "total_errors": 0,
+          "total_bytes": 10884823040,
+          "p99_us": 42815
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 71680,
+      "gateway": "envoy",
+      "mean_rps": 4369.822222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 4401.6,
+          "total_requests": 66024,
+          "total_errors": 0,
+          "total_bytes": 4732600320,
+          "p99_us": 157823
+        },
+        {
+          "iteration": 2,
+          "rps": 4345.0,
+          "total_requests": 65175,
+          "total_errors": 0,
+          "total_bytes": 4671744000,
+          "p99_us": 140159
+        },
+        {
+          "iteration": 3,
+          "rps": 4362.866666666667,
+          "total_requests": 65443,
+          "total_errors": 0,
+          "total_bytes": 4690954240,
+          "p99_us": 255103
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 71680,
+      "gateway": "ferrum",
+      "mean_rps": 3973.2,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 3426.0666666666666,
+          "total_requests": 51391,
+          "total_errors": 195,
+          "total_bytes": 3683706880,
+          "p99_us": 95743
+        },
+        {
+          "iteration": 2,
+          "rps": 4236.4,
+          "total_requests": 63546,
+          "total_errors": 0,
+          "total_bytes": 4554977280,
+          "p99_us": 255103
+        },
+        {
+          "iteration": 3,
+          "rps": 4257.133333333333,
+          "total_requests": 63857,
+          "total_errors": 0,
+          "total_bytes": 4577269760,
+          "p99_us": 175871
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 71680,
+      "gateway": "kong",
+      "mean_rps": 3540.3777777777777,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 3568.8,
+          "total_requests": 53532,
+          "total_errors": 0,
+          "total_bytes": 3837173760,
+          "p99_us": 82751
+        },
+        {
+          "iteration": 2,
+          "rps": 3595.8,
+          "total_requests": 53937,
+          "total_errors": 0,
+          "total_bytes": 3866204160,
+          "p99_us": 83455
+        },
+        {
+          "iteration": 3,
+          "rps": 3456.5333333333333,
+          "total_requests": 51848,
+          "total_errors": 0,
+          "total_bytes": 3716464640,
+          "p99_us": 87551
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 71680,
+      "gateway": "tyk",
+      "mean_rps": 2967.288888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 2903.4,
+          "total_requests": 43551,
+          "total_errors": 0,
+          "total_bytes": 3121735680,
+          "p99_us": 78719
+        },
+        {
+          "iteration": 2,
+          "rps": 3061.733333333333,
+          "total_requests": 45926,
+          "total_errors": 0,
+          "total_bytes": 3291975680,
+          "p99_us": 98623
+        },
+        {
+          "iteration": 3,
+          "rps": 2936.733333333333,
+          "total_requests": 44051,
+          "total_errors": 0,
+          "total_bytes": 3157575680,
+          "p99_us": 81023
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 512000,
+      "gateway": "direct",
+      "mean_rps": 1497.6666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1497.6666666666667,
+          "total_requests": 22465,
+          "total_errors": 0,
+          "total_bytes": 11502080000,
+          "p99_us": 330751
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 512000,
+      "gateway": "envoy",
+      "mean_rps": 721.7111111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 724.4666666666667,
+          "total_requests": 10867,
+          "total_errors": 0,
+          "total_bytes": 5563904000,
+          "p99_us": 612351
+        },
+        {
+          "iteration": 2,
+          "rps": 723.1333333333333,
+          "total_requests": 10847,
+          "total_errors": 0,
+          "total_bytes": 5553664000,
+          "p99_us": 621567
+        },
+        {
+          "iteration": 3,
+          "rps": 717.5333333333333,
+          "total_requests": 10763,
+          "total_errors": 0,
+          "total_bytes": 5510656000,
+          "p99_us": 774143
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 512000,
+      "gateway": "ferrum",
+      "mean_rps": 779.4444444444445,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 750.8666666666667,
+          "total_requests": 11263,
+          "total_errors": 0,
+          "total_bytes": 5766656000,
+          "p99_us": 673279
+        },
+        {
+          "iteration": 2,
+          "rps": 795.2666666666667,
+          "total_requests": 11929,
+          "total_errors": 0,
+          "total_bytes": 6107648000,
+          "p99_us": 1710079
+        },
+        {
+          "iteration": 3,
+          "rps": 792.2,
+          "total_requests": 11883,
+          "total_errors": 0,
+          "total_bytes": 6084096000,
+          "p99_us": 775679
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 512000,
+      "gateway": "kong",
+      "mean_rps": 467.2666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 0,
+          "error": "bench wallclock timeout"
+        },
+        {
+          "iteration": 2,
+          "rps": 710.2,
+          "total_requests": 10653,
+          "total_errors": 0,
+          "total_bytes": 5454336000,
+          "p99_us": 573951
+        },
+        {
+          "iteration": 3,
+          "rps": 691.6,
+          "total_requests": 10374,
+          "total_errors": 0,
+          "total_bytes": 5311488000,
+          "p99_us": 520447
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 512000,
+      "gateway": "tyk",
+      "mean_rps": 583.4888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 589.6,
+          "total_requests": 8844,
+          "total_errors": 0,
+          "total_bytes": 4528128000,
+          "p99_us": 601087
+        },
+        {
+          "iteration": 2,
+          "rps": 572.0666666666667,
+          "total_requests": 8581,
+          "total_errors": 0,
+          "total_bytes": 4393472000,
+          "p99_us": 662527
+        },
+        {
+          "iteration": 3,
+          "rps": 588.8,
+          "total_requests": 8832,
+          "total_errors": 0,
+          "total_bytes": 4521984000,
+          "p99_us": 574463
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 1048576,
+      "gateway": "direct",
+      "mean_rps": 696.5333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 696.5333333333333,
+          "total_requests": 10448,
+          "total_errors": 0,
+          "total_bytes": 10955522048,
+          "p99_us": 380671
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 1048576,
+      "gateway": "envoy",
+      "mean_rps": 360.75555555555553,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 360.8666666666667,
+          "total_requests": 5413,
+          "total_errors": 0,
+          "total_bytes": 5675941888,
+          "p99_us": 1123327
+        },
+        {
+          "iteration": 2,
+          "rps": 364.26666666666665,
+          "total_requests": 5464,
+          "total_errors": 0,
+          "total_bytes": 5729419264,
+          "p99_us": 824319
+        },
+        {
+          "iteration": 3,
+          "rps": 357.1333333333333,
+          "total_requests": 5357,
+          "total_errors": 0,
+          "total_bytes": 5617221632,
+          "p99_us": 902655
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 1048576,
+      "gateway": "ferrum",
+      "mean_rps": 399.0444444444445,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 383.53333333333336,
+          "total_requests": 5753,
+          "total_errors": 0,
+          "total_bytes": 6032457728,
+          "p99_us": 656383
+        },
+        {
+          "iteration": 2,
+          "rps": 410.0,
+          "total_requests": 6150,
+          "total_errors": 0,
+          "total_bytes": 6448742400,
+          "p99_us": 535551
+        },
+        {
+          "iteration": 3,
+          "rps": 403.6,
+          "total_requests": 6054,
+          "total_errors": 0,
+          "total_bytes": 6348079104,
+          "p99_us": 762367
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 1048576,
+      "gateway": "kong",
+      "mean_rps": 345.4222222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 347.4,
+          "total_requests": 5211,
+          "total_errors": 0,
+          "total_bytes": 5464129536,
+          "p99_us": 466943
+        },
+        {
+          "iteration": 2,
+          "rps": 349.0,
+          "total_requests": 5235,
+          "total_errors": 0,
+          "total_bytes": 5489295360,
+          "p99_us": 469503
+        },
+        {
+          "iteration": 3,
+          "rps": 339.8666666666667,
+          "total_requests": 5098,
+          "total_errors": 0,
+          "total_bytes": 5345640448,
+          "p99_us": 562175
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 1048576,
+      "gateway": "tyk",
+      "mean_rps": 295.4888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 302.3333333333333,
+          "total_requests": 4535,
+          "total_errors": 0,
+          "total_bytes": 4755292160,
+          "p99_us": 517631
+        },
+        {
+          "iteration": 2,
+          "rps": 285.8,
+          "total_requests": 4287,
+          "total_errors": 0,
+          "total_bytes": 4495245312,
+          "p99_us": 511743
+        },
+        {
+          "iteration": 3,
+          "rps": 298.3333333333333,
+          "total_requests": 4475,
+          "total_errors": 0,
+          "total_bytes": 4692377600,
+          "p99_us": 516607
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 5242880,
+      "gateway": "direct",
+      "mean_rps": 135.26666666666668,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 135.26666666666668,
+          "total_requests": 2029,
+          "total_errors": 0,
+          "total_bytes": 10637803520,
+          "p99_us": 640511
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 5242880,
+      "gateway": "envoy",
+      "mean_rps": 75.66666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 73.33333333333333,
+          "total_requests": 1100,
+          "total_errors": 0,
+          "total_bytes": 5767168000,
+          "p99_us": 2129919
+        },
+        {
+          "iteration": 2,
+          "rps": 77.4,
+          "total_requests": 1161,
+          "total_errors": 0,
+          "total_bytes": 6086983680,
+          "p99_us": 1274879
+        },
+        {
+          "iteration": 3,
+          "rps": 76.26666666666667,
+          "total_requests": 1144,
+          "total_errors": 0,
+          "total_bytes": 5997854720,
+          "p99_us": 1150975
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 5242880,
+      "gateway": "ferrum",
+      "mean_rps": 82.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 77.8,
+          "total_requests": 1167,
+          "total_errors": 0,
+          "total_bytes": 6118440960,
+          "p99_us": 1225727
+        },
+        {
+          "iteration": 2,
+          "rps": 85.26666666666667,
+          "total_requests": 1279,
+          "total_errors": 0,
+          "total_bytes": 6705643520,
+          "p99_us": 1133567
+        },
+        {
+          "iteration": 3,
+          "rps": 82.93333333333334,
+          "total_requests": 1244,
+          "total_errors": 0,
+          "total_bytes": 6522142720,
+          "p99_us": 1484799
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 5242880,
+      "gateway": "kong",
+      "mean_rps": 49.75555555555555,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 0,
+          "error": "bench wallclock timeout"
+        },
+        {
+          "iteration": 2,
+          "rps": 75.73333333333333,
+          "total_requests": 1136,
+          "total_errors": 0,
+          "total_bytes": 5955911680,
+          "p99_us": 947199
+        },
+        {
+          "iteration": 3,
+          "rps": 73.53333333333333,
+          "total_requests": 1103,
+          "total_errors": 0,
+          "total_bytes": 5782896640,
+          "p99_us": 1023487
+        }
+      ]
+    },
+    {
+      "protocol": "grpcs",
+      "payload_bytes": 5242880,
+      "gateway": "tyk",
+      "mean_rps": 58.022222222222226,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 58.46666666666667,
+          "total_requests": 877,
+          "total_errors": 0,
+          "total_bytes": 4598005760,
+          "p99_us": 1115135
+        },
+        {
+          "iteration": 2,
+          "rps": 53.86666666666667,
+          "total_requests": 808,
+          "total_errors": 0,
+          "total_bytes": 4236247040,
+          "p99_us": 1402879
+        },
+        {
+          "iteration": 3,
+          "rps": 61.733333333333334,
+          "total_requests": 926,
+          "total_errors": 0,
+          "total_bytes": 4854906880,
+          "p99_us": 1390591
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 10240,
+      "gateway": "direct",
+      "mean_rps": 108920.6,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 108920.6,
+          "total_requests": 1633809,
+          "total_errors": 0,
+          "total_bytes": 16730204160,
+          "p99_us": 4751
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 10240,
+      "gateway": "envoy",
+      "mean_rps": 26511.777777777777,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 24544.666666666668,
+          "total_requests": 368170,
+          "total_errors": 0,
+          "total_bytes": 3770060800,
+          "p99_us": 27263
+        },
+        {
+          "iteration": 2,
+          "rps": 27455.066666666666,
+          "total_requests": 411826,
+          "total_errors": 0,
+          "total_bytes": 4217098240,
+          "p99_us": 12431
+        },
+        {
+          "iteration": 3,
+          "rps": 27535.6,
+          "total_requests": 413034,
+          "total_errors": 0,
+          "total_bytes": 4229468160,
+          "p99_us": 13031
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 10240,
+      "gateway": "ferrum",
+      "mean_rps": 24802.333333333332,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 23650.066666666666,
+          "total_requests": 354751,
+          "total_errors": 0,
+          "total_bytes": 3632650240,
+          "p99_us": 19103
+        },
+        {
+          "iteration": 2,
+          "rps": 23122.4,
+          "total_requests": 346836,
+          "total_errors": 0,
+          "total_bytes": 3551600640,
+          "p99_us": 18063
+        },
+        {
+          "iteration": 3,
+          "rps": 27634.533333333333,
+          "total_requests": 414518,
+          "total_errors": 0,
+          "total_bytes": 4244664320,
+          "p99_us": 14471
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 10240,
+      "gateway": "kong",
+      "mean_rps": 3764.0666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 3575.8,
+          "total_requests": 53637,
+          "total_errors": 0,
+          "total_bytes": 549242880,
+          "p99_us": 180095
+        },
+        {
+          "iteration": 2,
+          "rps": 3822.266666666667,
+          "total_requests": 57334,
+          "total_errors": 0,
+          "total_bytes": 587100160,
+          "p99_us": 151167
+        },
+        {
+          "iteration": 3,
+          "rps": 3894.133333333333,
+          "total_requests": 58412,
+          "total_errors": 0,
+          "total_bytes": 598138880,
+          "p99_us": 135935
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 10240,
+      "gateway": "krakend",
+      "mean_rps": 12611.511111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 11232.6,
+          "total_requests": 168489,
+          "total_errors": 4,
+          "total_bytes": 1725327360,
+          "p99_us": 63007
+        },
+        {
+          "iteration": 2,
+          "rps": 13672.466666666667,
+          "total_requests": 205087,
+          "total_errors": 1,
+          "total_bytes": 2100090880,
+          "p99_us": 46559
+        },
+        {
+          "iteration": 3,
+          "rps": 12929.466666666667,
+          "total_requests": 193942,
+          "total_errors": 1,
+          "total_bytes": 1985966080,
+          "p99_us": 50847
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 10240,
+      "gateway": "tyk",
+      "mean_rps": 13832.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 12967.4,
+          "total_requests": 194511,
+          "total_errors": 0,
+          "total_bytes": 1991792640,
+          "p99_us": 58143
+        },
+        {
+          "iteration": 2,
+          "rps": 14708.666666666666,
+          "total_requests": 220630,
+          "total_errors": 0,
+          "total_bytes": 2259251200,
+          "p99_us": 47871
+        },
+        {
+          "iteration": 3,
+          "rps": 13819.933333333332,
+          "total_requests": 207299,
+          "total_errors": 0,
+          "total_bytes": 2122741760,
+          "p99_us": 53375
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 71680,
+      "gateway": "direct",
+      "mean_rps": 23222.466666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 23222.466666666667,
+          "total_requests": 348337,
+          "total_errors": 0,
+          "total_bytes": 24968796160,
+          "p99_us": 19119
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 71680,
+      "gateway": "envoy",
+      "mean_rps": 7297.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 7073.066666666667,
+          "total_requests": 106096,
+          "total_errors": 1,
+          "total_bytes": 7604961280,
+          "p99_us": 47967
+        },
+        {
+          "iteration": 2,
+          "rps": 7380.2,
+          "total_requests": 110703,
+          "total_errors": 1,
+          "total_bytes": 7935191040,
+          "p99_us": 45471
+        },
+        {
+          "iteration": 3,
+          "rps": 7437.733333333334,
+          "total_requests": 111566,
+          "total_errors": 0,
+          "total_bytes": 7997050880,
+          "p99_us": 51359
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 71680,
+      "gateway": "ferrum",
+      "mean_rps": 6070.688888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 6081.533333333334,
+          "total_requests": 91223,
+          "total_errors": 0,
+          "total_bytes": 6538864640,
+          "p99_us": 68479
+        },
+        {
+          "iteration": 2,
+          "rps": 5676.6,
+          "total_requests": 85149,
+          "total_errors": 0,
+          "total_bytes": 6103480320,
+          "p99_us": 71807
+        },
+        {
+          "iteration": 3,
+          "rps": 6453.933333333333,
+          "total_requests": 96809,
+          "total_errors": 0,
+          "total_bytes": 6939269120,
+          "p99_us": 65119
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 71680,
+      "gateway": "kong",
+      "mean_rps": 2286.6,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 2178.6,
+          "total_requests": 32679,
+          "total_errors": 0,
+          "total_bytes": 2342430720,
+          "p99_us": 265471
+        },
+        {
+          "iteration": 2,
+          "rps": 2438.8,
+          "total_requests": 36582,
+          "total_errors": 0,
+          "total_bytes": 2622197760,
+          "p99_us": 255231
+        },
+        {
+          "iteration": 3,
+          "rps": 2242.4,
+          "total_requests": 33636,
+          "total_errors": 0,
+          "total_bytes": 2411028480,
+          "p99_us": 269311
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 71680,
+      "gateway": "krakend",
+      "mean_rps": 6274.355555555556,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 6079.133333333333,
+          "total_requests": 91187,
+          "total_errors": 11,
+          "total_bytes": 6536284160,
+          "p99_us": 99839
+        },
+        {
+          "iteration": 2,
+          "rps": 6466.266666666666,
+          "total_requests": 96994,
+          "total_errors": 17,
+          "total_bytes": 6952529920,
+          "p99_us": 94015
+        },
+        {
+          "iteration": 3,
+          "rps": 6277.666666666667,
+          "total_requests": 94165,
+          "total_errors": 13,
+          "total_bytes": 6749747200,
+          "p99_us": 98623
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 71680,
+      "gateway": "tyk",
+      "mean_rps": 5168.311111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 5033.266666666666,
+          "total_requests": 75499,
+          "total_errors": 1,
+          "total_bytes": 5411768320,
+          "p99_us": 150527
+        },
+        {
+          "iteration": 2,
+          "rps": 5335.4,
+          "total_requests": 80031,
+          "total_errors": 0,
+          "total_bytes": 5736622080,
+          "p99_us": 139903
+        },
+        {
+          "iteration": 3,
+          "rps": 5136.266666666666,
+          "total_requests": 77044,
+          "total_errors": 2,
+          "total_bytes": 5522513920,
+          "p99_us": 139903
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 512000,
+      "gateway": "direct",
+      "mean_rps": 3698.0666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 3698.0666666666666,
+          "total_requests": 55471,
+          "total_errors": 0,
+          "total_bytes": 28401152000,
+          "p99_us": 122431
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 512000,
+      "gateway": "envoy",
+      "mean_rps": 1286.111111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1270.0,
+          "total_requests": 19050,
+          "total_errors": 0,
+          "total_bytes": 9753600000,
+          "p99_us": 259583
+        },
+        {
+          "iteration": 2,
+          "rps": 1295.6,
+          "total_requests": 19434,
+          "total_errors": 0,
+          "total_bytes": 9950208000,
+          "p99_us": 312063
+        },
+        {
+          "iteration": 3,
+          "rps": 1292.7333333333333,
+          "total_requests": 19391,
+          "total_errors": 0,
+          "total_bytes": 9928192000,
+          "p99_us": 248191
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 512000,
+      "gateway": "ferrum",
+      "mean_rps": 1052.7555555555555,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1034.5333333333333,
+          "total_requests": 15518,
+          "total_errors": 0,
+          "total_bytes": 7945216000,
+          "p99_us": 429055
+        },
+        {
+          "iteration": 2,
+          "rps": 985.6666666666666,
+          "total_requests": 14785,
+          "total_errors": 0,
+          "total_bytes": 7569920000,
+          "p99_us": 444159
+        },
+        {
+          "iteration": 3,
+          "rps": 1138.0666666666666,
+          "total_requests": 17071,
+          "total_errors": 0,
+          "total_bytes": 8740352000,
+          "p99_us": 330495
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 512000,
+      "gateway": "kong",
+      "mean_rps": 816.6666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 815.7333333333333,
+          "total_requests": 12236,
+          "total_errors": 0,
+          "total_bytes": 6264832000,
+          "p99_us": 734207
+        },
+        {
+          "iteration": 2,
+          "rps": 846.8,
+          "total_requests": 12702,
+          "total_errors": 0,
+          "total_bytes": 6503424000,
+          "p99_us": 886783
+        },
+        {
+          "iteration": 3,
+          "rps": 787.4666666666667,
+          "total_requests": 11812,
+          "total_errors": 0,
+          "total_bytes": 6047744000,
+          "p99_us": 818175
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 512000,
+      "gateway": "krakend",
+      "mean_rps": 1459.3333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1442.9333333333334,
+          "total_requests": 21644,
+          "total_errors": 5,
+          "total_bytes": 11081728000,
+          "p99_us": 327167
+        },
+        {
+          "iteration": 2,
+          "rps": 1502.3333333333333,
+          "total_requests": 22535,
+          "total_errors": 5,
+          "total_bytes": 11537920000,
+          "p99_us": 409343
+        },
+        {
+          "iteration": 3,
+          "rps": 1432.7333333333333,
+          "total_requests": 21491,
+          "total_errors": 2,
+          "total_bytes": 11003392000,
+          "p99_us": 358911
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 512000,
+      "gateway": "tyk",
+      "mean_rps": 1259.6888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1209.0,
+          "total_requests": 18135,
+          "total_errors": 0,
+          "total_bytes": 9285120000,
+          "p99_us": 681471
+        },
+        {
+          "iteration": 2,
+          "rps": 1299.4666666666667,
+          "total_requests": 19492,
+          "total_errors": 1,
+          "total_bytes": 9979904000,
+          "p99_us": 613375
+        },
+        {
+          "iteration": 3,
+          "rps": 1270.6,
+          "total_requests": 19059,
+          "total_errors": 0,
+          "total_bytes": 9758208000,
+          "p99_us": 653823
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 1048576,
+      "gateway": "direct",
+      "mean_rps": 1871.1333333333334,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1871.1333333333334,
+          "total_requests": 28067,
+          "total_errors": 0,
+          "total_bytes": 29430382592,
+          "p99_us": 127551
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 1048576,
+      "gateway": "envoy",
+      "mean_rps": 616.4666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 601.7333333333333,
+          "total_requests": 9026,
+          "total_errors": 0,
+          "total_bytes": 9464446976,
+          "p99_us": 284415
+        },
+        {
+          "iteration": 2,
+          "rps": 622.0666666666667,
+          "total_requests": 9331,
+          "total_errors": 0,
+          "total_bytes": 9784262656,
+          "p99_us": 244735
+        },
+        {
+          "iteration": 3,
+          "rps": 625.6,
+          "total_requests": 9384,
+          "total_errors": 0,
+          "total_bytes": 9839837184,
+          "p99_us": 242815
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 1048576,
+      "gateway": "ferrum",
+      "mean_rps": 546.3777777777777,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 542.3333333333334,
+          "total_requests": 8135,
+          "total_errors": 0,
+          "total_bytes": 8530165760,
+          "p99_us": 330239
+        },
+        {
+          "iteration": 2,
+          "rps": 517.5333333333333,
+          "total_requests": 7763,
+          "total_errors": 0,
+          "total_bytes": 8140095488,
+          "p99_us": 380671
+        },
+        {
+          "iteration": 3,
+          "rps": 579.2666666666667,
+          "total_requests": 8689,
+          "total_errors": 0,
+          "total_bytes": 9111076864,
+          "p99_us": 325375
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 1048576,
+      "gateway": "kong",
+      "mean_rps": 480.0444444444444,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 452.46666666666664,
+          "total_requests": 6787,
+          "total_errors": 0,
+          "total_bytes": 7116685312,
+          "p99_us": 484095
+        },
+        {
+          "iteration": 2,
+          "rps": 508.8666666666667,
+          "total_requests": 7633,
+          "total_errors": 0,
+          "total_bytes": 8003780608,
+          "p99_us": 531967
+        },
+        {
+          "iteration": 3,
+          "rps": 478.8,
+          "total_requests": 7182,
+          "total_errors": 0,
+          "total_bytes": 7530872832,
+          "p99_us": 585215
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 1048576,
+      "gateway": "krakend",
+      "mean_rps": 778.2222222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 748.7333333333333,
+          "total_requests": 11231,
+          "total_errors": 3,
+          "total_bytes": 11776557056,
+          "p99_us": 307455
+        },
+        {
+          "iteration": 2,
+          "rps": 800.6666666666666,
+          "total_requests": 12010,
+          "total_errors": 2,
+          "total_bytes": 12593397760,
+          "p99_us": 301311
+        },
+        {
+          "iteration": 3,
+          "rps": 785.2666666666667,
+          "total_requests": 11779,
+          "total_errors": 2,
+          "total_bytes": 12351176704,
+          "p99_us": 295167
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 1048576,
+      "gateway": "tyk",
+      "mean_rps": 636.2666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 605.7333333333333,
+          "total_requests": 9086,
+          "total_errors": 0,
+          "total_bytes": 9527361536,
+          "p99_us": 577023
+        },
+        {
+          "iteration": 2,
+          "rps": 658.2,
+          "total_requests": 9873,
+          "total_errors": 0,
+          "total_bytes": 10352590848,
+          "p99_us": 540671
+        },
+        {
+          "iteration": 3,
+          "rps": 644.8666666666667,
+          "total_requests": 9673,
+          "total_errors": 0,
+          "total_bytes": 10142875648,
+          "p99_us": 570367
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 5242880,
+      "gateway": "direct",
+      "mean_rps": 364.6,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 364.6,
+          "total_requests": 5469,
+          "total_errors": 0,
+          "total_bytes": 28673310720,
+          "p99_us": 311295
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 5242880,
+      "gateway": "envoy",
+      "mean_rps": 130.51111111111112,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 127.46666666666667,
+          "total_requests": 1912,
+          "total_errors": 0,
+          "total_bytes": 10024386560,
+          "p99_us": 641023
+        },
+        {
+          "iteration": 2,
+          "rps": 131.53333333333333,
+          "total_requests": 1973,
+          "total_errors": 0,
+          "total_bytes": 10344202240,
+          "p99_us": 538623
+        },
+        {
+          "iteration": 3,
+          "rps": 132.53333333333333,
+          "total_requests": 1988,
+          "total_errors": 0,
+          "total_bytes": 10422845440,
+          "p99_us": 538623
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 5242880,
+      "gateway": "ferrum",
+      "mean_rps": 125.06666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 122.93333333333334,
+          "total_requests": 1844,
+          "total_errors": 0,
+          "total_bytes": 9667870720,
+          "p99_us": 784895
+        },
+        {
+          "iteration": 2,
+          "rps": 121.33333333333333,
+          "total_requests": 1820,
+          "total_errors": 0,
+          "total_bytes": 9542041600,
+          "p99_us": 707071
+        },
+        {
+          "iteration": 3,
+          "rps": 130.93333333333334,
+          "total_requests": 1964,
+          "total_errors": 0,
+          "total_bytes": 10297016320,
+          "p99_us": 666111
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 5242880,
+      "gateway": "kong",
+      "mean_rps": 115.37777777777778,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 111.46666666666667,
+          "total_requests": 1672,
+          "total_errors": 0,
+          "total_bytes": 8766095360,
+          "p99_us": 1782783
+        },
+        {
+          "iteration": 2,
+          "rps": 115.46666666666667,
+          "total_requests": 1732,
+          "total_errors": 0,
+          "total_bytes": 9080668160,
+          "p99_us": 1456127
+        },
+        {
+          "iteration": 3,
+          "rps": 119.2,
+          "total_requests": 1788,
+          "total_errors": 0,
+          "total_bytes": 9374269440,
+          "p99_us": 1437695
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 5242880,
+      "gateway": "krakend",
+      "mean_rps": 177.9111111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 173.0,
+          "total_requests": 2595,
+          "total_errors": 0,
+          "total_bytes": 13605273600,
+          "p99_us": 611327
+        },
+        {
+          "iteration": 2,
+          "rps": 182.06666666666666,
+          "total_requests": 2731,
+          "total_errors": 4,
+          "total_bytes": 14318305280,
+          "p99_us": 542719
+        },
+        {
+          "iteration": 3,
+          "rps": 178.66666666666666,
+          "total_requests": 2680,
+          "total_errors": 2,
+          "total_bytes": 14050918400,
+          "p99_us": 565247
+        }
+      ]
+    },
+    {
+      "protocol": "http1-tls",
+      "payload_bytes": 5242880,
+      "gateway": "tyk",
+      "mean_rps": 140.11111111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 134.13333333333333,
+          "total_requests": 2012,
+          "total_errors": 0,
+          "total_bytes": 10548674560,
+          "p99_us": 818175
+        },
+        {
+          "iteration": 2,
+          "rps": 144.6,
+          "total_requests": 2169,
+          "total_errors": 0,
+          "total_bytes": 11371806720,
+          "p99_us": 870399
+        },
+        {
+          "iteration": 3,
+          "rps": 141.6,
+          "total_requests": 2124,
+          "total_errors": 0,
+          "total_bytes": 11135877120,
+          "p99_us": 763391
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 10240,
+      "gateway": "direct",
+      "mean_rps": 42599.86666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 42599.86666666667,
+          "total_requests": 638998,
+          "total_errors": 0,
+          "total_bytes": 6543339520,
+          "p99_us": 11167
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 10240,
+      "gateway": "envoy",
+      "mean_rps": 13878.2,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 13331.733333333334,
+          "total_requests": 199976,
+          "total_errors": 0,
+          "total_bytes": 2047754240,
+          "p99_us": 62463
+        },
+        {
+          "iteration": 2,
+          "rps": 14588.866666666667,
+          "total_requests": 218833,
+          "total_errors": 0,
+          "total_bytes": 2240849920,
+          "p99_us": 32191
+        },
+        {
+          "iteration": 3,
+          "rps": 13714.0,
+          "total_requests": 205710,
+          "total_errors": 0,
+          "total_bytes": 2106470400,
+          "p99_us": 51775
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 10240,
+      "gateway": "ferrum",
+      "mean_rps": 13299.511111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 12860.666666666666,
+          "total_requests": 192910,
+          "total_errors": 0,
+          "total_bytes": 1975398400,
+          "p99_us": 31599
+        },
+        {
+          "iteration": 2,
+          "rps": 13168.933333333332,
+          "total_requests": 197534,
+          "total_errors": 0,
+          "total_bytes": 2022748160,
+          "p99_us": 28655
+        },
+        {
+          "iteration": 3,
+          "rps": 13868.933333333332,
+          "total_requests": 208034,
+          "total_errors": 0,
+          "total_bytes": 2130268160,
+          "p99_us": 25647
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 10240,
+      "gateway": "tyk",
+      "mean_rps": 5133.577777777778,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 4933.666666666667,
+          "total_requests": 74005,
+          "total_errors": 0,
+          "total_bytes": 757811200,
+          "p99_us": 56671
+        },
+        {
+          "iteration": 2,
+          "rps": 5231.133333333333,
+          "total_requests": 78467,
+          "total_errors": 0,
+          "total_bytes": 803502080,
+          "p99_us": 45407
+        },
+        {
+          "iteration": 3,
+          "rps": 5235.933333333333,
+          "total_requests": 78539,
+          "total_errors": 0,
+          "total_bytes": 804239360,
+          "p99_us": 46527
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 71680,
+      "gateway": "direct",
+      "mean_rps": 13363.2,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 13363.2,
+          "total_requests": 200448,
+          "total_errors": 0,
+          "total_bytes": 14368112640,
+          "p99_us": 38207
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 71680,
+      "gateway": "envoy",
+      "mean_rps": 3740.822222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 3751.6666666666665,
+          "total_requests": 56275,
+          "total_errors": 0,
+          "total_bytes": 4033792000,
+          "p99_us": 109695
+        },
+        {
+          "iteration": 2,
+          "rps": 3766.866666666667,
+          "total_requests": 56503,
+          "total_errors": 0,
+          "total_bytes": 4050135040,
+          "p99_us": 118911
+        },
+        {
+          "iteration": 3,
+          "rps": 3703.9333333333334,
+          "total_requests": 55559,
+          "total_errors": 0,
+          "total_bytes": 3982469120,
+          "p99_us": 156799
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 71680,
+      "gateway": "ferrum",
+      "mean_rps": 4227.955555555555,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 4284.0,
+          "total_requests": 64260,
+          "total_errors": 177,
+          "total_bytes": 4606156800,
+          "p99_us": 62047
+        },
+        {
+          "iteration": 2,
+          "rps": 4238.6,
+          "total_requests": 63579,
+          "total_errors": 168,
+          "total_bytes": 4557342720,
+          "p99_us": 77183
+        },
+        {
+          "iteration": 3,
+          "rps": 4161.266666666666,
+          "total_requests": 62419,
+          "total_errors": 0,
+          "total_bytes": 4474193920,
+          "p99_us": 69439
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 71680,
+      "gateway": "tyk",
+      "mean_rps": 2081.6,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 2061.5333333333333,
+          "total_requests": 30923,
+          "total_errors": 0,
+          "total_bytes": 2216560640,
+          "p99_us": 416767
+        },
+        {
+          "iteration": 2,
+          "rps": 2083.266666666667,
+          "total_requests": 31249,
+          "total_errors": 0,
+          "total_bytes": 2239928320,
+          "p99_us": 377599
+        },
+        {
+          "iteration": 3,
+          "rps": 2100.0,
+          "total_requests": 31500,
+          "total_errors": 0,
+          "total_bytes": 2257920000,
+          "p99_us": 298751
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 512000,
+      "gateway": "direct",
+      "mean_rps": 2540.4,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 2540.4,
+          "total_requests": 38106,
+          "total_errors": 0,
+          "total_bytes": 19510272000,
+          "p99_us": 284671
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 512000,
+      "gateway": "envoy",
+      "mean_rps": 638.8888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 635.3333333333334,
+          "total_requests": 9530,
+          "total_errors": 0,
+          "total_bytes": 4879360000,
+          "p99_us": 573439
+        },
+        {
+          "iteration": 2,
+          "rps": 651.4666666666667,
+          "total_requests": 9772,
+          "total_errors": 0,
+          "total_bytes": 5003264000,
+          "p99_us": 555519
+        },
+        {
+          "iteration": 3,
+          "rps": 629.8666666666667,
+          "total_requests": 9448,
+          "total_errors": 0,
+          "total_bytes": 4837376000,
+          "p99_us": 517887
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 512000,
+      "gateway": "ferrum",
+      "mean_rps": 835.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 907.4,
+          "total_requests": 13611,
+          "total_errors": 0,
+          "total_bytes": 6968832000,
+          "p99_us": 652799
+        },
+        {
+          "iteration": 2,
+          "rps": 891.1333333333333,
+          "total_requests": 13367,
+          "total_errors": 0,
+          "total_bytes": 6843904000,
+          "p99_us": 2297855
+        },
+        {
+          "iteration": 3,
+          "rps": 706.4666666666667,
+          "total_requests": 10597,
+          "total_errors": 0,
+          "total_bytes": 5425664000,
+          "p99_us": 345855
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 512000,
+      "gateway": "tyk",
+      "mean_rps": 528.4222222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 533.1333333333333,
+          "total_requests": 7997,
+          "total_errors": 0,
+          "total_bytes": 4094464000,
+          "p99_us": 1051647
+        },
+        {
+          "iteration": 2,
+          "rps": 518.6666666666666,
+          "total_requests": 7780,
+          "total_errors": 0,
+          "total_bytes": 3983360000,
+          "p99_us": 1517567
+        },
+        {
+          "iteration": 3,
+          "rps": 533.4666666666667,
+          "total_requests": 8002,
+          "total_errors": 0,
+          "total_bytes": 4097024000,
+          "p99_us": 1436671
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 1048576,
+      "gateway": "direct",
+      "mean_rps": 1283.4,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1283.4,
+          "total_requests": 19251,
+          "total_errors": 0,
+          "total_bytes": 20186136576,
+          "p99_us": 168831
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 1048576,
+      "gateway": "envoy",
+      "mean_rps": 323.31111111111113,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 324.6,
+          "total_requests": 4869,
+          "total_errors": 0,
+          "total_bytes": 5105516544,
+          "p99_us": 604159
+        },
+        {
+          "iteration": 2,
+          "rps": 328.93333333333334,
+          "total_requests": 4934,
+          "total_errors": 0,
+          "total_bytes": 5173673984,
+          "p99_us": 677375
+        },
+        {
+          "iteration": 3,
+          "rps": 316.4,
+          "total_requests": 4746,
+          "total_errors": 0,
+          "total_bytes": 4976541696,
+          "p99_us": 631807
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 1048576,
+      "gateway": "ferrum",
+      "mean_rps": 428.5111111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 464.53333333333336,
+          "total_requests": 6968,
+          "total_errors": 0,
+          "total_bytes": 7306477568,
+          "p99_us": 773631
+        },
+        {
+          "iteration": 2,
+          "rps": 463.26666666666665,
+          "total_requests": 6949,
+          "total_errors": 0,
+          "total_bytes": 7286554624,
+          "p99_us": 1393663
+        },
+        {
+          "iteration": 3,
+          "rps": 357.73333333333335,
+          "total_requests": 5366,
+          "total_errors": 0,
+          "total_bytes": 5626658816,
+          "p99_us": 429055
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 1048576,
+      "gateway": "tyk",
+      "mean_rps": 268.2888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 264.93333333333334,
+          "total_requests": 3974,
+          "total_errors": 0,
+          "total_bytes": 4167041024,
+          "p99_us": 687615
+        },
+        {
+          "iteration": 2,
+          "rps": 269.6,
+          "total_requests": 4044,
+          "total_errors": 0,
+          "total_bytes": 4240441344,
+          "p99_us": 705535
+        },
+        {
+          "iteration": 3,
+          "rps": 270.3333333333333,
+          "total_requests": 4055,
+          "total_errors": 0,
+          "total_bytes": 4251975680,
+          "p99_us": 1097727
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 5242880,
+      "gateway": "direct",
+      "mean_rps": 246.06666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 246.06666666666666,
+          "total_requests": 3691,
+          "total_errors": 0,
+          "total_bytes": 19351470080,
+          "p99_us": 326655
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 5242880,
+      "gateway": "envoy",
+      "mean_rps": 67.2,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 67.13333333333334,
+          "total_requests": 1007,
+          "total_errors": 0,
+          "total_bytes": 5279580160,
+          "p99_us": 1869823
+        },
+        {
+          "iteration": 2,
+          "rps": 68.46666666666667,
+          "total_requests": 1027,
+          "total_errors": 0,
+          "total_bytes": 5384437760,
+          "p99_us": 6680575
+        },
+        {
+          "iteration": 3,
+          "rps": 66.0,
+          "total_requests": 990,
+          "total_errors": 0,
+          "total_bytes": 5190451200,
+          "p99_us": 1145855
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 5242880,
+      "gateway": "ferrum",
+      "mean_rps": 91.33333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 101.2,
+          "total_requests": 1518,
+          "total_errors": 0,
+          "total_bytes": 7958691840,
+          "p99_us": 1334271
+        },
+        {
+          "iteration": 2,
+          "rps": 98.53333333333333,
+          "total_requests": 1478,
+          "total_errors": 0,
+          "total_bytes": 7748976640,
+          "p99_us": 2643967
+        },
+        {
+          "iteration": 3,
+          "rps": 74.26666666666667,
+          "total_requests": 1114,
+          "total_errors": 0,
+          "total_bytes": 5840568320,
+          "p99_us": 922111
+        }
+      ]
+    },
+    {
+      "protocol": "http2",
+      "payload_bytes": 5242880,
+      "gateway": "tyk",
+      "mean_rps": 58.31111111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 57.733333333333334,
+          "total_requests": 866,
+          "total_errors": 0,
+          "total_bytes": 4540334080,
+          "p99_us": 1620991
+        },
+        {
+          "iteration": 2,
+          "rps": 58.8,
+          "total_requests": 882,
+          "total_errors": 0,
+          "total_bytes": 4624220160,
+          "p99_us": 1548287
+        },
+        {
+          "iteration": 3,
+          "rps": 58.4,
+          "total_requests": 876,
+          "total_errors": 0,
+          "total_bytes": 4592762880,
+          "p99_us": 1490943
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 10240,
+      "gateway": "direct",
+      "mean_rps": 53338.666666666664,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 53338.666666666664,
+          "total_requests": 800080,
+          "total_errors": 0,
+          "total_bytes": 8192819200,
+          "p99_us": 10679
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 10240,
+      "gateway": "envoy",
+      "mean_rps": 4533.533333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 4365.866666666667,
+          "total_requests": 65488,
+          "total_errors": 0,
+          "total_bytes": 670597120,
+          "p99_us": 84479
+        },
+        {
+          "iteration": 2,
+          "rps": 4751.333333333333,
+          "total_requests": 71270,
+          "total_errors": 0,
+          "total_bytes": 729804800,
+          "p99_us": 71743
+        },
+        {
+          "iteration": 3,
+          "rps": 4483.4,
+          "total_requests": 67251,
+          "total_errors": 0,
+          "total_bytes": 688650240,
+          "p99_us": 74943
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 10240,
+      "gateway": "ferrum",
+      "mean_rps": 19617.022222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 19573.8,
+          "total_requests": 293607,
+          "total_errors": 0,
+          "total_bytes": 3006535680,
+          "p99_us": 23471
+        },
+        {
+          "iteration": 2,
+          "rps": 19878.333333333332,
+          "total_requests": 298175,
+          "total_errors": 0,
+          "total_bytes": 3053312000,
+          "p99_us": 22591
+        },
+        {
+          "iteration": 3,
+          "rps": 19398.933333333334,
+          "total_requests": 290984,
+          "total_errors": 0,
+          "total_bytes": 2979676160,
+          "p99_us": 24367
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 71680,
+      "gateway": "direct",
+      "mean_rps": 8913.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 8913.0,
+          "total_requests": 133695,
+          "total_errors": 0,
+          "total_bytes": 9583257600,
+          "p99_us": 88191
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 71680,
+      "gateway": "envoy",
+      "mean_rps": 1019.2444444444444,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1057.0,
+          "total_requests": 15855,
+          "total_errors": 0,
+          "total_bytes": 1136486400,
+          "p99_us": 466687
+        },
+        {
+          "iteration": 2,
+          "rps": 1031.8666666666666,
+          "total_requests": 15478,
+          "total_errors": 0,
+          "total_bytes": 1109463040,
+          "p99_us": 391423
+        },
+        {
+          "iteration": 3,
+          "rps": 968.8666666666667,
+          "total_requests": 14533,
+          "total_errors": 0,
+          "total_bytes": 1041725440,
+          "p99_us": 434943
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 71680,
+      "gateway": "ferrum",
+      "mean_rps": 3693.3333333333335,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 3698.3333333333335,
+          "total_requests": 55475,
+          "total_errors": 0,
+          "total_bytes": 3976448000,
+          "p99_us": 164991
+        },
+        {
+          "iteration": 2,
+          "rps": 3784.133333333333,
+          "total_requests": 56762,
+          "total_errors": 0,
+          "total_bytes": 4068700160,
+          "p99_us": 160511
+        },
+        {
+          "iteration": 3,
+          "rps": 3597.5333333333333,
+          "total_requests": 53963,
+          "total_errors": 0,
+          "total_bytes": 3868067840,
+          "p99_us": 171519
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 512000,
+      "gateway": "direct",
+      "mean_rps": 1290.6,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1290.6,
+          "total_requests": 19359,
+          "total_errors": 0,
+          "total_bytes": 9911808000,
+          "p99_us": 338175
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 512000,
+      "gateway": "envoy",
+      "mean_rps": 171.66666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 172.66666666666666,
+          "total_requests": 2590,
+          "total_errors": 0,
+          "total_bytes": 1326080000,
+          "p99_us": 2711551
+        },
+        {
+          "iteration": 2,
+          "rps": 172.8,
+          "total_requests": 2592,
+          "total_errors": 0,
+          "total_bytes": 1327104000,
+          "p99_us": 2676735
+        },
+        {
+          "iteration": 3,
+          "rps": 169.53333333333333,
+          "total_requests": 2543,
+          "total_errors": 0,
+          "total_bytes": 1302016000,
+          "p99_us": 2318335
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 512000,
+      "gateway": "ferrum",
+      "mean_rps": 557.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 560.9333333333333,
+          "total_requests": 8414,
+          "total_errors": 0,
+          "total_bytes": 4307968000,
+          "p99_us": 1825791
+        },
+        {
+          "iteration": 2,
+          "rps": 545.8,
+          "total_requests": 8187,
+          "total_errors": 0,
+          "total_bytes": 4191744000,
+          "p99_us": 713727
+        },
+        {
+          "iteration": 3,
+          "rps": 564.2666666666667,
+          "total_requests": 8464,
+          "total_errors": 0,
+          "total_bytes": 4333568000,
+          "p99_us": 1521663
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 1048576,
+      "gateway": "direct",
+      "mean_rps": 663.5333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 663.5333333333333,
+          "total_requests": 9953,
+          "total_errors": 0,
+          "total_bytes": 10436476928,
+          "p99_us": 269311
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 1048576,
+      "gateway": "envoy",
+      "mean_rps": 81.68888888888888,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 82.93333333333334,
+          "total_requests": 1244,
+          "total_errors": 0,
+          "total_bytes": 1304428544,
+          "p99_us": 3160063
+        },
+        {
+          "iteration": 2,
+          "rps": 83.6,
+          "total_requests": 1254,
+          "total_errors": 0,
+          "total_bytes": 1314914304,
+          "p99_us": 3078143
+        },
+        {
+          "iteration": 3,
+          "rps": 78.53333333333333,
+          "total_requests": 1178,
+          "total_errors": 0,
+          "total_bytes": 1235222528,
+          "p99_us": 2619391
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 1048576,
+      "gateway": "ferrum",
+      "mean_rps": 294.3333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 301.1333333333333,
+          "total_requests": 4517,
+          "total_errors": 0,
+          "total_bytes": 4736417792,
+          "p99_us": 891903
+        },
+        {
+          "iteration": 2,
+          "rps": 293.8,
+          "total_requests": 4407,
+          "total_errors": 0,
+          "total_bytes": 4621074432,
+          "p99_us": 1049599
+        },
+        {
+          "iteration": 3,
+          "rps": 288.06666666666666,
+          "total_requests": 4321,
+          "total_errors": 0,
+          "total_bytes": 4530896896,
+          "p99_us": 1230847
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 5242880,
+      "gateway": "direct",
+      "mean_rps": 137.4,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 137.4,
+          "total_requests": 2061,
+          "total_errors": 0,
+          "total_bytes": 10805575680,
+          "p99_us": 706047
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 5242880,
+      "gateway": "envoy",
+      "mean_rps": 12.88888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 13.4,
+          "total_requests": 201,
+          "total_errors": 0,
+          "total_bytes": 1053818880,
+          "p99_us": 10387455
+        },
+        {
+          "iteration": 2,
+          "rps": 12.933333333333334,
+          "total_requests": 194,
+          "total_errors": 0,
+          "total_bytes": 1017118720,
+          "p99_us": 10272767
+        },
+        {
+          "iteration": 3,
+          "rps": 12.333333333333334,
+          "total_requests": 185,
+          "total_errors": 0,
+          "total_bytes": 969932800,
+          "p99_us": 12353535
+        }
+      ]
+    },
+    {
+      "protocol": "http3",
+      "payload_bytes": 5242880,
+      "gateway": "ferrum",
+      "mean_rps": 62.06666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 63.733333333333334,
+          "total_requests": 956,
+          "total_errors": 0,
+          "total_bytes": 5012193280,
+          "p99_us": 1813503
+        },
+        {
+          "iteration": 2,
+          "rps": 62.53333333333333,
+          "total_requests": 938,
+          "total_errors": 0,
+          "total_bytes": 4917821440,
+          "p99_us": 1925119
+        },
+        {
+          "iteration": 3,
+          "rps": 59.93333333333333,
+          "total_requests": 899,
+          "total_errors": 0,
+          "total_bytes": 4713349120,
+          "p99_us": 2172927
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 10240,
+      "gateway": "direct",
+      "mean_rps": 97629.93333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 97629.93333333333,
+          "total_requests": 1464449,
+          "total_errors": 0,
+          "total_bytes": 14995957760,
+          "p99_us": 83391
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 10240,
+      "gateway": "envoy",
+      "mean_rps": 51004.933333333334,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 49004.933333333334,
+          "total_requests": 735074,
+          "total_errors": 0,
+          "total_bytes": 7527157760,
+          "p99_us": 122495
+        },
+        {
+          "iteration": 2,
+          "rps": 51814.13333333333,
+          "total_requests": 777212,
+          "total_errors": 0,
+          "total_bytes": 7958650880,
+          "p99_us": 86783
+        },
+        {
+          "iteration": 3,
+          "rps": 52195.73333333333,
+          "total_requests": 782936,
+          "total_errors": 2,
+          "total_bytes": 8017264640,
+          "p99_us": 46783
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 10240,
+      "gateway": "ferrum",
+      "mean_rps": 46877.26666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 45715.666666666664,
+          "total_requests": 685735,
+          "total_errors": 0,
+          "total_bytes": 7021926400,
+          "p99_us": 136063
+        },
+        {
+          "iteration": 2,
+          "rps": 47576.53333333333,
+          "total_requests": 713648,
+          "total_errors": 0,
+          "total_bytes": 7307755520,
+          "p99_us": 142847
+        },
+        {
+          "iteration": 3,
+          "rps": 47339.6,
+          "total_requests": 710094,
+          "total_errors": 0,
+          "total_bytes": 7271362560,
+          "p99_us": 143999
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 10240,
+      "gateway": "kong",
+      "mean_rps": 15356.755555555557,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 46070.26666666667,
+          "total_requests": 691054,
+          "total_errors": 0,
+          "total_bytes": 7076392960,
+          "p99_us": 145535
+        },
+        {
+          "iteration": 2,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        },
+        {
+          "iteration": 3,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 71680,
+      "gateway": "direct",
+      "mean_rps": 17892.933333333334,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 17892.933333333334,
+          "total_requests": 268394,
+          "total_errors": 0,
+          "total_bytes": 19238481920,
+          "p99_us": 168575
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 71680,
+      "gateway": "envoy",
+      "mean_rps": 8046.022222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 8074.933333333333,
+          "total_requests": 121124,
+          "total_errors": 2,
+          "total_bytes": 8682168320,
+          "p99_us": 497663
+        },
+        {
+          "iteration": 2,
+          "rps": 8024.066666666667,
+          "total_requests": 120361,
+          "total_errors": 2,
+          "total_bytes": 8627476480,
+          "p99_us": 490239
+        },
+        {
+          "iteration": 3,
+          "rps": 8039.066666666667,
+          "total_requests": 120586,
+          "total_errors": 1,
+          "total_bytes": 8643604480,
+          "p99_us": 511487
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 71680,
+      "gateway": "ferrum",
+      "mean_rps": 7847.444444444444,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 7841.066666666667,
+          "total_requests": 117616,
+          "total_errors": 0,
+          "total_bytes": 8430714880,
+          "p99_us": 221695
+        },
+        {
+          "iteration": 2,
+          "rps": 7670.2,
+          "total_requests": 115053,
+          "total_errors": 0,
+          "total_bytes": 8246999040,
+          "p99_us": 205439
+        },
+        {
+          "iteration": 3,
+          "rps": 8031.066666666667,
+          "total_requests": 120466,
+          "total_errors": 1,
+          "total_bytes": 8635002880,
+          "p99_us": 234367
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 71680,
+      "gateway": "kong",
+      "mean_rps": 2340.133333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 7020.4,
+          "total_requests": 105306,
+          "total_errors": 0,
+          "total_bytes": 7548334080,
+          "p99_us": 206463
+        },
+        {
+          "iteration": 2,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        },
+        {
+          "iteration": 3,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 512000,
+      "gateway": "direct",
+      "mean_rps": 2526.6666666666665,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 2526.6666666666665,
+          "total_requests": 37900,
+          "total_errors": 0,
+          "total_bytes": 19404800000,
+          "p99_us": 240127
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 512000,
+      "gateway": "envoy",
+      "mean_rps": 1145.1555555555556,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1149.3333333333333,
+          "total_requests": 17240,
+          "total_errors": 0,
+          "total_bytes": 8826880000,
+          "p99_us": 945663
+        },
+        {
+          "iteration": 2,
+          "rps": 1142.2,
+          "total_requests": 17133,
+          "total_errors": 1,
+          "total_bytes": 8772096000,
+          "p99_us": 955391
+        },
+        {
+          "iteration": 3,
+          "rps": 1143.9333333333334,
+          "total_requests": 17159,
+          "total_errors": 0,
+          "total_bytes": 8785408000,
+          "p99_us": 1021951
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 512000,
+      "gateway": "ferrum",
+      "mean_rps": 1173.0666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1168.9333333333334,
+          "total_requests": 17534,
+          "total_errors": 4,
+          "total_bytes": 8977408000,
+          "p99_us": 817663
+        },
+        {
+          "iteration": 2,
+          "rps": 1158.2666666666667,
+          "total_requests": 17374,
+          "total_errors": 2,
+          "total_bytes": 8895488000,
+          "p99_us": 489983
+        },
+        {
+          "iteration": 3,
+          "rps": 1192.0,
+          "total_requests": 17880,
+          "total_errors": 0,
+          "total_bytes": 9154560000,
+          "p99_us": 616447
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 512000,
+      "gateway": "kong",
+      "mean_rps": 334.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1002.0,
+          "total_requests": 15030,
+          "total_errors": 0,
+          "total_bytes": 7695360000,
+          "p99_us": 721919
+        },
+        {
+          "iteration": 2,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        },
+        {
+          "iteration": 3,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 1048576,
+      "gateway": "direct",
+      "mean_rps": 1247.2666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1247.2666666666667,
+          "total_requests": 18709,
+          "total_errors": 0,
+          "total_bytes": 19617808384,
+          "p99_us": 235519
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 1048576,
+      "gateway": "envoy",
+      "mean_rps": 555.1333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 553.3333333333334,
+          "total_requests": 8300,
+          "total_errors": 0,
+          "total_bytes": 8703180800,
+          "p99_us": 442111
+        },
+        {
+          "iteration": 2,
+          "rps": 550.9333333333333,
+          "total_requests": 8264,
+          "total_errors": 0,
+          "total_bytes": 8665432064,
+          "p99_us": 458239
+        },
+        {
+          "iteration": 3,
+          "rps": 561.1333333333333,
+          "total_requests": 8417,
+          "total_errors": 0,
+          "total_bytes": 8825864192,
+          "p99_us": 428031
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 1048576,
+      "gateway": "ferrum",
+      "mean_rps": 576.0666666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 572.4,
+          "total_requests": 8586,
+          "total_errors": 0,
+          "total_bytes": 9003073536,
+          "p99_us": 484863
+        },
+        {
+          "iteration": 2,
+          "rps": 591.8666666666667,
+          "total_requests": 8878,
+          "total_errors": 0,
+          "total_bytes": 9309257728,
+          "p99_us": 464639
+        },
+        {
+          "iteration": 3,
+          "rps": 563.9333333333333,
+          "total_requests": 8459,
+          "total_errors": 0,
+          "total_bytes": 8869904384,
+          "p99_us": 463359
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 1048576,
+      "gateway": "kong",
+      "mean_rps": 164.79999999999998,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 494.4,
+          "total_requests": 7416,
+          "total_errors": 0,
+          "total_bytes": 7776239616,
+          "p99_us": 502271
+        },
+        {
+          "iteration": 2,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        },
+        {
+          "iteration": 3,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 5242880,
+      "gateway": "direct",
+      "mean_rps": 252.26666666666668,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 252.26666666666668,
+          "total_requests": 3784,
+          "total_errors": 0,
+          "total_bytes": 19839057920,
+          "p99_us": 346623
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 5242880,
+      "gateway": "envoy",
+      "mean_rps": 113.64444444444445,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 113.0,
+          "total_requests": 1695,
+          "total_errors": 0,
+          "total_bytes": 8886681600,
+          "p99_us": 799231
+        },
+        {
+          "iteration": 2,
+          "rps": 113.73333333333333,
+          "total_requests": 1706,
+          "total_errors": 0,
+          "total_bytes": 8944353280,
+          "p99_us": 1012223
+        },
+        {
+          "iteration": 3,
+          "rps": 114.2,
+          "total_requests": 1713,
+          "total_errors": 0,
+          "total_bytes": 8981053440,
+          "p99_us": 818175
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 5242880,
+      "gateway": "ferrum",
+      "mean_rps": 123.33333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 124.33333333333333,
+          "total_requests": 1865,
+          "total_errors": 0,
+          "total_bytes": 9777971200,
+          "p99_us": 759807
+        },
+        {
+          "iteration": 2,
+          "rps": 121.2,
+          "total_requests": 1818,
+          "total_errors": 0,
+          "total_bytes": 9531555840,
+          "p99_us": 870399
+        },
+        {
+          "iteration": 3,
+          "rps": 124.46666666666667,
+          "total_requests": 1867,
+          "total_errors": 0,
+          "total_bytes": 9788456960,
+          "p99_us": 709119
+        }
+      ]
+    },
+    {
+      "protocol": "tcp-tls",
+      "payload_bytes": 5242880,
+      "gateway": "kong",
+      "mean_rps": 34.733333333333334,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 104.2,
+          "total_requests": 1563,
+          "total_errors": 8,
+          "total_bytes": 8194621440,
+          "p99_us": 1338367
+        },
+        {
+          "iteration": 2,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        },
+        {
+          "iteration": 3,
+          "rps": 0.0,
+          "total_requests": 0,
+          "total_errors": 0,
+          "total_bytes": 0,
+          "p99_us": 0
+        }
+      ]
+    },
+    {
+      "protocol": "udp",
+      "payload_bytes": 1024,
+      "gateway": "direct",
+      "mean_rps": 107907.4,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 107907.4,
+          "total_requests": 1618611,
+          "total_errors": 0,
+          "total_bytes": 1657457664,
+          "p99_us": 3325
+        }
+      ]
+    },
+    {
+      "protocol": "udp",
+      "payload_bytes": 1024,
+      "gateway": "envoy",
+      "mean_rps": 72622.2,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 69486.46666666666,
+          "total_requests": 1042297,
+          "total_errors": 0,
+          "total_bytes": 1067312128,
+          "p99_us": 6855
+        },
+        {
+          "iteration": 2,
+          "rps": 73938.13333333333,
+          "total_requests": 1109072,
+          "total_errors": 0,
+          "total_bytes": 1135689728,
+          "p99_us": 5851
+        },
+        {
+          "iteration": 3,
+          "rps": 74442.0,
+          "total_requests": 1116630,
+          "total_errors": 0,
+          "total_bytes": 1143429120,
+          "p99_us": 5815
+        }
+      ]
+    },
+    {
+      "protocol": "udp",
+      "payload_bytes": 1024,
+      "gateway": "ferrum",
+      "mean_rps": 77681.2888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 73877.6,
+          "total_requests": 1108164,
+          "total_errors": 0,
+          "total_bytes": 1134759936,
+          "p99_us": 5579
+        },
+        {
+          "iteration": 2,
+          "rps": 79315.66666666667,
+          "total_requests": 1189735,
+          "total_errors": 0,
+          "total_bytes": 1218288640,
+          "p99_us": 4911
+        },
+        {
+          "iteration": 3,
+          "rps": 79850.6,
+          "total_requests": 1197759,
+          "total_errors": 0,
+          "total_bytes": 1226505216,
+          "p99_us": 4859
+        }
+      ]
+    },
+    {
+      "protocol": "udp",
+      "payload_bytes": 1024,
+      "gateway": "kong",
+      "mean_rps": 81643.3111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 82073.46666666666,
+          "total_requests": 1231102,
+          "total_errors": 0,
+          "total_bytes": 1260648448,
+          "p99_us": 5799
+        },
+        {
+          "iteration": 2,
+          "rps": 81171.06666666667,
+          "total_requests": 1217566,
+          "total_errors": 0,
+          "total_bytes": 1246787584,
+          "p99_us": 5579
+        },
+        {
+          "iteration": 3,
+          "rps": 81685.4,
+          "total_requests": 1225281,
+          "total_errors": 0,
+          "total_bytes": 1254687744,
+          "p99_us": 5495
+        }
+      ]
+    },
+    {
+      "protocol": "udp-dtls",
+      "payload_bytes": 1024,
+      "gateway": "direct",
+      "mean_rps": 125363.0,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 125363.0,
+          "total_requests": 1880445,
+          "total_errors": 0,
+          "total_bytes": 1925575680,
+          "p99_us": 3037
+        }
+      ]
+    },
+    {
+      "protocol": "udp-dtls",
+      "payload_bytes": 1024,
+      "gateway": "ferrum",
+      "mean_rps": 53364.53333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 48804.13333333333,
+          "total_requests": 732062,
+          "total_errors": 0,
+          "total_bytes": 749631488,
+          "p99_us": 8263
+        },
+        {
+          "iteration": 2,
+          "rps": 56910.066666666666,
+          "total_requests": 853651,
+          "total_errors": 0,
+          "total_bytes": 874138624,
+          "p99_us": 6323
+        },
+        {
+          "iteration": 3,
+          "rps": 54379.4,
+          "total_requests": 815691,
+          "total_errors": 0,
+          "total_bytes": 835267584,
+          "p99_us": 6727
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 10240,
+      "gateway": "direct",
+      "mean_rps": 55327.86666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 55327.86666666667,
+          "total_requests": 829918,
+          "total_errors": 0,
+          "total_bytes": 8498360320,
+          "p99_us": 7779
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 10240,
+      "gateway": "envoy",
+      "mean_rps": 25000.977777777778,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 23249.6,
+          "total_requests": 348744,
+          "total_errors": 0,
+          "total_bytes": 3571138560,
+          "p99_us": 18127
+        },
+        {
+          "iteration": 2,
+          "rps": 26006.666666666668,
+          "total_requests": 390100,
+          "total_errors": 0,
+          "total_bytes": 3994624000,
+          "p99_us": 15159
+        },
+        {
+          "iteration": 3,
+          "rps": 25746.666666666668,
+          "total_requests": 386200,
+          "total_errors": 0,
+          "total_bytes": 3954688000,
+          "p99_us": 15767
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 10240,
+      "gateway": "ferrum",
+      "mean_rps": 28045.31111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 25676.733333333334,
+          "total_requests": 385151,
+          "total_errors": 0,
+          "total_bytes": 3943946240,
+          "p99_us": 16087
+        },
+        {
+          "iteration": 2,
+          "rps": 29535.8,
+          "total_requests": 443037,
+          "total_errors": 0,
+          "total_bytes": 4536698880,
+          "p99_us": 13127
+        },
+        {
+          "iteration": 3,
+          "rps": 28923.4,
+          "total_requests": 433851,
+          "total_errors": 0,
+          "total_bytes": 4442634240,
+          "p99_us": 13295
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 10240,
+      "gateway": "kong",
+      "mean_rps": 12949.311111111112,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 12755.666666666666,
+          "total_requests": 191335,
+          "total_errors": 0,
+          "total_bytes": 1959270400,
+          "p99_us": 84351
+        },
+        {
+          "iteration": 2,
+          "rps": 13221.2,
+          "total_requests": 198318,
+          "total_errors": 0,
+          "total_bytes": 2030776320,
+          "p99_us": 96703
+        },
+        {
+          "iteration": 3,
+          "rps": 12871.066666666668,
+          "total_requests": 193066,
+          "total_errors": 0,
+          "total_bytes": 1976995840,
+          "p99_us": 63423
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 10240,
+      "gateway": "tyk",
+      "mean_rps": 26384.266666666666,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 24524.6,
+          "total_requests": 367869,
+          "total_errors": 0,
+          "total_bytes": 3766978560,
+          "p99_us": 19039
+        },
+        {
+          "iteration": 2,
+          "rps": 27738.533333333333,
+          "total_requests": 416078,
+          "total_errors": 0,
+          "total_bytes": 4260638720,
+          "p99_us": 16943
+        },
+        {
+          "iteration": 3,
+          "rps": 26889.666666666668,
+          "total_requests": 403345,
+          "total_errors": 0,
+          "total_bytes": 4130252800,
+          "p99_us": 16879
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 71680,
+      "gateway": "direct",
+      "mean_rps": 12347.733333333334,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 12347.733333333334,
+          "total_requests": 185216,
+          "total_errors": 0,
+          "total_bytes": 13276282880,
+          "p99_us": 30559
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 71680,
+      "gateway": "envoy",
+      "mean_rps": 5015.377777777778,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 4939.4,
+          "total_requests": 74091,
+          "total_errors": 0,
+          "total_bytes": 5310842880,
+          "p99_us": 73279
+        },
+        {
+          "iteration": 2,
+          "rps": 5097.4,
+          "total_requests": 76461,
+          "total_errors": 0,
+          "total_bytes": 5480724480,
+          "p99_us": 86847
+        },
+        {
+          "iteration": 3,
+          "rps": 5009.333333333333,
+          "total_requests": 75140,
+          "total_errors": 0,
+          "total_bytes": 5386035200,
+          "p99_us": 75519
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 71680,
+      "gateway": "ferrum",
+      "mean_rps": 5781.155555555555,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 5717.066666666667,
+          "total_requests": 85756,
+          "total_errors": 0,
+          "total_bytes": 6146990080,
+          "p99_us": 64703
+        },
+        {
+          "iteration": 2,
+          "rps": 5830.933333333333,
+          "total_requests": 87464,
+          "total_errors": 0,
+          "total_bytes": 6269419520,
+          "p99_us": 61887
+        },
+        {
+          "iteration": 3,
+          "rps": 5795.466666666666,
+          "total_requests": 86932,
+          "total_errors": 0,
+          "total_bytes": 6231285760,
+          "p99_us": 62751
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 71680,
+      "gateway": "kong",
+      "mean_rps": 2693.5333333333333,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 2684.733333333333,
+          "total_requests": 40271,
+          "total_errors": 0,
+          "total_bytes": 2886625280,
+          "p99_us": 205695
+        },
+        {
+          "iteration": 2,
+          "rps": 2703.3333333333335,
+          "total_requests": 40550,
+          "total_errors": 0,
+          "total_bytes": 2906624000,
+          "p99_us": 205951
+        },
+        {
+          "iteration": 3,
+          "rps": 2692.5333333333333,
+          "total_requests": 40388,
+          "total_errors": 0,
+          "total_bytes": 2895011840,
+          "p99_us": 327935
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 71680,
+      "gateway": "tyk",
+      "mean_rps": 5776.711111111111,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 5808.066666666667,
+          "total_requests": 87121,
+          "total_errors": 0,
+          "total_bytes": 6244833280,
+          "p99_us": 74303
+        },
+        {
+          "iteration": 2,
+          "rps": 5879.266666666666,
+          "total_requests": 88189,
+          "total_errors": 0,
+          "total_bytes": 6321387520,
+          "p99_us": 74815
+        },
+        {
+          "iteration": 3,
+          "rps": 5642.8,
+          "total_requests": 84642,
+          "total_errors": 0,
+          "total_bytes": 6067138560,
+          "p99_us": 75903
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 512000,
+      "gateway": "direct",
+      "mean_rps": 1915.4,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1915.4,
+          "total_requests": 28731,
+          "total_errors": 0,
+          "total_bytes": 14710272000,
+          "p99_us": 244095
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 512000,
+      "gateway": "envoy",
+      "mean_rps": 871.1777777777778,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 875.1333333333333,
+          "total_requests": 13127,
+          "total_errors": 0,
+          "total_bytes": 6721024000,
+          "p99_us": 403199
+        },
+        {
+          "iteration": 2,
+          "rps": 867.4666666666667,
+          "total_requests": 13012,
+          "total_errors": 0,
+          "total_bytes": 6662144000,
+          "p99_us": 445183
+        },
+        {
+          "iteration": 3,
+          "rps": 870.9333333333333,
+          "total_requests": 13064,
+          "total_errors": 0,
+          "total_bytes": 6688768000,
+          "p99_us": 403199
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 512000,
+      "gateway": "ferrum",
+      "mean_rps": 976.3777777777779,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 960.4666666666667,
+          "total_requests": 14407,
+          "total_errors": 0,
+          "total_bytes": 7376384000,
+          "p99_us": 450815
+        },
+        {
+          "iteration": 2,
+          "rps": 990.3333333333334,
+          "total_requests": 14855,
+          "total_errors": 0,
+          "total_bytes": 7605760000,
+          "p99_us": 421119
+        },
+        {
+          "iteration": 3,
+          "rps": 978.3333333333334,
+          "total_requests": 14675,
+          "total_errors": 0,
+          "total_bytes": 7513600000,
+          "p99_us": 438783
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 512000,
+      "gateway": "kong",
+      "mean_rps": 409.4222222222222,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 414.46666666666664,
+          "total_requests": 6217,
+          "total_errors": 0,
+          "total_bytes": 3183104000,
+          "p99_us": 930303
+        },
+        {
+          "iteration": 2,
+          "rps": 396.4,
+          "total_requests": 5946,
+          "total_errors": 0,
+          "total_bytes": 3044352000,
+          "p99_us": 1278975
+        },
+        {
+          "iteration": 3,
+          "rps": 417.4,
+          "total_requests": 6261,
+          "total_errors": 0,
+          "total_bytes": 3205632000,
+          "p99_us": 899583
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 512000,
+      "gateway": "tyk",
+      "mean_rps": 989.6,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 1014.7333333333333,
+          "total_requests": 15221,
+          "total_errors": 0,
+          "total_bytes": 7793152000,
+          "p99_us": 397311
+        },
+        {
+          "iteration": 2,
+          "rps": 982.1333333333333,
+          "total_requests": 14732,
+          "total_errors": 0,
+          "total_bytes": 7542784000,
+          "p99_us": 389119
+        },
+        {
+          "iteration": 3,
+          "rps": 971.9333333333333,
+          "total_requests": 14579,
+          "total_errors": 0,
+          "total_bytes": 7464448000,
+          "p99_us": 431871
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 1048576,
+      "gateway": "direct",
+      "mean_rps": 997.2666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 997.2666666666667,
+          "total_requests": 14959,
+          "total_errors": 0,
+          "total_bytes": 15685648384,
+          "p99_us": 242687
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 1048576,
+      "gateway": "envoy",
+      "mean_rps": 444.4888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 445.3333333333333,
+          "total_requests": 6680,
+          "total_errors": 0,
+          "total_bytes": 7004487680,
+          "p99_us": 355839
+        },
+        {
+          "iteration": 2,
+          "rps": 442.6666666666667,
+          "total_requests": 6640,
+          "total_errors": 0,
+          "total_bytes": 6962544640,
+          "p99_us": 394495
+        },
+        {
+          "iteration": 3,
+          "rps": 445.46666666666664,
+          "total_requests": 6682,
+          "total_errors": 0,
+          "total_bytes": 7006584832,
+          "p99_us": 374527
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 1048576,
+      "gateway": "ferrum",
+      "mean_rps": 466.17777777777775,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 456.3333333333333,
+          "total_requests": 6845,
+          "total_errors": 0,
+          "total_bytes": 7177502720,
+          "p99_us": 400639
+        },
+        {
+          "iteration": 2,
+          "rps": 481.3333333333333,
+          "total_requests": 7220,
+          "total_errors": 0,
+          "total_bytes": 7570718720,
+          "p99_us": 392447
+        },
+        {
+          "iteration": 3,
+          "rps": 460.8666666666667,
+          "total_requests": 6913,
+          "total_errors": 0,
+          "total_bytes": 7248805888,
+          "p99_us": 397311
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 1048576,
+      "gateway": "kong",
+      "mean_rps": 214.26666666666665,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 217.53333333333333,
+          "total_requests": 3263,
+          "total_errors": 0,
+          "total_bytes": 3421503488,
+          "p99_us": 859135
+        },
+        {
+          "iteration": 2,
+          "rps": 206.73333333333332,
+          "total_requests": 3101,
+          "total_errors": 0,
+          "total_bytes": 3251634176,
+          "p99_us": 1076223
+        },
+        {
+          "iteration": 3,
+          "rps": 218.53333333333333,
+          "total_requests": 3278,
+          "total_errors": 0,
+          "total_bytes": 3437232128,
+          "p99_us": 1215487
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 1048576,
+      "gateway": "tyk",
+      "mean_rps": 523.2888888888889,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 525.4666666666667,
+          "total_requests": 7882,
+          "total_errors": 0,
+          "total_bytes": 8264876032,
+          "p99_us": 432383
+        },
+        {
+          "iteration": 2,
+          "rps": 508.3333333333333,
+          "total_requests": 7625,
+          "total_errors": 0,
+          "total_bytes": 7995392000,
+          "p99_us": 403711
+        },
+        {
+          "iteration": 3,
+          "rps": 536.0666666666667,
+          "total_requests": 8041,
+          "total_errors": 0,
+          "total_bytes": 8431599616,
+          "p99_us": 440063
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 5242880,
+      "gateway": "direct",
+      "mean_rps": 191.86666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 191.86666666666667,
+          "total_requests": 2878,
+          "total_errors": 0,
+          "total_bytes": 15089008640,
+          "p99_us": 568319
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 5242880,
+      "gateway": "envoy",
+      "mean_rps": 87.04444444444445,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 86.73333333333333,
+          "total_requests": 1301,
+          "total_errors": 0,
+          "total_bytes": 6820986880,
+          "p99_us": 778239
+        },
+        {
+          "iteration": 2,
+          "rps": 87.73333333333333,
+          "total_requests": 1316,
+          "total_errors": 0,
+          "total_bytes": 6899630080,
+          "p99_us": 875519
+        },
+        {
+          "iteration": 3,
+          "rps": 86.66666666666667,
+          "total_requests": 1300,
+          "total_errors": 0,
+          "total_bytes": 6815744000,
+          "p99_us": 956415
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 5242880,
+      "gateway": "ferrum",
+      "mean_rps": 99.44444444444444,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 99.46666666666667,
+          "total_requests": 1492,
+          "total_errors": 20,
+          "total_bytes": 7822376960,
+          "p99_us": 782335
+        },
+        {
+          "iteration": 2,
+          "rps": 99.93333333333334,
+          "total_requests": 1499,
+          "total_errors": 15,
+          "total_bytes": 7859077120,
+          "p99_us": 679935
+        },
+        {
+          "iteration": 3,
+          "rps": 98.93333333333334,
+          "total_requests": 1484,
+          "total_errors": 11,
+          "total_bytes": 7780433920,
+          "p99_us": 752127
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 5242880,
+      "gateway": "kong",
+      "mean_rps": 44.666666666666664,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 44.13333333333333,
+          "total_requests": 662,
+          "total_errors": 0,
+          "total_bytes": 3470786560,
+          "p99_us": 2861055
+        },
+        {
+          "iteration": 2,
+          "rps": 44.733333333333334,
+          "total_requests": 671,
+          "total_errors": 0,
+          "total_bytes": 3517972480,
+          "p99_us": 3639295
+        },
+        {
+          "iteration": 3,
+          "rps": 45.13333333333333,
+          "total_requests": 677,
+          "total_errors": 0,
+          "total_bytes": 3549429760,
+          "p99_us": 3911679
+        }
+      ]
+    },
+    {
+      "protocol": "wss",
+      "payload_bytes": 5242880,
+      "gateway": "tyk",
+      "mean_rps": 111.26666666666667,
+      "samples": [
+        {
+          "iteration": 1,
+          "rps": 111.93333333333334,
+          "total_requests": 1679,
+          "total_errors": 0,
+          "total_bytes": 8802795520,
+          "p99_us": 1014271
+        },
+        {
+          "iteration": 2,
+          "rps": 110.86666666666666,
+          "total_requests": 1663,
+          "total_errors": 0,
+          "total_bytes": 8718909440,
+          "p99_us": 1034239
+        },
+        {
+          "iteration": 3,
+          "rps": 111.0,
+          "total_requests": 1665,
+          "total_errors": 0,
+          "total_bytes": 8729395200,
+          "p99_us": 1019391
+        }
+      ]
+    }
+  ],
+  "envoy_h3_local_checks": [
+    {
+      "version": "1.37.1",
+      "platform": "macOS ARM64 native",
+      "duration_seconds": 5,
+      "purpose": "correctness probe, not comparative performance evidence",
+      "cases": [
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 10240,
+          "concurrency": 200,
+          "total_requests": 29551,
+          "total_errors": 0,
+          "total_bytes": 302602240
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 1048576,
+          "concurrency": 100,
+          "total_requests": 361,
+          "total_errors": 0,
+          "total_bytes": 378535936
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 512000,
+          "concurrency": 200,
+          "total_requests": 901,
+          "total_errors": 0,
+          "total_bytes": 461312000
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 5242880,
+          "concurrency": 50,
+          "total_requests": 82,
+          "total_errors": 0,
+          "total_bytes": 429916160
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 71680,
+          "concurrency": 200,
+          "total_requests": 6111,
+          "total_errors": 0,
+          "total_bytes": 438036480
+        },
+        {
+          "max_concurrent_streams": 16,
+          "payload_bytes": 10240,
+          "concurrency": 200,
+          "total_requests": 30583,
+          "total_errors": 0,
+          "total_bytes": 313169920
+        },
+        {
+          "max_concurrent_streams": 16,
+          "payload_bytes": 1048576,
+          "concurrency": 100,
+          "total_requests": 445,
+          "total_errors": 0,
+          "total_bytes": 466616320
+        },
+        {
+          "max_concurrent_streams": 16,
+          "payload_bytes": 512000,
+          "concurrency": 200,
+          "total_requests": 748,
+          "total_errors": 0,
+          "total_bytes": 382976000
+        },
+        {
+          "max_concurrent_streams": 16,
+          "payload_bytes": 5242880,
+          "concurrency": 50,
+          "total_requests": 95,
+          "total_errors": 0,
+          "total_bytes": 498073600
+        },
+        {
+          "max_concurrent_streams": 16,
+          "payload_bytes": 71680,
+          "concurrency": 200,
+          "total_requests": 6449,
+          "total_errors": 0,
+          "total_bytes": 462264320
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 10240,
+          "concurrency": 200,
+          "total_requests": 31149,
+          "total_errors": 0,
+          "total_bytes": 318965760
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 1048576,
+          "concurrency": 100,
+          "total_requests": 446,
+          "total_errors": 0,
+          "total_bytes": 467664896
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 512000,
+          "concurrency": 200,
+          "total_requests": 847,
+          "total_errors": 0,
+          "total_bytes": 433664000
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 5242880,
+          "concurrency": 50,
+          "total_requests": 93,
+          "total_errors": 0,
+          "total_bytes": 487587840
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 71680,
+          "concurrency": 200,
+          "total_requests": 6153,
+          "total_errors": 0,
+          "total_bytes": 441047040
+        }
+      ]
+    },
+    {
+      "version": "1.33.5",
+      "platform": "Linux ARM64 Envoy, x86_64 client/backend under emulation",
+      "duration_seconds": 10,
+      "purpose": "correctness probe, not comparative performance evidence",
+      "cases": [
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 10240,
+          "concurrency": 200,
+          "total_requests": 15058,
+          "total_errors": 0,
+          "total_bytes": 154193920
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 1048576,
+          "concurrency": 100,
+          "total_requests": 227,
+          "total_errors": 0,
+          "total_bytes": 238026752
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 512000,
+          "concurrency": 200,
+          "total_requests": 423,
+          "total_errors": 0,
+          "total_bytes": 216576000
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 5242880,
+          "concurrency": 50,
+          "total_requests": 58,
+          "total_errors": 0,
+          "total_bytes": 304087040
+        },
+        {
+          "max_concurrent_streams": 100,
+          "payload_bytes": 71680,
+          "concurrency": 200,
+          "total_requests": 2340,
+          "total_errors": 0,
+          "total_bytes": 167731200
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 10240,
+          "concurrency": 200,
+          "total_requests": 15265,
+          "total_errors": 0,
+          "total_bytes": 156313600
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 1048576,
+          "concurrency": 100,
+          "total_requests": 199,
+          "total_errors": 0,
+          "total_bytes": 208666624
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 512000,
+          "concurrency": 200,
+          "total_requests": 421,
+          "total_errors": 0,
+          "total_bytes": 215552000
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 5242880,
+          "concurrency": 50,
+          "total_requests": 59,
+          "total_errors": 0,
+          "total_bytes": 309329920
+        },
+        {
+          "max_concurrent_streams": 4,
+          "payload_bytes": 71680,
+          "concurrency": 200,
+          "total_requests": 2922,
+          "total_errors": 0,
+          "total_bytes": 209448960
+        }
+      ]
+    }
+  ]
+}

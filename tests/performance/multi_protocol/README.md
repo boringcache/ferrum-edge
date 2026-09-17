@@ -180,6 +180,22 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
+For the September 2026 multi-gateway investigation, see the
+[benchmark audit](../../../docs/benchmark_audit_2026_09_17.md). The gateway
+workflow now reports validity across every iteration: errors, zero successful
+work, missing iterations, or inconsistent echo byte totals exclude a scenario
+from the scoreboard. Raw rates remain diagnostic. Each run records its expected
+matrix before startup and saves backend/gateway logs plus Envoy counters under
+`diagnostics/` after the timed samples. A green workflow alone does not certify
+an error-free benchmark; inspect the validity tables.
+
+Focused harness checks:
+
+```bash
+python3 -m unittest discover -s tests/performance/multi_protocol/tests -p 'test_*.py'
+cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --test metrics_tests
+```
+
 **Date**: 2026-04-12
 **Environment**: macOS Darwin 25.4.0, Apple Silicon
 **Duration**: 10s per test, 200 concurrent connections

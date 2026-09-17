@@ -4,16 +4,15 @@
 # HTTP/3 downstream is production-ready per Envoy docs; upstream HTTP/3 is alpha.
 # We terminate HTTP/3 at the gateway and use HTTP/3 upstream via explicit config.
 #
-# This benchmark intentionally drives high-concurrency POST/echo streams with
-# payloads as large as 5 MiB. Envoy's QUIC connection window tops out at 24 MiB,
-# so use a 6 MiB stream window and cap H3 concurrent streams per QUIC connection
-# to 4 (4 x 6 MiB = 24 MiB). This makes the downstream and upstream pools fan
-# out across more QUIC connections instead of concentrating too much in-flight
-# body data onto one connection. With the bench client's concurrency/10+1 H3
-# connection pool, concurrency=100 maps to 11 x 4 = 44 in-flight downstream
-# streams, so post-tuning Envoy H3 numbers are not directly comparable to
-# uncapped runs. No HTTP buffer filter is needed because this benchmark streams
-# echo bodies rather than requiring full-body buffering.
+# The client assigns at most 10 workers per QUIC connection. Envoy's normal
+# 100-stream limit admits that entire workload; the old four-stream cap admitted
+# only 84 of 200 workers across 21 connections. Do not derive a stream-count cap
+# from 24 MiB / 6 MiB: flow-control credit advances as data is consumed and the
+# connection window need not hold every complete body simultaneously.
+# Keep the tested 6 MiB stream / 24 MiB connection windows and 128 MiB connection
+# buffers. No HTTP buffer filter is needed for forwarding the echo workload.
+# See docs/benchmark_audit_2026_09_17.md for the controlled zero-error checks
+# and their limits. Hosted reruns determine comparative performance.
 #
 # Envoy's QUIC upstream verifier requires an explicit SNI/server name for this
 # static 127.0.0.1 cluster. Without it the TLS hostname is empty and Envoy
@@ -54,7 +53,7 @@ static_resources:
                 codec_type: HTTP3
                 http3_protocol_options:
                   quic_protocol_options:
-                    max_concurrent_streams: { value: 4 }
+                    max_concurrent_streams: { value: 100 }
                     initial_stream_window_size: { value: 6291456 }
                     initial_connection_window_size: { value: 25165824 }
                 route_config:
@@ -89,7 +88,7 @@ static_resources:
           explicit_http_config:
             http3_protocol_options:
               quic_protocol_options:
-                max_concurrent_streams: { value: 4 }
+                max_concurrent_streams: { value: 100 }
                 initial_stream_window_size: { value: 6291456 }
                 initial_connection_window_size: { value: 25165824 }
       transport_socket:

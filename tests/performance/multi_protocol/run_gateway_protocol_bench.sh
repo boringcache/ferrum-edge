@@ -752,6 +752,20 @@ run_bench() {
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
     fi
+    # Capture after the timed load, while the gateway still exists. Keep these
+    # below a subdirectory so summary globs cannot mistake stats for samples.
+    local diagnostics="$OUTPUT_DIR/diagnostics"
+    mkdir -p "$diagnostics"
+    cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log"
+    if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
+        docker logs "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
+        if [ "$gateway" = "envoy" ]; then
+            curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
+                > "$diagnostics/envoy_${payload}_stats.json" \
+                2> "$diagnostics/envoy_${payload}_stats.err" || true
+        fi
+    fi
+
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"
@@ -796,6 +810,20 @@ PYEOF
 main() {
     mkdir -p "$OUTPUT_DIR"
     echo "[main] protocol=$PROTOCOL sizes=$PAYLOAD_SIZES gateways=$GATEWAYS"
+
+    # Persist the intended matrix before any build/startup can fail. Missing
+    # gateways must not disappear and leave the survivors with a false win.
+    local expected_gateways=""
+    for gw in $GATEWAYS; do
+        if supports "$gw" "$PROTOCOL"; then expected_gateways+=" $gw"; fi
+    done
+    if ! $SKIP_DIRECT; then expected_gateways="direct $expected_gateways"; fi
+    python3 - "$OUTPUT_DIR/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], "w") as manifest:
+    json.dump({"gateways": sys.argv[2].split(),
+               "payload_sizes": [int(size) for size in sys.argv[3].split()]}, manifest)
+PYEOF
 
     build_binaries
     start_backend
