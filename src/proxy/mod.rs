@@ -8881,9 +8881,9 @@ impl ProxyState {
     /// Mesh startup calls this for the ONE slot
     /// `mesh_inbound_spiffe_verifier` reads, at the moment it is created and
     /// before anything can be published into it. The fence's credential gate
-    /// re-checks live tunnels against exactly those anchors, because the fence
-    /// answers "would this tunnel still be admitted" and admission is what that
-    /// verifier decides. Idempotent for the same slot.
+    /// judges both live tunnels and arriving CONNECTs against exactly those
+    /// anchors, because the fence answers "would this still be admitted" and
+    /// admission is what that verifier decides. Idempotent for the same slot.
     pub fn install_mesh_inbound_admission_trust(&self, slot: &crate::tls::SharedBundleSlot) {
         self.hbone_admission_fence
             .install_inbound_admission_trust(slot);
@@ -8894,10 +8894,17 @@ impl ProxyState {
     /// This is the ONE way that slot changes: the store is followed by an HBONE
     /// admission-fence sweep, so a live tunnel whose peer chain no longer
     /// anchors in the material the next handshake would apply is revoked
-    /// (`peer_trust`) instead of outliving the trust that admitted it. A direct
-    /// `slot.store()` skips the sweep AND leaves the slot's trust revision —
-    /// the fence's skip key for certificate path building — behind the bytes it
-    /// names, which would make the gate stop re-checking.
+    /// (`peer_trust`) instead of outliving the trust that admitted it, and the
+    /// peer's next CONNECT on that same pooled session is refused rather than
+    /// re-admitted. A direct `slot.store()` skips the sweep AND leaves the
+    /// fence's in-force trust — its skip key for certificate path building, and
+    /// the anchors the CONNECT gate reads — behind the bytes the verifier is
+    /// serving, which would make the gate stop re-checking.
+    ///
+    /// A candidate that does not compile as ONE atomic set is stored (the same
+    /// slot backs the inbound listener's server identity) but does not take
+    /// force: the inbound verifier keeps its last-known-good set in exactly that
+    /// case, so the fence must too.
     pub fn publish_mesh_inbound_trust_bundle(
         &self,
         slot: &crate::tls::SharedBundleSlot,
