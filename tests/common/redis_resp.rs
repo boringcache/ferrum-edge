@@ -14,7 +14,6 @@
 //! replies live in exactly one place across the unit, integration, and
 //! functional targets.
 
-#![allow(dead_code)]
 
 use std::time::{Duration, SystemTime};
 

@@ -64,6 +64,7 @@ pub mod gateway_harness;
 pub mod hmac_helpers;
 pub mod isolated_audit_fallback;
 pub mod protocol_managed_response_headers;
+#[allow(dead_code)] // shared by several test targets; not every one drives a fake Redis
 pub mod redis_resp;
 pub mod scheduled_scaling;
 pub mod trusted_projected_gateway;
