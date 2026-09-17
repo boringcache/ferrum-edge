@@ -49432,6 +49432,7 @@ enum HboneInnerOpenError {
 /// (this gateway has no resolvable SVID identity, so there is no key to file
 /// it under) produces an unpooled lease and the dial below reports the same
 /// refusal it always did.
+#[allow(clippy::too_many_arguments)]
 async fn open_hbone_inner_h1(
     state: &ProxyState,
     proxy: &Proxy,
