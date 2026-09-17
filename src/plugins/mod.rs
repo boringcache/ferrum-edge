@@ -11300,6 +11300,17 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when an admitted HBONE CONNECT may safely carry later
+    /// application requests without running this plugin again.
+    ///
+    /// Non-authorization plugins are reusable by default. Authorization
+    /// plugins must opt in explicitly; the default `is_authorize_plugin()` is
+    /// `true`, so an unknown/custom plugin fails closed. Plugins with admission
+    /// side effects outside `authorize` must also override this to `false`.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        !self.is_authorize_plugin()
+    }
+
     /// Returns hostnames that this plugin will send traffic to.
     ///
     /// Used during DNS warmup to pre-resolve plugin endpoint hostnames

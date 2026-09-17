@@ -2508,6 +2508,31 @@ async fn an_admitted_connect_advertises_the_fence_capability_on_its_200() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_connect_with_per_request_rate_limiting_does_not_advertise_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![spiffe_rate_limit_plugin(2)],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(tunnel_reuse_advertisement(&response), None);
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_refused_connect_never_advertises_the_fence_capability() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
     let (backend_addr, backend_handle) = start_interactive_echo_backend().await;

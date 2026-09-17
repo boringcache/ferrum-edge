@@ -2776,6 +2776,13 @@ impl Plugin for MeshAuthz {
         true
     }
 
+    /// Local policy is covered by the live-admission fence. A generation with
+    /// CUSTOM policy is not reusable because its external verdict is
+    /// deliberately not re-issued by a sweep.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        self.ext_authz.is_none()
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
         // outbound capture leg is not judged at all (issue #4158). This is the

@@ -819,6 +819,13 @@ impl Plugin for RateLimiting {
         matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
     }
 
+    // Every application operation must consume its own token. This is also
+    // required for IP limiting, which runs in `on_request_received` rather
+    // than in the authorize phase.
+    fn allows_hbone_inner_reuse(&self) -> bool {
+        false
+    }
+
     /// Participate in the shared rejection/synthetic finalizer so an admitted,
     /// counted request still receives `x-ratelimit-*` decoration (and identity
     /// stripping) when a later plugin short-circuits or rejects. `after_proxy`

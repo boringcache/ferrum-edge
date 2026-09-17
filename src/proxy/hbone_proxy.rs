@@ -1131,14 +1131,15 @@ pub(super) async fn handle_hbone_request(
         // is allowed to be seeded from.
         peer_credential,
     });
-    // Advertise the receiver-side admission fence on the CONNECT `200` (issue
-    // #5042 step 2), and ONLY while the fence really holds this tunnel: source
-    // -side reuse of the application connection inside it is admissible only
-    // because a later policy or credential generation can still reach the
-    // tunnel and cut it. Read BEFORE the relay task takes ownership of the
-    // handle, and never assumed from `admit()` having returned — see
-    // `AdmittedHboneTunnel::fence_in_force`.
-    let advertise_tunnel_reuse = tunnel.fence_in_force();
+    // Reuse is safe only when the fence holds the tunnel AND every plugin that
+    // admitted this CONNECT classifies its verdict as connection-reusable.
+    // In particular, rate limits and external authorization must run once per
+    // application operation rather than once per pooled tunnel.
+    let advertise_tunnel_reuse = tunnel.fence_in_force()
+        && admission_view
+            .plugins()
+            .iter()
+            .all(|plugin| plugin.allows_hbone_inner_reuse());
     let relay_proxy = proxy.clone();
     let relay_method = method.to_string();
     let relay_backend_target = backend_target.clone();
