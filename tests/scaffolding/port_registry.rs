@@ -12,18 +12,20 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::future::{Ready, ready};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct PortRegistry {
     root: PathBuf,
     owner: PathBuf,
     _owner_lock: File,
     retained: Mutex<BTreeSet<u16>>,
+    candidate_offset: usize,
 }
 
 pub struct PortLease {
@@ -63,6 +65,18 @@ fn allocation_lock(root: &Path) -> io::Result<File> {
 
 impl PortRegistry {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Arc<Self>> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        let mut hasher = DefaultHasher::new();
+        (std::process::id(), nonce).hash(&mut hasher);
+        Self::with_candidate_offset(root, hasher.finish() as usize)
+    }
+
+    pub(super) fn with_candidate_offset(
+        root: impl Into<PathBuf>,
+        candidate_offset: usize,
+    ) -> io::Result<Arc<Self>> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let _allocation = allocation_lock(&root)?;
@@ -75,7 +89,19 @@ impl PortRegistry {
             owner,
             _owner_lock: owner_lock,
             retained: Mutex::new(BTreeSet::new()),
+            candidate_offset,
         }))
+    }
+
+    /// Start inside the eligible range and wrap once. Filter excluded ports before
+    /// rotating so offsets inside the source range do not all land on its upper edge.
+    /// The process registry keeps one PID/time-derived offset for its lifetime.
+    pub fn candidates(
+        &self,
+        ports: impl Iterator<Item = u16> + Clone,
+    ) -> impl Iterator<Item = u16> {
+        let offset = self.candidate_offset % ports.clone().count().max(1);
+        ports.clone().skip(offset).chain(ports.take(offset))
     }
 
     fn read_ports(path: &Path) -> io::Result<BTreeSet<u16>> {
@@ -237,17 +263,37 @@ pub fn process_registry() -> io::Result<&'static Arc<PortRegistry>> {
 /// Mesh listeners must also avoid the kernel's automatic source-port range.
 /// Call in the actual network namespace where the gateway will bind.
 pub fn unbound_port_outside(excluded: std::ops::RangeInclusive<u16>) -> io::Result<u16> {
-    let (lease, sockets) = process_registry()?.lease_with(
-        (10_240..=u16::MAX).filter(|port| !excluded.contains(port)),
-        |port| {
-            let tcp = TcpListener::bind(("0.0.0.0", port))?;
-            let udp = UdpSocket::bind(("0.0.0.0", port))?;
-            Ok((port, (tcp, udp)))
-        },
-    )?;
+    let registry = process_registry()?;
+    let candidates =
+        registry.candidates((10_240..=u16::MAX).filter(|port| !excluded.contains(port)));
+    let (lease, sockets) = registry.lease_with(candidates, |port| {
+        let tcp = bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], port)))?;
+        let udp = UdpSocket::bind(("0.0.0.0", port))?;
+        Ok((port, (tcp, udp)))
+    })?;
     let port = lease.retain_for_process();
     drop(sockets);
     Ok(port)
+}
+
+/// Match the gateway's exclusive TCP bind, including rejection of TIME_WAIT ports.
+/// `std::net::TcpListener::bind` enables SO_REUSEADDR on Unix and cannot prove this.
+pub fn bind_tcp_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(false)?;
+    socket.bind(&addr.into())?;
+    Ok(socket)
+}
+
+pub fn bind_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = bind_tcp_socket(addr)?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 fn bind_registered<S>(
@@ -285,7 +331,7 @@ impl TestSocket for TcpListener {
     type Binding = io::Result<Self>;
 
     fn bind_test(addr: impl ToSocketAddrs) -> Self::Binding {
-        bind_registered(addr, Self::bind, Self::local_addr)
+        bind_registered(addr, bind_tcp_listener, Self::local_addr)
     }
 }
 
@@ -331,6 +377,7 @@ impl TestSocket for tokio::net::TcpSocket {
                 } else {
                     Self::new_v6()?
                 };
+                socket.set_reuseaddr(false)?;
                 socket.bind(addr)?;
                 Ok(socket)
             },
