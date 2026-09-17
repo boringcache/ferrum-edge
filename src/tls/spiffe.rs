@@ -1086,6 +1086,12 @@ mod tests {
     };
 
     /// Generate a self-signed root + (DER, PEM, key-PEM) tuple.
+    /// An enforced CRL set carrying no records: revocation checking off, the
+    /// posture these cache tests were written against (issue #5574).
+    fn no_crls() -> Arc<EnforcedCrlSet> {
+        enforced_crl_set(Arc::new(Vec::new())).load_full()
+    }
+
     fn synthetic_root(td: &TrustDomain) -> (Vec<u8>, String, String) {
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
@@ -1257,7 +1263,7 @@ mod tests {
         )));
         let cache = ArcSwap::new(Arc::new(None));
 
-        peer_verifier_cache(&cache, valid_source.clone(), &[])
+        peer_verifier_cache(&cache, valid_source.clone(), &no_crls())
             .expect("initial trust bundle must build");
         let last_good = cache.load_full();
 
@@ -1279,7 +1285,7 @@ mod tests {
             .trust_bundles;
         let error = validate_trust_bundle_set(rejected_bundles)
             .expect_err("one unusable federated root must reject the complete update");
-        let retained = peer_verifier_cache(&cache, rejected_source, &[])
+        let retained = peer_verifier_cache(&cache, rejected_source, &no_crls())
             .expect("a failed reload with an existing cache must retain last-known-good");
 
         assert!(error.contains("certificate record #1"), "got: {error}");
@@ -1337,7 +1343,7 @@ mod tests {
             gateway_leaf.clone(),
         )));
         let cache = ArcSwap::new(Arc::new(None));
-        peer_verifier_cache(&cache, valid_source, &[])
+        peer_verifier_cache(&cache, valid_source, &no_crls())
             .expect("admitted multi-domain trust set must build");
         let last_good = cache.load_full();
 
@@ -1348,7 +1354,7 @@ mod tests {
             bundle_for(local_td.clone(), vec![1, 2, 3, 4]),
             gateway_leaf.clone(),
         )));
-        let retained_after_drop = peer_verifier_cache(&cache, rejected_drop.clone(), &[])
+        let retained_after_drop = peer_verifier_cache(&cache, rejected_drop.clone(), &no_crls())
             .expect("rejected candidate must keep last-known-good");
         assert!(Arc::ptr_eq(&retained_after_drop, &last_good));
 
@@ -1361,7 +1367,7 @@ mod tests {
             &[],
             None,
             None,
-            &[],
+            &no_crls(),
         )
         .expect("LKG-federated peer must remain trusted after rejected drop");
         assert_eq!(still_trusted.as_str(), federated_peer.as_str());
@@ -1384,7 +1390,7 @@ mod tests {
             adds_unusable,
             gateway_leaf,
         )));
-        let retained_after_add = peer_verifier_cache(&cache, rejected_add.clone(), &[])
+        let retained_after_add = peer_verifier_cache(&cache, rejected_add.clone(), &no_crls())
             .expect("rejected candidate must keep last-known-good");
         assert!(Arc::ptr_eq(&retained_after_add, &last_good));
 
@@ -1398,7 +1404,7 @@ mod tests {
             &[],
             None,
             None,
-            &[],
+            &no_crls(),
         )
         .expect_err("candidate-only domain must not pass LKG membership");
         assert!(
