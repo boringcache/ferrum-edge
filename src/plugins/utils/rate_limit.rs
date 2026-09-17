@@ -1683,6 +1683,17 @@ fn weighted_window_count(previous: u64, current: u64, elapsed_fraction: f64) -> 
     previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
 }
 
+/// Conservatively account Redis request quotas across the previous and current
+/// epoch-aligned buckets.
+///
+/// Counting both buckets in full can refuse requests whose exact trailing
+/// window has already shed part of the previous bucket, but it cannot discard
+/// a boundary-clustered burst that is still live. This is the fail-closed
+/// counterpart to the weighted estimate used by token-accounting paths.
+pub(crate) fn conservative_redis_window_count(previous: u64, current: u64) -> u64 {
+    previous.saturating_add(current)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl FixedWindow {
     pub fn new(limit: u64, window_seconds: u64) -> Self {
@@ -2104,15 +2115,14 @@ fn check_http_windows(
 ///
 /// # Algorithm
 ///
-/// Every window uses the documented previous/current two-window weighted
-/// approximation (`previous * (1 - elapsed_fraction) + current`) over
-/// `{prefix:key}:{window_index}` counters. Local mode's token bucket and its
-/// 64-bucket sliding aggregate are deliberately NOT replicated in Redis:
-/// reproducing them centrally costs either a server-side script or a
-/// read-modify-write per request. Burst and smoothing behaviour therefore
-/// differs from `sync_mode: "local"` within that approximation, while the
-/// contract that matters is identical — one unit per admitted request, refusal
-/// at the configured cap, and no charge left behind by a refusal.
+/// Every window counts the previous and current epoch-aligned buckets in full
+/// over `{prefix:key}:{window_index}` counters. This can refuse conservatively
+/// for up to one window after a boundary, but never decays a still-live burst
+/// below its actual contribution to the trailing window. Local mode's token
+/// bucket and 64-bucket sliding aggregate are deliberately NOT replicated in
+/// Redis: reproducing them centrally costs either a server-side script or a
+/// read-modify-write per request. Both modes nevertheless remain fail-closed
+/// relative to an exact trailing-window request cap.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
     redis: &Arc<RedisRateLimitClient>,
@@ -2136,12 +2146,11 @@ async fn check_http_windows_redis(
 
     // Fixed-capacity, allocated inline: at most `MAX_REDIS_ADMISSION_WINDOWS`
     // windows by construction, on a proxy hot path.
-    let mut elapsed_fractions = [0.0_f64; MAX_REDIS_ADMISSION_WINDOWS];
     let mut charges = RedisWindowCharges::default();
-    for (index, spec) in specs.iter().enumerate() {
+    for spec in specs {
         let window_seconds = spec.duration.as_secs().max(1);
-        // One timestamp sample per window, so a boundary straddle cannot pair
-        // an index from one instant with a fraction from another.
+        // Capture the epoch bucket once so the previous/current keys always
+        // describe adjacent windows even when the request crosses a boundary.
         let progress = RedisRateLimitClient::window_progress(window_seconds);
         let current_index = progress.index.to_string();
         let previous_index = progress.index.saturating_sub(1).to_string();
@@ -2155,7 +2164,6 @@ async fn check_http_windows_redis(
             // charge a subset of the configured windows.
             return Err(());
         }
-        elapsed_fractions[index] = progress.elapsed_fraction;
     }
 
     let charged = redis.charge_rate_limit_windows(charges.as_slice()).await?;
@@ -2174,13 +2182,13 @@ async fn check_http_windows_redis(
         // expiry; read that as zero usage rather than as negative budget.
         let previous = previous.max(0) as u64;
         let current = current.max(0) as u64;
-        let weighted = weighted_window_count(previous, current, elapsed_fractions[index]);
-        if weighted > spec.limit as f64 {
+        let usage = conservative_redis_window_count(previous, current);
+        if usage > spec.limit {
             refused = Some(spec);
             break;
         }
 
-        let remaining = (spec.limit as f64 - weighted).max(0.0) as u64;
+        let remaining = spec.limit.saturating_sub(usage);
         match tightest {
             Some((current_remaining, _, _)) if remaining >= current_remaining => {}
             _ => {

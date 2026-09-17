@@ -23,9 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal no longer consumes a looser window's budget — the previously
   documented multi-window "phantom increment" is retired (#5517). Admission
   stays native RESP on the existing pooled connections: no Lua, no `WATCH`, no
-  per-request connection, and no retry budget. The key layout and the two-window
-  weighted approximation are unchanged, so an in-place upgrade keeps its
-  counters and no Redis ACL change is required. Between a refused attempt's
+  per-request connection, and no retry budget. The key layout is unchanged, so
+  an in-place upgrade keeps its counters and no Redis ACL change is required.
+  Request quotas now count the previous and current epoch buckets in full,
+  preventing a boundary-clustered burst from decaying while it remains inside
+  the configured trailing window; this deliberately prefers conservative
+  refusals to over-admission. Between a refused attempt's
   `INCR` and its compensating `DECR` the transient charge is visible to
   concurrent requests for the same identity, which can refuse slightly early
   under contention and never over-admits; a refused request costs two round trips

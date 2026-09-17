@@ -5965,6 +5965,11 @@ pub mod _test_support {
         RedisRateLimitClient::window_progress(window_seconds)
     }
 
+    /// Conservative request-quota usage across Redis epoch buckets.
+    pub fn conservative_redis_window_count(previous: u64, current: u64) -> u64 {
+        crate::plugins::utils::rate_limit::conservative_redis_window_count(previous, current)
+    }
+
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::{
         DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,

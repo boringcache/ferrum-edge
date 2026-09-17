@@ -653,7 +653,9 @@ on a native-gRPC request.
 - `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
   `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
-- Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
+- Request quotas conservatively count the previous and current epoch buckets in
+  full with pipelined `INCR`/`GET`/`EXPIRE`; no Lua. Token-accounting paths may
+  still use the two-window weighted estimate.
 - HTTP/GraphQL/gRPC quota admission is CHARGE-THEN-COMPENSATE over that
   algorithm, on the shared pooled multiplexed connections: ONE atomic
   `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR`
@@ -676,8 +678,10 @@ on a native-gRPC request.
   exit between the charge and its compensation. Both transaction helpers carry
   their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
   the per-request window and counter buffers are fixed-capacity and inline, not
-  `Vec`s. The local token bucket / 64-bucket sliding aggregate are deliberately
-  NOT replicated in Redis.
+  `Vec`s. Counting both request buckets in full prevents boundary-clustered
+  bursts from being decayed while still live, at the cost of conservative
+  refusals for up to one window. The local token bucket / 64-bucket sliding
+  aggregate are deliberately NOT replicated in Redis.
 - Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
   are a Redis Cluster hash tag so every key of one atomic operation shares a
   slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is

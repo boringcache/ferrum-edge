@@ -1229,9 +1229,10 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
     use ferrum_edge::_test_support::redis_window_progress_at;
     use ferrum_edge::plugins::utils::rate_limit::FixedWindow;
 
-    // Redis path: prev bucket full (10), current has the candidate request (1).
-    // At fraction 0.0 the old code always denied; with subsecond decay the mid-
-    // window candidate is admitted.
+    // Weighted token-accounting path: prev bucket full (10), current has the
+    // candidate request (1). At fraction 0.0 the old code always denied; with
+    // subsecond decay the mid-window candidate is admitted. Redis request
+    // quotas intentionally use the conservative helper tested below instead.
     let window = FixedWindow::new(10, 1);
     let start = redis_window_progress_at(Duration::from_secs(50), 1);
     let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
@@ -1253,6 +1254,19 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
         (window.weighted_count(10, 0, mid.elapsed_fraction) - 5.0).abs() < 1e-12,
         "half-elapsed prior bucket of 10 contributes exactly 5"
     );
+}
+
+#[test]
+fn redis_request_quota_counts_boundary_clustered_bursts_in_full() {
+    use ferrum_edge::_test_support::conservative_redis_window_count;
+
+    // A full burst just before an epoch boundary remains live throughout almost
+    // all of the next exact trailing window. The request-quota path must not
+    // linearly decay it and admit a second burst near the next boundary.
+    assert_eq!(conservative_redis_window_count(100, 1), 101);
+    assert_eq!(conservative_redis_window_count(100, 99), 199);
+    assert!(conservative_redis_window_count(100, 1) > 100);
+    assert_eq!(conservative_redis_window_count(u64::MAX, 1), u64::MAX);
 }
 
 #[test]
