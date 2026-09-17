@@ -274,14 +274,25 @@ Error: Startup security validation failed: Invalid TLS configuration: ...
 ```
 
 Startup and validation failures include the full cause chain, from the outer
-operation to the underlying failure, with credential redaction applied before
-emission. For example, `run -m mesh` with a localized mesh file missing a workload
+operation to the underlying failure. Configuration deserialization withholds
+offending document scalars (including unregistered inline PEM and tokens) before
+retaining the error. Diagnostics keep field paths, available line/column positions,
+expected types, and missing/unknown field names. The final rendering also redacts
+credentials in exact configured primary/replica/failover database URLs and
+registered resolved external-secret values and their bounded derived forms.
+The URL inventory reads raw settings only: it never fetches database TLS sources
+or materializes temporary PEM files. Owning loaders must sanitize TLS-augmented
+or differently normalized URLs, password-only fragments, provider references,
+and arbitrary provider/driver/custom-validation payloads; the final renderer is
+not a general secret detector.
+
+For example, `run -m mesh` with a localized mesh file missing a workload
 selector reports the file-loading context followed by
 `invalid mesh configuration document: mesh.workloads[0]`, the missing `selector`
 field, and `at line 3 column 7`.
 `validate -m mesh` reports the same field and position under its validation
 context. The diagnostic includes neither the configuration document nor a
-backtrace; `-v` is not required to see the causes.
+backtrace; `-v` is not required to see the causes and still selects log verbosity.
 
 ## reload
 

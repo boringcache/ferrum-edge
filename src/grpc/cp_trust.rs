@@ -1259,11 +1259,12 @@ impl CpDpTrustBundle {
             TrustBundleLoadError::new(TrustBundleRejectReason::DocumentInvalid, detail)
         };
 
-        let document: TrustBundleDocument = serde_json::from_str(raw).map_err(|e| {
-            invalid(format!(
-                "CP/DP trust bundle '{origin}' is not valid JSON: {e}"
-            ))
-        })?;
+        let document: TrustBundleDocument =
+            crate::util::deserialization::from_json_str(raw).map_err(|e| {
+                invalid(format!(
+                    "CP/DP trust bundle '{origin}' is not valid JSON: {e}"
+                ))
+            })?;
         if let Some(version) = document.version
             && version != 1
         {

@@ -109,7 +109,8 @@ pub fn read_mesh_config_document(
     let document: MeshFileDocument = if is_yaml {
         admit_yaml_alias_expansion(&content)
             .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?;
-        serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
+        crate::util::deserialization::from_yaml_str(&content)
+            .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     } else {
         crate::util::json_object::from_json_object_slice::<MeshFileDocument>(content.as_bytes())
             .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
@@ -249,6 +250,7 @@ pub fn normalized_mesh_gateway_config(
 /// who fed a full gateway config file gets steered instead of puzzled by a
 /// bare "unknown field `proxies`".
 fn mesh_doc_parse_error(err: impl std::fmt::Display) -> String {
+    let err = crate::util::deserialization::sanitize_message(&err.to_string());
     format!(
         "invalid mesh configuration document: {err} (the localized mesh source consumes only an \
          optional `version` plus the `mesh` section; gateway resources such as proxies/upstreams \

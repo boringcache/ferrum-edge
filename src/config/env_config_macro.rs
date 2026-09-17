@@ -203,8 +203,12 @@ impl EnvValue for Vec<u32> {
 
 impl EnvValue for HashMap<String, String> {
     fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
-        serde_json::from_str(raw).map_err(|err| {
-            let invalid = invalid_env_value(key, raw, "a JSON object of string values");
+        crate::util::deserialization::from_json_str(raw).map_err(|err| {
+            let invalid = invalid_env_value(
+                key,
+                crate::util::deserialization::REDACTED_SCALAR,
+                "a JSON object of string values",
+            );
             // `serde_json` quotes the offending region of the document, which
             // for an externally resolved variable is the secret itself. Drop
             // the parser detail in that case and keep the key + expected shape.

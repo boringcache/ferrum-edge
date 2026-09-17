@@ -33,6 +33,7 @@ use crate::config::stable_file::{
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
+use crate::util::deserialization as config_decode;
 use std::path::Path;
 use tracing::{error, info, warn};
 
@@ -87,7 +88,7 @@ pub fn load_config_backup(
         }
     };
 
-    let mut value: serde_json::Value = serde_json::from_str(&content)
+    let mut value: serde_json::Value = config_decode::from_json_str(&content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config backup at {path}: {e}"))?;
 
     // GET /backup wraps the runtime resources in administrative metadata.
@@ -126,7 +127,7 @@ pub fn load_config_backup(
         );
     }
 
-    let mut config: GatewayConfig = serde_json::from_value(value)
+    let mut config: GatewayConfig = config_decode::from_json_value(value)
         .map_err(|e| anyhow::anyhow!("Failed to deserialize config backup at {path}: {e}"))?;
 
     // Preserve the same normalize → TLS resolution order used by database

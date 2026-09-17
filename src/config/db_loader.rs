@@ -42,6 +42,7 @@ use crate::config::validation_pipeline::{
 use crate::fips::approved::Sha256;
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::proxy::stream_match::StreamMatchCriteria;
+use crate::util::deserialization as config_decode;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1320,7 +1321,7 @@ impl DatabaseStore {
         for row in rows {
             let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
             let existing_hosts: Vec<String> =
-                serde_json::from_str(&existing_hosts_raw).map_err(|error| {
+                config_decode::from_json_str(&existing_hosts_raw).map_err(|error| {
                     anyhow::anyhow!("failed to parse hosts JSON during uniqueness check: {error}")
                 })?;
 
@@ -5983,7 +5984,7 @@ impl DatabaseStore {
                 }
                 let credentials_json = required_utf8_text_column(&row, "credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
-                    serde_json::from_str(&credentials_json).map_err(|error| {
+                    config_decode::from_json_str(&credentials_json).map_err(|error| {
                         anyhow::anyhow!(
                             "Consumer {}: failed to parse credentials JSON while checking mTLS uniqueness: {}",
                             consumer_id,
@@ -12293,14 +12294,14 @@ fn row_to_proxy_inner(
     let hosts_str = required_utf8_text_column(row, "hosts").map_err(|error| {
         anyhow::anyhow!("Proxy {}: failed to read hosts column: {}", pid, error)
     })?;
-    let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
+    let hosts: Vec<String> = config_decode::from_json_str(&hosts_str).map_err(|e| {
         // Do not embed the raw hosts column — poll/startup rejection logs
         // surface this message (issue #2997 redaction).
         anyhow::anyhow!("Proxy {}: failed to parse hosts JSON: {}", pid, e)
     })?;
 
     Ok(Proxy {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id,
         namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
@@ -12369,14 +12370,14 @@ fn row_to_proxy_inner(
         upstream_id: optional_utf8_text_column(row, "upstream_id")?,
         circuit_breaker: match optional_utf8_text_column(row, "circuit_breaker")? {
             Some(s) => Some(
-                serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
+                config_decode::from_json_str::<CircuitBreakerConfig>(&s).map_err(|e| {
                     anyhow::anyhow!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e)
                 })?,
             ),
             None => None,
         },
         retry: match optional_utf8_text_column(row, "retry")? {
-            Some(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str::<RetryConfig>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
             })?),
             None => None,
@@ -12471,13 +12472,13 @@ fn row_to_proxy_inner(
             .ok()
             .map(|v| v.max(0) as u64),
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
-            Some(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
             })?),
             None => None,
         },
         allowed_ws_origins: match optional_utf8_text_column(row, "allowed_ws_origins")? {
-            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+            Some(s) => config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Proxy {}: failed to parse allowed_ws_origins JSON: {}",
                     pid,
@@ -12520,7 +12521,7 @@ fn row_to_proxy_inner(
         },
         stream_match: match optional_utf8_text_column(row, "stream_match")? {
             Some(s) => Some(
-                serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|_| {
+                config_decode::from_json_str::<StreamMatchCriteria>(&s).map_err(|_| {
                     anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON", pid)
                 })?,
             ),
@@ -12626,7 +12627,7 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
             e
         )
     })?;
-    let credentials = serde_json::from_str(&creds_str).map_err(|e| {
+    let credentials = config_decode::from_json_str(&creds_str).map_err(|e| {
         anyhow::anyhow!(
             "Consumer {}: failed to parse credentials JSON: {}",
             id_preview,
@@ -12641,7 +12642,7 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
             e
         )
     })?;
-    let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
+    let acl_groups: Vec<String> = config_decode::from_json_str(&acl_groups_str).map_err(|e| {
         // Never embed the raw acl_groups column in the error — poll rejection
         // logs would otherwise leak row content (issue #2997).
         anyhow::anyhow!(
@@ -12652,7 +12653,7 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
     })?;
 
     Ok(Consumer {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
@@ -12698,7 +12699,7 @@ fn row_to_plugin_config_inner(
             e
         )
     })?;
-    let config_val = serde_json::from_str(&config_str).map_err(|e| {
+    let config_val = config_decode::from_json_str(&config_str).map_err(|e| {
         anyhow::anyhow!(
             "PluginConfig {}: failed to parse config JSON: {}",
             id_preview,
@@ -12724,7 +12725,7 @@ fn row_to_plugin_config_inner(
         // A stored trigger that no longer parses is a fail-closed error, not a
         // silently untriggered instance: dropping it would run a plugin the
         // operator scoped away.
-        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+        Some(raw) => Some(config_decode::from_json_str(&raw).map_err(|e| {
             anyhow::anyhow!(
                 "PluginConfig {}: failed to parse trigger JSON: {}",
                 id_preview,
@@ -12735,7 +12736,7 @@ fn row_to_plugin_config_inner(
     };
 
     Ok(PluginConfig {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
@@ -12855,8 +12856,9 @@ fn row_to_gateway_trust_bundle_inner(
         );
     }
     // Never surface serde's message: it can quote the offending document.
-    let bundle: crate::modes::mesh::config::TrustBundleSet = serde_json::from_str(&bundle_json)
-        .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))?;
+    let bundle: crate::modes::mesh::config::TrustBundleSet =
+        config_decode::from_json_str(&bundle_json)
+            .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))?;
     let revision = strict_stored_revision(row)?;
     let updated_by = optional_utf8_text_column(row, "updated_by").map_err(|error| {
         anyhow::anyhow!("gateway trust bundle updated_by column is unreadable: {error}")
@@ -12892,7 +12894,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
             e
         )
     })?;
-    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).map_err(|e| {
+    let targets: Vec<UpstreamTarget> = config_decode::from_json_str(&targets_str).map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to parse targets JSON: {}",
             id_preview,
@@ -12908,7 +12910,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         )
     })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|_| {
+        config_decode::from_json_value(serde_json::Value::String(algo_str)).map_err(|_| {
             // Do not embed the raw algorithm column — hostile/oversized DB
             // values must not reach poll/startup rejection logs through either
             // this message or serde's unknown-variant error (issue #2997).
@@ -12917,7 +12919,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let health_checks: Option<HealthCheckConfig> =
         match optional_utf8_text_column(row, "health_checks")? {
-            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse health_checks JSON: {}",
                     id_preview,
@@ -12929,7 +12931,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let service_discovery: Option<ServiceDiscoveryConfig> =
         match optional_utf8_text_column(row, "service_discovery")? {
-            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse service_discovery JSON: {}",
                     id_preview,
@@ -12941,7 +12943,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> =
         match optional_utf8_text_column(row, "hash_on_cookie_config")? {
-            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
                     id_preview,
@@ -12958,7 +12960,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         .unwrap_or(true);
 
     let subsets = match optional_utf8_text_column(row, "subsets")? {
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+        Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
             anyhow::anyhow!(
                 "Upstream {}: failed to parse subsets JSON: {}",
                 id_preview,
@@ -12970,7 +12972,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let backend_tls_san_allow_list =
         match optional_utf8_text_column(row, "backend_tls_san_allow_list")? {
-            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+            Some(s) => config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse backend_tls_san_allow_list JSON: {}",
                     id_preview,
@@ -12982,7 +12984,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
     let backend_tls_sni = optional_utf8_text_column(row, "backend_tls_sni")?;
 
     Ok(Upstream {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
@@ -13104,10 +13106,10 @@ fn row_to_api_spec_with_content(
 
     // Wave 5: parse JSON-text arrays for tags / server_urls.
     let tags_raw = required_utf8_text_column(row, "tags")?;
-    let tags: Vec<String> = serde_json::from_str(&tags_raw)
+    let tags: Vec<String> = config_decode::from_json_str(&tags_raw)
         .map_err(|error| anyhow::anyhow!("failed to parse api_specs.tags JSON: {error}"))?;
     let server_urls_raw = required_utf8_text_column(row, "server_urls")?;
-    let server_urls: Vec<String> = serde_json::from_str(&server_urls_raw)
+    let server_urls: Vec<String> = config_decode::from_json_str(&server_urls_raw)
         .map_err(|error| anyhow::anyhow!("failed to parse api_specs.server_urls JSON: {error}"))?;
     let operation_count: u32 = row
         .try_get::<i64, _>("operation_count")
@@ -13170,7 +13172,7 @@ fn row_to_api_spec_with_content(
 fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
     let id: String = row.try_get("id")?;
     let diff_raw = required_utf8_text_column(row, "diff")?;
-    let diff = serde_json::from_str(&diff_raw).unwrap_or_else(|e| {
+    let diff = config_decode::from_json_str(&diff_raw).unwrap_or_else(|e| {
         warn!(
             audit_event_id = %id,
             error = %e,

@@ -293,7 +293,8 @@ pub fn parse_app_probes(raw: &str) -> Result<BTreeMap<String, AppProbeSpec>, Str
         return Ok(BTreeMap::new());
     }
     let parsed: BTreeMap<String, AppProbeSpec> =
-        serde_json::from_str(trimmed).map_err(|e| format!("invalid {APP_PROBES_ENV} JSON: {e}"))?;
+        crate::util::deserialization::from_json_str(trimmed)
+            .map_err(|e| format!("invalid {APP_PROBES_ENV} JSON: {e}"))?;
     for (key, spec) in &parsed {
         spec.validate(key)?;
         let Some((container, probe_field)) = key.split_once('/') else {

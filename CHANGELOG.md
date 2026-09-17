@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Startup failures now print the full sanitized cause chain (#5589), including
-  the offending mesh field and YAML position beneath a localized-file context.
-  `run` and `validate` retain external-secret and database-URL redaction.
+- Startup failures now print the full cause chain (#5589), including mesh field
+  paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
+  withhold offending document scalars before retaining errors; diagnostics also
+  redact credentials in exact configured database URLs and registered external
+  secret values. The URL inventory reads only raw settings, without fetching
+  dormant database TLS sources or creating PEM files. Owning loaders remain
+  responsible for derived URLs and other provider/driver error payloads.
 
 ### Changed
 

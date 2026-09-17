@@ -1451,10 +1451,11 @@ pub(crate) fn parse_remote_discovery_credentials(
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(std::collections::HashMap::new());
     };
-    let parsed: std::collections::HashMap<String, String> = serde_json::from_str(raw)
-        .map_err(|e| {
+    let parsed: std::collections::HashMap<String, String> =
+        crate::util::deserialization::from_json_str(raw).map_err(|e| {
             format!(
-                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS is not a valid JSON object of ref->secret: {e}"
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS is not a valid JSON object \
+                 of ref->secret: {e}"
             )
         })?;
     let mut out = std::collections::HashMap::with_capacity(parsed.len());

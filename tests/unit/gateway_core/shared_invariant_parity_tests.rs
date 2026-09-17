@@ -77,6 +77,24 @@ fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
     );
 }
 
+#[test]
+fn startup_redaction_never_derives_database_tls_urls() {
+    let entry = source("src/gateway_entry.rs");
+    for derivation in [
+        "effective_db_url",
+        "effective_db_read_replica_url",
+        "effective_db_failover_urls",
+    ] {
+        assert!(
+            !entry.contains(derivation),
+            "diagnostic inventory must not fetch or persist TLS material: {derivation}"
+        );
+    }
+    for raw_url in [".db_url", ".db_read_replica_url", ".db_failover_urls"] {
+        assert!(entry.contains(raw_url), "redaction lost {raw_url}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared source-inventory helpers
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 /// Alternate `anyhow` Display includes every cause without Debug's backtrace.
 /// Redact after rendering: a safe outer context may still wrap a raw driver error.
 /// Callers supply known database URLs without reading configuration during bootstrap.
+/// Config parsers withhold offending document scalars before retaining their errors.
 /// TLS/provider loaders remain responsible for withholding key material and source
 /// references at their typed boundaries; arbitrary secret text cannot be inferred here.
 pub fn render_startup_error(error: anyhow::Error, database_urls: &[&str]) -> String {

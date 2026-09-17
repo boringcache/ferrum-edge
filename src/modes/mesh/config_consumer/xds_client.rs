@@ -1604,7 +1604,7 @@ fn reverse_translate(
             continue;
         };
         dr_carrier_seen = true;
-        match serde_json::from_slice::<MeshDestinationRule>(&inner.value) {
+        match crate::util::deserialization::from_json_slice::<MeshDestinationRule>(&inner.value) {
             Ok(mut dr) => {
                 // Restore the invariant `export_visibility_admits` documents:
                 // every source canonicalizes entries before the evaluator
@@ -2343,19 +2343,20 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
     let Some(inner) = destination_rule_carrier_inner(resource, &typed_extension)? else {
         return Ok(());
     };
-    let dr = serde_json::from_slice::<MeshDestinationRule>(&inner.value).map_err(|e| {
-        if reserved.is_some() {
-            format!(
-                "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
-                typed_extension.name
-            )
-        } else {
-            format!(
-                "xDS DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
-                typed_extension.name
-            )
-        }
-    })?;
+    let dr = crate::util::deserialization::from_json_slice::<MeshDestinationRule>(&inner.value)
+        .map_err(|e| {
+            if reserved.is_some() {
+                format!(
+                    "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                    typed_extension.name
+                )
+            } else {
+                format!(
+                    "xDS DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                    typed_extension.name
+                )
+            }
+        })?;
     if let Some((namespace, name)) = reserved {
         validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)?;
     }

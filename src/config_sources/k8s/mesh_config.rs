@@ -147,7 +147,7 @@ fn parse_mesh_config(raw: &str) -> Result<ParsedMeshConfig, String> {
     // Bound alias expansion before serde_yaml materializes ConfigMap data.mesh.
     // A small Kubernetes API object can otherwise induce unbounded expansion.
     admit_yaml_alias_expansion(raw).map_err(|error| error.to_string())?;
-    let value: Value = serde_yaml::from_str(raw)
+    let value: Value = crate::util::deserialization::from_yaml_str(raw)
         .map_err(|error| format!("ConfigMap data.mesh is not valid MeshConfig YAML: {error}"))?;
     let mut parsed = ParsedMeshConfig::default();
     collect_extension_providers(&value, &mut parsed)?;

@@ -1167,22 +1167,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             .chain(env_config.db_failover_urls.iter())
             .cloned()
             .collect();
-        // Include canonical TLS-augmented spellings that drivers receive. This
-        // only inventories successful derivations; mode admission still returns
-        // any derivation failure through the same fatal diagnostic below.
-        if let Ok(Some(url)) = env_config.effective_db_url() {
-            database_urls.push(url);
-        }
-        if let Ok(Some(url)) = env_config.effective_db_read_replica_url() {
-            database_urls.push(url);
-        }
-        if let Ok(urls) = env_config.effective_db_failover_urls() {
-            database_urls.extend(urls);
-        }
+        // Inventory only raw configured URLs. TLS URL derivation fetches source
+        // material and persists PEM files; diagnostics must never perform it,
+        // particularly in modes with dormant database settings. The owning mode
+        // and loaders must sanitize their actual TLS-augmented URLs/errors.
         database_urls.retain(|url| !url.is_empty());
         database_urls.sort_unstable();
         database_urls.dedup();
-        // Replace a complete augmented URL before its shorter configured prefix.
+        // Replace a longer configured URL before its shorter configured prefix.
         database_urls.sort_unstable_by_key(|url| std::cmp::Reverse(url.len()));
 
         // Run the appropriate mode

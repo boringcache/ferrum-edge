@@ -3660,6 +3660,128 @@ async fn functional_cli_mesh_startup_redacts_secret_in_inner_cause() {
 
 #[ignore]
 #[tokio::test]
+async fn functional_cli_mesh_document_scalars_are_redacted_without_registration() {
+    let secrets = [
+        "-----BEGIN PRIVATE KEY-----\nUNREGISTERED-PEM-MATERIAL-5589\n-----END PRIVATE KEY-----",
+        "unregistered.synthetic.token.5589",
+    ];
+    for secret in secrets {
+        for (field, expected) in [("tls", "expected a"), ("connect_timeout_ms", "expected u64")] {
+            let mut policy = serde_json::Map::new();
+            policy.insert(field.to_string(), serde_json::json!(secret));
+            let document = serde_json::json!({
+                "mesh": {
+                    "destination_rules": [{
+                        "name": "diagnostic-fixture",
+                        "namespace": "ferrum",
+                        "host": "fixture.ferrum.svc.cluster.local",
+                        "traffic_policy": policy
+                    }]
+                }
+            });
+            for extension in ["yaml", "json"] {
+                let directory = TempDir::new().unwrap();
+                let mesh_path = directory.path().join(format!("mesh-invalid.{extension}"));
+                let content = if extension == "yaml" {
+                    serde_yaml::to_string(&document).unwrap()
+                } else {
+                    serde_json::to_string_pretty(&document).unwrap()
+                };
+                std::fs::write(&mesh_path, content).unwrap();
+                for protocol in ["file", "stock_xds"] {
+                    for subcommand in ["run", "validate"] {
+                        let mut command =
+                            installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+                        command
+                            .env("FERRUM_MESH_CONFIG_PROTOCOL", protocol)
+                            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+                            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+                            // The local policy must fail BEFORE any ADS dial.
+                            .env("FERRUM_MESH_STOCK_XDS_URLS", "https://127.0.0.1:1")
+                            .env("FERRUM_MESH_STOCK_XDS_NODE_ID", "diagnostic-fixture")
+                            .env("FERRUM_PROXY_HTTP_PORT", "0")
+                            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+                        // No external-secret suffix or registry fixture is set.
+                        let output = cli_contract_output(command).await;
+                        let diagnostic = cli_contract_diagnostic(&output);
+                        let context = format!("{subcommand}/{protocol}/{extension}/{field}");
+                        assert_eq!(output.status.code(), Some(1), "{context}: {diagnostic}");
+                        for fragment in [
+                            "UNREGISTERED-PEM-MATERIAL-5589",
+                            "BEGIN PRIVATE KEY",
+                            "END PRIVATE KEY",
+                            "unregistered.synthetic.token.5589",
+                        ] {
+                            assert!(!diagnostic.contains(fragment), "{context}: {diagnostic}");
+                        }
+                        let path = format!("mesh.destination_rules[0].traffic_policy.{field}");
+                        for required in [
+                            "invalid mesh configuration document",
+                            &path,
+                            "line ",
+                            "column ",
+                            expected,
+                            ferrum_edge::util::deserialization::REDACTED_SCALAR,
+                        ] {
+                            assert!(diagnostic.contains(required), "{context}: {diagnostic}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_diagnostics_do_not_materialize_dormant_database_tls() {
+    for subcommand in ["run", "validate"] {
+        let directory = TempDir::new().unwrap();
+        let pem_directory = directory.path().join("temp-pem-inventory");
+        std::fs::create_dir(&pem_directory).unwrap();
+        let mesh_path = directory.path().join("mesh-invalid.yaml");
+        std::fs::write(
+            &mesh_path,
+            "mesh:\n  workloads:\n    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/fixture\n",
+        )
+        .unwrap();
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_DB_TYPE", "postgres")
+            .env("FERRUM_DB_URL", "postgres://fixture@localhost/primary")
+            .env("FERRUM_DB_READ_REPLICA_URL", "postgres://fixture@localhost/replica")
+            .env("FERRUM_DB_FAILOVER_URLS", "postgres://fixture@localhost/failover")
+            .env("FERRUM_DB_TLS_MODE", "require")
+            .env(
+                "FERRUM_DB_TLS_CLIENT_CERT_SOURCE",
+                "-----BEGIN CERTIFICATE-----\nSYNTHETIC-DORMANT-CERT\n-----END CERTIFICATE-----",
+            )
+            .env(
+                "FERRUM_DB_TLS_CLIENT_KEY_SOURCE",
+                "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-DORMANT-KEY\n-----END PRIVATE KEY-----",
+            )
+            .env("TMPDIR", &pem_directory)
+            .env("TMP", &pem_directory)
+            .env("TEMP", &pem_directory);
+        let before: Vec<_> = std::fs::read_dir(&pem_directory).unwrap().collect();
+        assert!(before.is_empty());
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
+        assert!(diagnostic.contains("missing field `selector`"), "{diagnostic}");
+        assert!(!diagnostic.contains("SYNTHETIC-DORMANT-KEY"), "{diagnostic}");
+        let after: Vec<_> = std::fs::read_dir(&pem_directory).unwrap().collect();
+        assert!(after.is_empty(), "dormant database TLS created files: {after:?}");
+    }
+}
+
+#[ignore]
+#[tokio::test]
 async fn functional_cli_bare_invocation_requires_subcommand() {
     let directory = TempDir::new().unwrap();
     let output = cli_contract_output(installed_cli_command(&directory, &[])).await;

@@ -50,7 +50,9 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    deserializer.deserialize_map(ObjectVisitor(PhantomData))
+    deserializer
+        .deserialize_map(ObjectVisitor(PhantomData))
+        .map_err(super::deserialization::sanitize_error)
 }
 
 /// Visitor for an optional object-valued field.
@@ -97,7 +99,9 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    deserializer.deserialize_option(OptionalObjectVisitor(PhantomData))
+    deserializer
+        .deserialize_option(OptionalObjectVisitor(PhantomData))
+        .map_err(super::deserialization::sanitize_error)
 }
 
 /// Newtype whose `Deserialize` requires the input to be a JSON object.
@@ -124,6 +128,7 @@ where
 {
     Vec::<JsonObject<T>>::deserialize(deserializer)
         .map(|objects| objects.into_iter().map(|object| object.0).collect())
+        .map_err(super::deserialization::sanitize_error)
 }
 
 /// Optional counterpart to [`deserialize_object_vec`]. Use `serde(default)`
@@ -138,6 +143,7 @@ where
 {
     Option::<Vec<JsonObject<T>>>::deserialize(deserializer)
         .map(|objects| objects.map(|objects| objects.into_iter().map(|object| object.0).collect()))
+        .map_err(super::deserialization::sanitize_error)
 }
 
 /// `serde_json::from_slice` for a request body that must be a JSON object.
@@ -148,5 +154,5 @@ pub fn from_json_object_slice<T>(body: &[u8]) -> Result<T, serde_json::Error>
 where
     T: DeserializeOwned,
 {
-    serde_json::from_slice::<JsonObject<T>>(body).map(|object| object.0)
+    super::deserialization::from_json_slice::<JsonObject<T>>(body).map(|object| object.0)
 }

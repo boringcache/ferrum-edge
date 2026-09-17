@@ -483,7 +483,8 @@ pub(crate) fn parse_federation_document(
     expected_trust_domain: &TrustDomain,
 ) -> Result<TrustBundle, String> {
     let doc: FederationDocument =
-        serde_json::from_slice(body).map_err(|e| format!("invalid federation bundle JSON: {e}"))?;
+        crate::util::deserialization::from_json_slice(body)
+            .map_err(|e| format!("invalid federation bundle JSON: {e}"))?;
     match doc {
         FederationDocument::Native(native) => {
             if let Some(ref td) = native.trust_domain

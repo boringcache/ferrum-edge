@@ -6919,7 +6919,8 @@ mod inner {
     /// `doc_to_*` helper strips MongoDB's `_id` before deserialization.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
-        let proxy: Proxy = mongodb::bson::from_document(doc)?;
+        let proxy: Proxy = mongodb::bson::from_document(doc)
+            .map_err(crate::util::deserialization::sanitize_error)?;
         Ok(proxy)
     }
 
@@ -7158,7 +7159,8 @@ mod inner {
     fn doc_to_consumer(mut doc: Document) -> Result<Consumer, anyhow::Error> {
         doc.remove("_id");
         doc.remove(HMAC_SECRET_HASHES_FIELD);
-        Ok(mongodb::bson::from_document(doc)?)
+        Ok(mongodb::bson::from_document(doc)
+            .map_err(crate::util::deserialization::sanitize_error)?)
     }
 
     /// Convert a domain `PluginConfig` into a BSON `Document`.
@@ -7171,7 +7173,8 @@ mod inner {
 
     fn doc_to_plugin_config(mut doc: Document) -> Result<PluginConfig, anyhow::Error> {
         doc.remove("_id");
-        Ok(mongodb::bson::from_document(doc)?)
+        Ok(mongodb::bson::from_document(doc)
+            .map_err(crate::util::deserialization::sanitize_error)?)
     }
 
     /// Convert a domain `Upstream` into a BSON `Document`.
@@ -7188,7 +7191,8 @@ mod inner {
 
     fn doc_to_upstream(mut doc: Document) -> Result<Upstream, anyhow::Error> {
         doc.remove("_id");
-        Ok(mongodb::bson::from_document(doc)?)
+        Ok(mongodb::bson::from_document(doc)
+            .map_err(crate::util::deserialization::sanitize_error)?)
     }
 
     /// Encode a gateway trust-bundle record (issue #3727).

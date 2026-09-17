@@ -48,6 +48,7 @@ use crate::config::validation_pipeline::{
     ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
 };
 use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
+use crate::util::deserialization as config_decode;
 use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
@@ -86,7 +87,7 @@ fn take_resource_counts_from_json(
     let Some(raw) = object.remove("resource_counts") else {
         return Ok(None);
     };
-    serde_json::from_value(raw)
+    config_decode::from_json_value(raw)
         .map(Some)
         .map_err(|error| anyhow::anyhow!("invalid resource_counts: {error}"))
 }
@@ -176,10 +177,10 @@ pub fn load_config_from_file(
     // YAML-specific tags.
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
         admit_yaml_alias_expansion(&content)?;
-        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(&content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
-        (serde_json::from_str(&content)?, None)
+        (config_decode::from_json_str(&content)?, None)
     };
     // The parsed trees own every retained value; release the bounded source
     // buffer before migration/validation allocates any additional structures.
@@ -247,11 +248,11 @@ pub fn load_config_from_file(
     // optional resource_counts strip above. Migrations still operate on
     // serde_json::Value, which remains authoritative for older versions.
     let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        serde_yaml::from_value(yaml_value.ok_or_else(|| {
+        config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
             anyhow::anyhow!("internal error: parsed YAML value was not retained")
         })?)?
     } else {
-        serde_json::from_value(value)?
+        config_decode::from_json_value(value)?
     };
 
     if let Some(ref expected) = resource_counts {
@@ -478,17 +479,17 @@ pub fn decode_and_validate_config_document(
     }
 
     // Admit YAML alias expansion before the detection parse. The detector uses
-    // `serde_yaml::from_str`, which would otherwise materialize aliases first.
+    // `config_decode::from_yaml_str`, which would otherwise materialize aliases first.
     admit_yaml_alias_expansion(content)?;
 
-    let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
+    let is_yaml = config_decode::from_yaml_str::<serde_yaml::Value>(content).is_ok()
         && !content.trim_start().starts_with('{');
 
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
-        let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
+        let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
-        (serde_json::from_str(content)?, None)
+        (config_decode::from_json_str(content)?, None)
     };
 
     let resource_counts = take_resource_counts_from_json(&mut value)?;
@@ -530,11 +531,11 @@ pub fn decode_and_validate_config_document(
     }
 
     let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        serde_yaml::from_value(yaml_value.ok_or_else(|| {
+        config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
             anyhow::anyhow!("internal error: parsed YAML value was not retained")
         })?)?
     } else {
-        serde_json::from_value(value)?
+        config_decode::from_json_value(value)?
     };
 
     if let Some(ref expected) = resource_counts {

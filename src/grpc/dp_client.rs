@@ -67,6 +67,7 @@ use crate::tls::multi_cert::{
 };
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::backoff::jittered_backoff;
+use crate::util::deserialization as config_decode;
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -2447,13 +2448,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 // snapshot must TERMINATE this stream (issue #2970). An invalid
                 // initial snapshot must also terminate so a later DELTA cannot
                 // apply against an unrelated old base.
-                let mut config = match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        error!("Failed to parse full config update: {}", e);
-                        return Ok(refuse_unusable_snapshot(subscription.base_applied));
-                    }
-                };
+                let mut config =
+                    match config_decode::from_json_str::<GatewayConfig>(&update.config_json) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            error!("Failed to parse full config update: {}", e);
+                            return Ok(refuse_unusable_snapshot(subscription.base_applied));
+                        }
+                    };
                 let gateway_trust_bundle_update =
                     match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
                         Ok(update) => update,
@@ -2815,7 +2817,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     crate::dp_config_freshness::record_snapshot_rejected();
                     return Ok(DpStreamEnd::InvalidSubscriptionBase);
                 }
-                match serde_json::from_str::<IncrementalResult>(&update.config_json) {
+                match config_decode::from_json_str::<IncrementalResult>(&update.config_json) {
                     Ok(mut result) => {
                         let gateway_trust_bundle_update =
                             match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
