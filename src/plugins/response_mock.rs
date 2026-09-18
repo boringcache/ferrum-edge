@@ -206,7 +206,9 @@ impl ResponseMock {
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("response_mock: `rule[{i}]` missing `path`"))?;
             if path_str.is_empty() {
-                return Err(format!("response_mock: `rule[{i}]` `path` must not be empty"));
+                return Err(format!(
+                    "response_mock: `rule[{i}]` `path` must not be empty"
+                ));
             }
 
             let path = if let Some(pattern) = path_str.strip_prefix('~') {
@@ -236,7 +238,9 @@ impl ResponseMock {
                             format!("response_mock: `rule[{i}]` header {k:?} is not a valid name")
                         })?;
                         let s = v.as_str().ok_or_else(|| {
-                            format!("response_mock: `rule[{i}]` header {k:?} value must be a string")
+                            format!(
+                                "response_mock: `rule[{i}]` header {k:?} value must be a string"
+                            )
                         })?;
                         HeaderValue::from_str(s).map_err(|_| {
                             format!("response_mock: `rule[{i}]` header {k:?} value is invalid")
@@ -271,7 +275,9 @@ impl ResponseMock {
                 Some(Value::String(body)) => body.clone(),
                 Some(Value::Null) | None => String::new(),
                 Some(_) => {
-                    return Err(format!("response_mock: `rule[{i}]` `body` must be a string"));
+                    return Err(format!(
+                        "response_mock: `rule[{i}]` `body` must be a string"
+                    ));
                 }
             };
 

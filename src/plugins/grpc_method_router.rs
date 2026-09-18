@@ -212,10 +212,13 @@ impl GrpcMethodRouter {
                         )
                     })?;
                 let max_requests = validate_max_requests(&label, "max_requests", max_requests)
-                    .map_err(|error| format!("grpc_method_router: `method_rate_limits`: {error}"))?;
+                    .map_err(|error| {
+                        format!("grpc_method_router: `method_rate_limits`: {error}")
+                    })?;
                 let window_seconds =
-                    validate_window_seconds(&label, "window_seconds", window_seconds)
-                        .map_err(|error| format!("grpc_method_router: `method_rate_limits`: {error}"))?;
+                    validate_window_seconds(&label, "window_seconds", window_seconds).map_err(
+                        |error| format!("grpc_method_router: `method_rate_limits`: {error}"),
+                    )?;
                 let normalized = normalize_config_method_path(method, "method_rate_limits")?;
                 let window = Duration::from_secs(window_seconds);
                 if method_rate_limits

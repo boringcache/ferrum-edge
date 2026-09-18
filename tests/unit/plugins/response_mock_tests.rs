@@ -1260,7 +1260,13 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains(reason), "{rendered}");
-        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "103", "true", "false"] {
+        for withheld in [
+            "UNREGISTERED_TRAFFIC_TOKEN",
+            "918273641",
+            "103",
+            "true",
+            "false",
+        ] {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }

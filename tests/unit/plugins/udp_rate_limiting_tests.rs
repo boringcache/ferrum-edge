@@ -1063,7 +1063,9 @@ fn shared_window_bound_keeps_udp_plugin_and_field_when_rendered() {
     assert!(rendered.starts_with("udp_rate_limiting:"), "{rendered}");
     assert!(rendered.contains("`window_seconds`"), "{rendered}");
     assert!(
-        rendered.contains(&format!("must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds")),
+        rendered.contains(&format!(
+            "must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds"
+        )),
         "{rendered}"
     );
     assert!(!rendered.contains(&value.to_string()), "{rendered}");

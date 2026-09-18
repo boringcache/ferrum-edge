@@ -197,7 +197,9 @@ pub fn parse_route_header_transforms(
                     ));
                 };
                 if value.bytes().any(|b| b == b'\r' || b == b'\n') {
-                    return Err(format!("`{context}[{idx}].value` must not contain CR or LF"));
+                    return Err(format!(
+                        "`{context}[{idx}].value` must not contain CR or LF"
+                    ));
                 }
                 // Same complete HeaderValue gate used by outbound Hyper / H3 /
                 // reqwest adapters so invalid controls fail at config load.

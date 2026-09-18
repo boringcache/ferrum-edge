@@ -1164,8 +1164,14 @@ fn method_rate_shape_errors_keep_schema_and_suggestions_without_supplied_content
             assert!(rendered.contains("grpc_method_router:"), "{rendered}");
             assert!(rendered.contains("`method_rate_limits`"), "{rendered}");
             assert!(rendered.contains(reason), "{rendered}");
-            if config["method_rate_limits"][key].get("max_requets").is_some() {
-                assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            if config["method_rate_limits"][key]
+                .get("max_requets")
+                .is_some()
+            {
+                assert!(
+                    rendered.contains("unknown configuration key(s)"),
+                    "{rendered}"
+                );
             }
             for withheld in [
                 "MethodIdentifierCanary",

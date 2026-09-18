@@ -1717,11 +1717,7 @@ mod udp_datagram_faults {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
     for (config, field, reason) in [
-        (
-            json!({"abort": {token: true}}),
-            "`abort`",
-            "unknown",
-        ),
+        (json!({"abort": {token: true}}), "`abort`", "unknown"),
         (
             json!({"abort": {"status_code": 918273641}}),
             "`abort.status_code`",

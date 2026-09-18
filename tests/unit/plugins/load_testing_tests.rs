@@ -2498,11 +2498,7 @@ fn schema_case_config_without_port(extra: &serde_json::Value) -> serde_json::Val
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
     for (config, field, reason) in [
-        (
-            json!({"key": true}),
-            "`key`",
-            "must be a string",
-        ),
+        (json!({"key": true}), "`key`", "must be a string"),
         (
             json!({"key": token, "concurrent_clients": 918273641}),
             "`concurrent_clients`",

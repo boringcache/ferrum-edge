@@ -2217,7 +2217,10 @@ fn rate_map_shape_errors_keep_schema_and_suggestions_without_supplied_content() 
             assert!(rendered.contains(&format!("`{parent}`")), "{rendered}");
             assert!(rendered.contains(reason), "{rendered}");
             if config[parent][key].get("max_requets").is_some() {
-                assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+                assert!(
+                    rendered.contains("unknown configuration key(s)"),
+                    "{rendered}"
+                );
             }
             for withheld in [
                 key,

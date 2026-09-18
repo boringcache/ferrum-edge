@@ -1817,11 +1817,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "supported keys",
             "unsupported configuration key",
         ),
-        (
-            json!({"spec_url": token}),
-            "`spec_url`",
-            "not a valid URL",
-        ),
+        (json!({"spec_url": token}), "`spec_url`", "not a valid URL"),
         (
             json!({"spec_url": "https://example.com", "content_type": true}),
             "`content_type`",

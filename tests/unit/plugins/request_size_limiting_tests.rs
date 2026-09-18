@@ -392,13 +392,11 @@ async fn test_final_request_body_over_limit_still_rejects_after_transforms() {
 
 #[test]
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
-    for (config, field, reason) in [
-        (
-            json!({"max_bytes": true}),
-            "`max_bytes`",
-            "must be greater than zero",
-        ),
-    ] {
+    for (config, field, reason) in [(
+        json!({"max_bytes": true}),
+        "`max_bytes`",
+        "must be greater than zero",
+    )] {
         let error = ferrum_edge::plugins::validate_plugin_config("request_size_limiting", &config)
             .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);

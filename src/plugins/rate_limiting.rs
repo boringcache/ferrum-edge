@@ -1085,7 +1085,8 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
             .ok_or_else(|| format!("{label} must be an object"))?;
         validate_limit_rule_fields(&label, rule)?;
 
-        let specs = parse_window_specs(&label, rule).map_err(|error| format!("{label}: {error}"))?;
+        let specs =
+            parse_window_specs(&label, rule).map_err(|error| format!("{label}: {error}"))?;
         if specs.is_empty() {
             return Err(format!(
                 "{label}: no rate limit windows configured — set `window_seconds`+`max_requests`, or `requests_per_second`/`requests_per_minute`/`requests_per_hour`"

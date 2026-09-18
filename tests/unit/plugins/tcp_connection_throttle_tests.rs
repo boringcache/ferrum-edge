@@ -549,8 +549,9 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "must be a positive integer",
         ),
     ] {
-        let error = ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &config)
-            .expect_err("invalid configuration must still be rejected");
+        let error =
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &config)
+                .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains(reason), "{rendered}");

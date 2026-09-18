@@ -2251,7 +2251,11 @@ fn traffic_root_unknown_keys_keep_fixed_context_and_suggestions_when_rendered() 
         ("response_size_limiting", "max_bytez", "max_bytes"),
         ("sse", "retry_mz", "retry_ms"),
         ("udp_rate_limiting", "window_secondz", "window_seconds"),
-        ("ws_message_size_limiting", "max_frame_bytez", "max_frame_bytes"),
+        (
+            "ws_message_size_limiting",
+            "max_frame_bytez",
+            "max_frame_bytes",
+        ),
         ("ws_rate_limiting", "frames_per_secon", "frames_per_second"),
     ] {
         let hostile_key = "'\"\\\n`ROOT_QUOTE_CANARY";
@@ -2265,7 +2269,9 @@ fn traffic_root_unknown_keys_keep_fixed_context_and_suggestions_when_rendered() 
             .expect_err("unknown root keys must still fail admission");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(
-            rendered.starts_with(&format!("{plugin}: `config`: unknown configuration key(s):")),
+            rendered.starts_with(&format!(
+                "{plugin}: `config`: unknown configuration key(s):"
+            )),
             "{rendered}"
         );
         assert!(
@@ -2323,7 +2329,10 @@ fn shared_rate_bounds_keep_the_nonzero_rule_index_when_rendered() {
                 .expect("the second rule must fail the shared bound");
             let rendered =
                 ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-            assert!(rendered.contains("rate_limiting: `limits[1]`"), "{rendered}");
+            assert!(
+                rendered.contains("rate_limiting: `limits[1]`"),
+                "{rendered}"
+            );
             assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
             if value == 0 {
                 assert!(rendered.contains("must be greater than zero"), "{rendered}");

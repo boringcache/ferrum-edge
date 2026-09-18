@@ -1689,9 +1689,8 @@ pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> 
         ));
     }
 
-    let url = Url::parse(origin).map_err(|_| {
-        format!("cors: invalid origin URL in `allowed_origins`: {origin:?}")
-    })?;
+    let url = Url::parse(origin)
+        .map_err(|_| format!("cors: invalid origin URL in `allowed_origins`: {origin:?}"))?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {

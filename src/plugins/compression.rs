@@ -475,7 +475,9 @@ impl CompressionPlugin {
                             ));
                         }
                         None => {
-                            return Err(format!("compression: `algorithms[{idx}]` must be a string"));
+                            return Err(format!(
+                                "compression: `algorithms[{idx}]` must be a string"
+                            ));
                         }
                     }
                 }

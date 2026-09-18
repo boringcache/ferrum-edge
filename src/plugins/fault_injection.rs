@@ -257,7 +257,7 @@ impl FaultInjectionPlugin {
 
                 if duration_ms == 0 {
                     return Err(
-                        "fault_injection: `delay.duration_ms` must be greater than 0".to_string()
+                        "fault_injection: `delay.duration_ms` must be greater than 0".to_string(),
                     );
                 }
                 if duration_ms > MAX_FAULT_DELAY_MS {

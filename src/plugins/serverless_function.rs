@@ -497,7 +497,9 @@ impl ServerlessFunction {
             } else {
                 "must not be null; omit the field instead"
             };
-            return Err(format!("serverless_function: `config` field {key:?} {detail}"));
+            return Err(format!(
+                "serverless_function: `config` field {key:?} {detail}"
+            ));
         }
 
         let provider = match config.get("provider").and_then(Value::as_str) {
@@ -1363,8 +1365,8 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
 
 fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "aws_endpoint_url")?;
-    let parsed =
-        Url::parse(url).map_err(|_| "serverless_function: invalid `aws_endpoint_url`".to_string())?;
+    let parsed = Url::parse(url)
+        .map_err(|_| "serverless_function: invalid `aws_endpoint_url`".to_string())?;
     if parsed.path() != "/" || parsed.query().is_some() {
         return Err(
             "serverless_function: `aws_endpoint_url` must be an HTTP(S) origin without a path, query, or fragment"

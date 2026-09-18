@@ -406,15 +406,15 @@ impl SpecExpose {
                     )
                 },
             )?;
-            let certificates =
-                reqwest::Certificate::from_pem_bundle(ca_material.bytes.expose_secret()).map_err(
-                    |_| {
-                        format!(
-                            "spec_expose: configured CA bundle {:?} is invalid; refusing to widen trust",
-                            ca_material.display_source_id
-                        )
-                    },
-                )?;
+            let certificates = reqwest::Certificate::from_pem_bundle(
+                ca_material.bytes.expose_secret(),
+            )
+            .map_err(|_| {
+                format!(
+                    "spec_expose: configured CA bundle {:?} is invalid; refusing to widen trust",
+                    ca_material.display_source_id
+                )
+            })?;
             if certificates.is_empty() {
                 return Err(format!(
                     "spec_expose: configured CA bundle {:?} contains no certificates; refusing to widen trust",
