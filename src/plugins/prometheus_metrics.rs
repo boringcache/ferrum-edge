@@ -6235,7 +6235,7 @@ impl PrometheusMetrics {
                 config_obj,
                 "config",
                 PROMETHEUS_METRICS_CONFIG_KEYS,
-                "prometheus_metrics: ",
+                "prometheus_metrics: `config`: ",
             )?;
         }
         if config.get("schema").is_some() || config.get("schema_ref").is_some() {

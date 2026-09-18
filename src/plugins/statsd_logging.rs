@@ -599,7 +599,8 @@ impl StatsdLogging {
                 "statsd_logging: `host` is required — metrics will have nowhere to send".to_string()
             })?
             .to_string();
-        let socket_host = parse_socket_host("statsd_logging", "host", &raw_host)?;
+        let socket_host = parse_socket_host("statsd_logging", "host", &raw_host)
+            .map_err(|e| format!("statsd_logging: {e}"))?;
         socket_host.screen_egress_ip("statsd_logging", "host", http_client.backend_allow_ips())?;
         let host = socket_host.dial_host.clone();
 

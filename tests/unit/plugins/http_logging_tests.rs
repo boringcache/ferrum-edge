@@ -1010,3 +1010,55 @@ fn startup_diagnostics_withhold_custom_header_keys_and_url_schemes() {
         assert!(!rendered.contains("987654321"), "{rendered}");
     }
 }
+
+#[test]
+fn startup_diagnostics_preserve_observability_root_context_and_suggestions() {
+    // Exercise each shared-helper caller through registered plugin admission.
+    // Unknown-key rejection precedes required-field validation in these plugins.
+    for (plugin, typo, suggestion) in [
+        ("http_logging", "endpont_url", "endpoint_url"),
+        ("kafka_logging", "broker_lsit", "broker_list"),
+        ("otel_tracing", "buffer_capcity", "buffer_capacity"),
+        (
+            "prometheus_metrics",
+            "render_cache_ttl_secnds",
+            "render_cache_ttl_seconds",
+        ),
+        ("tcp_logging", "tlss", "tls"),
+        ("udp_logging", "dtlss", "dtls"),
+        ("ws_logging", "endpont_url", "endpoint_url"),
+        ("proxy_alerts", "enabledd", "enabled"),
+    ] {
+        for key in ["CallerKey5594", "987654321", "'CallerKey5594`\"\\\n"] {
+            let mut config = json!({
+                "objectKey5594": {"payloadKey5594": "payloadValue5594"},
+                "arrayKey5594": [{"payloadKey5594": "payloadValue5594"}]
+            });
+            config[key] = json!("scalarValue5594");
+            config[typo] = json!({"payloadKey5594": ["payloadValue5594", 987654321]});
+            let error = ferrum_edge::plugins::validate_plugin_config(plugin, &config)
+                .expect_err("unknown observability keys must fail admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains(&format!("{plugin}: `config`:")), "{rendered}");
+            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("did you mean `{suggestion}`?")),
+                "{rendered}"
+            );
+            for hidden in [
+                key,
+                typo,
+                "CallerKey5594",
+                "987654321",
+                "objectKey5594",
+                "arrayKey5594",
+                "payloadKey5594",
+                "payloadValue5594",
+                "scalarValue5594",
+            ] {
+                assert!(!rendered.contains(hidden), "{plugin}: {rendered}");
+            }
+        }
+    }
+}

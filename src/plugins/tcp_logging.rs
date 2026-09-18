@@ -125,7 +125,8 @@ impl TcpLogging {
                 "tcp_logging: `host` is required — logs will have nowhere to send".to_string()
             })?
             .to_string();
-        let socket_host = parse_socket_host("tcp_logging", "host", &raw_host)?;
+        let socket_host = parse_socket_host("tcp_logging", "host", &raw_host)
+            .map_err(|e| format!("tcp_logging: {e}"))?;
         socket_host.screen_egress_ip("tcp_logging", "host", http_client.backend_allow_ips())?;
         let host = socket_host.dial_host.clone();
 
@@ -215,7 +216,12 @@ impl TcpLogging {
 }
 
 fn reject_unknown_tcp_logging_keys(object: &Map<String, Value>) -> Result<(), String> {
-    reject_unknown_keys(object, "config", TCP_LOGGING_CONFIG_KEYS, "tcp_logging: ")
+    reject_unknown_keys(
+        object,
+        "config",
+        TCP_LOGGING_CONFIG_KEYS,
+        "tcp_logging: `config`: ",
+    )
 }
 
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {

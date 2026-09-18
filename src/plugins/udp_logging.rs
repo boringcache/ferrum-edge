@@ -251,7 +251,12 @@ fn parse_udp_logging_config(
     let object = config
         .as_object()
         .ok_or_else(|| "udp_logging: config must be an object".to_string())?;
-    reject_unknown_keys(object, "config", UDP_LOGGING_CONFIG_KEYS, "udp_logging: ")?;
+    reject_unknown_keys(
+        object,
+        "config",
+        UDP_LOGGING_CONFIG_KEYS,
+        "udp_logging: `config`: ",
+    )?;
 
     let raw_host = config
         .get("host")
@@ -260,7 +265,8 @@ fn parse_udp_logging_config(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "udp_logging: `host` is required".to_string())?
         .to_string();
-    let socket_host = parse_socket_host("udp_logging", "host", &raw_host)?;
+    let socket_host = parse_socket_host("udp_logging", "host", &raw_host)
+        .map_err(|e| format!("udp_logging: {e}"))?;
     socket_host.screen_egress_ip("udp_logging", "host", http_client.backend_allow_ips())?;
     let host = socket_host.dial_host.clone();
     let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
@@ -455,7 +461,9 @@ pub(crate) fn dtls_file_dependency_cache_key(
     // Match constructor admission: bracketed IPv6 is valid config input, but
     // rustls ServerName and the dialer consume its unbracketed canonical form.
     // Normalization also lets case-only hostname variants share one cache row.
-    let host = parse_socket_host("udp_logging", "host", raw_host)?.dial_host;
+    let host = parse_socket_host("udp_logging", "host", raw_host)
+        .map_err(|e| format!("udp_logging: {e}"))?
+        .dial_host;
 
     Ok(Some(DtlsFileDependencyCacheKey {
         host,

@@ -601,7 +601,7 @@ impl OtelTracing {
             config_object,
             "config",
             ALLOWED_CONFIG_KEYS,
-            "otel_tracing: ",
+            "otel_tracing: `config`: ",
         )?;
 
         let service_name = string_config(config, "service_name", "ferrum-edge")?;

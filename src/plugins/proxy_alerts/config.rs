@@ -213,7 +213,7 @@ impl ProxyAlertsConfig {
         let obj = config
             .as_object()
             .ok_or_else(|| "proxy_alerts: config must be an object".to_string())?;
-        reject_unknown_keys(obj, "config", TOP_LEVEL_KEYS, "proxy_alerts: ")?;
+        reject_unknown_keys(obj, "config", TOP_LEVEL_KEYS, "proxy_alerts: `config`: ")?;
 
         let enabled = read_optional_bool(config, "enabled", "proxy_alerts")?.unwrap_or(true);
         let default_cooldown_seconds = read_u32_default(config, "default_cooldown_seconds", 300)?;
@@ -421,7 +421,7 @@ fn parse_rule(
         None => {
             return Err(missing_required_key_error(
                 obj,
-                &format!("proxy_alerts: rule {name:?}"),
+                &format!("proxy_alerts: `rules[{id}]`"),
                 "type",
             ));
         }
@@ -430,22 +430,42 @@ fn parse_rule(
 
     match kind {
         "error_rate" => {
-            reject_unknown_keys(obj, &rule_path, ERROR_RATE_KEYS, "proxy_alerts: ")?;
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                ERROR_RATE_KEYS,
+                &format!("proxy_alerts: `rules[{id}]`: "),
+            )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_error_rate(common, raw, defaults).map(Rule::ErrorRate)
         }
         "status_code_count" => {
-            reject_unknown_keys(obj, &rule_path, STATUS_CODE_COUNT_KEYS, "proxy_alerts: ")?;
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                STATUS_CODE_COUNT_KEYS,
+                &format!("proxy_alerts: `rules[{id}]`: "),
+            )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_status_code_count(common, raw).map(Rule::StatusCodeCount)
         }
         "latency_percentile" => {
-            reject_unknown_keys(obj, &rule_path, LATENCY_PERCENTILE_KEYS, "proxy_alerts: ")?;
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                LATENCY_PERCENTILE_KEYS,
+                &format!("proxy_alerts: `rules[{id}]`: "),
+            )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_latency_percentile(common, raw, defaults).map(Rule::LatencyPercentile)
         }
         "error_class" => {
-            reject_unknown_keys(obj, &rule_path, ERROR_CLASS_KEYS, "proxy_alerts: ")?;
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                ERROR_CLASS_KEYS,
+                &format!("proxy_alerts: `rules[{id}]`: "),
+            )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_error_class(common, raw).map(Rule::ErrorClass)
         }
@@ -454,18 +474,28 @@ fn parse_rule(
                 obj,
                 &rule_path,
                 STREAM_DISCONNECT_CAUSE_KEYS,
-                "proxy_alerts: ",
+                &format!("proxy_alerts: `rules[{id}]`: "),
             )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_stream_disconnect_cause(common, raw).map(Rule::StreamDisconnectCause)
         }
         "grpc_status_count" => {
-            reject_unknown_keys(obj, &rule_path, GRPC_STATUS_COUNT_KEYS, "proxy_alerts: ")?;
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                GRPC_STATUS_COUNT_KEYS,
+                &format!("proxy_alerts: `rules[{id}]`: "),
+            )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_grpc_status_count(common, raw).map(Rule::GrpcStatusCount)
         }
         "grpc_status_rate" => {
-            reject_unknown_keys(obj, &rule_path, GRPC_STATUS_RATE_KEYS, "proxy_alerts: ")?;
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                GRPC_STATUS_RATE_KEYS,
+                &format!("proxy_alerts: `rules[{id}]`: "),
+            )?;
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_grpc_status_rate(common, raw, defaults).map(Rule::GrpcStatusRate)
         }
@@ -905,7 +935,7 @@ fn read_recovery(
         rec_obj,
         &format!("rules[{rule_id}].recovery"),
         RECOVERY_KEYS,
-        "proxy_alerts: ",
+        &format!("proxy_alerts: `rules[{rule_id}].recovery`: "),
     )?;
     let resolved_window_seconds =
         read_object_u32(rec, "resolved_window_seconds", rule_name, "recovery")?
@@ -1028,7 +1058,7 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
             obj,
             &format!("quiet_hours_utc[{idx}]"),
             QUIET_HOUR_KEYS,
-            "proxy_alerts: ",
+            &format!("proxy_alerts: `quiet_hours_utc[{idx}]`: "),
         )?;
         let from_str = obj.get("from").and_then(Value::as_str).ok_or_else(|| {
             format!("proxy_alerts: `quiet_hours_utc[{idx}]`: `from` is required (HH:MM)")

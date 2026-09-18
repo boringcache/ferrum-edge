@@ -1914,3 +1914,33 @@ fn startup_diagnostics_withhold_udp_ports_and_dtls_material_paths() {
         assert!(!rendered.contains(hidden), "{rendered}");
     }
 }
+
+#[test]
+fn startup_diagnostics_preserve_dtls_dependency_host_context() {
+    for (host, reason) in [
+        (
+            "https://credential5594:'hostValue5594`\"\\\n@logs.example.com/path",
+            "must be a hostname or IP address without scheme, path, query, fragment, or credentials",
+        ),
+        (
+            "hostValue5594.example.com:987654321",
+            "must not include brackets or a port unless it is an IPv6 literal",
+        ),
+    ] {
+        let config = json!({"host": host, "port": 9514, "dtls": true});
+        // The existing hook enters file-dependency admission, which builds the
+        // cache key before reading or materializing any certificate files.
+        let error =
+            ferrum_edge::_test_support::udp_logging_validate_dtls_file_dependencies_for_test(
+                config.as_object().unwrap(),
+            )
+            .expect_err("invalid dependency-key host must fail before DTLS materialization");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for visible in ["udp_logging:", "`host`", reason] {
+            assert!(rendered.contains(visible), "{rendered}");
+        }
+        for hidden in [host, "hostValue5594", "credential5594", "987654321"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}

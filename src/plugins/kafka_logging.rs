@@ -1572,7 +1572,12 @@ impl KafkaLogging {
         let object = config
             .as_object()
             .ok_or_else(|| "kafka_logging: config must be an object".to_string())?;
-        reject_unknown_keys(object, "config", ALLOWED_CONFIG_KEYS, "kafka_logging: ")?;
+        reject_unknown_keys(
+            object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "kafka_logging: `config`: ",
+        )?;
 
         let broker_list = required_non_empty_string(config, "broker_list").ok_or_else(|| {
             near_miss_hint(

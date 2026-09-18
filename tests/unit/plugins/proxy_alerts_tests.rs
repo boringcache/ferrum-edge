@@ -2745,3 +2745,145 @@ fn startup_diagnostics_preserve_alert_paths_and_withhold_document_values() {
     assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
     assert!(!rendered.contains("987654321"), "{rendered}");
 }
+
+const ALERT_DIAGNOSTIC_KEYS: &[&str] = &["CallerKey5594", "987654321", "'CallerKey5594`\"\\\n"];
+
+fn assert_rendered_alert_diagnostic(config: &serde_json::Value, visible: &[&str], hidden: &[&str]) {
+    let error = ProxyAlerts::new(config, http_client())
+        .expect_err("invalid alert configuration must still be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for fragment in ["proxy_alerts"].into_iter().chain(visible.iter().copied()) {
+        assert!(rendered.contains(fragment), "{rendered}");
+    }
+    for fragment in [
+        "CallerKey5594",
+        "987654321",
+        "payloadKey5594",
+        "payloadValue5594",
+        "scalarValue5594",
+        "proxy_5xx",
+    ]
+    .into_iter()
+    .chain(hidden.iter().copied())
+    {
+        assert!(!rendered.contains(fragment), "{rendered}");
+    }
+}
+
+#[test]
+fn startup_diagnostics_preserve_second_alert_rule_context_for_every_kind() {
+    for rule in [
+        json!({"type": "error_rate", "status_codes": [500], "threshold_percent": 5.0}),
+        json!({"type": "status_code_count", "status_codes": [500], "threshold_count": 10}),
+        json!({"type": "latency_percentile", "metric": "backend_total_ms", "percentile": 95, "threshold_ms": 1000}),
+        json!({"type": "error_class", "classes": ["connection_refused"], "threshold_count": 10}),
+        json!({"type": "stream_disconnect_cause", "causes": ["backend_error"], "threshold_count": 10}),
+        json!({"type": "grpc_status_count", "grpc_statuses": [14], "threshold_count": 10}),
+        json!({"type": "grpc_status_rate", "grpc_statuses": [14], "threshold_percent": 5.0}),
+    ] {
+        for &key in ALERT_DIAGNOSTIC_KEYS {
+            let mut second = rule.clone();
+            second["name"] = json!(key);
+            second["channels"] = json!(["ops_slack"]);
+            let mut config = minimal_config();
+            config["rules"].as_array_mut().unwrap().push(second);
+            assert!(
+                ProxyAlerts::new(&config, http_client()).is_ok(),
+                "both rules must be valid before injecting unknown keys"
+            );
+            config["rules"][1][key] = json!("scalarValue5594");
+            config["rules"][1]["cooldown_secons"] =
+                json!({"payloadKey5594": ["payloadValue5594", 987654321]});
+            assert_rendered_alert_diagnostic(
+                &config,
+                &[
+                    "`rules[1]`",
+                    "unknown configuration key(s)",
+                    "did you mean `cooldown_seconds`?",
+                ],
+                &[key, "cooldown_secons"],
+            );
+        }
+    }
+}
+
+#[test]
+fn startup_diagnostics_preserve_second_alert_recovery_context() {
+    for &key in ALERT_DIAGNOSTIC_KEYS {
+        let mut config = minimal_config();
+        let mut second = config["rules"][0].clone();
+        second["name"] = json!(key);
+        second["recovery"] = json!({"resolved_window_seconds": 300});
+        config["rules"].as_array_mut().unwrap().push(second);
+        assert!(
+            ProxyAlerts::new(&config, http_client()).is_ok(),
+            "both rules and recovery must be valid before injecting unknown keys"
+        );
+        config["rules"][1]["recovery"][key] = json!(["payloadValue5594"]);
+        config["rules"][1]["recovery"]["resolved_window_secnds"] =
+            json!({"payloadKey5594": 987654321});
+        assert_rendered_alert_diagnostic(
+            &config,
+            &[
+                "`rules[1].recovery`",
+                "unknown configuration key(s)",
+                "did you mean `resolved_window_seconds`?",
+            ],
+            &[key, "resolved_window_secnds"],
+        );
+    }
+}
+
+#[test]
+fn startup_diagnostics_preserve_second_quiet_hours_context() {
+    for &key in ALERT_DIAGNOSTIC_KEYS {
+        let mut config = minimal_config();
+        config["quiet_hours_utc"] = json!([
+            {"from": "01:00", "to": "02:00"},
+            {"from": "03:00", "to": "04:00"}
+        ]);
+        assert!(
+            ProxyAlerts::new(&config, http_client()).is_ok(),
+            "both quiet-hours entries must be valid before injecting unknown keys"
+        );
+        config["quiet_hours_utc"][1][key] = json!({"payloadKey5594": "payloadValue5594"});
+        config["quiet_hours_utc"][1]["weekdayss"] = json!([987654321]);
+        assert_rendered_alert_diagnostic(
+            &config,
+            &[
+                "`quiet_hours_utc[1]`",
+                "unknown configuration key(s)",
+                "did you mean `weekdays`?",
+            ],
+            &[key, "weekdayss", "01:00", "03:00"],
+        );
+    }
+}
+
+#[test]
+fn startup_diagnostics_preserve_second_rule_index_when_type_is_missing() {
+    for &name in ALERT_DIAGNOSTIC_KEYS {
+        for typo_payload in [
+            None,
+            Some(json!("scalarValue5594")),
+            Some(json!({"payloadKey5594": "payloadValue5594"})),
+            Some(json!([{"payloadKey5594": 987654321}])),
+        ] {
+            let mut config = minimal_config();
+            let mut second = config["rules"][0].clone();
+            second["name"] = json!(name);
+            config["rules"].as_array_mut().unwrap().push(second);
+            assert!(
+                ProxyAlerts::new(&config, http_client()).is_ok(),
+                "both rules must be valid before removing the required type"
+            );
+            config["rules"][1].as_object_mut().unwrap().remove("type");
+            let mut visible = vec!["`rules[1]`", "`type` is required"];
+            if let Some(payload) = typo_payload {
+                config["rules"][1]["typee"] = payload;
+                visible.push("did you mean `type` instead of");
+            }
+            assert_rendered_alert_diagnostic(&config, &visible, &[name, "typee"]);
+        }
+    }
+}
