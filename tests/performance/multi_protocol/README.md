@@ -369,12 +369,29 @@ image IDs/digests, the experiment manifest, and host socket settings are artifac
 | 50 | 6 | 24 | 50 |
 
 These are downstream ceilings from the fixed round-robin worker assignment;
-`observed.active_streams` reports client admission during load. Both upstream
-limits change too, so this tests the historical two-leg cap, not either leg in
-isolation. The backend's timestamped `H3_PROFILE` records show upstream connection
+`observed.active_streams` reports client admission during load. The experiment
+changes the upstream and downstream limits together. The backend's timestamped
+`H3_PROFILE` records show upstream connection
 IDs, peer ports, accepted/completed echoes and bytes. Per-connection measurement
 deltas and per-thread CPU brackets accompany each sample. They include sampling
 slack; neither identifies which Envoy thread owns an individual UDP socket.
+
+The downstream limit is applied to
+`udp_listener_config.quic_options.quic_protocol_options`, which constructs the
+QUIC transport. Changing only the similarly named HCM options did **not** cap
+downstream admission in the first hosted experiment: all 200/100/50 streams
+remained admitted. Compare the observed queues and locally active exchanges
+with the transport ceiling: local validation can outlive transport stream
+closure, so the local gauge is not an exact server stream count. Previous
+claims that the historical HCM setting necessarily admitted
+only 84/44/24 streams were incorrect.
+
+H3 waits 750 ms at the ready barrier and after worker drain, identically for all
+arms, to bracket fast client and upstream sockets with the passive sampler.
+The former is `barrier_secs`, the latter `observation_hold_secs`; neither time
+enters measured throughput. Envoy histogram records are retained separately
+from its named scalar counters. The aggregate accepts the single-artifact flat
+layout as well as multiple artifact directories; missing runs fail explicitly.
 
 The enabled experiment requires a disposable Linux runner with passwordless
 `sudo sysctl`. It sets `rmem_default`, `wmem_default`, `rmem_max`, and `wmem_max`

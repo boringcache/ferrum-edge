@@ -87,6 +87,38 @@ def read_comparisons(path):
         return [dict(accepted=False, reason="unparseable")]
 
 
+def protocol_runs(root):
+    """download-artifact flattens a single match even with merge-multiple=false."""
+    root = Path(root)
+    result = []
+    protocols = {"http1-tls", "http2", "http3", "grpcs", "wss", "tcp-tls", "udp", "udp-dtls"}
+    for container in [root] + sorted(root.glob("gateways-protocol-bench-*")):
+        for directory in sorted(container.glob("run_*")):
+            if not directory.is_dir():
+                continue
+            if container != root:
+                protocol = "-".join(container.name.split("-")[3:-1])
+            else:
+                # The summary rows always carry the runner's normalized protocol.
+                found = set()
+                for path in directory.glob("*.json"):
+                    try:
+                        row = json.loads(path.read_text())
+                        if isinstance(row, dict) and row.get("protocol") in protocols:
+                            found.add(row["protocol"])
+                    except (OSError, ValueError):
+                        continue
+                if len(found) != 1:
+                    raise ValueError(f"cannot identify single-artifact protocol in {directory}")
+                protocol = found.pop()
+            if protocol not in protocols:
+                raise ValueError(f"unknown artifact protocol {protocol}")
+            result.append((protocol, directory))
+    if not result:
+        raise ValueError("no protocol runs discovered in downloaded artifacts")
+    return result
+
+
 def paired_comparison(baseline, candidate, expected_pairs):
     """Student-t interval over paired log ratios; never discard a failed pair."""
     result = {"expected_pairs": expected_pairs, "accepted": False}

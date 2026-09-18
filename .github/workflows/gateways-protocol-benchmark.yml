@@ -473,7 +473,7 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, "tests/performance/multi_protocol")
           from benchmark_validity import bucket_issues, expected_rows, throughput_value
-          from benchmark_plan import read_comparisons
+          from benchmark_plan import protocol_runs, read_comparisons
 
           iterations = int(os.environ.get("ITERATIONS", "1"))
           root = Path("all-results")
@@ -488,36 +488,27 @@ jobs:
           latest = {}
           unknown_plan_protocols = set()
 
-          for proto_artifact in sorted(root.iterdir()):
-              if not proto_artifact.is_dir(): continue
-              # Artifact name: gateways-protocol-bench-<protocol>-<sha>
-              # Protocols with hyphens (http1-tls, tcp-tls, udp-dtls) produce
-              # 6-part names; bare protocols (http2, http3, grpcs, wss, udp)
-              # produce 5-part names. Splitting on "-" and rejoining parts[3:-1]
-              # correctly reconstructs the protocol in both cases.
-              parts = proto_artifact.name.split("-")
-              if len(parts) < 5: continue
-              protocol = "-".join(parts[3:-1])
-              for run_dir in sorted(proto_artifact.glob("run_*")):
-                  planned_rows = expected_rows(run_dir)
-                  if planned_rows is None:
-                      unknown_plan_protocols.add(protocol)
-                      planned_rows = []
-                  for key in planned_rows:
-                      samples.setdefault(protocol, {}).setdefault(key, [])
-                      data.setdefault(protocol, {}).setdefault(key, [])
-                  for f in sorted(run_dir.glob(f"*_{protocol}_*.json")):
-                      try:
-                          d = json.loads(f.read_text())
-                      except Exception:
-                          d = {"error": "unparseable result"}
-                      gw = d.get("gateway") or f.stem.split(f"_{protocol}_")[0]
-                      size = int(d.get("payload_size") or f.stem.rsplit("_", 1)[1])
-                      d.setdefault("payload_size", size)
-                      samples.setdefault(protocol, {}).setdefault((gw, size), []).append(d)
-                      rps = throughput_value(d)
-                      data.setdefault(protocol, {}).setdefault((gw, size), []).append(rps)
-                      latest.setdefault(protocol, {})[(gw, size)] = d
+          runs = protocol_runs(root)
+          for protocol, run_dir in runs:
+              planned_rows = expected_rows(run_dir)
+              if planned_rows is None:
+                  unknown_plan_protocols.add(protocol)
+                  planned_rows = []
+              for key in planned_rows:
+                  samples.setdefault(protocol, {}).setdefault(key, [])
+                  data.setdefault(protocol, {}).setdefault(key, [])
+              for f in sorted(run_dir.glob(f"*_{protocol}_*.json")):
+                  try:
+                      d = json.loads(f.read_text())
+                  except Exception:
+                      d = {"error": "unparseable result"}
+                  gw = d.get("gateway") or f.stem.split(f"_{protocol}_")[0]
+                  size = int(d.get("payload_size") or f.stem.rsplit("_", 1)[1])
+                  d.setdefault("payload_size", size)
+                  samples.setdefault(protocol, {}).setdefault((gw, size), []).append(d)
+                  rps = throughput_value(d)
+                  data.setdefault(protocol, {}).setdefault((gw, size), []).append(rps)
+                  latest.setdefault(protocol, {})[(gw, size)] = d
 
           # Preserve flattened per-sample evidence in the combined artifact.
           records = [dict(child, matrix_protocol=proto, gateway=gw, payload_size=size)
@@ -526,7 +517,8 @@ jobs:
                      for row in rows for child in row.get("samples", [row])]
           (root / "observed-samples.json").write_text(json.dumps(records, indent=2) + "\n")
           paired = []
-          for path in sorted(root.glob("*/run_*/paired_comparisons.json")):
+          for _, directory in runs:
+              path = directory / "paired_comparisons.json"
               for row in read_comparisons(path):
                   paired.append(dict(row, run=str(path.parent.relative_to(root))))
           (root / "paired-comparisons.json").write_text(json.dumps(paired, indent=2) + "\n")
@@ -559,7 +551,8 @@ jobs:
           lines.append("### Planned position balance\n")
           lines.append("| Run | Arm | Positions | Mean position |")
           lines.append("|-----|-----|-----------|---------------|")
-          for path in sorted(root.glob("*/run_*/position_balance.json")):
+          for _, directory in runs:
+              path = directory / "position_balance.json"
               for row in read_comparisons(path):
                   lines.append(f"| {path.parent.relative_to(root)} | {row.get('gateway', '?')} | "
                                f"{row.get('positions', row.get('reason'))} | {row.get('mean_position', '?')} |")

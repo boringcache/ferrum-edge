@@ -253,6 +253,7 @@ pub struct PhaseReport {
     pub transport_close_timed_out: bool,
     pub transport_close_start_unix_secs: Option<f64>,
     pub transport_events: Vec<TransportEvent>,
+    pub observation_hold_secs: f64,
     pub preflight_bound_secs: f64,
     pub stalled_workers: Vec<usize>,
     pub timed_out: bool,
@@ -288,6 +289,7 @@ pub struct Phases {
     created: Instant,
     duration: Duration,
     preflight_bound: Duration,
+    observation_settle: Duration,
     phase: watch::Sender<Phase>,
     slots: Vec<Arc<Slot>>,
     connections: Connections,
@@ -300,6 +302,7 @@ impl Phases {
             created: Instant::now(),
             duration,
             preflight_bound: preflight_bound(0),
+            observation_settle: Duration::ZERO,
             phase,
             slots: Vec::new(),
             connections: Connections(Arc::new(AtomicUsize::new(0))),
@@ -313,6 +316,11 @@ impl Phases {
 
     pub fn connections(&self) -> Connections {
         self.connections.clone()
+    }
+
+    pub fn with_observation_settle(mut self, duration: Duration) -> Self {
+        self.observation_settle = duration;
+        self
     }
 
     /// Register before spawning, so even a setup panic releases the barrier.
@@ -386,6 +394,9 @@ impl Phases {
             }
         } else {
             let barrier = Instant::now();
+            // Give the passive sampler a full tick after every transport and
+            // warmup is ready, with workers still parked at the common barrier.
+            tokio::time::sleep(self.observation_settle).await;
             observed.workers_at_barrier = self
                 .slots
                 .iter()

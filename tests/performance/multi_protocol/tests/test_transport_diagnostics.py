@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from h3_experiment import envoy_config, load_experiment, topology
 from benchmark_validity import sample_issues
 from transport_diagnostics import (backend_distribution, counter_delta, parse_diag,
-                                   parse_snmp, parse_udp, summarize_transport, udp_sockets)
+                                   parse_envoy_stats, parse_snmp, parse_udp,
+                                   summarize_transport, udp_sockets)
 
 
 class TransportDiagnosticsTests(unittest.TestCase):
@@ -30,6 +31,8 @@ class TransportDiagnosticsTests(unittest.TestCase):
                                      "max_concurrent_streams: { value: 100 }"), high)
         self.assertEqual(low.count("name: 8, int_value: 2097152"), 2)
         self.assertEqual(low.count("name: 7, int_value: 2097152"), 2)
+        self.assertIn("quic_options:\n          quic_protocol_options:\n"
+                      "            max_concurrent_streams: { value: 4 }", low)
         self.assertIn("sni: localhost", low)
         self.assertIn("trusted_ca:", low)
         with self.assertRaises(ValueError):
@@ -97,6 +100,14 @@ class TransportDiagnosticsTests(unittest.TestCase):
         issues = sample_issues(dict(h3_experiment={"enabled": True}))
         self.assertIn("incomplete H3 transport observations", issues)
         self.assertIn("H3 socket budget parity unverified", issues)
+
+    def test_envoy_histogram_wrapper_is_not_a_scalar_counter(self):
+        self.assertEqual(parse_envoy_stats({"stats": [
+            {"name": "watchdog_miss", "value": 2},
+            {"histograms": {"supported_quantiles": [0, 50, 100], "computed_quantiles": []}},
+        ]}), {"watchdog_miss": 2})
+        with self.assertRaises(ValueError):
+            parse_envoy_stats({"stats": [{"unrecognized": 2}]})
 
     @unittest.skipUnless(sys.platform == "linux", "Linux socket diagnostics")
     def test_passive_readback_matches_getsockopt_on_a_live_socket(self):

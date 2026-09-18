@@ -969,7 +969,7 @@ PYEOF
                     direct) ;;
                     ferrum) start_ferrum ;;
                     ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
-                    envoy) start_envoy ;;
+                    envoy) ENVOY_STREAM_LIMIT=100 start_envoy ;;
                     envoy-limit-4) ENVOY_STREAM_LIMIT=4 start_envoy ;;
                     kong) start_kong ;;
                     tyk) start_tyk ;;

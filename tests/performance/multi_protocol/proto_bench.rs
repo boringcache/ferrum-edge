@@ -553,8 +553,9 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         .context("invalid address")?;
     let path = url.path().to_string();
 
-    let mut phases =
-        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let mut phases = Phases::new(Duration::from_secs(args.duration))
+        .with_payload(args.payload_size)
+        .with_observation_settle(Duration::from_millis(750));
     let connections = phases.connections();
     let client_cfg = tls_utils::make_h3_client_config_insecure();
 
@@ -753,6 +754,13 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     let mut combined = phases.finish(handles).await;
     while let Ok(event) = event_rx.try_recv() {
         events.push(event);
+    }
+    // Preserve live sockets for an ending passive observation. No requests are
+    // offered here, and this time is excluded from measured work and drain.
+    let observation_started = Instant::now();
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    if let Some(phases) = &mut combined.phases {
+        phases.observation_hold_secs = observation_started.elapsed().as_secs_f64();
     }
     let close_started = Instant::now();
     events.push(TransportEvent::new(0, "retirement_started", String::new()));

@@ -110,12 +110,25 @@ def snapshot(envoy=False):
     if envoy:
         try:
             with urllib.request.urlopen("http://127.0.0.1:15000/stats?format=json", timeout=0.2) as response:
-                result["envoy_stats"] = {row["name"]: row["value"]
-                                         for row in json.load(response)["stats"]}
+                document = json.load(response)
+                result["envoy_stats"] = parse_envoy_stats(document)
+                result["envoy_histograms"] = [row for row in document["stats"] if "histograms" in row]
         except (OSError, ValueError, KeyError) as error:
             result["errors"].append(f"envoy stats: {error}")
     result["capture_secs"] = time.time() - result["unix_secs"]
     return result
+
+
+def parse_envoy_stats(document):
+    counters = {}
+    for row in document["stats"]:
+        if "name" in row and "value" in row:
+            counters[row["name"]] = row["value"]
+        elif "histograms" not in row:
+            raise ValueError("unknown Envoy stats record")
+    if not counters:
+        raise ValueError("missing Envoy scalar counters")
+    return counters
 
 
 def counter_delta(left, right):
