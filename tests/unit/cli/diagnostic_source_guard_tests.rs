@@ -11,6 +11,7 @@ const ROOTS: &[&str] = &[
     "src/config_sources",
     "src/grpc",
     "src/plugins/waf",
+    "src/notifications",
     "src/util/unknown_keys.rs",
     "src/plugins/utils/rate_limit.rs",
     "src/plugins/utils/socket_host.rs",
