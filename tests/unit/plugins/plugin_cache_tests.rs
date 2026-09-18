@@ -237,6 +237,405 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
     }
 }
 
+const DIAGNOSTIC_PROXY_ID: &str = "'UNREGISTERED_CACHE5594_PROXY\"\\\n";
+const DIAGNOSTIC_PLUGIN_ID: &str = "'UNREGISTERED_CACHE5594_ID\"\\\n";
+const DIAGNOSTIC_VALUE: &str = "'UNREGISTERED_CACHE5594_VALUE\"\\\n";
+
+fn capture_cache_diagnostics<T>(operation: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
+    // Keep two dispatchers registered, as described by plugin_utils' interest
+    // floor convention, without installing or replacing any global subscriber.
+    // The idle dispatcher only lives for this capture; all events use the
+    // thread-local JSON subscriber and the existing captured-log writer.
+    let _interest_floor = tracing::Dispatch::new(tracing_subscriber::registry());
+    let logs = super::plugin_utils::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(logs.clone())
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        operation()
+    });
+    let records = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("captured JSON log record"))
+        .collect();
+    (result, records)
+}
+
+fn assert_cache_diagnostic_withholds_values(message: &str) {
+    for withheld in ["UNREGISTERED_CACHE5594", "918273641", "true"] {
+        assert!(!message.contains(withheld), "{message}");
+    }
+}
+
+#[test]
+fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
+    let invalid_trigger: PluginTrigger = serde_json::from_value(json!({
+        "when": {"match": {"method": [DIAGNOSTIC_VALUE]}}
+    }))
+    .unwrap();
+    let valid_trigger: PluginTrigger = serde_json::from_value(json!({
+        "when": {"match": {"method": ["GET"]}}
+    }))
+    .unwrap();
+    let mut cases = vec![
+        (
+            "'UNREGISTERED_CACHE5594_NAME\"\\\n",
+            json!({}),
+            None,
+            vec!["Unknown enabled plugin"],
+            false,
+        ),
+        (
+            "oauth2_auth",
+            json!({}),
+            None,
+            vec!["Removed security plugin", "is not supported"],
+            false,
+        ),
+        (
+            "stdout_logging",
+            json!({"filter": {"errors_only": DIAGNOSTIC_VALUE}}),
+            None,
+            vec!["filter.errors_only", "must be a boolean"],
+            true,
+        ),
+        (
+            "stdout_logging",
+            json!({}),
+            Some(invalid_trigger),
+            vec![
+                "execution trigger is invalid",
+                "`method`",
+                "not a valid HTTP token",
+            ],
+            false,
+        ),
+        (
+            "security_headers",
+            json!({}),
+            Some(valid_trigger),
+            vec![
+                "cannot carry an execution trigger",
+                "initial response-header policy",
+            ],
+            false,
+        ),
+    ];
+    for value in [json!(DIAGNOSTIC_VALUE), json!(918273641), json!(true)] {
+        cases.push((
+            "ip_restriction",
+            json!({"allow": ["127.0.0.1"], "mode": value}),
+            None,
+            vec![
+                "config validation failed",
+                "`mode`",
+                "`allow_first`",
+                "`deny_first`",
+            ],
+            false,
+        ));
+    }
+
+    for scope in [
+        PluginScope::Global,
+        PluginScope::Proxy,
+        PluginScope::ProxyGroup,
+    ] {
+        for (name, config, trigger, reasons, optional) in &cases {
+            let mut plugin = make_plugin_config_with_json(
+                DIAGNOSTIC_PLUGIN_ID,
+                name,
+                config.clone(),
+                scope.clone(),
+                (scope == PluginScope::Proxy).then_some(DIAGNOSTIC_PROXY_ID),
+            );
+            plugin.trigger = trigger.clone();
+            let candidate = make_config(
+                vec![make_proxy(
+                    DIAGNOSTIC_PROXY_ID,
+                    "/",
+                    vec![DIAGNOSTIC_PLUGIN_ID],
+                )],
+                vec![plugin],
+            );
+            let baseline =
+                make_config(vec![make_proxy(DIAGNOSTIC_PROXY_ID, "/", vec![])], vec![]);
+            let changed =
+                HashSet::from([NamespacedResourceId::new("ferrum", DIAGNOSTIC_PROXY_ID)]);
+            for path in ["startup", "rebuild", "delta"] {
+                let cache = PluginCache::new(&baseline).unwrap();
+                let prior = cache.get_plugins("ferrum", DIAGNOSTIC_PROXY_ID);
+                let (result, records) = capture_cache_diagnostics(|| match path {
+                    "startup" => PluginCache::new(&candidate).map(|built| {
+                        assert!(built.get_plugins("ferrum", DIAGNOSTIC_PROXY_ID).is_empty());
+                    }),
+                    "rebuild" => cache.rebuild(&candidate),
+                    "delta" => {
+                        cache.apply_delta(&candidate, &changed, &[], scope == PluginScope::Global)
+                    }
+                    _ => unreachable!(),
+                });
+                if *optional {
+                    result.expect("optional constructor failure must still admit the generation");
+                    assert!(cache.get_plugins("ferrum", DIAGNOSTIC_PROXY_ID).is_empty());
+                } else {
+                    let error = result.expect_err("enabled plugin rejection must remain fatal");
+                    // Returned diagnostics retain safely quoted identity and
+                    // detailed causes for their eventual rendering boundary.
+                    assert!(
+                        error.contains(&format!("{DIAGNOSTIC_PLUGIN_ID:?}")),
+                        "{error}"
+                    );
+                    let rendered =
+                        ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+                    assert_cache_diagnostic_withholds_values(&rendered);
+                    for &reason in reasons {
+                        assert!(rendered.contains(reason), "{path}: {rendered}");
+                    }
+                    assert!(Arc::ptr_eq(
+                        &prior,
+                        &cache.get_plugins("ferrum", DIAGNOSTIC_PROXY_ID)
+                    ));
+                }
+
+                for record in &records {
+                    assert_cache_diagnostic_withholds_values(&record.to_string());
+                }
+                let cache_records: Vec<_> = records
+                    .iter()
+                    .filter(|record| record["target"] == "ferrum_edge::plugin_cache")
+                    .collect();
+                // Rejections emit both at construction and at the outer
+                // startup/reload boundary. Optional omission emits one warning.
+                assert_eq!(
+                    cache_records.len(),
+                    if *optional { 1 } else { 2 },
+                    "{records:?}"
+                );
+                for record in cache_records {
+                    assert_eq!(record["level"], if *optional { "WARN" } else { "ERROR" });
+                    let message = record["fields"]["message"].as_str().unwrap();
+                    assert!(
+                        message.contains("plugin_config_id=<redacted scalar>"),
+                        "{message}"
+                    );
+                    for &reason in reasons {
+                        assert!(message.contains(reason), "{path}: {message}");
+                    }
+                    if *optional {
+                        assert!(
+                            message.contains("Optional plugin omitted after validation failure")
+                        );
+                    }
+                    if message.starts_with("Config reload:") && scope != PluginScope::Global {
+                        assert_eq!(record["fields"]["proxy_id"], "<redacted scalar>");
+                        if scope == PluginScope::ProxyGroup {
+                            assert_eq!(
+                                record["fields"]["plugin_config_id"],
+                                "<redacted scalar>"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cache_composition_diagnostics_keep_ordering_and_reason_but_withhold_priorities() {
+    let mut first = make_plugin_config_with_json(
+        "first",
+        "correlation_id",
+        json!({"header_name": "x-first"}),
+        PluginScope::Proxy,
+        Some(DIAGNOSTIC_PROXY_ID),
+    );
+    first.priority_override = Some(54321);
+    let mut second = first.clone();
+    second.id = "second".to_string();
+    second.config = json!({"header_name": "x-second"});
+    let config = make_config(
+        vec![make_proxy(DIAGNOSTIC_PROXY_ID, "/", vec!["first", "second"])],
+        vec![first, second],
+    );
+    let admission =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("duplicate effective priorities must fail admission");
+    let (startup, records) = capture_cache_diagnostics(|| {
+        PluginCache::new(&config)
+            .err()
+            .expect("duplicate effective priorities must fail startup")
+    });
+    for error in [admission, startup] {
+        assert!(error.contains("priority \"54321\""), "{error}");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert_cache_diagnostic_withholds_values(&rendered);
+        assert!(!rendered.contains("54321"), "{rendered}");
+        assert!(rendered.contains("proxy_id=<redacted scalar>"), "{rendered}");
+        assert!(
+            rendered.contains("duplicate effective priority <redacted scalar>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("priority_override"), "{rendered}");
+        assert!(
+            rendered.contains("canonical ownership is deterministic"),
+            "{rendered}"
+        );
+    }
+    let cache_records: Vec<_> = records
+        .iter()
+        .filter(|record| record["target"] == "ferrum_edge::plugin_cache")
+        .collect();
+    assert_eq!(cache_records.len(), 1, "{records:?}");
+    let message = cache_records[0]["fields"]["message"].as_str().unwrap();
+    assert_cache_diagnostic_withholds_values(message);
+    assert!(!message.contains("54321"), "{message}");
+    assert!(message.contains("priority_override"), "{message}");
+    assert!(
+        message.contains("canonical ownership is deterministic"),
+        "{message}"
+    );
+}
+
+#[test]
+fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
+    let mut triggered = make_plugin_config_with_json(
+        DIAGNOSTIC_PLUGIN_ID,
+        "stdout_logging",
+        json!({}),
+        PluginScope::Global,
+        None,
+    );
+    triggered.trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"path": {"regex": "UNREGISTERED_CACHE5594["}}}
+        }))
+        .unwrap(),
+    );
+    let mut invalid_mode = make_plugin_config_with_json(
+        "second",
+        "ip_restriction",
+        json!({"allow": ["127.0.0.1"], "mode": true}),
+        PluginScope::Global,
+        None,
+    );
+    // A trigger forces concrete construction during candidate admission too;
+    // an ordinary IP restriction is otherwise only a topology placeholder.
+    invalid_mode.trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap(),
+    );
+    let config = make_config(vec![], vec![triggered, invalid_mode]);
+    for error in [
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("candidate admission must preserve both rejections"),
+        PluginCache::new(&config)
+            .err()
+            .expect("startup must preserve both rejections"),
+    ] {
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert_cache_diagnostic_withholds_values(&rendered);
+        let trigger = rendered
+            .find("trigger: `path` regex is invalid or too large")
+            .unwrap();
+        let mode = rendered
+            .find("`mode` must be `allow_first` or `deny_first`")
+            .unwrap();
+        assert!(trigger < mode, "{rendered}");
+    }
+}
+
+#[test]
+fn cache_ownership_and_attachment_diagnostics_preserve_fixed_context() {
+    for (name, reason) in [
+        ("prometheus_metrics", "must have scope `global`"),
+        ("__mesh_bpf_metrics", "must have scope `global`"),
+        ("tcp_connection_throttle", "only TCP/TCP+TLS is supported"),
+    ] {
+        let config = make_config(
+            vec![make_proxy(
+                DIAGNOSTIC_PROXY_ID,
+                "/",
+                vec![DIAGNOSTIC_PLUGIN_ID],
+            )],
+            vec![make_plugin_config_with_json(
+                DIAGNOSTIC_PLUGIN_ID,
+                name,
+                json!({}),
+                PluginScope::Proxy,
+                Some(DIAGNOSTIC_PROXY_ID),
+            )],
+        );
+        let error = PluginCache::new(&config)
+            .err()
+            .expect("invalid ownership/attachment must fail before construction");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert_cache_diagnostic_withholds_values(&rendered);
+        assert!(rendered.contains(name), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+    }
+}
+
+#[test]
+fn cache_policy_warnings_withhold_structured_proxy_and_namespace_fields() {
+    let namespace = "'UNREGISTERED_CACHE5594_NAMESPACE\"\\\n";
+    let mut proxy = make_proxy(DIAGNOSTIC_PROXY_ID, "/", vec!["cors", "auth"]);
+    proxy.namespace = namespace.to_string();
+    let mut cors = make_plugin_config_with_json(
+        "cors",
+        "cors",
+        json!({"allowed_origins": ["https://example.com"]}),
+        PluginScope::Proxy,
+        Some(DIAGNOSTIC_PROXY_ID),
+    );
+    cors.namespace = namespace.to_string();
+    let mut auth = make_plugin_config_with_json(
+        "auth",
+        "key_auth",
+        minimal_plugin_config("key_auth"),
+        PluginScope::Proxy,
+        Some(DIAGNOSTIC_PROXY_ID),
+    );
+    auth.namespace = namespace.to_string();
+    auth.trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap(),
+    );
+    let config = make_config(vec![proxy], vec![cors, auth]);
+    let (cache, records) = capture_cache_diagnostics(|| PluginCache::new(&config).unwrap());
+    assert_eq!(cache.get_plugins(namespace, DIAGNOSTIC_PROXY_ID).len(), 2);
+    let cors_warning = records
+        .iter()
+        .find(|record| {
+            record["fields"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("strict CORS allowed_origins policy"))
+        })
+        .expect("strict CORS still warns about missing WebSocket policy");
+    assert_eq!(cors_warning["level"], "WARN");
+    assert_eq!(cors_warning["fields"]["proxy"], "<redacted scalar>");
+    assert_eq!(cors_warning["fields"]["namespace"], "<redacted scalar>");
+    let auth_warning = records
+        .iter()
+        .find(|record| {
+            record["fields"]["message"].as_str().is_some_and(|message| {
+                message.contains("Every authentication instance is trigger-gated")
+            })
+        })
+        .expect("conditional authentication still warns about unmatched requests");
+    assert_eq!(auth_warning["level"], "WARN");
+    assert_eq!(auth_warning["fields"]["proxy_id"], "<redacted scalar>");
+    assert!(auth_warning["fields"]["protocol"].is_string());
+    for record in records {
+        assert_cache_diagnostic_withholds_values(&record.to_string());
+    }
+}
+
 #[test]
 fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
     // The soap constructor rejects a blank stable identity because collapsing
@@ -1372,7 +1771,7 @@ fn test_prometheus_metrics_requires_global_and_unique_registry_owner() {
     let scoped_error = PluginCache::new(&scoped)
         .err()
         .expect("plugin cache must reject a scoped registry owner");
-    assert!(scoped_error.contains("must have scope 'global'"));
+    assert!(scoped_error.contains("must have scope `global`"));
 
     let duplicate = make_config(
         vec![make_proxy("p1", "/api", vec![])],
@@ -2799,7 +3198,7 @@ fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
         .expect_err("malformed body_validator must reject reload");
     assert!(err.contains("body_validator"), "{err}");
     assert!(err.contains("pc2"), "{err}");
-    assert!(err.contains("proxy_id=p1"), "{err}");
+    assert!(err.contains("proxy_id=\"p1\""), "{err}");
 
     let post_failure = cache.get_plugins("ferrum", "p1");
     assert_eq!(post_failure.len(), 1);
@@ -5984,7 +6383,7 @@ fn test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cach
         .expect_err("malformed request_size_limiting must reject delta reload");
     assert!(err.contains("request_size_limiting"), "{err}");
     assert!(err.contains("pc2"), "{err}");
-    assert!(err.contains("proxy_id=p1"), "{err}");
+    assert!(err.contains("proxy_id=\"p1\""), "{err}");
 
     let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
@@ -6024,7 +6423,7 @@ fn test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache() {
         .expect_err("unknown enabled plugin must reject delta reload");
     assert!(err.contains("unknown_enforcer"), "{err}");
     assert!(err.contains("pc2"), "{err}");
-    assert!(err.contains("proxy_id=p1"), "{err}");
+    assert!(err.contains("proxy_id=\"p1\""), "{err}");
 
     let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
@@ -10702,7 +11101,7 @@ fn test_duplicate_effective_correlation_headers_are_rejected() {
         .err()
         .expect("duplicate normalized correlation headers must fail closed");
     assert!(error.contains("duplicate effective header_name \"x-request-id\""));
-    assert!(error.contains("proxy_id=p1"));
+    assert!(error.contains("proxy_id=\"p1\""));
 }
 
 #[test]
@@ -10782,9 +11181,9 @@ fn test_equal_effective_correlation_priorities_are_rejected() {
     let error = PluginCache::new(&config)
         .err()
         .expect("equal correlation priorities must fail closed");
-    assert!(error.contains("duplicate effective priority 50"));
+    assert!(error.contains("duplicate effective priority \"50\""));
     assert!(error.contains("priority_override"));
-    assert!(error.contains("proxy_id=p1"));
+    assert!(error.contains("proxy_id=\"p1\""));
 }
 
 #[test]
@@ -10853,7 +11252,7 @@ fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
         .err()
         .expect("mixed-whitespace/case correlation claims must fail closed");
     assert!(error.contains("duplicate effective header_name \"x-custom-correlation-id\""));
-    assert!(error.contains("proxy_id=p1"));
+    assert!(error.contains("proxy_id=\"p1\""));
 }
 
 #[test]
@@ -10998,7 +11397,7 @@ fn test_shipped_custom_correlation_plugin_cannot_claim_reserved_header() {
     );
     assert!(error.contains("plugin \"example_plugin\""), "got: {error}");
     assert!(error.contains("protocol Http"), "got: {error}");
-    assert!(error.contains("proxy_id=p1"), "got: {error}");
+    assert!(error.contains("proxy_id=\"p1\""), "got: {error}");
     assert!(error.contains("reserved"), "got: {error}");
 }
 
@@ -13222,12 +13621,12 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
         (
             "prometheus owner",
             vec![scoped("a", "prometheus_metrics")],
-            "must have scope 'global'",
+            "must have scope `global`",
         ),
         (
             "BPF owner",
             vec![scoped("a", "__mesh_bpf_metrics")],
-            "must have scope 'global'",
+            "must have scope `global`",
         ),
     ];
     for (case, configs, diagnostic) in cases {

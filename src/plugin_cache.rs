@@ -360,8 +360,8 @@ fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) 
         return;
     }
     warn!(
-        proxy = %proxy.id,
-        namespace = %proxy.namespace,
+        proxy = %crate::startup::sanitize_startup_scalar(&proxy.id),
+        namespace = %crate::startup::sanitize_startup_scalar(&proxy.namespace),
         "Proxy has a strict CORS allowed_origins policy but allowed_ws_origins is empty; \
          the cors plugin does not run on WebSocket upgrades — configure allowed_ws_origins on \
          this proxy to enforce the same origin policy against Cross-Site WebSocket Hijacking \
@@ -520,7 +520,7 @@ pub(crate) fn validate_plugin_security_composition(
             && !plugin.requires_request_body_before_before_proxy()
     }) {
         return Err(format!(
-            "plugin '{}' declares validates_client_request_body_contract() but not \
+            "plugin {:?} declares validates_client_request_body_contract() but not \
              requires_request_body_before_before_proxy(); the client-request-contract phase \
              runs only over the pre-before_proxy buffer, so the declared contract would never \
              be enforced",
@@ -548,7 +548,7 @@ pub(crate) fn validate_plugin_security_composition(
             if auth_plugins.len() != 1 {
                 return Err(format!(
                     "identity-establishing soap_ws_security must be the sole authentication \
-                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {}",
+                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {:?}",
                     auth_plugins.join(", ")
                 ));
             }
@@ -565,7 +565,7 @@ pub(crate) fn validate_plugin_security_composition(
                 .find(|plugin| plugin.modifies_request_body())
         {
             return Err(format!(
-                "hmac_auth cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
+                "hmac_auth cannot be combined with request-body transformer {:?} for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
                 transformer.name(),
                 protocol
             ));
@@ -590,7 +590,7 @@ pub(crate) fn validate_plugin_security_composition(
                 .find(|plugin| plugin.modifies_request_body())
             {
                 return Err(format!(
-                    "request-body egress plugin '{}' cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the external decision runs before body transformation and Ferrum will not let it govern bytes different from those sent to the backend",
+                    "request-body egress plugin {:?} cannot be combined with request-body transformer {:?} for protocol {:?} on the same proxy; the external decision runs before body transformation and Ferrum will not let it govern bytes different from those sent to the backend",
                     egress_plugin.name(),
                     transformer.name(),
                     protocol
@@ -608,7 +608,7 @@ pub(crate) fn validate_plugin_security_composition(
                     .find(|plugin| plugin.enforces_finalized_request_policy())
             {
                 return Err(format!(
-                    "request-body egress plugin '{}' cannot be combined with final request-body policy plugin '{}' for protocol {:?} on the same proxy; '{}' only decides after the external request has already been sent, so its rejection could not retract the disclosure or side effect",
+                    "request-body egress plugin {:?} cannot be combined with final request-body policy plugin {:?} for protocol {:?} on the same proxy; {:?} only decides after the external request has already been sent, so its rejection could not retract the disclosure or side effect",
                     egress_plugin.name(),
                     validator.name(),
                     protocol,
@@ -627,7 +627,7 @@ pub(crate) fn validate_plugin_security_composition(
                 && plugin.dispatches_finalized_request_egress()
         }) {
             return Err(format!(
-                "plugin '{}' declares both egresses_request_body_before_finalization() and dispatches_finalized_request_egress() for protocol {:?}; exactly one request-egress phase must govern the representation it transmits",
+                "plugin {:?} declares both egresses_request_body_before_finalization() and dispatches_finalized_request_egress() for protocol {:?}; exactly one request-egress phase must govern the representation it transmits",
                 contradictory.name(),
                 protocol
             ));
@@ -645,7 +645,7 @@ pub(crate) fn validate_plugin_security_composition(
             }) {
                 return Err(format!(
                     "request_deduplication cannot be combined with deferred request-body \
-                     transformer '{}' for protocol {:?} on the same proxy; deduplication \
+                     transformer {:?} for protocol {:?} on the same proxy; deduplication \
                      fingerprints during before_proxy, before request-body transforms run, \
                      so a retained operation cannot witness the backend-visible body policy",
                     transformer.name(),
@@ -662,9 +662,9 @@ pub(crate) fn validate_plugin_security_composition(
                         || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
-                    "request mutation plugin '{}' at effective priority {} must run before \
+                    "request mutation plugin {:?} at effective priority \"{}\" must run before \
                      every request_deduplication instance for protocol {:?}; \
-                     request_deduplication priority {} would fingerprint headers/query/destination \
+                     request_deduplication priority \"{}\" would fingerprint headers/query/destination \
                      before their backend-visible mutation",
                     later_mutator.name(),
                     later_mutator.priority(),
@@ -685,8 +685,8 @@ pub(crate) fn validate_plugin_security_composition(
                     && plugin.enforces_final_backend_header_policy()
             }) {
                 return Err(format!(
-                    "plugin '{}' re-asserts a backend-boundary header policy after every \
-                     before_proxy hook for protocol {:?}; request_deduplication at priority {} \
+                    "plugin {:?} re-asserts a backend-boundary header policy after every \
+                     before_proxy hook for protocol {:?}; request_deduplication at priority \"{}\" \
                      fingerprints headers during before_proxy and cannot witness that final \
                      mutation",
                     final_header_policy.name(),
@@ -712,7 +712,7 @@ pub(crate) fn validate_plugin_security_composition(
             }) {
                 return Err(format!(
                     "response_caching cannot be combined with deferred request-body \
-                     transformer '{}' for protocol {:?} on the same proxy; cache lookup runs \
+                     transformer {:?} for protocol {:?} on the same proxy; cache lookup runs \
                      during before_proxy and only admits a transport-proven empty body, so a \
                      later transform could synthesize backend-visible bytes after lookup",
                     transformer.name(),
@@ -735,9 +735,9 @@ pub(crate) fn validate_plugin_security_composition(
                         || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
-                    "request mutation plugin '{}' at effective priority {} must run before \
+                    "request mutation plugin {:?} at effective priority \"{}\" must run before \
                      every response_caching instance for protocol {:?}; response_caching \
-                     priority {} would select a retained response before the final \
+                     priority \"{}\" would select a retained response before the final \
                      backend-visible headers/query/destination exist",
                     later_mutator.name(),
                     later_mutator.priority(),
@@ -765,7 +765,7 @@ pub(crate) fn validate_plugin_security_composition(
                     && plugin.priority() >= side_effecting_plugin.priority()
             }) {
                 return Err(format!(
-                    "{} at effective priority {} must run after every request_deduplication instance for protocol {:?}; request_deduplication priority {} would let a terminal external side effect execute before retry ownership is acquired",
+                    "{:?} at effective priority \"{}\" must run after every request_deduplication instance for protocol {:?}; request_deduplication priority \"{}\" would let a terminal external side effect execute before retry ownership is acquired",
                     side_effecting_plugin.name(),
                     side_effecting_plugin.priority(),
                     protocol,
@@ -784,9 +784,9 @@ pub(crate) fn validate_plugin_security_composition(
                     && plugin.priority() <= audit.priority()
             }) {
                 return Err(format!(
-                    "ai_transcript_audit at effective priority {} must run before every \
+                    "ai_transcript_audit at effective priority \"{}\" must run before every \
                      request_deduplication instance for protocol {:?}; request_deduplication \
-                     priority {} could return a cached response before audit staging",
+                     priority \"{}\" could return a cached response before audit staging",
                     audit.priority(),
                     protocol,
                     deduplication.priority(),
@@ -895,7 +895,7 @@ fn trigger_composition_error(
     }
     if gate.reads_authenticated_identity() && is_stream_only_plugin(plugin) {
         return Some(
-            "a stream-only plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`: a stream connection's only gated phase is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
+            "a stream-only plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`: the only gated phase of a stream connection is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
         );
     }
     None
@@ -1017,7 +1017,7 @@ pub(crate) fn validate_correlation_id_composition(
             let priority = plugin.priority();
             if !priorities.insert(priority) {
                 return Err(format!(
-                    "correlation_id: duplicate effective priority {priority} for protocol {protocol:?} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
+                    "correlation_id: duplicate effective priority \"{priority}\" for protocol {protocol:?} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
                 ));
             }
         }
@@ -2218,7 +2218,7 @@ fn exclusive_effective_instance_errors(merged: &[Arc<dyn Plugin>], proxy_id: &st
                 .count();
             (count > 1).then(|| {
                 format!(
-                    "proxy_id={proxy_id}: {plugin_name} permits at most one effective instance \
+                    "proxy_id={proxy_id:?}: {plugin_name} permits at most one effective instance \
                      per proxy ({reason}); found {count}"
                 )
             })
@@ -2241,19 +2241,19 @@ fn validate_tcp_connection_throttle_attachment(
             proxy.effective_scheme(),
             BackendScheme::Tcp | BackendScheme::Tcps
         ) {
-            unsupported.push(format!("{} ({})", proxy.id, proxy.effective_scheme()));
+            unsupported.push(format!("{:?} ({})", proxy.id, proxy.effective_scheme()));
         }
     }
 
     match pc.scope {
         PluginScope::Global if attached_count > 0 && unsupported.len() == attached_count => {
             Err(format!(
-                "tcp_connection_throttle: global plugin config '{}' has no TCP/TCP+TLS proxy to protect; UDP/DTLS and HTTP-family proxies are unsupported",
+                "tcp_connection_throttle: global plugin config {:?} has no TCP/TCP+TLS proxy to protect; UDP/DTLS and HTTP-family proxies are unsupported",
                 pc.id
             ))
         }
         PluginScope::Proxy | PluginScope::ProxyGroup if !unsupported.is_empty() => Err(format!(
-            "tcp_connection_throttle: plugin config '{}' is attached to unsupported UDP/DTLS or HTTP-family proxy/proxies {}; only TCP/TCP+TLS is supported (use udp_rate_limiting for datagram/session admission)",
+            "tcp_connection_throttle: plugin config {:?} is attached to unsupported UDP/DTLS or HTTP-family proxy/proxies {}; only TCP/TCP+TLS is supported (use udp_rate_limiting for datagram/session admission)",
             pc.id,
             unsupported.join(", ")
         )),
@@ -2533,6 +2533,9 @@ fn try_create_plugin(
 /// through a non-production constructor (candidate composition admission uses a
 /// worker-free `oidc_relying_party`) still gets the identical trigger,
 /// priority, and failure-policy handling instead of a second, drifting copy.
+/// Cache identities are Debug-quoted and log copies are sanitized before
+/// emission. Constructors remain responsible for safe value interpolation in
+/// their own causes; keep their field/reason text in the returned diagnostic.
 fn finalize_created_plugin(
     pc: &PluginConfig,
     created: Result<Option<Arc<dyn Plugin>>, String>,
@@ -2543,26 +2546,32 @@ fn finalize_created_plugin(
                 Some(trigger) => {
                     let gate = PluginTriggerGate::compile(trigger, &pc.id).map_err(|error| {
                         let msg = format!(
-                            "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) execution trigger is invalid: {}",
+                            "Plugin {:?} (plugin_config_id={:?}, scope={:?}, proxy_id={:?}) execution trigger is invalid: {}",
                             pc.plugin_name,
                             pc.id,
                             pc.scope,
                             pc.proxy_id.as_deref().unwrap_or("<none>"),
                             error
                         );
-                        error!("Config rejected: {}", msg);
+                        error!(
+                            "Config rejected: {}",
+                            crate::startup::sanitize_startup_cause(&msg, &[])
+                        );
                         msg
                     })?;
                     if let Some(reason) = trigger_composition_error(plugin.as_ref(), &gate) {
                         let msg = format!(
-                            "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) cannot carry an execution trigger: {}",
+                            "Plugin {:?} (plugin_config_id={:?}, scope={:?}, proxy_id={:?}) cannot carry an execution trigger: {}",
                             pc.plugin_name,
                             pc.id,
                             pc.scope,
                             pc.proxy_id.as_deref().unwrap_or("<none>"),
                             reason
                         );
-                        error!("Config rejected: {}", msg);
+                        error!(
+                            "Config rejected: {}",
+                            crate::startup::sanitize_startup_cause(&msg, &[])
+                        );
                         return Err(msg);
                     }
                     Some(gate)
@@ -2584,20 +2593,23 @@ fn finalize_created_plugin(
         Ok(None) => {
             if crate::plugins::removed_plugin_registration(&pc.plugin_name).is_some() {
                 let msg = format!(
-                    "Removed security plugin '{}' (plugin_config_id={}) is not supported; migrate to a supported auth plugin before startup/reload",
+                    "Removed security plugin {:?} (plugin_config_id={:?}) is not supported; migrate to a supported auth plugin before startup/reload",
                     pc.plugin_name, pc.id
                 );
-                error!("FATAL: {}", msg);
+                error!("FATAL: {}", crate::startup::sanitize_startup_cause(&msg, &[]));
                 Err(msg)
             } else {
                 let msg = format!(
-                    "Unknown enabled plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={})",
+                    "Unknown enabled plugin {:?} (plugin_config_id={:?}, scope={:?}, proxy_id={:?})",
                     pc.plugin_name,
                     pc.id,
                     pc.scope,
                     pc.proxy_id.as_deref().unwrap_or("<none>")
                 );
-                error!("Config rejected: {}", msg);
+                error!(
+                    "Config rejected: {}",
+                    crate::startup::sanitize_startup_cause(&msg, &[])
+                );
                 Err(msg)
             }
         }
@@ -2605,7 +2617,7 @@ fn finalize_created_plugin(
             let failure_policy = crate::plugins::plugin_failure_policy(&pc.plugin_name)
                 .unwrap_or(PluginFailurePolicy::FailClosed);
             let msg = format!(
-                "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) config validation failed: {}",
+                "Plugin {:?} (plugin_config_id={:?}, scope={:?}, proxy_id={:?}) config validation failed: {}",
                 pc.plugin_name,
                 pc.id,
                 pc.scope,
@@ -2613,10 +2625,16 @@ fn finalize_created_plugin(
                 e
             );
             if failure_policy == PluginFailurePolicy::OptionalFailOpen {
-                warn!("Optional plugin omitted after validation failure: {}", msg);
+                warn!(
+                    "Optional plugin omitted after validation failure: {}",
+                    crate::startup::sanitize_startup_cause(&msg, &[])
+                );
                 Ok(None)
             } else {
-                error!("Config rejected: {}", msg);
+                error!(
+                    "Config rejected: {}",
+                    crate::startup::sanitize_startup_cause(&msg, &[])
+                );
                 Err(msg)
             }
         }
@@ -4135,7 +4153,7 @@ fn create_adaptive_concurrency_plugin(
     if let Some(existing) = staged.get(&identity) {
         if !adaptive_definition_matches(existing, pc, &route_definition) {
             return Err(format!(
-                "adaptive_concurrency: plugin config identity '{}:{}' resolves to conflicting policy definitions",
+                "adaptive_concurrency: plugin config identity (namespace={:?}, plugin_config_id={:?}) resolves to conflicting policy definitions",
                 pc.namespace, pc.id
             ));
         }
@@ -4152,7 +4170,7 @@ fn create_adaptive_concurrency_plugin(
     {
         let generation = existing.generation.checked_add(1).ok_or_else(|| {
             format!(
-                "adaptive_concurrency: plugin config '{}:{}' exhausted its reload generation counter",
+                "adaptive_concurrency: plugin config (namespace={:?}, plugin_config_id={:?}) exhausted its reload generation counter",
                 pc.namespace, pc.id
             )
         })?;
@@ -4320,7 +4338,7 @@ fn prepare_plugin_chain(
 ) -> Vec<String> {
     let context = proxy.map_or_else(
         || "global plugins".to_string(),
-        |proxy| format!("proxy_id={}", proxy.id),
+        |proxy| format!("proxy_id={:?}", proxy.id),
     );
     let mut errors = Vec::new();
     plugins.sort_by_key(|plugin| plugin.priority());
@@ -5165,7 +5183,7 @@ fn build_protocol_snapshot(
                     .all(|plugin| plugin.has_execution_trigger())
             {
                 warn!(
-                    proxy_id = %proxy_id,
+                    proxy_id = %crate::startup::sanitize_startup_scalar(proxy_id),
                     protocol = ?proto,
                     "Every authentication instance is trigger-gated; requests matching no \
                      authentication trigger are unauthenticated"
@@ -5312,7 +5330,7 @@ fn start_background_tasks(
         if started.insert(pointer) {
             plugin.start_background_tasks().map_err(|error| {
                 format!(
-                    "plugin '{}' background startup failed: {error}",
+                    "plugin {:?} background startup failed: {error}",
                     plugin.name()
                 )
             })?;
@@ -6356,13 +6374,13 @@ fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), S
     };
     if first.scope != PluginScope::Global {
         return Err(format!(
-            "PluginConfig '{}' (prometheus_metrics) must have scope 'global'",
+            "PluginConfig {:?} (prometheus_metrics) must have scope `global`",
             first.id
         ));
     }
     if let Some(second) = enabled.next() {
         return Err(format!(
-            "prometheus_metrics permits at most one enabled global instance; found '{}' and '{}'",
+            "prometheus_metrics permits at most one enabled global instance; found {:?} and {:?}",
             first.id, second.id
         ));
     }
@@ -6407,14 +6425,14 @@ fn validate_mesh_bpf_metrics_ownership(config: &GatewayConfig) -> Result<(), Str
     };
     if first.scope != PluginScope::Global {
         return Err(format!(
-            "PluginConfig '{}' ({}) must have scope 'global'",
+            "PluginConfig {:?} ({}) must have scope `global`",
             first.id,
             crate::plugins::mesh::bpf_metrics::PLUGIN_NAME
         ));
     }
     if let Some(second) = enabled.next() {
         return Err(format!(
-            "{} permits at most one enabled global instance; found '{}' and '{}'",
+            "{} permits at most one enabled global instance; found {:?} and {:?}",
             crate::plugins::mesh::bpf_metrics::PLUGIN_NAME,
             first.id,
             second.id
@@ -7064,7 +7082,10 @@ impl PluginCache {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        error!("Config reload: {}", error);
+                        error!(
+                            "Config reload: {}",
+                            crate::startup::sanitize_startup_cause(&error, &[])
+                        );
                         plugin_errors.push(error);
                     }
                 }
@@ -7142,7 +7163,10 @@ impl PluginCache {
                     Ok(Some(_)) => {}
                     Ok(None) => {}
                     Err(e) => {
-                        error!("Config reload: {}", e);
+                        error!(
+                            "Config reload: {}",
+                            crate::startup::sanitize_startup_cause(&e, &[])
+                        );
                         plugin_errors.push(e);
                     }
                 }
@@ -7171,7 +7195,10 @@ impl PluginCache {
                         Ok(Some(plugin)) => global_plugins.push(plugin),
                         Ok(None) => {}
                         Err(e) => {
-                            error!("Config reload: {}", e);
+                            error!(
+                                "Config reload: {}",
+                                crate::startup::sanitize_startup_cause(&e, &[])
+                            );
                             plugin_errors.push(e);
                         }
                     }
@@ -7215,7 +7242,10 @@ impl PluginCache {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
                     Err(e) => {
-                        error!("Config reload: {}", e);
+                        error!(
+                            "Config reload: {}",
+                            crate::startup::sanitize_startup_cause(&e, &[])
+                        );
                         plugin_errors.push(e);
                     }
                 }
@@ -7393,8 +7423,12 @@ impl PluginCache {
                                 }
                             }
                             Err(e) => {
-                                error!(proxy_id = %proxy.id, "Config reload: {}", e);
-                                plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e));
+                                error!(
+                                    proxy_id = %crate::startup::sanitize_startup_scalar(&proxy.id),
+                                    "Config reload: {}",
+                                    crate::startup::sanitize_startup_cause(&e, &[])
+                                );
+                                plugin_errors.push(format!("proxy_id={:?}: {}", proxy.id, e));
                             }
                         }
                     }
@@ -7450,12 +7484,12 @@ impl PluginCache {
                             }
                             Err(e) => {
                                 error!(
-                                    proxy_id = %proxy.id,
-                                    plugin_config_id = %pc.id,
+                                    proxy_id = %crate::startup::sanitize_startup_scalar(&proxy.id),
+                                    plugin_config_id = %crate::startup::sanitize_startup_scalar(&pc.id),
                                     "Config reload: {}",
-                                    e
+                                    crate::startup::sanitize_startup_cause(&e, &[])
                                 );
-                                plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e));
+                                plugin_errors.push(format!("proxy_id={:?}: {}", proxy.id, e));
                             }
                         }
                     }
@@ -8181,7 +8215,7 @@ impl PluginCache {
                                     );
                                 }
                             }
-                            Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
+                            Err(e) => plugin_errors.push(format!("proxy_id={:?}: {}", proxy.id, e)),
                         }
                     }
                 }
@@ -8237,7 +8271,7 @@ impl PluginCache {
                                     &pc.plugin_name,
                                 );
                             }
-                            Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
+                            Err(e) => plugin_errors.push(format!("proxy_id={:?}: {}", proxy.id, e)),
                         }
                     }
                 }
@@ -8289,7 +8323,7 @@ impl PluginCache {
                 plugin_errors.push(error);
             }
             for err in &plugin_errors {
-                error!("{}", err);
+                error!("{}", crate::startup::sanitize_startup_cause(err, &[]));
             }
             return Err(format!(
                 "Gateway startup aborted: {} plugin config(s) failed validation: {}",
