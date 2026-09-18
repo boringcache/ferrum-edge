@@ -341,8 +341,228 @@ Both requested runs and the candidate are now analyzed. The report and JSON
 retain the findings; #5588 remains open for the correctness fixes, measurement
 repairs, transport verification, and production optimization experiments.
 
-**Hot-path findings and ranked experiments.** These are source-supported
-mechanisms and testable hypotheses, not claims from a CPU profile.
+### Section 4 — same-image HTTP/1.1 framing experiment
+
+The first section-4 A/B is
+[hosted run 35345033478](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35345033478),
+revision `86724a319273e08277b82a83fc35d4bc22182561`, based on
+`d44ca81545e9f96bd76c46db543d307a0422bf60`. The branch-committed
+[`experiment.json`](../tests/performance/multi_protocol/experiment.json) selected
+`ferrum` with `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` and
+`ferrum-exp-cutoff-one` with `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1`. Both use
+one image, one configuration, and identical useful-work validation. Direct is
+repeated. The frozen benchmark matrix job is unchanged.
+
+The runner was a 4-vCPU AMD EPYC 7763 VM under the Microsoft hypervisor,
+with 15 GiB RAM, 3 GiB swap and 0.0% steal in the startup check. Host boot ID:
+`1d9861a4-9ea3-4816-8319-a3bb5c028236`. Both Ferrum arms used image ID
+`sha256:32d582ff627463224a83d55ab1850a17fb49141bf1d07ef0d4e14a5cc8c23b9b`
+and `configs/http1_tls_e2e_perf.yaml` (no plugins, backend TLS on port 3447).
+The image's revision label was absent; provenance is the workflow checkout
+and recorded image ID, not an asserted OCI revision label.
+
+Predeclared scope: HTTP/1.1 TLS on both legs, 30 seconds per sample, one
+iteration, two counterbalanced pairs, all five payloads (10240/71680/512000/
+1048576/5242880), offered workers 200/200/200/100/50. There are 30 expected
+samples. Orders are direct/0/1 and 1/0/direct; all arms have mean position 2.
+Adaptive extension is off. The conservative benchmark-step projection is
+27.5 minutes; hosted build time is additional. This is an exploratory two-pair
+experiment, not a confirmatory claim or a comparison against an older VM.
+The actual benchmark step took 24m08s, image build 31m05s, and the entire
+workflow finished in 56m32s. There was no second benchmark run or error retry.
+
+The command used below ran the branch at the measured SHA above (the runner's
+fixed default supplies `--pairs 2`). The final branch disables the manifest
+after recording the result. To repeat, commit `enabled: true` on the intended
+experiment branch before dispatching; record its new image and revision.
+
+```bash
+gh workflow run gateways-protocol-benchmark.yml \
+  --ref worker/20260918-edge-5588-h1-framing-ab \
+  -f duration=30 -f concurrency=200 -f iterations=1 \
+  -f skip_protocols='http2 http3 grpcs wss tcp-tls udp udp-dtls' \
+  -f skip_gateways='envoy kong tyk krakend' -f skip_payload_sizes=''
+```
+
+The passive `/proc` series now includes read/write accounting bytes and syscall
+counters with the same CPU/RSS boundary brackets. The privileged reader observes
+container PIDs without launching the client. H1 client observations add received
+TLS wire records/bytes, Hyper data frames/bytes, and chunked/Content-Length
+response counts. TLS framing is parsed below rustls without buffering payloads,
+changing flushes or decrypting records. Each worker has separate counters.
+See the [measurement definitions](../tests/performance/multi_protocol/README.md#same-image-environment-experiments-5588-section-4)
+for boundary attribution and observer cost. Linux `syscr`/`syscw` are not all
+socket calls; storage `read_bytes`/`write_bytes` are not network traffic. Client
+Hyper frames are not the gateway's upstream frame count.
+
+**Hosted results and retained evidence.** The
+[combined artifact](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35345033478/artifacts/10549857170)
+has SHA-256 `5ffe9dd128b69ae004d2bc2be91cab5cbec3a700c699c5ceff98074754928ead`.
+All 30 raw observations, including failures, and all 15 hosted paired comparison
+objects are retained in
+[`5588-h1-cutoff-35345033478.json`](../tests/performance/multi_protocol/evidence/5588-h1-cutoff-35345033478.json).
+The artifact expires October 18; its full passive time series remain useful
+for follow-up. The download action extracted this single protocol directly into
+`run_1/`. Consequently the old aggregate glob missed it: top-level
+`observed-samples.json` and `paired-comparisons.json` are empty. The intervals
+below are the **existing hosted output** in `run_1/paired_comparisons.json`,
+which the combined artifact retained intact. This PR repairs the non-frozen
+aggregate's single-artifact layout handling and includes named experiment arms
+in all combined tables and rankings. It does not reinterpret missing output as
+a clean run.
+
+All 30 samples have positive completed work, exact echo byte totals, complete
+process measurement brackets, and observed workers/connections fixed at the
+offered 200/200/200/100/50. Every warmup/barrier completed; no worker retired
+before the measurement deadline. **27/30 are valid**: three 5 MiB Ferrum samples
+hit the shared drain deadline and reported one error each. Therefore both
+5 MiB Ferrum groups and their paired comparison are invalid. Passing workflow
+status does not override these sample failures.
+
+| Payload | Cutoff 0 useful RPS | Cutoff 1 useful RPS | Cutoff 1 / 0, paired 95% interval |
+|---------|--------------------|--------------------|---------------------------------|
+| 10 KiB | 10,351.2 | 10,555.3 | 1.0202 (0.6573–1.5835) |
+| 70 KiB | 3,139.1 | 3,102.8 | 0.9884 (0.9350–1.0448) |
+| 500 KiB | 546.9 | 534.9 | 0.9780 (0.9461–1.0110) |
+| 1 MiB | 290.5 | 283.5 | 0.9756 (0.9042–1.0527) |
+| 5 MiB | Invalid group | Invalid group | No interval: invalid pair |
+
+RPS is the equal-duration mean; ratios/intervals use matched log ratios with
+Student-t, two pairs and one degree of freedom. All four accepted intervals
+include 1. This rejects promoting cutoff `1` on the evidence available; it
+does **not** prove equivalence or establish a slowdown. The particularly wide
+10 KiB interval needs more predeclared pairs if revisited.
+
+Per-sample latency ranges across the two pairs, in milliseconds (ranges of
+quantiles, not pooled quantiles):
+
+| Payload | Cutoff 0 p50 / p99 | Cutoff 1 p50 / p99 |
+|---------|-------------------|-------------------|
+| 10 KiB | 18.271–19.199 / 36.191–41.599 | 18.383–18.511 / 36.703–37.087 |
+| 70 KiB | 61.439–61.727 / 126.783–128.063 | 62.111–62.527 / 129.151–133.247 |
+| 500 KiB | 359.935–361.727 / 617.983–694.783 | 365.567–371.711 / 635.391–669.183 |
+| 1 MiB | 343.807–345.343 / 542.719–552.447 | 352.255–353.279 / 536.575–572.415 |
+
+The 5 MiB failures were cutoff 0/pair 1 and cutoff 1/pairs 1 and 2. Their
+warmups lasted 66.856–66.917s and drains 30.002–30.004s; stderr records cancelled
+tasks 8, 67 and 44 respectively. Cutoff 0/pair 2 finished cleanly (0.567s warmup,
+0.467s drain), but it cannot rescue the group. At 1 MiB, cutoff 0/pair 1 and
+both cutoff 1 samples also had 9.867–10.076s drains despite zero errors.
+All gateway logs were empty, and backend logs contained only startup banners.
+These observations do not locate the stall. Follow-up needs hosted connection
+progress/timeout traces through warmup and drain, with the same offered work;
+do not widen deadlines, lower one arm's concurrency or retry samples to obtain
+a performance number.
+
+Approximate measured cost/cadence below uses summed counters divided by summed
+completed requests; RSS is the maximum sampled gateway RSS. Each cell is
+**cutoff 0 / cutoff 1**. The 5 MiB row is retained diagnostic data from invalid
+groups and must not be used to claim a performance or memory improvement.
+
+| Payload | Gateway CPU ms/request | Gateway RSS MiB | Client TLS records/request | Client data frames/request | Gateway syscw/request |
+|---------|------------------------|-----------------|----------------------------|----------------------------|-----------------------|
+| 10 KiB | 0.210 / 0.211 | 138.6 / 137.7 | 1.00 / 1.00 | 1.00 / 1.00 | 2.01 / 2.01 |
+| 70 KiB | 0.624 / 0.633 | 167.2 / 168.3 | 9.00 / 9.00 | 9.00 / 9.00 | 10.05 / 10.05 |
+| 500 KiB | 3.504 / 3.597 | 158.8 / 164.9 | 63.16 / 63.13 | 63.16 / 63.13 | 65.60 / 65.64 |
+| 1 MiB | 6.407 / 6.607 | 152.5 / 149.1 | 129.25 / 129.26 | 129.25 / 129.26 | 133.02 / 133.10 |
+| 5 MiB (invalid) | 28.130 / 29.026 | 145.8 / 117.6 | 642.47 / 642.13 | 642.49 / 642.13 | 653.83 / 655.83 |
+
+Both arms retain chunked responses with zero observed Content-Length responses;
+all TLS parsers report zero errors. Mean received wire-record sizes remain
+about 8.0–8.2 kB at 70 KiB and above in both arms. Direct has approximately
+1/5/32/65/321 records per response across the five sizes and Content-Length
+framing; this is a framing observation, not causal attribution to a particular
+gateway adapter. The cutoff change produces no material change in observed
+record/frame/write cadence. No individual-call timing or all-socket syscall
+trace was captured.
+
+All gateway I/O counters were readable. `read_bytes` and `write_bytes` were zero;
+gateway `rchar` was only about 41.5–43.7 kB with 247–262 `syscr` calls per sample,
+illustrating why these Linux accounting fields cannot represent socket receives.
+The JSON retains every `wchar`, `syscw`, other I/O delta, client/backend/gateway
+CPU/RSS record, observed queue/stream gauge and phase duration. Gateway CPU/I/O
+brackets include about 0.59–0.62s slack around 30s (0.106s for clean 5 MiB/pair 2),
+plus in-flight boundary work; normalized values are diagnostics rather than
+precise per-response costs. No paired confidence interval for CPU or memory is
+claimed. Client profiling adds overhead equally across arms, so these RPS values
+should not be compared directly to older unprofiled runs.
+The final harness marks future rolling data as
+`2026-09-18.phased-h1-profile.v2` to start a fresh history window; this same-host
+A/B remains pinned to its recorded experiment SHA.
+
+**Pinned source comparison (read only).**
+[Tyk v5.3.0](https://github.com/TykTechnologies/tyk/blob/v5.3.0/gateway/reverse_proxy.go#L332)
+initializes a `sync.Pool` of 32 KiB buffers; `copyBuffer` acquires one, repeatedly
+reads into it and writes the received slice, then returns it. `flushInterval`
+selects immediate flushing for event streams and unknown-length responses;
+`CopyResponse` otherwise uses the configured latency writer when enabled. This
+is buffer reuse, not evidence of zero copied bytes.
+[KrakenD v2.13.2 pins Lura v2.14.1](https://github.com/krakend/krakend-ce/blob/v2.13.2/go.mod#L38).
+Lura's [no-op parser](https://github.com/luraproject/lura/blob/v2.14.1/proxy/http_response.go#L72)
+retains a wrapped body reader plus status and headers. Its
+[no-op renderer](https://github.com/luraproject/lura/blob/v2.14.1/router/gin/render.go#L149)
+forwards metadata and calls `io.Copy`. Neither source inspection nor a no-op
+name measures allocation/copy cost or makes the earlier error-affected KrakenD
+results a clean victory. No competitor was executed in this experiment.
+
+Ferrum already has the proposed single-frame mechanism: `CoalesceBuffer::Single`
+retains a `Bytes` value and flushes it without copying; a second frame promotes
+it to `BytesMut`, and a large frame bypasses aggregation. H1's existing
+`COALESCE_TARGET` is 128 KiB. Its default coalescer flushes held data on upstream
+Pending, EOF, trailers or error. Cutoff `1` selects this implementation for these
+payloads without whole-response buffering. Both arms retain the existing unknown
+streaming length. This A/B does not test restoring Content-Length or removing
+truncation, trailer, deadline or late-policy handling.
+Existing [allocation probes](../tests/unit/gateway_core/response_coalescing_allocation_tests.rs)
+and [lazy-coalescer tests](../tests/unit/gateway_core/response_coalescing_lazy_tests.rs)
+cover the single-frame/bypass and merge behavior; source inspection of those
+tests is not a live allocation profile of the hosted proxy.
+
+Allocations, internal copied bytes, gateway input frame counts and adapter/header
+CPU attribution are **not observable** from these passive counters. Measuring
+them needs a separately budgeted hosted profiling build with allocator/copy/frame
+counters or permitted symbolized `perf`/eBPF probes, matching observer overhead
+across arms. The current Docker release strips symbols and uses fat LTO; retain
+matching symbols/frame pointers without changing optimization settings for CPU
+attribution, and instrument copy sites to include inlined copies that a `memcpy`
+probe misses. A dedicated streaming fixture must also exercise delayed tiny
+frames, truncation, trailers, and late policy failure before changing aggregation
+or adapters. The echo-only benchmark cannot certify their latency or semantics.
+
+**Disposition by hypothesis.**
+
+- **Enable existing bounded aggregation via cutoff `1`: reject promotion; keep
+  cutoff `0` for this workload.** The four valid paired throughput intervals are
+  above; none establishes a gain, and 5 MiB has no valid interval. This completes
+  the first A/B tracker item with an explicit invalid-size result.
+- **Add bounded aggregation/prompt flush/zero-copy single-frame variants: reject
+  a new production change on this evidence.** These mechanisms already exist in
+  the tested cutoff-1 implementation and the measured cadence barely changes.
+  No additional prototype or independent interval is claimed. A different
+  coalescing policy needs internal frame/copy profiles and the streaming fixture
+  described above before another budgeted paired run.
+- **Reduce H1 body/header adapter work: reject an unprofiled production edit;
+  keep the hypothesis open.** Passive CPU totals do not attribute adapter cost.
+  No independent A/B interval exists. Symbolized CPU and allocation/copy/frame
+  observations are the missing prerequisite, so the full profiling and
+  conditional optimization tracker items remain open. Content-Length restoration
+  and removal of truncation/trailer/late-policy handling were never candidates.
+
+Harness validation on the experiment SHA:
+[run 35345035672](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35345035672)
+passed 19 Rust tests and 34 Python tests, including record fragmentation,
+transport forwarding/half-close, manifest rejection, missing-arm pairing,
+I/O counter monotonicity and privileged-reader termination. No project code,
+build, test or script was executed locally; local validation was source/diff
+inspection and `git diff --check`.
+The later aggregate layout/table regression tests and final report changes
+require GitHub-hosted CI on the final pushed head; the experiment-SHA test run
+does not validate those later edits.
+
+### Ranked experiments (source hypotheses)
+
+These are source-supported mechanisms and testable hypotheses. Section 4 above
+records the first measured H1 experiment and its limits.
 
 1. **Fix buffered-writer progress before tuning WSS.**
    `src/proxy/tcp_proxy.rs::poll_copy_direction` switches back to reading after
@@ -443,16 +663,14 @@ mechanisms and testable hypotheses, not claims from a CPU profile.
    HTTP/1.1 uses chunked transfer. The typed body is adapted through reqwest,
    error/deadline wrappers, and the final proxy body. In comparison,
    KrakenD/Lura's no-op path retains a response reader and forwards headers
-   into `io.Copy`; Tyk uses a reusable body-copy buffer. Profile frames, TLS
-   records, writes, copied bytes, and allocations at 10/70/500 KiB and 1/5 MiB.
-   A promising experiment is bounded aggregation matched to TLS record cadence,
-   with a zero-copy single-frame path and prompt flushes. A narrowly scoped
-   first A/B is `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` versus `1`: all measured
-   bodies exceed one byte, so the latter selects the existing coalescer without
-   fully buffering these responses. Another experiment is a dedicated
-   H1 sender/body path to reduce adapter and header conversion overhead. Do not
-   restore an unverified or plugin-authored Content-Length: truncation, trailers,
-   and late policy rejection must remain observable.
+   into `io.Copy`; Tyk uses a reusable body-copy buffer. The section-4 hosted A/B
+   of `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` versus `1` found no demonstrated
+   gain in the four valid sizes; 5 MiB failed drain validation. The existing
+   coalescer already has bounded aggregation, prompt flushes and a zero-copy
+   single-frame path. Internal copied bytes, allocations and adapter CPU remain
+   unmeasured prerequisites for further independent changes. Do not restore an
+   unverified or plugin-authored Content-Length: truncation, trailers, streaming
+   latency and late policy rejection must remain observable.
 
 3. **Reduce shared pool work for small HTTP/2 and gRPC requests.**
    Envoy owns connection pools per worker, keeping pool operations local to

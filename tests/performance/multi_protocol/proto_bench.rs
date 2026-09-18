@@ -13,6 +13,7 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
 use bytes::Buf;
+use multi_protocol_perf::h1_profile::{Counters, ObservedTls};
 use multi_protocol_perf::metrics::BenchMetrics;
 use multi_protocol_perf::phases::{Connections, Phases};
 use multi_protocol_perf::tls_utils;
@@ -279,6 +280,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         let authority = authority.clone();
         let tls_connector = tls_connector.clone();
         let payload = payload.clone();
+        let h1_counters = phases.h1_counters();
         let mut metrics = phases.worker();
         let connections = connections.clone();
         handles.push(tokio::spawn(async move {
@@ -286,6 +288,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
             async fn connect_h1(
                 addr: SocketAddr,
                 connections: &Connections,
+                counters: &Arc<Counters>,
                 tls: &Option<(
                     tokio_rustls::TlsConnector,
                     rustls::pki_types::ServerName<'static>,
@@ -294,6 +297,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                 let tcp = tokio::net::TcpStream::connect(addr).await?;
                 let _ = tcp.set_nodelay(true);
                 if let Some((connector, server_name)) = tls {
+                    let tcp = ObservedTls::new(tcp, counters.clone());
                     let tls_stream = connector.connect(server_name.clone(), tcp).await?;
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
@@ -315,14 +319,14 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                 }
             }
 
-            let mut send_req = connect_h1(addr, &connections, &tls_connector).await?;
+            let mut send_req = connect_h1(addr, &connections, &h1_counters, &tls_connector).await?;
             let mut reconnects: u64 = 0;
 
             while metrics.next_request().await {
                 // Reconnect if the connection was closed
                 if send_req.is_closed() {
                     reconnects += 1;
-                    send_req = connect_h1(addr, &connections, &tls_connector).await?;
+                    send_req = connect_h1(addr, &connections, &h1_counters, &tls_connector).await?;
                 }
 
                 let req = hyper::Request::post(&path)
@@ -334,7 +338,15 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                     Ok(resp) => {
                         use http_body_util::BodyExt;
                         let status = resp.status();
-                        match resp.into_body().collect().await {
+                        h1_counters.response_headers(resp.headers());
+                        let counters = h1_counters.clone();
+                        let body = resp.into_body().map_frame(move |frame| {
+                            if let Some(data) = frame.data_ref() {
+                                counters.data_frame(data.len());
+                            }
+                            frame
+                        });
+                        match body.collect().await {
                             Ok(body) => {
                                 let bytes = body.to_bytes();
                                 let latency = start.elapsed().as_micros() as u64;
