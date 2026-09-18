@@ -48,7 +48,7 @@ jobs:
       - name: Hosted prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev clang
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
       - name: Formatting (hosted only)
         run: cargo fmt --all -- --check
       - name: Feature compile and lint (default builds do not cover observers)
@@ -86,7 +86,7 @@ jobs:
       - name: Hosted prerequisites and memory headroom
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev clang lsof binutils
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils
           sudo fallocate -l 12G /mnt/h1-profile-swap
           sudo chmod 600 /mnt/h1-profile-swap
           sudo mkswap /mnt/h1-profile-swap
