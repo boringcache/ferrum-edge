@@ -17,6 +17,13 @@ mod unit {
         #[allow(dead_code)]
         pub(crate) mod plugin_utils;
 
+        // The one place a fake Redis peer's `TIME` reply is defined. Shared
+        // with the integration and functional targets, which reach the same
+        // file through `tests/common`.
+        #[allow(dead_code)]
+        #[path = "../../common/redis_resp.rs"]
+        pub(crate) mod redis_resp;
+
         #[allow(dead_code, unused_imports)]
         mod jwks_auth_support; // shared helper, also compiled by the other half
         #[allow(dead_code, unused_imports)]

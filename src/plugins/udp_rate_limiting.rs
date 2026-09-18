@@ -219,6 +219,19 @@ impl UdpRateLimiting {
         self.limiter.redis_failure_policy()
     }
 
+    /// Whether this policy's centralized client demands the Redis server clock
+    /// (`TIME`). `None` for a local-only config. Not a production API.
+    ///
+    /// Only the request-quota ladder selects sub-buckets on the server's clock,
+    /// so this is what proves which of the six Redis-backed rate-limit roots
+    /// forces an operator's ACL to grant `+time`.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_requires_server_clock_for_test(&self) -> Option<bool> {
+        self.limiter
+            .redis_client_arc_for_test()
+            .map(|client| client.requires_server_clock_for_test())
+    }
+
     /// Effective Redis key prefix for policy-isolation coverage. Not a
     /// production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target

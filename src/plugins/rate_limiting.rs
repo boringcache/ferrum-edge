@@ -288,6 +288,19 @@ impl RateLimiting {
         self.limiter.redis_failure_policy()
     }
 
+    /// Whether this policy's centralized client demands the Redis server clock
+    /// (`TIME`). `None` for a local-only config. Not a production API.
+    ///
+    /// Only the request-quota ladder selects sub-buckets on the server's clock,
+    /// so this is what proves which of the six Redis-backed rate-limit roots
+    /// forces an operator's ACL to grant `+time`.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_requires_server_clock_for_test(&self) -> Option<bool> {
+        self.limiter
+            .redis_client_arc_for_test()
+            .map(|client| client.requires_server_clock_for_test())
+    }
+
     /// Mark this policy's centralized store unavailable so the next enforcement
     /// decision takes the fail-closed path. `false` for a local-only policy.
     ///
@@ -676,27 +689,30 @@ impl RateLimiting {
         // expired keys could remain pinned closed when only new identities
         // arrive. Cleanup never removes live budgets.
         self.maybe_evict_stale_entries();
-        let Some(outcome) = self
+        let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity(
+            .check_with_redis_key_and_local_capacity_attributed(
                 key.clone(),
                 || key.clone(),
                 limit_op,
                 MAX_STATE_ENTRIES,
             )
-            .await
-        else {
+            .await;
+        let Some(outcome) = decision.outcome else {
             // A capacity denial carries no budget of its own, and a composed
             // sibling's admitted budget must not be published as its verdict.
             self.claim_published_headers(ctx, HeaderAuthority::Refused);
-            // A capacity denial reached while the backend is serving the
-            // per-process fallback budget IS a fallback-caused refusal, and the
-            // one an operator most needs attributed: a Redis-backed policy
+            // A capacity denial reached while THIS decision was being served on
+            // the per-process fallback budget IS a fallback-caused refusal, and
+            // the one an operator most needs attributed: a Redis-backed policy
             // suddenly hitting the local key cap is an outage symptom, not
             // client behaviour. The `Some(outcome)` arms below carry the marker
-            // on the outcome; this arm has no outcome to carry it, so it asks
-            // the backend directly.
-            if self.limiter.local_fallback_active() {
+            // on the outcome; this arm has none, so it reads the provenance the
+            // decision carried out with it. Asking the backend whether it is
+            // unavailable *now* would answer a different question and lose the
+            // attribution for every per-decision fallback (a staleness
+            // rollover, an unpairable reply) that leaves the client healthy.
+            if decision.local_fallback {
                 self.mark_local_fallback(ctx);
             }
             return self.reject_capacity();
@@ -737,17 +753,22 @@ impl RateLimiting {
         ctx: &mut super::StreamConnectionContext,
     ) -> PluginResult {
         self.maybe_evict_stale_entries();
-        let Some(outcome) = self
+        // Attribution travels with the decision, exactly as `check_rate` does
+        // above: a capacity refusal taken on the local fallback budget is
+        // marked from the decision that took it, never reconstructed from the
+        // client's availability signal (a second sub-bucket rollover refuses
+        // through the failure policy while that signal still reads available).
+        let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity(
+            .check_with_redis_key_and_local_capacity_attributed(
                 key.clone(),
                 || key.clone(),
                 limit_op,
                 MAX_STATE_ENTRIES,
             )
-            .await
-        else {
-            if self.limiter.local_fallback_active() {
+            .await;
+        let Some(outcome) = decision.outcome else {
+            if decision.local_fallback {
                 ctx.metadata
                     .get_or_insert_with(HashMap::new)
                     .insert("ratelimit_local_fallback".to_string(), "true".to_string());

@@ -12,6 +12,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use super::redis_resp::{
+    TIME_CMD, TIME_DENIED_REPLY, TIME_UNKNOWN_COMMAND_REPLY, encode_server_time,
+    host_clock_time_reply,
+};
+
 fn make_config(url: &str, tls: bool) -> RedisConfig {
     RedisConfig {
         url: url.to_string(),
@@ -774,10 +779,16 @@ fn recovery_ping_is_bounded_by_the_connect_timeout() {
     );
 }
 
-/// Accept TCP, optionally delay, then answer every RESP array command with +OK.
+/// Accept TCP, optionally delay, then answer every RESP array command with
+/// `+OK` — except the standalone `TIME` probe, which gets this host's clock.
 ///
 /// Used to simulate a Redis endpoint whose protocol handshake is delayed after
 /// TCP accept (the failure mode in issue #2310).
+///
+/// Framing is exact rather than a `*`-byte count, because `TIME` now has to be
+/// told apart from the rest: a `+OK` answer to it is a reply the client cannot
+/// pair with a clock, so it drops the connection unpublished and no pool slot
+/// is ever established. See [`super::redis_resp`].
 async fn spawn_delayed_redis_handshake_server(
     handshake_delay: Option<Duration>,
 ) -> (u16, oneshot::Sender<()>, Arc<AtomicUsize>) {
@@ -800,21 +811,30 @@ async fn spawn_delayed_redis_handshake_server(
                             tokio::time::sleep(delay).await;
                         }
                         let mut buf = vec![0_u8; 4096];
+                        let mut pending: Vec<u8> = Vec::new();
                         loop {
-                            match stream.read(&mut buf).await {
+                            let n = match stream.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    // Rough RESP command count: each top-level array
-                                    // begins with '*'. Enough for CLIENT SETINFO pipelines.
-                                    let commands = buf[..n].iter().filter(|&&b| b == b'*').count().max(1);
-                                    let mut reply = Vec::new();
-                                    for _ in 0..commands {
-                                        reply.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    if stream.write_all(&reply).await.is_err() {
-                                        break;
-                                    }
+                                Ok(n) => n,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            let mut reply = Vec::new();
+                            // Exactly one reply per fully received command, so
+                            // the client's in-flight accounting always matches
+                            // even when the redis crate pipelines its setup.
+                            while let Some((name, consumed)) = parse_resp_command(&pending) {
+                                pending.drain(..consumed);
+                                if name == "TIME" {
+                                    reply.extend_from_slice(&host_clock_time_reply());
+                                } else {
+                                    reply.extend_from_slice(b"+OK\r\n");
                                 }
+                            }
+                            if reply.is_empty() {
+                                continue;
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
                             }
                         }
                     });
@@ -1229,9 +1249,11 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
     use ferrum_edge::_test_support::redis_window_progress_at;
     use ferrum_edge::plugins::utils::rate_limit::FixedWindow;
 
-    // Redis path: prev bucket full (10), current has the candidate request (1).
-    // At fraction 0.0 the old code always denied; with subsecond decay the mid-
-    // window candidate is admitted.
+    // TOKEN-ACCOUNTING path only (`ai_rate_limiter` budgets, `ws_rate_limiting`
+    // frames): prev bucket full (10), current has the candidate request (1). At
+    // fraction 0.0 the old code always denied; with subsecond decay the
+    // mid-window candidate is admitted. Request quotas moved off this estimate
+    // onto the sub-bucket ladder covered below.
     let window = FixedWindow::new(10, 1);
     let start = redis_window_progress_at(Duration::from_secs(50), 1);
     let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
@@ -1255,22 +1277,4087 @@ fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
     );
 }
 
+// ── Request-quota sub-bucket ladder ──────────────────────────────────────
+//
+// Request quotas (`rate_limiting`, `graphql`, `grpc_method_router`) count a
+// sub-bucketed trailing window in full instead of decaying a previous epoch
+// bucket. Coverage below is pure/deterministic via `sub_bucket_at`,
+// `window_charge`, and `redis_trailing_window_count`.
+
+#[test]
+fn sub_bucket_index_splits_each_window_into_equal_parts() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_SUB_BUCKETS, REDIS_WINDOW_TRAILING_SUB_BUCKETS,
+        RedisRateLimitClient, redis_sub_bucket_nanos,
+    };
+
+    assert_eq!(REDIS_WINDOW_SUB_BUCKETS, 16, "the key layout pins K");
+    assert_eq!(
+        REDIS_WINDOW_TRAILING_SUB_BUCKETS,
+        REDIS_WINDOW_SUB_BUCKETS + 1,
+        "the ladder reads ONE sub-bucket further back than the window itself, \
+         because a retained charge's key can be one bucket older than the bucket \
+         the server executed it in"
+    );
+    assert_eq!(
+        REDIS_WINDOW_SUB_BUCKET_KEYS,
+        REDIS_WINDOW_SUB_BUCKETS + 3,
+        "K + 1 older, the charged bucket, and the forward bucket"
+    );
+
+    // One-second window → 62.5ms sub-buckets.
+    let at = |millis: u64, window: u64| {
+        RedisRateLimitClient::sub_bucket_at(Duration::from_millis(millis), window)
+    };
+    assert_eq!(at(100_000, 1).index, 1_600);
+    assert_eq!(at(100_062, 1).index, 1_600);
+    assert_eq!(at(100_063, 1).index, 1_601);
+    assert_eq!(at(100_999, 1).index, 1_615);
+    assert_eq!(at(101_000, 1).index, 1_616);
+
+    // Sixty-second window → 3.75s sub-buckets; a whole window is exactly K of
+    // them, which is what makes `current + K older` cover the trailing window.
+    assert_eq!(at(600_000, 60).index, 160);
+    assert_eq!(at(603_749, 60).index, 160);
+    assert_eq!(at(603_750, 60).index, 161);
+    assert_eq!(at(660_000, 60).index - at(600_000, 60).index, 16);
+
+    // The width helper the key builder and the quarantine threshold share.
+    assert_eq!(redis_sub_bucket_nanos(1), 62_500_000);
+    assert_eq!(redis_sub_bucket_nanos(60), 3_750_000_000);
+    assert_eq!(redis_sub_bucket_nanos(0), redis_sub_bucket_nanos(1));
+
+    // The window travels with the index because it is a key component.
+    assert_eq!(at(100_000, 60).window_seconds, 60);
+    // A zero window is clamped to one second rather than dividing by zero.
+    assert_eq!(at(100_000, 0).window_seconds, 1);
+    assert_eq!(at(100_000, 0).index, 1_600);
+}
+
+#[test]
+fn window_charge_keys_share_a_hash_tag_and_name_their_window() {
+    use ferrum_edge::plugins::utils::rate_limit::two_window_ttl_seconds;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_TRAILING_SUB_BUCKETS, RedisRateLimitClient,
+    };
+
+    let client = redis_rate_limit_client_for_test(make_config("redis://127.0.0.1:6379/0", false));
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
+    let charge = client.window_charge("ip:127.0.0.1", bucket, two_window_ttl_seconds(1));
+
+    // `%`, braces, and `:` are percent-escaped inside the tag so a
+    // caller-controlled identity cannot terminate it early.
+    let tag = "{ferrum%3Atest:ip%3A127.0.0.1}";
+    let trailing: Vec<&str> = charge.trailing_keys().collect();
+    assert_eq!(trailing.len(), REDIS_WINDOW_TRAILING_SUB_BUCKETS);
+    // `K + 1` back, not `K`: the oldest counter is one sub-bucket further back
+    // than the window itself, which is what keeps a peer's retained charge
+    // inside this ladder when its key is one bucket older than the bucket the
+    // server executed it in.
+    assert_eq!(trailing[0], format!("{tag}:1:1583"));
+    assert_eq!(trailing[16], format!("{tag}:1:1599"));
+    assert_eq!(charge.charged_key(), format!("{tag}:1:1600"));
+    // The forward counter: read, never written, and what makes two reordered
+    // transactions on either side of a boundary see each other.
+    assert_eq!(charge.next_key(), format!("{tag}:1:1601"));
+    assert_eq!(
+        charge.bucket(),
+        RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1),
+        "the charge carries the bucket it selected, for the post-EXEC check"
+    );
+
+    // Retention outlives the `window + two sub-buckets` of history the ladder
+    // reads back, so the oldest bucket a decision needs is never expired first.
+    assert_eq!(charge.ttl_seconds(), 3);
+
+    // Every key of one transaction hashes to the same slot.
+    let charged = charge.charged_key();
+    for key in trailing.iter().copied().chain([charged, charge.next_key()]) {
+        assert!(key.starts_with(tag), "{key} must carry the shared hash tag");
+    }
+
+    // Nineteen distinct keys, never a repeat that would double-count one
+    // counter.
+    let mut distinct: Vec<&str> = trailing
+        .iter()
+        .copied()
+        .chain([charged, charge.next_key()])
+        .collect();
+    assert_eq!(distinct.len(), REDIS_WINDOW_SUB_BUCKET_KEYS);
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), REDIS_WINDOW_SUB_BUCKET_KEYS);
+
+    // Two windows of one policy are disjoint ladders because the key names the
+    // window, not only its index.
+    let minute = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 60);
+    let minute_charge = client.window_charge("ip:127.0.0.1", minute, two_window_ttl_seconds(60));
+    assert_eq!(minute_charge.charged_key(), format!("{tag}:60:26"));
+    assert_ne!(minute_charge.charged_key(), charge.charged_key());
+}
+
+#[test]
+fn trailing_window_count_sums_every_sub_bucket_in_full() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_TRAILING_SUB_BUCKETS,
+        redis_trailing_window_count,
+    };
+
+    // No decay term: a burst clustered in the OLDEST sub-bucket of a full
+    // ladder still counts for everything it is worth.
+    let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
+    ladder[0] = Some(100);
+    ladder[REDIS_WINDOW_TRAILING_SUB_BUCKETS] = Some(1);
+    assert_eq!(redis_trailing_window_count(&ladder), 101);
+
+    // A missing key is zero usage, not an error.
+    assert_eq!(redis_trailing_window_count(&[None, None, Some(7)]), 7);
+
+    // A counter can only go negative when a compensating DECR raced its key's
+    // expiry. Flooring each bucket on its own keeps that stale key from
+    // cancelling a live burst in another bucket.
+    let raced = [Some(-5), Some(100), Some(1)];
+    assert_eq!(redis_trailing_window_count(&raced), 101);
+
+    // Saturating, because a wrapped total would read as spare budget. Two
+    // `i64::MAX` buckets land one short of `u64::MAX`; the third proves the
+    // clamp rather than a wrap back to a tiny, admissible total.
+    let huge = [Some(i64::MAX), Some(i64::MAX)];
+    assert_eq!(redis_trailing_window_count(&huge), u64::MAX - 1);
+    let huger = [Some(i64::MAX), Some(i64::MAX), Some(i64::MAX)];
+    assert_eq!(redis_trailing_window_count(&huger), u64::MAX);
+
+    assert_eq!(redis_trailing_window_count(&[]), 0);
+}
+
+/// What one modelled decision did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelDecision {
+    /// The trailing-window total the settled ladder summed, this request's own
+    /// charge included. `None` when two passes could not settle and the
+    /// decision failed closed the way `check_http_windows_redis` does.
+    counted: Option<u64>,
+    admitted: bool,
+}
+
+/// Deterministic model of ONE identity's Redis request-quota decisions, driven
+/// by synthetic timestamps through the production sub-bucket derivation and the
+/// production fold.
+///
+/// `buckets` stands in for the Redis keyspace; admission is charge-then-compare
+/// and a refusal hands its own charge straight back, exactly like
+/// `check_http_windows_redis`.
+///
+/// Selection and execution are SEPARATE instants: a request selects its bucket
+/// at `selected_at` and the server applies the transaction `latency` later.
+/// That is the production shape, and modelling both with one instant is what
+/// hid the reader's own placement lag — a charge is keyed at the bucket it
+/// SELECTED while the reader counts history from the bucket it EXECUTES in, and
+/// settlement deliberately admits a one-bucket gap between the two. Two passes,
+/// and a second mis-settlement fails closed, exactly like
+/// `MAX_REDIS_CHARGE_PASSES`.
+fn model_sub_bucket_decision(
+    buckets: &mut std::collections::HashMap<u64, i64>,
+    selected_at: Duration,
+    latency: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> ModelDecision {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKET_KEYS, REDIS_WINDOW_TRAILING_SUB_BUCKETS, RedisRateLimitClient,
+        redis_trailing_window_count, sub_bucket_charge_is_settled,
+    };
+
+    let mut selected_at = selected_at;
+    for pass in 0..2 {
+        let bucket = RedisRateLimitClient::sub_bucket_at(selected_at, window_seconds);
+        let charged = bucket.index;
+        *buckets.entry(charged).or_insert(0) += 1;
+        let executed_at = selected_at.saturating_add(latency);
+        if !sub_bucket_charge_is_settled(bucket, executed_at) {
+            // Hand the abandoned charge back and rebuild from the instant the
+            // server proved the rollover, exactly like production.
+            *buckets.entry(charged).or_insert(0) -= 1;
+            if pass == 1 {
+                return ModelDecision {
+                    counted: None,
+                    admitted: false,
+                };
+            }
+            selected_at = executed_at;
+            continue;
+        }
+        // Same ladder shape production builds: the `K + 1` older sub-buckets,
+        // the charged one, and the one after it. A single-client ordered
+        // timeline never charges ahead of the clock, so the forward counter is
+        // always empty here — it exists for concurrent/reordered execution,
+        // which
+        // `a_reordered_transaction_across_a_sub_bucket_boundary_cannot_double_admit`
+        // covers against a real server.
+        let mut ladder = [None; REDIS_WINDOW_SUB_BUCKET_KEYS];
+        for (slot, value) in ladder.iter_mut().enumerate() {
+            let index = if slot > REDIS_WINDOW_TRAILING_SUB_BUCKETS {
+                charged.saturating_add((slot - REDIS_WINDOW_TRAILING_SUB_BUCKETS) as u64)
+            } else {
+                charged.saturating_sub((REDIS_WINDOW_TRAILING_SUB_BUCKETS - slot) as u64)
+            };
+            *value = buckets.get(&index).copied();
+        }
+        let counted = redis_trailing_window_count(&ladder);
+        if counted > limit {
+            *buckets.entry(charged).or_insert(0) -= 1;
+            return ModelDecision {
+                counted: Some(counted),
+                admitted: false,
+            };
+        }
+        return ModelDecision {
+            counted: Some(counted),
+            admitted: true,
+        };
+    }
+    unreachable!("the loop returns on both passes")
+}
+
+/// [`model_sub_bucket_decision`] reduced to the admission bit, for the timeline
+/// sweeps that only care whether a request got through.
+fn model_sub_bucket_admits(
+    buckets: &mut std::collections::HashMap<u64, i64>,
+    selected_at: Duration,
+    latency: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> bool {
+    model_sub_bucket_decision(buckets, selected_at, latency, window_seconds, limit).admitted
+}
+
+/// The retired two-window weighted estimate, for the same synthetic timeline.
+fn model_weighted_admits(
+    windows: &mut std::collections::HashMap<u64, i64>,
+    now: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> bool {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    let progress = redis_window_progress_at(now, window_seconds);
+    let index = progress.index;
+    *windows.entry(index).or_insert(0) += 1;
+    let previous = windows.get(&index.saturating_sub(1)).copied().unwrap_or(0);
+    let current = windows.get(&index).copied().unwrap_or(0);
+    let weighted = previous as f64 * (1.0 - progress.elapsed_fraction) + current as f64;
+    if weighted > limit as f64 {
+        *windows.entry(index).or_insert(0) -= 1;
+        return false;
+    }
+    true
+}
+
+/// The retired bare `previous + current` sum, for the same synthetic timeline.
+fn model_two_bucket_admits(
+    windows: &mut std::collections::HashMap<u64, i64>,
+    now: Duration,
+    window_seconds: u64,
+    limit: u64,
+) -> bool {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    let index = redis_window_progress_at(now, window_seconds).index;
+    *windows.entry(index).or_insert(0) += 1;
+    let previous = windows.get(&index.saturating_sub(1)).copied().unwrap_or(0);
+    let current = windows.get(&index).copied().unwrap_or(0);
+    let usage = previous.max(0) as u64 + current.max(0) as u64;
+    if usage > limit {
+        *windows.entry(index).or_insert(0) -= 1;
+        return false;
+    }
+    true
+}
+
+#[test]
+fn boundary_clustered_burst_stays_counted_inside_the_trailing_window() {
+    // 100/second. The attacker spends its whole quota at the very END of epoch
+    // second 10, then comes back half a second later. The exact trailing second
+    // at t = 11.5s still contains all 100 of those requests, so nothing more may
+    // be admitted until they age out.
+    let mut buckets = std::collections::HashMap::new();
+    let mut weighted = std::collections::HashMap::new();
+    for offset in 0..100_u64 {
+        let at = Duration::from_micros(10_900_000 + offset);
+        assert!(
+            model_sub_bucket_admits(&mut buckets, at, Duration::ZERO, 1, 100),
+            "the burst itself is within budget"
+        );
+        assert!(model_weighted_admits(&mut weighted, at, 1, 100));
+    }
+
+    assert!(
+        !model_sub_bucket_admits(
+            &mut buckets,
+            Duration::from_millis(11_500),
+            Duration::ZERO,
+            1,
+            100
+        ),
+        "a burst still inside the exact trailing second must be counted in full"
+    );
+    // The vulnerability this replaces: the weighted estimate assumed the burst
+    // was spread evenly through second 10, so at half-elapsed it discounted
+    // half of it and re-opened the budget while every request was still live.
+    assert!(
+        model_weighted_admits(&mut weighted, Duration::from_millis(11_500), 1, 100),
+        "the retired weighted estimate admitted a second burst here"
+    );
+
+    // Once the burst has aged past the trailing window the budget is free
+    // again: this is a trailing-window limiter, not a lockout.
+    assert!(
+        model_sub_bucket_admits(
+            &mut buckets,
+            Duration::from_millis(12_200),
+            Duration::ZERO,
+            1,
+            100
+        ),
+        "a burst outside the trailing window must stop counting"
+    );
+}
+
+#[test]
+fn steady_traffic_at_the_configured_rate_is_not_halved() {
+    // Exactly 20 requests per second against a 20/second quota, for six
+    // seconds, with no placement lag. A homogeneous stream over-refuses by at
+    // most two sub-buckets of history — up to `ceil(2 * limit / K)` = 3
+    // requests here — so the client keeps about `20 / 23` of its rate; the
+    // documented BOUND allows three sub-buckets (`ceil(3 * limit / K)` = 4, so
+    // `20 / 24`) for a reader whose own placement lag straddles a boundary. The
+    // bare `previous + current` sum this replaces counts up to two whole
+    // windows and settles at half for EVERY limit. The exact per-limit
+    // quantisation, including the small quotas where it costs most, is pinned
+    // by `steady_traffic_pays_the_documented_sub_bucket_quantisation`.
+    let offered = 120_u64;
+    let mut buckets = std::collections::HashMap::new();
+    let mut two_bucket = std::collections::HashMap::new();
+    let mut sub_bucket_admitted = 0_u64;
+    let mut two_bucket_admitted = 0_u64;
+    for attempt in 0..offered {
+        let at = Duration::from_millis(600_000 + attempt * 50);
+        if model_sub_bucket_admits(&mut buckets, at, Duration::ZERO, 1, 20) {
+            sub_bucket_admitted += 1;
+        }
+        if model_two_bucket_admits(&mut two_bucket, at, 1, 20) {
+            two_bucket_admitted += 1;
+        }
+    }
+
+    // Steady state is about 20 * 20/23 ≈ 17.4 per second after the first window
+    // fills; 95/120 is the floor that separates it from the halved shape.
+    assert!(
+        sub_bucket_admitted >= 95,
+        "steady traffic at the configured rate must not be throttled: \
+         {sub_bucket_admitted}/{offered}"
+    );
+    assert!(
+        sub_bucket_admitted <= offered,
+        "the quota must still bind: {sub_bucket_admitted}/{offered}"
+    );
+    // Root's finding: `previous + current` refuses for a whole window after any
+    // window that reached its limit, which is about half the configured quota.
+    assert!(
+        two_bucket_admitted <= 75,
+        "the retired two-bucket sum halves a well-behaved client: \
+         {two_bucket_admitted}/{offered}"
+    );
+    assert!(
+        sub_bucket_admitted > two_bucket_admitted + 20,
+        "{sub_bucket_admitted} vs {two_bucket_admitted}"
+    );
+}
+
+#[test]
+fn sub_bucket_ladder_never_admits_more_than_the_exact_trailing_window() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, REDIS_WINDOW_TRAILING_SUB_BUCKETS, RedisRateLimitClient,
+        redis_sub_bucket_nanos,
+    };
+
+    // Fail-closed property, swept across every sub-bucket phase of a one-second
+    // window: whatever the arrival pattern, the admissions inside ANY exact
+    // trailing second never exceed the configured cap. Microseconds, because a
+    // one-second window's sub-bucket is 62.5ms and does not divide into
+    // milliseconds.
+    let limit = 20_u64;
+    for phase in 0..REDIS_WINDOW_SUB_BUCKETS as u64 {
+        let mut buckets = std::collections::HashMap::new();
+        let mut admitted_at: Vec<u64> = Vec::new();
+        for attempt in 0..400_u64 {
+            // Bursty arrivals: eight back-to-back requests every 40ms, offset
+            // into the ladder by `phase` sub-buckets.
+            let micros = 600_000_000 + phase * 62_500 + (attempt / 8) * 40_000;
+            if model_sub_bucket_admits(
+                &mut buckets,
+                Duration::from_micros(micros),
+                Duration::ZERO,
+                1,
+                limit,
+            ) {
+                admitted_at.push(micros);
+            }
+        }
+        for window_end in &admitted_at {
+            let inside = admitted_at
+                .iter()
+                .filter(|at| **at > window_end.saturating_sub(1_000_000) && *at <= window_end)
+                .count() as u64;
+            assert!(
+                inside <= limit,
+                "phase {phase}: {inside} admissions inside the second ending at {window_end}"
+            );
+        }
+        assert!(
+            !admitted_at.is_empty(),
+            "phase {phase} must still admit traffic"
+        );
+    }
+
+    // The derivation the sweep rests on: the `K + 1` older sub-buckets plus the
+    // charged one span a whole window AND one sub-bucket more, which is the
+    // extra history that keeps a peer's one-bucket-older key inside the ladder.
+    let width = redis_sub_bucket_nanos(1);
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_millis(600_000), 1);
+    let oldest_start = (bucket.index - REDIS_WINDOW_TRAILING_SUB_BUCKETS as u64) as u128 * width;
+    let covered = Duration::from_millis(600_000).as_nanos() - oldest_start;
+    assert!(covered >= 1_000_000_000 + width);
+    assert!(covered <= 1_000_000_000 + 2 * width);
+
+    // Measured from the instant the SERVER executes the decision, one more
+    // sub-bucket: settlement admits a reader that selected `s - 1`, so its
+    // execution instant can sit a whole bucket past the one its ladder was
+    // built around. That is the `W + 3 * (W / K)` the documented over-count
+    // bound states, and `placement_lag_widens_the_counted_history_to_three_sub_buckets`
+    // is what pins the request counts it implies.
+    let latest_execution = (bucket.index as u128 + 2) * width - 1;
+    let covered_from_execution = latest_execution - oldest_start;
+    assert!(covered_from_execution > 1_000_000_000 + 2 * width);
+    assert!(covered_from_execution <= 1_000_000_000 + 3 * width);
+}
+
+/// The honest steady-state cost of counting the oldest sub-bucket in full, for
+/// a HOMOGENEOUS stream — every request carrying the same placement lag.
+///
+/// Any bucketed counter that counts its oldest bucket at face value covers MORE
+/// than the exact trailing window, so a client sending at EXACTLY its
+/// configured rate is throttled. Measured between requests that all place their
+/// charge the same way, the extra history is at most two sub-buckets — up to
+/// `ceil(2 * limit / K)` requests — so the admitted fraction is
+/// `limit / (limit + ceil(2 * limit / K))`. For `K = 16` that is one half at
+/// `limit = 1`, two thirds at `limit = 2`, and eight ninths at `limit = 8`.
+///
+/// This is the BETTER case, not the contract. The documented bound is
+/// `limit / (limit + ceil(3 * limit / K))`, because a reader whose own
+/// transaction straddles a sub-bucket boundary reads a ladder built one bucket
+/// before the bucket it executes in while the charges it counts did not —
+/// `placement_lag_widens_the_counted_history_to_three_sub_buckets` is what pins
+/// that. A uniform latency does NOT widen it, which is why the sweep below
+/// repeats every case with a straddling one and gets the same answer: the key
+/// is the selection bucket either way, so shifting every request equally shifts
+/// nothing.
+///
+/// Every arrival below lands exactly on a sub-bucket edge, which is the worst
+/// phase for the oldest bucket and the one a "roughly" argument would skip.
+#[test]
+fn steady_traffic_pays_the_documented_sub_bucket_quantisation() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    let sub_bucket_nanos = NANOS_PER_SECOND / REDIS_WINDOW_SUB_BUCKETS as u64;
+
+    // (limit, requests offered, admissions the ladder actually grants)
+    //
+    // The start is epoch second 100, which is sub-bucket 1600 exactly, so the
+    // first arrival of every case sits on a bucket edge. Counts are the closed
+    // form of the steady-state cycle, verified below against the fraction the
+    // doc comment and `docs/plugins.md` promise.
+    let cases: [(u64, u64, u64); 3] = [
+        // 1/s: admit, refuse, admit, refuse … — exactly half.
+        (1, 20, 10),
+        // 2/s: admit, admit, refuse … — exactly two thirds.
+        (2, 21, 14),
+        // 8/s: eight admissions then one refusal — exactly eight ninths.
+        (8, 36, 32),
+    ];
+
+    // A latency of zero, and one that pushes every execution into the sub-bucket
+    // AFTER the one it selected — the widest placement lag settlement admits.
+    // Both are homogeneous, so both must produce the same figures: the key is
+    // the selection bucket either way, and shifting every request equally
+    // shifts nothing.
+    let latencies = [Duration::ZERO, Duration::from_nanos(sub_bucket_nanos)];
+
+    for (limit, offered, expected_admitted) in cases {
+        // Exactly the configured rate: `limit` arrivals per second, evenly
+        // spaced, every one on a sub-bucket edge.
+        let spacing_nanos = NANOS_PER_SECOND / limit;
+        for latency in latencies {
+            let mut buckets = std::collections::HashMap::new();
+            let mut admitted = 0_u64;
+            for attempt in 0..offered {
+                let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+                if model_sub_bucket_admits(&mut buckets, at, latency, 1, limit) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, expected_admitted,
+                "limit {limit} at latency {latency:?}: {admitted}/{offered} admitted"
+            );
+
+            // The closed form for a homogeneous stream: at most
+            // `ceil(2 * limit / K)` requests of extra history are counted.
+            let excess = (limit * 2).div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64);
+            let predicted = limit as f64 / (limit + excess) as f64;
+            let measured = admitted as f64 / offered as f64;
+            assert!(
+                (measured - predicted).abs() < 0.02,
+                "limit {limit} at latency {latency:?}: measured {measured} vs homogeneous \
+                 {predicted}"
+            );
+            // And never below the documented bound, which allows one more
+            // sub-bucket of history than a homogeneous stream ever counts.
+            let bound_excess = (limit * 3).div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64);
+            let bound = limit as f64 / (limit + bound_excess) as f64;
+            assert!(
+                measured + 0.02 >= bound,
+                "limit {limit} at latency {latency:?}: measured {measured} below the \
+                 documented bound {bound}"
+            );
+            // The quota still binds: a client at exactly its configured rate is
+            // throttled, which is the whole point of stating the figure.
+            assert!(
+                admitted < offered,
+                "limit {limit} at latency {latency:?}: the quota must still bind \
+                 ({admitted}/{offered})"
+            );
+        }
+    }
+
+    // A sanity anchor on the sub-bucket width the spacing above rests on.
+    assert_eq!(sub_bucket_nanos, 62_500_000);
+}
+
+/// Review finding (MINOR 4): the ladder's real over-count is THREE sub-buckets,
+/// not two, once the reader's own placement lag is modelled.
+///
+/// A charge is keyed at the sub-bucket it SELECTED; settlement deliberately
+/// admits a transaction the server applies one bucket later. So a reader that
+/// executes at server bucket `s` may be reading a ladder built around `s - 1`,
+/// starting at `s - K - 2`, while the peers it counts were keyed at the bucket
+/// they executed in. Measured execution-to-execution that ladder reaches back
+/// `W + 3 * (W / K)` instead of `W + 2 * (W / K)` — up to `ceil(3 * L / K)`
+/// requests of extra history rather than `ceil(2 * L / K)`.
+///
+/// Peers arrive at exactly the configured rate and key their charges at the
+/// bucket they executed in. The reader executes at the next instant of that
+/// same stream, once with no placement lag and once one whole sub-bucket after
+/// its own selection — the widest lag settlement admits. The phase of the whole
+/// timeline against the sub-bucket grid is swept, because both figures are the
+/// WORST phase and a single alignment would measure the best one.
+#[test]
+fn placement_lag_widens_the_counted_history_to_three_sub_buckets() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    const PHASE_STEPS: u64 = 64;
+    let sub_bucket_nanos = NANOS_PER_SECOND / REDIS_WINDOW_SUB_BUCKETS as u64;
+    let base = 100 * NANOS_PER_SECOND;
+
+    for limit in [1_u64, 2, 8, 16, 100] {
+        let spacing_nanos = NANOS_PER_SECOND / limit;
+        assert_eq!(
+            spacing_nanos * limit,
+            NANOS_PER_SECOND,
+            "limit {limit}: the arrival spacing must divide the window exactly"
+        );
+        let mut widest_prompt = 0_u64;
+        let mut widest_lagging = 0_u64;
+        for step in 0..PHASE_STEPS {
+            let phase = sub_bucket_nanos * step / PHASE_STEPS;
+            let executes_at = Duration::from_nanos(base + phase);
+            // Three windows of peers, each keyed at the bucket it executed in,
+            // so the reader's ladder is full whatever it reaches back to.
+            let mut peers = std::collections::HashMap::new();
+            for back in 1..=(limit * 3) {
+                let at = Duration::from_nanos(base + phase - back * spacing_nanos);
+                let index = RedisRateLimitClient::sub_bucket_at(at, 1).index;
+                *peers.entry(index).or_insert(0) += 1;
+            }
+
+            let counted_by = |selected_at: Duration, lag: Duration| {
+                model_sub_bucket_decision(&mut peers.clone(), selected_at, lag, 1, limit)
+                    .counted
+                    .expect("a charge inside the settlement band always settles")
+            };
+            // One whole sub-bucket of placement lag: the reader selected at
+            // `s - 1` and the server applied the transaction at `s`, which is
+            // exactly the straddle `sub_bucket_charge_is_settled` admits.
+            let lag = Duration::from_nanos(sub_bucket_nanos);
+            let lagging_selects_at = executes_at.saturating_sub(lag);
+            widest_prompt = widest_prompt.max(counted_by(executes_at, Duration::ZERO));
+            widest_lagging = widest_lagging.max(counted_by(lagging_selects_at, lag));
+        }
+
+        assert_eq!(
+            widest_prompt,
+            limit + (limit * 2).div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64),
+            "limit {limit}: a reader with no placement lag counts at most TWO \
+             sub-buckets of extra history"
+        );
+        assert_eq!(
+            widest_lagging,
+            limit + (limit * 3).div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64),
+            "limit {limit}: a reader that straddled a sub-bucket boundary counts \
+             THREE sub-buckets of extra history — the documented bound"
+        );
+        assert!(
+            widest_lagging > limit,
+            "limit {limit}: the quota still binds at exactly the configured rate"
+        );
+    }
+}
+
+/// The reviewer's concrete counterexample to the `W + 2 * (W / K)` history
+/// claim, at `1/s`: a peer 1.178 seconds old is still counted.
+///
+/// A charges key `1600`, executing at `100.003`. B's learned offset is 60ms
+/// behind the server, so B selects at local `101.180` — corrected `101.120`,
+/// sub-bucket `1617` — and the server applies the transaction at `101.181`,
+/// sub-bucket `1618`. That is `b + 1`, so settlement admits it, and B's ladder
+/// runs `[1600, 1618]` and includes A.
+///
+/// A executed 1.178 seconds before B did. The retired claim was that no charge
+/// older than `W + 2 * (W / K)` = 1.125s is counted; the real bound is
+/// `W + 3 * (W / K)` = 1.1875s, and this sits between the two.
+#[test]
+fn a_straddling_reader_counts_a_peer_older_than_the_retired_history_claim() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, sub_bucket_charge_is_settled,
+    };
+
+    let sub_bucket = Duration::from_nanos(1_000_000_000 / REDIS_WINDOW_SUB_BUCKETS as u64);
+
+    // A: no placement lag, so its key IS the bucket the server executed it in.
+    let a_executes = Duration::from_micros(100_003_000);
+    let a_bucket = RedisRateLimitClient::sub_bucket_at(a_executes, 1);
+    assert_eq!(a_bucket.index, 1_600);
+    assert!(sub_bucket_charge_is_settled(a_bucket, a_executes));
+
+    // B: selects on a clock 60ms behind the server, executes 1ms later.
+    let b_selects = Duration::from_micros(101_180_000).saturating_sub(Duration::from_millis(60));
+    let b_executes = Duration::from_micros(101_181_000);
+    let b_bucket = RedisRateLimitClient::sub_bucket_at(b_selects, 1);
+    assert_eq!(b_bucket.index, 1_617);
+    assert_eq!(
+        RedisRateLimitClient::sub_bucket_at(b_executes, 1).index,
+        1_618,
+        "B's transaction must straddle the boundary for this to be the case under test"
+    );
+    assert!(
+        sub_bucket_charge_is_settled(b_bucket, b_executes),
+        "a charge the server applies at b + 1 is exactly what settlement admits"
+    );
+
+    // B's ladder starts at `b - K - 1` = 1600, so it counts A. On one timeline
+    // the gap between B's selection and the instant the server applied its
+    // transaction is 61ms: 1ms of real latency plus the 60ms its learned offset
+    // was behind the server.
+    let mut server = std::collections::HashMap::from([(a_bucket.index, 1_i64)]);
+    let decision =
+        model_sub_bucket_decision(&mut server, b_selects, Duration::from_millis(61), 1, 1);
+    assert_eq!(
+        decision.counted,
+        Some(2),
+        "B must count A's still-live charge plus its own"
+    );
+    assert!(
+        !decision.admitted,
+        "a 1/s quota already spent must refuse B"
+    );
+
+    // And the age that makes this the correction rather than a restatement.
+    let age = b_executes.saturating_sub(a_executes);
+    assert_eq!(age, Duration::from_micros(1_178_000));
+    assert!(
+        age > Duration::from_secs(1) + 2 * sub_bucket,
+        "the retired W + 2*(W/K) claim would have excluded a charge this old: {age:?}"
+    );
+    assert!(
+        age <= Duration::from_secs(1) + 3 * sub_bucket,
+        "and the corrected W + 3*(W/K) bound must still contain it: {age:?}"
+    );
+}
+
+/// The small-quota quantisation is NOT a regression introduced by the
+/// sub-bucket ladder: the two-window weighted estimate it replaced refused a
+/// `1/s` client every other request as well.
+///
+/// The weighted estimate still weighs a full `previous` bucket at `0.95` when
+/// the current window is 5% elapsed, so `0.95 + 1 > 1` refuses — exactly every
+/// other request, indefinitely. The sub-bucket ladder is no worse on the same
+/// timeline, and it is what keeps the LARGER limits near their configured rate,
+/// where `previous + current` would have halved those too.
+#[test]
+fn the_retired_weighted_estimate_halved_small_quotas_too() {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+    // A well-behaved `1/s` poller, deliberately a touch SLOWER than its quota.
+    let spacing_nanos = 1_050_000_000_u64;
+    let offered = 20_u64;
+
+    let mut weighted = std::collections::HashMap::new();
+    let mut weighted_admitted = 0_u64;
+    let mut buckets = std::collections::HashMap::new();
+    let mut sub_bucket_admitted = 0_u64;
+    for attempt in 0..offered {
+        let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+        if model_weighted_admits(&mut weighted, at, 1, 1) {
+            weighted_admitted += 1;
+        }
+        if model_sub_bucket_admits(&mut buckets, at, Duration::ZERO, 1, 1) {
+            sub_bucket_admitted += 1;
+        }
+    }
+
+    // Exactly alternating: a refusal rolls its own increment back, so the next
+    // request sees `previous = 0` and is admitted, and that admission makes the
+    // one after it refuse. `previous` still weighs 0.95 at 5% elapsed, so the
+    // odd requests never squeeze in.
+    assert_eq!(
+        weighted_admitted, 10,
+        "the retired weighted estimate admitted only every other request"
+    );
+    assert!(
+        sub_bucket_admitted >= weighted_admitted,
+        "the sub-bucket ladder must be no worse than what it replaced at limit 1: \
+         {sub_bucket_admitted} vs {weighted_admitted} of {offered}"
+    );
+    assert!(
+        sub_bucket_admitted < offered,
+        "the quota must still bind: {sub_bucket_admitted}/{offered}"
+    );
+}
+
+/// A client three sub-buckets slower than its configured rate is admitted in
+/// full, whatever its placement lag.
+///
+/// This is the other side of the quantisation bound, and it is what makes the
+/// cost a *known* one rather than an unbounded throttle. `W + 3 * (W / K)` — one
+/// window plus the whole of the extra history a straddling reader can reach —
+/// is the spacing `docs/plugins.md` promises, so it must hold at a placement
+/// lag of one full sub-bucket as well as at none. A homogeneous stream with no
+/// lag clears at the narrower `W + 2 * (W / K)` too, which is the figure that
+/// applied before the reader's own lag was accounted for.
+#[test]
+fn traffic_three_sub_buckets_slower_than_the_configured_rate_is_fully_admitted() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    let sub_bucket_nanos = NANOS_PER_SECOND / REDIS_WINDOW_SUB_BUCKETS as u64;
+    // One window plus THREE sub-buckets, divided across the limit.
+    let cycle_nanos = NANOS_PER_SECOND + 3 * sub_bucket_nanos;
+    // And the narrower cycle, which only the no-lag stream is promised.
+    let narrow_cycle_nanos = NANOS_PER_SECOND + 2 * sub_bucket_nanos;
+    assert_eq!(narrow_cycle_nanos, NANOS_PER_SECOND + NANOS_PER_SECOND / 8);
+
+    for limit in [1_u64, 2, 8] {
+        for (cycle, latency, label) in [
+            (cycle_nanos, Duration::ZERO, "W + 3*W/K, no placement lag"),
+            (
+                cycle_nanos,
+                Duration::from_nanos(sub_bucket_nanos),
+                "W + 3*W/K, a full sub-bucket of placement lag",
+            ),
+            (
+                narrow_cycle_nanos,
+                Duration::ZERO,
+                "W + 2*W/K, no placement lag",
+            ),
+        ] {
+            let spacing_nanos = cycle / limit;
+            let offered = 40_u64;
+            let mut buckets = std::collections::HashMap::new();
+            let mut admitted = 0_u64;
+            for attempt in 0..offered {
+                let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+                if model_sub_bucket_admits(&mut buckets, at, latency, 1, limit) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, offered,
+                "limit {limit} ({label}): a client spaced this far apart must never be refused"
+            );
+        }
+    }
+}
+
+/// The settlement judgement, against the server clock that `EXEC` returned. It
+/// is TWO-SIDED, and both ends are load-bearing.
+///
+/// Late (`> b + 1`) means a peer may have charged a bucket this ladder neither
+/// read nor charged. EARLY (`< b`) means the charge was placed in the FUTURE,
+/// where no peer's trailing window reaches it — the case a gateway whose clock
+/// runs ahead of Redis produces, and the one that let an unsampled gateway at
+/// `700s` charge bucket `11200` while the server ordered everything at `1600`.
+///
+/// Together the two ends pin every retained charge's key to
+/// `{exec_bucket - 1, exec_bucket}`, which is exactly the span the ladder's
+/// extra old counter covers.
+#[test]
+fn a_charge_is_settled_only_within_one_sub_bucket_of_its_selection() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        RedisRateLimitClient, sub_bucket_charge_is_settled,
+    };
+
+    let ms = Duration::from_millis;
+    let selected = RedisRateLimitClient::sub_bucket_at(ms(100_000), 1);
+    assert_eq!(selected.index, 1_600);
+
+    // Same bucket, and the next one: the ladder read `1601`, so a peer that
+    // charged there is already counted.
+    assert!(sub_bucket_charge_is_settled(selected, ms(100_062)));
+    assert!(sub_bucket_charge_is_settled(selected, ms(100_124)));
+    // Two buckets on: `1602` was neither read nor charged, so a peer there is
+    // invisible and the decision cannot be published.
+    assert!(!sub_bucket_charge_is_settled(selected, ms(100_125)));
+    assert!(!sub_bucket_charge_is_settled(selected, ms(100_600)));
+
+    // A charge the server applied BEFORE the bucket it was keyed to sits in the
+    // future, where no peer's trailing window reaches it. Accepting it was the
+    // hole that let a gateway whose clock ran ahead of Redis charge an
+    // unreachable ladder and then admit again on the corrected one.
+    assert!(!sub_bucket_charge_is_settled(selected, ms(99_999)));
+    assert!(!sub_bucket_charge_is_settled(selected, ms(99_000)));
+
+    // One bucket back is a whole sub-bucket of placement error, so it is
+    // refused just like one bucket too far forward: the band is exactly
+    // `[b, b + 1]`.
+    let ahead = RedisRateLimitClient::sub_bucket_at(ms(700_000), 1);
+    assert_eq!(ahead.index, 11_200);
+    assert!(!sub_bucket_charge_is_settled(ahead, ms(100_000)));
+    assert!(sub_bucket_charge_is_settled(ahead, ms(700_000)));
+}
+
+/// The admission decision reads the bucket clock only through the client's
+/// server-clock correction, and settles on the instant `EXEC` returned.
+///
+/// The bare local clock must not appear here at all: a raw `SystemTime` sample
+/// is what let two gateways disagree about which sub-bucket "now" is, and a
+/// local post-`EXEC` sample is what conflated harmless reply latency with a
+/// genuinely late execution.
+#[test]
+fn a_quota_decision_reads_the_bucket_clock_only_through_the_server_correction() {
+    let source = include_str!("../../../src/plugins/utils/rate_limit.rs");
+    let body = source
+        .split("async fn check_http_windows_redis(")
+        .nth(1)
+        .expect("check_http_windows_redis must exist");
+    let body = body
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("function body ends before the test-only items");
+
+    assert_eq!(
+        body.matches("redis_epoch_now()").count(),
+        0,
+        "admission must never read this process's clock directly; every instant \
+         comes from the client's server-clock correction"
+    );
+    // Per-window live sampling is what the shared sample replaced.
+    assert!(
+        !body.contains("RedisRateLimitClient::sub_bucket("),
+        "every window must derive its bucket from the shared sample"
+    );
+    let seed = body
+        .find("redis.ensure_clock_seeded().await;")
+        .expect("the first selection must come after the connection probe");
+    let select = body
+        .find("let mut sampled_at = redis.server_clock().now();")
+        .expect("the first ladder must be built on the corrected server clock");
+    assert!(
+        seed < select,
+        "bucket selection otherwise precedes connection acquisition, so the FIRST \
+         request of a client's life would select on the raw local clock"
+    );
+    assert!(
+        body.contains("RedisRateLimitClient::sub_bucket_at(sampled_at, window_seconds)"),
+        "the ladder must be derived from the captured instant"
+    );
+    assert!(
+        body.contains("charged.settled_at()"),
+        "settlement must use the server clock the charge transaction returned"
+    );
+    assert!(
+        body.contains("sub_bucket_charge_is_settled(charge.bucket(), settled_at)"),
+        "the settlement check must use the shared staleness helper"
+    );
+    assert!(
+        body.contains("sampled_at = settled_at;"),
+        "the rebuild must reuse the server instant that proved the rollover"
+    );
+    assert!(
+        body.contains("compensation.confirmed().await"),
+        "the rebuild must wait for its own hand-back to land"
+    );
+}
+
+/// Every production token-accounting path reasons in the ONE shared weighted
+/// formula, so a change to it cannot leave one caller behind with a green test.
+///
+/// The `ai_rate_limiter` `Check`/`Reserve`/`AdjustUsage` arms and the
+/// `ws_rate_limiting` frame budget each used to spell the estimate out inline;
+/// the retained `FixedWindow` decay coverage then proved nothing about them.
+#[test]
+fn token_accounting_paths_share_the_one_weighted_formula() {
+    let source = include_str!("../../../src/plugins/utils/rate_limit.rs");
+
+    assert!(
+        source.contains("pub(crate) fn weighted_window_count("),
+        "the weighted estimate must live in one shared helper"
+    );
+    // Three ai_rate_limiter arms, the ws_rate_limiting frame budget, and
+    // FixedWindow::weighted_count.
+    assert_eq!(
+        source.matches("weighted_window_count(").count(),
+        6,
+        "every weighted caller must route through the shared helper"
+    );
+    assert!(
+        !source.contains("as f64 * (1.0 - elapsed_fraction)"),
+        "no caller may keep its own inline copy of the weighted formula"
+    );
+}
+
 #[test]
 fn shared_consumers_use_same_window_progress_helper() {
     // rate_limiting, GraphQL type/named-operation limits, and grpc_method_router
-    // per-method limits all reach check_http_windows_redis → window_progress.
-    // Prove the shared helper (not a per-plugin copy) is what the test support
-    // and live clock path expose.
+    // per-method limits all reach check_http_windows_redis → sub_bucket, and the
+    // token-accounting paths (`ai_rate_limiter`, `ws_rate_limiting`) all reach
+    // window_progress. Prove the shared helpers (not per-plugin copies) are what
+    // the test support and live clock paths expose.
     use ferrum_edge::_test_support::{redis_window_progress, redis_window_progress_at};
-    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, RedisRateLimitClient,
+    };
 
     let at = redis_window_progress_at(Duration::from_millis(1_250), 1);
     let direct = RedisRateLimitClient::window_progress_at(Duration::from_millis(1_250), 1);
     assert_eq!(at, direct);
     assert!((at.elapsed_fraction - 0.25).abs() < 1e-12);
 
+    // The quota ladder is derived from the same wall clock. Sample the window
+    // first: a sub-bucket taken no earlier than it can never precede that
+    // window's first sub-bucket.
     let live = redis_window_progress(1);
     assert!(live.elapsed_fraction >= 0.0 && live.elapsed_fraction < 1.0);
+    let live_bucket = RedisRateLimitClient::sub_bucket(1);
+    assert_eq!(live_bucket.window_seconds, 1);
+    assert!(live_bucket.index >= live.index * REDIS_WINDOW_SUB_BUCKETS as u64);
+}
+
+// ── Reordered / stalled quota transactions (review of PR #5584) ───────────
+//
+// Bucket selection samples the clock BEFORE the pooled connection is acquired,
+// so a charge always executes slightly after it was built. Two properties have
+// to hold under that:
+//
+// 1. Two requests on either side of a sub-bucket boundary must not both be
+//    admitted against a one-request quota, whichever transaction reaches the
+//    server first. The forward `GET` is what makes that order-independent.
+// 2. A stall longer than a whole sub-bucket is not covered by the forward
+//    `GET`, so the caller must hand its charge back and rebuild once, and fail
+//    closed if that rebuild rolls over as well.
+//
+// Both are exercised against a fake RESP server that keeps a REAL keyspace, so
+// `GET`/`INCR`/`DECR` answer with the values the ladder actually wrote.
+
+/// Parse one complete RESP command array out of `buf`, returning every
+/// argument.
+///
+/// Framing is exact for the same reason [`parse_resp_command`] is: a server
+/// that guesses at chunk boundaries answers a split or coalesced write with the
+/// wrong number of replies and drives the client's multiplexed connection into
+/// an accounting underflow instead of the behavior under test.
+fn parse_resp_command_args(buf: &[u8]) -> Option<(Vec<String>, usize)> {
+    fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+        let rest = buf.get(from..)?;
+        let idx = rest.windows(2).position(|w| w == b"\r\n")?;
+        Some((&rest[..idx], from + idx + 2))
+    }
+
+    if *buf.first()? != b'*' {
+        return None;
+    }
+    let (count_line, mut cursor) = read_line(buf, 1)?;
+    let argc: usize = std::str::from_utf8(count_line).ok()?.parse().ok()?;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if *buf.get(cursor)? != b'$' {
+            return None;
+        }
+        let (len_line, after_len) = read_line(buf, cursor + 1)?;
+        let len: usize = std::str::from_utf8(len_line).ok()?.parse().ok()?;
+        let end = after_len.checked_add(len)?;
+        let payload = buf.get(after_len..end)?;
+        if buf.get(end..end + 2)? != b"\r\n" {
+            return None;
+        }
+        args.push(String::from_utf8_lossy(payload).to_string());
+        cursor = end + 2;
+    }
+    Some((args, cursor))
+}
+
+/// Where a held `EXEC` sleeps relative to APPLYING its commands.
+///
+/// The distinction is the whole point of judging settlement on the server's
+/// own clock: only one of these two is a hazard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldPhase {
+    /// Sleep BEFORE applying: the transaction genuinely executes late, so its
+    /// own `TIME` reports the late instant and a peer may have charged a bucket
+    /// this ladder never read. This is the real hazard.
+    BeforeApply,
+    /// Sleep AFTER applying: the transaction executed on time and only its
+    /// REPLY is late. Harmless — a peer charging afterwards reads this
+    /// request's own increment — but a local post-`EXEC` sample cannot tell the
+    /// two apart and would roll the ladder over for nothing.
+    AfterApply,
+}
+
+/// How the fake server answers `TIME`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ServerTimeMode {
+    /// The server's real clock, which is also the clock the client's local
+    /// samples read, so the learned offset settles near zero.
+    RealClock,
+    /// A server clock genuinely ahead of this process's, so a client that used
+    /// its own clock would pick different sub-buckets than the server orders
+    /// charges on.
+    Ahead(Duration),
+    /// A server clock genuinely BEHIND this process's: the gateway is fast
+    /// relative to Redis, so an uncorrected selection lands in the future,
+    /// where no peer's trailing window reaches it.
+    Behind(Duration),
+    /// A restrictive ACL: `TIME` is refused. A request-quota client's connection
+    /// cannot be screened, so the store is unavailable and
+    /// `redis_failure_policy` governs. A client that reads no clock never sends
+    /// the command and is unaffected.
+    Denied,
+    /// A RESP-compatible server that does not implement `TIME` at all. Like
+    /// `Denied`, a permanent statement about the endpoint — and the same
+    /// outcome, because the bucket clock is not optional.
+    UnknownCommand,
+    /// The standalone probe is ALLOWED and answers something that is not a
+    /// clock. That says nothing about the ACL, so the connection must be
+    /// treated as unscreened rather than silently downgraded.
+    MalformedProbe,
+    /// The standalone probe never answers inside the screened per-command
+    /// deadline.
+    ProbeTimeout,
+    /// The server closes the connection when the standalone probe arrives.
+    ProbeTransportError,
+    /// The standalone probe answers a real clock, but the `TIME` queued inside
+    /// a transaction answers something that is not one. The client must treat
+    /// that as an unusable endpoint rather than silently reinstating its own
+    /// clock on an endpoint that claimed to support the server's.
+    MalformedInTransaction,
+}
+
+/// Knobs for one fake server. Defaults answer everything immediately from the
+/// real clock.
+#[derive(Clone, Copy)]
+struct KeyspaceServerOptions {
+    charge_delay: Duration,
+    delayed_charges: usize,
+    hold_phase: HoldPhase,
+    compensation_delay: Duration,
+    delayed_compensations: usize,
+    time_mode: ServerTimeMode,
+    /// Append one bogus element to every `EXEC` array, so the client's
+    /// reply-length validation sees a shape it cannot pair with its windows.
+    extra_exec_element: bool,
+}
+
+impl Default for KeyspaceServerOptions {
+    fn default() -> Self {
+        Self {
+            charge_delay: Duration::ZERO,
+            delayed_charges: 0,
+            hold_phase: HoldPhase::BeforeApply,
+            compensation_delay: Duration::ZERO,
+            delayed_compensations: 0,
+            time_mode: ServerTimeMode::RealClock,
+            extra_exec_element: false,
+        }
+    }
+}
+
+/// What one `EXEC` does about timing: how long it is held, and on which side of
+/// applying its commands.
+struct ExecSchedule {
+    hold: Duration,
+    phase: HoldPhase,
+}
+
+/// Whether an `EXEC` batch queued a command with this name.
+fn batch_contains(batch: &[Vec<String>], command: &str) -> bool {
+    batch
+        .iter()
+        .filter_map(|queued| queued.first())
+        .any(|name| name.eq_ignore_ascii_case(command))
+}
+
+/// Shared keyspace and counters of the fake server, cloned into each
+/// connection task.
+#[derive(Clone)]
+struct KeyspaceState {
+    keys: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    incrs: Arc<AtomicUsize>,
+    decrs: Arc<AtomicUsize>,
+    charges: Arc<AtomicUsize>,
+    compensations: Arc<AtomicUsize>,
+    /// Applied mutations in the order the keyspace saw them. Recorded under the
+    /// keyspace lock, so it is the real serialization order across connections
+    /// and not a dispatch order — which is what an ordering assertion needs.
+    ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Standalone `TIME` commands this server answered — the connection-screening
+    /// probe, counted apart from the `TIME` that rides inside a charge
+    /// transaction. Zero proves a client never asked for the server clock.
+    clock_probes: Arc<AtomicUsize>,
+    /// The fixture's `TIME` behaviour, settable while the server is running so
+    /// a test can revoke or restore the ACL under a LIVE client — which is the
+    /// only way to exercise a clock-mode transition rather than a startup
+    /// verdict.
+    time_mode: Arc<std::sync::Mutex<ServerTimeMode>>,
+    options: KeyspaceServerOptions,
+}
+
+impl KeyspaceState {
+    /// The fixture's current `TIME` behaviour.
+    fn time_mode(&self) -> ServerTimeMode {
+        *self.time_mode.lock().expect("time mode mutex")
+    }
+
+    /// This server's own clock, as `TIME` would report it.
+    fn server_now(&self) -> Duration {
+        let real = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        match self.time_mode() {
+            ServerTimeMode::Ahead(shift) => real.saturating_add(shift),
+            ServerTimeMode::Behind(shift) => real.saturating_sub(shift),
+            _ => real,
+        }
+    }
+
+    /// Whether a `TIME` queued inside a transaction answers a non-clock.
+    fn breaks_transaction_time(&self) -> bool {
+        self.time_mode() == ServerTimeMode::MalformedInTransaction
+    }
+
+    /// Apply ONE command to the fake keyspace and return its RESP reply.
+    fn apply(&self, args: &[String], in_transaction: bool) -> Vec<u8> {
+        let name = args
+            .first()
+            .map(|arg| arg.to_uppercase())
+            .unwrap_or_default();
+        // Read the clock before taking the keyspace lock; `TIME` touches no key.
+        if name == "TIME" {
+            if in_transaction && self.breaks_transaction_time() {
+                return b"+OK\r\n".to_vec();
+            }
+            if !in_transaction {
+                self.clock_probes.fetch_add(1, Ordering::Relaxed);
+            }
+            return match self.time_mode() {
+                ServerTimeMode::Denied => TIME_DENIED_REPLY.to_vec(),
+                ServerTimeMode::UnknownCommand => TIME_UNKNOWN_COMMAND_REPLY.to_vec(),
+                ServerTimeMode::MalformedProbe => b"+OK\r\n".to_vec(),
+                _ => encode_server_time(self.server_now()),
+            };
+        }
+        let key = args.get(1).cloned().unwrap_or_default();
+        let mut store = self.keys.lock().expect("keyspace mutex");
+        match name.as_str() {
+            "GET" => match store.get(&key) {
+                Some(value) => {
+                    let rendered = value.to_string();
+                    format!("${}\r\n{rendered}\r\n", rendered.len()).into_bytes()
+                }
+                None => b"$-1\r\n".to_vec(),
+            },
+            "INCR" => {
+                self.incrs.fetch_add(1, Ordering::Relaxed);
+                self.ops.lock().expect("op log mutex").push("INCR");
+                let slot = store.entry(key).or_insert(0);
+                *slot += 1;
+                let value = *slot;
+                format!(":{value}\r\n").into_bytes()
+            }
+            "DECR" => {
+                self.decrs.fetch_add(1, Ordering::Relaxed);
+                self.ops.lock().expect("op log mutex").push("DECR");
+                let slot = store.entry(key).or_insert(0);
+                *slot -= 1;
+                let value = *slot;
+                format!(":{value}\r\n").into_bytes()
+            }
+            "EXPIRE" => b":1\r\n".to_vec(),
+            _ => b"+OK\r\n".to_vec(),
+        }
+    }
+
+    /// Classify one `EXEC`'s queued batch and consume its place in the
+    /// fixture's schedule. Called exactly once per transaction.
+    fn schedule_for(&self, batch: &[Vec<String>]) -> ExecSchedule {
+        if batch_contains(batch, "INCR") {
+            let index = self.charges.fetch_add(1, Ordering::Relaxed);
+            return ExecSchedule {
+                hold: if index < self.options.delayed_charges {
+                    self.options.charge_delay
+                } else {
+                    Duration::ZERO
+                },
+                phase: self.options.hold_phase,
+            };
+        }
+        if batch_contains(batch, "DECR") {
+            let index = self.compensations.fetch_add(1, Ordering::Relaxed);
+            return ExecSchedule {
+                // A held compensation is held before it applies: the point is
+                // that the `DECR` has genuinely not landed yet.
+                hold: if index < self.options.delayed_compensations {
+                    self.options.compensation_delay
+                } else {
+                    Duration::ZERO
+                },
+                phase: HoldPhase::BeforeApply,
+            };
+        }
+        ExecSchedule {
+            hold: Duration::ZERO,
+            phase: HoldPhase::BeforeApply,
+        }
+    }
+
+    /// Handle one received command and append its reply. `false` closes the
+    /// connection instead of answering, which is how the fixture produces a
+    /// transport failure on a specific command.
+    async fn handle(
+        &self,
+        queued: &mut Option<Vec<Vec<String>>>,
+        args: Vec<String>,
+        reply: &mut Vec<u8>,
+    ) -> bool {
+        let name = args
+            .first()
+            .map(|arg| arg.to_uppercase())
+            .unwrap_or_default();
+        // The standalone `TIME` probe is the only command whose failure mode is
+        // about the TRANSPORT rather than the reply, so it is handled here (in
+        // async context) rather than in the synchronous `apply`.
+        if name == "TIME" && queued.is_none() {
+            match self.time_mode() {
+                ServerTimeMode::ProbeTimeout => {
+                    // Far past the screened per-command deadline.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    reply.extend_from_slice(&self.apply(&args, false));
+                }
+                ServerTimeMode::ProbeTransportError => return false,
+                _ => reply.extend_from_slice(&self.apply(&args, false)),
+            }
+            return true;
+        }
+        match name.as_str() {
+            "INFO" => {
+                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                let bulk = format!("${}\r\n{text}\r\n", text.len());
+                reply.extend_from_slice(bulk.as_bytes());
+            }
+            "MULTI" => {
+                *queued = Some(Vec::new());
+                reply.extend_from_slice(b"+OK\r\n");
+            }
+            "EXEC" => {
+                let batch = queued.take().unwrap_or_default();
+                let schedule = self.schedule_for(&batch);
+                if !schedule.hold.is_zero() && schedule.phase == HoldPhase::BeforeApply {
+                    tokio::time::sleep(schedule.hold).await;
+                }
+                let extra = usize::from(self.options.extra_exec_element);
+                let values = batch.len() + extra;
+                let mut body = format!("*{values}\r\n").into_bytes();
+                for command in &batch {
+                    body.extend_from_slice(&self.apply(command, true));
+                }
+                if self.options.extra_exec_element {
+                    body.extend_from_slice(b":1\r\n");
+                }
+                if !schedule.hold.is_zero() && schedule.phase == HoldPhase::AfterApply {
+                    tokio::time::sleep(schedule.hold).await;
+                }
+                reply.extend_from_slice(&body);
+            }
+            _ => match queued.as_mut() {
+                Some(batch) => {
+                    batch.push(args);
+                    reply.extend_from_slice(b"+QUEUED\r\n");
+                }
+                None => reply.extend_from_slice(&self.apply(&args, false)),
+            },
+        }
+        true
+    }
+}
+
+struct KeyspaceServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    state: KeyspaceState,
+}
+
+impl KeyspaceServer {
+    /// Change how the server answers `TIME` while a client is already running,
+    /// so a test can revoke or restore the ACL mid-life.
+    fn set_time_mode(&self, mode: ServerTimeMode) {
+        *self.state.time_mode.lock().expect("time mode mutex") = mode;
+    }
+
+    fn counter(&self, key: &str) -> i64 {
+        self.state
+            .keys
+            .lock()
+            .expect("keyspace mutex")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn incrs(&self) -> usize {
+        self.state.incrs.load(Ordering::Relaxed)
+    }
+
+    fn decrs(&self) -> usize {
+        self.state.decrs.load(Ordering::Relaxed)
+    }
+
+    /// Standalone `TIME` commands answered: the connection-screening probe.
+    fn clock_probes(&self) -> usize {
+        self.state.clock_probes.load(Ordering::Relaxed)
+    }
+
+    /// Every key the fake keyspace holds.
+    fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .state
+            .keys
+            .lock()
+            .expect("keyspace mutex")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Applied `INCR`/`DECR` mutations, in keyspace order.
+    fn ops(&self) -> Vec<&'static str> {
+        self.state.ops.lock().expect("op log mutex").clone()
+    }
+
+    fn charged_total(&self) -> i64 {
+        self.state
+            .keys
+            .lock()
+            .expect("keyspace mutex")
+            .values()
+            .copied()
+            .sum()
+    }
+}
+
+/// Every sub-bucket the fake keyspace holds, as `(sub_index, counter)`, oldest
+/// first.
+///
+/// Placement assertions read this rather than recomputing the expected index,
+/// so a sub-bucket boundary crossing between the traffic and the assertion
+/// cannot decide the result.
+fn charged_sub_buckets(server: &KeyspaceServer) -> Vec<(u64, i64)> {
+    let mut charged: Vec<(u64, i64)> = server
+        .keys()
+        .into_iter()
+        .map(|key| {
+            let index: u64 = key
+                .rsplit(':')
+                .next()
+                .expect("the key names its sub-bucket last")
+                .parse()
+                .expect("sub-bucket index");
+            (index, server.counter(&key))
+        })
+        .collect();
+    charged.sort_by_key(|(index, _)| *index);
+    charged
+}
+
+/// Minimal RESP server with a REAL integer keyspace and working `MULTI`/`EXEC`.
+///
+/// `GET` answers the stored value (or nil), `INCR`/`DECR` mutate and answer the
+/// new value, `EXPIRE` answers `:1`, `TIME` answers this fixture's server clock
+/// (or `NOPERM` under [`ServerTimeMode::Denied`]), `INFO` reports a non-Cluster
+/// server, and anything else answers `+OK`. Inside a transaction every queued
+/// command answers `+QUEUED` and `EXEC` answers the array of their results,
+/// which is the shape `redis::pipe().atomic()` decodes.
+///
+/// `delayed_charges` holds the FIRST `delayed_charges` CHARGE transactions for
+/// `charge_delay`, and `delayed_compensations` does the same for hand-backs.
+/// `hold_phase` decides whether a held charge sleeps before applying (a real
+/// execution stall, so its own `TIME` reports the late instant) or after (only
+/// the reply is late). All counts are per server, not per connection.
+async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> KeyspaceServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let state = KeyspaceState {
+        keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        incrs: Arc::new(AtomicUsize::new(0)),
+        decrs: Arc::new(AtomicUsize::new(0)),
+        charges: Arc::new(AtomicUsize::new(0)),
+        compensations: Arc::new(AtomicUsize::new(0)),
+        ops: Arc::new(std::sync::Mutex::new(Vec::new())),
+        clock_probes: Arc::new(AtomicUsize::new(0)),
+        time_mode: Arc::new(std::sync::Mutex::new(options.time_mode)),
+        options,
+    };
+    let accept_state = state.clone();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break; };
+                    tokio::spawn(serve_keyspace_connection(stream, accept_state.clone()));
+                }
+            }
+        }
+    });
+
+    KeyspaceServer {
+        port,
+        shutdown: shutdown_tx,
+        state,
+    }
+}
+
+/// One connection's read/reply loop: exactly one reply per fully received
+/// command, so the client's in-flight accounting always matches.
+async fn serve_keyspace_connection(mut stream: tokio::net::TcpStream, state: KeyspaceState) {
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    // Commands queued by the current MULTI, if any.
+    let mut queued: Option<Vec<Vec<String>>> = None;
+    loop {
+        let n = match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&buf[..n]);
+        let mut reply = Vec::new();
+        let mut keep_open = true;
+        while let Some((args, consumed)) = parse_resp_command_args(&pending) {
+            pending.drain(..consumed);
+            if !state.handle(&mut queued, args, &mut reply).await {
+                keep_open = false;
+                break;
+            }
+        }
+        if !keep_open {
+            let _ = stream.write_all(&reply).await;
+            return;
+        }
+        if reply.is_empty() {
+            continue;
+        }
+        if stream.write_all(&reply).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn keyspace_config(port: u16) -> RedisConfig {
+    let url = format!("redis://127.0.0.1:{port}/0");
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = 5;
+    // Long enough that no background recovery dial happens during a test.
+    config.health_check_interval_seconds = 3600;
+    // Four pooled slots so a held charge cannot serialize an unrelated
+    // transaction behind it on one socket; the timing under test is the
+    // client's, not the fake server's read loop.
+    config.pool_size = 4;
+    config
+}
+
+fn keyspace_client(port: u16) -> RedisRateLimitClient {
+    redis_rate_limit_client_for_test(keyspace_config(port))
+}
+
+/// Two requests that select adjacent sub-buckets must not both be admitted
+/// against a one-request quota, even when the NEWER ladder executes first.
+///
+/// Review finding (MAJOR 2): A samples `100.124s` and selects bucket `1601`,
+/// then stalls behind connection acquisition; B samples `100.126s`, selects
+/// `1602`, and executes first. Both timestamps are inside one trailing second.
+/// With a trailing-only ladder A would read `1584..=1601`, never see B's charge
+/// in `1602`, and be admitted alongside it. Reading `1602` as well makes
+/// whichever transaction lands SECOND observe the other.
+#[tokio::test]
+async fn a_reordered_transaction_across_a_sub_bucket_boundary_cannot_double_admit() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_TRAILING_SUB_BUCKETS, RedisWindowCharges,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    let earlier = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
+    let later = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_126_000), 1);
+    assert_eq!(earlier.index, 1_601);
+    assert_eq!(
+        later.index,
+        earlier.index + 1,
+        "the two samples must straddle exactly one sub-bucket boundary"
+    );
+
+    let mut stalled = RedisWindowCharges::default();
+    assert!(stalled.push(client.window_charge("ip:127.0.0.1", earlier, 3)));
+    let mut newer = RedisWindowCharges::default();
+    assert!(newer.push(client.window_charge("ip:127.0.0.1", later, 3)));
+    let stalled_ladder: Vec<String> = stalled.as_slice()[0]
+        .trailing_keys()
+        .map(str::to_string)
+        .collect();
+    let stalled_charged = stalled.as_slice()[0].charged_key().to_string();
+
+    // The NEWER ladder executes FIRST — the reordering the finding describes.
+    let newer_counts = client
+        .charge_rate_limit_windows(newer.as_slice())
+        .await
+        .expect("the newer transaction must execute");
+    let stalled_counts = client
+        .charge_rate_limit_windows(stalled.as_slice())
+        .await
+        .expect("the stalled transaction must execute");
+
+    let limit = 1_u64;
+    let admitted = [newer_counts, stalled_counts]
+        .iter()
+        .filter(|counts| counts.as_slice()[0] <= limit)
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "exactly one of two requests inside one trailing second may be admitted; \
+         newer={newer_counts:?} stalled={stalled_counts:?}"
+    );
+    assert_eq!(
+        newer_counts.as_slice()[0],
+        1,
+        "the transaction that landed first sees only itself"
+    );
+    assert_eq!(
+        stalled_counts.as_slice()[0],
+        2,
+        "the transaction that landed second must see the peer one bucket ahead"
+    );
+
+    // What the trailing-only ladder would have read: its own increment and
+    // nothing else, so BOTH would have been admitted. This is the arithmetic
+    // the forward `GET` changes, read straight off the fake keyspace.
+    let trailing_only: i64 = stalled_ladder
+        .iter()
+        .map(|key| server.counter(key))
+        .sum::<i64>()
+        + server.counter(&stalled_charged);
+    assert_eq!(
+        trailing_only, 1,
+        "without the forward counter the stalled ladder sums to 1 and over-admits"
+    );
+    assert_eq!(stalled_ladder.len(), REDIS_WINDOW_TRAILING_SUB_BUCKETS);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A charge whose sub-bucket rolled past `b + 1` before the reply arrived is
+/// handed back and rebuilt exactly once.
+///
+/// Beyond one sub-bucket the forward `GET` no longer covers the drift: a peer
+/// may have charged a bucket the ladder neither read nor charged. The decision
+/// is therefore not published — the charge is compensated and the ladder is
+/// rebuilt from the server instant that proved the rollover, for one more
+/// transaction.
+#[tokio::test]
+async fn a_charge_that_rolls_past_its_sub_bucket_is_handed_back_and_rebuilt_once() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    // A one-second window has 62.5ms sub-buckets, so stalling the first
+    // transaction for 250ms before it EXECUTES guarantees the server applies it
+    // well past `b + 1` and reports that instant in its own `TIME`. The hold
+    // stays inside the 500ms screened per-command response deadline.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::BeforeApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let outcome = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the rebuilt pass must produce a decision");
+    assert!(
+        outcome.allowed,
+        "an empty quota admits once the rebuilt ladder lands"
+    );
+
+    // Two charges: the rolled-over pass and the rebuild. One compensation: the
+    // rolled-over pass handing its own charge back. The hand-back is detached,
+    // so settle it before reading the counters.
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.incrs(),
+        2,
+        "the rolled-over pass and the rebuild are two charges, and no more"
+    );
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the abandoned pass must hand its own charge back"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A second consecutive rollover fails closed rather than publishing a decision
+/// derived from a ladder that provably missed part of its own window.
+#[tokio::test]
+async fn a_second_sub_bucket_rollover_fails_closed() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    // Every CHARGE stalls 250ms before it executes, so the rebuild rolls over
+    // as well.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::BeforeApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "two consecutive rollovers must fail closed, not admit: {result:?}"
+    );
+
+    // Both passes handed their own charge back, so nothing is stranded.
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.incrs(),
+        2,
+        "the bounded rebuild must stop at two transactions"
+    );
+    assert_eq!(
+        server.decrs(),
+        2,
+        "both abandoned passes must hand their charges back"
+    );
+    assert_eq!(
+        server.charged_total(),
+        0,
+        "a fail-closed refusal leaves no lasting charge"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+// ── The shared bucket clock is Redis's own (review round 3 of PR #5584) ───
+//
+// Sub-buckets are only as shared as the clock that selects them. The forward
+// `GET` covers ONE sub-bucket of drift, and it has to spend that allowance on
+// transaction staleness; asking it to absorb clock skew as well lets a pair of
+// gateways consume it twice and both be admitted. Every charge transaction
+// therefore carries a `TIME`, and selection plus settlement run on the offset
+// it teaches the client.
+
+/// The offset arithmetic itself, without a server: integer, saturating, and
+/// clamped at the epoch.
+#[test]
+fn a_learned_offset_shifts_the_local_clock_onto_the_server_clock() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        RedisServerClock, apply_clock_offset, clock_offset_nanos,
+    };
+
+    let local = Duration::from_millis(100_251);
+    let server = Duration::from_millis(100_151);
+    let offset = clock_offset_nanos(server, local);
+    assert_eq!(offset, -100_000_000, "a gateway 100ms fast learns -100ms");
+    assert_eq!(apply_clock_offset(local, offset), server);
+
+    let behind = clock_offset_nanos(Duration::from_millis(500), Duration::from_millis(200));
+    assert_eq!(behind, 300_000_000);
+    assert_eq!(
+        apply_clock_offset(Duration::from_millis(200), behind),
+        Duration::from_millis(500)
+    );
+
+    // A nonsense offset clamps at the epoch instead of wrapping into a
+    // plausible-looking sub-bucket at the far end of the index space.
+    assert_eq!(
+        apply_clock_offset(Duration::from_millis(1), i64::MIN),
+        Duration::ZERO
+    );
+
+    // Unsampled, the clock IS the local clock; one reply is enough to move it.
+    let clock = RedisServerClock::new();
+    assert_eq!(clock.offset_nanos(), None);
+    assert_eq!(clock.at(local), local);
+    clock.record_reply(server, local);
+    assert_eq!(clock.offset_nanos(), Some(-100_000_000));
+    assert_eq!(clock.at(local), server);
+    assert_eq!(
+        clock.at(local + Duration::from_millis(40)),
+        server + Duration::from_millis(40),
+        "the correction is an offset, not a pinned instant"
+    );
+}
+
+/// A `TIME` reply is accepted only in the exact shape Redis documents.
+#[test]
+fn a_server_time_reply_is_parsed_strictly_or_not_at_all() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::parse_redis_server_time;
+
+    let ok = redis::Value::Array(vec![
+        redis::Value::BulkString(b"100".to_vec()),
+        redis::Value::BulkString(b"151000".to_vec()),
+    ]);
+    assert_eq!(
+        parse_redis_server_time(ok),
+        Some(Duration::from_millis(100_151))
+    );
+
+    for rejected in [
+        // Not an array at all: a server that answered `+OK` to `TIME`.
+        redis::Value::Okay,
+        // One element, or three: a shape this code cannot pair with a clock.
+        redis::Value::Array(vec![redis::Value::BulkString(b"100".to_vec())]),
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"100".to_vec()),
+            redis::Value::BulkString(b"1".to_vec()),
+            redis::Value::BulkString(b"1".to_vec()),
+        ]),
+        // A microsecond field outside its second.
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"100".to_vec()),
+            redis::Value::BulkString(b"1000000".to_vec()),
+        ]),
+        // Non-numeric text.
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"now".to_vec()),
+            redis::Value::BulkString(b"0".to_vec()),
+        ]),
+    ] {
+        // The parse consumes the reply, so render the shape before handing it over.
+        let rendered = format!("{rejected:?}");
+        assert_eq!(
+            parse_redis_server_time(rejected),
+            None,
+            "an unusable server clock must never be guessed at: {rendered}"
+        );
+    }
+}
+
+/// Review finding 1, first counterexample: skew PLUS transaction staleness.
+///
+/// Gateway B's clock runs 100ms ahead of A's. On their own clocks A samples
+/// `100.124` (bucket 1601) and B samples `100.251` (bucket 1604) for the same
+/// real instant `100.151`; B executes first, A's ladder stops at `1602`, and
+/// both are admitted against a one-request quota. Corrected onto the one server
+/// clock both pick adjacent buckets, so whichever lands second sees the other.
+#[tokio::test]
+async fn skewed_gateways_corrected_to_the_server_clock_cannot_double_admit() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisServerClock, RedisWindowCharges};
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    // Gateway A's clock IS the server's; gateway B's runs 100ms fast. Each
+    // learns its own offset from a `TIME` reply taken at its own local instant.
+    let a_clock = RedisServerClock::new();
+    a_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_000));
+    let b_clock = RedisServerClock::new();
+    b_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_100));
+    assert_eq!(a_clock.offset_nanos(), Some(0));
+    assert_eq!(b_clock.offset_nanos(), Some(-100_000_000));
+
+    // The real instants: A at 100.124 on the server clock, B 27ms later.
+    let a_local = Duration::from_micros(100_124_000);
+    let b_local = Duration::from_micros(100_251_000);
+
+    let a_raw = RedisRateLimitClient::sub_bucket_at(a_local, 1);
+    let b_raw = RedisRateLimitClient::sub_bucket_at(b_local, 1);
+    assert_eq!(a_raw.index, 1_601);
+    assert_eq!(
+        b_raw.index, 1_604,
+        "on its own fast clock B selects three buckets past A's — the gap the \
+         forward GET cannot cover"
+    );
+
+    let a_bucket = RedisRateLimitClient::sub_bucket_at(a_clock.at(a_local), 1);
+    let b_bucket = RedisRateLimitClient::sub_bucket_at(b_clock.at(b_local), 1);
+    assert_eq!(a_bucket.index, 1_601);
+    assert_eq!(
+        b_bucket.index, 1_602,
+        "corrected onto the server clock the two land in ADJACENT sub-buckets"
+    );
+
+    let mut a_charge = RedisWindowCharges::default();
+    assert!(a_charge.push(client.window_charge("ip:127.0.0.1", a_bucket, 3)));
+    let mut b_charge = RedisWindowCharges::default();
+    assert!(b_charge.push(client.window_charge("ip:127.0.0.1", b_bucket, 3)));
+
+    // B executes FIRST, exactly as the finding describes.
+    let b_counts = client
+        .charge_rate_limit_windows(b_charge.as_slice())
+        .await
+        .expect("B's transaction must execute");
+    let a_counts = client
+        .charge_rate_limit_windows(a_charge.as_slice())
+        .await
+        .expect("A's transaction must execute");
+
+    let limit = 1_u64;
+    let admitted = [&b_counts, &a_counts]
+        .iter()
+        .filter(|counts| counts.as_slice()[0] <= limit)
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "exactly one of two requests inside one trailing second may be admitted; \
+         b={b_counts:?} a={a_counts:?}"
+    );
+    assert_eq!(
+        a_counts.as_slice()[0],
+        2,
+        "A must observe B one bucket ahead"
+    );
+
+    // What the uncorrected pair would have read: A's ladder stops at 801 and
+    // never reaches B's charge in 802, so BOTH would have been admitted. Read
+    // straight off the fake keyspace.
+    let mut uncorrected = RedisWindowCharges::default();
+    assert!(uncorrected.push(client.window_charge("ip:127.0.0.1", b_raw, 3)));
+    let skewed_slot = &uncorrected.as_slice()[0];
+    let skewed_key = skewed_slot.charged_key().to_string();
+    let a_slot = &a_charge.as_slice()[0];
+    let mut a_ladder: Vec<String> = a_slot.trailing_keys().map(str::to_string).collect();
+    a_ladder.push(a_slot.charged_key().to_string());
+    a_ladder.push(a_slot.next_key().to_string());
+    assert!(
+        !a_ladder.contains(&skewed_key),
+        "the skewed bucket is outside A's ladder, which is exactly the \
+         over-admission the server clock removes"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Review finding 1, second counterexample: skew alone, at the OLDEST end.
+///
+/// No transaction delay at all. A admits at `100.124` (bucket 1601). 976ms
+/// later B, whose clock is 100ms fast, reads `101.200` and selects bucket 1619,
+/// whose ladder starts at 1602 — dropping A's admission although it is still
+/// inside the real trailing second. Corrected onto the server clock B selects
+/// 1617 and its ladder still covers 1601.
+#[tokio::test]
+async fn a_skewed_gateway_corrected_to_the_server_clock_keeps_the_oldest_live_charge() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisServerClock, RedisWindowCharges};
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    let b_clock = RedisServerClock::new();
+    b_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_100));
+
+    let a_bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
+    assert_eq!(a_bucket.index, 1_601);
+    let mut a_charge = RedisWindowCharges::default();
+    assert!(a_charge.push(client.window_charge("ip:127.0.0.1", a_bucket, 3)));
+    let a_counts = client
+        .charge_rate_limit_windows(a_charge.as_slice())
+        .await
+        .expect("A's admission must execute");
+    assert_eq!(a_counts.as_slice()[0], 1);
+    let a_key = a_charge.as_slice()[0].charged_key().to_string();
+
+    // B's own clock reads 101.200 for the real instant 101.100.
+    let b_local = Duration::from_micros(101_200_000);
+    let b_raw = RedisRateLimitClient::sub_bucket_at(b_local, 1);
+    let b_bucket = RedisRateLimitClient::sub_bucket_at(b_clock.at(b_local), 1);
+    assert_eq!(b_raw.index, 1_619);
+    assert_eq!(b_bucket.index, 1_617);
+
+    let mut skewed = RedisWindowCharges::default();
+    assert!(skewed.push(client.window_charge("ip:127.0.0.1", b_raw, 3)));
+    let raw_slot = &skewed.as_slice()[0];
+    let raw_ladder: Vec<String> = raw_slot.trailing_keys().map(str::to_string).collect();
+    assert!(
+        !raw_ladder.contains(&a_key),
+        "on its own fast clock B drops a still-live charge off the oldest end"
+    );
+
+    let mut corrected = RedisWindowCharges::default();
+    assert!(corrected.push(client.window_charge("ip:127.0.0.1", b_bucket, 3)));
+    let fixed_slot = &corrected.as_slice()[0];
+    let fixed_ladder: Vec<String> = fixed_slot.trailing_keys().map(str::to_string).collect();
+    assert!(
+        fixed_ladder.contains(&a_key),
+        "corrected onto the server clock the oldest live sub-bucket is still read"
+    );
+
+    let b_counts = client
+        .charge_rate_limit_windows(corrected.as_slice())
+        .await
+        .expect("B's transaction must execute");
+    assert_eq!(
+        b_counts.as_slice()[0],
+        2,
+        "B must count A's still-live admission; a one-request quota refuses it"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The offset is seeded from the connection probe BEFORE the first selection,
+/// and refreshed by every `EXEC` after it.
+///
+/// The fake server's clock runs ten minutes ahead of this process's, so a
+/// gateway that selected buckets from its own wall clock would write keys ten
+/// minutes away from the ones every other gateway charges. Bucket selection
+/// would otherwise precede connection acquisition, so `check_http_windows_redis`
+/// establishes the connection — and therefore runs its `TIME` probe — first.
+/// The startup rollover this replaces cost an extra transaction AND left the
+/// abandoned charge on a ladder no peer shares until its TTL elapsed.
+#[tokio::test]
+async fn a_charge_transaction_teaches_the_client_the_server_clock() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::redis_epoch_now;
+
+    const SHIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Ahead(SHIFT),
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    // Before any connection there is no sample, and the clock IS the local one.
+    assert_eq!(
+        client.server_clock().offset_nanos(),
+        None,
+        "a client that has never reached Redis has no offset to apply"
+    );
+    let local_before = redis_epoch_now();
+    let unsampled = client.server_clock().at(local_before);
+    assert_eq!(unsampled, local_before);
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    // The bucket a raw local selection would have chosen, captured before the
+    // client has ever connected. Ten minutes is 9600 sub-buckets of a
+    // one-second window, so it could never be mistaken for a server bucket.
+    let local_bucket = RedisRateLimitClient::sub_bucket_at(redis_epoch_now(), 1).index;
+
+    // The FIRST request of a client's life seeds its offset from the connection
+    // probe before it selects, so it charges the SERVER's bucket directly: one
+    // transaction, no hand-back, no rebuild.
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the charge must land")
+            .allowed
+    );
+
+    let offset = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the connection probe must teach the client the server clock");
+    let shift_nanos = SHIFT.as_nanos() as i64;
+    assert!(
+        (offset - shift_nanos).abs() < 5_000_000_000,
+        "the learned offset must be the server's ten-minute lead, not zero: {offset}"
+    );
+
+    assert_eq!(
+        server.incrs(),
+        1,
+        "a seeded first selection charges once; the startup rollover is gone"
+    );
+    assert_eq!(server.decrs(), 0, "and hands nothing back");
+    let charged = charged_sub_buckets(&server);
+    assert_eq!(
+        charged.len(),
+        1,
+        "exactly one sub-bucket is touched, on the server clock: {charged:?}"
+    );
+    let (server_index, server_count) = charged[0];
+    assert_eq!(server_count, 1);
+    assert!(
+        server_index - local_bucket > 9_000,
+        "the charged bucket must be the SERVER's: local={local_bucket} \
+         server={server_index}"
+    );
+
+    // And the NEXT request stays on the server clock.
+    let charges_before = server.incrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the second charge must land")
+            .allowed
+    );
+    assert_eq!(
+        server.incrs() - charges_before,
+        1,
+        "a learned offset means the next selection needs no rebuild"
+    );
+    let charged = charged_sub_buckets(&server);
+    let newest = charged.last().copied().expect("a charged sub-bucket");
+    assert!(
+        newest.0.abs_diff(server_index) <= 1,
+        "the second request must charge on the SERVER clock too: \
+         first={server_index} second={}",
+        newest.0
+    );
+    assert!(
+        newest.0.abs_diff(local_bucket) > 9_000,
+        "and never back on this process's own clock: local={local_bucket} \
+         second={}",
+        newest.0
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Settlement is judged on the server's clock at `EXEC`, not on a local sample
+/// taken after the reply arrives.
+///
+/// The transaction executes on time and only its REPLY is held for four whole
+/// sub-buckets. A local post-`EXEC` sample would read `b + 4` and roll the
+/// ladder over for nothing; the server's own `TIME` says `b`, and reply latency
+/// after `EXEC` is harmless because a peer charging later reads this request's
+/// own increment.
+#[tokio::test]
+async fn settlement_is_judged_on_the_server_clock_not_a_local_post_exec_sample() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::AfterApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let outcome = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("a late REPLY is not a stale ladder");
+    assert!(outcome.allowed);
+
+    assert_eq!(
+        server.incrs(),
+        1,
+        "the ladder executed inside its own sub-bucket, so nothing may be rebuilt"
+    );
+    assert_eq!(
+        server.decrs(),
+        0,
+        "nothing was abandoned, so nothing is handed back"
+    );
+    assert_eq!(client.pending_compensations_for_test(), 0);
+
+    let _ = server.shutdown.send(());
+}
+
+/// Review finding 2: a rebuilt ladder must not count the charge its own
+/// abandoned pass left behind.
+///
+/// The rebuilt ladder reads the sub-bucket the abandoned pass charged, so
+/// dispatching the hand-back is not enough — the rebuild has to wait for the
+/// `DECR` to land. With a one-request quota and a deliberately slow
+/// compensation, a rebuild that raced ahead would read its own abandoned charge
+/// plus its new one, see usage `2`, and refuse a request the quota admits.
+#[tokio::test]
+async fn a_rebuilt_ladder_does_not_count_the_charge_it_abandoned() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    // Timing budget, all against a TWO-second window's 125ms sub-buckets. The
+    // window is two seconds rather than one so the margins below stay where
+    // they were when `K` was eight: at `K = 16` a one-second window's
+    // sub-buckets are 62.5ms, which the 80ms hand-back hold would itself
+    // straddle.
+    //
+    // - The first charge stalls 250ms BEFORE executing, so the server applies
+    //   it exactly two sub-buckets late and its own `TIME` proves the rollover.
+    //   250ms stays inside the 500ms screened per-command response deadline.
+    // - Its hand-back is then held 80ms, which is long enough that a rebuild
+    //   which only DISPATCHED the compensation would reach the server first,
+    //   and short enough (< one sub-bucket) that the rebuilt ladder cannot roll
+    //   over in turn and turn this into the two-rollover refusal.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::BeforeApply,
+        compensation_delay: Duration::from_millis(80),
+        delayed_compensations: 1,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(2),
+    }]);
+    let outcome = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the rebuilt pass must produce a decision");
+    assert!(
+        outcome.allowed,
+        "an empty one-request quota admits: the abandoned charge was handed \
+         back before the rebuilt ladder read its bucket"
+    );
+
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(server.incrs(), 2, "the abandoned pass and the rebuild");
+    assert_eq!(server.decrs(), 1, "exactly one hand-back");
+    // The decisive ordering, read off the keyspace rather than off the clock:
+    // the hand-back must be APPLIED between the abandoned charge and the
+    // rebuild. Dispatch order alone would put the rebuild's `INCR` second.
+    assert_eq!(
+        server.ops(),
+        vec!["INCR", "DECR", "INCR"],
+        "the rebuild must execute only after its own hand-back landed"
+    );
+    assert_eq!(
+        server.charged_total(),
+        1,
+        "exactly one charge survives: the admitted request's"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A hand-back that cannot be confirmed refuses instead of rebuilding.
+///
+/// The compensation is held past the screened per-command deadline that bounds
+/// the confirmation, so the rebuild would have to read a bucket that still
+/// holds the abandoned charge. Refusing routes the request through
+/// `redis_failure_policy` (an unavailable centralized store) rather than
+/// publishing a quota decision derived from a charge this request abandoned.
+#[tokio::test]
+async fn a_rollover_whose_hand_back_is_unconfirmed_refuses_instead_of_rebuilding() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: 1,
+        hold_phase: HoldPhase::BeforeApply,
+        // Past both the 500ms screened per-command deadline and the equal
+        // bound on the confirmation wait.
+        compensation_delay: Duration::from_millis(900),
+        delayed_compensations: 1,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "an unconfirmed hand-back must refuse through redis_failure_policy, \
+         not rebuild against its own abandoned charge: {result:?}"
+    );
+    assert_eq!(
+        server.incrs(),
+        1,
+        "the rebuild must never be issued once the hand-back is in doubt"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// An endpoint whose ACL refuses `TIME` is an UNUSABLE store, not a weaker
+/// contract.
+///
+/// `TIME` is a hard requirement: the bucket clock is the only thing that makes
+/// sub-buckets shared, so a connection that cannot answer it is discarded
+/// exactly like one that failed the Cluster screen, and `redis_failure_policy`
+/// decides from there. The earlier "local-clock mode" — selecting buckets from
+/// each gateway's own wall clock under a documented skew contract — is gone: it
+/// kept admitting centrally against ladders that were not shared.
+///
+/// The probe is still a STANDALONE command, because a denied command queued
+/// inside `MULTI` aborts the whole `EXEC` and the endpoint has to be rejected
+/// before it can carry a policy command at all.
+#[tokio::test]
+async fn an_acl_that_denies_time_makes_the_store_unavailable() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "a denied TIME must refuse through redis_failure_policy rather than admit on a \
+         clock no peer shares: {result:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "the connection could not be screened, so the store is unavailable"
+    );
+    assert_eq!(
+        client.server_clock().offset_nanos(),
+        None,
+        "no clock was learned, and none is invented"
+    );
+    assert_eq!(
+        server.incrs(),
+        0,
+        "no policy command may run on a connection that could not be screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Reply-shape validation for the server-clock transaction: a reply this code
+/// cannot pair with its windows is an unusable ENDPOINT, never a quota
+/// decision.
+///
+/// The `INCR`s have already landed when the mismatch is seen, so the client
+/// marks itself unavailable and hands the next decision to
+/// `redis_failure_policy` rather than re-charging a reply it cannot read on
+/// every request.
+#[tokio::test]
+async fn a_charge_reply_with_an_extra_element_is_refused_in_server_clock_mode() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        extra_exec_element: true,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    // The probe runs when the pool slot is established — inside that first
+    // charge — so the mode is observable only afterwards.
+    assert!(
+        client.server_clock().offset_nanos().is_some(),
+        "the probe must have seeded a clock for this to be the reply shape under test"
+    );
+    assert!(
+        result.is_err(),
+        "a reply one element longer than the ladder plus its clock must refuse: {result:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "an unpairable reply is an unusable endpoint, so the NEXT decision goes \
+         through redis_failure_policy instead of re-charging"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A `TIME` the transaction answered with something that is not a clock fails
+/// closed instead of silently falling back to this gateway's own clock.
+///
+/// The standalone probe succeeded, so the endpoint claimed the server-clock
+/// contract. Quietly reinstating the local clock there would put the skew term
+/// back into the ladder on exactly the deployments that believe they do not
+/// have one.
+#[tokio::test]
+async fn a_transaction_clock_this_code_cannot_read_fails_closed() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::MalformedInTransaction,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    // The probe runs on connect, inside that first charge.
+    assert!(
+        client.server_clock().offset_nanos().is_some(),
+        "the standalone probe must have succeeded for this to be the case under test"
+    );
+    assert!(
+        result.is_err(),
+        "an unreadable server clock must refuse, not read as a local instant: {result:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "the endpoint claimed the server-clock contract and did not honour it"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+// ── Learned offsets are not an exact clock (review round 4 of PR #5584) ───
+//
+// `server_time − local_time_at_reply` is sampled one REPLY LATENCY after the
+// server read its clock, so two gateways sharing a quota select on corrected
+// clocks that differ by the difference of their latencies. The ladder is
+// correct in spite of that because settlement is two-sided and the ladder reads
+// one sub-bucket further back than its own window.
+
+/// Review finding (MAJOR 1): two gateways with synchronized host clocks and
+/// different Redis reply latencies still select sub-buckets `K + 1` apart, and
+/// a `K`-deep trailing ladder drops the older one while it is still live.
+///
+/// A's reply is decoded 10ms after the server read its clock, B's 1ms after, so
+/// their learned offsets are −10ms and −1ms. A admits at real `100.009` and B
+/// 993ms later at real `101.002` — inside one trailing second, so a `1/s` quota
+/// may admit exactly one of them. A's key is `1599`, B's is `1616`: seventeen
+/// apart, which is one further than a `K`-deep ladder reaches.
+///
+/// Both charges are legitimate and retained — each settles inside its own
+/// two-sided band against the instant the server applied it — so this is not a
+/// case settlement can reject. The extra OLD counter is what counts it.
+#[tokio::test]
+async fn reply_latency_puts_a_live_charge_one_bucket_past_a_k_deep_ladder() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_TRAILING_SUB_BUCKETS, RedisServerClock, RedisWindowCharges,
+        sub_bucket_charge_is_settled,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    // Synchronized host clocks; only the reply latencies differ.
+    let a_clock = RedisServerClock::new();
+    a_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_010));
+    let b_clock = RedisServerClock::new();
+    b_clock.record_reply(Duration::from_millis(90_000), Duration::from_millis(90_001));
+    assert_eq!(a_clock.offset_nanos(), Some(-10_000_000));
+    assert_eq!(b_clock.offset_nanos(), Some(-1_000_000));
+
+    let a_local = Duration::from_micros(100_009_000);
+    let b_local = Duration::from_micros(101_002_000);
+    assert!(
+        b_local - a_local < Duration::from_secs(1),
+        "the two admissions must lie inside ONE trailing second"
+    );
+
+    let a_bucket = RedisRateLimitClient::sub_bucket_at(a_clock.at(a_local), 1);
+    let b_bucket = RedisRateLimitClient::sub_bucket_at(b_clock.at(b_local), 1);
+    assert_eq!(a_bucket.index, 1_599);
+    assert_eq!(b_bucket.index, 1_616);
+    assert_eq!(
+        (b_bucket.index - a_bucket.index) as usize,
+        REDIS_WINDOW_TRAILING_SUB_BUCKETS,
+        "exactly the depth the extra old counter adds"
+    );
+
+    // Neither charge is something settlement may reject: each lands in its own
+    // two-sided band against the instant the server applies it.
+    assert!(sub_bucket_charge_is_settled(a_bucket, a_local));
+    assert!(sub_bucket_charge_is_settled(b_bucket, b_local));
+
+    let mut a_charge = RedisWindowCharges::default();
+    assert!(a_charge.push(client.window_charge("ip:127.0.0.1", a_bucket, 3)));
+    let mut b_charge = RedisWindowCharges::default();
+    assert!(b_charge.push(client.window_charge("ip:127.0.0.1", b_bucket, 3)));
+
+    let a_counts = client
+        .charge_rate_limit_windows(a_charge.as_slice())
+        .await
+        .expect("A's admission must execute");
+    assert_eq!(a_counts.as_slice()[0], 1);
+    let b_counts = client
+        .charge_rate_limit_windows(b_charge.as_slice())
+        .await
+        .expect("B's transaction must execute");
+
+    let limit = 1_u64;
+    let admitted = [&a_counts, &b_counts]
+        .iter()
+        .filter(|counts| counts.as_slice()[0] <= limit)
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "exactly one of two requests 993ms apart may be admitted against a 1/s \
+         quota; a={a_counts:?} b={b_counts:?}"
+    );
+    assert_eq!(
+        b_counts.as_slice()[0],
+        2,
+        "B must count A's still-live admission at the OLDEST end of its ladder"
+    );
+
+    // What a `K`-deep trailing ladder would have summed: drop the oldest
+    // counter and A's charge disappears, so both would have been admitted.
+    let b_slot = &b_charge.as_slice()[0];
+    let trailing: Vec<String> = b_slot.trailing_keys().map(str::to_string).collect();
+    let mut narrower = trailing[1..].to_vec();
+    narrower.push(b_slot.charged_key().to_string());
+    narrower.push(b_slot.next_key().to_string());
+    let narrower_total: i64 = narrower.iter().map(|key| server.counter(key)).sum();
+    assert_eq!(
+        narrower_total, 1,
+        "without the extra old counter the ladder sums to 1 and over-admits"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The steady-state quantisation at `K = 16`, swept across limits and placement
+/// lags.
+///
+/// Two closed forms, and every document has to keep them apart. A HOMOGENEOUS
+/// stream — every request placing its charge the same way — keeps
+/// `limit / (limit + ceil(2 * limit / K))`, because the ladder reads `K + 1`
+/// older counters rather than `K`. The BOUND the module docs,
+/// `docs/plugins.md`, and the CHANGELOG state is
+/// `limit / (limit + ceil(3 * limit / K))`, one sub-bucket wider, because a
+/// reader whose transaction straddles a sub-bucket boundary reads a ladder
+/// built one bucket before the bucket it executes in
+/// (`placement_lag_widens_the_counted_history_to_three_sub_buckets`).
+///
+/// Shifting every request by the SAME latency moves no key, so the measured
+/// fraction is the homogeneous one at every lag; this sweep is what would catch
+/// a future change to either constant that quietly moved either figure.
+#[test]
+fn the_steady_rate_model_matches_the_documented_fraction_at_k_sixteen() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKETS;
+
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    let sub_bucket_nanos = NANOS_PER_SECOND / REDIS_WINDOW_SUB_BUCKETS as u64;
+
+    for limit in [1_u64, 2, 4, 8, 16, 32, 100] {
+        let spacing_nanos = NANOS_PER_SECOND / limit;
+        assert_eq!(
+            spacing_nanos * limit,
+            NANOS_PER_SECOND,
+            "limit {limit}: the arrival spacing must divide the window exactly"
+        );
+        for latency in [
+            Duration::ZERO,
+            Duration::from_nanos(sub_bucket_nanos / 2),
+            Duration::from_nanos(sub_bucket_nanos),
+        ] {
+            // Five seconds of warm-up so the ladder is full, then forty seconds
+            // of steady traffic at exactly the configured rate.
+            let warmup = limit * 5;
+            let offered = limit * 45;
+            let mut buckets = std::collections::HashMap::new();
+            let mut admitted = 0_u64;
+            for attempt in 0..offered {
+                let at = Duration::from_nanos(100 * NANOS_PER_SECOND + attempt * spacing_nanos);
+                if model_sub_bucket_admits(&mut buckets, at, latency, 1, limit) && attempt >= warmup
+                {
+                    admitted += 1;
+                }
+            }
+
+            let excess = (limit * 2).div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64);
+            let homogeneous = limit as f64 / (limit + excess) as f64;
+            let bound_excess = (limit * 3).div_ceil(REDIS_WINDOW_SUB_BUCKETS as u64);
+            let bound = limit as f64 / (limit + bound_excess) as f64;
+            let measured = admitted as f64 / (offered - warmup) as f64;
+            assert!(
+                (measured - homogeneous).abs() < 0.02,
+                "limit {limit} at latency {latency:?}: measured {measured} vs homogeneous \
+                 {homogeneous}"
+            );
+            assert!(
+                measured + 0.02 >= bound,
+                "limit {limit} at latency {latency:?}: measured {measured} below the \
+                 documented bound {bound}"
+            );
+            assert!(
+                measured >= 0.49,
+                "limit {limit} at latency {latency:?}: even the worst small quota keeps half \
+                 its rate ({measured})"
+            );
+        }
+    }
+}
+
+// ── A gateway ahead of Redis (review round 4, MAJOR 2) ────────────────────
+//
+// Settlement now refuses BOTH directions. A charge placed in the future is
+// invisible to every peer reading its own trailing window, so accepting it let
+// an unsampled fast gateway charge an unreachable ladder and then admit again
+// on the corrected one.
+
+/// Redis BEHIND the gateway, with the shared budget already consumed by a peer:
+/// the second gateway must not admit.
+///
+/// The fake server's clock runs ten minutes behind this process's, so a gateway
+/// selecting on its own wall clock would charge 9600 sub-buckets into the
+/// future — a ladder no peer's trailing window reaches.
+#[tokio::test]
+async fn a_gateway_ahead_of_redis_cannot_double_admit_a_consumed_peer_budget() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::redis_epoch_now;
+
+    const SHIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Behind(SHIFT),
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let peer = Arc::new(keyspace_client(server.port));
+    let latecomer = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(1),
+    }]);
+
+    // The peer consumes the one-request budget on the SERVER's clock.
+    assert!(
+        algorithm
+            .check_redis(&peer, "ip:127.0.0.1", &op)
+            .await
+            .expect("the peer's charge must land")
+            .allowed
+    );
+    let peer_keys = server.keys();
+    assert_eq!(peer_keys.len(), 1, "one charged sub-bucket: {peer_keys:?}");
+    let peer_key = peer_keys[0].clone();
+
+    // What an uncorrected selection would have charged: a bucket 9600
+    // sub-buckets away, whose ladder cannot reach the peer's key at all.
+    let raw_bucket = RedisRateLimitClient::sub_bucket_at(redis_epoch_now(), 1);
+    let raw = latecomer.window_charge("ip:127.0.0.1", raw_bucket, 3);
+    let mut raw_ladder: Vec<String> = raw.trailing_keys().map(str::to_string).collect();
+    raw_ladder.push(raw.charged_key().to_string());
+    raw_ladder.push(raw.next_key().to_string());
+    assert!(
+        !raw_ladder.contains(&peer_key),
+        "the raw-local ladder misses the peer's charge entirely, which is the \
+         double admission this closes"
+    );
+
+    // The second gateway seeds from the probe, selects the server's bucket, and
+    // sees the peer.
+    let second = algorithm
+        .check_redis(&latecomer, "ip:127.0.0.1", &op)
+        .await
+        .expect("the second gateway's transaction must execute");
+    assert!(
+        !second.allowed,
+        "a 1/s quota already consumed by a peer must refuse the second gateway"
+    );
+    let offset = latecomer
+        .server_clock()
+        .offset_nanos()
+        .expect("the probe must teach the latecomer the server clock");
+    assert!(
+        offset < -500_000_000_000,
+        "the learned offset must be the server's ten-minute LAG: {offset}"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A charge the server applies BEFORE the bucket it was keyed to is compensated
+/// and rebuilt on the server clock.
+///
+/// The client learns a correct offset, then Redis steps ten minutes backward.
+/// The stale offset puts the next selection 9600 sub-buckets into the future,
+/// where no peer's trailing window reaches it. Settlement's early end catches
+/// exactly that.
+#[tokio::test]
+async fn a_charge_placed_in_the_future_is_compensated_and_rebuilt() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const SHIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the first charge must land")
+            .allowed
+    );
+    assert_eq!(server.incrs(), 1);
+
+    // Redis steps backward; the client's offset is now stale in the direction
+    // that places its charge in the future.
+    server.set_time_mode(ServerTimeMode::Behind(SHIFT));
+    let charges_before = server.incrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the rebuilt pass must produce a decision")
+            .allowed
+    );
+    assert_eq!(
+        server.incrs() - charges_before,
+        2,
+        "the future placement and its rebuild are two charges, and no more"
+    );
+
+    for _ in 0..6_000 {
+        if client.pending_compensations_for_test() == 0 && server.decrs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the future placement must hand its own charge back"
+    );
+    assert_eq!(
+        server.charged_total(),
+        2,
+        "the first admission and the rebuilt one, and nothing stranded"
+    );
+
+    let charged = charged_sub_buckets(&server);
+    let oldest = *charged.first().expect("a charged sub-bucket");
+    let newest = *charged.last().expect("a charged sub-bucket");
+    assert!(
+        newest.0 - oldest.0 > 9_000,
+        "the rebuilt charge must sit on the server's stepped-back clock: \
+         {charged:?}"
+    );
+    assert_eq!(oldest.1, 1, "and it is the one that stands: {charged:?}");
+
+    let _ = server.shutdown.send(());
+}
+
+// ── The TIME probe degrades only on a recognised verdict (round 4, MAJOR 3) ─
+//
+// `NOPERM` and `ERR unknown command` are permanent statements about what the
+// endpoint offers. A malformed reply, a timeout, and a transport failure are
+// not: they are connections that could not be screened, and collapsing them
+// into a silent local-clock mode let an explicit `fail_closed` policy keep
+// admitting against an endpoint that could not answer its own clock. Every one
+// of them now rejects the connection, exactly as a `NOPERM` does.
+
+/// A server that answers `TIME` with something that is not a clock is an
+/// unusable endpoint, not an ACL verdict.
+#[tokio::test]
+async fn a_time_probe_that_answers_a_non_clock_is_an_unusable_endpoint() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::MalformedProbe,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "an unreadable probe must refuse through redis_failure_policy, not admit \
+         on a quietly weakened contract: {result:?}"
+    );
+    assert!(!client.is_available());
+    assert_eq!(
+        client.server_clock().offset_nanos(),
+        None,
+        "a reply this code cannot pair with a clock teaches no offset"
+    );
+    assert_eq!(
+        server.incrs(),
+        0,
+        "no policy command may run on a connection that could not be screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A probe that never answers inside the screened per-command deadline is an
+/// unusable endpoint.
+#[tokio::test]
+async fn a_time_probe_that_never_answers_is_an_unusable_endpoint() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::ProbeTimeout,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(result.is_err(), "a silent probe must refuse: {result:?}");
+    assert!(!client.is_available());
+    assert_eq!(client.server_clock().offset_nanos(), None);
+    assert_eq!(server.incrs(), 0);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A probe whose connection drops is an unusable endpoint.
+#[tokio::test]
+async fn a_time_probe_whose_connection_drops_is_an_unusable_endpoint() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::ProbeTransportError,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "a transport failure on the probe must refuse: {result:?}"
+    );
+    assert!(!client.is_available());
+    assert_eq!(client.server_clock().offset_nanos(), None);
+    assert_eq!(server.incrs(), 0);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A RESP-compatible server that does not implement `TIME` is an unusable
+/// store, exactly like a `NOPERM`.
+///
+/// The two answers differ only in the diagnostic they produce — "grant `+time`"
+/// versus "this server has no `TIME`" — never in the outcome.
+#[tokio::test]
+async fn a_server_that_does_not_implement_time_is_an_unusable_endpoint() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::UnknownCommand,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let result = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        result.is_err(),
+        "a server without TIME cannot back a shared request quota: {result:?}"
+    );
+    assert!(!client.is_available());
+    assert_eq!(client.server_clock().offset_nanos(), None);
+    assert_eq!(
+        server.incrs(),
+        0,
+        "no policy command may run on a connection that could not be screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+// ── The `TIME` requirement is scoped to the consumers that read the clock ──
+//
+// Connection screening is shared by every consumer of `RedisRateLimitClient`,
+// so making the probe a property of the SOCKET made `+time` mandatory for
+// `request_deduplication`, `soap_ws_security`'s shared replay authority,
+// `ai_semantic_cache`, and the three token/frame/datagram budgets — none of
+// which ever selects a sub-bucket. The requirement is therefore declared at
+// construction, and enforced at both ends: the probe runs only for a
+// request-quota client, and the ladder refuses to charge on any other.
+
+/// A consumer that reads no server clock never sends `TIME`, so an endpoint
+/// whose ACL denies it stays fully usable for that consumer.
+///
+/// The same fixture refuses the request-quota client on the same connection
+/// screen, which is what keeps the two halves of this test honest: the endpoint
+/// is identical, only the declared requirement differs.
+#[tokio::test]
+async fn only_a_request_quota_client_probes_the_server_clock() {
+    use ferrum_edge::_test_support::redis_client_without_server_clock_for_test;
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+
+    // A replay / idempotency / cache / token-budget client: no probe, no
+    // refusal, and the endpoint's missing `+time` grant is none of its business.
+    let clockless = redis_client_without_server_clock_for_test(keyspace_config(server.port));
+    let counted = clockless.incr_with_expire("ferrum:clockless:key", 60).await;
+    assert_eq!(
+        counted,
+        Ok(1),
+        "a consumer that reads no clock must not be refused by a TIME ACL"
+    );
+    assert!(
+        clockless.is_available(),
+        "an endpoint that denies TIME is still a usable marker/counter store"
+    );
+    assert_eq!(
+        clockless.server_clock().offset_nanos(),
+        None,
+        "a clockless consumer learns no offset because it asks for none"
+    );
+    assert_eq!(
+        server.clock_probes(),
+        0,
+        "no standalone TIME may be sent on behalf of a consumer that reads no clock"
+    );
+
+    // The request-quota client, against the very same endpoint. The clockless
+    // client above legitimately ran one INCR; only the delta from here on
+    // says whether a policy command ran on an unscreened connection.
+    let incrs_before = server.incrs();
+    let quota = keyspace_client(server.port);
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
+    let charge = quota.window_charge("ip:127.0.0.1", bucket, 3);
+    assert!(
+        quota.charge_rate_limit_windows(&[charge]).await.is_err(),
+        "a shared ladder cannot be charged against an endpoint that denies TIME"
+    );
+    assert!(!quota.is_available());
+    assert!(
+        server.clock_probes() >= 1,
+        "the request-quota client must screen the server clock before it charges"
+    );
+    assert_eq!(
+        server.incrs(),
+        incrs_before,
+        "no policy command may run on a connection that could not be screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Charging a ladder on a client that never declared the requirement is a
+/// wiring mistake, and it fails closed.
+///
+/// Such a client never probed `TIME`, so its `RedisServerClock` offset is
+/// unseeded and every sub-bucket would be selected from this gateway's raw
+/// local clock — precisely the local-clock mode the layout exists to refuse.
+/// The guard runs before any connection is acquired, so the unreachable
+/// endpoint below is never dialled.
+async fn charge_on_a_clockless_client_is_refused() -> bool {
+    use ferrum_edge::_test_support::redis_client_without_server_clock_for_test;
+
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+    let client = redis_client_without_server_clock_for_test(config);
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_secs(100), 1);
+    let charge = client.window_charge("ip:127.0.0.1", bucket, 3);
+    client.charge_rate_limit_windows(&[charge]).await.is_err()
+}
+
+/// Debug builds make the mistake loud.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "for_request_quota")]
+async fn a_client_without_the_server_clock_requirement_cannot_charge_a_ladder() {
+    let _ = charge_on_a_clockless_client_is_refused().await;
+}
+
+/// Release builds refuse instead of panicking: a proxy hot path never aborts
+/// the process over a decision it can fail closed on.
+#[cfg(not(debug_assertions))]
+#[tokio::test]
+async fn a_client_without_the_server_clock_requirement_cannot_charge_a_ladder() {
+    assert!(
+        charge_on_a_clockless_client_is_refused().await,
+        "a ladder charged on an unseeded clock is not a shared budget"
+    );
+}
+
+// ── An ACL change is an outage, not a mode change (review round 6) ────────
+//
+// There is ONE bucket base: the Redis server's. A gateway that cannot read it
+// does not enforce centrally at all, so revoking `TIME` under a live gateway is
+// an ordinary availability transition and granting it again is an ordinary
+// recovery. Neither needs a second base, a transition generation, or a
+// quarantine — the machinery this replaces was itself the thing a delayed reply
+// could race.
+
+/// Revoking `TIME` under a live gateway takes the store away; it does not move
+/// the gateway onto a private clock.
+///
+/// The queued `TIME` aborts the whole `EXEC`, which is an ordinary command
+/// failure: the endpoint is marked unavailable and its connections cleared, and
+/// the reconnect that follows re-probes `TIME` and refuses to publish a socket
+/// that cannot answer it. From the caller's side that is exactly a Redis
+/// outage, and `redis_failure_policy` governs.
+#[tokio::test]
+async fn revoking_time_under_a_live_gateway_makes_the_store_unavailable() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const SHIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Ahead(SHIFT),
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 20,
+        duration: Duration::from_secs(1),
+    }]);
+    // Enough requests to establish EVERY pooled slot, so the revocation below
+    // is observed by a connection that was already screened rather than by a
+    // fresh probe — the mid-flight case under test.
+    for _ in 0..6 {
+        assert!(
+            algorithm
+                .check_redis(&client, "ip:127.0.0.1", &op)
+                .await
+                .expect("every warm-up charge must land")
+                .allowed
+        );
+    }
+    let learned = client
+        .server_clock()
+        .offset_nanos()
+        .expect("a screened connection must have learned the server clock");
+    assert!(learned > 500_000_000_000, "a ten-minute lead: {learned}");
+
+    // The ACL is revoked under the live client: the queued `TIME` aborts the
+    // whole `EXEC`.
+    server.set_time_mode(ServerTimeMode::Denied);
+    let aborted = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        aborted.is_err(),
+        "the aborted transaction is a failure, not an admission: {aborted:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "an endpoint that stopped answering TIME is an unavailable store"
+    );
+
+    // And it stays unavailable: the reconnect re-probes and refuses to publish
+    // a connection that cannot answer its own clock, so no request slips
+    // through on a stale base. The fixture applies a transaction's queued
+    // commands before it answers the denied `TIME` (a real Redis refuses at
+    // queue time and aborts), so the count from the aborted pass is the
+    // fixture's; what matters is that nothing runs after it.
+    let charges_at_outage = server.incrs();
+    assert!(client.publish_reachable_for_test());
+    let after_recovery = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        after_recovery.is_err(),
+        "a re-probe that is still denied must keep the store unavailable: \
+         {after_recovery:?}"
+    );
+    assert!(!client.is_available());
+    assert_eq!(
+        server.incrs(),
+        charges_at_outage,
+        "no transaction may run on a connection the re-probe refused to publish"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Granting `TIME` again is an ordinary recovery: the next screened connection
+/// adopts the server clock and enforcement resumes with no quarantine.
+///
+/// The client starts against an endpoint that denies `TIME`, so it never
+/// enforced anything and has no charges of its own on any base. Once the ACL is
+/// granted, the reconnect's probe seeds the server offset and the very next
+/// request selects on it.
+#[tokio::test]
+async fn granting_time_again_restores_centralized_enforcement() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::redis_epoch_now;
+
+    const SHIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    let denied = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+    assert!(
+        denied.is_err(),
+        "a denied TIME leaves nothing to enforce with: {denied:?}"
+    );
+    assert!(!client.is_available());
+    assert_eq!(client.server_clock().offset_nanos(), None);
+    assert_eq!(server.incrs(), 0);
+
+    // The ACL is granted, and the server's clock is ten minutes ahead of this
+    // process's. Let the client retry the endpoint.
+    server.set_time_mode(ServerTimeMode::Ahead(SHIFT));
+    assert!(client.publish_reachable_for_test());
+
+    let restored = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("a screened connection restores centralized enforcement");
+    assert!(restored.allowed);
+    assert!(client.is_available());
+    let adopted = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the probe must have adopted the server clock");
+    assert!(adopted > 500_000_000_000, "a ten-minute lead: {adopted}");
+    assert_eq!(server.incrs(), 1);
+
+    // The charge landed on the SERVER's base, ten minutes ahead of this
+    // process's raw clock, which is the whole point of requiring `TIME`.
+    let charged = charged_sub_buckets(&server);
+    let raw = RedisRateLimitClient::sub_bucket_at(redis_epoch_now(), 1).index;
+    let placed = charged.first().expect("one charged sub-bucket").0;
+    assert!(
+        placed > raw + 9_000,
+        "the charge must sit on the server's clock, not this process's: {placed} vs {raw}"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A reply delayed past one sub-bucket of the tightest window it charged must
+/// not move the learned offset.
+///
+/// The transaction's commands apply promptly — its `TIME` reports the instant
+/// the server executed them, so settlement passes — but the RESPONSE is held.
+/// `server_time − local_time_at_reply` would then teach an offset short by the
+/// whole hold, walking the next selection backwards by more than the ladder's
+/// forward cover. The previous offset stands instead, and the charge is still
+/// judged against the server instant the reply carried.
+#[tokio::test]
+async fn a_reply_held_past_one_sub_bucket_does_not_move_the_learned_offset() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const SHIFT: Duration = Duration::from_secs(5);
+    // 200ms is more than three sub-buckets of a one-second window, and still
+    // comfortably inside the screened per-command response deadline.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Ahead(SHIFT),
+        charge_delay: Duration::from_millis(200),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::AfterApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+
+    // The standalone probe is not held by the charge schedule, so it seeds a
+    // truthful offset first.
+    client.ensure_clock_seeded().await;
+    let seeded = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the probe seeds the offset");
+    assert!(
+        seeded > 4_500_000_000,
+        "the probe must learn the server's five-second lead: {seeded}"
+    );
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the charge itself settles: only its reply was held")
+            .allowed
+    );
+
+    let after = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the offset is still known");
+    // The stale sample would have taught an offset roughly 200ms SMALLER, which
+    // is more than three sub-buckets of walk on the next selection. Only a
+    // prompt standalone probe on a second pooled slot may have refreshed it,
+    // and that moves the offset by its own sub-millisecond latency.
+    let moved = (after - seeded).abs();
+    assert!(
+        moved < 50_000_000,
+        "a reply held 200ms past its transaction must not walk the learned offset: \
+         moved {moved}ns (seeded {seeded}, after {after})"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Background recovery must re-prove the SERVER CLOCK, not just reachability.
+///
+/// Review finding (MINOR 1): the recovery checker screened `PING`, topology and
+/// retention and then republished availability, so a request-quota client whose
+/// endpoint still denied `TIME` was advertised as recovered — and logged as
+/// "centralized Redis access restored" — while every request would still fail
+/// its connection probe and fall to `redis_failure_policy`. With no traffic at
+/// all the false healthy state simply persisted.
+///
+/// Driven through the ACTUAL background checker, across denial AND restoration:
+/// the transition tests elsewhere in this file publish reachability by hand,
+/// which is exactly the step that could not have caught this.
+#[tokio::test]
+async fn background_recovery_waits_for_time_before_republishing_a_quota_client() {
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let mut config = keyspace_config(server.port);
+    // The real checker, probing once a second.
+    config.health_check_interval_seconds = 1;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    // The outage a denied `TIME` produces: the connection is never published,
+    // the store is unavailable, and recovery is armed.
+    assert!(
+        !client.connect_cached_for_test().await,
+        "a connection that cannot answer TIME must never be published"
+    );
+    assert!(!client.is_available());
+    assert!(client.health_checker_started_for_test());
+
+    // `PING` and `INFO CLUSTER` both succeed on this endpoint, so a checker
+    // that screened only reachability would republish within one interval.
+    let probes_at_outage = server.clock_probes();
+    tokio::time::sleep(Duration::from_millis(2_600)).await;
+    let probes_after_interval = server.clock_probes();
+    assert!(
+        probes_after_interval > probes_at_outage,
+        "the recovery probe must ask this endpoint for the server clock: \
+         {probes_at_outage} -> {probes_after_interval}"
+    );
+    assert!(
+        !client.is_available(),
+        "an endpoint that still denies TIME is not a recovered quota store"
+    );
+    assert!(
+        !client.observer_sees_available_for_test(),
+        "no false recovery may be advertised to a failover health observer"
+    );
+
+    // Restoration, through the same checker: a clock refusal is retryable, not
+    // terminal the way a proven Cluster topology is, so granting the ACL under
+    // the live gateway is picked up on an ordinary interval.
+    server.set_time_mode(ServerTimeMode::RealClock);
+    let mut restored = false;
+    for _ in 0..60 {
+        if client.is_available() {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        restored,
+        "granting TIME again must restore availability through the background checker"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The scope survives into recovery: a client that reads no server clock sends
+/// no `TIME` there either, and recovers on reachability alone.
+///
+/// The sibling of the finding above. Requiring the clock of every recovery
+/// probe would take a replay or cache deployment on a restrictive ACL out of
+/// service over a command it never sends — the same mistake, moved from the
+/// connect path into the background task.
+#[tokio::test]
+async fn background_recovery_never_probes_the_clock_for_a_clockless_client() {
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        time_mode: ServerTimeMode::Denied,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let mut config = keyspace_config(server.port);
+    config.health_check_interval_seconds = 1;
+    config.pool_size = 1;
+    let client = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+
+    // Enter the state an outage produces and let the real checker run.
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+
+    let mut restored = false;
+    for _ in 0..60 {
+        if client.is_available() {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        restored,
+        "a consumer that reads no clock recovers on PING and the topology screen alone"
+    );
+    assert_eq!(
+        server.clock_probes(),
+        0,
+        "a NotUsed client must spend no round trip on TIME anywhere: an ACL that \
+         withholds +time must not take a replay or cache deployment out of service"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Starved offset learning does NOT by itself degrade through the failure
+/// policy — and this is where the real boundary is.
+///
+/// Review finding (MINOR 2): the earlier wording said a store whose replies are
+/// never prompt is "already past the settlement rollover threshold", so its
+/// decisions are going through `redis_failure_policy` anyway. They are not.
+/// Response delay and execution delay are different failures, and only one of
+/// them rolls a ladder over. The whole boundary, on one fixture:
+///
+/// 1. Every transaction EXECUTES inside the sub-bucket it was keyed to and
+///    answers 200ms later — more than three sub-buckets of a one-second window.
+///    Learning stops (no reply is prompt enough to move the offset) and every
+///    charge still settles, because settlement is judged on the `TIME` that same
+///    transaction carried. No rebuild, no hand-back, no refusal, indefinitely.
+/// 2. The server's clock then steps ten minutes ahead under the live client.
+///    The frozen base cannot learn it, so every request mis-settles on its
+///    FIRST pass and hands its charge back — and the rebuild cannot recover the
+///    step either, because the SAME held response is what makes it unrecoverable:
+///    the rebuilt pass selects from the server instant the abandoned pass
+///    carried, which the 200ms hold already leaves more than three sub-buckets
+///    behind the instant the server applies the rebuild in. So the second pass
+///    mis-settles too and the request refuses through `redis_failure_policy`.
+///
+/// That is the whole statement, and it is an entailment rather than a
+/// coincidence of these parameters: the threshold that starves learning (a
+/// reply latency of one sub-bucket) and the staleness the rebuild inherits are
+/// the same quantity, so a response held far enough past one sub-bucket to
+/// freeze the base is also far enough to push the rebuilt pass past `b + 1`.
+/// A frozen offset plus a drift past the band is an unavailable store, not a
+/// permanent double charge.
+/// [`a_prompt_store_pays_exactly_one_rebuild_for_a_clock_step_and_learns_it`]
+/// is the other side: with prompt replies the same drift costs exactly one
+/// rebuild, is admitted, and is learned from that pass's own sample.
+#[tokio::test]
+async fn starved_offset_learning_settles_until_the_server_clock_drifts_under_it() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const DRIFT: Duration = Duration::from_secs(600);
+    // Held AFTER applying: the server executes promptly and only the response
+    // is late. 200ms is more than three sub-buckets of a one-second window and
+    // still inside the 500ms screened per-command response deadline.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(200),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::AfterApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+    // EVERY pooled slot is established (and screened, and probed) up front, on
+    // the undrifted clock. A slot opened after the step below would seed the
+    // new clock from its own probe and there would be no drift left to observe
+    // — including one opened by a detached hand-back racing its rebuild.
+    assert_eq!(
+        client.warm_pool_for_test().await,
+        4,
+        "every pooled slot must be screened before the clock moves"
+    );
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    // Roomy enough that nothing below is a quota refusal; the assertions are
+    // about placement, not about the budget.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 100,
+        duration: Duration::from_secs(1),
+    }]);
+
+    // 1. Learning is starved and every decision still stands.
+    for _ in 0..6 {
+        assert!(
+            algorithm
+                .check_redis(&client, "ip:127.0.0.1", &op)
+                .await
+                .expect("a late RESPONSE is not a stale ladder")
+                .allowed
+        );
+    }
+    let frozen = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the connections' own probes seeded the offset");
+    assert_eq!(
+        server.incrs(),
+        6,
+        "a transaction executed inside its own sub-bucket settles however late \
+         its response is: no pass may be abandoned"
+    );
+    assert_eq!(
+        server.decrs(),
+        0,
+        "and nothing is handed back, so nothing reaches redis_failure_policy"
+    );
+
+    // 2. The clock steps under the live client. Nothing can re-teach the offset
+    //    while replies stay slow, and nothing can place the rebuild either: the
+    //    rebuilt pass selects from the instant the abandoned pass carried, and
+    //    this fixture holds every response 200ms AFTER applying it, so by the
+    //    time the server applies the rebuild that instant is more than three
+    //    sub-buckets stale. Both passes mis-settle and the request refuses.
+    //    Repeated, because the point is that it is the steady state and not a
+    //    transient.
+    server.set_time_mode(ServerTimeMode::Ahead(DRIFT));
+    for round in 0..2 {
+        let charges_before = server.incrs();
+        let handbacks_before = server.decrs();
+        let refused = algorithm.check_redis(&client, "ip:127.0.0.1", &op).await;
+        assert!(
+            refused.is_err(),
+            "round {round}: a drift past the settlement band, on a store no reply \
+             of which is prompt enough to teach it, must refuse through \
+             redis_failure_policy rather than publish a decision from a ladder it \
+             could not place: {refused:?}"
+        );
+        await_compensations(&client).await;
+        assert_eq!(
+            server.incrs() - charges_before,
+            2,
+            "round {round}: the bounded rebuild still stops at two transactions"
+        );
+        assert_eq!(
+            server.decrs() - handbacks_before,
+            2,
+            "round {round}: both abandoned passes hand their charges back"
+        );
+    }
+    let still_frozen = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the offset is still known");
+    assert_eq!(
+        still_frozen, frozen,
+        "no reply was prompt enough to teach the ten-minute step, so the base \
+         stays exactly where the probes left it: frozen={frozen} now={still_frozen}"
+    );
+    // And it is a PLACEMENT refusal, not an endpoint verdict: every transaction
+    // succeeded, so the store is still available and the consumer's
+    // `redis_failure_policy` is what governs these decisions.
+    assert!(
+        client.is_available(),
+        "a ladder that could not be placed is routed through redis_failure_policy; \
+         it must not mark an endpoint that answered every command unusable"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The other side of that boundary: with PROMPT replies the same ten-minute
+/// step costs exactly ONE rebuild, is admitted, and is not paid twice.
+///
+/// Nothing is held here, so the sample the mis-settled pass carries is prompt
+/// enough to move the base (`clock_sample_is_prompt`'s rule). Three things
+/// follow, and they are the exact complement of the starved fixture above:
+/// the rebuild selects from an instant that is still current when the server
+/// applies it, so it settles and the request is admitted; the same sample
+/// teaches the step, so the NEXT request settles on its first pass; and the
+/// double charge is therefore a one-off rather than a steady state.
+///
+/// The pool is warmed BEFORE the step so the only thing that can teach the
+/// drift is a charge transaction's own reply — a slot opened afterwards would
+/// seed the new clock from its own probe and prove nothing about learning.
+#[tokio::test]
+async fn a_prompt_store_pays_exactly_one_rebuild_for_a_clock_step_and_learns_it() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    const DRIFT: Duration = Duration::from_secs(600);
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    assert_eq!(
+        client.warm_pool_for_test().await,
+        4,
+        "every pooled slot must be screened before the clock moves"
+    );
+
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 100,
+        duration: Duration::from_secs(1),
+    }]);
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("an undrifted charge settles on its first pass")
+            .allowed
+    );
+    let seeded = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the connections' own probes seeded the offset");
+    assert_eq!(server.incrs(), 1);
+    assert_eq!(server.decrs(), 0);
+
+    // The step. The first request after it mis-settles on the base it still
+    // holds, hands that charge back, and rebuilds from the server instant —
+    // which is current here, because no leg of that round trip was held.
+    server.set_time_mode(ServerTimeMode::Ahead(DRIFT));
+    let charges_before = server.incrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("one rebuild is still a decision")
+            .allowed,
+        "a prompt store's single mis-settlement rebuilds and admits"
+    );
+    await_compensations(&client).await;
+    assert_eq!(
+        server.incrs() - charges_before,
+        2,
+        "the drifted base mis-settles once and rebuilds once"
+    );
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the abandoned pass hands its own charge back, and only it"
+    );
+
+    // The mis-settled pass's own reply was prompt, so it also taught the step.
+    let learned = client
+        .server_clock()
+        .offset_nanos()
+        .expect("the offset is still known");
+    assert!(
+        learned - seeded > 500_000_000_000,
+        "a prompt sample from the mis-settled pass must teach the ten-minute \
+         step: seeded={seeded} learned={learned}"
+    );
+
+    // Which makes the rebuild a one-off rather than a standing cost.
+    let charges_before = server.incrs();
+    let handbacks_before = server.decrs();
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("the relearned base settles on its first pass")
+            .allowed
+    );
+    await_compensations(&client).await;
+    assert_eq!(
+        server.incrs() - charges_before,
+        1,
+        "a base that learned the step charges exactly one transaction again"
+    );
+    assert_eq!(
+        server.decrs() - handbacks_before,
+        0,
+        "with nothing left to hand back"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The rule itself: a sample is adopted only while its own reply latency is
+/// under one sub-bucket of the narrowest window the transaction charged.
+#[test]
+fn a_clock_sample_is_prompt_only_inside_one_sub_bucket_of_the_tightest_window() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        clock_sample_is_prompt, redis_sub_bucket_nanos,
+    };
+
+    // One-second window: 62.5ms sub-buckets.
+    assert!(clock_sample_is_prompt(Duration::from_millis(10), 1));
+    assert!(clock_sample_is_prompt(Duration::from_micros(62_499), 1));
+    assert!(!clock_sample_is_prompt(Duration::from_micros(62_500), 1));
+    assert!(!clock_sample_is_prompt(Duration::from_millis(250), 1));
+
+    // A one-minute window tolerates a far later reply, and the boundary is
+    // exactly the production sub-bucket width.
+    let minute = Duration::from_nanos(redis_sub_bucket_nanos(60) as u64);
+    assert_eq!(minute, Duration::from_millis(3_750));
+    assert!(clock_sample_is_prompt(
+        minute.saturating_sub(Duration::from_nanos(1)),
+        60
+    ));
+    assert!(!clock_sample_is_prompt(minute, 60));
+
+    // A zero window clamps to one second rather than dividing by zero.
+    assert!(clock_sample_is_prompt(Duration::from_millis(10), 0));
+    assert!(!clock_sample_is_prompt(Duration::from_millis(100), 0));
+}
+
+/// Design pins for the shared bucket clock.
+///
+/// `TIME` rides inside the charge transaction and nowhere else, it is queued
+/// unconditionally because a connection that could not answer the standalone
+/// probe is never published, the offset only moves on a prompt reply, and the
+/// compensation stays a pure `DECR`/`EXPIRE` pair.
+#[test]
+fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
+    let redis = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+
+    fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n    /// ")
+            .map(|index| index + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    let charge = method_body(redis, "pub async fn charge_rate_limit_windows(");
+    assert!(
+        charge.contains("pipeline.cmd(\"TIME\");"),
+        "every charge transaction must carry the server clock"
+    );
+    assert!(
+        !charge.contains("server_time_permitted"),
+        "there is no clock MODE any more: a connection that cannot answer TIME is \
+         never published, so nothing may branch on a per-client verdict"
+    );
+    assert!(
+        charge.contains("* REDIS_WINDOW_SUB_BUCKET_KEYS + 1"),
+        "the expected reply length must account for the one TIME element exactly"
+    );
+    assert!(
+        charge.contains("clock_sample_is_prompt(reply_latency, narrowest_window_seconds)"),
+        "a reply held past one sub-bucket of the tightest charged window must not \
+         move the learned offset"
+    );
+    assert!(
+        charge.contains("self.server_clock.record_reply(server_time, local_at_reply)"),
+        "a prompt EXEC must still refresh the offset the NEXT request selects with"
+    );
+    assert!(
+        charge.contains("settled_at: Some(server_time)"),
+        "settlement is always judged on the instant the SERVER applied the charge"
+    );
+
+    let compensate = method_body(redis, "pub async fn uncharge_rate_limit_windows(");
+    assert!(
+        !compensate.contains("TIME"),
+        "a hand-back settles nothing and must not carry the server clock"
+    );
+
+    // The probe is STANDALONE and runs on every screened connection, before the
+    // socket may carry a policy command.
+    let screen = method_body(
+        redis,
+        "async fn screen_and_arm(&self, conn: &mut redis::aio::MultiplexedConnection) -> bool {",
+    );
+    assert!(
+        screen.contains("self.probe_server_time(conn).await"),
+        "every established connection must re-probe TIME; an ACL can change under \
+         a live gateway"
+    );
+    assert!(
+        !screen.contains("self.probe_server_time(conn).await;"),
+        "the probe's verdict must GATE the connection, not be discarded: a probe \
+         that could not be read leaves the socket unscreened"
+    );
+    let probe = method_body(redis, "async fn probe_server_time(");
+    assert!(
+        probe.contains("screen_connection_server_clock(conn, SCREENED_COMMAND_RESPONSE_TIMEOUT)"),
+        "the connect-path probe must go through the ONE shared screen, bounded by the \
+         per-command deadline armed on the connection it just screened: {probe}"
+    );
+
+    // The wire work itself is that one shared screen, so the connect path and
+    // the background recovery checker cannot drift apart.
+    let clock_screen = redis
+        .split("async fn screen_connection_server_clock(")
+        .nth(1)
+        .expect("the shared TIME screen must exist")
+        .split("\n/// ")
+        .next()
+        .expect("the body ends before the next item's doc comment");
+    assert!(
+        clock_screen.contains("redis::cmd(\"TIME\").query_async::<redis::Value>(conn)"),
+        "the screen must be a plain standalone TIME, never a trial run inside MULTI"
+    );
+    assert!(
+        clock_screen.contains("tokio::time::timeout(") && clock_screen.contains("probe_timeout"),
+        "an endpoint that accepts and then never answers TIME must cost one bounded \
+         probe, not a wedged caller: {clock_screen}"
+    );
+    assert!(
+        clock_screen.contains("parse_redis_server_time(value)"),
+        "one parser decides what counts as a clock"
+    );
+    // EVERY unsuccessful arm rejects the connection. The two recognised
+    // refusals pick the diagnostic, never the outcome.
+    assert!(
+        clock_screen.contains("is_permission_denied_error(&error)")
+            && clock_screen.contains("is_unknown_command_error(&error)"),
+        "a NOPERM and an unknown command still name themselves in the diagnostic"
+    );
+    assert_eq!(
+        probe.matches("self.reject_unclocked_connection(").count(),
+        3,
+        "a non-clock reply, a NOPERM, and an unknown command each publish their own \
+         diagnostic and reject the connection: {probe}"
+    );
+    assert_eq!(
+        probe.matches("self.mark_unavailable()").count(),
+        3,
+        "those same three arms must mark the store unavailable themselves — they are \
+         not ordinary command failures: {probe}"
+    );
+    assert!(
+        probe.contains("self.note_command_failure(&e)"),
+        "a timeout or a transport failure must reach ordinary availability handling"
+    );
+    assert_eq!(
+        probe.matches("true").count(),
+        1,
+        "only a well-formed clock may publish the connection: {probe}"
+    );
+    // Recovery publishes THIS client's availability, so it must screen what the
+    // client's own connections screen. A PING/topology-only recovery advertised
+    // a restored quota store — and logged one — on an endpoint that still
+    // denied the clock (review finding MINOR 1).
+    let recovery = method_body(redis, "pub(crate) fn start_health_checker_if_needed(");
+    assert!(
+        recovery.contains("let requires_server_clock = self.requires_server_clock();"),
+        "the recovery task must carry the client's clock requirement: {recovery}"
+    );
+    assert!(
+        recovery.contains("if requires_server_clock {")
+            && recovery.contains("screen_connection_server_clock(&mut conn, connect_timeout)"),
+        "a Required client's recovery must obtain a bounded, well-formed TIME before \
+         availability may be republished, through the same screen the probe uses"
+    );
+    assert!(
+        !recovery.contains("record_reply"),
+        "a recovery sample is bounded only by the connect timeout, far past one \
+         sub-bucket: it must never move the learned offset"
+    );
+
+    assert!(
+        !redis.contains("fn degrade_to_local_clock")
+            && !redis.contains("fn begin_clock_quarantine")
+            && !redis.contains("fn quarantine_clock_base_change")
+            && !redis.contains("fn observe_window"),
+        "local-clock mode and its base-transition machinery are retired; do not \
+         reintroduce a second bucket base"
+    );
+
+    // Only the replay logger may describe a rejected probe to a replay client,
+    // and the raw backend error reaches an operational client only.
+    let reject = method_body(redis, "fn reject_unclocked_connection(");
+    assert!(
+        reject.contains("warn_replay_backend(")
+            && !reject.contains("error = %e")
+            && !reject.contains("error = %error"),
+        "replay clients publish a fixed classification beside the redacted endpoint, \
+         never backend text: {reject}"
+    );
+
+    // Bucket selection everywhere in production goes through the correction.
+    let limiter = include_str!("../../../src/plugins/utils/rate_limit.rs");
+    let admission = limiter
+        .split("async fn check_http_windows_redis(")
+        .nth(1)
+        .expect("check_http_windows_redis must exist")
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("function body ends before the test-only items");
+    assert_eq!(
+        admission.matches("redis.server_clock()").count(),
+        1,
+        "selection is the ONLY bucket-clock read on the quota path: settlement now \
+         always uses the instant the transaction itself returned"
+    );
+
+    // The requirement is scoped at BOTH ends, and the two must stay paired: a
+    // probe that only screened, or a charge that only asserted, would let a
+    // clockless client select sub-buckets on its own wall clock.
+    assert!(
+        screen.contains("if !self.requires_server_clock() {"),
+        "only a request-quota client's connections may spend a round trip proving \
+         TIME: {screen}"
+    );
+    assert!(
+        charge.contains("if !self.requires_server_clock() {"),
+        "the ladder must fail closed on a client that never declared the \
+         server-clock requirement: {charge}"
+    );
+    assert!(
+        charge.contains("debug_assert!("),
+        "and it must say so loudly in debug, where reaching it is a wiring bug: \
+         {charge}"
+    );
+    assert!(
+        redis.contains("enum ServerClockRequirement"),
+        "the requirement is a construction-time property, not a runtime guess"
+    );
+
+    // The limiter picks the client kind from the ALGORITHM, so a new algorithm
+    // cannot silently inherit a quota client's ACL demand.
+    assert!(
+        limiter.contains("if A::REQUIRES_SERVER_CLOCK {")
+            && limiter.contains("RedisRateLimitClient::for_request_quota("),
+        "RedisLimiter must choose its client from the algorithm's declared contract"
+    );
+    assert!(
+        limiter.contains("const REQUIRES_SERVER_CLOCK: bool;"),
+        "the contract must stay a REQUIRED associated const: a default would let a \
+         new algorithm decide an operator's Redis ACL by omission"
+    );
+}
+
+/// The six Redis-backed rate-limit roots, and which of them makes `+time`
+/// mandatory.
+///
+/// Only the three request-quota roots charge the shared sub-bucket ladder. The
+/// token, frame, and datagram budgets index their windows locally, so an ACL
+/// that withholds `TIME` must leave them enforcing. A new root added without a
+/// row here fails the count assertion rather than quietly inheriting either
+/// answer.
+#[test]
+fn only_the_request_quota_roots_make_the_server_clock_mandatory() {
+    use ferrum_edge::_test_support::rate_limit_redis_requires_server_clock;
+
+    let redis_fields = |extra: serde_json::Value| {
+        let mut base = json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_health_check_interval_seconds": 3600,
+        });
+        let (Some(object), Some(extra)) = (base.as_object_mut(), extra.as_object()) else {
+            return base;
+        };
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+        base
+    };
+
+    let expected = [
+        (
+            "rate_limiting",
+            redis_fields(json!({
+                "limit_by": "ip",
+                "limits": [{ "scope": "default", "requests_per_minute": 10 }]
+            })),
+            true,
+        ),
+        (
+            "graphql",
+            redis_fields(json!({
+                "type_rate_limits": { "query": { "max_requests": 5, "window_seconds": 60 } }
+            })),
+            true,
+        ),
+        (
+            "grpc_method_router",
+            redis_fields(json!({
+                "method_rate_limits": {
+                    "/pkg.Svc/M": { "max_requests": 5, "window_seconds": 60 }
+                }
+            })),
+            true,
+        ),
+        (
+            "ai_rate_limiter",
+            redis_fields(json!({ "token_limit": 100, "window_seconds": 60 })),
+            false,
+        ),
+        (
+            "ws_rate_limiting",
+            redis_fields(json!({ "frames_per_second": 10, "burst_size": 10 })),
+            false,
+        ),
+        (
+            "udp_rate_limiting",
+            redis_fields(json!({ "datagrams_per_second": 10 })),
+            false,
+        ),
+    ];
+
+    assert_eq!(
+        expected.len(),
+        6,
+        "every Redis-backed rate-limit root must state which clock contract it is on"
+    );
+    for (plugin_name, config, requires_clock) in expected {
+        let observed = rate_limit_redis_requires_server_clock(plugin_name, &config)
+            .unwrap_or_else(|error| panic!("{plugin_name}: {error}"))
+            .unwrap_or_else(|| panic!("{plugin_name}: sync_mode redis must build a client"));
+        assert_eq!(
+            observed, requires_clock,
+            "{plugin_name}: server-clock requirement (and therefore whether the \
+             deployment's Redis ACL must grant +time)"
+        );
+    }
+}
+
+/// Review finding 3: a capacity refusal taken during a per-decision fallback
+/// must still be attributed to the fallback budget.
+///
+/// A second sub-bucket rollover refuses through `redis_failure_policy` while
+/// every transaction it issued SUCCEEDED, so the client's availability signal
+/// stays true. Reconstructing the attribution from "is the store unreachable
+/// now" therefore answers `false`, and the `429` a previously unseen identity
+/// gets at the local key cap loses both its `ratelimit_local_fallback` metadata
+/// and its fallback-decision counter — exactly where degraded enforcement is
+/// least visible. The decision carries its own provenance instead.
+#[tokio::test]
+async fn a_second_rollover_attributes_its_capacity_refusal_to_the_fallback_budget() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+        RedisFailurePolicy,
+    };
+
+    // Every charge stalls past its sub-bucket, so both passes roll over and the
+    // decision fails closed into `redis_failure_policy`.
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(250),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::BeforeApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+                "redis_pool_size": 4,
+                "redis_failure_policy": "local_fallback",
+                "redis_health_check_interval_seconds": 3600,
+            }),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+    assert_eq!(
+        backend.redis_failure_policy(),
+        Some(RedisFailurePolicy::LocalFallback),
+        "this coverage is about the fallback budget, not a fail-closed refusal"
+    );
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("failover backend must own a Redis client");
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(1),
+    }]);
+
+    // One local slot, and the first identity takes it on the fallback budget.
+    let seen = backend
+        .check_with_redis_key_and_local_capacity_attributed(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1,
+        )
+        .await;
+    assert!(
+        seen.outcome.expect("an admitted fallback decision").allowed,
+        "the per-process budget admits the first identity"
+    );
+    assert!(
+        seen.local_fallback,
+        "a rollover refusal routes THIS decision onto the fallback budget"
+    );
+
+    // The signal the old attribution read: the client is perfectly healthy,
+    // because both of its transactions succeeded.
+    assert!(
+        client.is_available(),
+        "a rollover is not a command failure; the endpoint is reachable"
+    );
+    assert!(
+        !backend.local_fallback_active(),
+        "the backend-level outage question answers 'no', which is why a \
+         capacity refusal must not be attributed from it"
+    );
+
+    // A previously unseen identity at the cap: no outcome to carry the marker.
+    let denied = backend
+        .check_with_redis_key_and_local_capacity_attributed(
+            "identity-b".to_string(),
+            || "{ferrum%3Atest:identity-b}".to_string(),
+            &op,
+            1,
+        )
+        .await;
+    assert!(
+        denied.outcome.is_none(),
+        "an unseen identity at the local cap is a capacity refusal"
+    );
+    assert!(
+        denied.local_fallback,
+        "the capacity 429 belongs to the fallback budget and must stay attributed"
+    );
+    assert_eq!(backend.tracked_keys_count(), 1);
+
+    let _ = server.shutdown.send(());
 }
 
 // ── Redis health-task lifecycle (issue #2305) ─────────────────────────────
@@ -1573,8 +5660,16 @@ async fn spawn_watch_then_drop_redis_server() -> (u16, oneshot::Sender<()>, Arc<
                             let commands =
                                 pending.iter().filter(|&&b| b == b'*').count().max(1);
                             let mut reply = Vec::new();
-                            for _ in 0..commands {
-                                reply.extend_from_slice(b"+OK\r\n");
+                            if chunk_contains(&pending, TIME_CMD) {
+                                // The standalone screening probe. `+OK` here is
+                                // not a clock, so the connection would never be
+                                // published and the WATCH sequence under test
+                                // would never run.
+                                reply.extend_from_slice(&host_clock_time_reply());
+                            } else {
+                                for _ in 0..commands {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
                             }
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -1668,8 +5763,15 @@ async fn spawn_set_then_drop_redis_server() -> (u16, oneshot::Sender<()>) {
                             }
                             let commands = buf[..n].iter().filter(|&&b| b == b'*').count().max(1);
                             let mut reply = Vec::new();
-                            for _ in 0..commands {
-                                reply.extend_from_slice(b"+OK\r\n");
+                            if chunk_contains(&buf[..n], TIME_CMD) {
+                                // The standalone screening probe: without a
+                                // clock the connection is dropped unpublished
+                                // and the `SET` under test never arrives.
+                                reply.extend_from_slice(&host_clock_time_reply());
+                            } else {
+                                for _ in 0..commands {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
                             }
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -1990,6 +6092,64 @@ fn only_retention_authorities_require_the_no_eviction_screen() {
     );
 }
 
+/// The `TIME` prerequisite belongs to the consumers that select sub-buckets on
+/// the Redis server's clock, not to the socket. Screening is shared, so making
+/// it a property of the connection took a replay-only deployment on a
+/// restrictive ACL out of service for a command it never sends.
+#[test]
+fn only_request_quota_clients_require_the_server_clock() {
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+
+    let quota = RedisRateLimitClient::for_request_quota(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        quota.requires_server_clock_for_test(),
+        "request-quota admission orders one ladder across gateways on the server clock"
+    );
+
+    let counters = RedisRateLimitClient::new(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    let replay = RedisRateLimitClient::for_replay_authority(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    let retention = RedisRateLimitClient::for_retention_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+
+    for (label, client) in [
+        ("counter/cache", &counters),
+        ("replay authority", &replay),
+        ("retention authority", &retention),
+    ] {
+        assert!(
+            !client.requires_server_clock_for_test(),
+            "{label}: a consumer that reads no clock must not force an operator to grant +time"
+        );
+    }
+}
+
+/// The two screening prerequisites are independent: the retention proof follows
+/// what a consumer RETAINS, the clock proof follows what it COMPUTES, and no
+/// current consumer needs both.
+#[test]
+fn the_retention_and_server_clock_prerequisites_are_chosen_independently() {
+    let config = make_config("redis://127.0.0.1:6379/0", false);
+
+    let quota = RedisRateLimitClient::for_request_quota(config.clone(), None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(quota.requires_server_clock_for_test());
+    assert!(
+        !quota.requires_no_eviction_screen_for_test(),
+        "an evicted counter degrades a budget; it does not void a guarantee"
+    );
+
+    let retention = RedisRateLimitClient::for_retention_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(retention.requires_no_eviction_screen_for_test());
+    assert!(
+        !retention.requires_server_clock_for_test(),
+        "an idempotency authority claims markers with SET NX EX and reads no clock"
+    );
+}
+
 /// The three memory-policy verdicts, applied exactly as a freshly established
 /// connection applies them: a proven non-evicting endpoint is usable, a proven
 /// evicting one is terminal for the client generation (no recovery ping can
@@ -2143,8 +6303,10 @@ fn parse_resp_command(buf: &[u8]) -> Option<(String, usize)> {
 /// `info_payload` as a bulk string. Once `after_info_reply` is set, every later
 /// command receives that raw reply instead of `+OK` — except `MULTI`, which is
 /// still answered `+OK` because that is what a real Cluster node does: it opens
-/// the transaction and redirects the keyed commands queued inside it. Counts
-/// accepted TCP connections and observed `INCR` commands.
+/// the transaction and redirects the keyed commands queued inside it. The
+/// standalone `TIME` screening probe gets this host's clock unless
+/// `after_info_reply` has claimed it. Counts accepted TCP connections and
+/// observed `INCR` commands.
 async fn spawn_topology_redis_server(
     info_payload: &'static str,
     after_info_reply: Option<&'static str>,
@@ -2194,6 +6356,11 @@ async fn spawn_topology_redis_server(
                                     && name != "MULTI"
                                 {
                                     reply.extend_from_slice(raw.as_bytes());
+                                } else if name == "TIME" {
+                                    // The standalone screening probe, answered
+                                    // only where `after_info_reply` has not
+                                    // already claimed every post-screen command.
+                                    reply.extend_from_slice(&host_clock_time_reply());
                                 } else {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }
@@ -2356,9 +6523,10 @@ fn command_count(chunk: &[u8]) -> usize {
 }
 
 /// Minimal RESP server: `+OK` to every command except `INFO` (per
-/// [`InfoBehavior`]) and `GET` (always a nil bulk string). `info_delay` /
-/// `get_delay` hold the corresponding reply *after* counting it, so a test can
-/// land a concurrent topology rejection while that exact operation is in flight.
+/// [`InfoBehavior`]), the standalone `TIME` screening probe (this host's
+/// clock), and `GET` (always a nil bulk string). `info_delay` / `get_delay`
+/// hold the corresponding reply *after* counting it, so a test can land a
+/// concurrent topology rejection while that exact operation is in flight.
 async fn spawn_screened_redis_server(
     info: InfoBehavior,
     info_delay: Duration,
@@ -2443,6 +6611,13 @@ async fn spawn_screened_redis_server_with_drop(
                                     // Accepted, authenticated, silent.
                                     InfoBehavior::Never => continue,
                                 }
+                            } else if chunk_contains(chunk, TIME_CMD) {
+                                // The standalone screening probe that follows a
+                                // usable `INFO`. A `+OK` is not a clock, so the
+                                // connection would be dropped unpublished and
+                                // every case below would observe a refused
+                                // endpoint instead of the behaviour under test.
+                                reply.extend_from_slice(&host_clock_time_reply());
                             } else if chunk_contains(chunk, GET_CMD) {
                                 gets.fetch_add(1, Ordering::Relaxed);
                                 conn_gets += 1;
@@ -2912,13 +7087,26 @@ const MULTI_ARG: &[u8] = b"MULTI";
 const EXEC_ARG: &[u8] = b"EXEC";
 const INCR_ARG: &[u8] = b"INCR";
 const INFO_ARG: &[u8] = b"INFO";
+const TIME_ARG: &[u8] = b"TIME";
+
+/// `GET`s one window contributes to a charge: one per older sub-bucket, plus
+/// one on the read-only sub-bucket AFTER the charged one. Only the charged
+/// bucket is written, so that is the whole ladder minus one.
+const CHARGE_GETS_PER_WINDOW: usize =
+    ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_WINDOW_SUB_BUCKET_KEYS - 1;
+
+/// Commands one window contributes to a charge transaction: every `GET`, plus
+/// `INCR` and `EXPIRE` on the sub-bucket being charged. Only the `EXPIRE` is
+/// `.ignore()`d, so the client pairs `CHARGE_COMMANDS_PER_WINDOW - 1` values.
+const CHARGE_COMMANDS_PER_WINDOW: usize = CHARGE_GETS_PER_WINDOW + 2;
 
 /// How the fake server answers the limiter's two transactions.
 ///
-/// A charge is `MULTI` / `GET` / `INCR` / `EXPIRE` / `EXEC` per window; the
-/// compensating transaction a refusal issues is `MULTI` / `DECR` / `EXPIRE` /
-/// `EXEC` per window. The server tells them apart by the queued commands, so a
-/// script never has to hardcode a reply length.
+/// A charge is `MULTI` / (`GET` × K / `INCR` / `EXPIRE`) per window / one
+/// trailing `TIME` for the whole transaction / `EXEC`; the compensating
+/// transaction a refusal issues is `MULTI` / `DECR` / `EXPIRE` / `EXEC` per
+/// window and carries no clock. The server tells them apart by the queued
+/// commands, so a script never has to hardcode a reply length.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransactionScript {
     /// The FIRST charge fails with a plain server error; every later charge
@@ -2937,17 +7125,31 @@ enum TransactionScript {
     ChargeReplyIsUnpairable,
 }
 
-/// `EXEC` array for a charge: per window `GET` (nil or an exhausted count),
-/// `INCR` (the post-increment count) and `EXPIRE`.
+/// `EXEC` array for a charge: per window one `GET` per older sub-bucket (nil or
+/// an exhausted count), then `INCR` (the post-increment count) and `EXPIRE`,
+/// and finally the one trailing `TIME` the charge queues once per transaction.
+///
+/// The trailing clock is there because this fixture answers the standalone
+/// probe with a clock, so the client is in server-clock mode and queues `TIME`
+/// last. Only the `EXPIRE`s are `.ignore()`d, so the client pairs
+/// `windows * REDIS_WINDOW_SUB_BUCKET_KEYS` counters plus that clock.
 fn charge_reply(windows: usize, exhausted: bool) -> Vec<u8> {
-    let mut reply = format!("*{}\r\n", windows * 3).into_bytes();
+    let values = windows * CHARGE_COMMANDS_PER_WINDOW + 1;
+    let mut reply = format!("*{values}\r\n").into_bytes();
+    let older: &[u8] = if exhausted { b":9\r\n" } else { b"$-1\r\n" };
+    // The charged sub-bucket's post-increment `INCR`, then its ignored `EXPIRE`.
+    let charged: &[u8] = if exhausted {
+        b":9\r\n:1\r\n"
+    } else {
+        b":1\r\n:1\r\n"
+    };
     for _ in 0..windows {
-        if exhausted {
-            reply.extend_from_slice(b":9\r\n:9\r\n:1\r\n");
-        } else {
-            reply.extend_from_slice(b"$-1\r\n:1\r\n:1\r\n");
+        for _ in 0..CHARGE_GETS_PER_WINDOW {
+            reply.extend_from_slice(older);
         }
+        reply.extend_from_slice(charged);
     }
+    reply.extend_from_slice(&host_clock_time_reply());
     reply
 }
 
@@ -3029,8 +7231,10 @@ fn take_resp_command(pending: &mut Vec<u8>) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
-/// Screens clean on every connection and answers each `MULTI`/`EXEC` the
-/// limiter sends according to `script`.
+/// Screens clean on every connection — including the standalone `TIME` probe,
+/// which gets this host's clock so the client runs in the server-clock mode a
+/// real Redis puts it in — and answers each `MULTI`/`EXEC` the limiter sends
+/// according to `script`.
 async fn spawn_transaction_redis_server(script: TransactionScript) -> TransactionServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
@@ -3074,8 +7278,16 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                     let charge = queued
                                         .iter()
                                         .any(|command| command.eq_ignore_ascii_case(INCR_ARG));
+                                    let clocked = queued
+                                        .iter()
+                                        .any(|command| command.eq_ignore_ascii_case(TIME_ARG));
+                                    // A charge queues one trailing `TIME` for the
+                                    // whole transaction, not one per window, so
+                                    // it is excluded before the per-window
+                                    // commands are counted.
+                                    let ladder = queued.len() - usize::from(clocked);
                                     let windows = if charge {
-                                        queued.len() / 3
+                                        ladder / CHARGE_COMMANDS_PER_WINDOW
                                     } else {
                                         queued.len() / 2
                                     };
@@ -3096,16 +7308,21 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                             reply.extend(compensation_reply(windows));
                                         }
                                         (TransactionScript::ChargeReplyIsUnpairable, true) => {
-                                            // One extra integer: the client
+                                            // One extra integer beyond the
+                                            // charge's own commands: the client
                                             // filters the ignored `EXPIRE`
                                             // slots by index, so the surviving
                                             // count no longer divides into
-                                            // (previous, current) pairs.
+                                            // whole sub-bucket ladders even
+                                            // after the trailing server clock
+                                            // is accounted for.
+                                            let values = windows * CHARGE_COMMANDS_PER_WINDOW + 1;
                                             let mut unpairable =
-                                                format!("*{}\r\n", windows * 3 + 1).into_bytes();
-                                            for _ in 0..windows * 3 + 1 {
+                                                format!("*{}\r\n", values + 1).into_bytes();
+                                            for _ in 0..values {
                                                 unpairable.extend_from_slice(b":1\r\n");
                                             }
+                                            unpairable.extend_from_slice(&host_clock_time_reply());
                                             reply.extend(unpairable);
                                         }
                                         (_, true) => reply.extend(charge_reply(windows, true)),
@@ -3122,8 +7339,19 @@ async fn spawn_transaction_redis_server(script: TransactionScript) -> Transactio
                                     let bulk = format!("${len}\r\n{text}\r\n");
                                     reply.extend_from_slice(bulk.as_bytes());
                                 } else if in_transaction {
+                                    // Including the `TIME` a charge queues last:
+                                    // inside `MULTI` it is `+QUEUED` like every
+                                    // other command and answered by the `EXEC`
+                                    // array that `charge_reply` builds.
                                     queued.push(name);
                                     reply.extend_from_slice(b"+QUEUED\r\n");
+                                } else if name.eq_ignore_ascii_case(TIME_ARG) {
+                                    // The standalone screening probe. Answering
+                                    // a clock is what a real Redis does, and it
+                                    // is what puts the client in the
+                                    // server-clock mode `charge_reply` is
+                                    // shaped for.
+                                    reply.extend_from_slice(&host_clock_time_reply());
                                 } else {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }
@@ -3576,18 +7804,33 @@ fn http_window_admission_is_pooled_plain_resp_and_hands_back_a_refused_charge() 
     let refusal = body
         .find("if let Some(spec) = refused {")
         .expect("admission must have a single refusal branch");
-    let compensation = body
+    // Exactly two hand-backs, and the review of the sub-bucket rework is why
+    // there are two: the staleness rebuild abandons its own pass inside the
+    // charge loop (before any decision is derived), and the refusal branch
+    // hands back after one. An admitted request still reaches neither.
+    let rollover_handback = body
         .find(".spawn_uncharge_rate_limit_windows(charges)")
+        .expect("an abandoned stale pass must hand its charge back");
+    let refusal_handback = body
+        .rfind(".spawn_uncharge_rate_limit_windows(charges)")
         .expect("a refusal must hand the charge back");
+    let pass_bound = body
+        .find("if pass >= MAX_REDIS_CHARGE_PASSES {")
+        .expect("the staleness rebuild must be bounded");
     assert!(
-        charge < refusal && refusal < compensation,
-        "the charge must precede the decision, and the hand-back must sit behind \
-         the refusal branch"
+        charge < rollover_handback && rollover_handback < pass_bound,
+        "the abandoned pass must hand its charge back before the bound refuses"
+    );
+    assert!(
+        pass_bound < refusal && refusal < refusal_handback,
+        "the charge must precede the decision, and the refusal's hand-back must \
+         sit behind the refusal branch"
     );
     assert_eq!(
         body.matches("uncharge_rate_limit_windows").count(),
-        1,
-        "an admitted request must never compensate"
+        2,
+        "only the abandoned pass and the refusal compensate; an admitted request \
+         must never compensate"
     );
     // The hand-back must NOT be tied to the request future. Plugin hooks run
     // under `tokio::time::timeout_at`, so a gRPC deadline or a client

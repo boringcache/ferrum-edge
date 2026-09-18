@@ -211,11 +211,26 @@ async fn redis_fallback_path_denies_new_local_keys_at_capacity() {
     assert!(backend.contains_local_key(&"fb-a".to_string()));
     assert!(backend.contains_local_key(&"fb-b".to_string()));
 
-    // The capacity denial above carries no outcome, so `rate_limiting` reads
-    // the backend directly to decide whether that 429 belongs to the outage.
-    // A Redis-backed policy hitting the local key cap during an outage is an
-    // outage symptom, not client behaviour, and must be attributed with
-    // `ratelimit_local_fallback` like every other fallback decision.
+    // The capacity denial above carries no outcome, so its provenance has to
+    // travel beside it. A Redis-backed policy hitting the local key cap while
+    // serving the fallback budget is an outage symptom, not client behaviour,
+    // and must be attributed with `ratelimit_local_fallback` like every other
+    // fallback decision.
+    let denied = backend
+        .check_with_redis_key_and_local_capacity_attributed(
+            "fb-new".to_string(),
+            || "redis:fb-new".to_string(),
+            &op,
+            max_entries,
+        )
+        .await;
+    assert!(denied.outcome.is_none(), "still a capacity denial");
+    assert!(
+        denied.local_fallback,
+        "the decision itself must report that it was served on the fallback budget"
+    );
+
+    // The backend-level observability signal still answers its own question.
     assert!(
         backend.local_fallback_active(),
         "a Redis-backed policy whose store is unreachable is serving the fallback budget"
@@ -223,6 +238,19 @@ async fn redis_fallback_path_denies_new_local_keys_at_capacity() {
     assert!(
         !local_backend().local_fallback_active(),
         "a local-only policy has no centralized store to lose"
+    );
+    let local_denied = local_backend()
+        .check_with_redis_key_and_local_capacity_attributed(
+            "only".to_string(),
+            || "redis:only".to_string(),
+            &op,
+            0,
+        )
+        .await;
+    assert!(local_denied.outcome.is_none());
+    assert!(
+        !local_denied.local_fallback,
+        "a local-only policy's capacity denial is not a degraded-enforcement refusal"
     );
 }
 
