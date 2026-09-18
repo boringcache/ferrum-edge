@@ -107,7 +107,10 @@ async fn ca_construction_logs_withhold_hostile_sources_and_malformed_material() 
             "`FERRUM_TLS_CA_BUNDLE_PATH`",
             reason,
         ] {
-            assert!(captured.contains(expected), "missing {expected:?}: {captured}");
+            assert!(
+                captured.contains(expected),
+                "missing {expected:?}: {captured}"
+            );
         }
         for withheld in [
             "HTTP_CA_MISSING_MARKER",
@@ -116,7 +119,10 @@ async fn ca_construction_logs_withhold_hostile_sources_and_malformed_material() 
             "HTTP_CA_PROVIDER_MARKER",
             source,
         ] {
-            assert!(!captured.contains(withheld), "leaked {withheld:?}: {captured}");
+            assert!(
+                !captured.contains(withheld),
+                "leaked {withheld:?}: {captured}"
+            );
         }
         assert!(
             client.get().is_ok(),
@@ -162,12 +168,21 @@ async fn invalid_ca_der_constructor_logs_keep_fixed_failure_reason() {
         "Failed to build minimal DNS-cached fallback plugin client",
         "error=plugin HTTP client construction failed",
     ] {
-        assert!(captured.contains(expected), "missing {expected:?}: {captured}");
+        assert!(
+            captured.contains(expected),
+            "missing {expected:?}: {captured}"
+        );
     }
     for withheld in ["HTTP_CA_DER_FILENAME_MARKER", "OTI3NDUx", "927451"] {
-        assert!(!captured.contains(withheld), "leaked {withheld:?}: {captured}");
+        assert!(
+            !captured.contains(withheld),
+            "leaked {withheld:?}: {captured}"
+        );
     }
-    assert!(client.get().is_ok(), "empty-trust fallback remains constructible");
+    assert!(
+        client.get().is_ok(),
+        "empty-trust fallback remains constructible"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

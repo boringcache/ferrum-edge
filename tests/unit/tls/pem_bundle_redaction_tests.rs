@@ -170,7 +170,11 @@ fn rendered_material_errors_keep_schema_index_and_reason_without_source_or_conte
     let error = validate_pem_key_file("backend_tls_client_key_path", &path).unwrap_err();
     assert_rendered_material_error(
         anyhow::anyhow!(error),
-        &["`backend_tls_client_key_path`", "private key", "is malformed"],
+        &[
+            "`backend_tls_client_key_path`",
+            "private key",
+            "is malformed",
+        ],
         &["TLS_KEY_FILENAME_MARKER", PEM_MARKER, &path],
     );
 
@@ -307,12 +311,18 @@ fn backend_constructor_errors_keep_material_context_without_paths_or_payloads() 
     );
     assert_rendered_material_error(
         build(Some(&missing), None).into(),
-        &["`backend TLS client certificate`", "the private key is missing"],
+        &[
+            "`backend TLS client certificate`",
+            "the private key is missing",
+        ],
         &["TLS_BACKEND_MISSING_MARKER"],
     );
     assert_rendered_material_error(
         build(None, Some(&missing)).into(),
-        &["`backend TLS client private key`", "the certificate is missing"],
+        &[
+            "`backend TLS client private key`",
+            "the certificate is missing",
+        ],
         &["TLS_BACKEND_MISSING_MARKER"],
     );
 
@@ -336,7 +346,11 @@ fn backend_constructor_errors_keep_material_context_without_paths_or_payloads() 
     let key = write_pem(&dir, "'TLS_BACKEND_KEY_MARKER.pem", &malformed_key);
     assert_rendered_material_error(
         build(Some(Path::new(&cert)), Some(Path::new(&key))).into(),
-        &["`backend TLS client private key`", "private key", "is malformed"],
+        &[
+            "`backend TLS client private key`",
+            "private key",
+            "is malformed",
+        ],
         &["TLS_BACKEND_KEY_MARKER", PEM_MARKER, &key],
     );
 }

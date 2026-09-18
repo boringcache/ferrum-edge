@@ -1441,10 +1441,20 @@ fn crl_constructor_emissions_withhold_the_configured_source() {
         "INFO",
         "Loaded 1 CRL(s)",
     ] {
-        assert!(rendered.contains(expected), "missing {expected}: {rendered}");
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
     }
-    for forbidden in ["TLS_CRL_LOG_MARKER", path.to_str().unwrap(), "BEGIN X509 CRL"] {
-        assert!(!rendered.contains(forbidden), "leaked {forbidden}: {rendered}");
+    for forbidden in [
+        "TLS_CRL_LOG_MARKER",
+        path.to_str().unwrap(),
+        "BEGIN X509 CRL",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "leaked {forbidden}: {rendered}"
+        );
     }
 }
 
@@ -1467,7 +1477,11 @@ fn frontend_constructor_emissions_withhold_certificate_and_key_paths() {
     let policy = TlsPolicy::from_env_config(&EnvConfig::default()).unwrap();
 
     for (no_verify, client_ca, expected) in [
-        (false, None, "loaded without client certificate verification"),
+        (
+            false,
+            None,
+            "loaded without client certificate verification",
+        ),
         (true, None, "loaded with certificate verification DISABLED"),
         (
             false,

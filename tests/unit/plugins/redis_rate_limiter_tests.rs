@@ -113,7 +113,10 @@ fn redis_ca_load_diagnostic_omits_hostile_source_and_provider_details() {
         .expect("unloadable exclusive CA must refuse construction");
         assert!(!error.contains("REDIS_CA_SOURCE_MARKER"), "{error}");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
-        assert!(rendered.contains("`FERRUM_TLS_CA_BUNDLE_PATH`"), "{rendered}");
+        assert!(
+            rendered.contains("`FERRUM_TLS_CA_BUNDLE_PATH`"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("failed to load exclusive CA bundle"),
             "{rendered}"

@@ -255,10 +255,9 @@ pub(crate) fn parse_pem_certificate_bundle(
     // The policy helper bounds its label by truncation, so pass a fixed label
     // there and keep the complete, safely quoted caller context in the wrapper.
     for (index, certificate) in certificates.iter().enumerate() {
-        if let Err(reason) = crate::fips::keys::check_certificate_public_key(
-            certificate.as_ref(),
-            "TLS certificate",
-        ) {
+        if let Err(reason) =
+            crate::fips::keys::check_certificate_public_key(certificate.as_ref(), "TLS certificate")
+        {
             return Err(anyhow::anyhow!(
                 "certificate record #{} of {}: {}",
                 index + 1,
