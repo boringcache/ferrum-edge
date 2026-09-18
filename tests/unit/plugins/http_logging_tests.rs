@@ -121,7 +121,7 @@ fn test_http_logging_rejects_unknown_endpont_url_key() {
     .expect("typo endpont_url must fail construction");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("endpont_url"), "{err}");
-    assert!(err.contains("did you mean 'endpoint_url'?"), "{err}");
+    assert!(err.contains("did you mean `endpoint_url`?"), "{err}");
 }
 
 #[tokio::test]
@@ -185,7 +185,7 @@ async fn test_http_logging_rejects_malformed_endpoint_url() {
         default_client(),
     );
     match result {
-        Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
+        Err(e) => assert!(e.contains("invalid `endpoint_url`")),
         Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
     }
 }
@@ -246,7 +246,7 @@ async fn test_http_logging_custom_headers_rejects_non_string_values() {
         default_client(),
     );
     match result {
-        Err(e) => assert!(e.contains("custom_headers['bad_")),
+        Err(e) => assert!(e.contains("`custom_headers` key \"bad_")),
         Ok(_) => panic!("Expected non-string custom header values to be rejected"),
     }
 }
@@ -977,5 +977,36 @@ async fn http_logging_permanent_4xx_counts_records_once_and_survives_reload() {
             dropped_after,
             "a successful reload batch must increment no loss counter"
         );
+    }
+}
+
+#[test]
+fn startup_diagnostics_withhold_custom_header_keys_and_url_schemes() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (config, field) in [
+        (
+            json!({"endpoint_url": "http://logs.example.com", "custom_headers": {secret: 987654321}}),
+            "`custom_headers`",
+        ),
+        (
+            json!({"endpoint_url": "http://logs.example.com", "custom_headers": {secret: "safe"}}),
+            "`custom_headers`",
+        ),
+        (
+            json!({"endpoint_url": "http://logs.example.com", "custom_headers": {"'diagnostic-secret-5594": "bad\nvalue"}}),
+            "`custom_headers`",
+        ),
+        (
+            json!({"endpoint_url": "diagnostic-secret-5594://logs.example.com"}),
+            "`endpoint_url`",
+        ),
+    ] {
+        let error = HttpLogging::new(&config, default_client())
+            .err()
+            .expect("invalid HTTP sink configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+        assert!(!rendered.contains("987654321"), "{rendered}");
     }
 }

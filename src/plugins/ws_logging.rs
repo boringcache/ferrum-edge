@@ -517,12 +517,12 @@ impl WsLogging {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                "ws_logging: 'endpoint_url' is required — logs will have nowhere to send"
+                "ws_logging: `endpoint_url` is required — logs will have nowhere to send"
                     .to_string()
             })?
             .to_string();
         let parsed_url = Url::parse(&endpoint_url)
-            .map_err(|e| format!("ws_logging: invalid 'endpoint_url': {e}"))?;
+            .map_err(|_| "ws_logging: invalid `endpoint_url`: invalid URL".to_string())?;
         match parsed_url.scheme() {
             "ws" | "wss" => {}
             scheme => {
@@ -536,12 +536,12 @@ impl WsLogging {
             || endpoint_authority(&endpoint_url).is_some_and(|authority| authority.contains('@'))
         {
             return Err(
-                "ws_logging: 'endpoint_url' must not include URL user information".to_string(),
+                "ws_logging: `endpoint_url` must not include URL user information".to_string(),
             );
         }
         if !has_non_empty_authority(&endpoint_url) {
             return Err(
-                "ws_logging: 'endpoint_url' must include a hostname or IP address".to_string(),
+                "ws_logging: `endpoint_url` must include a hostname or IP address".to_string(),
             );
         }
         let endpoint_hostname = endpoint_hostname(&parsed_url)?;
@@ -551,8 +551,8 @@ impl WsLogging {
         // canonical serialized URL so admission and the collector handshake share
         // one representation, then refuse values that still cannot be a request URI.
         let endpoint_url = parsed_url.as_str().to_string();
-        if let Err(error) = endpoint_url.parse::<http::Uri>() {
-            return Err(format!("ws_logging: invalid 'endpoint_url': {error}"));
+        if let Err(_error) = endpoint_url.parse::<http::Uri>() {
+            return Err("ws_logging: invalid `endpoint_url`: invalid HTTP URI".to_string());
         }
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
@@ -585,7 +585,7 @@ impl WsLogging {
             if let Some(value) = config.get(key)
                 && value.as_u64().is_none()
             {
-                return Err(format!("ws_logging: '{key}' must be an unsigned integer"));
+                return Err(format!("ws_logging: `{key}` must be an unsigned integer"));
             }
         }
 
@@ -662,7 +662,7 @@ impl WsLogging {
         let minimum_buffer_max_bytes = max_entry_bytes.saturating_add(1).saturating_mul(2);
         if buffer_max_bytes < minimum_buffer_max_bytes {
             return Err(
-                "ws_logging: 'buffer_max_bytes' must be at least twice 'max_entry_bytes' plus 2 bytes for conservative queue/batch accounting"
+                "ws_logging: `buffer_max_bytes` must be at least twice `max_entry_bytes` plus 2 bytes for conservative queue/batch accounting"
                     .to_string(),
             );
         }
@@ -683,7 +683,7 @@ impl WsLogging {
             })
         });
         let endpoint_port = parsed_url.port_or_known_default().ok_or_else(|| {
-            "ws_logging: 'endpoint_url' has no port and no default port for its scheme".to_string()
+            "ws_logging: `endpoint_url` has no port and no default port for its scheme".to_string()
         })?;
 
         let ws_config = WsConfig {
@@ -915,11 +915,11 @@ fn bounded_u64(
         None => default,
         Some(value) => value
             .as_u64()
-            .ok_or_else(|| format!("ws_logging: '{key}' must be an unsigned integer"))?,
+            .ok_or_else(|| format!("ws_logging: `{key}` must be an unsigned integer"))?,
     };
     if !(minimum..=maximum).contains(&value) {
         return Err(format!(
-            "ws_logging: '{key}' must be between {minimum} and {maximum}"
+            "ws_logging: `{key}` must be between {minimum} and {maximum}"
         ));
     }
     Ok(value)
@@ -927,7 +927,7 @@ fn bounded_u64(
 
 fn endpoint_hostname(parsed_url: &Url) -> Result<String, String> {
     let host = parsed_url.host().ok_or_else(|| {
-        "ws_logging: 'endpoint_url' must include a hostname or IP address".to_string()
+        "ws_logging: `endpoint_url` must include a hostname or IP address".to_string()
     })?;
 
     Ok(match host {
@@ -969,13 +969,13 @@ fn build_tls_connector(
     let root_store = if let Some(ca_path) = ca_bundle_path {
         let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
         let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-            .map_err(|e| format!("ws_logging: failed to load CA bundle: {e}"))?;
+            .map_err(|_| "ws_logging: failed to load CA bundle".to_string())?;
         crate::tls::root_cert_store_from_pem_bundle(
             ca_material.bytes.expose_secret(),
             "ws_logging CA bundle",
             &ca_material.display_source_id,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(|_| "ws_logging: invalid CA bundle".to_string())?
     } else {
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
@@ -989,7 +989,7 @@ fn build_tls_connector(
         // Apply gateway CRL list via `build_server_verifier_with_crls`, which
         // applies the shared `tls::crl_policy`.
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
-            .map_err(|e| format!("ws_logging: failed to build TLS verifier: {e}"))?;
+            .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
         rustls::ClientConfig::builder()
             .with_webpki_verifier(verifier)
             .with_no_client_auth()

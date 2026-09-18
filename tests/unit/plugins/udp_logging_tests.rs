@@ -891,7 +891,7 @@ async fn test_udp_logging_dtls_rejects_mismatched_certificate_and_key_at_admissi
     .err()
     .expect("mismatched DTLS certificate/key must fail admission");
     assert!(
-        err.contains("do not form a valid pair") || err.contains("key does not match"),
+        err.contains("DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`"),
         "got: {err}"
     );
 }
@@ -913,7 +913,7 @@ async fn test_udp_logging_dtls_rejects_rsa_key_at_admission() {
     .err()
     .expect("RSA keys are unsupported for DTLS");
     assert!(
-        err.contains("Unsupported DTLS private key") || err.contains("ECDSA"),
+        err.contains("DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`"),
         "got: {err}"
     );
 }
@@ -1886,4 +1886,31 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         !section.contains("DTLS sessions are not re-handshaken mid-session"),
         "stale DTLS non-rehandshake wording must be removed"
     );
+}
+
+#[test]
+fn startup_diagnostics_withhold_udp_ports_and_dtls_material_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("'diagnostic-secret-5594.pem");
+    for (extra, field, hidden) in [
+        (json!({"port": 987654321}), "`port`", "987654321"),
+        (
+            json!({"dtls": true, "dtls_no_verify": true, "dtls_cert_path": missing, "dtls_key_path": missing}),
+            "`dtls_cert_path` / `dtls_key_path`",
+            "diagnostic-secret-5594",
+        ),
+    ] {
+        let mut config = json!({"host": "127.0.0.1", "port": 9514});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = UdpLogging::new(&config, test_client())
+            .err()
+            .expect("invalid UDP sink configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("udp_logging"), "{rendered}");
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
+    }
 }

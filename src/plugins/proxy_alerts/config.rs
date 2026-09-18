@@ -228,7 +228,7 @@ impl ProxyAlertsConfig {
             MAX_COOLDOWN_SECONDS,
         )?;
         if default_min_request_count == 0 {
-            return Err("proxy_alerts: 'default_min_request_count' must be >= 1".to_string());
+            return Err("proxy_alerts: `default_min_request_count` must be >= 1".to_string());
         }
         validate_top_level_u32_range(
             "default_window_seconds",
@@ -245,7 +245,7 @@ impl ProxyAlertsConfig {
         let max_concurrent_dispatches = {
             let n = read_u32_default(config, "max_concurrent_dispatches", 8)?;
             if n == 0 {
-                return Err("proxy_alerts: 'max_concurrent_dispatches' must be >= 1".to_string());
+                return Err("proxy_alerts: `max_concurrent_dispatches` must be >= 1".to_string());
             }
             n as usize
         };
@@ -253,7 +253,7 @@ impl ProxyAlertsConfig {
             let n = read_u32_default(config, "max_delivery_retries", 2)?;
             if n > 8 {
                 return Err(
-                    "proxy_alerts: 'max_delivery_retries' must be <= 8 (bounded retry budget)"
+                    "proxy_alerts: `max_delivery_retries` must be <= 8 (bounded retry budget)"
                         .to_string(),
                 );
             }
@@ -263,7 +263,7 @@ impl ProxyAlertsConfig {
             let n = read_u32_default(config, "delivery_retry_base_ms", 100)?;
             if !(10..=60_000).contains(&n) {
                 return Err(
-                    "proxy_alerts: 'delivery_retry_base_ms' must be in [10, 60000]".to_string(),
+                    "proxy_alerts: `delivery_retry_base_ms` must be in [10, 60000]".to_string(),
                 );
             }
             n as u64
@@ -272,14 +272,14 @@ impl ProxyAlertsConfig {
             let n = read_u32_default(config, "delivery_retry_max_ms", 2_000)?;
             if !(10..=60_000).contains(&n) {
                 return Err(
-                    "proxy_alerts: 'delivery_retry_max_ms' must be in [10, 60000]".to_string(),
+                    "proxy_alerts: `delivery_retry_max_ms` must be in [10, 60000]".to_string(),
                 );
             }
             n as u64
         };
         if delivery_retry_max_ms < delivery_retry_base_ms {
             return Err(
-                "proxy_alerts: 'delivery_retry_max_ms' must be >= 'delivery_retry_base_ms'"
+                "proxy_alerts: `delivery_retry_max_ms` must be >= `delivery_retry_base_ms`"
                     .to_string(),
             );
         }
@@ -311,12 +311,12 @@ impl ProxyAlertsConfig {
 
         let rules_value = config
             .get("rules")
-            .ok_or_else(|| "proxy_alerts: 'rules' is required".to_string())?;
+            .ok_or_else(|| "proxy_alerts: `rules` is required".to_string())?;
         let rules_array = rules_value
             .as_array()
-            .ok_or_else(|| "proxy_alerts: 'rules' must be an array".to_string())?;
+            .ok_or_else(|| "proxy_alerts: `rules` must be an array".to_string())?;
         if rules_array.is_empty() {
-            return Err("proxy_alerts: 'rules' must contain at least one rule".to_string());
+            return Err("proxy_alerts: `rules` must contain at least one rule".to_string());
         }
 
         let mut seen_rule_names: HashSet<String> = HashSet::new();
@@ -359,7 +359,7 @@ impl ProxyAlertsConfig {
 
         if rules.is_empty() {
             return Err(
-                "proxy_alerts: every rule was 'enabled: false' — no rules left to evaluate"
+                "proxy_alerts: every rule was `enabled: false` — no rules left to evaluate"
                     .to_string(),
             );
         }
@@ -398,10 +398,10 @@ fn parse_rule(
         Some(v) => {
             let s = v
                 .as_str()
-                .ok_or_else(|| format!("proxy_alerts: rule[{id}]: 'name' must be a string"))?;
+                .ok_or_else(|| format!("proxy_alerts: rule[{id}]: `name` must be a string"))?;
             if s.is_empty() {
                 return Err(format!(
-                    "proxy_alerts: rule[{id}]: 'name' must not be empty"
+                    "proxy_alerts: rule[{id}]: `name` must not be empty"
                 ));
             }
             s.to_string()
@@ -470,7 +470,7 @@ fn parse_rule(
             parse_grpc_status_rate(common, raw, defaults).map(Rule::GrpcStatusRate)
         }
         other => Err(format!(
-            "proxy_alerts: rule {name:?}: unknown type {other:?} (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause, grpc_status_count, grpc_status_rate)"
+            "proxy_alerts: rule {name:?}: unknown `type` {other:?} (expected one of: `error_rate`, `status_code_count`, `latency_percentile`, `error_class`, `stream_disconnect_cause`, `grpc_status_count`, `grpc_status_rate`)"
         )),
     }
 }
@@ -563,7 +563,7 @@ fn parse_latency_percentile(
         .and_then(Value::as_str)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule {:?}: `metric` is required (one of: backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms)",
+                "proxy_alerts: rule {:?}: `metric` is required (one of: `backend_total_ms`, `backend_ttfb_ms`, `total_ms`, `stream_duration_ms`)",
                 common.name
             )
         })?;
@@ -574,7 +574,7 @@ fn parse_latency_percentile(
         "stream_duration_ms" => LatencyMetric::StreamDurationMs,
         other => {
             return Err(format!(
-                "proxy_alerts: rule {:?}: unknown `metric` {other:?} (expected one of: backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms)",
+                "proxy_alerts: rule {:?}: unknown `metric` {other:?} (expected one of: `backend_total_ms`, `backend_ttfb_ms`, `total_ms`, `stream_duration_ms`)",
                 common.name
             ));
         }
@@ -648,13 +648,13 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule {:?}: 'classes' is required (array of error_class names)",
+                "proxy_alerts: rule {:?}: `classes` is required (array of error_class names)",
                 common.name
             )
         })?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule {:?}: 'classes' must contain at least one entry",
+            "proxy_alerts: rule {:?}: `classes` must contain at least one entry",
             common.name
         ));
     }
@@ -662,7 +662,7 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
             format!(
-                "proxy_alerts: rule {:?}: 'classes' entries must be strings",
+                "proxy_alerts: rule {:?}: `classes` entries must be strings",
                 common.name
             )
         })?;
@@ -694,13 +694,13 @@ fn parse_stream_disconnect_cause(
 ) -> Result<StreamDisconnectCauseRule, String> {
     let arr = raw.get("causes").and_then(Value::as_array).ok_or_else(|| {
         format!(
-            "proxy_alerts: rule {:?}: 'causes' is required (array of disconnect_cause names)",
+            "proxy_alerts: rule {:?}: `causes` is required (array of disconnect_cause names)",
             common.name
         )
     })?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule {:?}: 'causes' must contain at least one entry",
+            "proxy_alerts: rule {:?}: `causes` must contain at least one entry",
             common.name
         ));
     }
@@ -708,7 +708,7 @@ fn parse_stream_disconnect_cause(
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
             format!(
-                "proxy_alerts: rule {:?}: 'causes' entries must be strings",
+                "proxy_alerts: rule {:?}: `causes` entries must be strings",
                 common.name
             )
         })?;
@@ -776,7 +776,7 @@ fn read_grpc_statuses(raw: &Value, rule_name: &str) -> Result<Vec<GrpcStatusMatc
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule {rule_name:?}: `grpc_statuses` is required (array of 0..=16 integers or \"OTHER\")"
+                "proxy_alerts: rule {rule_name:?}: `grpc_statuses` is required (array of 0..=16 integers or `OTHER`)"
             )
         })?;
     if arr.is_empty() {
@@ -790,25 +790,25 @@ fn read_grpc_statuses(raw: &Value, rule_name: &str) -> Result<Vec<GrpcStatusMatc
             Value::String(s) if s == "OTHER" => GrpcStatusMatch::Other,
             Value::String(s) => {
                 return Err(format!(
-                    "proxy_alerts: rule {rule_name:?}: unknown `grpc_statuses` entry {s:?} (expected 0..=16 or \"OTHER\")"
+                    "proxy_alerts: rule {rule_name:?}: unknown `grpc_statuses` entry {s:?} (expected 0..=16 or `OTHER`)"
                 ));
             }
             Value::Number(n) => {
                 let Some(v) = n.as_u64() else {
                     return Err(format!(
-                        "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entries must be unsigned integers 0..=16 or \"OTHER\""
+                        "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entries must be unsigned integers 0..=16 or `OTHER`"
                     ));
                 };
                 if v > 16 {
                     return Err(format!(
-                        "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entry \"{v}\" is not in [0, 16] (use \"OTHER\" for out-of-range codes)"
+                        "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entry \"{v}\" is not in [0, 16] (use `OTHER` for out-of-range codes)"
                     ));
                 }
                 GrpcStatusMatch::Code(v as u8)
             }
             _ => {
                 return Err(format!(
-                    "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entries must be unsigned integers 0..=16 or \"OTHER\""
+                    "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entries must be unsigned integers 0..=16 or `OTHER`"
                 ));
             }
         };
@@ -967,7 +967,7 @@ fn read_severity(raw: &Value, rule_name: &str) -> Result<Severity, String> {
         "high" => Ok(Severity::High),
         "critical" => Ok(Severity::Critical),
         other => Err(format!(
-            "proxy_alerts: rule {rule_name:?}: unknown severity {other:?} (expected one of: info, low, medium, high, critical)"
+            "proxy_alerts: rule {rule_name:?}: unknown `severity` {other:?} (expected one of: `info`, `low`, `medium`, `high`, `critical`)"
         )),
     }
 }
@@ -1018,12 +1018,12 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
     // OpenAPI declares an array; present null is not the empty default.
     let arr = v
         .as_array()
-        .ok_or_else(|| "proxy_alerts: 'quiet_hours_utc' must be an array".to_string())?;
+        .ok_or_else(|| "proxy_alerts: `quiet_hours_utc` must be an array".to_string())?;
     let mut out = Vec::with_capacity(arr.len());
     for (idx, item) in arr.iter().enumerate() {
         let obj = item
             .as_object()
-            .ok_or_else(|| format!("proxy_alerts: 'quiet_hours_utc'[{idx}] must be an object"))?;
+            .ok_or_else(|| format!("proxy_alerts: `quiet_hours_utc[{idx}]` must be an object"))?;
         reject_unknown_keys(
             obj,
             &format!("quiet_hours_utc[{idx}]"),
@@ -1031,29 +1031,29 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
             "proxy_alerts: ",
         )?;
         let from_str = obj.get("from").and_then(Value::as_str).ok_or_else(|| {
-            format!("proxy_alerts: 'quiet_hours_utc'[{idx}]: 'from' is required (HH:MM)")
+            format!("proxy_alerts: `quiet_hours_utc[{idx}]`: `from` is required (HH:MM)")
         })?;
         let to_str = obj.get("to").and_then(Value::as_str).ok_or_else(|| {
-            format!("proxy_alerts: 'quiet_hours_utc'[{idx}]: 'to' is required (HH:MM)")
+            format!("proxy_alerts: `quiet_hours_utc[{idx}]`: `to` is required (HH:MM)")
         })?;
         let from_minute = parse_hh_mm(from_str)
-            .map_err(|e| format!("proxy_alerts: 'quiet_hours_utc'[{idx}].from: {e}"))?;
+            .map_err(|e| format!("proxy_alerts: `quiet_hours_utc[{idx}].from`: {e}"))?;
         let to_minute = parse_hh_mm(to_str)
-            .map_err(|e| format!("proxy_alerts: 'quiet_hours_utc'[{idx}].to: {e}"))?;
+            .map_err(|e| format!("proxy_alerts: `quiet_hours_utc[{idx}].to`: {e}"))?;
         let mut weekdays: Vec<u32> = Vec::new();
         if let Some(days) = obj.get("weekdays") {
             let days_arr = days.as_array().ok_or_else(|| {
-                format!("proxy_alerts: 'quiet_hours_utc'[{idx}].weekdays must be an array")
+                format!("proxy_alerts: `quiet_hours_utc[{idx}].weekdays` must be an array")
             })?;
             for d in days_arr {
                 let n = d.as_u64().ok_or_else(|| {
                     format!(
-                        "proxy_alerts: 'quiet_hours_utc'[{idx}].weekdays entries must be 0..=6 integers"
+                        "proxy_alerts: `quiet_hours_utc[{idx}].weekdays` entries must be 0..=6 integers"
                     )
                 })?;
                 if n > 6 {
                     return Err(format!(
-                        "proxy_alerts: 'quiet_hours_utc'[{idx}].weekdays entry {n} is out of range 0..=6"
+                        "proxy_alerts: `quiet_hours_utc[{idx}].weekdays` entry \"{n}\" is out of range 0..=6"
                     ));
                 }
                 let day = n as u32;

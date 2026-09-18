@@ -126,7 +126,7 @@ async fn test_tcp_logging_tls_rejects_empty_custom_ca_store() {
     )
     .err()
     .expect("an empty custom CA store must reject plugin construction");
-    assert!(error.contains("no valid PEM certificates"), "got: {error}");
+    assert!(error.contains("invalid CA bundle"), "got: {error}");
 }
 
 /// Counterpart to the above: TLS with no custom CA (system/webpki roots) still
@@ -499,7 +499,7 @@ async fn test_tcp_logging_rejects_unknown_keys_with_suggestion() {
     assert!(
         err.contains("unknown configuration key")
             && err.contains("tlls")
-            && err.contains("did you mean 'tls'?"),
+            && err.contains("did you mean `tls`?"),
         "got: {err}"
     );
 }
@@ -690,4 +690,35 @@ async fn test_tcp_logging_rejects_malformed_and_out_of_range_batching() {
         .is_ok(),
         "valid batching and connect-timeout boundaries must be admitted"
     );
+}
+
+#[test]
+fn startup_diagnostics_withhold_tls_identity_and_numeric_values() {
+    ensure_crypto_provider();
+    for (extra, field, hidden) in [
+        (
+            json!({"tls": true, "tls_server_name": "'diagnostic-secret-5594"}),
+            "`tls_server_name`",
+            "diagnostic-secret-5594",
+        ),
+        (json!({"port": 987654321}), "`port`", "987654321"),
+        (
+            json!({"connect_timeout_ms": 987654321}),
+            "`connect_timeout_ms`",
+            "987654321",
+        ),
+    ] {
+        let mut config = json!({"host": "logs.example.com", "port": 9000});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = TcpLogging::new(&config, default_client())
+            .err()
+            .expect("invalid sink configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("tcp_logging"), "{rendered}");
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
+    }
 }

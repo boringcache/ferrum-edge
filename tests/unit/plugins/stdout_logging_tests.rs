@@ -433,3 +433,25 @@ fn test_stdout_logging_rejects_unknown_errors_only_expression_fields() {
     assert!(plugin.should_log_transaction(&failed));
     assert!(!plugin.should_log_transaction(&create_test_transaction_summary()));
 }
+
+#[test]
+fn startup_diagnostics_withhold_expression_scalars_and_unknown_keys() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for expression in [
+        json!({"op": secret}),
+        json!({"op": "status_code_min", "value": 987654321}),
+        json!({"op": "status_code_min", "value": true}),
+        json!({"op": "errors_only", secret: false}),
+        json!({"op": "and", "left": {"op": "errors_only", secret: 1}, "right": {"op": "errors_only"}}),
+    ] {
+        let error = StdoutLogging::new(&json!({"filter": {"expression": expression}}))
+            .err()
+            .expect("invalid expression must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("filter.expression"), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+        assert!(!rendered.contains("987654321"), "{rendered}");
+        assert!(!rendered.contains("true"), "{rendered}");
+        assert!(!rendered.contains("false"), "{rendered}");
+    }
+}

@@ -109,7 +109,7 @@ fn rejects_missing_rules() {
         http_client(),
     )
     .unwrap_err();
-    assert!(err.contains("'rules' is required"), "got: {err}");
+    assert!(err.contains("`rules` is required"), "got: {err}");
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn rejects_unknown_severity() {
     let mut cfg = minimal_config();
     cfg["rules"][0]["severity"] = json!("urgent");
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("unknown severity"), "got: {err}");
+    assert!(err.contains("unknown `severity`"), "got: {err}");
 }
 
 #[test]
@@ -612,7 +612,7 @@ fn rejects_unknown_rule_type_with_variant_fields_reports_type() {
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
     assert!(
-        err.contains("unknown type \"error_ratee\""),
+        err.contains("unknown `type` \"error_ratee\""),
         "unknown discriminator must be the primary error: {err}"
     );
     assert!(
@@ -752,7 +752,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'max_concurrent_dispatches' must be >= 1",
+            "`max_concurrent_dispatches` must be >= 1",
         ),
         (
             json!({
@@ -809,7 +809,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'quiet_hours_utc' must be an array",
+            "`quiet_hours_utc` must be an array",
         ),
         (
             json!({
@@ -911,7 +911,7 @@ fn rejects_invalid_top_level_defaults_even_when_rules_override_them() {
         (
             "default_min_request_count",
             json!(0),
-            "'default_min_request_count' must be >= 1",
+            "`default_min_request_count` must be >= 1",
         ),
         (
             "default_window_seconds",
@@ -2712,4 +2712,36 @@ async fn grpc_status_http_only_rules_do_not_opt_into_websocket_disconnect_hook()
     });
     let plugin = ProxyAlerts::new(&cfg, http_client()).unwrap();
     assert!(!plugin.requires_ws_disconnect_hooks());
+}
+
+#[test]
+fn startup_diagnostics_preserve_alert_paths_and_withhold_document_values() {
+    for (quiet_hours, field, hidden) in [
+        (
+            json!([{"from": "'diagnostic-secret-5594`\"\\\n", "to": "08:00"}]),
+            "`quiet_hours_utc[0].from`",
+            "diagnostic-secret-5594",
+        ),
+        (
+            json!([{"from": "00:00", "to": "08:00", "weekdays": [987654321]}]),
+            "`quiet_hours_utc[0].weekdays`",
+            "987654321",
+        ),
+    ] {
+        let mut config = minimal_config();
+        config["quiet_hours_utc"] = quiet_hours;
+        let error = ProxyAlerts::new(&config, http_client()).unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
+    }
+
+    let mut config = minimal_config();
+    config["rules"][0]["name"] = json!("'diagnostic-secret-5594`\"\\\n");
+    config["rules"][0]["threshold_percent"] = json!(987654321);
+    let error = ProxyAlerts::new(&config, http_client()).unwrap_err();
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains("`threshold_percent` must be in"), "{rendered}");
+    assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+    assert!(!rendered.contains("987654321"), "{rendered}");
 }

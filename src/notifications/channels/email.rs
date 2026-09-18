@@ -149,12 +149,12 @@ impl TlsMode {
             "starttls" => Ok(Self::StartTls),
             "implicit_tls" => Ok(Self::ImplicitTls),
             "none" | "plaintext" | "disabled" | "insecure" => Err(format!(
-                "channel '{channel}' (email): 'tls_mode' must be 'starttls' or 'implicit_tls' — \
+                "channel {channel:?} (email): `tls_mode` must be `starttls` or `implicit_tls` — \
                  plaintext SMTP is not supported because this channel carries credentials and \
                  internal topology names"
             )),
             other => Err(format!(
-                "channel '{channel}' (email): unknown 'tls_mode' '{other}' (expected 'starttls' or 'implicit_tls')"
+                "channel {channel:?} (email): unknown `tls_mode` {other:?} (expected `starttls` or `implicit_tls`)"
             )),
         }
     }
@@ -270,14 +270,14 @@ impl EmailChannel {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("channel '{name}' (email): 'smtp_host' is required"))?;
+            .ok_or_else(|| format!("channel {name:?} (email): `smtp_host` is required"))?;
         let socket_host =
-            parse_socket_host(&format!("channel '{name}' (email)"), "smtp_host", raw_host)?;
+            parse_socket_host(&format!("channel {name:?} (email)"), "smtp_host", raw_host)?;
 
         let tls_mode = match value.get("tls_mode") {
             Some(v) => {
                 let raw = v.as_str().ok_or_else(|| {
-                    format!("channel '{name}' (email): 'tls_mode' must be a string")
+                    format!("channel {name:?} (email): `tls_mode` must be a string")
                 })?;
                 TlsMode::parse(raw, name)?
             }
@@ -287,11 +287,11 @@ impl EmailChannel {
         let smtp_port = match value.get("smtp_port") {
             Some(v) => {
                 let port = v.as_u64().ok_or_else(|| {
-                    format!("channel '{name}' (email): 'smtp_port' must be an integer")
+                    format!("channel {name:?} (email): `smtp_port` must be an integer")
                 })?;
                 if port == 0 || port > 65535 {
                     return Err(format!(
-                        "channel '{name}' (email): 'smtp_port' must be between 1 and 65535 (got {port})"
+                        "channel {name:?} (email): `smtp_port` must be between 1 and 65535 (got \"{port}\")"
                     ));
                 }
                 port as u16
@@ -304,21 +304,21 @@ impl EmailChannel {
                 let raw = v
                     .as_str()
                     .ok_or_else(|| {
-                        format!("channel '{name}' (email): 'tls_server_name' must be a string")
+                        format!("channel {name:?} (email): `tls_server_name` must be a string")
                     })?
                     .trim();
                 if raw.is_empty() {
                     return Err(format!(
-                        "channel '{name}' (email): 'tls_server_name' must not be empty"
+                        "channel {name:?} (email): `tls_server_name` must not be empty"
                     ));
                 }
                 raw.to_string()
             }
             None => socket_host.dial_host.clone(),
         };
-        let tls_server_name = ServerName::try_from(tls_server_name_display.clone()).map_err(|e| {
+        let tls_server_name = ServerName::try_from(tls_server_name_display.clone()).map_err(|_| {
             format!(
-                "channel '{name}' (email): invalid TLS server name '{tls_server_name_display}': {e}"
+                "channel {name:?} (email): invalid TLS server name for `tls_server_name` / `smtp_host`: {tls_server_name_display:?}"
             )
         })?;
 
@@ -347,12 +347,12 @@ impl EmailChannel {
             }
             (Some(_), None) => {
                 return Err(format!(
-                    "channel '{name}' (email): 'username' is set without a password — supply 'password' or 'password_env'"
+                    "channel {name:?} (email): `username` is set without a password — supply `password` or `password_env`"
                 ));
             }
             (None, Some(_)) => {
                 return Err(format!(
-                    "channel '{name}' (email): a password is set without 'username' or 'username_env'"
+                    "channel {name:?} (email): a password is set without `username` or `username_env`"
                 ));
             }
             (None, None) => None,
@@ -363,21 +363,21 @@ impl EmailChannel {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("channel '{name}' (email): 'from' is required"))?
+            .ok_or_else(|| format!("channel {name:?} (email): `from` is required"))?
             .to_string();
         validate_email_address(&from, "from", name)?;
 
         let to_values = value.get("to").and_then(Value::as_array).ok_or_else(|| {
-            format!("channel '{name}' (email): 'to' is required and must be an array of addresses")
+            format!("channel {name:?} (email): `to` is required and must be an array of addresses")
         })?;
         if to_values.is_empty() {
             return Err(format!(
-                "channel '{name}' (email): 'to' must contain at least one recipient"
+                "channel {name:?} (email): `to` must contain at least one recipient"
             ));
         }
         if to_values.len() > MAX_RECIPIENTS {
             return Err(format!(
-                "channel '{name}' (email): 'to' must contain at most {MAX_RECIPIENTS} recipients (got {})",
+                "channel {name:?} (email): `to` must contain at most {MAX_RECIPIENTS} recipients (got \"{}\")",
                 to_values.len()
             ));
         }
@@ -385,7 +385,7 @@ impl EmailChannel {
         for entry in to_values {
             let address = entry
                 .as_str()
-                .ok_or_else(|| format!("channel '{name}' (email): 'to' entries must be strings"))?
+                .ok_or_else(|| format!("channel {name:?} (email): `to` entries must be strings"))?
                 .trim();
             validate_email_address(address, "to", name)?;
             if to.iter().any(|existing| existing.as_ref() == address) {
@@ -416,7 +416,7 @@ impl EmailChannel {
                 let raw = v
                     .as_str()
                     .ok_or_else(|| {
-                        format!("channel '{name}' (email): 'helo_name' must be a string")
+                        format!("channel {name:?} (email): `helo_name` must be a string")
                     })?
                     .trim()
                     .to_string();
@@ -1671,23 +1671,23 @@ fn optional_template(
     let template = match value.get(key) {
         Some(v) => v
             .as_str()
-            .ok_or_else(|| format!("channel '{channel}' (email): '{key}' must be a string"))?
+            .ok_or_else(|| format!("channel {channel:?} (email): `{key}` must be a string"))?
             .to_string(),
         None => default.to_string(),
     };
     if template.is_empty() {
         return Err(format!(
-            "channel '{channel}' (email): '{key}' must not be empty"
+            "channel {channel:?} (email): `{key}` must not be empty"
         ));
     }
     if template.len() > max_bytes {
         return Err(format!(
-            "channel '{channel}' (email): '{key}' must be at most {max_bytes} bytes (got {})",
+            "channel {channel:?} (email): `{key}` must be at most {max_bytes} bytes (got \"{}\")",
             template.len()
         ));
     }
     validate_template(&template)
-        .map_err(|e| format!("channel '{channel}' (email): invalid '{key}': {e}"))?;
+        .map_err(|e| format!("channel {channel:?} (email): invalid `{key}`: {e}"))?;
     Ok(template)
 }
 
@@ -1703,10 +1703,10 @@ fn bounded_timeout_ms(
     };
     let millis = raw
         .as_u64()
-        .ok_or_else(|| format!("channel '{channel}' (email): '{key}' must be an integer"))?;
+        .ok_or_else(|| format!("channel {channel:?} (email): `{key}` must be an integer"))?;
     if !(MIN_TIMEOUT_MS..=max).contains(&millis) {
         return Err(format!(
-            "channel '{channel}' (email): '{key}' must be between {MIN_TIMEOUT_MS} and {max} ms (got {millis})"
+            "channel {channel:?} (email): `{key}` must be between {MIN_TIMEOUT_MS} and {max} ms (got \"{millis}\")"
         ));
     }
     Ok(millis)
@@ -1717,12 +1717,12 @@ fn bounded_timeout_ms(
 fn validate_credential_component(raw: &str, field: &str, channel: &str) -> Result<(), String> {
     if raw.chars().any(char::is_control) {
         return Err(format!(
-            "channel '{channel}' (email): resolved '{field}' must not contain control characters"
+            "channel {channel:?} (email): resolved `{field}` must not contain control characters"
         ));
     }
     if raw.len() > 512 {
         return Err(format!(
-            "channel '{channel}' (email): resolved '{field}' must be at most 512 bytes"
+            "channel {channel:?} (email): resolved `{field}` must be at most 512 bytes"
         ));
     }
     Ok(())
@@ -1731,11 +1731,11 @@ fn validate_credential_component(raw: &str, field: &str, channel: &str) -> Resul
 fn validate_helo_name(raw: &str, channel: &str) -> Result<(), String> {
     if raw.is_empty() || raw.len() > MAX_DOMAIN_BYTES {
         return Err(format!(
-            "channel '{channel}' (email): 'helo_name' must be 1..={MAX_DOMAIN_BYTES} bytes"
+            "channel {channel:?} (email): `helo_name` must be 1..={MAX_DOMAIN_BYTES} bytes"
         ));
     }
     validate_domain(raw)
-        .map_err(|reason| format!("channel '{channel}' (email): invalid 'helo_name' ({reason})"))
+        .map_err(|reason| format!("channel {channel:?} (email): invalid `helo_name` ({reason})"))
 }
 
 /// Conservative RFC 5321 addr-spec check.
@@ -1747,7 +1747,7 @@ fn validate_helo_name(raw: &str, channel: &str) -> Result<(), String> {
 fn validate_email_address(address: &str, field: &str, channel: &str) -> Result<(), String> {
     let reject = |reason: &str| {
         Err(format!(
-            "channel '{channel}' (email): invalid '{field}' address ({reason})"
+            "channel {channel:?} (email): invalid `{field}` address ({reason})"
         ))
     };
     if address.is_empty() {
@@ -1766,10 +1766,10 @@ fn validate_email_address(address: &str, field: &str, channel: &str) -> Result<(
         return reject("must not contain whitespace or control characters");
     }
     let Some((local, domain)) = address.split_once('@') else {
-        return reject("must contain exactly one '@'");
+        return reject("must contain exactly one `@`");
     };
     if domain.contains('@') {
-        return reject("must contain exactly one '@'");
+        return reject("must contain exactly one `@`");
     }
     if local.is_empty() || local.len() > MAX_LOCAL_PART_BYTES {
         return reject(&format!(
@@ -1777,7 +1777,7 @@ fn validate_email_address(address: &str, field: &str, channel: &str) -> Result<(
         ));
     }
     if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
-        return reject("local part must not start, end, or repeat with '.'");
+        return reject("local part must not start, end, or repeat with `.`");
     }
     const LOCAL_SPECIALS: &str = "!#$%&'*+-/=?^_`{|}~.";
     if !local
@@ -1787,7 +1787,7 @@ fn validate_email_address(address: &str, field: &str, channel: &str) -> Result<(
         return reject("local part contains an unsupported character");
     }
     validate_domain(domain).map_err(|reason| {
-        format!("channel '{channel}' (email): invalid '{field}' address ({reason})")
+        format!("channel {channel:?} (email): invalid `{field}` address ({reason})")
     })
 }
 
@@ -1799,20 +1799,20 @@ fn validate_domain(domain: &str) -> Result<(), String> {
         return Err("domain must be ASCII".to_string());
     }
     if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
-        return Err("domain must not start, end, or repeat with '.'".to_string());
+        return Err("domain must not start, end, or repeat with `.`".to_string());
     }
     for label in domain.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err("domain labels must be 1..=63 bytes".to_string());
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return Err("domain labels must not start or end with '-'".to_string());
+            return Err("domain labels must not start or end with `-`".to_string());
         }
         if !label
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
         {
-            return Err("domain labels must be alphanumeric or '-'".to_string());
+            return Err("domain labels must be alphanumeric or `-`".to_string());
         }
     }
     Ok(())

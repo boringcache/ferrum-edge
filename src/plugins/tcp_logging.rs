@@ -122,7 +122,7 @@ impl TcpLogging {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                "tcp_logging: 'host' is required — logs will have nowhere to send".to_string()
+                "tcp_logging: `host` is required — logs will have nowhere to send".to_string()
             })?
             .to_string();
         let socket_host = parse_socket_host("tcp_logging", "host", &raw_host)?;
@@ -132,10 +132,10 @@ impl TcpLogging {
         let port = config
             .get("port")
             .and_then(Value::as_u64)
-            .ok_or_else(|| "tcp_logging: 'port' is required and must be an integer".to_string())?;
+            .ok_or_else(|| "tcp_logging: `port` is required and must be an integer".to_string())?;
         if port == 0 || port > 65535 {
             return Err(format!(
-                "tcp_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
+                "tcp_logging: `port` must be between 1 and 65535 (got \"{port}\")"
             ));
         }
         let port = port as u16;
@@ -144,7 +144,7 @@ impl TcpLogging {
         let tls_server_name_override = optional_non_empty_string(config, "tls_server_name")?;
         if !tls_enabled && tls_server_name_override.is_some() {
             return Err(
-                "tcp_logging: 'tls_server_name' requires 'tls: true' — refuse plaintext sinks with a TLS identity override"
+                "tcp_logging: `tls_server_name` requires `tls: true` — refuse plaintext sinks with a TLS identity override"
                     .to_string(),
             );
         }
@@ -179,8 +179,8 @@ impl TcpLogging {
                 .as_deref()
                 .unwrap_or(host.as_str())
                 .to_string();
-            let server_name = ServerName::try_from(server_name_str.clone()).map_err(|error| {
-                format!("tcp_logging: invalid TLS server name '{server_name_str}': {error}")
+            let server_name = ServerName::try_from(server_name_str.clone()).map_err(|_| {
+                format!("tcp_logging: invalid TLS server name for `tls_server_name` / `host`: {server_name_str:?}")
             })?;
             Some(TcpTlsRuntime {
                 connector,
@@ -223,7 +223,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
         Some(value) => value
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("tcp_logging: '{key}' must be a boolean")),
+            .ok_or_else(|| format!("tcp_logging: `{key}` must be a boolean")),
         None => Ok(None),
     }
 }
@@ -233,7 +233,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(value) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("tcp_logging: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("tcp_logging: `{key}` must be an unsigned integer")),
         None => Ok(None),
     }
 }
@@ -242,7 +242,7 @@ fn bounded_timeout_ms(config: &Value, key: &str, default_ms: u64) -> Result<u64,
     let value = optional_u64(config, key)?.unwrap_or(default_ms);
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&value) {
         return Err(format!(
-            "tcp_logging: '{key}' must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds (got \"{value}\")"
+            "tcp_logging: `{key}` must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds (got \"{value}\")"
         ));
     }
     Ok(value)
@@ -253,13 +253,13 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("tcp_logging: '{key}' must be a string"))?;
+                .ok_or_else(|| format!("tcp_logging: `{key}` must be a string"))?;
             if value.is_empty() {
-                return Err(format!("tcp_logging: '{key}' must not be empty"));
+                return Err(format!("tcp_logging: `{key}` must not be empty"));
             }
             if value.trim() != value {
                 return Err(format!(
-                    "tcp_logging: '{key}' must not contain leading or trailing whitespace"
+                    "tcp_logging: `{key}` must not contain leading or trailing whitespace"
                 ));
             }
             Ok(Some(value.to_string()))
@@ -406,13 +406,13 @@ fn build_tls_connector(
         .map(|ca_path| {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
             let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-                .map_err(|error| format!("TCP logging: failed to load CA bundle: {error}"))?;
+                .map_err(|_| "TCP logging: failed to load CA bundle".to_string())?;
             crate::tls::root_cert_store_from_pem_bundle(
                 ca_material.bytes.expose_secret(),
                 "TCP logging CA bundle",
                 &ca_material.display_source_id,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|_| "TCP logging: invalid CA bundle".to_string())
         })
         .transpose()?;
 
@@ -433,7 +433,7 @@ fn build_tls_connector(
         // / frontend mTLS surfaces. The shared `tls::crl_policy` (applied inside
         // `build_server_verifier_with_crls`) decides the posture.
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, tls_crls)
-            .map_err(|error| format!("TCP logging: failed to build TLS verifier: {error}"))?;
+            .map_err(|_| "TCP logging: failed to build TLS verifier".to_string())?;
         rustls::ClientConfig::builder()
             .with_webpki_verifier(verifier)
             .with_no_client_auth()
