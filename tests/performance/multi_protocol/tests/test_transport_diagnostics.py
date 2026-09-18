@@ -83,6 +83,16 @@ class TransportDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(result["sockets"][0]["delta"]["socket_drops"])
         self.assertFalse(summarize_transport(timeline[:1], phases)["complete_bracket"])
 
+    def test_socket_that_exists_only_inside_measurement_is_not_hidden(self):
+        phases = dict(measurement_start_unix_secs=10, measurement_secs=1)
+        values = [dict(unix_secs=t, errors=[], sockets=[], udp_snmp={}) for t in (9.9, 10.5, 11.1)]
+        values[1]["sockets"] = [dict(inode=42, cookie=[1, 2], local_port=8443,
+                                      so_rcvbuf=212992, so_sndbuf=212992)]
+        result = summarize_transport([dict(transport=row) for row in values], phases)
+        self.assertEqual(len(result["new_or_retired_sockets"]), 1)
+        self.assertFalse(result["new_or_retired_sockets"][0]["complete_bracket"])
+        self.assertEqual(result["new_or_retired_sockets"][0]["so_rcvbuf"], 212992)
+
     def test_backend_distribution_is_per_connection_and_bracketed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "backend.log"

@@ -170,8 +170,15 @@ def summarize_transport(timeline, phases):
                             delta=counter_delta({key: first[key] for key in ("socket_drops", "proc_drops")
                                                  if key in first}, last or {})))
     result["sockets"] = sockets
-    result["new_or_retired_sockets"] = [row for row in right.get("sockets", [])
-                                        if not any(row["cookie"] == old["cookie"] for old in sockets)]
+    initial_cookies = {tuple(row["cookie"]) for row in sockets}
+    new_sockets = {}
+    for observation in values:
+        if left["unix_secs"] <= observation["unix_secs"] <= right["unix_secs"]:
+            for row in observation.get("sockets", []):
+                cookie = tuple(row["cookie"])
+                if cookie not in initial_cookies:
+                    new_sockets[cookie] = dict(row, complete_bracket=False)
+    result["new_or_retired_sockets"] = list(new_sockets.values())
     return result
 
 
@@ -181,7 +188,11 @@ def thread_snapshot(pid, ticks, parse_stat):
         for path in Path(f"/proc/{pid}/task").iterdir():
             try:
                 contents = (path / "stat").read_text()
-                result.append(dict(parse_stat(contents, ticks, 1), tid=int(path.name), pid=pid,
+                record = parse_stat(contents, ticks, 1)
+                # RSS belongs to the process, not each thread. Keep its byte
+                # accounting in the existing process sampler only.
+                record.pop("rss_bytes", None)
+                result.append(dict(record, tid=int(path.name), pid=pid,
                                    name=contents[contents.find("(") + 1:contents.rfind(")")]))
             except (OSError, ValueError, IndexError):
                 continue
@@ -262,7 +273,8 @@ def annotate_experiment(sample, path, usage_path):
         diagnostics["backend_connections"] = distribution
         upstream_ports = {int(row["peer"].rsplit(":", 1)[1]) for row in distribution}
         relevant = []
-        for row in diagnostics.get("sockets", []):
+        all_sockets = diagnostics.get("sockets", []) + diagnostics.get("new_or_retired_sockets", [])
+        for row in all_sockets:
             port = row["local_port"]
             if port in (8443, 3445) or port in upstream_ports:
                 row["role"] = ("backend" if port == 3445 else "gateway_downstream"

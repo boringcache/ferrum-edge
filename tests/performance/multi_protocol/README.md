@@ -440,7 +440,8 @@ quantiles are the maximum per-sample quantiles, explicitly labelled, because
 quantiles cannot be pooled without histograms. All constituent observations are
 validated. The rolling regression evaluator restarts its window when
 `protocol_perf_budgets.json.workload_revision` changes, excluding missing/older
-markers; this revision is `2026-09-18.phased-bounded-echo.v1`. The historical
+markers; this revision is `2026-09-18.h3-transport-observation.v2`, accounting for
+the H3 observation holds and explicit retirement instrumentation. The historical
 H1 paired-ratio reference remains unchanged. The
 combined artifact also contains flattened `observed-samples.json` and
 `paired-comparisons.json`; use those or the raw samples for analysis. The frozen
