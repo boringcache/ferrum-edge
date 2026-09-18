@@ -527,10 +527,61 @@ fn refusal_diagnostics_carry_no_crl_contents() {
     // fixed reason. No issuer name, no serials, no timestamps.
     assert_eq!(
         error,
-        "CRL record #1 in 'redacted-source' has expired (nextUpdate has passed)"
+        "CRL record #1 in \"redacted-source\" has expired (nextUpdate has passed)"
     );
     assert!(!error.contains("CRL Policy Root"));
     assert!(!error.contains(&base.year().to_string()));
+}
+
+#[test]
+fn rendered_crl_refusals_keep_record_and_reason_without_supplied_source() {
+    let pki = build_chain_pki();
+    let base = OffsetDateTime::now_utc();
+    let fresh = fresh_crl(&pki.root_issuer, &[UNRELATED_SERIAL]);
+    for (der, reason) in [
+        (
+            b"TLS_CRL_PAYLOAD_MARKER".to_vec(),
+            "is not a parseable X.509 CRL",
+        ),
+        (
+            retime_crl(
+                &fresh,
+                base + TimeDuration::days(1),
+                Some(base + TimeDuration::days(2)),
+            ),
+            "is not yet valid",
+        ),
+        (
+            retime_crl(&fresh, base - TimeDuration::days(1), None),
+            "omits the required nextUpdate field",
+        ),
+        (
+            retime_crl(
+                &fresh,
+                base - TimeDuration::days(2),
+                Some(base - TimeDuration::days(1)),
+            ),
+            "has expired",
+        ),
+    ] {
+        let error = validate_crl_windows_at(
+            &crl_list(vec![fresh.clone(), der]),
+            "'TLS_CRL_SOURCE_MARKER\"\\\n927451 true",
+            unix(base),
+        )
+        .unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains("CRL record #2"), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for forbidden in [
+            "TLS_CRL_SOURCE_MARKER",
+            "TLS_CRL_PAYLOAD_MARKER",
+            "927451",
+            "true",
+        ] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
+    }
 }
 
 // ── 2. Admission is atomic and shared ────────────────────────────────────
@@ -1367,6 +1418,126 @@ fn a_crl_inside_the_warning_window_warns_and_one_outside_it_does_not() {
         "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS=0 disables the warning: {}",
         logs.contents()
     );
+}
+
+#[test]
+fn crl_constructor_emissions_withhold_the_configured_source() {
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let pki = build_chain_pki();
+    let dir = TempDir::new().unwrap();
+    let path = write_crl_expiring_in(dir.path(), "'TLS_CRL_LOG_MARKER.pem", &pki, 5);
+    let (logs, guard) = capture_logs();
+    load_crls(Some(path.to_str().unwrap()), 30).unwrap();
+    drop(guard);
+
+    let rendered = logs.contents();
+    for expected in [
+        "WARN",
+        "Revocation material expires within the configured warning window",
+        "revocation_material=\"crl\"",
+        "source=",
+        "days_until_next_update=5",
+        "warning_days=30",
+        "INFO",
+        "Loaded 1 CRL(s)",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected}: {rendered}");
+    }
+    for forbidden in ["TLS_CRL_LOG_MARKER", path.to_str().unwrap(), "BEGIN X509 CRL"] {
+        assert!(!rendered.contains(forbidden), "leaked {forbidden}: {rendered}");
+    }
+}
+
+#[test]
+fn frontend_constructor_emissions_withhold_certificate_and_key_paths() {
+    use ferrum_edge::tls::{TlsPolicy, load_tls_config_with_client_auth};
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    ensure_crypto_provider();
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let certificate = CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let dir = TempDir::new().unwrap();
+    let cert_path = dir.path().join("'TLS_FRONTEND_CERT_MARKER.pem");
+    let key_path = dir.path().join("'TLS_FRONTEND_KEY_MARKER.pem");
+    std::fs::write(&cert_path, certificate.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    let policy = TlsPolicy::from_env_config(&EnvConfig::default()).unwrap();
+
+    for (no_verify, client_ca, expected) in [
+        (false, None, "loaded without client certificate verification"),
+        (true, None, "loaded with certificate verification DISABLED"),
+        (
+            false,
+            Some(cert_path.to_str().unwrap()),
+            "loaded with client certificate verification",
+        ),
+    ] {
+        let (logs, guard) = capture_logs();
+        load_tls_config_with_client_auth(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            client_ca,
+            no_verify,
+            &policy,
+            0,
+            0,
+            &[],
+        )
+        .unwrap();
+        drop(guard);
+        let rendered = logs.contents();
+        assert!(rendered.contains(expected), "{rendered}");
+        for forbidden in ["TLS_FRONTEND_CERT_MARKER", "TLS_FRONTEND_KEY_MARKER"] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn backend_constructor_warning_withholds_proxy_identity() {
+    use ferrum_edge::config::types::Proxy;
+    use ferrum_edge::tls::TlsPolicy;
+    use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let policy = TlsPolicy::from_env_config(&EnvConfig::default()).unwrap();
+    let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "'TLS_PROXY_LOG_MARKER\"\\\n927451 true",
+        "name": "diagnostic-backend",
+        "listen_path": "/",
+        "backend_scheme": "https",
+        "backend_host": "localhost",
+        "backend_port": 443,
+    }))
+    .unwrap();
+    proxy.resolved_tls.san_allow_list = vec!["localhost".to_string()];
+    let (logs, guard) = capture_logs();
+    BackendTlsConfigBuilder {
+        proxy: &proxy,
+        policy: Some(&policy),
+        global_ca: None,
+        global_no_verify: true,
+        global_client_cert: None,
+        global_client_key: None,
+        crls: &[],
+    }
+    .build_rustls()
+    .unwrap();
+    drop(guard);
+    let rendered = logs.contents();
+    for expected in [
+        "WARN",
+        "SAN allow-list will not be enforced",
+        "san_allow_list_entries=1",
+    ] {
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+    for forbidden in ["TLS_PROXY_LOG_MARKER", "927451", "true"] {
+        assert!(!rendered.contains(forbidden), "{rendered}");
+    }
 }
 
 #[test]

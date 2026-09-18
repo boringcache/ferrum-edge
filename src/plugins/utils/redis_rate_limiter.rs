@@ -979,7 +979,7 @@ impl RedisConfig {
             "redis" => true,
             _ => {
                 return Err(
-                    "redis rate limiter: 'sync_mode' must be exactly 'local' or 'redis'"
+                    "redis rate limiter: `sync_mode` must be exactly `local` or `redis`"
                         .to_string(),
                 );
             }
@@ -992,12 +992,12 @@ impl RedisConfig {
         let url = parse_optional_string(object, "redis_url")?;
         if let Some(url) = url {
             if url.is_empty() {
-                return Err("redis rate limiter: 'redis_url' must be non-empty".to_string());
+                return Err("redis rate limiter: `redis_url` must be non-empty".to_string());
             }
             validate_redis_url(url)?;
         } else if redis_enabled {
             return Err(
-                "redis rate limiter: 'redis_url' is required when sync_mode='redis'".to_string(),
+                "redis rate limiter: `redis_url` is required when `sync_mode=redis`".to_string(),
             );
         }
 
@@ -1006,20 +1006,20 @@ impl RedisConfig {
             .unwrap_or(default_prefix)
             .to_string();
         if key_prefix.is_empty() {
-            return Err("redis rate limiter: 'redis_key_prefix' must be non-empty".to_string());
+            return Err("redis rate limiter: `redis_key_prefix` must be non-empty".to_string());
         }
 
         let pool_size = parse_optional_u64(object, "redis_pool_size")?.unwrap_or(4);
         if pool_size == 0 {
             return Err(
-                "redis rate limiter: 'redis_pool_size' must be greater than zero".to_string(),
+                "redis rate limiter: `redis_pool_size` must be greater than zero".to_string(),
             );
         }
         let pool_size = usize::try_from(pool_size)
-            .map_err(|_| "redis rate limiter: 'redis_pool_size' is too large".to_string())?;
+            .map_err(|_| "redis rate limiter: `redis_pool_size` is too large".to_string())?;
         if pool_size > MAX_REDIS_POOL_SIZE {
             return Err(format!(
-                "redis rate limiter: 'redis_pool_size' must be <= {MAX_REDIS_POOL_SIZE}"
+                "redis rate limiter: `redis_pool_size` must be <= {MAX_REDIS_POOL_SIZE}"
             ));
         }
 
@@ -1027,7 +1027,7 @@ impl RedisConfig {
             parse_optional_u64(object, "redis_connect_timeout_seconds")?.unwrap_or(5);
         if connect_timeout_seconds == 0 {
             return Err(
-                "redis rate limiter: 'redis_connect_timeout_seconds' must be greater than zero"
+                "redis rate limiter: `redis_connect_timeout_seconds` must be greater than zero"
                     .to_string(),
             );
         }
@@ -1036,7 +1036,7 @@ impl RedisConfig {
             parse_optional_u64(object, "redis_health_check_interval_seconds")?.unwrap_or(5);
         if health_check_interval_seconds == 0 {
             return Err(
-                "redis rate limiter: 'redis_health_check_interval_seconds' must be greater than zero"
+                "redis rate limiter: `redis_health_check_interval_seconds` must be greater than zero"
                     .to_string(),
             );
         }
@@ -1048,7 +1048,7 @@ impl RedisConfig {
             return Ok(None);
         }
         let url = url.ok_or_else(|| {
-            "redis rate limiter: 'redis_url' is required when sync_mode='redis'".to_string()
+            "redis rate limiter: `redis_url` is required when `sync_mode=redis`".to_string()
         })?;
 
         Ok(Some(RedisConfig {
@@ -1201,26 +1201,26 @@ fn validate_redis_url(raw_url: &str) -> Result<(), String> {
         // value is rejected before `Url::parse` can normalize it, and the text
         // still never echoes the value.
         return Err(
-            "redis rate limiter: 'redis_url' must be a valid URL with scheme redis or rediss \
+            "redis rate limiter: `redis_url` must be a valid URL with scheme `redis` or `rediss` \
              and no whitespace"
                 .to_string(),
         );
     }
     let parsed = Url::parse(raw_url).map_err(|_| {
-        "redis rate limiter: 'redis_url' must be a valid URL with scheme redis or rediss"
+        "redis rate limiter: `redis_url` must be a valid URL with scheme `redis` or `rediss`"
             .to_string()
     })?;
     match parsed.scheme() {
         "redis" | "rediss" => {}
         _ => {
             return Err(
-                "redis rate limiter: 'redis_url' scheme must be exactly 'redis' or 'rediss'"
+                "redis rate limiter: `redis_url` scheme must be exactly `redis` or `rediss`"
                     .to_string(),
             );
         }
     }
     if !has_non_empty_authority(raw_url) || normalized_url_hostname(&parsed).is_none() {
-        return Err("redis rate limiter: 'redis_url' must include a hostname".to_string());
+        return Err("redis rate limiter: `redis_url` must include a hostname".to_string());
     }
     // redis-rs treats `#insecure` as ConnectionAddr::TcpTls.insecure = true.
     // That is a verification opt-out that is not FERRUM_TLS_NO_VERIFY, so it
@@ -1229,7 +1229,7 @@ fn validate_redis_url(raw_url: &str) -> Result<(), String> {
     // on the sanctioned FERRUM_TLS_NO_VERIFY path after admission.
     if parsed.fragment().is_some() {
         return Err(
-            "redis rate limiter: 'redis_url' must not carry a URL fragment; TLS certificate \
+            "redis rate limiter: `redis_url` must not carry a URL fragment; TLS certificate \
              verification cannot be disabled per URL"
                 .to_string(),
         );
@@ -1273,18 +1273,18 @@ fn validate_redis_database_selector(raw_url: &str) -> Result<(), String> {
         || (selector.len() > 1 && selector.starts_with('0'))
     {
         return Err(
-            "redis rate limiter: 'redis_url' path must be a canonical database number \
-             (for example '/0'), without a sign, zero-padding, or extra path segments"
+            "redis rate limiter: `redis_url` path must be a canonical database number \
+             (for example `/0`), without a sign, zero-padding, or extra path segments"
                 .to_string(),
         );
     }
     let database = selector.parse::<i64>().map_err(|_| {
-        "redis rate limiter: 'redis_url' path must be a database number (for example '/0')"
+        "redis rate limiter: `redis_url` path must be a database number (for example `/0`)"
             .to_string()
     })?;
     if !(0..=MAX_REDIS_DATABASE_INDEX).contains(&database) {
         return Err(format!(
-            "redis rate limiter: 'redis_url' database number must be between 0 and \
+            "redis rate limiter: `redis_url` database number must be between 0 and \
              {MAX_REDIS_DATABASE_INDEX}"
         ));
     }
@@ -1365,7 +1365,7 @@ fn parse_optional_string<'a>(
         .map(|value| {
             value
                 .as_str()
-                .ok_or_else(|| format!("redis rate limiter: '{field}' must be a string"))
+                .ok_or_else(|| format!("redis rate limiter: `{field}` must be a string"))
         })
         .transpose()
 }
@@ -1379,7 +1379,7 @@ fn parse_optional_bool(
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("redis rate limiter: '{field}' must be a boolean"))
+                .ok_or_else(|| format!("redis rate limiter: `{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -1393,7 +1393,7 @@ fn parse_optional_u64(
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| format!("redis rate limiter: '{field}' must be an integer"))
+                .ok_or_else(|| format!("redis rate limiter: `{field}` must be an integer"))
         })
         .transpose()
 }
@@ -2932,8 +2932,9 @@ fn load_redis_tls_ca_bundle(
     match load_material_blocking(&source, MaterialKind::CaBundle) {
         Ok(material) => Ok(Some(material.bytes.expose_secret().to_vec())),
         Err(error) => Err(format!(
-            "redis rate limiter: failed to load exclusive CA bundle; \
-             refusing to fall back to default TLS roots: {error}"
+            "redis rate limiter: `FERRUM_TLS_CA_BUNDLE_PATH`: failed to load exclusive CA bundle; \
+             refusing to fall back to default TLS roots: {}",
+            error.failure_class()
         )),
     }
 }
