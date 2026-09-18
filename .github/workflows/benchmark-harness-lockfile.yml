@@ -1,0 +1,41 @@
+# Resolve only on a hosted runner, retain the exact expected lockfile on drift,
+# and fail the check. Existing build/test lanes still enforce --locked.
+name: Benchmark Harness Lockfile
+
+on:
+  pull_request:
+    paths:
+      - tests/performance/multi_protocol/Cargo.toml
+      - tests/performance/multi_protocol/Cargo.lock
+      - .github/workflows/benchmark-harness-lockfile.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: Benchmark harness lockfile consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Resolve metadata and retain the expected lockfile
+        run: |
+          mkdir -p harness-lockfile-evidence
+          cp tests/performance/multi_protocol/Cargo.lock harness-lockfile-evidence/committed.lock
+          cargo metadata --format-version 1 --manifest-path tests/performance/multi_protocol/Cargo.toml > harness-lockfile-evidence/metadata.json
+          cp tests/performance/multi_protocol/Cargo.lock harness-lockfile-evidence/expected.lock
+          git diff -- tests/performance/multi_protocol/Cargo.lock > harness-lockfile-evidence/lockfile.diff
+          git diff --exit-code -- tests/performance/multi_protocol/Cargo.lock
+      - name: Retain resolver evidence even when consistency fails
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: harness-lockfile-${{ github.sha }}
+          path: harness-lockfile-evidence/
+          retention-days: 14

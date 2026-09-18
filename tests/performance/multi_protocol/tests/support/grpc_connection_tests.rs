@@ -115,7 +115,10 @@ async fn cancelled_and_failed_attempts_do_not_restore_the_previous_socket() {
 
         let mut report = PhaseReport::default();
         connector.observer.attach(&mut report);
-        assert_eq!(report.transport_events_total, 4, "only real sockets counted");
+        assert_eq!(
+            report.transport_events_total, 4,
+            "only real sockets counted"
+        );
     })
     .await
     .unwrap();
@@ -327,7 +330,14 @@ mod tonic_reconnect {
             let connected = identity.snapshot();
             assert_ne!(connected, 0);
             connect.abort_all();
-            assert!(connect.join_next().await.unwrap().unwrap_err().is_cancelled());
+            assert!(
+                connect
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
             assert_eq!(identity.snapshot(), 0);
             assert_eq!(identity.connection_id_since(connected), 0);
 
