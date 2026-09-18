@@ -1377,7 +1377,7 @@ async fn handle_ads_response(
                     consecutive_nacks = consecutive_after,
                     nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
                     error = %crate::startup::sanitize_startup_cause(
-                        &bounded_xds_log_value(&e),
+                        bounded_xds_log_value(&e),
                         &[]
                     ),
                     "First mesh slice blocked: NACKing a required xDS type before initial convergence; \
@@ -1395,7 +1395,7 @@ async fn handle_ads_response(
                     ),
                     type_url = xds_type_url_log_label(&type_url),
                     error = %crate::startup::sanitize_startup_cause(
-                        &bounded_xds_log_value(&e),
+                        bounded_xds_log_value(&e),
                         &[]
                     ),
                     "NACKing invalid xDS ADS response"
@@ -1635,7 +1635,7 @@ fn reverse_translate(
                         &[]
                     ),
                     error = %crate::startup::sanitize_startup_cause(
-                        &bounded_xds_log_value(&e),
+                        bounded_xds_log_value(&e),
                         &[]
                     ),
                     "xDS ECDS resource failed TypedExtensionConfig decode; skipping"
