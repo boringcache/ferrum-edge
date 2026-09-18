@@ -3,6 +3,19 @@ use ferrum_edge::startup::render_startup_error;
 use serde_json::json;
 
 #[test]
+fn cors_unknown_keys_are_supplied_values_not_schema_labels() {
+    for key in ["UNREGISTERED_CORS_KEY", "'\"`UNREGISTERED_CORS_KEY"] {
+        let mut config = json!({"allowed_origins": ["https://example.com"]});
+        config.as_object_mut().unwrap().insert(key.into(), json!(true));
+        let error = validate_plugin_config("cors", &config).unwrap_err();
+        let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains("unknown configuration key"), "{rendered}");
+        assert!(rendered.contains("<redacted scalar>"), "{rendered}");
+        assert!(!rendered.contains("UNREGISTERED_CORS_KEY"), "{rendered}");
+    }
+}
+
+#[test]
 fn waf_custom_pattern_sets_do_not_retain_regex_library_errors() {
     for (target, set) in [("url_path", "url_path"), ("body_text", "body_bytes")] {
         let config = json!({"include_default_rules": false, "custom_rules": [{
