@@ -1533,13 +1533,12 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     // has drained, the carrier reports closed and the pool must retire it
     // rather than hand it out again.
     tokio::time::timeout(DEADLINE, async {
-        loop {
-            match fx.pool.inner_pool().checkout_h2(&parts) {
-                Some(reused) if !reused.sender.is_closed() => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                _ => return,
-            }
+        while let Some(reused) = fx.pool.inner_pool().checkout_h2(&parts) {
+            // The driver can close this clone after checkout checked
+            // liveness. Only a subsequent miss proves checkout has
+            // observed closure and removed the resident carrier.
+            drop(reused);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
