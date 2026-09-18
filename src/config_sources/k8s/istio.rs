@@ -7142,9 +7142,8 @@ fn telemetry(
                             // controller-host environment here — sidecar env is
                             // only known on the target data plane.
                             custom_env_tags.insert(key.clone(), name.to_string());
-                            if let Some(default_value) = env_tag
-                                .get("defaultValue")
-                                .and_then(Value::as_str)
+                            if let Some(default_value) =
+                                env_tag.get("defaultValue").and_then(Value::as_str)
                             {
                                 custom_tags.insert(key.clone(), default_value.to_string());
                             }

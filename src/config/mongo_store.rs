@@ -1274,7 +1274,8 @@ mod inner {
                     tls_ca_cert_path
                         .map(|value| {
                             crate::startup::sanitize_startup_scalar(
-                                CertSource::parse(value, MaterialKind::CaBundle).redacted_source_id(),
+                                CertSource::parse(value, MaterialKind::CaBundle)
+                                    .redacted_source_id(),
                             )
                         })
                         .unwrap_or_else(|| "system-roots".to_string()),
@@ -1315,9 +1316,9 @@ mod inner {
             info!(
                 "MongoDB connected (database={}, url={}, replica_set={})",
                 crate::startup::sanitize_startup_scalar(&settings.database_name),
-                crate::startup::sanitize_startup_scalar(
-                    crate::config::db_backend::redact_url(mongo_url)
-                ),
+                crate::startup::sanitize_startup_scalar(crate::config::db_backend::redact_url(
+                    mongo_url
+                )),
                 replica_set_configured
             );
 

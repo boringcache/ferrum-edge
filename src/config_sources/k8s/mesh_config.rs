@@ -762,10 +762,12 @@ fn ext_authz_body_check(
                  includeRequestBodyInCheck.maxRequestBytes must be an integer"
             )
         })?,
-        None => return Err(format!(
-            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+        None => {
+            return Err(format!(
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
              includeRequestBodyInCheck requires maxRequestBytes"
-        )),
+            ));
+        }
     };
     if max_request_bytes == 0 || max_request_bytes > MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES as u64 {
         return Err(format!(

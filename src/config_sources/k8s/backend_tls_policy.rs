@@ -1138,27 +1138,31 @@ fn resolve_ca_certificate_ref(
 
     match kind {
         "ConfigMap" => {
-            let pem = acc.configmap_ca_bundle_pem(namespace, name).ok_or_else(|| {
-                BackendTlsPolicyError::of(
-                    BackendTlsPolicyRejection::InvalidCaCertificateRef,
-                    format!(
-                        "ConfigMap {namespace:?}/{name:?} is missing or has no usable \
+            let pem = acc
+                .configmap_ca_bundle_pem(namespace, name)
+                .ok_or_else(|| {
+                    BackendTlsPolicyError::of(
+                        BackendTlsPolicyRejection::InvalidCaCertificateRef,
+                        format!(
+                            "ConfigMap {namespace:?}/{name:?} is missing or has no usable \
                          data.ca.crt PEM bundle"
-                    ),
-                )
-            })?;
+                        ),
+                    )
+                })?;
             Ok(pem.to_string())
         }
         "Secret" => {
-            let digest = acc.secret_ca_bundle_digest(namespace, name).ok_or_else(|| {
-                BackendTlsPolicyError::of(
-                    BackendTlsPolicyRejection::InvalidCaCertificateRef,
-                    format!(
-                        "Secret {namespace:?}/{name:?} is missing or has no usable data.ca.crt \
+            let digest = acc
+                .secret_ca_bundle_digest(namespace, name)
+                .ok_or_else(|| {
+                    BackendTlsPolicyError::of(
+                        BackendTlsPolicyRejection::InvalidCaCertificateRef,
+                        format!(
+                            "Secret {namespace:?}/{name:?} is missing or has no usable data.ca.crt \
                          PEM bundle"
-                    ),
-                )
-            })?;
+                        ),
+                    )
+                })?;
             Ok(format!("k8s://{namespace}/{name}#ca.crt?sha256={digest}"))
         }
         other => Err(BackendTlsPolicyError::of(

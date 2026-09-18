@@ -4752,9 +4752,7 @@ fn mesh_services_from_gateway(
                 acc.warnings.push(format!(
                     "Gateway API Gateway {:?}/{:?} listener {:?} uses unsupported protocol TLS \
                      with a non-Passthrough mode and will not be exposed",
-                    object.metadata.namespace,
-                    object.metadata.name,
-                    listener_name
+                    object.metadata.namespace, object.metadata.name, listener_name
                 ));
                 return Ok(());
             }
@@ -4766,9 +4764,7 @@ fn mesh_services_from_gateway(
                 acc.warnings.push(format!(
                     "Gateway API Gateway {:?}/{:?} listener {:?} is not materializable and will \
                      not be exposed",
-                    object.metadata.namespace,
-                    object.metadata.name,
-                    listener_name
+                    object.metadata.namespace, object.metadata.name, listener_name
                 ));
                 return Ok(());
             }
@@ -4776,9 +4772,7 @@ fn mesh_services_from_gateway(
                 acc.warnings.push(format!(
                     "Gateway API Gateway {:?}/{:?} listener {:?} has no admitted frontend TLS \
                      source and will not be exposed",
-                    object.metadata.namespace,
-                    object.metadata.name,
-                    listener_name
+                    object.metadata.namespace, object.metadata.name, listener_name
                 ));
                 return Ok(());
             }

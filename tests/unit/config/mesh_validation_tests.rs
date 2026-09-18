@@ -242,7 +242,9 @@ fn mesh_ports_reject_zero_on_core_resources() {
         "expected mesh service port error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("protocol_overrides[\"0\"]")),
+        errors
+            .iter()
+            .any(|e| e.contains("protocol_overrides[\"0\"]")),
         "expected protocol override port error, got: {errors:?}"
     );
     assert!(

@@ -9966,17 +9966,17 @@ fn initialize_backend_after_load(
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
             error!(
-                cgroup_root = %crate::startup::sanitize_startup_cause(
-            format!("{:?}", config.cgroup_root), &[]
-        ),
-                error = %e,
-                "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
-                 cookie bridge is not running, so per-pod source-identity resolution would \
-                 be disabled and scoped node-waypoint authz would fail closed (TCP-layer \
-                 telemetry is also lost). Refusing startup so /health cannot report Ready \
-                 for a partially attached node-waypoint topology. Set \
-                 ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
-            );
+                    cgroup_root = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.cgroup_root), &[]
+            ),
+                    error = %e,
+                    "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
+                     cookie bridge is not running, so per-pod source-identity resolution would \
+                     be disabled and scoped node-waypoint authz would fail closed (TCP-layer \
+                     telemetry is also lost). Refusing startup so /health cannot report Ready \
+                     for a partially attached node-waypoint topology. Set \
+                     ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
+                );
             anyhow::bail!(
                 "node-waypoint eBPF capture requires the SOCK_OPS identity bridge to attach; \
                  source workload identity resolution would be unavailable: {e}"

@@ -1004,9 +1004,8 @@ fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
 }
 
 pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value, String> {
-    let review: AdmissionReview =
-        crate::util::deserialization::from_json_slice(body)
-            .map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
+    let review: AdmissionReview = crate::util::deserialization::from_json_slice(body)
+        .map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
     let api_version = review
         .api_version
         .unwrap_or_else(|| "admission.k8s.io/v1".to_string());

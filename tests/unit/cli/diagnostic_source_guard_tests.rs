@@ -196,8 +196,14 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                 && pair[1].text == "("
         });
         for literal in body.iter().filter(|token| token.string) {
-            let line = source[..literal.offset].bytes().filter(|b| *b == b'\n').count() + 1;
-            if literal.text.contains("'{") && !SINGLE_QUOTE_EXCEPTIONS.contains(&(path, literal.text)) {
+            let line = source[..literal.offset]
+                .bytes()
+                .filter(|b| *b == b'\n')
+                .count()
+                + 1;
+            if literal.text.contains("'{")
+                && !SINGLE_QUOTE_EXCEPTIONS.contains(&(path, literal.text))
+            {
                 failures.push(format!(
                     "{path}:{line}: {}!: single-quoted interpolation",
                     name.text

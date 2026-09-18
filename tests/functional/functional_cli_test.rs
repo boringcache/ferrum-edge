@@ -3696,7 +3696,10 @@ async fn functional_cli_dp_initial_snapshot_rejection_withholds_document_values(
     .unwrap_or_else(|_| panic!("DP did not refuse the delivered snapshot: {}", combined()));
     gateway.shutdown();
     let output = combined();
-    assert!(output.contains("references non-existent upstream"), "{output}");
+    assert!(
+        output.contains("references non-existent upstream"),
+        "{output}"
+    );
     assert!(
         !output.contains("Full configuration snapshot accepted"),
         "{output}"

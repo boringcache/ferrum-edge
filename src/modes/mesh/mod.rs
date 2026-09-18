@@ -11190,14 +11190,14 @@ fn resolve_subset_traffic_policy(
                     upstream_presents_dynamic_svid,
                 )
                 .map_err(|e| {
-                        anyhow::anyhow!(
-                            "DestinationRule subset trafficPolicy.tls projection failed for \
+                    anyhow::anyhow!(
+                        "DestinationRule subset trafficPolicy.tls projection failed for \
                              upstream={:?} subset={:?}: {}",
-                            upstream.id,
-                            subset.name,
-                            e
-                        )
-                    })?;
+                        upstream.id,
+                        subset.name,
+                        e
+                    )
+                })?;
                 Some(slot)
             } else {
                 None
@@ -15451,13 +15451,13 @@ async fn arm_mesh_runtime_startup(
                     )
                     .with_ready_dir(Some(ready_dir));
                     info!(
-                        registry_dir = %sanitize_startup_scalar(
-                    env_config.mesh_node_waypoint_pod_registry_dir.as_str()
-                ),
-                        capture_port = settings.udp_outbound_port,
-                        "Ambient host-network UDP capture enabled (per-pod ingress-interface \
-                         scoping; no pod-netns entry)"
-                    );
+                            registry_dir = %sanitize_startup_scalar(
+                        env_config.mesh_node_waypoint_pod_registry_dir.as_str()
+                    ),
+                            capture_port = settings.udp_outbound_port,
+                            "Ambient host-network UDP capture enabled (per-pod ingress-interface \
+                             scoping; no pod-netns entry)"
+                        );
                     owner.push_mesh_background(tokio::spawn(async move {
                         manager.run(manager_shutdown).await;
                     }));
@@ -15479,12 +15479,12 @@ async fn arm_mesh_runtime_startup(
                     )
                     .with_ready_dir(Some(ready_dir));
                     info!(
-                        registry_dir = %sanitize_startup_scalar(
-                    env_config.mesh_node_waypoint_pod_registry_dir.as_str()
-                ),
-                        capture_port = settings.udp_outbound_port,
-                        "Ambient per-pod-netns UDP capture producer enabled"
-                    );
+                            registry_dir = %sanitize_startup_scalar(
+                        env_config.mesh_node_waypoint_pod_registry_dir.as_str()
+                    ),
+                            capture_port = settings.udp_outbound_port,
+                            "Ambient per-pod-netns UDP capture producer enabled"
+                        );
                     let retraction_ready = host_udp_retraction_ready.take();
                     owner.push_mesh_background(tokio::spawn(async move {
                         let mut manager_shutdown = manager_shutdown;
@@ -18574,7 +18574,9 @@ fn load_mesh_frontend_tls_by_port(
                 client_ca_bundle,
                 spiffe_bundle_slot,
             )
-            .with_context(|| format!("failed to build inbound TLS config for app port \"{port}\""))?;
+            .with_context(|| {
+                format!("failed to build inbound TLS config for app port \"{port}\"")
+            })?;
             configs_by_mode.push((mode, built.clone()));
             built
         };

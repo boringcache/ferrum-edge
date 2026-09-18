@@ -6968,7 +6968,10 @@ fn validate_mesh_config_internal(
         }
         for port in svc.protocol_overrides.keys() {
             validate_non_zero_port(
-                format!("MeshService {:?}.protocol_overrides[\"{}\"]", svc.name, port),
+                format!(
+                    "MeshService {:?}.protocol_overrides[\"{}\"]",
+                    svc.name, port
+                ),
                 *port,
                 &mut errors,
             );
@@ -7152,7 +7155,10 @@ fn validate_mesh_config_internal(
         }
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
-                format!("PeerAuthentication {:?}.port_overrides[\"{}\"]", pa.name, port),
+                format!(
+                    "PeerAuthentication {:?}.port_overrides[\"{}\"]",
+                    pa.name, port
+                ),
                 *port,
                 &mut errors,
             );

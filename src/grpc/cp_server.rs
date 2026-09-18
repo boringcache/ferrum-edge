@@ -404,9 +404,7 @@ impl<S> Drop for TrackedStream<S> {
         info!(
             "{}",
             crate::startup::sanitize_startup_cause(
-                format!(
-                    "DP node {:?} disconnected (stream dropped)", self.node_id
-                ),
+                format!("DP node {:?} disconnected (stream dropped)", self.node_id),
                 &[]
             )
         );
@@ -1825,9 +1823,7 @@ impl CpGrpcServer {
                 error!(
                     "{}",
                     crate::startup::sanitize_startup_cause(
-                        format!(
-                            "Refusing to publish configuration to data planes: {}", e
-                        ),
+                        format!("Refusing to publish configuration to data planes: {}", e),
                         &[]
                     )
                 );
@@ -1944,9 +1940,7 @@ impl CpGrpcServer {
                 error!(
                     "{}",
                     crate::startup::sanitize_startup_cause(
-                        format!(
-                            "Failed to serialize delta for broadcast: {}", e
-                        ),
+                        format!("Failed to serialize delta for broadcast: {}", e),
                         &[]
                     )
                 );
@@ -2311,9 +2305,7 @@ impl ConfigSync for CpGrpcServer {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
-                    format!(
-                        "Refusing to publish configuration in subscribe: {}", e
-                    ),
+                    format!("Refusing to publish configuration in subscribe: {}", e),
                     &[]
                 )
             );

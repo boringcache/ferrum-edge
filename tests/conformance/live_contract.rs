@@ -1960,6 +1960,33 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
         }
     }
 
+    let client_logs = non_comment_lines(&bash_function_body(
+        source,
+        "native_rotation_client_logs",
+    ));
+    for required in [
+        "logs \"pod/$NATIVE_ROTATION_NODE_ID\"",
+        "-c ferrum-edge",
+        "--prefix=true",
+        "--tail=-1",
+    ] {
+        if !client_logs.contains(required) {
+            errors.push(format!("rotation client log provenance missing {required}"));
+        }
+    }
+    if client_logs.contains("deploy/") || client_logs.contains("--previous") {
+        errors.push("rotation client log provenance must pin the current baseline pod".into());
+    }
+    for function in [
+        "count_native_rotation_observations",
+        "native_rotation_fresh_now",
+    ] {
+        let body = non_comment_lines(&bash_function_body(source, function));
+        if !body.contains("native_rotation_client_logs > \"$client_file\"") {
+            errors.push(format!("rotation client log provenance missing in {function}"));
+        }
+    }
+
     let probe_body = bash_function_body(source, "probe_native_mtls_rotation");
     if !probe_body.is_empty() {
         let idx_base = probe_body.find("capture_native_rotation_baseline");
@@ -1993,6 +2020,22 @@ fn live_contract_sidecar_native_rotation_observes_served_leaf_serial() {
         "mesh-e2e-sidecar rotation gate must observe the served CP leaf over mTLS: \
          {violations:?}"
     );
+
+    for (before, after) in [
+        ("--prefix=true", "--prefix=false"),
+        ("logs \"pod/$NATIVE_ROTATION_NODE_ID\"", "logs deploy/capp"),
+        (
+            "native_rotation_client_logs > \"$client_file\"",
+            "native_rotation_component_logs deploy/capp > \"$client_file\"",
+        ),
+    ] {
+        let changed = RUN_SH.replace(before, after);
+        let errors = native_rotation_observation_violations(&changed);
+        assert!(
+            errors.iter().any(|error| error.contains("log provenance")),
+            "redacted connection evidence must retain exact pod provenance: {errors:?}"
+        );
+    }
 
     let secret_false_proof = r#"
 apply_native_mtls_secrets gen2
