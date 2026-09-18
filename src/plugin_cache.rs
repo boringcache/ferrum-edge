@@ -39,8 +39,8 @@ use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_re
 use crate::plugins::utils::openai_error::proxy_has_openai_auth_error_envelope_plugin;
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
-    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
-    create_plugin_with_http_client_and_config_id,
+    HboneReuseContext, Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol,
+    ResponsePresentationPolicy, create_plugin_with_http_client_and_config_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1158,9 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn allows_hbone_inner_reuse(&self) -> bool {
         self.inner.allows_hbone_inner_reuse()
+    }
+    fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {
+        self.inner.allows_hbone_inner_reuse_for(admission)
     }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()

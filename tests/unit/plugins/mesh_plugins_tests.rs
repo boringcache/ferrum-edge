@@ -17,7 +17,7 @@ use ferrum_edge::plugins::mesh::workload_metrics::{
 };
 use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+    HboneReuseContext, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
     StreamConnectionContext, available_plugins, create_plugin, plugin_failure_policy,
 };
 use serde_json::json;
@@ -403,7 +403,7 @@ async fn mesh_outbound_registry_direction_gate_precedes_registry_and_metrics() {
         )
         .expect("valid empty registry")
         .expect("registered plugin");
-        assert_eq!(plugin.allows_hbone_inner_reuse(), scoped);
+        assert!(!plugin.allows_hbone_inner_reuse());
 
         // Inbound bypasses even a matching scope and a missing Host. Neither
         // registry membership nor the missing-header rejection may run.
@@ -412,6 +412,10 @@ async fn mesh_outbound_registry_direction_gate_precedes_registry_and_metrics() {
                 let mut ctx = RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
                 ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
                 ctx.frontend_listen_port = port;
+                assert_eq!(
+                    plugin.allows_hbone_inner_reuse_for(&HboneReuseContext::from(&ctx)),
+                    scoped
+                );
                 if let Some(host) = host {
                     ctx.headers.insert("host".into(), host.into());
                 }
@@ -435,6 +439,10 @@ async fn mesh_outbound_registry_direction_gate_precedes_registry_and_metrics() {
                 let mut ctx = RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
                 ctx.mesh_direction = direction;
                 ctx.frontend_listen_port = port;
+                assert_eq!(
+                    plugin.allows_hbone_inner_reuse_for(&HboneReuseContext::from(&ctx)),
+                    scoped && port != Some(15008)
+                );
                 ctx.headers
                     .insert("host".into(), "unknown.example:8080".into());
                 let result = plugin.on_request_received(&mut ctx).await;

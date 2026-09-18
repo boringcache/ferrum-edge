@@ -192,7 +192,7 @@ use super::{
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugin_cache::PluginCacheRequestView;
 use crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY;
-use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
+use crate::plugins::{HboneReuseContext, Plugin, PluginResult, ProxyProtocol, RequestContext};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::tls::CrlList;
 use crate::tls::crl_policy::{crl_records_equal, publish_enforced_crl_set, usable_crl_records};
@@ -757,6 +757,10 @@ pub struct HboneAdmissionSnapshot {
     /// reuse. `false` obliges nothing — that tunnel already performs one full
     /// destination admission per operation.
     pub advertised_inner_reuse: bool,
+    /// The listener facts the admitting classification used. Sweeps keep these
+    /// unchanged even while re-folding a new plugin generation or authorizing
+    /// with a mutable clone of `ctx`.
+    pub reuse_context: HboneReuseContext,
 }
 
 struct AdmittedHboneTunnelInner {
@@ -2192,7 +2196,7 @@ impl HboneAdmissionFence {
         // there and the two cannot drift apart.
         if snapshot.advertised_inner_reuse {
             let current_chain = view.plugins();
-            if !admitting_chain_allows_inner_reuse(&current_chain) {
+            if !admitting_chain_allows_inner_reuse(&current_chain, &snapshot.reuse_context) {
                 return Some(HboneRevocationReason::ReuseWithdrawn);
             }
         }

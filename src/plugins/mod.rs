@@ -2247,6 +2247,25 @@ pub(crate) enum BackendDispatchState {
     AmbiguousFailure,
 }
 
+/// Listener facts used to classify an admitted HBONE CONNECT for inner reuse.
+/// Captured once at admission and retained unchanged for later fence sweeps.
+/// Classification must be pure: it may inspect these facts and plugin config,
+/// but must not run request hooks, consume a budget, or consult an external service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HboneReuseContext {
+    pub mesh_direction: Option<MeshTrafficDirection>,
+    pub frontend_listen_port: Option<u16>,
+}
+
+impl From<&RequestContext> for HboneReuseContext {
+    fn from(ctx: &RequestContext) -> Self {
+        Self {
+            mesh_direction: ctx.mesh_direction,
+            frontend_listen_port: ctx.frontend_listen_port,
+        }
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -11356,6 +11375,16 @@ pub trait Plugin: Send + Sync {
     /// so must every one that becomes reusable later.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
+    }
+
+    /// Classify reuse for the listener facts of the admitting CONNECT.
+    /// The default preserves the context-free classification, including its
+    /// literal-false default for unclassified plugins. A context-aware override
+    /// has the same safety contract as [`Self::allows_hbone_inner_reuse`].
+    /// Both admission and every sweep use this method with the SAME recorded
+    /// facts; only the plugin generation may change.
+    fn allows_hbone_inner_reuse_for(&self, _admission: &HboneReuseContext) -> bool {
+        self.allows_hbone_inner_reuse()
     }
 
     /// Returns hostnames that this plugin will send traffic to.

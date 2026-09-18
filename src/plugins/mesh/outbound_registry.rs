@@ -65,7 +65,8 @@ use serde_json::Value;
 
 use crate::modes::mesh::MeshTrafficDirection;
 use crate::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
+    HTTP_FAMILY_PROTOCOLS, HboneReuseContext, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    priority,
 };
 use crate::util::json_object::JsonObject;
 
@@ -291,12 +292,20 @@ impl OutboundRegistry {
 
     #[inline]
     fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {
-        if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound) {
+        self.should_enforce_for_request_facts(ctx.mesh_direction, ctx.frontend_listen_port)
+    }
+
+    #[inline]
+    fn should_enforce_for_request_facts(
+        &self,
+        mesh_direction: Option<MeshTrafficDirection>,
+        frontend_listen_port: Option<u16>,
+    ) -> bool {
+        if mesh_direction == Some(MeshTrafficDirection::Inbound) {
             return false;
         }
         self.outbound_listen_ports.is_empty()
-            || ctx
-                .frontend_listen_port
+            || frontend_listen_port
                 .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())
     }
 
@@ -516,27 +525,18 @@ impl Plugin for OutboundRegistry {
         HTTP_FAMILY_PROTOCOLS
     }
 
-    /// Reusable while this instance is scoped to explicit listener ports.
-    ///
-    /// `should_enforce_for_request` is the FIRST statement of the request
-    /// hook and reads only the listener-stamped direction, frontend port, and
-    /// this instance's port list. Inbound always returns `Continue` before
-    /// any registry lookup, metric, or rejection, even if its numeric port
-    /// appears in the scope. An inbound HBONE CONNECT can therefore never be
-    /// decided by this egress plugin, whatever the listener port numbers.
-    ///
-    /// Auto-injection names the outbound capture ports and removes the plugin
-    /// when none exist. Its Global row still enters every inbound chain, so a
-    /// blanket refusal would withhold inbound reuse and revoke live advertised
-    /// tunnels on REGISTRY_ONLY publication despite deciding nothing on them.
-    ///
-    /// An UNSCOPED operator-managed instance (also built by `Self::deny_all`)
-    /// skips Inbound too, but enforces on non-mesh listeners as a generic Host
-    /// allowlist. Its registry verdict is a per-operation decision no sweep
-    /// re-issues: the fence re-issues authorization and the mTLS credential,
-    /// never this lookup. Keep the fail-closed default for that instance shape.
-    fn allows_hbone_inner_reuse(&self) -> bool {
+    /// Reuse is advertised only for CONNECTs the registry did not decide.
+    /// A matching outbound (or non-mesh) listener can terminate CONNECT too;
+    /// port scoping alone does not make its registry verdict reusable. Share
+    /// the request hook's gate so every sweep judges the recorded admission
+    /// facts against the current scope without re-running the registry lookup.
+    /// Unscoped instances, including `deny_all`, remain fail-closed.
+    fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {
         !self.outbound_listen_ports.is_empty()
+            && !self.should_enforce_for_request_facts(
+                admission.mesh_direction,
+                admission.frontend_listen_port,
+            )
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

@@ -92,7 +92,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTrafficDirection, prepare_gateway_config_for_mesh,
 };
-use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
+use ferrum_edge::plugins::{HboneReuseContext, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
     AdmittedHboneTunnel, AdmittedLeafExpiry, HboneAdmissionSnapshot, HbonePeerCredential,
     HboneRelayDestinationGate, HboneRevocationReason,
@@ -469,6 +469,10 @@ fn synthetic_snapshot(
         // there is no synthetic fixture for it, because the thing under test is
         // the chain the dispatcher itself resolves.
         advertised_inner_reuse: false,
+        reuse_context: HboneReuseContext {
+            mesh_direction: None,
+            frontend_listen_port: None,
+        },
     }
 }
 
@@ -493,6 +497,7 @@ fn dual_gate_snapshot(proxy: Arc<Proxy>, admission_sweep_epoch: u64) -> HboneAdm
     ctx.peer_spiffe_id = Some(SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"));
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     HboneAdmissionSnapshot {
+        reuse_context: HboneReuseContext::from(&ctx),
         ctx,
         proxy,
         upstream_target: None,

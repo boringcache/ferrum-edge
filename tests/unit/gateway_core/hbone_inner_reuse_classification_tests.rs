@@ -27,7 +27,7 @@
 //! `tests/integration/hbone_admission_fence_tests.rs`.
 
 use async_trait::async_trait;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{HboneReuseContext, Plugin, PluginResult, RequestContext};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -39,6 +39,8 @@ fn repo_root() -> PathBuf {
 /// signature cannot fail these pins for a reason that has nothing to do with
 /// the classification they are about.
 const SIGNATURE: &str = "fn allows_hbone_inner_reuse(&self) -> bool {";
+const CONTEXT_SIGNATURE: &str =
+    "fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {";
 
 /// Collapse every run of whitespace to one space, so source scanning compares
 /// tokens rather than layout.
@@ -46,20 +48,19 @@ fn normalized(source: &str) -> String {
     source.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
-/// Every occurrence of [`SIGNATURE`] in `source`, with its body returned as a
+/// Every occurrence of `signature` in `source`, with its body returned as a
 /// whitespace-normalized expression (`true`, `false`,
-/// `self.ext_authz.is_none()`).
+/// `self.ext_authz.is_none()`, or a pure listener-facts predicate).
 ///
 /// The bodies this contract admits are single expressions with no braces of
 /// their own, so the first `}` after the signature closes the method. A body
-/// that needed a brace would not be a classification any more — it would be a
-/// computation — and this scan failing to parse it is the correct outcome.
-fn classification_bodies(source: &str) -> Vec<String> {
+/// that needed a brace requires this source pin to be deliberately revisited.
+fn classification_bodies(source: &str, signature: &str) -> Vec<String> {
     let flat = normalized(source);
     let mut bodies = Vec::new();
     let mut rest = flat.as_str();
-    while let Some(start) = rest.find(SIGNATURE) {
-        let after = &rest[start + SIGNATURE.len()..];
+    while let Some(start) = rest.find(signature) {
+        let after = &rest[start + signature.len()..];
         let end = after
             .find('}')
             .expect("a classification body must close with `}`");
@@ -90,17 +91,15 @@ fn classification_bodies(source: &str) -> Vec<String> {
 ///   decision, no per-request budget, no rejection. Reuse costs record
 ///   fidelity, not enforcement.
 ///
-/// `mesh/outbound_registry` is classified per INSTANCE:
+/// `mesh/outbound_registry` is classified per admitting CONNECT:
 ///
-/// * A scoped instance qualifies under (a). Its first hook statement gates on
-///   listener direction before the numeric port scope: Inbound always returns
-///   `Continue` before any lookup, metric, or rejection, even on a matching
-///   port. An inbound CONNECT therefore decided nothing, and eliding it costs
-///   nothing. Auto-injection names the outbound capture ports (and removes the
-///   plugin when there are none), but the Global row enters inbound chains too.
-///   A blanket `false` would withhold reuse and revoke live advertised tunnels
-///   on REGISTRY_ONLY publication. The direction boundary and gate position are
-///   pinned by [`the_outbound_registry_port_gate_precedes_every_decision_in_its_hook`].
+/// * A scoped instance qualifies under (a) ONLY when the shared enforcement gate
+///   skips this CONNECT's recorded listener facts. Inbound always skips; a
+///   matching Outbound or non-mesh listener does not, even if it terminates an
+///   authenticated CONNECT. A sweep never re-issues the registry lookup.
+///   Inbound reuse and live tunnels survive REGISTRY_ONLY publication because
+///   the gate skips them. The shared gate and its position are pinned by
+///   [`the_outbound_registry_port_gate_precedes_every_decision_in_its_hook`].
 /// * An UNSCOPED instance also skips Inbound, but enforces as a generic Host
 ///   allowlist on non-mesh listeners. That verdict is a per-operation decision
 ///   no sweep re-issues, so this instance keeps the fail-closed answer.
@@ -124,7 +123,8 @@ const EXPECTED_CLASSIFICATION: &[(&str, &str)] = &[
     ("mesh/bpf_metrics.rs", "true"),
     (
         "mesh/outbound_registry.rs",
-        "!self.outbound_listen_ports.is_empty()",
+        "!self.outbound_listen_ports.is_empty() && !self.should_enforce_for_request_facts( \
+         admission.mesh_direction, admission.frontend_listen_port, )",
     ),
     ("mesh/spiffe_identity.rs", "true"),
     ("mesh/workload_metrics.rs", "true"),
@@ -170,7 +170,9 @@ fn classifying_plugin_sources() -> Vec<(String, String)> {
         if relative == "mod.rs" {
             continue;
         }
-        let bodies = classification_bodies(&read_source(&path));
+        let source = read_source(&path);
+        let mut bodies = classification_bodies(&source, SIGNATURE);
+        bodies.extend(classification_bodies(&source, CONTEXT_SIGNATURE));
         assert!(
             bodies.len() <= 1,
             "src/plugins/{relative}: one classification per plugin source"
@@ -225,8 +227,14 @@ fn the_outbound_registry_port_gate_precedes_every_decision_in_its_hook() {
         "the direction/port gate must be the FIRST statement and return Continue immediately"
     );
 
-    const GATE: &str = "fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {";
     let flat = normalized(&src);
+    assert!(flat.contains(
+        "fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool { \
+         self.should_enforce_for_request_facts(ctx.mesh_direction, ctx.frontend_listen_port) }"
+    ));
+    const GATE: &str = "fn should_enforce_for_request_facts( &self, \
+        mesh_direction: Option<MeshTrafficDirection>, frontend_listen_port: Option<u16>, \
+        ) -> bool {";
     let gate_start = flat.find(GATE).expect("the direction/port gate must exist");
     let after_gate = &flat[gate_start + GATE.len()..];
     let mut depth = 1;
@@ -244,8 +252,8 @@ fn the_outbound_registry_port_gate_precedes_every_decision_in_its_hook() {
     let gate_body = after_gate[..gate_end].trim();
     assert_eq!(
         gate_body,
-        "if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound) { return false; } \
-         self.outbound_listen_ports.is_empty() || ctx .frontend_listen_port \
+        "if mesh_direction == Some(MeshTrafficDirection::Inbound) { return false; } \
+         self.outbound_listen_ports.is_empty() || frontend_listen_port \
          .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())",
         "the gate must skip Inbound for every instance and otherwise read only the port scope"
     );
@@ -265,7 +273,7 @@ fn the_outbound_registry_port_gate_precedes_every_decision_in_its_hook() {
 #[test]
 fn the_reuse_default_is_a_literal_false() {
     let src = read_source(&repo_root().join("src/plugins/mod.rs"));
-    let bodies = classification_bodies(&src);
+    let bodies = classification_bodies(&src, SIGNATURE);
     assert_eq!(
         bodies.len(),
         1,
@@ -276,6 +284,19 @@ fn the_reuse_default_is_a_literal_false() {
         "the default classification must be a literal `false`; deriving it from another marker \
          opts unclassified and custom plugins into reuse through a question that marker does not \
          answer"
+    );
+    assert!(normalized(&src).contains(
+        "fn allows_hbone_inner_reuse_for(&self, _admission: &HboneReuseContext) -> bool { \
+         self.allows_hbone_inner_reuse() }"
+    ));
+}
+
+#[test]
+fn the_instance_wrapper_forwards_the_admitting_listener_facts() {
+    let src = read_source(&repo_root().join("src/plugin_cache.rs"));
+    assert_eq!(
+        classification_bodies(&src, CONTEXT_SIGNATURE),
+        vec!["self.inner.allows_hbone_inner_reuse_for(admission)"]
     );
 }
 
@@ -300,6 +321,10 @@ fn an_unclassified_plugin_with_a_request_phase_hook_refuses_reuse() {
          shape this stands for charges a quota or consults an external service per request, and \
          reuse would spend one charge and one verdict for an unbounded number of later operations"
     );
+    assert!(!plugin.allows_hbone_inner_reuse_for(&HboneReuseContext {
+        mesh_direction: Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound),
+        frontend_listen_port: Some(15008),
+    }));
 }
 
 /// Flipping ONLY the authorize marker cannot change the reuse answer.
@@ -371,7 +396,8 @@ impl Plugin for AuthorizePhasePlugin {
 #[test]
 fn the_connect_path_records_the_admitting_chain_fold_before_it_advertises() {
     let src = normalized(&read_source(&repo_root().join("src/proxy/hbone_proxy.rs")));
-    let fold_call = "admitting_chain_allows_inner_reuse(plugins)";
+    let fold_call = "admitting_chain_allows_inner_reuse(plugins, &reuse_context)";
+    assert!(src.contains("let reuse_context = HboneReuseContext::from(&*ctx);"));
     assert!(
         src.contains(&format!("let chain_allows_inner_reuse = {fold_call};")),
         "the CONNECT path must fold the dispatcher's own `plugins` slice"
@@ -381,6 +407,7 @@ fn the_connect_path_records_the_admitting_chain_fold_before_it_advertises() {
         "the fold's result must be recorded on the admission snapshot, so every later sweep can \
          re-judge the eligibility this tunnel was granted"
     );
+    assert!(src.contains("advertised_inner_reuse: chain_allows_inner_reuse, reuse_context,"));
     assert!(
         src.contains(
             "let advertise_tunnel_reuse = tunnel.fence_in_force() && \
@@ -417,7 +444,7 @@ fn the_sweep_refolds_the_current_chain_for_every_tunnel_that_advertised_reuse() 
     assert!(
         src.contains(
             "if snapshot.advertised_inner_reuse { let current_chain = view.plugins(); if \
-             !admitting_chain_allows_inner_reuse(&current_chain) { return \
+             !admitting_chain_allows_inner_reuse(&current_chain, &snapshot.reuse_context) { return \
              Some(HboneRevocationReason::ReuseWithdrawn); } }"
         ),
         "every sweep must re-fold the CURRENT chain for a tunnel that advertised reuse, and \
