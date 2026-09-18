@@ -347,7 +347,7 @@ impl TransactionDebugger {
         if !unknown_keys.is_empty() {
             unknown_keys.sort_unstable();
             return Err(format!(
-                "transaction_debugger: unknown configuration keys: {}",
+                "transaction_debugger: unknown configuration keys at `config`: {:?}",
                 unknown_keys.join(", ")
             ));
         }
@@ -366,8 +366,8 @@ impl TransactionDebugger {
             optional_body_field_names(config, "redacted_body_fields")?.unwrap_or_default();
         if !redacted_body_fields.is_empty() && !(log_request_body || log_response_body) {
             return Err(
-                "transaction_debugger: 'redacted_body_fields' requires 'log_request_body' or \
-                 'log_response_body' to be true"
+                "transaction_debugger: `redacted_body_fields` requires `log_request_body` or \
+                 `log_response_body` to be true"
                     .to_string(),
             );
         }
@@ -2087,12 +2087,12 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     match config.get(field) {
         None => Ok(None),
         Some(Value::Null) => Err(format!(
-            "transaction_debugger: '{field}' must be a boolean; null is not allowed"
+            "transaction_debugger: `{field}` must be a boolean; null is not allowed"
         )),
         Some(value) => value
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("transaction_debugger: '{field}' must be a boolean")),
+            .ok_or_else(|| format!("transaction_debugger: `{field}` must be a boolean")),
     }
 }
 
@@ -2108,12 +2108,12 @@ fn optional_capture_budget(
         None => return Ok(DEFAULT_BODY_CAPTURE_BYTES as usize),
         Some(Value::Null) => {
             return Err(format!(
-                "transaction_debugger: '{field}' must be a positive integer; null is not allowed"
+                "transaction_debugger: `{field}` must be a positive integer; null is not allowed"
             ));
         }
         Some(value) => value
             .as_u64()
-            .ok_or_else(|| format!("transaction_debugger: '{field}' must be a positive integer"))?,
+            .ok_or_else(|| format!("transaction_debugger: `{field}` must be a positive integer"))?,
     };
     let switch = if field == "max_request_body_bytes" {
         "log_request_body"
@@ -2122,12 +2122,12 @@ fn optional_capture_budget(
     };
     if !capture_enabled {
         return Err(format!(
-            "transaction_debugger: '{field}' requires '{switch}' to be true"
+            "transaction_debugger: `{field}` requires `{switch}` to be true"
         ));
     }
     if raw == 0 {
         return Err(format!(
-            "transaction_debugger: '{field}' must be greater than zero"
+            "transaction_debugger: `{field}` must be greater than zero"
         ));
     }
     if raw > MAX_BODY_CAPTURE_BYTES {
@@ -2146,24 +2146,24 @@ fn optional_body_field_names(
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("transaction_debugger: '{field}' must be an array"));
+        return Err(format!("transaction_debugger: `{field}` must be an array"));
     };
     let mut names = Vec::with_capacity(values.len());
     for (idx, value) in values.iter().enumerate() {
         let Some(raw) = value.as_str() else {
             return Err(format!(
-                "transaction_debugger: '{field}[{idx}]' must be a string"
+                "transaction_debugger: `{field}[{idx}]` must be a string"
             ));
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(format!(
-                "transaction_debugger: '{field}[{idx}]' must not be empty"
+                "transaction_debugger: `{field}[{idx}]` must not be empty"
             ));
         }
         if trimmed.chars().count() > 128 {
             return Err(format!(
-                "transaction_debugger: '{field}[{idx}]' must be at most 128 characters"
+                "transaction_debugger: `{field}[{idx}]` must be at most 128 characters"
             ));
         }
         names.push(trimmed.to_ascii_lowercase());
@@ -2179,23 +2179,23 @@ fn optional_header_names(
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("transaction_debugger: '{field}' must be an array"));
+        return Err(format!("transaction_debugger: `{field}` must be an array"));
     };
     let mut headers = Vec::with_capacity(values.len());
     for (idx, value) in values.iter().enumerate() {
         let Some(raw) = value.as_str() else {
             return Err(format!(
-                "transaction_debugger: '{field}[{idx}]' must be a string"
+                "transaction_debugger: `{field}[{idx}]` must be a string"
             ));
         };
         if raw.is_empty() {
             return Err(format!(
-                "transaction_debugger: '{field}[{idx}]' must not be empty"
+                "transaction_debugger: `{field}[{idx}]` must not be empty"
             ));
         }
         let raw = raw.to_ascii_lowercase();
         let name = HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
-            format!("transaction_debugger: '{field}[{idx}]' is not a valid HTTP header name")
+            format!("transaction_debugger: `{field}[{idx}]` is not a valid HTTP header name")
         })?;
         headers.push(name.as_str().to_string());
     }

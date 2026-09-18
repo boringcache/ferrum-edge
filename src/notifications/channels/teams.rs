@@ -22,7 +22,7 @@ impl TeamsChannel {
     pub fn new(name: &str, value: &Value) -> Result<Self, String> {
         let webhook_url =
             resolve_optional_string(value, "webhook_url", "webhook_url_env", name)?
-                .ok_or_else(|| format!("channel '{name}' (teams): 'webhook_url' is required"))?;
+                .ok_or_else(|| format!("channel {name:?} (teams): `webhook_url` is required"))?;
         validate_webhook_url(&webhook_url, name, "teams")?;
         Ok(Self {
             name: Arc::from(name),

@@ -221,7 +221,7 @@ fn absent_class_named_ferrum_is_not_managed() {
         translation
             .warnings
             .iter()
-            .any(|warning| warning.contains("GatewayClass 'ferrum' is not present")),
+            .any(|warning| warning.contains(r#"GatewayClass "ferrum" is not present"#)),
         "missing class must surface a bounded unresolved-authority diagnostic: {:?}",
         translation.warnings
     );

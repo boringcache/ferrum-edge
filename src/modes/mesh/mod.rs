@@ -17288,7 +17288,7 @@ async fn rotate_mesh_jwt_authority_if_due(
         Err(error) => {
             warn!(
                 error = %sanitize_startup_scalar(&error),
-                spiffe_id = %sanitize_startup_scalar(&spiffe_id),
+                spiffe_id = %sanitize_startup_scalar(spiffe_id),
                 "JWT-SVID signing key rotation did not complete; keeping the current key and \
                  every already-minted token verifiable"
             );

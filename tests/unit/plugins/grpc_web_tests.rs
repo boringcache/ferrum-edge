@@ -126,7 +126,7 @@ fn test_unknown_keys_rejected_with_path_qualified_suggestions() {
         .expect("singular/plural typo must be rejected");
     assert_eq!(
         err,
-        "grpc_web: unknown configuration key(s): 'config.expose_header' (did you mean 'expose_headers'?)"
+        "grpc_web: unknown configuration key(s): \"config.expose_header\" (did you mean `expose_headers`?)"
     );
 
     let err = GrpcWebPlugin::new(&json!({
@@ -139,7 +139,7 @@ fn test_unknown_keys_rejected_with_path_qualified_suggestions() {
     .expect("multiple unknown keys must be rejected deterministically");
     assert_eq!(
         err,
-        "grpc_web: unknown configuration key(s): 'config.a_unknown', 'config.expose_headerz' (did you mean 'expose_headers'?), 'config.z_unknown'"
+        "grpc_web: unknown configuration key(s): \"config.a_unknown\", \"config.expose_headerz\" (did you mean `expose_headers`?), \"config.z_unknown\""
     );
     assert_eq!(GRPC_WEB_CONFIG_KEYS, &["expose_headers"]);
 }
@@ -151,7 +151,7 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
         .expect_err("shared validate_plugin_config must reject typos");
     assert!(shared.contains("config.expose_header"), "got: {shared}");
     assert!(
-        shared.contains("did you mean 'expose_headers'"),
+        shared.contains("did you mean `expose_headers`"),
         "got: {shared}"
     );
 

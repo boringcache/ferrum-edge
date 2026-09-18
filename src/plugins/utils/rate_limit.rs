@@ -105,8 +105,8 @@ pub fn parse_redis_failure_policy(
     };
     let Some(raw) = raw.as_str() else {
         return Err(
-            "rate limiting: 'redis_failure_policy' must be a string ('fail_closed' or \
-             'local_fallback')"
+            "rate limiting: `redis_failure_policy` must be a string (`fail_closed` or \
+             `local_fallback`)"
                 .to_string(),
         );
     };
@@ -116,8 +116,8 @@ pub fn parse_redis_failure_policy(
         // Value-redacted diagnostics: the root object can carry redis_url /
         // redis_password, so name the accepted shape without echoing input.
         _ => Err(
-            "rate limiting: 'redis_failure_policy' must be exactly 'fail_closed' or \
-             'local_fallback'"
+            "rate limiting: `redis_failure_policy` must be exactly `fail_closed` or \
+             `local_fallback`"
                 .to_string(),
         ),
     }
@@ -204,15 +204,15 @@ pub fn local_window_algorithm(duration: Duration) -> LocalWindowAlgorithm {
 
 /// Reject a configured window that is zero or beyond [`MAX_RATE_LIMIT_WINDOW_SECONDS`].
 ///
-/// `label` is the caller's diagnostic prefix (for example
-/// `"rate_limiting: limits[0]"`) and `field` the offending key.
+/// `field` must be a schema-authored key. `label` can include document keys
+/// (GraphQL operations or gRPC methods), so it is Debug-escaped as a whole.
 pub fn validate_window_seconds(label: &str, field: &str, value: u64) -> Result<u64, String> {
     if value == 0 {
-        return Err(format!("{label}: '{field}' must be greater than zero"));
+        return Err(format!("{label:?}: `{field}` must be greater than zero"));
     }
     if value > MAX_RATE_LIMIT_WINDOW_SECONDS {
         return Err(format!(
-            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds, got: \"{value}\""
+            "{label:?}: `{field}` must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds, got: \"{value}\""
         ));
     }
     Ok(value)
@@ -220,13 +220,15 @@ pub fn validate_window_seconds(label: &str, field: &str, value: u64) -> Result<u
 
 /// Reject a configured request cap that is zero or beyond
 /// [`MAX_RATE_LIMIT_MAX_REQUESTS`].
+///
+/// `field` and `label` follow the same contract as [`validate_window_seconds`].
 pub fn validate_max_requests(label: &str, field: &str, value: u64) -> Result<u64, String> {
     if value == 0 {
-        return Err(format!("{label}: '{field}' must be greater than zero"));
+        return Err(format!("{label:?}: `{field}` must be greater than zero"));
     }
     if value > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
-            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{value}\""
+            "{label:?}: `{field}` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{value}\""
         ));
     }
     Ok(value)
@@ -661,11 +663,11 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         algorithm: A,
     ) -> Result<Option<Self>, String> {
         crate::config::types::validate_resource_id(plugin_name)
-            .map_err(|error| format!("{plugin_name}: invalid canonical plugin name: {error}"))?;
+            .map_err(|error| format!("{plugin_name:?}: invalid canonical plugin name: {error}"))?;
         crate::config::types::validate_resource_id(config_id)
-            .map_err(|error| format!("{plugin_name}: invalid plugin config id: {error}"))?;
+            .map_err(|error| format!("{plugin_name:?}: invalid plugin config id: {error}"))?;
         crate::config::types::validate_namespace(http_client.namespace())
-            .map_err(|error| format!("{plugin_name}: invalid Redis namespace: {error}"))?;
+            .map_err(|error| format!("{plugin_name:?}: invalid Redis namespace: {error}"))?;
         let default_prefix = format!("{}:{plugin_name}:{config_id}", http_client.namespace());
         let Some(cfg) = RedisConfig::from_plugin_config(config, &default_prefix)? else {
             return Ok(None);
@@ -803,7 +805,7 @@ where
                         plugin = self.plugin_name,
                         topology_unsupported = self.primary.is_topology_unsupported(),
                         "Redis rate limiting unavailable — denying under \
-                         redis_failure_policy='fail_closed'"
+                         `redis_failure_policy=fail_closed`"
                     );
                 }
                 false
@@ -814,7 +816,7 @@ where
                         plugin = self.plugin_name,
                         topology_unsupported = self.primary.is_topology_unsupported(),
                         "Redis rate limiting unavailable — falling back to local in-memory state \
-                         under redis_failure_policy='local_fallback'; the configured budget is \
+                         under `redis_failure_policy=local_fallback`; the configured budget is \
                          now enforced once per gateway process"
                     );
                 }
@@ -3494,10 +3496,10 @@ pub fn validate_ws_frame_rate_params(
     burst_size: u64,
 ) -> Result<(), String> {
     if frames_per_second == 0 {
-        return Err("ws_rate_limiting: 'frames_per_second' must be greater than zero".to_string());
+        return Err("ws_rate_limiting: `frames_per_second` must be greater than zero".to_string());
     }
     if burst_size == 0 {
-        return Err("ws_rate_limiting: 'burst_size' must be greater than zero".to_string());
+        return Err("ws_rate_limiting: `burst_size` must be greater than zero".to_string());
     }
     if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
@@ -3510,21 +3512,20 @@ pub fn validate_ws_frame_rate_params(
         ));
     }
     if burst_size < frames_per_second {
-        return Err(format!(
-            "ws_rate_limiting: 'burst_size' ({burst_size}) must be >= 'frames_per_second' ({frames_per_second})"
-        ));
+        return Err("ws_rate_limiting: `burst_size` must be >= `frames_per_second`".to_string());
     }
     if !burst_size.is_multiple_of(frames_per_second) {
-        return Err(format!(
-            "ws_rate_limiting: 'burst_size' ({burst_size}) must be an integer multiple of \
-             'frames_per_second' ({frames_per_second}) so Redis and local sustained rates match"
-        ));
+        return Err(
+            "ws_rate_limiting: `burst_size` must be an integer multiple of \
+             `frames_per_second` so Redis and local sustained rates match"
+                .to_string(),
+        );
     }
     let window_seconds = burst_size / frames_per_second;
     if window_seconds > WS_FRAME_REDIS_MAX_WINDOW_SECONDS {
         return Err(format!(
-            "ws_rate_limiting: 'burst_size' / 'frames_per_second' refill window \
-             ({window_seconds}s) exceeds the Redis-representable maximum of \
+            "ws_rate_limiting: `burst_size` / `frames_per_second` refill window \
+             exceeds the Redis-representable maximum of \
              {WS_FRAME_REDIS_MAX_WINDOW_SECONDS} seconds"
         ));
     }
