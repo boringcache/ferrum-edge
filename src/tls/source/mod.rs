@@ -561,9 +561,17 @@ pub enum MaterialError {
         source_id: String,
         source: std::io::Error,
     },
-    UnsupportedScheme { scheme: &'static str },
-    Secret { source_id: String, details: String },
-    InvalidSource { source_id: String, details: String },
+    UnsupportedScheme {
+        scheme: &'static str,
+    },
+    Secret {
+        source_id: String,
+        details: String,
+    },
+    InvalidSource {
+        source_id: String,
+        details: String,
+    },
     /// Source material exceeded `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
     ///
     /// The Display form is intentionally source-redacted: it never includes
@@ -598,18 +606,15 @@ impl fmt::Display for MaterialError {
                 f,
                 "failed to resolve TLS material source {source_id:?}: {details:?}"
             ),
-            Self::InvalidSource { source_id, details } => write!(
-                f,
-                "invalid TLS material source {source_id:?}: {details:?}"
-            ),
+            Self::InvalidSource { source_id, details } => {
+                write!(f, "invalid TLS material source {source_id:?}: {details:?}")
+            }
             Self::Oversized { kind, max_bytes } => write!(
                 f,
                 "TLS {kind} material exceeds the configured maximum of \"{max_bytes}\" bytes"
             ),
             Self::DeadlineExceeded => f.write_str("TLS material source resolution timed out"),
-            Self::ExecutorUnavailable => {
-                f.write_str("TLS material source executor is unavailable")
-            }
+            Self::ExecutorUnavailable => f.write_str("TLS material source executor is unavailable"),
         }
     }
 }
