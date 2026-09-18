@@ -8396,6 +8396,21 @@ struct CopyDirectionState {
     pos: usize,
     cap: usize,
     terminal_read_error: Option<std::io::Error>,
+    /// Whether the writer has accepted bytes it may still be holding.
+    ///
+    /// `poll_write` returning `Ok(n)` does not mean `n` bytes reached the
+    /// peer. A buffering writer takes the bytes and keeps them: tokio's
+    /// `BufWriter` copies into its own buffer, and `tokio-rustls`'
+    /// `poll_write` hands the plaintext to rustls and returns `Ok(n)` even
+    /// when the resulting ciphertext could not be pushed to the transport
+    /// (`common::Stream::poll_write`'s `(n, would_block)` arm). Until a flush
+    /// completes, those bytes are invisible to the peer — and for a
+    /// request/response protocol the peer that owes us the next read is
+    /// waiting on exactly them.
+    ///
+    /// Mirrors `need_flush` in tokio's own `CopyBuffer`, which exists for the
+    /// same deadlock.
+    needs_flush: bool,
 }
 
 impl CopyDirectionState {
@@ -8406,8 +8421,33 @@ impl CopyDirectionState {
             pos: 0,
             cap: 0,
             terminal_read_error: None,
+            needs_flush: false,
         }
     }
+}
+
+/// Outcome of one `poll_read` inside [`poll_copy_direction`], lifted out of
+/// the `ReadBuf` borrow of `state.buf` so the pending arm can still reach the
+/// writer to flush it.
+enum CopyReadOutcome {
+    Filled(usize),
+    Failed(std::io::Error),
+    Pending,
+}
+
+/// Enter the half-close phase for one direction.
+///
+/// `AsyncWrite::poll_shutdown` implies a flush, so anything the writer is
+/// still holding leaves with the half-close and the write-stall deadline goes
+/// inert here — the same point it did before flush tracking existed. What
+/// bounds a writer that cannot complete its half-close is the idle timeout and
+/// the half-close hard cap, unchanged.
+fn begin_half_close(state: &mut CopyDirectionState, write_watermark: Option<&AtomicU64>) {
+    state.needs_flush = false;
+    if let Some(wm) = write_watermark {
+        wm.store(u64::MAX, Ordering::Relaxed);
+    }
+    state.phase = CopyPhase::ShuttingDown;
 }
 
 // The queue state and watermark are private. Keep their deterministic
@@ -8506,6 +8546,15 @@ fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
 /// AND **after** the write (post-write). The pre-write refresh prevents
 /// a backpressured write from masquerading as inactivity.
 ///
+/// **Flush progress (issue #5588):** `poll_write` accepting `n` bytes does not
+/// mean the peer can see them. Whenever the reader returns `Pending` while the
+/// writer is still holding accepted bytes ([`CopyDirectionState::needs_flush`]),
+/// this function flushes before parking. Without that, a buffering writer —
+/// every `tokio-rustls` stream under transport backpressure — could hold a
+/// WebSocket reply or a tunnelled response while both peers waited on each
+/// other. The write-stall deadline stays armed across an in-flight flush, so
+/// `backend_write_timeout` still covers a writer that cannot let go of them.
+///
 /// `read_watermark` / `write_watermark` are per-direction inactivity
 /// timestamps polled by the `bidirectional_copy` watchdog. Shared via
 /// bare references to parent-scoped `AtomicU64`s — no `Arc` indirection
@@ -8541,31 +8590,71 @@ where
                 };
             }
             CopyPhase::Reading => {
-                let n = {
+                let read_outcome = {
                     let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
                     match reader.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Ready(Ok(())) => read_buf.filled().len(),
-                        Poll::Ready(Err(e)) => {
-                            // rustls represents a TCP FIN without close_notify as an
-                            // error, but the relay later classifies it as clean EOF.
-                            // Preserve true-EOF semantics by half-closing the opposite
-                            // writer before returning the error for classification.
-                            if is_userspace_tls_close_without_notify(
-                                StreamIoSide::Read,
-                                e.kind(),
-                                &e,
-                            ) {
-                                state.terminal_read_error = Some(e);
-                                state.phase = CopyPhase::ShuttingDown;
-                                continue;
-                            }
-                            return Poll::Ready(Err((StreamIoSide::Read, e)));
+                        Poll::Ready(Ok(())) => CopyReadOutcome::Filled(read_buf.filled().len()),
+                        Poll::Ready(Err(e)) => CopyReadOutcome::Failed(e),
+                        Poll::Pending => CopyReadOutcome::Pending,
+                    }
+                };
+                let n = match read_outcome {
+                    CopyReadOutcome::Filled(n) => n,
+                    CopyReadOutcome::Failed(e) => {
+                        // rustls represents a TCP FIN without close_notify as an
+                        // error, but the relay later classifies it as clean EOF.
+                        // Preserve true-EOF semantics by half-closing the opposite
+                        // writer before returning the error for classification.
+                        if is_userspace_tls_close_without_notify(StreamIoSide::Read, e.kind(), &e) {
+                            state.terminal_read_error = Some(e);
+                            begin_half_close(state, write_watermark);
+                            continue;
                         }
-                        Poll::Pending => return Poll::Pending,
+                        return Poll::Ready(Err((StreamIoSide::Read, e)));
+                    }
+                    CopyReadOutcome::Pending => {
+                        // The reader has nothing more for now, so this direction
+                        // is about to park on it. Anything the writer accepted
+                        // but is still holding has to go out HERE: parking while
+                        // a buffering writer retains bytes is a deadlock whenever
+                        // the next read depends on the peer seeing them —
+                        // request/response over a TLS tunnel, a WebSocket reply,
+                        // an HBONE byte tunnel. Tokio's `CopyBuffer::poll_copy`
+                        // flushes at exactly this point for the same reason.
+                        //
+                        // Cost: at most one `poll_flush` per accepted batch, not
+                        // per byte, and an unbuffered writer's `poll_flush` is a
+                        // no-op (`TcpStream`, `DuplexStream`, and the HBONE
+                        // `H2ConnectTunnel`, whose h2 driver flushes on its own),
+                        // so the plain-TCP hot path gains no syscall.
+                        if state.needs_flush {
+                            match writer.as_mut().poll_flush(cx) {
+                                Poll::Ready(Ok(())) => {
+                                    state.needs_flush = false;
+                                    // Nothing is queued for the peer any more,
+                                    // in this relay's buffer or inside the
+                                    // writer, so the write-stall deadline goes
+                                    // inert. While the flush is still in flight
+                                    // it stays armed at the last accepted write,
+                                    // which is what keeps a writer that is
+                                    // holding bytes under `backend_write_timeout`
+                                    // instead of only under the idle timeout.
+                                    if let Some(wm) = write_watermark {
+                                        wm.store(u64::MAX, Ordering::Relaxed);
+                                    }
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    return Poll::Ready(Err((StreamIoSide::Write, e)));
+                                }
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
+                        // `poll_read` already registered this task's waker.
+                        return Poll::Pending;
                     }
                 };
                 if n == 0 {
-                    state.phase = CopyPhase::ShuttingDown;
+                    begin_half_close(state, write_watermark);
                     continue;
                 }
 
@@ -8604,6 +8693,10 @@ where
                         }
                         Poll::Ready(Ok(nw)) => {
                             state.pos += nw;
+                            // Accepted is not delivered: a buffering writer may
+                            // still be holding these bytes. Owe a flush before
+                            // this direction parks on its reader.
+                            state.needs_flush = true;
                             // Count as soon as the destination accepts bytes,
                             // matching splice. Waiting until the whole chunk
                             // lands would report zero when a stalled write is
@@ -8622,11 +8715,13 @@ where
                     }
                 }
 
-                // Nothing remains queued for the backend. Client silence
-                // must not retain the previous write-stall deadline.
-                if let Some(wm) = write_watermark {
-                    wm.store(u64::MAX, Ordering::Relaxed);
-                }
+                // Nothing remains queued in this relay's own buffer, but the
+                // writer may still be holding what it just accepted. Client
+                // silence must not retain the previous write-stall deadline —
+                // and it does not: the reader-pending branch above flushes and
+                // disarms the watermark on the very next loop iteration, so the
+                // deadline is released exactly when the bytes are actually gone
+                // rather than when they were merely handed over.
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;

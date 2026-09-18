@@ -2338,3 +2338,65 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// One flushing relay byte pump for every tunnelled protocol (issue #5588)
+//
+// `poll_copy_direction` flushes a writer that is still holding accepted bytes
+// whenever its reader returns `Pending`. Buffering writers reach that loop from
+// every tunnelled path — userspace TCP/TLS, WebSocket tunnel mode, mesh TCP
+// inbound and egress, and the HBONE HTTP/2 CONNECT byte tunnel — so the
+// invariant holds only while those paths keep sharing ONE pump. A call site
+// that grows its own copy loop, or drops back to
+// `tokio::io::copy_bidirectional`, silently leaves the fix behind: tokio tracks
+// its own flush debt but reports neither per-direction byte counts nor which
+// half failed, and it cannot be raced against the authorization or
+// admission-revocation bounds.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_tunnelled_relay_path_shares_one_flushing_byte_pump() {
+    const RELAY: &str = "tcp_proxy::bidirectional_copy_for_relay(";
+    const FENCED: &str = "tcp_proxy::bidirectional_copy_for_fenced_relay(";
+    for (path, entry_point) in [
+        // WebSocket tunnel mode.
+        ("src/proxy/mod.rs", RELAY),
+        ("src/proxy/mesh_tcp_inbound.rs", RELAY),
+        ("src/proxy/mesh_tcp_egress.rs", RELAY),
+        // HBONE HTTP/2 CONNECT byte tunnel, under the admission fence.
+        ("src/proxy/hbone_proxy.rs", FENCED),
+    ] {
+        assert!(
+            admission_source_without_line_comments(&source(path)).contains(entry_point),
+            "{path}: tunnelled relays must reuse the shared `tcp_proxy` copy loop"
+        );
+    }
+
+    let tcp_proxy = source("src/proxy/tcp_proxy.rs");
+    assert_eq!(
+        tcp_proxy.matches("fn poll_copy_direction<").count(),
+        1,
+        "the flushing copy loop must have exactly one definition"
+    );
+    let pump = item_body(&tcp_proxy, "fn poll_copy_direction<", "\n}");
+    assert!(
+        pump.contains("state.needs_flush = true"),
+        "an accepted write must record the flush this direction now owes"
+    );
+    assert!(
+        pump.contains("writer.as_mut().poll_flush(cx)"),
+        "the reader-pending branch must flush the writer before parking"
+    );
+
+    // Only `tcp_proxy.rs` may reach for tokio's bidirectional copy, and there
+    // only on the documented all-bounds-disabled fast path.
+    for (path, text) in production_sources() {
+        if path == "src/proxy/tcp_proxy.rs" {
+            continue;
+        }
+        assert!(
+            !admission_source_without_line_comments(&text).contains("copy_bidirectional"),
+            "{path}: relays must go through the shared `tcp_proxy` copy loop"
+        );
+    }
+}
