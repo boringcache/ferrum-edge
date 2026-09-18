@@ -954,7 +954,7 @@ fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
             error.contains("request_deduplication: `config`: unknown configuration key(s)"),
             "{error}"
         );
-        assert!(error.contains(&format!("'config.{unknown}'")), "{error}");
+        assert!(error.contains(&format!("\"config.{unknown}\"")), "{error}");
         assert!(error.contains(suggestion), "{error}");
     }
 

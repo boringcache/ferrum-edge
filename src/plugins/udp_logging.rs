@@ -251,24 +251,30 @@ fn parse_udp_logging_config(
     let object = config
         .as_object()
         .ok_or_else(|| "udp_logging: config must be an object".to_string())?;
-    reject_unknown_keys(object, "config", UDP_LOGGING_CONFIG_KEYS, "udp_logging: ")?;
+    reject_unknown_keys(
+        object,
+        "config",
+        UDP_LOGGING_CONFIG_KEYS,
+        "udp_logging: `config`: ",
+    )?;
 
     let raw_host = config
         .get("host")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "udp_logging: 'host' is required".to_string())?
+        .ok_or_else(|| "udp_logging: `host` is required".to_string())?
         .to_string();
-    let socket_host = parse_socket_host("udp_logging", "host", &raw_host)?;
+    let socket_host = parse_socket_host("udp_logging", "host", &raw_host)
+        .map_err(|e| format!("udp_logging: {e}"))?;
     socket_host.screen_egress_ip("udp_logging", "host", http_client.backend_allow_ips())?;
     let host = socket_host.dial_host.clone();
     let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
-        "udp_logging: 'port' is required and must be a positive integer".to_string()
+        "udp_logging: `port` is required and must be a positive integer".to_string()
     })?;
     if port == 0 || port > 65535 {
         return Err(format!(
-            "udp_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
+            "udp_logging: `port` must be between 1 and 65535 (got \"{port}\")"
         ));
     }
 
@@ -282,7 +288,7 @@ fn parse_udp_logging_config(
         let no_verify = optional_bool(config, "dtls_no_verify")?.unwrap_or(false);
         if cert_path.is_some() != key_path.is_some() {
             return Err(
-                "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
+                "udp_logging: `dtls_cert_path` and `dtls_key_path` must be provided together"
                     .to_string(),
             );
         }
@@ -346,12 +352,13 @@ pub(crate) fn materialize_dtls_material(
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<CachedDtlsMaterial, String> {
     let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|error| {
-            format!("udp_logging: DTLS cert/key materialization failed: {error}")
+        crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|_| {
+            "udp_logging: DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`"
+                .to_string()
         })?
     } else {
         crate::dtls::generate_ephemeral_cert_public()
-            .map_err(|error| format!("udp_logging: DTLS ephemeral cert failed: {error}"))?
+            .map_err(|_| "udp_logging: DTLS ephemeral cert failed".to_string())?
     };
 
     // A configured CA source is still materialized under `no_verify`: although
@@ -359,8 +366,9 @@ pub(crate) fn materialize_dtls_material(
     // source must not pass admission and become a latent rollout defect.
     let configured_root_store = match ca_path {
         Some(ca_path) => Some(
-            crate::dtls::load_root_store_from_pem(ca_path)
-                .map_err(|error| format!("udp_logging: DTLS CA materialization failed: {error}"))?,
+            crate::dtls::load_root_store_from_pem(ca_path).map_err(|_| {
+                "udp_logging: DTLS CA materialization failed for `dtls_ca_cert_path`".to_string()
+            })?,
         ),
         None => None,
     };
@@ -376,9 +384,11 @@ pub(crate) fn materialize_dtls_material(
             roots
         };
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| format!("udp_logging: invalid DTLS server name: {host:?}"))?;
+            .map_err(|_| {
+                format!("udp_logging: invalid DTLS server name for `dtls_server_name` / `host`: {host:?}")
+            })?;
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
-            .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
+            .map_err(|_| "udp_logging: DTLS verifier build failed".to_string())?;
         (
             Some(server_name),
             Some(verifier as Arc<dyn rustls::client::danger::ServerCertVerifier>),
@@ -416,7 +426,7 @@ pub(crate) fn dtls_file_dependency_cache_key(
 ) -> Result<Option<DtlsFileDependencyCacheKey>, String> {
     let dtls_enabled = match config.get("dtls") {
         Some(Value::Bool(enabled)) => *enabled,
-        Some(_) => return Err("udp_logging: 'dtls' must be a boolean".to_string()),
+        Some(_) => return Err("udp_logging: `dtls` must be a boolean".to_string()),
         None => false,
     };
     reject_dtls_only_fields_unless_enabled(config, dtls_enabled)?;
@@ -429,13 +439,13 @@ pub(crate) fn dtls_file_dependency_cache_key(
     let ca_path = optional_non_empty_string_from_map(config, "dtls_ca_cert_path")?;
     let no_verify = match config.get("dtls_no_verify") {
         Some(Value::Bool(value)) => *value,
-        Some(_) => return Err("udp_logging: 'dtls_no_verify' must be a boolean".to_string()),
+        Some(_) => return Err("udp_logging: `dtls_no_verify` must be a boolean".to_string()),
         None => false,
     };
 
     if cert_path.is_some() != key_path.is_some() {
         return Err(
-            "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
+            "udp_logging: `dtls_cert_path` and `dtls_key_path` must be provided together"
                 .to_string(),
         );
     }
@@ -451,7 +461,9 @@ pub(crate) fn dtls_file_dependency_cache_key(
     // Match constructor admission: bracketed IPv6 is valid config input, but
     // rustls ServerName and the dialer consume its unbracketed canonical form.
     // Normalization also lets case-only hostname variants share one cache row.
-    let host = parse_socket_host("udp_logging", "host", raw_host)?.dial_host;
+    let host = parse_socket_host("udp_logging", "host", raw_host)
+        .map_err(|e| format!("udp_logging: {e}"))?
+        .dial_host;
 
     Ok(Some(DtlsFileDependencyCacheKey {
         host,
@@ -557,7 +569,7 @@ fn reject_dtls_only_fields_unless_enabled(
     }
     for key in DTLS_ONLY_CONFIG_KEYS {
         if config.contains_key(*key) {
-            return Err(format!("udp_logging: '{key}' requires dtls: true"));
+            return Err(format!("udp_logging: `{key}` requires dtls: true"));
         }
     }
     Ok(())
@@ -571,10 +583,10 @@ fn optional_non_empty_string_from_map(
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("udp_logging: '{key}' must be a string"))?
+                .ok_or_else(|| format!("udp_logging: `{key}` must be a string"))?
                 .trim();
             if value.is_empty() {
-                return Err(format!("udp_logging: '{key}' must not be empty"));
+                return Err(format!("udp_logging: `{key}` must not be empty"));
             }
             Ok(Some(value.to_string()))
         }
@@ -587,7 +599,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
         Some(value) => value
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("udp_logging: '{key}' must be a boolean")),
+            .ok_or_else(|| format!("udp_logging: `{key}` must be a boolean")),
         None => Ok(None),
     }
 }
@@ -597,10 +609,10 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("udp_logging: '{key}' must be a string"))?
+                .ok_or_else(|| format!("udp_logging: `{key}` must be a string"))?
                 .trim();
             if value.is_empty() {
-                return Err(format!("udp_logging: '{key}' must not be empty"));
+                return Err(format!("udp_logging: `{key}` must not be empty"));
             }
             Ok(Some(value.to_string()))
         }

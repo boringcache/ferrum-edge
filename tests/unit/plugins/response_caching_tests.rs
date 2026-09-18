@@ -388,7 +388,7 @@ fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
             "missing unknown-key wording: {err}"
         );
         assert!(
-            err.contains(&format!("'config.{typo}'")),
+            err.contains(&format!("\"config.{typo}\"")),
             "error must path-qualify the typo: {err}"
         );
         assert!(
@@ -403,7 +403,7 @@ fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
         let shared = validate_plugin_config("response_caching", &config)
             .expect_err("shared admission must reject the same typo");
         assert!(
-            shared.contains(&format!("'config.{typo}'")),
+            shared.contains(&format!("\"config.{typo}\"")),
             "shared path must surface the same diagnostic: {shared}"
         );
     }
@@ -419,11 +419,11 @@ fn test_multiple_unknown_root_keys_are_sorted_and_path_qualified() {
     }))
     .err()
     .expect("multiple unknown keys must be rejected");
-    assert!(err.contains("'config.aaa_extra'"), "got: {err}");
-    assert!(err.contains("'config.vary_by_header'"), "got: {err}");
-    assert!(err.contains("'config.zzz_extra'"), "got: {err}");
+    assert!(err.contains("\"config.aaa_extra\""), "got: {err}");
+    assert!(err.contains("\"config.vary_by_header\""), "got: {err}");
+    assert!(err.contains("\"config.zzz_extra\""), "got: {err}");
     assert!(
-        err.contains("did you mean 'vary_by_headers'?"),
+        err.contains("did you mean `vary_by_headers`?"),
         "near-miss Vary typo should suggest the canonical key: {err}"
     );
     let aaa = err.find("aaa_extra").expect("aaa_extra present");

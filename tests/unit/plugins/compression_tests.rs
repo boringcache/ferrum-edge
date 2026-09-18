@@ -256,18 +256,18 @@ fn test_rejects_one_unknown_key_with_spelling_suggestion() {
         "missing unknown-key wording: {err}"
     );
     assert!(
-        err.contains("'config.min_content_lenght'"),
+        err.contains("\"config.min_content_lenght\""),
         "path-qualified key missing: {err}"
     );
     assert!(
-        err.contains("did you mean 'min_content_length'?"),
+        err.contains("did you mean `min_content_length`?"),
         "spelling suggestion missing: {err}"
     );
 
     let shared = validate_plugin_config("compression", &json!({"gzip_leveel": 1}))
         .expect_err("shared file/admin/database/CP-DP admission must reject the typo");
     assert!(
-        shared.contains("'config.gzip_leveel'") && shared.contains("did you mean 'gzip_level'?"),
+        shared.contains("\"config.gzip_leveel\"") && shared.contains("did you mean `gzip_level`?"),
         "got: {shared}"
     );
 }
@@ -283,7 +283,7 @@ fn test_rejects_multiple_unknown_keys_deterministically() {
     .err()
     .expect("multiple unknown keys must be rejected");
     assert!(
-        err.contains("unknown configuration key(s): 'config.aaa_extra', 'config.remove_accept_encodng' (did you mean 'remove_accept_encoding'?), 'config.zzz_extra'"),
+        err.contains("unknown configuration key(s): \"config.aaa_extra\", \"config.remove_accept_encodng\" (did you mean `remove_accept_encoding`?), \"config.zzz_extra\""),
         "unexpected multi-key diagnostic: {err}"
     );
 

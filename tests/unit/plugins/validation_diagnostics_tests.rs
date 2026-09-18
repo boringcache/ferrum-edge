@@ -43,8 +43,7 @@ fn claim_mapping_keys_do_not_become_schema_labels() {
             "jwks_auth",
             "test.",
         )
-        .err()
-        .expect("invalid mapping must be rejected");
+        .expect_err("invalid mapping must be rejected");
         let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(
             rendered.contains(&format!("claim_headers[0].{field}")),

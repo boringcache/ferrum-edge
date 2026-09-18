@@ -65,7 +65,7 @@ fn test_unknown_config_keys_rejected_with_spelling_suggestion() {
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("require_buffered_checks"), "{err}");
     assert!(
-        err.contains("did you mean 'require_buffered_check'?"),
+        err.contains("did you mean `require_buffered_check`?"),
         "{err}"
     );
 

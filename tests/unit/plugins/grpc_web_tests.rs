@@ -151,7 +151,7 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
         .expect_err("shared validate_plugin_config must reject typos");
     assert!(shared.contains("config.expose_header"), "got: {shared}");
     assert!(
-        shared.contains("did you mean 'expose_headers'"),
+        shared.contains("did you mean `expose_headers`"),
         "got: {shared}"
     );
 

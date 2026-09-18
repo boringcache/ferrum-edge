@@ -423,9 +423,9 @@ fn test_rejects_one_typo_with_path_qualified_suggestion() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .expect("typo must be rejected");
-    assert!(err.contains("'config.request_timeot_ms'"), "got: {err}");
+    assert!(err.contains("\"config.request_timeot_ms\""), "got: {err}");
     assert!(
-        err.contains("did you mean 'request_timeout_ms'"),
+        err.contains("did you mean `request_timeout_ms`"),
         "got: {err}"
     );
 }
@@ -444,7 +444,7 @@ fn shared_file_admin_database_cp_dp_admission_rejects_unknown_keys() {
         "request_timeot_ms": 5000
     });
     let err = validate_plugin_config("load_testing", &config).expect_err("must reject typo");
-    assert!(err.contains("'config.request_timeot_ms'"), "got: {err}");
+    assert!(err.contains("\"config.request_timeot_ms\""), "got: {err}");
 }
 
 #[test]
