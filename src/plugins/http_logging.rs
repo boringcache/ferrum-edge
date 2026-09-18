@@ -79,7 +79,7 @@ impl HttpLogging {
             config_obj,
             "config",
             HTTP_LOGGING_CONFIG_KEYS,
-            "http_logging: ",
+            "http_logging: `config`: ",
         )?;
 
         let (endpoint_url, endpoint_hostname) =

@@ -210,7 +210,7 @@ pub fn validate_tag_key(key: &str) -> Result<&str, String> {
     }
     if trimmed != key {
         return Err(format!(
-            "statsd_logging: tag key '{key}' must not contain leading or trailing whitespace"
+            "statsd_logging: tag key {key:?} must not contain leading or trailing whitespace"
         ));
     }
     if trimmed.len() > MAX_TAG_KEY_LEN {
@@ -224,13 +224,13 @@ pub fn validate_tag_key(key: &str) -> Result<&str, String> {
     };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(format!(
-            "statsd_logging: tag key '{trimmed}' must start with an ASCII letter or underscore"
+            "statsd_logging: tag key {trimmed:?} must start with an ASCII letter or underscore"
         ));
     }
     for c in chars {
         if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) {
             return Err(format!(
-                "statsd_logging: tag key '{trimmed}' contains characters outside [A-Za-z0-9_.-]"
+                "statsd_logging: tag key {trimmed:?} contains characters outside [A-Za-z0-9_.-]"
             ));
         }
     }
@@ -240,7 +240,7 @@ pub fn validate_tag_key(key: &str) -> Result<&str, String> {
 fn validate_reserved_tag_key(key: &str, context: &str) -> Result<(), String> {
     if is_reserved_tag_key(key) {
         return Err(format!(
-            "statsd_logging: {context} tag key '{key}' is reserved and cannot be overridden \
+            "statsd_logging: {context} tag key {key:?} is reserved and cannot be overridden \
              (reserved: {})",
             RESERVED_TAG_KEYS.join(", ")
         ));
@@ -406,18 +406,18 @@ fn validate_statsd_schema_keys(schema: Option<&SummarySchema>) -> Result<HashSet
                 continue;
             };
             let validated = validate_tag_key(key).map_err(|err| {
-                format!("{err} (schema rename target for {family} tag '{default_key}')")
+                format!("{err} (schema rename target for {family} tag `{default_key}`)")
             })?;
             if validated != *default_key && is_reserved_tag_key(validated) {
                 return Err(format!(
-                    "statsd_logging: schema rename target '{validated}' for {family} tag \
-                     '{default_key}' collides with a reserved runtime tag"
+                    "statsd_logging: schema rename target {validated:?} for {family} tag \
+                     `{default_key}` collides with a reserved runtime tag"
                 ));
             }
             let dedupe = format!("{family}:{}", validated.to_ascii_lowercase());
             if !seen.insert(dedupe) {
                 return Err(format!(
-                    "statsd_logging: schema produces duplicate {family} tag key '{validated}'"
+                    "statsd_logging: schema produces duplicate {family} tag key {validated:?}"
                 ));
             }
             runtime_keys.insert(validated.to_ascii_lowercase());
@@ -437,7 +437,7 @@ fn build_global_tags(
     if let Some(global_tags) = config.get("global_tags") {
         let tags_obj = global_tags
             .as_object()
-            .ok_or_else(|| "statsd_logging: 'global_tags' must be an object".to_string())?;
+            .ok_or_else(|| "statsd_logging: `global_tags` must be an object".to_string())?;
         pairs.reserve(tags_obj.len() + 1);
         for (key, value) in tags_obj {
             let validated = validate_tag_key(key)?;
@@ -445,18 +445,18 @@ fn build_global_tags(
             let dedupe = validated.to_ascii_lowercase();
             if runtime_tag_keys.contains(&dedupe) {
                 return Err(format!(
-                    "statsd_logging: global_tags key '{validated}' collides with a schema-owned \
+                    "statsd_logging: global_tags key {validated:?} collides with a schema-owned \
                      runtime tag"
                 ));
             }
             if !seen_keys.insert(dedupe) {
                 return Err(format!(
-                    "statsd_logging: duplicate global_tags key '{validated}' after normalization"
+                    "statsd_logging: duplicate global_tags key {validated:?} after normalization"
                 ));
             }
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("statsd_logging: 'global_tags.{key}' must be a string"))?;
+                .ok_or_else(|| format!("statsd_logging: `global_tags` key {key:?} must be a string"))?;
             pairs.push(format!("{validated}:{}", sanitize_tag_value(value)));
         }
     }
@@ -471,7 +471,7 @@ fn build_global_tags(
     if encoded.len() > MAX_GLOBAL_TAGS_ENCODED_LEN {
         return Err(format!(
             "statsd_logging: encoded global_tags (+ namespace) exceed maximum length of \
-             {MAX_GLOBAL_TAGS_ENCODED_LEN} bytes (got {})",
+             {MAX_GLOBAL_TAGS_ENCODED_LEN} bytes (got \"{}\")",
             encoded.len()
         ));
     }
@@ -596,22 +596,23 @@ impl StatsdLogging {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                "statsd_logging: 'host' is required — metrics will have nowhere to send".to_string()
+                "statsd_logging: `host` is required — metrics will have nowhere to send".to_string()
             })?
             .to_string();
-        let socket_host = parse_socket_host("statsd_logging", "host", &raw_host)?;
+        let socket_host = parse_socket_host("statsd_logging", "host", &raw_host)
+            .map_err(|e| format!("statsd_logging: {e}"))?;
         socket_host.screen_egress_ip("statsd_logging", "host", http_client.backend_allow_ips())?;
         let host = socket_host.dial_host.clone();
 
         let port = match config.get("port") {
             Some(value) => value.as_u64().ok_or_else(|| {
-                "statsd_logging: 'port' must be an integer between 1 and 65535".to_string()
+                "statsd_logging: `port` must be an integer between 1 and 65535".to_string()
             })?,
             None => 8125,
         };
         if port == 0 || port > 65535 {
             return Err(format!(
-                "statsd_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
+                "statsd_logging: `port` must be between 1 and 65535 (got \"{port}\")"
             ));
         }
 
@@ -624,9 +625,9 @@ impl StatsdLogging {
             Some(value) => {
                 let raw = value
                     .as_str()
-                    .ok_or_else(|| "statsd_logging: 'prefix' must be a string".to_string())?;
+                    .ok_or_else(|| "statsd_logging: `prefix` must be a string".to_string())?;
                 sanitize_metric_name(raw)
-                    .ok_or_else(|| "statsd_logging: 'prefix' must not be empty".to_string())?
+                    .ok_or_else(|| "statsd_logging: `prefix` must not be empty".to_string())?
             }
             None => sanitize_metric_name(ns).ok_or_else(|| {
                 "statsd_logging: namespace used as the metric prefix must not be empty".to_string()
@@ -634,8 +635,8 @@ impl StatsdLogging {
         };
         if prefix.len() > MAX_PREFIX_LEN {
             return Err(format!(
-                "statsd_logging: 'prefix' exceeds maximum length of {MAX_PREFIX_LEN} bytes \
-                 after sanitization (got {})",
+                "statsd_logging: `prefix` exceeds maximum length of {MAX_PREFIX_LEN} bytes \
+                 after sanitization (got \"{}\")",
                 prefix.len()
             ));
         }
@@ -1173,7 +1174,7 @@ fn validate_minimum_record_budget(
     let required = minimum_ordinary_record_bytes(prefix, global_tags, schema);
     if required > max_entry_bytes {
         return Err(format!(
-            "statsd_logging: `max_entry_bytes` must fit at least the smallest ordinary record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix, tags, and schema (requires at least {required} bytes, configured \"{max_entry_bytes}\")"
+            "statsd_logging: `max_entry_bytes` must fit at least the smallest ordinary record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix, tags, and schema (requires at least \"{required}\" bytes, configured \"{max_entry_bytes}\")"
         ));
     }
     Ok(())

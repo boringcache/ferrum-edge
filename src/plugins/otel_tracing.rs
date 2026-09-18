@@ -104,7 +104,7 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
 /// Fixed diagnostic for an unusable `authorization` value. The rejected value
 /// is a credential, so it never appears in the message.
 const INVALID_AUTHORIZATION_ERROR: &str =
-    "otel_tracing: 'authorization' contains characters not permitted in HTTP header values";
+    "otel_tracing: `authorization` contains characters not permitted in HTTP header values";
 const MAX_PARTIAL_SUCCESS_MESSAGE_BYTES: usize = 512;
 const MAX_OTLP_SUCCESS_BODY_BYTES: usize = 64 * 1024;
 const MAX_URL_PATH_BYTES: usize = 512;
@@ -601,7 +601,7 @@ impl OtelTracing {
             config_object,
             "config",
             ALLOWED_CONFIG_KEYS,
-            "otel_tracing: ",
+            "otel_tracing: `config`: ",
         )?;
 
         let service_name = string_config(config, "service_name", "ferrum-edge")?;
@@ -1526,10 +1526,10 @@ impl TraceHttpExporterConfig {
         options: &TraceExporterOptions,
     ) -> Result<Self, String> {
         let parsed = Url::parse(&endpoint)
-            .map_err(|e| format!("{provider_name}: 'endpoint' must be a valid URL: {e}"))?;
+            .map_err(|_| format!("{provider_name}: `endpoint` must be a valid URL"))?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(format!(
-                "{provider_name}: 'endpoint' must not contain user information; use authorization or headers"
+                "{provider_name}: `endpoint` must not contain user information; use `authorization` or `headers`"
             ));
         }
         let endpoint_for_logs = redacted_endpoint_url(&parsed);
@@ -1582,9 +1582,9 @@ pub(crate) fn trace_exporters_from_providers(
                 collector_url,
                 access_token_env,
             } => {
-                let access_token = std::env::var(access_token_env).map_err(|error| {
+                let access_token = std::env::var(access_token_env).map_err(|_| {
                     format!(
-                        "Lightstep access token env var '{access_token_env}' is not set or unreadable: {error}"
+                        "Lightstep `access_token_env` {access_token_env:?} is not set or unreadable"
                     )
                 })?;
                 Ok(Arc::new(LightstepTraceExporter::new(
@@ -1773,26 +1773,26 @@ fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, 
     };
     let Value::Object(map) = value else {
         if value.is_null() {
-            return Err("otel_tracing: 'headers' must be a non-null object".to_string());
+            return Err("otel_tracing: `headers` must be a non-null object".to_string());
         }
-        return Err("otel_tracing: 'headers' must be an object".to_string());
+        return Err("otel_tracing: `headers` must be an object".to_string());
     };
 
     let mut headers = Vec::with_capacity(map.len());
     for (key, value) in map {
         if HeaderName::from_bytes(key.as_bytes()).is_err() {
             return Err(format!(
-                "otel_tracing: 'headers' contains an invalid HTTP header name: {key:?}"
+                "otel_tracing: `headers` contains an invalid HTTP header name: {key:?}"
             ));
         }
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "otel_tracing: 'headers.{key}' must be a string value"
+                "otel_tracing: `headers` key {key:?} must be a string value"
             ));
         };
         if HeaderValue::from_str(value).is_err() {
             return Err(format!(
-                "otel_tracing: 'headers.{key}' contains characters not permitted in HTTP header values"
+                "otel_tracing: `headers` key {key:?} contains characters not permitted in HTTP header values"
             ));
         }
         headers.push((key.clone(), value.to_string()));
@@ -2921,17 +2921,17 @@ fn json_type_name(value: &Value) -> &'static str {
 fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
     match config.get(key) {
         None => Ok(default.to_string()),
-        Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null string")),
+        Some(Value::Null) => Err(format!("otel_tracing: `{key}` must be a non-null string")),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                Err(format!("otel_tracing: '{key}' must be a non-empty string"))
+                Err(format!("otel_tracing: `{key}` must be a non-empty string"))
             } else {
                 Ok(trimmed.to_string())
             }
         }
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a string, got: {}",
+            "otel_tracing: `{key}` must be a string, got: {}",
             json_type_name(other)
         )),
     }
@@ -2956,17 +2956,17 @@ fn parse_authorization(config: &Value) -> Result<Option<String>, String> {
 fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null string")),
+        Some(Value::Null) => Err(format!("otel_tracing: `{key}` must be a non-null string")),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                Err(format!("otel_tracing: '{key}' must be a non-empty string"))
+                Err(format!("otel_tracing: `{key}` must be a non-empty string"))
             } else {
                 Ok(Some(trimmed.to_string()))
             }
         }
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a string, got: {}",
+            "otel_tracing: `{key}` must be a string, got: {}",
             json_type_name(other)
         )),
     }
@@ -2975,10 +2975,10 @@ fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, S
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
         None => Ok(default),
-        Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null boolean")),
+        Some(Value::Null) => Err(format!("otel_tracing: `{key}` must be a non-null boolean")),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a boolean, got: {}",
+            "otel_tracing: `{key}` must be a boolean, got: {}",
             json_type_name(other)
         )),
     }
@@ -2995,22 +2995,22 @@ fn u64_config_range(
         None => default,
         Some(Value::Null) => {
             return Err(format!(
-                "otel_tracing: '{key}' must be a non-null non-negative integer"
+                "otel_tracing: `{key}` must be a non-null non-negative integer"
             ));
         }
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("otel_tracing: '{key}' must be a non-negative integer"))?,
+            .ok_or_else(|| format!("otel_tracing: `{key}` must be a non-negative integer"))?,
         Some(other) => {
             return Err(format!(
-                "otel_tracing: '{key}' must be a non-negative integer, got: {}",
+                "otel_tracing: `{key}` must be a non-negative integer, got: {}",
                 json_type_name(other)
             ));
         }
     };
     if value < min || value > max {
         return Err(format!(
-            "otel_tracing: '{key}' must be between {min} and {max}, got: \"{value}\""
+            "otel_tracing: `{key}` must be between {min} and {max}, got: \"{value}\""
         ));
     }
     Ok(value)
@@ -3024,7 +3024,7 @@ fn usize_config_range(
     max: u64,
 ) -> Result<usize, String> {
     let value = u64_config_range(config, key, default, min, max)?;
-    usize::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+    usize::try_from(value).map_err(|_| format!("otel_tracing: `{key}` is too large"))
 }
 
 fn u32_config_range(
@@ -3035,14 +3035,14 @@ fn u32_config_range(
     max: u64,
 ) -> Result<u32, String> {
     let value = u64_config_range(config, key, default, min, max)?;
-    u32::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+    u32::try_from(value).map_err(|_| format!("otel_tracing: `{key}` is too large"))
 }
 
 fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String> {
     match config.get("trace_context_trust") {
         None => Ok(TraceContextTrust::Untrusted),
         Some(Value::Null) => {
-            Err("otel_tracing: 'trace_context_trust' must be a non-null string".to_string())
+            Err("otel_tracing: `trace_context_trust` must be a non-null string".to_string())
         }
         Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
             "untrusted" => Ok(TraceContextTrust::Untrusted),
@@ -3053,7 +3053,7 @@ fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String
             )),
         },
         Some(other) => Err(format!(
-            "otel_tracing: 'trace_context_trust' must be a string, got: {}",
+            "otel_tracing: `trace_context_trust` must be a string, got: {}",
             json_type_name(other)
         )),
     }
@@ -3063,12 +3063,12 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
     let mode = match config.get("root_sampling") {
         None => "always_on".to_string(),
         Some(Value::Null) => {
-            return Err("otel_tracing: 'root_sampling' must be a non-null string".to_string());
+            return Err("otel_tracing: `root_sampling` must be a non-null string".to_string());
         }
         Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
         Some(other) => {
             return Err(format!(
-                "otel_tracing: 'root_sampling' must be a string, got: {}",
+                "otel_tracing: `root_sampling` must be a string, got: {}",
                 json_type_name(other)
             ));
         }
@@ -3077,12 +3077,12 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
         None => None,
         Some(Value::Null) => {
             return Err(
-                "otel_tracing: 'root_sampling_ratio' must be a non-null number".to_string(),
+                "otel_tracing: `root_sampling_ratio` must be a non-null number".to_string(),
             );
         }
         Some(Value::Number(n)) => {
             let ratio = n.as_f64().ok_or_else(|| {
-                "otel_tracing: 'root_sampling_ratio' must be a number between 0.0 and 1.0"
+                "otel_tracing: `root_sampling_ratio` must be a number between 0.0 and 1.0"
                     .to_string()
             })?;
             if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
@@ -3094,15 +3094,15 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
         }
         Some(other) => {
             return Err(format!(
-                "otel_tracing: 'root_sampling_ratio' must be a number, got: {}",
+                "otel_tracing: `root_sampling_ratio` must be a number, got: {}",
                 json_type_name(other)
             ));
         }
     };
     if configured_ratio.is_some() && mode != "ratio" {
         return Err(format!(
-            "otel_tracing: 'root_sampling_ratio' requires root_sampling=ratio \
-             (got root_sampling={mode})"
+            "otel_tracing: `root_sampling_ratio` requires `root_sampling=ratio` \
+             (got `root_sampling`={mode:?})"
         ));
     }
     match mode.as_str() {
@@ -3110,13 +3110,13 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
         "always_off" => Ok(RootSampling::AlwaysOff),
         "ratio" => {
             let ratio = configured_ratio.ok_or_else(|| {
-                "otel_tracing: 'root_sampling_ratio' is required when root_sampling=ratio"
+                "otel_tracing: `root_sampling_ratio` is required when `root_sampling=ratio`"
                     .to_string()
             })?;
             Ok(RootSampling::Ratio(ratio))
         }
         other => Err(format!(
-            "otel_tracing: `root_sampling` must be always_on, always_off, or ratio, got: {other:?}",
+            "otel_tracing: `root_sampling` must be `always_on`, `always_off`, or `ratio`, got: {other:?}",
             other = other.to_string()
         )),
     }
@@ -3124,45 +3124,45 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
 
 fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result<String, String> {
     let url = Url::parse(endpoint)
-        .map_err(|e| format!("{provider_name}: 'endpoint' must be a valid URL: {e}"))?;
+        .map_err(|_| format!("{provider_name}: `endpoint` must be a valid URL"))?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "{provider_name}: `endpoint` scheme must be http or https, got: {scheme:?}"
+                "{provider_name}: `endpoint` scheme must be `http` or `https`, got: {scheme:?}"
             ));
         }
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(format!(
-            "{provider_name}: 'endpoint' must not contain user information; use authorization or headers"
+            "{provider_name}: `endpoint` must not contain user information; use `authorization` or `headers`"
         ));
     }
     if !has_non_empty_authority(endpoint) {
         return Err(format!(
-            "{provider_name}: 'endpoint' must include a hostname"
+            "{provider_name}: `endpoint` must include a hostname"
         ));
     }
     normalized_url_hostname(&url)
-        .ok_or_else(|| format!("{provider_name}: 'endpoint' must include a hostname"))
+        .ok_or_else(|| format!("{provider_name}: `endpoint` must include a hostname"))
 }
 
 fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
     let mut url = Url::parse(agent_url)
-        .map_err(|e| format!("Datadog: 'agent_url' must be a valid URL: {e}"))?;
+        .map_err(|_| "Datadog: `agent_url` must be a valid URL".to_string())?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "Datadog: `agent_url` scheme must be http or https, got: {scheme:?}"
+                "Datadog: `agent_url` scheme must be `http` or `https`, got: {scheme:?}"
             ));
         }
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("Datadog: 'agent_url' must not contain user information".to_string());
+        return Err("Datadog: `agent_url` must not contain user information".to_string());
     }
     if !has_non_empty_authority(agent_url) || normalized_url_hostname(&url).is_none() {
-        return Err("Datadog: 'agent_url' must include a hostname".to_string());
+        return Err("Datadog: `agent_url` must include a hostname".to_string());
     }
     let path = url.path().trim_end_matches('/');
     if path.is_empty() || path == "/" {

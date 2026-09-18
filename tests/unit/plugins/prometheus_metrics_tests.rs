@@ -229,7 +229,7 @@ fn test_prometheus_plugin_rejects_unknown_render_cache_ttl_secnds_key() {
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("render_cache_ttl_secnds"), "{err}");
     assert!(
-        err.contains("did you mean 'render_cache_ttl_seconds'?"),
+        err.contains("did you mean `render_cache_ttl_seconds`?"),
         "{err}"
     );
 }
@@ -2976,7 +2976,7 @@ fn test_prometheus_plugin_rejects_schema_customization() {
             .err()
             .unwrap_or_else(|| panic!("expected schema customization to fail: {config}"));
         assert!(
-            err.contains("'schema' / 'schema_ref' is not supported"),
+            err.contains("`schema` / `schema_ref` is not supported"),
             "unexpected diagnostic for {config}: {err}"
         );
         assert!(

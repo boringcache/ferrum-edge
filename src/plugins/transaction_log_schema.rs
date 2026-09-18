@@ -74,25 +74,25 @@ impl TransactionLogSchema {
 
     fn validate_and_compile_entries(config: &Value) -> Result<Vec<CompiledSchemaEntry>, String> {
         let config_object = config.as_object().ok_or_else(|| {
-            "transaction_log_schema: config must be an object containing 'schemas'".to_string()
+            "transaction_log_schema: config must be an object containing `schemas`".to_string()
         })?;
         for key in config_object.keys() {
             if !TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.contains(&key.as_str()) {
                 return Err(format!(
-                    "transaction_log_schema: unknown config key '{key}' at 'config.{key}' (valid keys: {})",
-                    TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.join(", ")
+                    "transaction_log_schema: unknown config key {key:?} at `config` (valid keys: `{}`)",
+                    TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.join("`, `")
                 ));
             }
         }
         let schemas_value = config_object.get("schemas").ok_or_else(|| {
-            "transaction_log_schema: 'schemas' is required (an object mapping name -> schema definition)".to_string()
+            "transaction_log_schema: `schemas` is required (an object mapping name -> schema definition)".to_string()
         })?;
         let obj = schemas_value
             .as_object()
-            .ok_or_else(|| "transaction_log_schema: 'schemas' must be an object".to_string())?;
+            .ok_or_else(|| "transaction_log_schema: `schemas` must be an object".to_string())?;
         if obj.is_empty() {
             return Err(
-                "transaction_log_schema: 'schemas' must contain at least one named schema"
+                "transaction_log_schema: `schemas` must contain at least one named schema"
                     .to_string(),
             );
         }
@@ -117,7 +117,7 @@ impl TransactionLogSchema {
             // its own capability at `schema_ref` resolve time (see
             // `resolve_schema`), which is how disconnect fields reach parity
             // with an inline `ws_logging` schema.
-            let plugin_label = format!("transaction_log_schema[{name}]");
+            let plugin_label = format!("transaction_log_schema `schemas` entry {name:?}");
             let compiled =
                 SummarySchema::compile(schema_value, &plugin_label, SchemaCapabilities::BASE)?;
             entries.push((name.clone(), Arc::new(schema_value.clone()), compiled));
@@ -181,7 +181,7 @@ pub(crate) fn validate_config_graph(
     for namespace in namespaces {
         if let Err(error) = registry::begin_reload() {
             errors.push(format!(
-                "transaction-log schema registry could not begin validation for namespace '{namespace}': {error}"
+                "transaction-log schema registry could not begin validation for namespace {namespace:?}: {error}"
             ));
             continue;
         }
@@ -193,14 +193,14 @@ pub(crate) fn validate_config_graph(
         }) {
             if plugin.scope != crate::config::types::PluginScope::Global {
                 errors.push(format!(
-                    "Plugin '{}' (id={}, namespace={}): transaction_log_schema must have scope 'global'",
+                    "Plugin {:?} (id={:?}, namespace={:?}): transaction_log_schema must have scope `global`",
                     plugin.plugin_name, plugin.id, namespace
                 ));
                 continue;
             }
             if let Err(error) = TransactionLogSchema::new(&plugin.config) {
                 errors.push(format!(
-                    "Plugin '{}' (id={}, namespace={}): {}",
+                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
             }
@@ -220,11 +220,11 @@ pub(crate) fn validate_config_graph(
             // recompilation such as ws_logging's disconnect fields.
             if let Err(error) = resolve_schema(
                 &plugin.config,
-                &plugin.plugin_name,
+                &format!("plugin {:?}", plugin.plugin_name),
                 SchemaCapabilities::BASE,
             ) {
                 errors.push(format!(
-                    "Plugin '{}' (id={}, namespace={}): {}",
+                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
                 continue;
@@ -235,14 +235,17 @@ pub(crate) fn validate_config_graph(
                 http_client.clone(),
             ) {
                 let message = format!(
-                    "Plugin '{}' (id={}, namespace={}): {}",
+                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 );
                 if !optional_failures_are_errors
                     && super::plugin_failure_policy(&plugin.plugin_name)
                         == Some(super::PluginFailurePolicy::OptionalFailOpen)
                 {
-                    warn!("Optional plugin config validation warning: {}", message);
+                    warn!(
+                        "Optional plugin config validation warning: {}",
+                        crate::startup::sanitize_startup_cause(message, &[])
+                    );
                 } else {
                     errors.push(message);
                 }
@@ -251,7 +254,7 @@ pub(crate) fn validate_config_graph(
 
         if let Err(error) = registry::abort_reload() {
             errors.push(format!(
-                "transaction-log schema registry could not discard validation for namespace '{namespace}': {error}"
+                "transaction-log schema registry could not discard validation for namespace {namespace:?}: {error}"
             ));
         }
     }
@@ -292,7 +295,7 @@ mod tests {
         let _g = lock();
         registry::reset_for_tests();
         let e = TransactionLogSchema::new(&json!({})).unwrap_err();
-        assert!(e.contains("'schemas' is required"), "got: {e}");
+        assert!(e.contains("`schemas` is required"), "got: {e}");
     }
 
     #[test]
@@ -334,9 +337,9 @@ mod tests {
         }))
         .unwrap_err();
         // Compile errors are prefixed with the schema label.
-        assert!(e.contains("[bad]"), "got: {e}");
+        assert!(e.contains("entry \"bad\""), "got: {e}");
         assert!(
-            e.contains("schema omit references unknown field \"not_a_field\""),
+            e.contains("schema `omit` references unknown field \"not_a_field\""),
             "got: {e}"
         );
     }

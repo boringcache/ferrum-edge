@@ -22,7 +22,7 @@ impl DiscordChannel {
     pub fn new(name: &str, value: &Value) -> Result<Self, String> {
         let webhook_url =
             resolve_optional_string(value, "webhook_url", "webhook_url_env", name)?
-                .ok_or_else(|| format!("channel '{name}' (discord): 'webhook_url' is required"))?;
+                .ok_or_else(|| format!("channel {name:?} (discord): `webhook_url` is required"))?;
         validate_webhook_url(&webhook_url, name, "discord")?;
         let username = take_optional_string(value, "username", name)?;
         Ok(Self {
@@ -92,7 +92,7 @@ fn take_optional_string(value: &Value, key: &str, channel: &str) -> Result<Optio
             .as_str()
             .map(|s| s.to_string())
             .map(Some)
-            .ok_or_else(|| format!("channel '{channel}' (discord): '{key}' must be a string")),
+            .ok_or_else(|| format!("channel {channel:?} (discord): `{key}` must be a string")),
         None => Ok(None),
     }
 }
