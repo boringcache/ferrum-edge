@@ -1141,7 +1141,7 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     use bench_proto::EchoRequest;
     use bench_proto::bench_service_client::BenchServiceClient;
-    use multi_protocol_perf::transport::GrpcConnector;
+    use multi_protocol_perf::transport::{GrpcConnectionIdentity, GrpcConnector};
 
     let observer = Observer::new(args.h2_observe, "client_grpc", false);
 
@@ -1200,7 +1200,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target))?;
         }
 
-        let current_connection = Arc::new(AtomicUsize::new(0));
+        let current_connection = Arc::new(GrpcConnectionIdentity::default());
         let channel = endpoint
             .connect_with_connector(GrpcConnector {
                 connections: connections.clone(),
@@ -1234,7 +1234,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
             .max_decoding_message_size(8 * 1024 * 1024)
             .max_encoding_message_size(8 * 1024 * 1024);
             while metrics.next_request().await {
-                let connection_before = current_connection.load(Ordering::Acquire);
+                let connection_before = current_connection.snapshot();
                 let req = tonic::Request::new(EchoRequest {
                     payload: payload.clone(),
                 });
@@ -1256,14 +1256,10 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                     Err(status) => {
                         report_transport_error("gRPC", "unary_echo", &status);
-                        let connection_after = current_connection.load(Ordering::Acquire);
-                        // A reconnect during an RPC makes its physical identity
-                        // ambiguous. Zero means unknown, never a channel index.
-                        let connection_id = if connection_before == connection_after {
-                            connection_before
-                        } else {
-                            0
-                        };
+                        // Includes failed/cancelled reconnects and retirement.
+                        // Zero means unknown, never a channel index.
+                        let connection_id =
+                            current_connection.connection_id_since(connection_before);
                         events.record(
                             connection_id,
                             Some(i as usize),

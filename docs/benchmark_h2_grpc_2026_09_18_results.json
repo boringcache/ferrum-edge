@@ -4,7 +4,7 @@
   "run_url": "https://github.com/ferrum-edge/ferrum-edge/actions/runs/35393243172",
   "duration_secs": 15,
   "offered_workers": 200,
-  "canonical_samples": "run_1/pairs/pair_*/*.json; root run_1 sample files are duplicate final-pair copies",
+  "canonical_samples": "run_1/pairs/pair_*/*.json only; root run_1/<gateway>_<protocol>_<size>.json files are four-pair aggregate summaries containing canonical samples, summed totals, aggregate rates and conservative latency summaries; some inherited metadata comes from the last sample; do not count summaries as additional observations",
   "protocols": {
     "http2": {
       "manifest": {
