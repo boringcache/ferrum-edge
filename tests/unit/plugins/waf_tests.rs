@@ -1970,7 +1970,7 @@ fn unknown_keys_are_rejected_before_defaults_weaken_policy() {
             json!({
                 "rule_overrides": { "FE-SQLI-001": { "severty": "critical" } }
             }),
-            "config.rule_overrides['FE-SQLI-001'].severty",
+            r#"config.rule_overrides[\"FE-SQLI-001\"].severty"#,
             Some("severity"),
         ),
     ];
