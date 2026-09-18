@@ -413,10 +413,7 @@ pub(crate) async fn await_listener_handles(
     let mut shutdown_on_panic = Some(shutdown_on_panic);
     while let Some(result) = futures.next().await {
         if let Err(err) = result {
-            error!(
-                "Gateway listener task failed: {}",
-                crate::startup::sanitize_startup_cause(&err, &[])
-            );
+            error!("Gateway listener task failed to join");
             if first_error.is_none() {
                 first_error = Some(err);
                 if let Some(trigger) = shutdown_on_panic.take() {
@@ -429,6 +426,20 @@ pub(crate) async fn await_listener_handles(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+// OS kinds retain actionable bind/permission diagnostics without trusting the
+// Display payload of an I/O error (which can wrap arbitrary provider text).
+pub(super) fn listener_failure_for_log(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            let kind = io_error.kind();
+            // Construct from the kind alone: this preserves the address-in-use
+            // spelling used by bind-race classifiers without the original payload.
+            return format!("listener I/O failed: {} ({kind:?})", std::io::Error::from(kind));
+        }
+    }
+    "listener operation failed".to_string()
 }
 
 /// Await fallible listener handles concurrently. Logs every task failure and
@@ -451,15 +462,12 @@ pub(crate) async fn await_fallible_listener_handles(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                // Include the anyhow source chain. A top-level listener context
-                // such as `HTTP proxy listener failed` otherwise erases the OS
-                // `AddrInUse` cause that hosted test harnesses need to classify
-                // the one retryable ephemeral-port race. The chain contains no
-                // request/config payload, only gateway-authored listener errors.
+                // Preserve the OS failure classification, but do not emit
+                // arbitrary provider or panic payloads from the source chain.
                 error!(
                     "Gateway listener task `{}` failed: {}",
                     name,
-                    crate::startup::sanitize_startup_cause(format!("{err:#}"), &[])
+                    listener_failure_for_log(&err)
                 );
                 if first_error.is_none() {
                     first_error = Some(err.context(format!("{name} failed")));
@@ -469,11 +477,7 @@ pub(crate) async fn await_fallible_listener_handles(
                 }
             }
             Err(err) => {
-                error!(
-                    "Gateway listener task `{}` failed: {}",
-                    name,
-                    crate::startup::sanitize_startup_cause(&err, &[])
-                );
+                error!("Gateway listener task `{}` failed to join", name);
                 if first_error.is_none() {
                     first_error = Some(if err.is_panic() {
                         anyhow::anyhow!("{name} panicked: {err}")
@@ -590,7 +594,7 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     info!(
         "Starting in file mode with log level: {}",
-        env_config.log_level
+        sanitize_startup_scalar(&env_config.log_level)
     );
     if env_config.proxy_https_port != 8443 {
         info!(
@@ -776,8 +780,9 @@ pub async fn serve(
     if !admin_tls_paths_ready && let Some(listener) = prebound.admin_https.take() {
         match listener.local_addr() {
             Ok(addr) => info!(
-                "Dropping unused pre-bound admin HTTPS listener on {addr} — \
-                 admin TLS cert/key paths are not both configured"
+                "Dropping unused pre-bound admin HTTPS listener on {} — \
+                 admin TLS cert/key paths are not both configured",
+                sanitize_startup_scalar(addr)
             ),
             Err(_) => info!(
                 "Dropping unused pre-bound admin HTTPS listener — \
@@ -983,8 +988,7 @@ pub async fn serve(
             Ok(None) => None,
             Err(e) => {
                 error!(
-                    "TLS configuration validation failed: {}",
-                    crate::startup::sanitize_startup_cause(&e, &[])
+                    "TLS configuration validation failed: frontend certificate, key, or client trust material could not be loaded"
                 );
                 shutdown_file_background_startup_tasks(
                     &shutdown_tx,
@@ -1018,7 +1022,7 @@ pub async fn serve(
         && handles.watcher_handle.is_some()
     {
         info!(
-            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            interval_secs = %sanitize_startup_scalar(env_config.frontend_tls_watch_interval_seconds),
             "Frontend TLS live reload enabled for file-mode proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
@@ -1181,8 +1185,7 @@ pub async fn serve(
             Ok(candidate) => candidate,
             Err(e) => {
                 error!(
-                    "Admin TLS configuration failed: {}",
-                    crate::startup::sanitize_startup_cause(&e, &[])
+                    "Admin TLS configuration failed: certificate, key, or client trust material could not be loaded"
                 );
                 shutdown_file_background_startup_tasks(
                     &shutdown_tx,
@@ -1655,7 +1658,7 @@ pub async fn serve(
         warn!(
             "Gateway startup failed after spawning listener / background tasks: {}; \
              draining spawned tasks before returning",
-            crate::startup::sanitize_startup_cause(&e, &[])
+            listener_failure_for_log(&e)
         );
         if let Err(listener_err) = serve_handles.shutdown_and_join().await {
             return Err(listener_err.context(format!("Gateway startup failed: {e}")));
@@ -1681,6 +1684,38 @@ mod tests {
     use super::*;
     use std::future::pending;
     use std::time::Instant;
+
+    #[test]
+    fn listener_failure_emits_io_kind_and_preserves_the_original_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shutdown_requested = AtomicBool::new(false);
+        let (result, logs) = crate::modes::database::tests::capture_logs(|| {
+            runtime.block_on(async {
+                let listener = tokio::spawn(async {
+                    Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "bare-unregistered-listener-canary",
+                    ))
+                    .context("listener provider context"))
+                });
+                await_fallible_listener_handles(
+                    vec![("HTTP proxy listener".to_string(), listener)],
+                    || shutdown_requested.store(true, Ordering::Relaxed),
+                )
+                .await
+            })
+        });
+
+        assert!(shutdown_requested.load(Ordering::Relaxed));
+        assert!(format!("{:#}", result.unwrap_err()).contains("bare-unregistered-listener-canary"));
+        assert!(logs.contains("HTTP proxy listener"), "{logs}");
+        assert!(logs.contains("AddrInUse"), "{logs}");
+        assert!(logs.contains("address in use"), "{logs}");
+        assert!(!logs.contains("bare-unregistered-listener-canary"), "{logs}");
+    }
 
     // Regression: a stuck background task must not wedge graceful shutdown.
     // The pre-refactor `run()` capped the background drain at 5 s; the
