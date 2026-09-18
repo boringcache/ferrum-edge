@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 
 use bytes::Buf;
 use multi_protocol_perf::metrics::BenchMetrics;
-use multi_protocol_perf::phases::{Connections, Phases};
+use multi_protocol_perf::phases::{Connections, Phases, TransportEvent};
 use multi_protocol_perf::tls_utils;
 use multi_protocol_perf::transport::{ObservedBody, ObservedChannel, echo_exchange, request_body};
 
@@ -575,7 +575,10 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         Vec::with_capacity(num_conns);
 
     let mut endpoints = Vec::with_capacity(num_conns);
-    for _ in 0..num_conns {
+    let mut drivers = Vec::with_capacity(num_conns);
+    let mut transports = Vec::with_capacity(num_conns);
+    let mut events = Vec::new();
+    for connection_id in 0..num_conns {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
         endpoint.set_default_client_config(client_cfg.clone());
 
@@ -584,16 +587,27 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("quinn connect: {e}"))?
             .await
             .map_err(|e| anyhow::anyhow!("quinn connect: {e}"))?;
-        let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn))
+        events.push(TransportEvent::new(
+            connection_id,
+            "connected",
+            format!("local={} peer={}", endpoint.local_addr()?, conn.remote_address()),
+        ));
+        transports.push(conn.clone());
+        let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
             .await
             .map_err(|e| anyhow::anyhow!("h3 handshake: {e}"))?;
         endpoints.push(endpoint);
         let connection = connections.opened();
         // h3 driver must be polled concurrently to process connection frames
-        tokio::spawn(async move {
+        drivers.push(tokio::spawn(async move {
             let _connection = connection;
-            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        });
+            let result = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            TransportEvent::new(
+                connection_id,
+                "driver_closed",
+                format!("h3={result:?}; quic={:?}", conn.close_reason()),
+            )
+        }));
         senders.push(send_req);
     }
 
@@ -705,11 +719,18 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
 
     let mut combined = phases.finish(handles).await;
     let close_started = Instant::now();
-    for endpoint in &endpoints {
+    drop(senders);
+    for (connection_id, endpoint) in endpoints.iter().enumerate() {
+        events.push(TransportEvent::new(
+            connection_id,
+            "local_close_requested",
+            format!("benchmark drained; stats={:?}", transports[connection_id].stats()),
+        ));
         endpoint.close(0u32.into(), b"benchmark drained");
     }
-    for endpoint in endpoints {
-        if tokio::time::timeout(Duration::from_secs(5), endpoint.wait_idle())
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for (connection_id, endpoint) in endpoints.into_iter().enumerate() {
+        if tokio::time::timeout_at(close_deadline, endpoint.wait_idle())
             .await
             .is_err()
         {
@@ -717,10 +738,45 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             if let Some(phases) = &mut combined.phases {
                 phases.transport_close_timed_out = true;
             }
+            events.push(TransportEvent::new(connection_id, "idle_timeout", String::new()));
+        } else {
+            events.push(TransportEvent::new(connection_id, "endpoint_idle", String::new()));
+        }
+    }
+    for (connection_id, mut driver) in drivers.into_iter().enumerate() {
+        match tokio::time::timeout_at(close_deadline, &mut driver).await {
+            Ok(Ok(event)) => events.push(event),
+            Ok(Err(error)) => {
+                events.push(TransportEvent::new(
+                    connection_id,
+                    "driver_join_failed",
+                    error.to_string(),
+                ));
+                if let Some(phases) = &mut combined.phases {
+                    phases.transport_close_timed_out = true;
+                }
+            }
+            Err(error) => {
+                driver.abort();
+                let _ = driver.await;
+                events.push(TransportEvent::new(
+                    connection_id,
+                    "driver_join_failed",
+                    error.to_string(),
+                ));
+                if let Some(phases) = &mut combined.phases {
+                    phases.transport_close_timed_out = true;
+                }
+            }
         }
     }
     if let Some(phases) = &mut combined.phases {
         phases.transport_close_secs = close_started.elapsed().as_secs_f64();
+        phases.transport_close_start_unix_secs = events
+            .iter()
+            .find(|event| event.event == "local_close_requested")
+            .map(|event| event.unix_secs);
+        phases.set_transport_events(events);
     }
     print_results(&combined, "HTTP/3", args);
     Ok(())

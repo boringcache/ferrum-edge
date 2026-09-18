@@ -7,6 +7,7 @@ from pathlib import Path
 
 from benchmark_validity import sample_issues
 from process_usage import measurement_usage
+from transport_diagnostics import annotate_experiment, measurement_threads, summarize_transport
 
 
 def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usage_path, order):
@@ -28,6 +29,11 @@ def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usag
         if usage.get("capture_complete") is not True:
             raise ValueError("process capture incomplete")
         usage["measurement"] = measurement_usage(usage, sample.get("phases") or {})
+        if any("transport" in row for row in usage.get("timeline", [])):
+            sample["transport_diagnostics"] = summarize_transport(
+                usage["timeline"], sample.get("phases") or {})
+            usage["measurement_threads"] = measurement_threads(
+                usage["timeline"], sample.get("phases") or {})
         client = (sample.get("phases") or {}).get("client_usage")
         if isinstance(client, dict):
             usage["processes"] = [p for p in usage.get("processes", []) if p.get("role") != "client"]
@@ -39,6 +45,7 @@ def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usag
         sample["process_usage"] = usage
     except (OSError, ValueError):
         sample["process_usage"] = {"error": "process capture unavailable/incomplete"}
+    annotate_experiment(sample, path, usage_path)
     path.write_text(json.dumps(sample, indent=2) + "\n")
 
 
@@ -122,6 +129,8 @@ def summarize(samples, expected_pairs):
     summary.pop("phases", None)
     summary.pop("observed", None)
     summary.pop("process_usage", None)
+    summary.pop("transport_diagnostics", None)
+    summary.pop("h3_experiment", None)
     summary.pop("pair", None)
     summary.pop("order_position", None)
     for field in ("total_requests", "total_errors", "total_bytes", "duration_secs",
@@ -167,6 +176,8 @@ def write_summaries(directory, protocol, gateways, sizes, pairs):
     comparisons = []
     references = ["direct"]
     references += ["ferrum-baseline"] if "ferrum-baseline" in gateways else ["ferrum"]
+    if "envoy-limit-4" in gateways:
+        references.append("envoy")
     for reference in references:
         if reference not in gateways:
             continue

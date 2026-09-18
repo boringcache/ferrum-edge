@@ -217,6 +217,29 @@ pub struct Observed {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct TransportEvent {
+    pub unix_secs: f64,
+    pub connection_id: usize,
+    pub event: String,
+    pub detail: String,
+    pub phase: String,
+}
+
+impl TransportEvent {
+    pub fn new(connection_id: usize, event: &str, detail: String) -> Self {
+        Self {
+            unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64()),
+            connection_id,
+            event: event.to_string(),
+            detail,
+            phase: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct PhaseReport {
     pub setup_secs: f64,
     pub warmup_secs: f64,
@@ -228,9 +251,37 @@ pub struct PhaseReport {
     pub drain_secs: f64,
     pub transport_close_secs: f64,
     pub transport_close_timed_out: bool,
+    pub transport_close_start_unix_secs: Option<f64>,
+    pub transport_events: Vec<TransportEvent>,
     pub preflight_bound_secs: f64,
     pub stalled_workers: Vec<usize>,
     pub timed_out: bool,
+}
+
+impl PhaseReport {
+    pub fn set_transport_events(&mut self, mut events: Vec<TransportEvent>) {
+        for event in &mut events {
+            event.phase = if self
+                .transport_close_start_unix_secs
+                .is_some_and(|start| event.unix_secs >= start)
+            {
+                "transport_close"
+            } else if let Some(start) = self.measurement_start_unix_secs {
+                if event.unix_secs >= start + self.measurement_secs {
+                    "drain"
+                } else if event.unix_secs >= start {
+                    "measurement"
+                } else {
+                    "setup_or_warmup"
+                }
+            } else {
+                "setup_or_warmup"
+            }
+            .to_string();
+        }
+        events.sort_by(|left, right| left.unix_secs.total_cmp(&right.unix_secs));
+        self.transport_events = events;
+    }
 }
 
 pub struct Phases {

@@ -12,6 +12,8 @@ import signal
 import time
 from pathlib import Path
 
+from transport_diagnostics import snapshot as transport_snapshot, thread_snapshot
+
 
 def parse_stat(contents, ticks, page_size):
     # comm can contain spaces and parentheses; fields follow its LAST ')'.
@@ -94,7 +96,7 @@ def client_pids(parent, proc_root=Path("/proc")):
     return result
 
 
-def sample_processes(backend, gateway_pids, output, interval):
+def sample_processes(backend, gateway_pids, output, interval, http3=False, envoy=False):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("sampling interval must be positive and finite")
@@ -132,6 +134,11 @@ def sample_processes(backend, gateway_pids, output, interval):
             record["cpu_seconds"] = state["cpu_seconds"] - record["first_cpu_seconds"]
             record["peak_rss_bytes"] = max(record["peak_rss_bytes"], state["rss_bytes"])
             snapshot["processes"].append(dict(state, pid=pid, role=role))
+        if http3:
+            snapshot["threads"] = [dict(thread, role=role)
+                                   for pid, role in roles.items() if role != "client"
+                                   for thread in thread_snapshot(pid, ticks, parse_stat)]
+            snapshot["transport"] = transport_snapshot(envoy)
         timeline.append(snapshot)
 
     try:
@@ -166,6 +173,8 @@ if __name__ == "__main__":
     parser.add_argument("--gateway-pids", default="")
     parser.add_argument("--output", required=True)
     parser.add_argument("--interval", type=float, default=0.5)
+    parser.add_argument("--http3", action="store_true")
+    parser.add_argument("--envoy", action="store_true")
     args = parser.parse_args()
     sample_processes(args.backend, [int(pid) for pid in args.gateway_pids.split()],
-                     args.output, args.interval)
+                     args.output, args.interval, args.http3, args.envoy)

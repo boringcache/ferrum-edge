@@ -352,6 +352,70 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
 
+### HTTP/3 transport experiment (#5588, section 2)
+
+`h3_experiment.json` enables the hosted experiment without changing the frozen
+matrix job. `H3_EXPERIMENT_MANIFEST` can select another data manifest; setting
+`enabled: false` disables it. With Envoy selected, the runner adds
+`envoy-limit-4` to the same counterbalanced pairs as `envoy` (limit 100), Ferrum,
+and direct. Both Envoy arms retain pinned 1.33.5, SNI `localhost`, CA validation,
+windows, timeouts, and strict HTTP 200/exact-body validation. Generated configs,
+image IDs/digests, the experiment manifest, and host socket settings are artifacts.
+
+| Offered workers | Client QUIC connections | Limit 4 admission ceiling | Limit 100 ceiling |
+|---:|---:|---:|---:|
+| 200 | 21 | 84 | 200 |
+| 100 | 11 | 44 | 100 |
+| 50 | 6 | 24 | 50 |
+
+These are downstream ceilings from the fixed round-robin worker assignment;
+`observed.active_streams` reports client admission during load. Both upstream
+limits change too, so this tests the historical two-leg cap, not either leg in
+isolation. The backend's timestamped `H3_PROFILE` records show upstream connection
+IDs, peer ports, accepted/completed echoes and bytes. Per-connection measurement
+deltas and per-thread CPU brackets accompany each sample. They include sampling
+slack; neither identifies which Envoy thread owns an individual UDP socket.
+
+The enabled experiment requires a disposable Linux runner with passwordless
+`sudo sysctl`. It sets `rmem_default`, `wmem_default`, `rmem_max`, and `wmem_max`
+before any arm to 4,194,304 bytes. Ferrum/Quinn inherit the defaults; Envoy uses
+explicit downstream and upstream `SO_RCVBUF`/`SO_SNDBUF` requests of 2,097,152
+bytes because Linux doubles explicit requests. Equal **effective per-socket**
+budgets must be observed before a sample is accepted. This does not equalize the
+number of sockets or total gateway memory. No production config knob is added.
+
+The existing passive 500 ms sampler now also reads `/proc/net/snmp`,
+`/proc/net/udp{,6}`, thread stat files, and `NETLINK_SOCK_DIAG` for this experiment.
+`INET_DIAG_SKMEMINFO` gives the same kernel receive/send limits as `getsockopt`,
+verified against a live UDP socket in hosted tests. Socket cookies prevent inode
+reuse from producing false deltas. The sampler neither executes commands nor
+injects descriptors into another process. Kernel UDP deltas cover the shared
+host namespace; socket deltas are narrower. The backend peer port identifies
+upstream sockets, including unconnected Quinn endpoints. Missing observations,
+counter resets, incomplete brackets, and unverified buffer parity stay explicit.
+
+Envoy stats are sampled via its loopback admin endpoint and retained in full.
+Pinned 1.33.5 repeatedly adds cumulative `SO_RXQ_OVFL` values; its reported drops
+are **not loss totals** ([upstream correction #38652](https://github.com/envoyproxy/envoy/pull/38652)).
+Use independent kernel/socket deltas. `TOO_MANY_RTOS`, idle-close, and watchdog
+counters remain raw, timestamped observations. Both gateways use info logging;
+startup and per-payload logs have Docker timestamps, exposing BPF/GRO/GSO
+warnings. No warning is not positive proof of an optimized path: record
+unsupported/unverified unless logs or other observations positively establish it.
+
+H3 endpoints close explicitly after worker drain under one shared five-second
+deadline, and all drivers are joined or aborted/reaped. `phases.transport_events`
+retains connection IDs, UNIX timestamps, raw closure reasons and final Quinn
+stats, labelled setup/warmup, measurement, drain, or transport close. Timestamped
+server counters between payloads distinguish retired connections from measured
+failures; do not infer request loss merely from a post-measurement closure.
+
+For the scoped hosted run use duration 10, concurrency 200, iterations 1, skip
+protocols `http1-tls http2 grpcs wss tcp-tls udp udp-dtls`, skip gateways
+`kong tyk krakend`, and skip sizes `71680 512000`. The runner defaults to two
+pairs: 24 samples across four arms and three sizes. Adaptive extension is off;
+two-pair intervals are diagnostic, not a confirmatory performance claim.
+
 Raw JSON lives under `pairs/pair_NNN/`. Root `<gateway>_<protocol>_<size>.json`
 keeps the legacy totals/rate fields and adds `samples` plus `expected_pairs`.
 Rates use total measured requests / total measured seconds; summary latency
