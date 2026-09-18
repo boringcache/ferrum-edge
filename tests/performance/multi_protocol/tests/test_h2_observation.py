@@ -144,6 +144,21 @@ class H2ObservationTests(unittest.TestCase):
         self.assertEqual(observation["capture_errors"], ["malformed_backend_event"])
         self.assertIn("H2 backend errors or incomplete diagnostic capture", sample_issues(sample))
 
+    def test_truncated_capture_invalidates_an_otherwise_clean_sample(self):
+        clean = dict(gateway="ferrum", total_requests=10, total_bytes=716800,
+                     total_errors=0, payload_size=71680, rps=10,
+                     phases={"transport_errors_total": 0, "transport_events_suppressed": 0},
+                     h2_observation={"gauges_available": True, "capture_errors": [],
+                                     "backend_errors_observed": 0})
+        self.assertEqual(sample_issues(clean), [])
+        client = copy.deepcopy(clean)
+        client["phases"]["transport_events_suppressed"] = 1
+        backend = copy.deepcopy(clean)
+        backend["h2_observation"]["backend_log_limit_reached"] = True
+        for sample in (client, backend):
+            self.assertIn("truncated H2 transport observations", sample_issues(sample))
+            self.assertEqual(sample["total_errors"], 0)
+
     def test_failed_repetition_invalidates_the_whole_comparison(self):
         left, right = [], []
         for pair in range(1, 5):

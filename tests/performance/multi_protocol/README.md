@@ -434,8 +434,8 @@ historical 10/70 KiB failures. The later `d302bfb05` refusal-body snippet and
 overlay and its duplicate parser are removed; its artifact provenance remains
 part of this history.
 
-`experiment.json` now contains this campaign, **disabled by default**. Root can
-enable it in a reviewed commit, then use the existing
+`experiment.json` enables this campaign for the pending hosted investigation.
+Disable it after preserving the results. Use the existing
 `gateways-protocol-benchmark.yml` dispatch inputs:
 
 | Input | Exact value |
@@ -533,8 +533,8 @@ include shared-host client/backend and observer cost.
 Failures stay in raw samples, stderr and cumulative logs. The existing paired
 validator rejects a comparison if any declared repetition is missing or invalid;
 the campaign also rejects missing gauge observations, incomplete diagnostic
-capture, captured client/backend transport errors or an incomplete H2 driver
-observation. Inspect every repetition, including
+capture, client/backend event-log truncation, captured client/backend transport
+errors or an incomplete H2 driver observation. Inspect every repetition, including
 warmup/drain failures and clean controls; bounded logs or zero observed events
 are not proof of zero transport faults. Do not average surviving workers into a
 performance win. The next investigation is to compare failure incidence/reasons

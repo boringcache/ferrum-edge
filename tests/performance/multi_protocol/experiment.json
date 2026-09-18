@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "name": "5588-h2-grpc-adaptive-observation",
   "protocol": ["http2", "grpcs"],
   "h2_campaign": {

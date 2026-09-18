@@ -92,6 +92,8 @@ def sample_issues(sample):
             issues.append("H2 transport errors or incomplete driver observation")
         if observation.get("capture_errors") or observation.get("backend_errors_observed"):
             issues.append("H2 backend errors or incomplete diagnostic capture")
+        if phases.get("transport_events_suppressed", 0) or observation.get("backend_log_limit_reached"):
+            issues.append("truncated H2 transport observations")
     if sample.get("h3_experiment"):
         transport = sample.get("transport_diagnostics") or {}
         if transport.get("complete_bracket") is not True:
