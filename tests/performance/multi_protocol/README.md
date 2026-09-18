@@ -222,7 +222,7 @@ Raw samples add these fields without removing the existing scalar report:
 | `observed.workers_at_barrier`, `workers_retired_before_deadline` | Actual barrier participants and early retirements, including setup/warmup failures |
 | `observed.samples`, `sampling_interval_ms` | Observation count and requested 10 ms cadence; scheduler delays are possible |
 | `pair`, `host_id`, `gateway_order`, `order_position` | Same-host pair identity and executed order |
-| `process_usage` | Per-PID CPU deltas and sampled peak RSS for client, backend and all gateway PIDs discovered with `docker top`; exact whole-client CPU/RSS from `wait` resource accounting |
+| `process_usage` | Sampled per-PID CPU deltas and peak RSS for client, backend and all gateway PIDs discovered with `docker top`; `client_accounting` identifies the sampled client counters |
 
 H1/H2/gRPC admission is observed at the first request-body frame polled by the
 transport; H3 uses successful stream opening. These are **client-local** streams
@@ -232,13 +232,21 @@ Worker/stream gauges are sampled, not exact extrema or time-weighted averages.
 No requested count is substituted for an observation. `effective_concurrency`
 continues to mean the **offered** worker count.
 
-Process sampling is Linux-only (`/proc`, 100 ms); this runner targets the hosted
-Linux lane. `diagnostics/*_process_usage.json` retains the full timestamped series.
+Process sampling is Linux-only (`/proc`, 500 ms); this runner targets the hosted
+Linux lane. The runner launches `proto_bench` directly under `timeout`/`gtimeout`.
+A separate passive sampler discovers that client among the runner's children
+(including the child of `timeout`), reads `/proc`, and writes JSON. It never
+launches commands. The runner waits for sampler readiness before the load, then
+signals and reaps it before reading its final report; incomplete capture remains
+an invalid sample. `diagnostics/*_process_usage.json` retains the full timestamped series.
 `process_usage.measurement` brackets the measured interval per PID and reports
 `boundary_slack_secs`, `bracket_secs`, `complete_bracket`, and sampled peak RSS.
 A process that exits before the ending sample has an incomplete bracket, not a
-fabricated zero CPU value. Whole-invocation counters explicitly include setup,
-warmup and drain. The sampler itself adds shared-runner overhead; these rates and
+fabricated zero CPU value. Client CPU deltas and peak RSS are sampled lower bounds,
+not exact exit accounting: startup/exit CPU and peaks between observations can be
+missed. A client too short to observe leaves the required client role missing and
+invalidates the sample. Sampler-lifetime counters include setup, warmup and drain.
+The sampler itself adds shared-runner overhead; these rates and
 direct ratios still do not isolate proxy CPU cost. Optional external dependencies
 such as Tyk's Redis are not included in gateway PID accounting.
 

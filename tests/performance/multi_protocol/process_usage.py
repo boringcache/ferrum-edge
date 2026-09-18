@@ -6,9 +6,9 @@ boundaries; setup/warmup/drain costs remain visible beside measurement costs.
 
 import argparse
 import json
+import math
 import os
-import resource
-import subprocess
+import signal
 import time
 from pathlib import Path
 
@@ -58,7 +58,45 @@ def measurement_usage(usage, phases):
     return result
 
 
-def run(command, backend, gateway_pids, output, timeout):
+def client_pids(parent, proc_root=Path("/proc")):
+    """Find only the runner's direct client or the client below GNU timeout."""
+    result = []
+    pending = [parent]
+    while pending:
+        pid = pending.pop()
+        try:
+            children = (proc_root / str(pid) / "task" / str(pid) / "children").read_text()
+        except OSError:
+            continue
+        for child in children.split():
+            if not child.isdecimal():
+                continue
+            try:
+                argv0 = (proc_root / child / "cmdline").read_bytes().split(b"\0", 1)[0]
+            except OSError:
+                continue
+            name = argv0.rsplit(b"/", 1)[-1]
+            if name == b"proto_bench":
+                result.append(int(child))
+            elif pid == parent and name in (b"timeout", b"gtimeout"):
+                pending.append(int(child))
+    return result
+
+
+def sample_processes(backend, gateway_pids, output, interval):
+    """Observe processes until signalled; never launch or control the client."""
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("sampling interval must be positive and finite")
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    # Background jobs inherit ignored SIGINT from Bash. Override it explicitly
+    # before publishing readiness so the runner can always stop and reap us.
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    parent = os.getppid()
     ticks = os.sysconf("SC_CLK_TCK")
     page_size = os.sysconf("SC_PAGE_SIZE")
     roles = {pid: "gateway" for pid in gateway_pids}
@@ -68,6 +106,8 @@ def run(command, backend, gateway_pids, output, timeout):
     started = time.monotonic()
 
     def sample():
+        for pid in client_pids(parent):
+            roles[pid] = "client"
         snapshot = {"unix_secs": time.time(), "processes": []}
         for pid, role in roles.items():
             state = capture(pid, ticks, page_size)
@@ -83,36 +123,30 @@ def run(command, backend, gateway_pids, output, timeout):
             snapshot["processes"].append(dict(state, pid=pid, role=role))
         timeline.append(snapshot)
 
-    sample()
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    client = subprocess.Popen(command)
-    roles[client.pid] = "client"
-    timed_out = False
-    while True:
+    try:
         sample()
-        if client.poll() is not None:
-            break
-        if time.monotonic() - started >= timeout:
-            timed_out = True
-            client.kill()
-            client.wait()
-            break
-        time.sleep(0.1)
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    sample()
-    report = {
-        "scope": "whole client invocation including setup, warmup and drain",
-        "interval_ms": 100,
-        "elapsed_secs": time.monotonic() - started,
-        "processes": list(records.values()),
-        "missing_pids": sorted(set(roles) - {key[0] for key in records}),
-        "client_cpu_seconds": after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime,
-        "client_peak_rss_bytes": after.ru_maxrss * 1024,
-        "timed_out": timed_out,
-        "timeline": timeline,
-    }
-    Path(output).write_text(json.dumps(report) + "\n")
-    return 124 if timed_out else client.returncode
+        Path(output).write_text(json.dumps({"capture_complete": False}) + "\n")
+        while not stopping and os.getppid() == parent:
+            sample()
+            time.sleep(interval)
+        sample()
+        clients = [record for record in records.values() if record["role"] == "client"]
+        report = {
+            "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+            "interval_ms": interval * 1000,
+            "elapsed_secs": time.monotonic() - started,
+            "capture_complete": stopping,
+            "processes": list(records.values()),
+            "missing_pids": sorted(set(roles) - {key[0] for key in records}),
+            "client_accounting": "sampled /proc deltas; process endpoints may be missed",
+            "client_cpu_seconds": sum(record["cpu_seconds"] for record in clients) if clients else None,
+            "client_peak_rss_bytes": max((record["peak_rss_bytes"] for record in clients), default=None),
+            "timeline": timeline,
+        }
+        Path(output).write_text(json.dumps(report) + "\n")
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
@@ -120,10 +154,7 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=int, required=True)
     parser.add_argument("--gateway-pids", default="")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--timeout", type=int, required=True)
-    parser.add_argument("command", nargs=argparse.REMAINDER)
+    parser.add_argument("--interval", type=float, default=0.5)
     args = parser.parse_args()
-    command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    raise SystemExit(run(command, args.backend,
-                         [int(pid) for pid in args.gateway_pids.split()],
-                         args.output, args.timeout))
+    sample_processes(args.backend, [int(pid) for pid in args.gateway_pids.split()],
+                     args.output, args.interval)

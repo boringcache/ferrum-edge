@@ -112,6 +112,10 @@ The runner now performs at least three counterbalanced same-host pairs per
 invocation, repeats direct in every pair, and supports a separately provisioned
 `ferrum-baseline` image for revision comparisons. Per-PID gateway/client/backend
 CPU and RSS series include explicit measurement brackets and sampling slack.
+The shell retains the static `timeout`/`gtimeout` client invocation; a passive
+500 ms `/proc` sampler observes it and is signalled/reaped after the load.
+Client CPU/RSS are sampled lower bounds, not exact child-exit accounting, and
+incomplete capture or a missing client observation invalidates the sample.
 Paired log-ratio intervals that overlap no gain trigger one bounded extra block
 at double duration for every arm. Invalid pairs remain invalid; unresolved
 uncertainty requires a longer predeclared experiment. This exploratory adaptation

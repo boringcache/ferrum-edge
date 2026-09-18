@@ -6,6 +6,29 @@ import statistics
 from pathlib import Path
 
 from benchmark_validity import sample_issues
+from process_usage import measurement_usage
+
+
+def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usage_path, order):
+    """Attach metadata and passive process observations after the client exits."""
+    path = Path(path)
+    try:
+        sample = json.loads(path.read_text())
+    except (OSError, ValueError):
+        sample = {"rps": 0, "error": "unparseable"}
+    sample.update(gateway=gateway, payload_size=int(payload), effective_concurrency=int(concurrency),
+                  sample_schema=2, pair=int(pair), order_position=int(position),
+                  host_id=host, gateway_order=order.split())
+    try:
+        usage = json.loads(Path(usage_path).read_text())
+        if usage.get("capture_complete") is not True:
+            raise ValueError("process capture incomplete")
+        usage["measurement"] = measurement_usage(usage, sample.get("phases") or {})
+        usage.pop("timeline", None)  # full series stays in the diagnostic file
+        sample["process_usage"] = usage
+    except (OSError, ValueError):
+        sample["process_usage"] = {"error": "process capture unavailable/incomplete"}
+    path.write_text(json.dumps(sample, indent=2) + "\n")
 
 
 def gateway_order(gateways, pair):
@@ -132,5 +155,7 @@ if __name__ == "__main__":
         needs_more = write_summaries(directory, protocol, gateways.split(),
                                      [int(size) for size in sizes.split()], int(pairs))
         print("extend" if needs_more else "done")
+    elif command == "stamp":
+        stamp_sample(*args)
     else:
         raise SystemExit("unknown plan command")

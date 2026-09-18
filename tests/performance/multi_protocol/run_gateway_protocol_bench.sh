@@ -31,7 +31,18 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
-# Resource capture and its subprocess timeout run on the hosted Linux runner.
+# ── Portable `timeout` command (GNU coreutils) ──────────────────────────────
+# macOS/BSD ships without `timeout`; Homebrew installs it as `gtimeout`.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    TIMEOUT_CMD=""
+    echo "[warn] Neither 'timeout' nor 'gtimeout' found — bench runs will have no wallclock kill-switch" >&2
+fi
+
+# Passive resource capture runs on the hosted Linux runner.
 if [ ! -r /proc/sys/kernel/random/boot_id ]; then
     echo "paired gateway benchmarks require Linux /proc resource capture" >&2
     exit 2
@@ -193,10 +204,15 @@ KRAKEND_IMAGE="krakend:2.13.2"
 BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
+sampler_pid=""
 CERT_DIR="$SCRIPT_DIR/certs"
 
 cleanup() {
     echo "[cleanup] stopping all processes..."
+    if [ -n "$sampler_pid" ]; then
+        kill -TERM "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" || true
+    fi
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
@@ -750,17 +766,49 @@ run_bench() {
     mkdir -p "$diagnostics"
     local gateway_pids=""
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
-        gateway_pids=$(docker top "$GATEWAY_CID" -eo pid | tail -n +2 | xargs)
+        gateway_pids=$(docker top "$GATEWAY_CID" -eo pid | tail -n +2 | tr '\n' ' ')
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
+    : > "$usage"
     python3 "$SCRIPT_DIR/process_usage.py" \
         --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
-        --output "$usage" --timeout "$bench_wallclock" -- \
+        --output "$usage" --interval 0.5 &
+    sampler_pid=$!
+    # Wait for the first observation and installed signal handlers. Without
+    # readiness, an immediately failing client could leave SIGINT ignored.
+    local sampler_wait=0
+    while [ ! -s "$usage" ] && kill -0 "$sampler_pid" 2>/dev/null && [ "$sampler_wait" -lt 100 ]; do
+        sleep 0.05
+        sampler_wait=$(( sampler_wait + 1 ))
+    done
+    if [ ! -s "$usage" ]; then
+        kill -TERM "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" || true
+        sampler_pid=""
+    fi
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD "${bench_wallclock}s" \
+            "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
+            --target "$bench_target" \
+            --duration "$DURATION" \
+            --concurrency "$effective_concurrency" \
+            --payload-size "$payload" \
+            --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
+            || rc=$?
+    else
         "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
-        --target "$bench_target" --duration "$DURATION" \
-        --concurrency "$effective_concurrency" --payload-size "$payload" \
-        --json "${extra_args[@]}" > "$out" \
-        2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" || rc=$?
+            --target "$bench_target" \
+            --duration "$DURATION" \
+            --concurrency "$effective_concurrency" \
+            --payload-size "$payload" \
+            --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
+            || rc=$?
+    fi
+    if [ -n "$sampler_pid" ]; then
+        kill -INT "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" || true
+        sampler_pid=""
+    fi
     # Capture after the timed load, while the gateway still exists. Keep these
     # below a subdirectory so summary globs cannot mistake stats for samples.
     local diagnostics="$OUTPUT_DIR/diagnostics"
@@ -788,35 +836,9 @@ run_bench() {
     fi
 
     # Stamp metadata into JSON for aggregation.
-    python3 - "$out" "$gateway" "$payload" "$effective_concurrency" \
-        "$PAIR" "$ORDER_POSITION" "$HOST_ID" "$usage" "$GATEWAY_ORDER" "$SCRIPT_DIR" <<'PYEOF'
-import json, sys
-sys.path.insert(0, sys.argv[10])
-from process_usage import measurement_usage
-path, gateway, payload, concurrency = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-try:
-    with open(path) as f:
-        d = json.load(f)
-except Exception:
-    d = {"rps": 0, "error": "unparseable"}
-d["gateway"] = gateway
-d["payload_size"] = payload
-d["effective_concurrency"] = concurrency
-d["sample_schema"] = 2
-d["pair"] = int(sys.argv[5])
-d["order_position"] = int(sys.argv[6])
-d["host_id"] = sys.argv[7]
-d["gateway_order"] = sys.argv[9].split()
-try:
-    usage = json.loads(open(sys.argv[8]).read())
-    usage["measurement"] = measurement_usage(usage, d.get("phases") or {})
-    usage.pop("timeline", None)  # raw series stays in diagnostics beside this sample
-    d["process_usage"] = usage
-except (OSError, ValueError):
-    d["process_usage"] = {"error": "process capture unavailable"}
-with open(path, "w") as f:
-    json.dump(d, f, indent=2)
-PYEOF
+    python3 "$SCRIPT_DIR/benchmark_plan.py" stamp \
+        "$out" "$gateway" "$payload" "$effective_concurrency" \
+        "$PAIR" "$ORDER_POSITION" "$HOST_ID" "$usage" "$GATEWAY_ORDER"
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
