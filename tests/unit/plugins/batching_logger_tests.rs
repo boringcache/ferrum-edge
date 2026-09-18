@@ -302,19 +302,19 @@ fn parse_custom_headers_rejects_invalid_shapes() {
     for (config, expected) in [
         (
             json!({"custom_headers": []}),
-            "'custom_headers' must be an object",
+            "`custom_headers` must be an object",
         ),
         (
             json!({"custom_headers": {"X-Test": 1}}),
-            "custom_headers['X-Test'] must be a string",
+            "`custom_headers` key \"X-Test\" must be a string",
         ),
         (
             json!({"custom_headers": {"Bad Header": "value"}}),
-            "invalid custom_headers name",
+            "invalid `custom_headers` name",
         ),
         (
             json!({"custom_headers": {"X-Test": "bad\u{0001}value"}}),
-            "invalid custom_headers value",
+            "invalid `custom_headers` value",
         ),
     ] {
         let err = parse_custom_headers(&config, "batching_logger_headers")
