@@ -6891,7 +6891,7 @@ impl CountryMmdbLoadSession {
         let retained = self.retained_snapshots.get(path_key)?;
         tracing::warn!(
             db_path = %sanitize_startup_cause(format!("{:?}", path.to_string()), &[]),
-            error = %sanitize_startup_cause(&error, &[]),
+            error = %sanitize_startup_cause(error, &[]),
             plugin = "geo_restriction",
             retained_snapshot_bytes = retained.size_bytes(),
             "MaxMind database temporarily unavailable during node-local refresh; retaining the last known good snapshot so geo enforcement is not downgraded to the on_lookup_failure fallback"

@@ -4538,7 +4538,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("Duplicate listen_port 15432")),
+                .any(|error| error.contains("Duplicate listen_port \"15432\"")),
             "same-namespace conflict must still be rejected: {errors:?}"
         );
     }

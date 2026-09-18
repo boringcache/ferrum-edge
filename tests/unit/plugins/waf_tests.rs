@@ -1690,7 +1690,7 @@ fn invalid_custom_regex_is_rejected() {
     }))
     .unwrap_err();
 
-    assert!(err.contains("RegexSet"));
+    assert!(err.contains("invalid or too complex"), "{err}");
 }
 
 #[test]

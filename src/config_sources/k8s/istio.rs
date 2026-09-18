@@ -20783,7 +20783,7 @@ extensionProviders:
         .expect_err("duplicate port must still fail");
 
         assert!(
-            err.to_string().contains("duplicate port 8080"),
+            err.to_string().contains("duplicate port \"8080\""),
             "unexpected duplicate-port error: {err}"
         );
     }
