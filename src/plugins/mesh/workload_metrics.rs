@@ -308,7 +308,7 @@ fn parse_effective_authz_baggage_gate(
         object,
         &format!("{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]"),
         EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS,
-        "workload_metrics: ",
+        &format!("workload_metrics: `{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]`: "),
     )?;
     BaggageTrustGate::from_config(gate).map_err(|e| {
         format!("workload_metrics: `{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]`: {e}")
@@ -394,7 +394,7 @@ impl WorkloadMetrics {
             object,
             "config",
             WORKLOAD_METRICS_CONFIG_KEYS,
-            "workload_metrics: ",
+            "workload_metrics: `config`: ",
         )?;
         for key in [
             "node_id",

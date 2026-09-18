@@ -1628,7 +1628,12 @@ impl MeshAuthz {
         // implicit-deny floor never engages, and every request is ALLOWED.
         match config {
             Value::Object(object) => {
-                reject_unknown_keys(object, "config", MESH_AUTHZ_CONFIG_KEYS, "mesh_authz: ")?;
+                reject_unknown_keys(
+                    object,
+                    "config",
+                    MESH_AUTHZ_CONFIG_KEYS,
+                    "mesh_authz: `config`: ",
+                )?;
             }
             Value::Null => {}
             _ => {
