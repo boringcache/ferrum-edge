@@ -2150,7 +2150,10 @@ fn assert_rendered_waf_unknown_keys(
     let error = Waf::new(config).expect_err("unknown keys must reject construction");
     let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
     assert!(rendered.contains(&format!("waf: `{path}`:")), "{rendered}");
-    assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+    assert!(
+        rendered.contains("unknown configuration key(s)"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains(&format!("did you mean `{suggestion}`?")),
         "{rendered}"
