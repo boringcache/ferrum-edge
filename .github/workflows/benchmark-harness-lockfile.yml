@@ -17,6 +17,10 @@ jobs:
     name: Benchmark harness lockfile consistency
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
