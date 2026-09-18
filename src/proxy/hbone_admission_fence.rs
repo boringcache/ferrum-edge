@@ -35,6 +35,14 @@
 //! provider's admission-time verdict stands for the tunnel's life, exactly as
 //! before, while the local DENY/ALLOW tiers are re-applied.
 //!
+//! Inner-reuse classification is also re-folded over the current chain for
+//! every tunnel admitted with the capability. The snapshot retains the
+//! admitting listener facts in `HboneReuseContext`; every sweep uses those
+//! same facts. Registry reuse is advertised only for CONNECTs the registry did
+//! not decide: a matching Outbound listener may terminate CONNECT, and a sweep
+//! never re-runs its per-operation registry lookup. A new scope that would
+//! enforce on the recorded listener therefore revokes `ReuseWithdrawn`.
+//!
 //! The fence bounds TWO dimensions, POLICY and CREDENTIALS (issues #5568 and
 //! #5574). Beside the policy gates, a sweep re-checks the credential the
 //! CONNECT was admitted on: the admitted leaf's `notAfter`, and — when the
@@ -2191,9 +2199,9 @@ impl HboneAdmissionFence {
         // issuing an external check here would do to every live tunnel exactly
         // what `Plugin::reevaluates_live_admission` exists to prevent.
         //
-        // It is also the SAME function the CONNECT path folded, over the same
-        // slice, so "still reusable" here means exactly what "reusable" meant
-        // there and the two cannot drift apart.
+        // It is also the SAME function the CONNECT path folded, using the
+        // recorded listener facts with the current chain, so "still reusable"
+        // here means exactly what "reusable" meant there.
         if snapshot.advertised_inner_reuse {
             let current_chain = view.plugins();
             if !admitting_chain_allows_inner_reuse(&current_chain, &snapshot.reuse_context) {

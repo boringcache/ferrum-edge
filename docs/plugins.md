@@ -3959,6 +3959,8 @@ config:
 
 Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a configured registry. Mesh mode auto-injects this plugin when the effective outbound traffic policy is `REGISTRY_ONLY` and the topology has an outbound capture listener. Operators can also configure it directly on non-mesh gateways as a generic Host allowlist.
 
+HBONE inner reuse is advertised only for CONNECTs the registry did not decide. A scoped instance permits reuse when its direction/port gate skips the admitting listener; a matching outbound listener can terminate CONNECT and must withhold reuse. Unscoped instances always refuse reuse. Every fence sweep reclassifies with the recorded admission facts and current plugin scope. See [HBONE Inner Application Connection Reuse](mesh.md#hbone-inner-application-connection-reuse).
+
 **Priority:** 130
 **Supported protocols:** HTTP, gRPC, WebSocket, HTTP/3
 

@@ -2,6 +2,10 @@
 //!
 //! Mesh mode identifies HBONE in the main proxy path, then delegates the
 //! backend connection, circuit-breaker accounting, relay task, and logging here.
+//! Termination is not restricted to Inbound listeners: a matching authenticated
+//! CONNECT on an Outbound listener also reaches this handler. Inner reuse is
+//! classified with that CONNECT's listener facts and records them for sweeps;
+//! registry reuse is advertised only for CONNECTs the registry did not decide.
 
 use std::collections::HashMap;
 use std::io;
@@ -600,11 +604,12 @@ pub(super) struct HboneAdmissionView {
 ///    admission snapshot as `advertised_inner_reuse`; the response reads that
 ///    field back rather than re-folding, so the header the source receives and
 ///    the obligation the fence takes on are the same value.
+///    `HboneReuseContext` records this CONNECT's listener direction and port.
 /// 2. every fence sweep folds the same view key, re-resolved from whatever
 ///    generation is then current (route overrides never move a request's
 ///    `namespace|id`, so the key is stable), for every tunnel whose snapshot
-///    recorded the advertisement. A chain that has stopped permitting reuse
-///    revokes those tunnels
+///    recorded the advertisement, using the SAME recorded listener facts.
+///    A chain that has stopped permitting reuse revokes those tunnels
 ///    ([`crate::proxy::hbone_admission_fence::HboneRevocationReason::ReuseWithdrawn`]),
 ///    which is what restores per-operation admission: the source's next
 ///    operation performs a fresh CONNECT under the new chain.

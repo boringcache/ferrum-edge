@@ -11325,7 +11325,8 @@ pub trait Plugin: Send + Sync {
     /// The destination stamps
     /// [`crate::modes::mesh::hbone::TUNNEL_REUSE_HEADER`] on a CONNECT `200`
     /// only when every plugin in the ADMITTING request view returns `true`
-    /// here, so one `false` anywhere in the chain forces one CONNECT — and one
+    /// from [`Self::allows_hbone_inner_reuse_for`], which defaults to this
+    /// method. One `false` anywhere in the chain forces one CONNECT — and one
     /// full destination admission decision — per application operation, exactly
     /// as before reuse existed.
     ///
@@ -11371,8 +11372,8 @@ pub trait Plugin: Send + Sync {
     /// two markers are independent: changing a plugin's authorize marker can
     /// never, on its own, make it reusable.
     ///
-    /// Every reusable built-in therefore overrides this method explicitly, and
-    /// so must every one that becomes reusable later.
+    /// Every reusable built-in therefore overrides this method or the
+    /// context-aware classification explicitly, as must any new opt-in.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
     }

@@ -47,6 +47,13 @@
 //!   every other direction, including non-mesh listeners.
 //!   Port `0` is rejected at construction; intentional global scope is only
 //!   represented by an empty `outbound_listen_ports` vector.
+//! - Reuse is advertised only for CONNECTs the registry did not decide.
+//!   `allows_hbone_inner_reuse_for` shares the enforcement gate using the
+//!   admitting listener's direction and port, recorded for every later sweep.
+//!   A matching Outbound listener can terminate an authenticated CONNECT (for
+//!   example NodeWaypoint capture); its scoped registry verdict is not reusable
+//!   because the fence never re-runs the lookup. Unscoped instances always
+//!   refuse reuse, including on Inbound listeners they skip.
 //!
 //! ## Wire compatibility
 //!
