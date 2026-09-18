@@ -3747,13 +3747,19 @@ async fn an_outbound_terminated_connect_decided_by_the_registry_never_advertises
         "this CONNECT spent a registry verdict that no fence sweep re-issues"
     );
     assert_eq!(
-        state.hbone_admission_fence.inspect_live_tunnels(|snapshot| {
-            (
-                snapshot.reuse_context,
-                snapshot.advertised_inner_reuse,
-                snapshot.ctx.peer_spiffe_id.as_ref().map(ToString::to_string),
-            )
-        }),
+        state
+            .hbone_admission_fence
+            .inspect_live_tunnels(|snapshot| {
+                (
+                    snapshot.reuse_context,
+                    snapshot.advertised_inner_reuse,
+                    snapshot
+                        .ctx
+                        .peer_spiffe_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                )
+            }),
         vec![(
             HboneReuseContext {
                 mesh_direction: Some(MeshTrafficDirection::Outbound),
