@@ -123,9 +123,74 @@ pub(crate) const MAX_PEM_MATERIAL_BYTES: usize =
 /// store. Keep record enumeration bounded independently of the byte ceiling.
 pub(crate) const MAX_PEM_CERTIFICATE_RECORDS: usize = 4096;
 
+/// Keep known schema/surface labels actionable without trusting arbitrary
+/// context passed through public certificate-validation helpers. In particular,
+/// a composed label may include a document key or a source reference.
+fn material_diagnostic_label(label: &str) -> String {
+    match label {
+        "backend_tls_client_cert_path"
+        | "backend_tls_client_key_path"
+        | "backend_tls_server_ca_cert_path"
+        | "mesh_route_dispatch.backend_tls.client_cert_path"
+        | "mesh_route_dispatch.backend_tls.client_key_path"
+        | "mesh_route_dispatch.backend_tls.server_ca_cert_path"
+        | "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH"
+        | "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH"
+        | "FERRUM_TLS_CA_BUNDLE_PATH"
+        | "FERRUM_TLS_CRL_FILE_PATH"
+        | "cert_pem"
+        | "ca_bundle_pem"
+        | "acme_renewal_cert"
+        | "ACME order finalization"
+        | "server TLS cert"
+        | "server TLS private key"
+        | "server TLS OCSP response"
+        | "client CA bundle"
+        | "backend CA bundle"
+        | "backend TLS client certificate"
+        | "backend TLS client private key"
+        | "Gateway server TLS cert"
+        | "Gateway server TLS private key"
+        | "mesh server TLS cert"
+        | "mesh server TLS private key"
+        | "mesh client CA bundle"
+        | "gateway SVID certificate chain"
+        | "gateway SVID trust bundle"
+        | "gateway SVID key"
+        | "SPIFFE trust bundle"
+        | "Workload API local trust bundle"
+        | "Workload API federated trust bundle"
+        | "DTLS certificate"
+        | "DTLS private key"
+        | "DTLS CA bundle"
+        | "DTLS frontend cert"
+        | "DTLS client CA cert"
+        | "DP gRPC TLS CA cert"
+        | "DP gRPC TLS client cert"
+        | "Mesh gRPC TLS CA cert"
+        | "Mesh gRPC TLS client cert"
+        | "gRPC health probe CA"
+        | "gRPC health probe client cert"
+        | "gRPC health probe client key"
+        | "Health check CA"
+        | "Health check client cert"
+        | "Health check client key" => format!("`{label}`"),
+        _ => format!("{label:?}"),
+    }
+}
+
+fn material_load_error(label: &str, error: source::MaterialError) -> anyhow::Error {
+    // Keep the typed failure class, never the provider/I/O payload or its chain.
+    anyhow::anyhow!(
+        "{}: failed to read TLS material or resolve its source ({})",
+        material_diagnostic_label(label),
+        error.failure_class()
+    )
+}
+
 /// Parse a non-empty PEM certificate bundle without silently dropping records.
 ///
-/// The display source must already be safe for operator-facing diagnostics.
+/// Display sources can contain filesystem paths; quote them for withholding.
 /// Certificate record indexes are one-based and refer to the original order in
 /// the configured bundle.
 pub(crate) fn parse_pem_certificate_bundle(
@@ -133,9 +198,10 @@ pub(crate) fn parse_pem_certificate_bundle(
     label: &str,
     display_source: &str,
 ) -> Result<Vec<CertificateDer<'static>>, anyhow::Error> {
+    let label = material_diagnostic_label(label);
     if pem_data.len() > MAX_PEM_MATERIAL_BYTES {
         return Err(anyhow::anyhow!(
-            "{}: certificate bundle in '{}' exceeds the {} byte admission limit",
+            "{}: certificate bundle in {:?} exceeds the {} byte admission limit",
             label,
             display_source,
             MAX_PEM_MATERIAL_BYTES
@@ -147,7 +213,7 @@ pub(crate) fn parse_pem_certificate_bundle(
         .map(|(index, result)| {
             if index >= MAX_PEM_CERTIFICATE_RECORDS {
                 return Err(anyhow::anyhow!(
-                    "{}: certificate bundle in '{}' exceeds the {} record admission limit",
+                    "{}: certificate bundle in {:?} exceeds the {} record admission limit",
                     label,
                     display_source,
                     MAX_PEM_CERTIFICATE_RECORDS
@@ -155,7 +221,7 @@ pub(crate) fn parse_pem_certificate_bundle(
             }
             result.map_err(|_error| {
                 anyhow::anyhow!(
-                    "{}: certificate record #{} in '{}' is malformed: {}",
+                    "{}: certificate record #{} in {:?} is malformed: {}",
                     label,
                     index + 1,
                     display_source,
@@ -167,7 +233,7 @@ pub(crate) fn parse_pem_certificate_bundle(
 
     if certificates.is_empty() {
         return Err(anyhow::anyhow!(
-            "{}: no valid PEM certificates (no CERTIFICATE records) found in '{}'",
+            "{}: no valid PEM certificates (no CERTIFICATE records) found in {:?}",
             label,
             display_source
         ));
@@ -186,10 +252,13 @@ pub(crate) fn parse_pem_certificate_bundle(
     // multi-record bundle names the offending entry, and the diagnostic itself
     // carries no path, subject, or key bytes — `display_source` is deliberately
     // not interpolated into it.
+    // The policy helper bounds its label by truncation, so pass a fixed label
+    // there and keep the complete, safely quoted caller context in the wrapper.
     for (index, certificate) in certificates.iter().enumerate() {
-        if let Err(reason) =
-            crate::fips::keys::check_certificate_public_key(certificate.as_ref(), label)
-        {
+        if let Err(reason) = crate::fips::keys::check_certificate_public_key(
+            certificate.as_ref(),
+            "TLS certificate",
+        ) {
             return Err(anyhow::anyhow!(
                 "certificate record #{} of {}: {}",
                 index + 1,
@@ -211,9 +280,10 @@ pub(crate) fn parse_pem_private_key(
     label: &str,
     display_source: &str,
 ) -> Result<PrivateKeyDer<'static>, anyhow::Error> {
+    let label = material_diagnostic_label(label);
     if pem_data.len() > MAX_PEM_MATERIAL_BYTES {
         return Err(anyhow::anyhow!(
-            "{}: private-key material in '{}' exceeds the {} byte admission limit",
+            "{}: private-key material in {:?} exceeds the {} byte admission limit",
             label,
             display_source,
             MAX_PEM_MATERIAL_BYTES
@@ -227,7 +297,7 @@ pub(crate) fn parse_pem_private_key(
             Ok(Some(key)) if selected.is_none() => selected = Some(key),
             Ok(Some(_)) => {
                 return Err(anyhow::anyhow!(
-                    "{}: '{}' contains more than one PEM private key",
+                    "{}: {:?} contains more than one PEM private key",
                     label,
                     display_source
                 ));
@@ -235,7 +305,7 @@ pub(crate) fn parse_pem_private_key(
             Ok(None) => break,
             Err(_error) => {
                 return Err(anyhow::anyhow!(
-                    "{}: private key in '{}' is malformed",
+                    "{}: private key in {:?} is malformed",
                     label,
                     display_source
                 ));
@@ -245,7 +315,7 @@ pub(crate) fn parse_pem_private_key(
 
     selected.ok_or_else(|| {
         anyhow::anyhow!(
-            "{}: no PEM private key found in '{}'",
+            "{}: no PEM private key found in {:?}",
             label,
             display_source
         )
@@ -262,13 +332,14 @@ pub(crate) fn root_cert_store_from_certificates(
     label: &str,
     display_source: &str,
 ) -> Result<rustls::RootCertStore, anyhow::Error> {
+    let label = material_diagnostic_label(label);
     let mut roots = rustls::RootCertStore::empty();
     let mut count = 0usize;
     let mut total_bytes = 0usize;
     for (index, certificate) in certificates.into_iter().enumerate() {
         if index >= MAX_PEM_CERTIFICATE_RECORDS {
             return Err(anyhow::anyhow!(
-                "{}: trust bundle in '{}' exceeds the {} record admission limit",
+                "{}: trust bundle in {:?} exceeds the {} record admission limit",
                 label,
                 display_source,
                 MAX_PEM_CERTIFICATE_RECORDS
@@ -277,7 +348,7 @@ pub(crate) fn root_cert_store_from_certificates(
         total_bytes = total_bytes.saturating_add(certificate.as_ref().len());
         if total_bytes > MAX_PEM_MATERIAL_BYTES {
             return Err(anyhow::anyhow!(
-                "{}: trust bundle in '{}' exceeds the {} byte admission limit",
+                "{}: trust bundle in {:?} exceeds the {} byte admission limit",
                 label,
                 display_source,
                 MAX_PEM_MATERIAL_BYTES
@@ -286,7 +357,7 @@ pub(crate) fn root_cert_store_from_certificates(
         count = index + 1;
         roots.add(certificate).map_err(|_rejected_certificate| {
             anyhow::anyhow!(
-                "{}: certificate record #{} in '{}' is not a usable trust root: {}",
+                "{}: certificate record #{} in {:?} is not a usable trust root: {}",
                 label,
                 index + 1,
                 display_source,
@@ -296,7 +367,7 @@ pub(crate) fn root_cert_store_from_certificates(
     }
     if count == 0 {
         return Err(anyhow::anyhow!(
-            "{}: no usable trust roots found in '{}'",
+            "{}: no usable trust roots found in {:?}",
             label,
             display_source
         ));
@@ -539,28 +610,28 @@ pub fn load_crls(path: Option<&str>, expiry_warning_days: u64) -> Result<CrlList
     };
 
     let crl_source = CertSource::parse(crl_source_raw, MaterialKind::Crl);
-    let material = load_material_blocking(&crl_source, MaterialKind::Crl).map_err(|e| {
+    let material = load_material_blocking(&crl_source, MaterialKind::Crl).map_err(|error| {
         anyhow::anyhow!(
-            "Failed to load CRL source '{}': {}",
-            crl_source.redacted_source_id(),
-            e
+            "Failed to load CRL source: {}",
+            material_load_error("FERRUM_TLS_CRL_FILE_PATH", error)
         )
     })?;
 
     let crls: Vec<CertificateRevocationListDer<'static>> =
         rustls_pemfile::crls(&mut Cursor::new(material.bytes.expose_secret()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
+            .map_err(|_error| {
                 anyhow::anyhow!(
-                    "Failed to parse CRL PEM blocks from '{}': {}",
-                    material.display_source_id,
-                    e
+                    "`FERRUM_TLS_CRL_FILE_PATH`: Failed to parse CRL PEM blocks from {:?}: \
+                     malformed PEM CRL record",
+                    material.display_source_id
                 )
             })?;
 
     if crls.is_empty() {
         return Err(anyhow::anyhow!(
-            "No valid CRL entries found in '{}'. Expected PEM blocks with '-----BEGIN X509 CRL-----'",
+            "`FERRUM_TLS_CRL_FILE_PATH`: No valid CRL entries found in {:?}. \
+             Expected PEM blocks with `-----BEGIN X509 CRL-----`",
             material.display_source_id
         ));
     }
@@ -570,8 +641,8 @@ pub fn load_crls(path: Option<&str>, expiry_warning_days: u64) -> Result<CrlList
     // multi-CRL source would silently drop revocations the operator declared.
     // On a live reload this `Err` is what keeps the last accepted generation,
     // verifier, and sessions in service.
-    crl_policy::validate_crl_windows(&crls, &material.display_source_id)
-        .map_err(|error| anyhow::anyhow!("{}", error))?;
+    crl_policy::validate_crl_windows(&crls, "<redacted source>")
+        .map_err(|error| anyhow::anyhow!("`FERRUM_TLS_CRL_FILE_PATH`: {}", error))?;
 
     // Lead-time notice (issue #4505). Admission has already proven every
     // record carries a `nextUpdate` still in the future, so the earliest one
@@ -1158,7 +1229,8 @@ pub fn load_frontend_tls_candidate(
     crls: &[CertificateRevocationListDer<'static>],
     handshake_scope: Option<client_trust::ClientTrustScope>,
 ) -> Result<FrontendTlsCandidate, anyhow::Error> {
-    let cert_material = load_material_blocking(cert_source, MaterialKind::Cert)?;
+    let cert_material = load_material_blocking(cert_source, MaterialKind::Cert)
+        .map_err(|error| material_load_error("server TLS cert", error))?;
 
     check_cert_expiry_from_pem_bytes(
         cert_material.bytes.expose_secret(),
@@ -1180,7 +1252,8 @@ pub fn load_frontend_tls_candidate(
     let mut accepted_staple: Option<crate::tls::ocsp_recheck::AcceptedStaple> = None;
     let ocsp_response = match ocsp_response_source {
         Some(source) => {
-            let material = load_material_blocking(source, MaterialKind::Ocsp)?;
+            let material = load_material_blocking(source, MaterialKind::Ocsp)
+                .map_err(|error| material_load_error("server TLS OCSP response", error))?;
             let bytes = material.bytes.expose_secret().to_vec();
             // One shared "accept a staple" contract for every certificate
             // source (issue #4773, refs #4792): validation, the acceptance
@@ -1317,7 +1390,8 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     // a configuration error rather than being silently ignored.
     let client_ca = client_ca_bundle_source
         .map(|ca_bundle_source| {
-            let ca_material = load_material_blocking(ca_bundle_source, MaterialKind::CaBundle)?;
+            let ca_material = load_material_blocking(ca_bundle_source, MaterialKind::CaBundle)
+                .map_err(|error| material_load_error("client CA bundle", error))?;
             check_cert_expiry_from_pem_bytes(
                 ca_material.bytes.expose_secret(),
                 "client CA bundle",
@@ -1506,7 +1580,8 @@ fn load_server_cert_resolver(
         });
     }
 
-    let key_material = load_material_blocking(key_source, MaterialKind::Key)?;
+    let key_material = load_material_blocking(key_source, MaterialKind::Key)
+        .map_err(|error| material_load_error("server TLS private key", error))?;
     let key = parse_pem_private_key(
         key_material.bytes.expose_secret(),
         "server TLS private key",
@@ -1880,8 +1955,10 @@ pub fn load_mesh_server_identity(
 
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
-    let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)?;
-    let key_material = load_material_blocking(&key_source, MaterialKind::Key)?;
+    let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
+        .map_err(|error| material_load_error("mesh server TLS cert", error))?;
+    let key_material = load_material_blocking(&key_source, MaterialKind::Key)
+        .map_err(|error| material_load_error("mesh server TLS private key", error))?;
 
     let cert_chain = parse_pem_certificate_bundle(
         cert_material.bytes.expose_secret(),
@@ -1916,7 +1993,7 @@ pub fn load_mesh_tls_config_with_identity(
         .map(|path| {
             let source = CertSource::parse(path, MaterialKind::CaBundle);
             load_material_blocking(&source, MaterialKind::CaBundle)
-                .map_err(|e| anyhow::anyhow!("mesh client CA bundle: {}", e))
+                .map_err(|error| material_load_error("mesh client CA bundle", error))
         })
         .transpose()?;
     let client_ca_bundle_ref =
@@ -2273,7 +2350,8 @@ pub fn build_client_cert_verifier_candidate(
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<ClientCertVerifierCandidate, anyhow::Error> {
     let ca_source = CertSource::parse(ca_bundle_path, MaterialKind::CaBundle);
-    let ca_material = load_material_blocking(&ca_source, MaterialKind::CaBundle)?;
+    let ca_material = load_material_blocking(&ca_source, MaterialKind::CaBundle)
+        .map_err(|error| material_load_error("client CA bundle", error))?;
     let client_auth_roots = root_cert_store_from_pem_bundle(
         ca_material.bytes.expose_secret(),
         "client CA bundle",
@@ -2317,7 +2395,7 @@ pub fn check_cert_expiry(
 ) -> Result<(), anyhow::Error> {
     let source = CertSource::parse(pem_source, MaterialKind::Cert);
     let material = load_material_blocking(&source, MaterialKind::Cert)
-        .map_err(|e| anyhow::anyhow!("{}: {}", label, e))?;
+        .map_err(|error| material_load_error(label, error))?;
     check_cert_expiry_from_pem_bytes(
         material.bytes.expose_secret(),
         label,
@@ -2333,11 +2411,12 @@ pub(crate) fn check_cert_expiry_from_pem_bytes(
     warning_days: u64,
 ) -> Result<(), anyhow::Error> {
     let der_certs = parse_pem_certificate_bundle(pem_data, label, display_path)?;
+    let label = material_diagnostic_label(label);
 
     for (i, der) in der_certs.iter().enumerate() {
         let (_, cert) = X509Certificate::from_der(der.as_ref()).map_err(|_error| {
             anyhow::anyhow!(
-                "{}: certificate record #{} in '{}' failed X.509 validation",
+                "{}: certificate record #{} in {:?} failed X.509 validation",
                 label,
                 i + 1,
                 display_path
@@ -2354,14 +2433,14 @@ pub(crate) fn check_cert_expiry_from_pem_bytes(
 
             if now_ts < not_before_ts {
                 return Err(anyhow::anyhow!(
-                    "{}: certificate record #{} in '{}' is not yet valid",
+                    "{}: certificate record #{} in {:?} is not yet valid",
                     label,
                     i + 1,
                     display_path
                 ));
             } else {
                 return Err(anyhow::anyhow!(
-                    "{}: certificate record #{} in '{}' has expired",
+                    "{}: certificate record #{} in {:?} has expired",
                     label,
                     i + 1,
                     display_path
@@ -2377,10 +2456,10 @@ pub(crate) fn check_cert_expiry_from_pem_bytes(
             let remaining_days = remaining_secs / 86400;
             if remaining_days < warning_days as i64 {
                 warn!(
-                    "{}: certificate record #{} in '{}' expires in {} days",
-                    label,
+                    "{}: certificate record #{} in {} expires in {} days",
+                    crate::startup::sanitize_startup_cause(&label, &[]),
                     i + 1,
-                    display_path,
+                    crate::startup::sanitize_startup_scalar(display_path),
                     remaining_days
                 );
             }
@@ -2407,7 +2486,7 @@ pub fn check_cert_expiry_for_validation(
         )
         .map_err(|e| e.to_string()),
         Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(error) => Err(material_load_error(field_name, error).to_string()),
     }
 }
 

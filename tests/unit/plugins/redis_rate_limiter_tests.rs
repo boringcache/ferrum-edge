@@ -31,6 +31,99 @@ fn make_config(url: &str, tls: bool) -> RedisConfig {
 }
 
 #[test]
+fn redis_admission_diagnostics_preserve_schema_without_supplied_scalars() {
+    let cases = [
+        (
+            "sync_mode",
+            json!("'REDIS_VALUE_MARKER"),
+            "exactly `local` or `redis`",
+        ),
+        ("redis_url", json!("'REDIS_VALUE_MARKER"), "valid URL"),
+        ("redis_url", json!(927451), "must be a string"),
+        (
+            "redis_url",
+            json!("redis://localhost/927451/extra"),
+            "for example `/0`",
+        ),
+        ("redis_username", json!(true), "must be a string"),
+        (
+            "redis_password",
+            json!({"'REDIS_KEY_MARKER": "secret"}),
+            "must be a string",
+        ),
+        (
+            "redis_tls",
+            json!("'REDIS_VALUE_MARKER"),
+            "must be a boolean",
+        ),
+        (
+            "redis_pool_size",
+            json!("'REDIS_VALUE_MARKER"),
+            "must be an integer",
+        ),
+        ("redis_pool_size", json!(927451), "must be <="),
+        (
+            "redis_connect_timeout_seconds",
+            json!(false),
+            "must be an integer",
+        ),
+        (
+            "redis_health_check_interval_seconds",
+            json!(0),
+            "greater than zero",
+        ),
+        ("redis_key_prefix", json!(""), "must be non-empty"),
+    ];
+    for (field, value, reason) in cases {
+        let mut config = json!({});
+        config[field] = value;
+        let error = RedisConfig::from_plugin_config(&config, "ferrum:test").unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in [
+            "REDIS_VALUE_MARKER",
+            "REDIS_KEY_MARKER",
+            "secret",
+            "927451",
+            "true",
+            "false",
+        ] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn redis_ca_load_diagnostic_omits_hostile_source_and_provider_details() {
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("'REDIS_CA_SOURCE_MARKER.pem");
+    for source in [
+        missing.to_str().unwrap().to_string(),
+        "file://operator:REDIS_CA_SOURCE_MARKER@localhost/missing.pem".to_string(),
+    ] {
+        let error = RedisRateLimitClient::new(
+            make_config("rediss://cache.internal:6380/0", true),
+            None,
+            false,
+            Some(&source),
+        )
+        .err()
+        .expect("unloadable exclusive CA must refuse construction");
+        assert!(!error.contains("REDIS_CA_SOURCE_MARKER"), "{error}");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains("`FERRUM_TLS_CA_BUNDLE_PATH`"), "{rendered}");
+        assert!(
+            rendered.contains("failed to load exclusive CA bundle"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("refusing to fall back"), "{rendered}");
+        assert!(!rendered.contains(&source), "{rendered}");
+    }
+}
+
+#[test]
 fn test_hostname_uses_url_parser_and_preserves_credentials() {
     let config = make_config("redis://user:pass@redis:6379/15", false);
     assert_eq!(config.hostname().as_deref(), Some("redis"));
@@ -5928,7 +6021,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
     .err()
     .unwrap_or_else(|| panic!("invalid sync_mode must be rejected"));
     assert!(
-        sync_err.contains("'sync_mode'") && sync_err.contains("'local' or 'redis'"),
+        sync_err.contains("`sync_mode`") && sync_err.contains("`local` or `redis`"),
         "unexpected sync_mode diagnostic: {sync_err}"
     );
     for secret in [PASSWORD, USER] {
@@ -5950,7 +6043,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
     .err()
     .unwrap_or_else(|| panic!("non-redis scheme must be rejected"));
     assert!(
-        url_err.contains("'redis_url'") && url_err.contains("scheme"),
+        url_err.contains("`redis_url`") && url_err.contains("scheme"),
         "unexpected url diagnostic: {url_err}"
     );
     for secret in [PASSWORD, USER, TOKEN, "http://", "cache.internal"] {
@@ -5970,7 +6063,7 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
     .err()
     .unwrap_or_else(|| panic!("unparseable redis_url must be rejected"));
     assert!(
-        parse_err.contains("'redis_url'") && parse_err.contains("valid URL"),
+        parse_err.contains("`redis_url`") && parse_err.contains("valid URL"),
         "unexpected parse diagnostic: {parse_err}"
     );
     for secret in [PASSWORD, USER, TOKEN] {
