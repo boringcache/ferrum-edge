@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "envoy_stream_limits": [100, 4],
+  "socket_buffer_bytes": 4194304,
+  "log_level": "info",
+  "description": "#5588 section 2: same-host H3 admission comparison with equal per-socket kernel buffer budgets"
+}

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from benchmark_validity import sample_issues
 from process_usage import measurement_usage
+from transport_diagnostics import annotate_experiment, measurement_threads, summarize_transport
 
 
 def ordered_gateways(gateways):
@@ -55,6 +56,11 @@ def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usag
         if usage.get("capture_complete") is not True:
             raise ValueError("process capture incomplete")
         usage["measurement"] = measurement_usage(usage, sample.get("phases") or {})
+        if any("transport" in row for row in usage.get("timeline", [])):
+            sample["transport_diagnostics"] = summarize_transport(
+                usage["timeline"], sample.get("phases") or {})
+            usage["measurement_threads"] = measurement_threads(
+                usage["timeline"], sample.get("phases") or {})
         client = (sample.get("phases") or {}).get("client_usage")
         if isinstance(client, dict):
             usage["processes"] = [p for p in usage.get("processes", []) if p.get("role") != "client"]
@@ -66,6 +72,7 @@ def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usag
         sample["process_usage"] = usage
     except (OSError, ValueError):
         sample["process_usage"] = {"error": "process capture unavailable/incomplete"}
+    annotate_experiment(sample, path, usage_path)
     path.write_text(json.dumps(sample, indent=2) + "\n")
 
 
@@ -105,6 +112,38 @@ def read_comparisons(path):
         return rows
     except (OSError, ValueError):
         return [dict(accepted=False, reason="unparseable")]
+
+
+def protocol_runs(root):
+    """download-artifact flattens a single match even with merge-multiple=false."""
+    root = Path(root)
+    result = []
+    protocols = {"http1-tls", "http2", "http3", "grpcs", "wss", "tcp-tls", "udp", "udp-dtls"}
+    for container in [root] + sorted(root.glob("gateways-protocol-bench-*")):
+        for directory in sorted(container.glob("run_*")):
+            if not directory.is_dir():
+                continue
+            if container != root:
+                protocol = "-".join(container.name.split("-")[3:-1])
+            else:
+                # The summary rows always carry the runner's normalized protocol.
+                found = set()
+                for path in directory.glob("*.json"):
+                    try:
+                        row = json.loads(path.read_text())
+                        if isinstance(row, dict) and row.get("protocol") in protocols:
+                            found.add(row["protocol"])
+                    except (OSError, ValueError):
+                        continue
+                if len(found) != 1:
+                    raise ValueError(f"cannot identify single-artifact protocol in {directory}")
+                protocol = found.pop()
+            if protocol not in protocols:
+                raise ValueError(f"unknown artifact protocol {protocol}")
+            result.append((protocol, directory))
+    if not result:
+        raise ValueError("no protocol runs discovered in downloaded artifacts")
+    return result
 
 
 def paired_comparison(baseline, candidate, expected_pairs):
@@ -149,6 +188,8 @@ def summarize(samples, expected_pairs):
     summary.pop("phases", None)
     summary.pop("observed", None)
     summary.pop("process_usage", None)
+    summary.pop("transport_diagnostics", None)
+    summary.pop("h3_experiment", None)
     summary.pop("pair", None)
     summary.pop("order_position", None)
     for field in ("total_requests", "total_errors", "total_bytes", "duration_secs",
@@ -194,6 +235,8 @@ def write_summaries(directory, protocol, gateways, sizes, pairs):
     comparisons = []
     references = ["direct"]
     references += ["ferrum-baseline"] if "ferrum-baseline" in gateways else ["ferrum"]
+    if "envoy-limit-4" in gateways:
+        references.append("envoy")
     for reference in references:
         if reference not in gateways:
             continue

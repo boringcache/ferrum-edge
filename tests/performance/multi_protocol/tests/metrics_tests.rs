@@ -387,3 +387,46 @@ async fn preflight_timeout_identifies_the_stalled_worker() {
     assert_eq!(report.measurement_elapsed_secs, 0.0);
     assert!(report.client_usage.is_none());
 }
+
+#[test]
+fn transport_events_distinguish_measured_failures_from_retired_connections() {
+    use multi_protocol_perf::phases::{PhaseReport, TransportEvent};
+
+    let mut report = PhaseReport {
+        measurement_start_unix_secs: Some(100.0),
+        measurement_secs: 10.0,
+        transport_close_start_unix_secs: Some(112.0),
+        ..PhaseReport::default()
+    };
+    let events = [113.0, 99.0, 100.0, 110.0, 112.0]
+        .into_iter()
+        .map(|unix_secs| TransportEvent {
+            unix_secs,
+            event: "driver_closed".to_string(),
+            detail: "TOO_MANY_RTOS raw observation".to_string(),
+            ..TransportEvent::default()
+        })
+        .collect();
+    report.set_transport_events(events);
+    let phases: Vec<_> = report
+        .transport_events
+        .iter()
+        .map(|event| event.phase.as_str())
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "setup_or_warmup",
+            "measurement",
+            "drain",
+            "transport_close",
+            "transport_close"
+        ]
+    );
+    assert!(
+        report
+            .transport_events
+            .iter()
+            .all(|event| { event.detail == "TOO_MANY_RTOS raw observation" })
+    );
+}

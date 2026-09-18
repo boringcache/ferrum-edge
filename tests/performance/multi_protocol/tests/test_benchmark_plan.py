@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_plan import (extension_decision, gateway_order, normalize_artifact_layout,
                             ordered_gateways, paired_comparison, position_balance,
-                            read_comparisons, summarize, write_summaries)
+                            protocol_runs, read_comparisons, summarize, write_summaries)
 from benchmark_validity import sample_issues
 from process_usage import measurement_usage, parse_stat
 
@@ -20,6 +20,19 @@ def sample(pair, rps=10):
 
 
 class PairedPlanTests(unittest.TestCase):
+    def test_single_and_multiple_artifact_layouts_are_both_discovered(self):
+        for nested in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                container = root / "gateways-protocol-bench-http3-sha" if nested else root
+                run = container / "run_1"
+                run.mkdir(parents=True)
+                (run / "envoy_http3_10240.json").write_text('{"protocol":"http3"}')
+                self.assertEqual(protocol_runs(root), [("http3", run)])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                protocol_runs(directory)
+
     def test_tables_include_all_experiment_arms(self):
         self.assertEqual(
             ordered_gateways(["ferrum-exp-b", "ferrum", "direct", "ferrum-exp-a", "ferrum"]),

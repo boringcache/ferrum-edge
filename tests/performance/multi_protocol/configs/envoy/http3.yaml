@@ -5,12 +5,17 @@
 # We terminate HTTP/3 at the gateway and use HTTP/3 upstream via explicit config.
 #
 # The client assigns at most 10 workers per QUIC connection. Envoy's normal
-# 100-stream limit admits that entire workload; the old four-stream cap admitted
-# only 84 of 200 workers across 21 connections. Do not derive a stream-count cap
+# 100-stream limit admits that entire workload. A listener transport limit of
+# four admits at most 84 of 200 workers across 21 connections. The historical
+# HCM setting did not apply that downstream limit: the H3 experiment generator
+# explicitly sets udp_listener_config.quic_options.quic_protocol_options.
+# Do not derive a stream-count cap
 # from 24 MiB / 6 MiB: flow-control credit advances as data is consumed and the
 # connection window need not hold every complete body simultaneously.
-# Keep the tested 6 MiB stream / 24 MiB connection windows and 128 MiB connection
-# buffers. No HTTP buffer filter is needed for forwarding the echo workload.
+# Keep the configured 6 MiB stream / 24 MiB connection windows and 128 MiB
+# connection buffers. Downstream transport windows retain the listener defaults;
+# HCM HTTP/3 options do not override those transport parameters.
+# No HTTP buffer filter is needed for forwarding the echo workload.
 # See docs/benchmark_audit_2026_09_17.md for the controlled zero-error checks
 # and their limits. Hosted reruns determine comparative performance.
 #

@@ -218,6 +218,29 @@ pub struct Observed {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct TransportEvent {
+    pub unix_secs: f64,
+    pub connection_id: usize,
+    pub event: String,
+    pub detail: String,
+    pub phase: String,
+}
+
+impl TransportEvent {
+    pub fn new(connection_id: usize, event: &str, detail: String) -> Self {
+        Self {
+            unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64()),
+            connection_id,
+            event: event.to_string(),
+            detail,
+            phase: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct PhaseReport {
     pub setup_secs: f64,
     pub warmup_secs: f64,
@@ -230,15 +253,45 @@ pub struct PhaseReport {
     pub drain_secs: f64,
     pub transport_close_secs: f64,
     pub transport_close_timed_out: bool,
+    pub transport_close_start_unix_secs: Option<f64>,
+    pub transport_events: Vec<TransportEvent>,
+    pub observation_hold_secs: f64,
     pub preflight_bound_secs: f64,
     pub stalled_workers: Vec<usize>,
     pub timed_out: bool,
+}
+
+impl PhaseReport {
+    pub fn set_transport_events(&mut self, mut events: Vec<TransportEvent>) {
+        for event in &mut events {
+            event.phase = if self
+                .transport_close_start_unix_secs
+                .is_some_and(|start| event.unix_secs >= start)
+            {
+                "transport_close"
+            } else if let Some(start) = self.measurement_start_unix_secs {
+                if event.unix_secs >= start + self.measurement_secs {
+                    "drain"
+                } else if event.unix_secs >= start {
+                    "measurement"
+                } else {
+                    "setup_or_warmup"
+                }
+            } else {
+                "setup_or_warmup"
+            }
+            .to_string();
+        }
+        events.sort_by(|left, right| left.unix_secs.total_cmp(&right.unix_secs));
+        self.transport_events = events;
+    }
 }
 
 pub struct Phases {
     created: Instant,
     duration: Duration,
     preflight_bound: Duration,
+    observation_settle: Duration,
     phase: watch::Sender<Phase>,
     slots: Vec<Arc<Slot>>,
     connections: Connections,
@@ -252,6 +305,7 @@ impl Phases {
             created: Instant::now(),
             duration,
             preflight_bound: preflight_bound(0),
+            observation_settle: Duration::ZERO,
             phase,
             slots: Vec::new(),
             connections: Connections(Arc::new(AtomicUsize::new(0))),
@@ -266,6 +320,11 @@ impl Phases {
 
     pub fn connections(&self) -> Connections {
         self.connections.clone()
+    }
+
+    pub fn with_observation_settle(mut self, duration: Duration) -> Self {
+        self.observation_settle = duration;
+        self
     }
 
     pub fn h1_counters(&mut self) -> Arc<h1_profile::Counters> {
@@ -345,6 +404,9 @@ impl Phases {
             }
         } else {
             let barrier = Instant::now();
+            // Give the passive sampler a full tick after every transport and
+            // warmup is ready, with workers still parked at the common barrier.
+            tokio::time::sleep(self.observation_settle).await;
             observed.workers_at_barrier = self
                 .slots
                 .iter()

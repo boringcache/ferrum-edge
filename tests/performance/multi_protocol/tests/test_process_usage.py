@@ -34,17 +34,35 @@ class PassiveUsageTests(unittest.TestCase):
         self.assertNotIn("io", row)
         self.assertIn("io_error", row)
 
-    def test_privileged_reader_stop_file_finalizes_without_launching_a_client(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output, stop = Path(directory) / "usage.json", Path(directory) / "stop"
-            stop.touch()
-            with patch("process_usage.signal.signal"), \
-                    patch("process_usage.os.sysconf", return_value=100), \
-                    patch("process_usage.client_pids", return_value=[]) as discover, \
-                    patch("process_usage.capture", return_value=None):
-                sample_processes(1, [2], output, 0.5, parent_pid=42, stop_file=stop)
-            self.assertTrue(json.loads(output.read_text())["capture_complete"])
-            discover.assert_called_with(42)
+    def test_privileged_reader_stop_file_preserves_optional_h3_observations(self):
+        for http3 in (False, True):
+            with self.subTest(http3=http3), tempfile.TemporaryDirectory() as directory:
+                output, stop = Path(directory) / "usage.json", Path(directory) / "stop"
+                stop.touch()
+                with patch("process_usage.signal.signal"), \
+                        patch("process_usage.os.sysconf", return_value=100), \
+                        patch("process_usage.client_pids", return_value=[]) as discover, \
+                        patch("process_usage.capture", return_value=None), \
+                        patch("process_usage.thread_snapshot", return_value=[{"tid": 7}]), \
+                        patch("process_usage.transport_snapshot", return_value={"observed": True}) as transport:
+                    sample_processes(1, [2], output, 0.5, parent_pid=42, stop_file=stop,
+                                     http3=http3, envoy=True)
+                report = json.loads(output.read_text())
+                self.assertTrue(report["capture_complete"])
+                discover.assert_called_with(42)
+                self.assertEqual(len(report["timeline"]), 2)
+                for snapshot in report["timeline"]:
+                    if http3:
+                        self.assertEqual(snapshot["transport"], {"observed": True})
+                        self.assertEqual({row["role"] for row in snapshot["threads"]},
+                                         {"gateway", "backend"})
+                    else:
+                        self.assertNotIn("transport", snapshot)
+                        self.assertNotIn("threads", snapshot)
+                if http3:
+                    transport.assert_called_with(True)
+                else:
+                    transport.assert_not_called()
 
     def test_client_boundary_capture_replaces_a_missing_passive_endpoint(self):
         phases = dict(measurement_start_unix_secs=1, measurement_secs=1,
