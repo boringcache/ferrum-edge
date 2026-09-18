@@ -1771,3 +1771,26 @@ fn startup_diagnostics_withhold_email_names_and_numeric_scalars() {
     );
     assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
 }
+
+#[test]
+fn smtp_host_diagnostics_keep_channel_schema_without_supplied_names() {
+    let name = "'\"`UNREGISTERED_EMAIL_NAME\\tail";
+    let config = json!({
+        name: {
+            "type": "email",
+            "smtp_host": "https://UNREGISTERED_SMTP_HOST.invalid",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        }
+    });
+    let error = parse_channels(&config)
+        .err()
+        .expect("URL host must be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in ["`channels`", "email", "`smtp_host`", "scheme"] {
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+    for withheld in ["UNREGISTERED_EMAIL_NAME", "UNREGISTERED_SMTP_HOST"] {
+        assert!(!rendered.contains(withheld), "{rendered}");
+    }
+}
