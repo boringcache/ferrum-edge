@@ -21,9 +21,20 @@ def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usag
                   host_id=host, gateway_order=order.split())
     try:
         usage = json.loads(Path(usage_path).read_text())
+        if usage.get("available") is False:
+            sample["process_usage"] = usage
+            path.write_text(json.dumps(sample, indent=2) + "\n")
+            return
         if usage.get("capture_complete") is not True:
             raise ValueError("process capture incomplete")
         usage["measurement"] = measurement_usage(usage, sample.get("phases") or {})
+        client = (sample.get("phases") or {}).get("client_usage")
+        if isinstance(client, dict):
+            usage["processes"] = [p for p in usage.get("processes", []) if p.get("role") != "client"]
+            usage["processes"].append(client)
+            usage["client_accounting"] = "getrusage(RUSAGE_SELF) at measurement boundaries"
+            usage["client_cpu_seconds"] = client.get("cpu_seconds")
+            usage["client_peak_rss_bytes"] = client.get("peak_rss_bytes")
         usage.pop("timeline", None)  # full series stays in the diagnostic file
         sample["process_usage"] = usage
     except (OSError, ValueError):
@@ -40,6 +51,33 @@ def gateway_order(gateways, pair):
     offset = ((pair - 1) // 2) % len(gateways)
     order = gateways[offset:] + gateways[:offset]
     return list(reversed(order)) if pair % 2 == 0 else order
+
+
+def position_balance(gateways, pairs):
+    orders = [gateway_order(gateways, pair) for pair in range(1, pairs + 1)]
+    return [dict(gateway=gateway, positions=[order.index(gateway) + 1 for order in orders],
+                 mean_position=statistics.mean(order.index(gateway) + 1 for order in orders))
+            for gateway in gateways]
+
+
+def extension_decision(enabled, uncertain, elapsed, pair_seconds, pairs, budget):
+    """Conservatively double measured pair cost, add 25% and 60s finalization."""
+    projected = elapsed + pair_seconds * pairs * 2 * 1.25 + 60
+    reason = "disabled" if not enabled else "not needed" if not uncertain else (
+        "budget" if projected > budget else None)
+    return dict(extend=reason is None, extension_skipped=reason,
+                projected_wallclock_secs=projected, wallclock_budget_secs=budget)
+
+
+def read_comparisons(path):
+    """Keep truncated aggregate inputs visible without losing the artifact."""
+    try:
+        rows = json.loads(Path(path).read_text())
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("invalid comparison records")
+        return rows
+    except (OSError, ValueError):
+        return [dict(accepted=False, reason="unparseable")]
 
 
 def paired_comparison(baseline, candidate, expected_pairs):
@@ -61,10 +99,10 @@ def paired_comparison(baseline, candidate, expected_pairs):
             if field not in left or left[field] != right.get(field):
                 return dict(result, reason=f"unmatched {field}")
         ratios.append(math.log(right["rps"] / left["rps"]))
-    if expected_pairs < 3:
-        return dict(result, reason="at least three pairs required")
-    # Exact two-sided 95% t critical values for n=3..7; conservative above 7.
-    critical = {3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571, 7: 2.447}
+    if expected_pairs < 2 or expected_pairs % 2:
+        return dict(result, reason="an even number of at least two pairs required")
+    # Exact two-sided 95% t critical values; conservative above n=7.
+    critical = {2: 12.706, 4: 3.182, 6: 2.571}
     mean = statistics.mean(ratios)
     margin = critical.get(expected_pairs, 2.447) * statistics.stdev(ratios) / math.sqrt(
         expected_pairs)
@@ -141,6 +179,8 @@ def write_summaries(directory, protocol, gateways, sizes, pairs):
                 comparisons.append(dict(comparison, baseline=reference, candidate=gateway,
                                         payload_size=size))
     (directory / "paired_comparisons.json").write_text(json.dumps(comparisons, indent=2) + "\n")
+    (directory / "position_balance.json").write_text(
+        json.dumps(position_balance(gateways, pairs), indent=2) + "\n")
     return any(row.get("needs_more_measurement") for row in comparisons)
 
 
@@ -157,5 +197,14 @@ if __name__ == "__main__":
         print("extend" if needs_more else "done")
     elif command == "stamp":
         stamp_sample(*args)
+    elif command == "extension":
+        path, enabled, uncertain, elapsed, pair_seconds, pairs, budget = args
+        decision = extension_decision(enabled == "true", uncertain == "extend", int(elapsed),
+                                      float(pair_seconds), int(pairs), int(budget))
+        path = Path(path)
+        plan = json.loads(path.read_text())
+        plan.update(decision)
+        path.write_text(json.dumps(plan, indent=2) + "\n")
+        print("extend" if decision["extend"] else decision["extension_skipped"])
     else:
         raise SystemExit("unknown plan command")

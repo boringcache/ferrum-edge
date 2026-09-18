@@ -110,6 +110,16 @@ pub struct CountedIo {
     _connection: ConnectionGuard,
 }
 
+pub fn authority_host(uri: &http::Uri) -> std::io::Result<&str> {
+    let host = uri
+        .host()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing host"))?;
+    Ok(host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host))
+}
+
 impl AsyncRead for CountedIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -150,9 +160,7 @@ impl Service<http::Uri> for Connections {
     fn call(&mut self, uri: http::Uri) -> Self::Future {
         let connections = self.clone();
         Box::pin(async move {
-            let host = uri.host().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing host")
-            })?;
+            let host = authority_host(&uri)?;
             let port = uri
                 .port_u16()
                 .unwrap_or(if uri.scheme_str() == Some("https") {

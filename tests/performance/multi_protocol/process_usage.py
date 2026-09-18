@@ -38,6 +38,8 @@ def measurement_usage(usage, phases):
     by_process = {}
     for snapshot in usage.get("timeline", []):
         for process in snapshot["processes"]:
+            if process["role"] == "client":
+                continue  # the client's own boundary snapshots are authoritative
             key = (process["pid"], process["start_ticks"])
             by_process.setdefault(key, []).append((snapshot["unix_secs"], process))
     result = []
@@ -51,10 +53,19 @@ def measurement_usage(usage, phases):
                       peak_rss_bytes=max((item[1]["rss_bytes"] for item in within), default=None))
         if before and after:
             left, right = before[-1], after[0]
+            # Endpoints alone must not hide a vanished/reused process mid-window.
+            record["complete_bracket"] = all(any(
+                p["pid"] == identity["pid"] and p["start_ticks"] == identity["start_ticks"]
+                for p in snapshot["processes"])
+                for snapshot in usage.get("timeline", [])
+                if left[0] <= snapshot["unix_secs"] <= right[0])
             record.update(cpu_seconds=right[1]["cpu_seconds"] - left[1]["cpu_seconds"],
                           bracket_secs=right[0] - left[0],
                           boundary_slack_secs=(start - left[0]) + (right[0] - end))
         result.append(record)
+    client = phases.get("client_usage")
+    if isinstance(client, dict):
+        result.append(dict(client))
     return result
 
 

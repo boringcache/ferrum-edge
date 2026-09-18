@@ -439,6 +439,13 @@ jobs:
           retention-days: 90
 
   aggregate:
+    # Maximum safe dispatch inputs (full http1-tls: 6 arms x 5 sizes; adaptive off).
+    # Planning envelope: iterations * pairs * 30 * (duration + 15) / 60 + 5 minutes.
+    # duration x iterations x pairs -> projected minutes (75-minute frozen step):
+    # 10 x 1 x 2 -> 30; 15 x 1 x 2 -> 35; 15 x 2 x 2 -> 65;
+    #  5 x 3 x 2 -> 65; 15 x 3 x 2 -> 95 (unsafe); 15 x 1 x 4 -> 65.
+    # Reserve >=10 minutes; 15s/call overhead is an estimate, not a timeout guarantee.
+    # The frozen dispatcher cannot set pairs/adaptive: defaults are 2/off.
     name: Aggregate Results
     runs-on: ubuntu-latest
     needs: benchmark
@@ -466,6 +473,7 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, "tests/performance/multi_protocol")
           from benchmark_validity import bucket_issues, expected_rows, throughput_value
+          from benchmark_plan import read_comparisons
 
           iterations = int(os.environ.get("ITERATIONS", "1"))
           root = Path("all-results")
@@ -519,7 +527,7 @@ jobs:
           (root / "observed-samples.json").write_text(json.dumps(records, indent=2) + "\n")
           paired = []
           for path in sorted(root.glob("*/run_*/paired_comparisons.json")):
-              for row in json.loads(path.read_text()):
+              for row in read_comparisons(path):
                   paired.append(dict(row, run=str(path.parent.relative_to(root))))
           (root / "paired-comparisons.json").write_text(json.dumps(paired, indent=2) + "\n")
 
@@ -544,8 +552,17 @@ jobs:
               if row.get("accepted"):
                   result = (f"{row['ratio']:.3f} ({row['ci95_low']:.3f}–{row['ci95_high']:.3f}); "
                             + result)
-              lines.append(f"| {row['run']} | {row['baseline']} → {row['candidate']} | "
-                           f"{fmt_bytes(row['payload_size'])} | {result} |")
+              lines.append(f"| {row['run']} | {row.get('baseline', '?')} → {row.get('candidate', '?')} | "
+                           f"{fmt_bytes(row.get('payload_size', 0))} | {result} |")
+          lines.append("")
+
+          lines.append("### Planned position balance\n")
+          lines.append("| Run | Arm | Positions | Mean position |")
+          lines.append("|-----|-----|-----------|---------------|")
+          for path in sorted(root.glob("*/run_*/position_balance.json")):
+              for row in read_comparisons(path):
+                  lines.append(f"| {path.parent.relative_to(root)} | {row.get('gateway', '?')} | "
+                               f"{row.get('positions', row.get('reason'))} | {row.get('mean_position', '?')} |")
           lines.append("")
 
           # Rank only complete, error-free scenarios. One bad iteration
@@ -693,6 +710,7 @@ jobs:
           PYEOF
 
       - name: Upload combined artifact
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: gateways-protocol-bench-combined-${{ github.sha }}

@@ -1,11 +1,13 @@
 import json
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from benchmark_plan import gateway_order, paired_comparison, summarize, write_summaries
+from benchmark_plan import (extension_decision, gateway_order, paired_comparison,
+                            position_balance, read_comparisons, summarize, write_summaries)
 from benchmark_validity import sample_issues
 from process_usage import measurement_usage, parse_stat
 
@@ -17,6 +19,47 @@ def sample(pair, rps=10):
 
 
 class PairedPlanTests(unittest.TestCase):
+    def test_every_even_pair_count_has_equal_mean_position_for_any_arm_count(self):
+        for count in range(2, 8):
+            gateways = [f"arm-{i}" for i in range(count)]
+            for pairs in range(2, 13, 2):
+                rows = position_balance(gateways, pairs)
+                self.assertTrue(all(row["mean_position"] == (count + 1) / 2 for row in rows))
+
+    def test_runner_rejects_odd_pairs_before_starting_any_work(self):
+        runner = Path(__file__).resolve().parents[1] / "run_gateway_protocol_bench.sh"
+        for pairs in ("1", "3", "5", "11"):
+            result = subprocess.run(
+                ["bash", "tests/performance/multi_protocol/run_gateway_protocol_bench.sh",
+                 "http2", "--pairs", pairs], cwd=Path(__file__).resolve().parents[4],
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("EVEN", result.stderr)
+        source = runner.read_text()
+        self.assertIn("PAIRS=2\nADAPTIVE=false", source)
+        self.assertIn('--adaptive) ADAPTIVE=true', source)
+        self.assertIn('--no-process-usage) PROCESS_USAGE=false', source)
+        self.assertNotIn('require Linux /proc', source)
+        self.assertIn("tr '\\n' ' ' || true)", source)
+
+    def test_adaptive_extension_is_opt_in_and_budget_gated(self):
+        self.assertEqual(extension_decision(False, True, 100, 20, 2, 1000)
+                         ["extension_skipped"], "disabled")
+        self.assertEqual(extension_decision(True, False, 100, 20, 2, 1000)
+                         ["extension_skipped"], "not needed")
+        decision = extension_decision(True, True, 100, 20, 2, 259)
+        self.assertFalse(decision["extend"])
+        self.assertEqual(decision["extension_skipped"], "budget")
+        self.assertEqual(decision["projected_wallclock_secs"], 260)
+        self.assertTrue(extension_decision(True, True, 100, 20, 2, 260)["extend"])
+
+    def test_truncated_comparisons_survive_aggregation_as_diagnostic_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "paired_comparisons.json"
+            for contents in ("[", "{}", "[4]"):
+                path.write_text(contents)
+                self.assertEqual(read_comparisons(path), [dict(accepted=False, reason="unparseable")])
+
     def test_counterbalances_and_rotates_every_arm_including_direct(self):
         gateways = ["direct", "ferrum", "envoy", "ferrum-baseline"]
         orders = [gateway_order(gateways, pair) for pair in range(1, 9)]
@@ -28,49 +71,50 @@ class PairedPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gateway_order(["ferrum", "ferrum"], 1)
 
-    def test_requires_three_matched_clean_pairs_without_cherry_picking(self):
-        baseline = [sample(i) for i in range(1, 4)]
-        candidate = [sample(i, 20) for i in range(1, 4)]
-        result = paired_comparison(baseline, candidate, 3)
+    def test_requires_even_matched_clean_pairs_without_cherry_picking(self):
+        baseline = [sample(i) for i in range(1, 5)]
+        candidate = [sample(i, 20) for i in range(1, 5)]
+        result = paired_comparison(baseline, candidate, 4)
         self.assertTrue(result["accepted"])
         self.assertAlmostEqual(result["ratio"], 2)
         self.assertFalse(result["needs_more_measurement"])
-        self.assertFalse(paired_comparison(baseline[:2], candidate[:2], 2)["accepted"])
-        for field, value in (("host_id", "another-host"), ("pair", 4),
+        self.assertTrue(paired_comparison(baseline[:2], candidate[:2], 2)["accepted"])
+        self.assertFalse(paired_comparison(baseline[:3], candidate[:3], 3)["accepted"])
+        for field, value in (("host_id", "another-host"), ("pair", 5),
                              ("duration_secs", 2), ("effective_concurrency", 1),
                              ("total_errors", 1)):
             changed = [dict(row) for row in candidate]
             changed[1][field] = value
-            self.assertFalse(paired_comparison(baseline, changed, 3)["accepted"])
+            self.assertFalse(paired_comparison(baseline, changed, 4)["accepted"])
         self.assertFalse(paired_comparison([sample(1)] * 3, [sample(1, 20)] * 3, 3)["accepted"])
         baseline[1]["host_id"] = candidate[1]["host_id"] = "another-host"
-        self.assertFalse(paired_comparison(baseline, candidate, 3)["accepted"])
+        self.assertFalse(paired_comparison(baseline, candidate, 4)["accepted"])
 
     def test_uncertainty_requests_more_measurement(self):
-        result = paired_comparison([sample(i, 100) for i in range(1, 4)],
-                                   [sample(i, rps) for i, rps in enumerate((98, 102, 104), 1)], 3)
+        result = paired_comparison([sample(i, 100) for i in range(1, 5)],
+                                   [sample(i, rps) for i, rps in enumerate((98, 102, 104, 100), 1)], 4)
         self.assertTrue(result["needs_more_measurement"])
         self.assertLess(result["ci95_low"], 1)
         self.assertGreater(result["ci95_high"], 1)
 
     def test_summary_retains_raw_records_and_legacy_byte_and_rate_contract(self):
-        rows = [sample(i, 10 * i) for i in range(1, 4)]
-        summary = summarize(rows, 3)
+        rows = [sample(i, 10 * i) for i in range(1, 5)]
+        summary = summarize(rows, 4)
         self.assertEqual(summary["samples"], rows)
-        self.assertEqual(summary["rps"], 20)
+        self.assertEqual(summary["rps"], 25)
         self.assertEqual(summary["total_bytes"], summary["total_requests"] * 64)
         self.assertEqual(sample_issues(summary), [])
         rows[1]["total_errors"] = 1
-        self.assertTrue(sample_issues(summarize(rows, 3)))
-        self.assertTrue(sample_issues(summarize(rows[:2], 3)))
+        self.assertTrue(sample_issues(summarize(rows, 4)))
+        self.assertTrue(sample_issues(summarize(rows[:2], 4)))
         rows[1] = sample(1)  # duplicate IDs are not a complete pair set
-        self.assertTrue(sample_issues(summarize(rows, 3)))
+        self.assertTrue(sample_issues(summarize(rows, 4)))
 
     def test_missing_arm_remains_visible_in_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
-            write_summaries(directory, "http3", ["direct", "ferrum"], [64], 3)
+            write_summaries(directory, "http3", ["direct", "ferrum"], [64], 4)
             row = json.loads((Path(directory) / "ferrum_http3_64.json").read_text())
-            self.assertEqual(len(row["samples"]), 3)
+            self.assertEqual(len(row["samples"]), 4)
             self.assertTrue(sample_issues(row))
 
     def test_proc_parser_handles_parentheses_and_counts_process_cpu(self):

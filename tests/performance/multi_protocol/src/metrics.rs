@@ -1,3 +1,4 @@
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use serde::Serialize;
 
@@ -8,8 +9,9 @@ pub async fn collect_results(
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<BenchMetrics>>>,
 ) -> BenchMetrics {
     let mut combined = BenchMetrics::new();
-    for handle in handles {
-        match handle.await {
+    let mut pending: FuturesUnordered<_> = handles.into_iter().collect();
+    while let Some(result) = pending.next().await {
+        match result {
             Ok(Ok(metrics)) => combined.merge(&metrics),
             Ok(Err(error)) => {
                 eprintln!("  task error: {error}");

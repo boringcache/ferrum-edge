@@ -267,7 +267,8 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         None
     };
 
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
     let protocol_label = if is_tls { "HTTP/1.1+TLS" } else { "HTTP/1.1" };
     let payload = Bytes::from(make_payload(args.payload_size));
@@ -410,7 +411,8 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         url.path()
     );
 
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
 
     let tls_cfg = if is_tls {
@@ -551,7 +553,8 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         .context("invalid address")?;
     let path = url.path().to_string();
 
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
     let client_cfg = tls_utils::make_h3_client_config_insecure();
 
@@ -711,7 +714,9 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             .is_err()
         {
             eprintln!("H3 endpoint close timed out");
-            combined.record_error();
+            if let Some(phases) = &mut combined.phases {
+                phases.transport_close_timed_out = true;
+            }
         }
     }
     if let Some(phases) = &mut combined.phases {
@@ -728,7 +733,8 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
     use tokio_tungstenite::Connector;
     use tokio_tungstenite::tungstenite::Message;
 
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
     let mut handles = Vec::new();
     let payload = make_payload(args.payload_size);
@@ -861,7 +867,8 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     use bench_proto::EchoRequest;
     use bench_proto::bench_service_client::BenchServiceClient;
 
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
     let payload = make_payload(args.payload_size);
 
@@ -933,13 +940,14 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
             // both caps, every 5 MiB RPC fails with OutOfRange on the
             // encode side (client) or RESOURCE_EXHAUSTED on the decode
             // side (server). Must match proto_backend's cap.
+            // Admission shares the worker's atomics; next_request refreshes it.
+            let mut client = BenchServiceClient::new(ObservedChannel {
+                inner: channel,
+                admission: metrics.admission(),
+            })
+            .max_decoding_message_size(8 * 1024 * 1024)
+            .max_encoding_message_size(8 * 1024 * 1024);
             while metrics.next_request().await {
-                let mut client = BenchServiceClient::new(ObservedChannel {
-                    inner: channel.clone(),
-                    admission: metrics.admission(),
-                })
-                .max_decoding_message_size(8 * 1024 * 1024)
-                .max_encoding_message_size(8 * 1024 * 1024);
                 let req = tonic::Request::new(EchoRequest {
                     payload: payload.clone(),
                 });
@@ -1021,7 +1029,8 @@ where
 
 async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid TCP target address")?;
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
     let payload = make_payload(args.payload_size);
     let tls_cfg = args
@@ -1057,7 +1066,8 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
 #[allow(unused_assignments)] // next_timeout assignments are defensive — drain loop may not always produce Timeout
 async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid UDP target address")?;
-    let mut phases = Phases::new(Duration::from_secs(args.duration));
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
     let connections = phases.connections();
     let mut handles = Vec::new();
     let payload = make_payload(args.payload_size);

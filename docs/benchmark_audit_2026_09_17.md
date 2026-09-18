@@ -108,16 +108,20 @@ replace inference from requested `effective_concurrency`. Queue totals, barrier
 participation and worker retirement are recorded in every raw sample. Server
 stream admission and kernel/QUIC queue depths remain separate transport questions.
 
-The runner now performs at least three counterbalanced same-host pairs per
+The runner now defaults to two counterbalanced same-host pairs per
 invocation, repeats direct in every pair, and supports a separately provisioned
 `ferrum-baseline` image for revision comparisons. Per-PID gateway/client/backend
 CPU and RSS series include explicit measurement brackets and sampling slack.
 The shell retains the static `timeout`/`gtimeout` client invocation; a passive
 500 ms `/proc` sampler observes it and is signalled/reaped after the load.
-Client CPU/RSS are sampled lower bounds, not exact child-exit accounting, and
-incomplete capture or a missing client observation invalidates the sample.
-Paired log-ratio intervals that overlap no gain trigger one bounded extra block
-at double duration for every arm. Invalid pairs remain invalid; unresolved
+Client CPU now comes from its own `getrusage` snapshots at the measurement
+boundaries, with lifetime peak RSS recorded at the end; every required process
+role must have a complete bracket. Never-observed transient gateway PIDs are
+diagnostic, while at least one gateway PID must span the whole window. Only even
+pair counts are accepted, and the combined summary exposes position balance.
+Adaptive extension is opt-in and gated on measured per-pair cost and remaining
+wall-clock budget; the frozen job defaults to two pairs without extension.
+Use at least four predeclared pairs for a performance claim. Invalid pairs remain invalid; unresolved
 uncertainty requires a longer predeclared experiment. This exploratory adaptation
 does not by itself establish a statistically confirmed gain. Existing report
 fields remain available, with raw constituent samples retained in aggregate
@@ -126,7 +130,11 @@ artifacts. The Cross-frozen benchmark job is unchanged.
 See the [harness phases and paired procedure](../tests/performance/multi_protocol/README.md#phases-and-observed-concurrency-tracker-5588-section-1)
 for definitions and caveats. TCP/TLS now uses bounded full-duplex echoes instead
 of its former unbounded writer pipeline, identically for all gateways; its older
-rates are therefore not a workload-matched reference. The historical runs in this
+rates are therefore not a workload-matched reference. The explicit rolling-budget
+`workload_revision` is now `2026-09-18.phased-bounded-echo.v1`: the evaluator
+excludes old/unmarked points and restarts its window, preventing a deliberate
+workload/accounting change from alerting as a regression. Absolute budgets and
+the shared-harness historical H1 ratio reference remain unchanged. The historical runs in this
 audit are not retroactively repaired by the harness change. A short hosted smoke
 run verifies artifact plumbing, not a revision performance improvement; production
 optimization experiments and the rest of #5588 remain open.

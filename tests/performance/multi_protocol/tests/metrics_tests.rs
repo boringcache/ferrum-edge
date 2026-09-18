@@ -84,6 +84,16 @@ async fn slow_setup_and_warmup_do_not_spend_the_measurement_interval() {
     assert!(timing.setup_secs >= 0.03);
     assert!(timing.warmup_secs >= 0.03);
     assert_eq!(timing.measurement_secs, 0.08);
+    assert!(timing.measurement_elapsed_secs >= timing.measurement_secs);
+    #[cfg(unix)]
+    {
+        let client = timing.client_usage.as_ref().unwrap();
+        assert!(client.complete_bracket);
+        assert_eq!(client.pid, std::process::id());
+        assert!(client.cpu_seconds >= 0.0);
+        assert!(client.peak_rss_bytes > 0);
+        assert_eq!(client.bracket_secs, timing.measurement_elapsed_secs);
+    }
     assert!(!timing.timed_out);
     let observed = combined.observed.as_ref().unwrap();
     assert_eq!(observed.workers_at_barrier, 1);
@@ -252,4 +262,108 @@ async fn every_worker_finishes_setup_and_warmup_before_measurement_starts() {
     assert_eq!(combined.total_errors, 0);
     assert_eq!(combined.warmup_requests, 2);
     assert_eq!(combined.drain_requests, 2);
+}
+
+#[test]
+fn ipv6_authorities_are_unbracketed_only_for_socket_resolution() {
+    use multi_protocol_perf::transport::authority_host;
+
+    for (address, expected) in [
+        ("https://[::1]:50053/echo", "::1"),
+        ("http://[2001:db8::1]/", "2001:db8::1"),
+        ("https://localhost:50053/", "localhost"),
+        ("http://127.0.0.1/", "127.0.0.1"),
+    ] {
+        let uri = address.parse().unwrap();
+        assert_eq!(authority_host(&uri).unwrap(), expected);
+    }
+    assert!(authority_host(&"/echo".parse().unwrap()).is_err());
+}
+
+#[test]
+fn transport_close_timeout_is_diagnostic_and_preflight_scales_with_payload() {
+    use multi_protocol_perf::phases::{PhaseReport, preflight_bound};
+
+    let mut metrics = BenchMetrics::new();
+    metrics.record(1, 64);
+    metrics.phases = Some(PhaseReport {
+        transport_close_timed_out: true,
+        ..PhaseReport::default()
+    });
+    let report = serde_json::to_value(metrics.to_json_report("HTTP/3", "test", 1, 1)).unwrap();
+    assert_eq!(report["total_errors"], 0);
+    assert_eq!(report["phases"]["transport_close_timed_out"], true);
+    assert_eq!(preflight_bound(0), Duration::from_secs(30));
+    assert_eq!(preflight_bound(5 * 1024 * 1024), Duration::from_secs(70));
+}
+
+#[tokio::test]
+async fn reused_admission_tracks_each_new_request_without_rebuilding_the_client() {
+    let mut phases = Phases::new(Duration::from_millis(60));
+    let mut metrics = phases.worker();
+    let admission = metrics.admission().unwrap();
+    let handle = tokio::spawn(async move {
+        while metrics.next_request().await {
+            admission.admitted();
+            admission.admitted();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            metrics.record(10_000, 64);
+        }
+        Ok(metrics.finish_worker())
+    });
+    let combined = phases.finish(vec![handle]).await;
+    assert_eq!(combined.warmup_requests, 1);
+    assert!(combined.total_requests > 1);
+    assert_eq!(
+        combined.observed.unwrap().admissions,
+        combined.total_requests + combined.drain_requests,
+    );
+}
+
+#[tokio::test]
+async fn hung_first_worker_does_not_lose_completed_workers_at_the_drain_bound() {
+    let mut phases = Phases::new(Duration::from_millis(20));
+    let mut stalled_metrics = phases.worker();
+    let stalled = tokio::spawn(async move {
+        assert!(stalled_metrics.next_request().await);
+        stalled_metrics.record(1, 64);
+        assert!(stalled_metrics.next_request().await);
+        std::future::pending::<()>().await;
+        Ok(stalled_metrics.finish_worker())
+    });
+    let mut completed_metrics = phases.worker();
+    let completed = tokio::spawn(async move {
+        while completed_metrics.next_request().await {
+            completed_metrics.record(1, 64);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok(completed_metrics.finish_worker())
+    });
+    let combined = tokio::time::timeout(
+        Duration::from_secs(35),
+        phases.finish(vec![stalled, completed]),
+    )
+    .await
+    .unwrap();
+    assert!(combined.phases.unwrap().timed_out);
+    assert_eq!(combined.total_errors, 1);
+    assert!(combined.total_requests > 0);
+}
+
+#[tokio::test]
+async fn preflight_timeout_identifies_the_stalled_worker() {
+    let mut phases = Phases::new(Duration::from_millis(20));
+    let metrics = phases.worker();
+    let stalled = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        Ok(metrics.finish_worker())
+    });
+    let combined = tokio::time::timeout(Duration::from_secs(35), phases.finish(vec![stalled]))
+        .await
+        .unwrap();
+    let report = combined.phases.unwrap();
+    assert!(report.timed_out);
+    assert_eq!(report.stalled_workers, vec![0]);
+    assert_eq!(report.measurement_elapsed_secs, 0.0);
+    assert!(report.client_usage.is_none());
 }

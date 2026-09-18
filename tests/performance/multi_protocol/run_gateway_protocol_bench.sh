@@ -16,9 +16,11 @@
 #   --output-dir /tmp/gateway-protocol-results
 #   --skip-build                (reuse existing proto_bench binaries + ferrum docker image)
 #   --skip-direct               (accepted for frozen workflow; pairs always include direct)
-#   --pairs N                   (minimum 3, default 3)
+#   --pairs N                   (even integer 2..12, default 2)
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
-#   --no-adaptive               (smoke only: do not extend uncertain comparisons)
+#   --adaptive                  (opt in to one budget-gated extension)
+#   --wallclock-budget-seconds N (per invocation, default 4200)
+#   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -42,12 +44,6 @@ else
     echo "[warn] Neither 'timeout' nor 'gtimeout' found — bench runs will have no wallclock kill-switch" >&2
 fi
 
-# Passive resource capture runs on the hosted Linux runner.
-if [ ! -r /proc/sys/kernel/random/boot_id ]; then
-    echo "paired gateway benchmarks require Linux /proc resource capture" >&2
-    exit 2
-fi
-
 # ── Defaults ─────────────────────────────────────────────────────────────────
 PROTOCOL="${1:-}"
 [ -z "$PROTOCOL" ] && { echo "usage: $0 <protocol> [options]" >&2; exit 2; }
@@ -60,8 +56,10 @@ CONCURRENCY=100
 OUTPUT_DIR="/tmp/gateway-protocol-results"
 SKIP_BUILD=false
 SKIP_DIRECT=false
-PAIRS=3
-ADAPTIVE=true
+PAIRS=2
+ADAPTIVE=false
+WALLCLOCK_BUDGET=4200
+PROCESS_USAGE=true
 BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
@@ -78,7 +76,9 @@ while [[ $# -gt 0 ]]; do
         --skip-direct) SKIP_DIRECT=true; shift ;;
         --pairs) PAIRS="$2"; shift 2 ;;
         --baseline-image) BASELINE_IMAGE="$2"; shift 2 ;;
-        --no-adaptive) ADAPTIVE=false; shift ;;
+        --adaptive) ADAPTIVE=true; shift ;;
+        --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
+        --no-process-usage) PROCESS_USAGE=false; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -90,9 +90,19 @@ if [[ ! $DURATION =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
-if [[ ! $PAIRS =~ ^[0-9]+$ ]] || [ "${#PAIRS}" -gt 2 ] || [ "$PAIRS" -lt 3 ] || [ "$PAIRS" -gt 12 ]; then
-    echo "--pairs must be an integer from 3 through 12" >&2
+if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]]; then
+    echo "--pairs must be an EVEN integer from 2 through 12 for exact position balance" >&2
     exit 2
+fi
+if [[ ! $WALLCLOCK_BUDGET =~ ^[1-9][0-9]{0,4}$ ]]; then
+    echo "--wallclock-budget-seconds must be a positive integer (at most 99999)" >&2
+    exit 2
+fi
+if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
+    PROCESS_USAGE=false
+fi
+if ! $PROCESS_USAGE; then
+    echo "[warn] process_usage unavailable; samples are diagnostic and invalid for paired comparisons" >&2
 fi
 
 # UDP protocols are fixed to 1 KB regardless of caller.
@@ -755,7 +765,7 @@ run_bench() {
     # etc.) that would otherwise let a single stuck bench eat the workflow's
     # 75-minute step budget. DURATION seconds of actual work + 120s head-room
     # for connect/handshake/teardown.
-    local bench_wallclock=$(( DURATION + 120 ))
+    local bench_wallclock=$(( DURATION + 120 + (payload + 131071) / 131072 ))
 
     # `|| rc=$?` captures the exit code without tripping `set -e`. Using an
     # `if !` branch here would clear $? inside the then-block (bash semantics
@@ -766,25 +776,29 @@ run_bench() {
     mkdir -p "$diagnostics"
     local gateway_pids=""
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
-        gateway_pids=$(docker top "$GATEWAY_CID" -eo pid | tail -n +2 | tr '\n' ' ')
+        gateway_pids=$(docker top "$GATEWAY_CID" -eo pid | tail -n +2 | tr '\n' ' ' || true)
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
-    : > "$usage"
-    python3 "$SCRIPT_DIR/process_usage.py" \
-        --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
-        --output "$usage" --interval 0.5 &
-    sampler_pid=$!
-    # Wait for the first observation and installed signal handlers. Without
-    # readiness, an immediately failing client could leave SIGINT ignored.
-    local sampler_wait=0
-    while [ ! -s "$usage" ] && kill -0 "$sampler_pid" 2>/dev/null && [ "$sampler_wait" -lt 100 ]; do
-        sleep 0.05
-        sampler_wait=$(( sampler_wait + 1 ))
-    done
-    if [ ! -s "$usage" ]; then
-        kill -TERM "$sampler_pid" 2>/dev/null || true
-        wait "$sampler_pid" || true
-        sampler_pid=""
+    if $PROCESS_USAGE; then
+        : > "$usage"
+        python3 "$SCRIPT_DIR/process_usage.py" \
+            --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+            --output "$usage" --interval 0.5 &
+        sampler_pid=$!
+        # Wait for the first observation and installed signal handlers. Without
+        # readiness, an immediately failing client could leave SIGINT ignored.
+        local sampler_wait=0
+        while [ ! -s "$usage" ] && kill -0 "$sampler_pid" 2>/dev/null && [ "$sampler_wait" -lt 100 ]; do
+            sleep 0.05
+            sampler_wait=$(( sampler_wait + 1 ))
+        done
+        if [ ! -s "$usage" ]; then
+            kill -TERM "$sampler_pid" 2>/dev/null || true
+            wait "$sampler_pid" || true
+            sampler_pid=""
+        fi
+    else
+        echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
     if [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "${bench_wallclock}s" \
@@ -870,7 +884,11 @@ main() {
     if [ -n "$BASELINE_IMAGE" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
         expected_gateways+=" ferrum-baseline"
     fi
-    HOST_ID=$(cat /proc/sys/kernel/random/boot_id)
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        HOST_ID=$(cat /proc/sys/kernel/random/boot_id)
+    else
+        HOST_ID="$(hostname)-$$"
+    fi
     local root_output="$OUTPUT_DIR"
     python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" <<'PYEOF'
 import json, sys
@@ -890,6 +908,7 @@ PYEOF
     local final_pairs="$PAIRS"
     local extended=false
     local first_pair=1
+    local base_started=$SECONDS
     while true; do
         for PAIR in $(seq "$first_pair" "$final_pairs"); do
             OUTPUT_DIR="$root_output/pairs/$(printf 'pair_%03d' "$PAIR")"
@@ -928,7 +947,14 @@ PYEOF
         local decision
         decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" summarize "$OUTPUT_DIR" \
             "$PROTOCOL" "$expected_gateways" "$PAYLOAD_SIZES" "$final_pairs")
-        if $ADAPTIVE && ! $extended && [ "$decision" = extend ]; then
+        if ! $extended; then
+            local pair_seconds=$(( (SECONDS - base_started + requested_pairs - 1) / requested_pairs ))
+            decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" extension \
+                "$OUTPUT_DIR/manifest.json" "$ADAPTIVE" "$decision" "$SECONDS" \
+                "$pair_seconds" "$requested_pairs" "$WALLCLOCK_BUDGET")
+            echo "[main] extension decision: $decision"
+        fi
+        if ! $extended && [ "$decision" = extend ]; then
             # One bounded extension of the WHOLE matrix, never just the loser.
             extended=true
             first_pair=$(( final_pairs + 1 ))

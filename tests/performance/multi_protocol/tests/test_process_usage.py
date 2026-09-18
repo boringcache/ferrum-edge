@@ -8,10 +8,38 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_plan import stamp_sample
-from process_usage import client_pids, sample_processes
+from process_usage import client_pids, measurement_usage, sample_processes
 
 
 class PassiveUsageTests(unittest.TestCase):
+    def test_client_boundary_capture_replaces_a_missing_passive_endpoint(self):
+        phases = dict(measurement_start_unix_secs=1, measurement_secs=1,
+                      client_usage=dict(pid=3, role="client", complete_bracket=True,
+                                        cpu_seconds=0.4, peak_rss_bytes=4096))
+        timeline = [dict(unix_secs=0.9, processes=[dict(
+            pid=3, role="client", start_ticks=1, cpu_seconds=0, rss_bytes=1024)])]
+        rows = measurement_usage(dict(timeline=timeline), phases)
+        self.assertEqual(rows, [phases["client_usage"]])
+        del phases["client_usage"]
+        self.assertEqual(measurement_usage(dict(timeline=timeline), phases), [])
+
+    def test_process_must_remain_observable_for_the_entire_window(self):
+        process = dict(pid=42, role="gateway", start_ticks=1, cpu_seconds=1, rss_bytes=1024)
+        timeline = [dict(unix_secs=t, processes=[dict(process)]) for t in (0.9, 1.5, 2.1)]
+        phases = dict(measurement_start_unix_secs=1, measurement_secs=1)
+        self.assertTrue(measurement_usage(dict(timeline=timeline), phases)[0]["complete_bracket"])
+        timeline[1]["processes"] = []
+        self.assertFalse(measurement_usage(dict(timeline=timeline), phases)[0]["complete_bracket"])
+
+    def test_unavailable_process_capture_is_preserved_for_diagnostic_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, usage_path = Path(directory) / "sample.json", Path(directory) / "usage.json"
+            path.write_text('{}')
+            unavailable = dict(available=False, error="process usage unavailable or disabled")
+            usage_path.write_text(json.dumps(unavailable))
+            stamp_sample(path, "direct", "64", "2", "1", "1", "host", usage_path, "direct")
+            self.assertEqual(json.loads(path.read_text())["process_usage"], unavailable)
+
     def test_discovers_direct_and_timeout_clients_without_unrelated_processes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

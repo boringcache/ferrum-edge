@@ -8,6 +8,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::metrics::{BenchMetrics, collect_results};
+use crate::process_usage::{ClientUsage, Snapshot};
 
 const SETUP: usize = 0;
 const READY: usize = 1;
@@ -31,6 +32,8 @@ struct Slot {
     active: AtomicUsize,
     queue_ns: AtomicU64,
     admissions: AtomicU64,
+    offered_ns: AtomicU64,
+    measured: AtomicBool,
     retired_early: AtomicBool,
 }
 
@@ -57,17 +60,17 @@ impl Connections {
 #[derive(Clone)]
 pub struct Admission {
     slot: Arc<Slot>,
-    queued_at: Instant,
-    measured: bool,
+    epoch: Instant,
 }
 
 impl Admission {
     pub fn admitted(&self) {
-        if self.slot.queued.swap(0, Ordering::Relaxed) != 0 {
+        if self.slot.queued.swap(0, Ordering::AcqRel) != 0 {
             self.slot.active.store(1, Ordering::Relaxed);
-            if self.measured {
+            if self.slot.measured.load(Ordering::Relaxed) {
                 self.slot.queue_ns.fetch_add(
-                    self.queued_at.elapsed().as_nanos() as u64,
+                    (self.epoch.elapsed().as_nanos() as u64)
+                        .saturating_sub(self.slot.offered_ns.load(Ordering::Relaxed)),
                     Ordering::Relaxed,
                 );
                 self.slot.admissions.fetch_add(1, Ordering::Relaxed);
@@ -80,7 +83,7 @@ pub struct Worker {
     slot: Arc<Slot>,
     phase: watch::Receiver<Phase>,
     window: Option<(Instant, Instant)>,
-    offered_at: Instant,
+    epoch: Instant,
     warmup_offered: bool,
 }
 
@@ -95,8 +98,7 @@ impl Worker {
                 self.slot.state.store(DONE, Ordering::Release);
                 return false;
             }
-            self.offered_at = Instant::now();
-            self.slot.queued.store(1, Ordering::Relaxed);
+            self.offer();
             return true;
         }
         if self.slot.state.load(Ordering::Relaxed) == SETUP {
@@ -129,16 +131,24 @@ impl Worker {
                 }
             }
         }
-        self.offered_at = Instant::now();
-        self.slot.queued.store(1, Ordering::Relaxed);
+        self.offer();
         true
+    }
+
+    fn offer(&self) {
+        self.slot
+            .offered_ns
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.slot
+            .measured
+            .store(self.window.is_some(), Ordering::Relaxed);
+        self.slot.queued.store(1, Ordering::Release);
     }
 
     pub fn admission(&self) -> Admission {
         Admission {
             slot: self.slot.clone(),
-            queued_at: self.offered_at,
-            measured: self.window.is_some(),
+            epoch: self.epoch,
         }
     }
 
@@ -212,15 +222,21 @@ pub struct PhaseReport {
     pub warmup_secs: f64,
     pub barrier_secs: f64,
     pub measurement_secs: f64,
+    pub measurement_elapsed_secs: f64,
     pub measurement_start_unix_secs: Option<f64>,
+    pub client_usage: Option<ClientUsage>,
     pub drain_secs: f64,
     pub transport_close_secs: f64,
+    pub transport_close_timed_out: bool,
+    pub preflight_bound_secs: f64,
+    pub stalled_workers: Vec<usize>,
     pub timed_out: bool,
 }
 
 pub struct Phases {
     created: Instant,
     duration: Duration,
+    preflight_bound: Duration,
     phase: watch::Sender<Phase>,
     slots: Vec<Arc<Slot>>,
     connections: Connections,
@@ -232,10 +248,16 @@ impl Phases {
         Self {
             created: Instant::now(),
             duration,
+            preflight_bound: preflight_bound(0),
             phase,
             slots: Vec::new(),
             connections: Connections(Arc::new(AtomicUsize::new(0))),
         }
+    }
+
+    pub fn with_payload(mut self, payload_bytes: usize) -> Self {
+        self.preflight_bound = preflight_bound(payload_bytes);
+        self
     }
 
     pub fn connections(&self) -> Connections {
@@ -250,7 +272,7 @@ impl Phases {
             slot,
             phase: self.phase.subscribe(),
             window: None,
-            offered_at: Instant::now(),
+            epoch: self.created,
             warmup_offered: false,
         })
     }
@@ -283,7 +305,10 @@ impl Phases {
                 }
             }
         });
-        let mut phases = PhaseReport::default();
+        let mut phases = PhaseReport {
+            preflight_bound_secs: self.preflight_bound.as_secs_f64(),
+            ..PhaseReport::default()
+        };
         let mut observed = Observed {
             sampling_interval_ms: 10,
             ..Observed::default()
@@ -296,11 +321,18 @@ impl Phases {
             self.wait_for(BARRIER).await;
             phases.warmup_secs = warmup.elapsed().as_secs_f64();
         };
-        if tokio::time::timeout(Duration::from_secs(30), preflight)
+        if tokio::time::timeout(self.preflight_bound, preflight)
             .await
             .is_err()
         {
             phases.timed_out = true;
+            for (id, slot) in self.slots.iter().enumerate() {
+                let state = slot.state.load(Ordering::Acquire);
+                if state != BARRIER && state != DONE {
+                    eprintln!("preflight stalled worker {id}: state={state}");
+                    phases.stalled_workers.push(id);
+                }
+            }
         } else {
             let barrier = Instant::now();
             observed.workers_at_barrier = self
@@ -316,6 +348,7 @@ impl Phases {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|elapsed| elapsed.as_secs_f64());
+            let client_start = Snapshot::capture();
             self.phase.send_replace(Phase::Measure { start, end });
             // Sample independently of worker joins, including after worker loss.
             while Instant::now() < end {
@@ -339,6 +372,21 @@ impl Phases {
                     (Instant::now() + Duration::from_millis(10)).min(end).into(),
                 )
                 .await;
+            }
+            let client_end = Snapshot::capture();
+            phases.measurement_elapsed_secs =
+                self.duration.as_secs_f64() + end.elapsed().as_secs_f64();
+            match (client_start, client_end) {
+                (Ok(left), Ok(right)) => {
+                    phases.client_usage = Some(left.finish(
+                        right,
+                        phases.measurement_elapsed_secs,
+                        phases.measurement_secs,
+                    ));
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("client measurement resource capture failed: {error}");
+                }
             }
         }
         self.phase.send_replace(Phase::Stop);
@@ -371,4 +419,9 @@ impl Phases {
         combined.observed = Some(observed);
         combined
     }
+}
+
+/// Allow one full-payload warmup at 128 KiB/s beyond the setup allowance.
+pub fn preflight_bound(payload_bytes: usize) -> Duration {
+    Duration::from_secs(30 + (payload_bytes as u64).div_ceil(131_072))
 }

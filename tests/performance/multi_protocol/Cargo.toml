@@ -62,6 +62,7 @@ tokio-stream = "0.1"
 bytes = "1"
 anyhow = "1"
 dashmap = "6"
+libc = "0.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"

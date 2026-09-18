@@ -21,7 +21,8 @@ def sample_issues(sample):
         children = sample["samples"]
         expected = sample.get("expected_pairs")
         if (not isinstance(children, list) or not isinstance(expected, int)
-                or isinstance(expected, bool) or expected < 3 or len(children) != expected):
+                or isinstance(expected, bool) or expected < 2 or expected % 2
+                or len(children) != expected):
             issues.append("incomplete paired samples")
         elif any(not isinstance(child, dict) or "samples" in child for child in children):
             issues.append("invalid nested sample")
@@ -37,8 +38,11 @@ def sample_issues(sample):
             issues.append("invalid phase/concurrency record")
         else:
             duration = phases.get("measurement_secs")
+            elapsed = phases.get("measurement_elapsed_secs")
             if (not _is_number(duration) or not math.isfinite(duration) or duration <= 0
-                    or duration != sample.get("duration_secs") or phases.get("timed_out")):
+                    or duration != sample.get("duration_secs") or phases.get("timed_out")
+                    or not _is_number(elapsed) or not math.isfinite(elapsed)
+                    or not duration <= elapsed <= duration + max(0.1, duration * 0.05)):
                 issues.append("invalid/incomplete measurement phase")
             count = observed.get("samples")
             if (not isinstance(count, int) or isinstance(count, bool) or count <= 0
@@ -55,19 +59,28 @@ def sample_issues(sample):
                     or sample.get("warmup_requests") != sample.get("effective_concurrency")):
                 issues.append("incomplete setup/warmup barrier")
         usage = sample.get("process_usage") or {}
-        if (not isinstance(usage, dict) or usage.get("error")
+        if (not isinstance(usage, dict) or usage.get("error") or usage.get("available") is False
                 or not isinstance(usage.get("processes"), list) or not usage["processes"]):
             issues.append("missing per-process resource capture")
-        elif usage.get("missing_pids"):
-            issues.append("incomplete per-process resource capture")
         else:
-            roles = {process.get("role") for process in usage["processes"]
-                     if isinstance(process, dict)}
+            # missing_pids were never observable: preserve them diagnostically,
+            # but require continuous live evidence for each role below.
+            measurement = usage.get("measurement")
+            measurement = measurement if isinstance(measurement, list) else []
+            roles = {process.get("role") for process in measurement if isinstance(process, dict)}
             required = {"client", "backend"}
             if sample.get("gateway") != "direct":
                 required.add("gateway")
             if not required <= roles:
                 issues.append("missing process roles")
+            for role in sorted(required):
+                records = [p for p in measurement if isinstance(p, dict) and p.get("role") == role]
+                if not records or any(
+                        p.get("complete_bracket") is not True
+                        or not _is_number(p.get("cpu_seconds"))
+                        or not math.isfinite(p["cpu_seconds"]) or p["cpu_seconds"] < 0
+                        for p in records):
+                    issues.append(f"incomplete {role} measurement bracket")
     if sample.get("error"):
         issues.append(str(sample["error"]))
     errors = sample.get("total_errors")
