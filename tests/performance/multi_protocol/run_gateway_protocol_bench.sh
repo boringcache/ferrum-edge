@@ -33,6 +33,10 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
+# Branch-committed Ferrum environment overlay (see `ferrum_env_overlay_pairs`).
+FERRUM_ENV_OVERLAY_FILE="$SCRIPT_DIR/ferrum_experiment.env"
+FERRUM_ENV_OVERLAY=()
+
 # ── Portable `timeout` command (GNU coreutils) ──────────────────────────────
 # macOS/BSD ships without `timeout`; Homebrew installs it as `gtimeout`.
 if command -v timeout >/dev/null 2>&1; then
@@ -305,6 +309,32 @@ prepare_ferrum_config() {
     echo "$runtime_config"
 }
 
+# Read `ferrum_experiment.env` into FERRUM_ENV_OVERLAY. Blank lines and `#`
+# comments are ignored; every other line must be a KEY=VALUE pair whose key is a
+# FERRUM_-prefixed shouting-snake-case name, so a stray line cannot become a
+# `docker run` argument. Malformed lines are reported and skipped rather than
+# silently dropped.
+ferrum_env_overlay_pairs() {
+    FERRUM_ENV_OVERLAY=()
+    [ -r "$FERRUM_ENV_OVERLAY_FILE" ] || return 0
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        if [[ ! $line =~ ^FERRUM_[A-Z0-9_]*=.*$ ]]; then
+            echo "[ferrum] ignoring malformed overlay line: $line" >&2
+            continue
+        fi
+        FERRUM_ENV_OVERLAY+=("$line")
+    done < "$FERRUM_ENV_OVERLAY_FILE"
+    if [ ${#FERRUM_ENV_OVERLAY[@]} -gt 0 ]; then
+        echo "[ferrum] DIAGNOSTIC overlay active: ${FERRUM_ENV_OVERLAY[*]}" >&2
+    fi
+}
+
 start_ferrum() {
     local config_src="$SCRIPT_DIR/configs/$(ferrum_config_name)"
     local config_file
@@ -328,6 +358,18 @@ start_ferrum() {
             extra_env+=(-e "$pair")
         done
     fi
+    # Branch-committed overlay for the same purpose. `Trusted Cross Build Policy`
+    # freezes the benchmark matrix job byte-for-byte and that job exports no
+    # environment of its own, so a committed file is the ONLY way a pull request
+    # can enable a diagnostic Ferrum setting (for example FERRUM_LOG_LEVEL=warn,
+    # which surfaces the backend dispatch error classes the default `error` level
+    # hides) on a hosted run. Empty in the committed tree: a populated overlay
+    # changes Ferrum's runtime configuration for that arm only, so such a run is
+    # diagnostic and its rates are NOT a paired performance measurement.
+    ferrum_env_overlay_pairs
+    for pair in "${FERRUM_ENV_OVERLAY[@]}"; do
+        extra_env+=(-e "$pair")
+    done
 
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
@@ -894,12 +936,15 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" <<'PYEOF'
+    ferrum_env_overlay_pairs
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" \
+        "$HOST_ID" "${FERRUM_ENV_OVERLAY[@]}" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
                "payload_sizes": [int(size) for size in sys.argv[3].split()],
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
+               "ferrum_env_overlay": sys.argv[6:],
                "sample_schema": 2}, manifest)
 PYEOF
 

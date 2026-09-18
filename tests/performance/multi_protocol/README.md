@@ -317,6 +317,34 @@ If uncertainty still overlaps, report inconclusive and schedule a longer
 predeclared experiment. Optional stopping does not make this exploratory interval
 a confirmatory test. Inspect every sample's p99 as well as RPS.
 
+#### Diagnostic Ferrum environment overlay
+
+`Trusted Cross Build Policy` freezes the `benchmark` matrix job byte-for-byte
+and that job exports no environment of its own, so a pull request cannot set
+`FERRUM_EXTRA_ENV` on a hosted run. `ferrum_experiment.env` is the
+branch-committed equivalent: the runner reads each `FERRUM_<NAME>=<value>` line
+and appends it to the Ferrum container's `-e` list **after** the harness
+defaults, so an overlay line wins. `#` comments and blank lines are ignored and
+any other line is reported and skipped.
+
+The overlay reaches the `ferrum` and `ferrum-baseline` arms only, so a populated
+file makes the run **diagnostic**: Ferrum is no longer configured the way the
+comparison configures it, and the run's rates are not a paired performance
+measurement. `manifest.json` records the active overlay under
+`ferrum_env_overlay` so an artifact states that on its own. Keep the file empty
+(comments only) on `main`.
+
+The tracker #5588 section-3 failure diagnosis used `FERRUM_LOG_LEVEL=warn`. The
+harness default is `error`, at which Ferrum still logs `HTTP/2 backend request
+failed`, `HTTP/2 pool connection failed` and `gRPC: backend request failed` with
+their classified `error_kind`; `warn` adds the body-read and
+capability/establishment paths that sit one level below.
+
+Client-side transport failures are reported too: `proto_bench` prints one
+bounded stderr line per failing worker with the error's whole `source()` chain
+(`  gRPC unary_echo error: …`, `  HTTP/2 send_request error: …`). Before this a
+sample could report 159 gRPC errors with an empty stderr file.
+
 #### Maximum safe dispatch inputs
 
 For the full `http1-tls` matrix (direct + five gateways, five sizes), budget

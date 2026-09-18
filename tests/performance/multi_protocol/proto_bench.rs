@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -152,6 +152,44 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ── Reporting helper ─────────────────────────────────────────────────────────
+
+/// Process-wide cap on transport-failure stderr lines (tracker #5588 section 3).
+///
+/// Transport failures used to be discarded (`Err(_) => metrics.record_error()`),
+/// so a sample could report 159 gRPC errors with an empty stderr file and no way
+/// to tell a backend refusal from a stream reset. Every worker retires on its
+/// first transport failure, so the natural bound is one line per worker; the
+/// response-body branch does not retire, so an explicit cap keeps a persistently
+/// failing read from flooding the artifact. Reporting happens only on the error
+/// path and cannot touch a successful request.
+static REPORTED_TRANSPORT_ERRORS: AtomicUsize = AtomicUsize::new(0);
+const MAX_REPORTED_TRANSPORT_ERRORS: usize = 512;
+
+fn report_transport_error(protocol: &str, phase: &str, error: &(dyn std::error::Error + 'static)) {
+    let reported = REPORTED_TRANSPORT_ERRORS.fetch_add(1, Ordering::Relaxed);
+    if reported < MAX_REPORTED_TRANSPORT_ERRORS {
+        eprintln!("  {protocol} {phase} error: {}", error_chain(error));
+    } else if reported == MAX_REPORTED_TRANSPORT_ERRORS {
+        eprintln!("  {protocol} further transport errors suppressed");
+    }
+}
+
+/// Render an error together with its whole `source()` chain.
+///
+/// `hyper::Error` and `tonic::Status` both print a generic summary and keep the
+/// actionable cause (`GOAWAY`, `RST_STREAM`, connection reset, the upstream
+/// status) one or more links down, which is exactly the detail this diagnosis
+/// needs.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        rendered.push_str(" <- ");
+        rendered.push_str(&cause.to_string());
+        source = std::error::Error::source(cause);
+    }
+    rendered
+}
 
 fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
     if args.json {
@@ -350,10 +388,13 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                                     break;
                                 }
                             }
-                            Err(_) => metrics.record_error(),
+                            Err(error) => {
+                                report_transport_error(protocol_label, "response body", &error);
+                                metrics.record_error();
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // Break out of the per-task loop on connection-level
                         // send errors (matches run_http2 / run_grpc). Without
                         // the break, a broken connection that reports fast
@@ -363,6 +404,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                         // payload sizes. Dropping the task is preferable —
                         // the other N-1 workers continue producing clean
                         // throughput data.
+                        report_transport_error(protocol_label, "send_request", &error);
                         metrics.record_error();
                         break;
                     }
@@ -524,10 +566,14 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                                     break;
                                 }
                             }
-                            Err(_) => metrics.record_error(),
+                            Err(error) => {
+                                report_transport_error("HTTP/2", "response body", &error);
+                                metrics.record_error();
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        report_transport_error("HTTP/2", "send_request", &error);
                         metrics.record_error();
                         break;
                     }
@@ -960,7 +1006,8 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(status) => {
+                        report_transport_error("gRPC", "unary_echo", &status);
                         metrics.record_error();
                         break;
                     }
