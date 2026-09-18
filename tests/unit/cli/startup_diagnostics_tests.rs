@@ -405,6 +405,61 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
     }
 }
 
+#[tokio::test]
+async fn mongo_failover_emissions_withhold_invalid_options_before_network_io() {
+    use ferrum_edge::config::mongo_store::MongoStore;
+
+    // Invalid maxPoolSize is rejected by ClientOptions before any client/socket
+    // exists. Exercise the real early failure events without a live database.
+    // The values are unregistered: URL credential scrubbing alone is insufficient.
+    for value in [
+        "'UNREGISTERED_MONGO5591",
+        "a\"UNREGISTERED_MONGO5591",
+        "918273641999999999999",
+        "true",
+    ] {
+        let logs = DiagnosticLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let url = format!("mongodb://localhost/?maxPoolSize={value}");
+        let result = MongoStore::connect_with_failover(
+            &url,
+            "unused",
+            None,
+            None,
+            None,
+            Some(1),
+            Some(1),
+            false,
+            None,
+            None,
+            None,
+            false,
+            std::slice::from_ref(&url),
+        )
+        .await;
+        let error = result.err().expect("invalid options must reject the connection");
+        assert!(error.to_string().contains("All MongoDB URLs failed"));
+        assert!(error.to_string().contains("Tried 1 failover URL(s)"));
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("Primary MongoDB connection failed"),
+            "{output}"
+        );
+        assert!(output.contains("Trying 1 failover URL(s)"), "{output}");
+        assert!(output.contains("Failover MongoDB #1"), "{output}");
+        assert!(output.contains("<redacted scalar>"), "{output}");
+        assert!(output.contains("details withheld"), "{output}");
+        for withheld in ["UNREGISTERED_MONGO5591", "918273641999999999999", "true"] {
+            assert!(!output.contains(withheld), "{output}");
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct DiagnosticLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
