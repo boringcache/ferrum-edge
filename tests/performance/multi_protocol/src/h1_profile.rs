@@ -34,7 +34,8 @@ pub struct Snapshot {
 impl Counters {
     pub fn data_frame(&self, bytes: usize) {
         self.body_data_frames.fetch_add(1, Ordering::Relaxed);
-        self.body_data_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.body_data_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn response_headers(&self, headers: &http::HeaderMap) {
@@ -45,7 +46,8 @@ impl Counters {
             self.chunked_responses.fetch_add(1, Ordering::Relaxed);
         }
         if headers.contains_key(http::header::CONTENT_LENGTH) {
-            self.content_length_responses.fetch_add(1, Ordering::Relaxed);
+            self.content_length_responses
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -74,7 +76,8 @@ impl Snapshot {
             body_data_frames: self.body_data_frames - start.body_data_frames,
             body_data_bytes: self.body_data_bytes - start.body_data_bytes,
             chunked_responses: self.chunked_responses - start.chunked_responses,
-            content_length_responses: self.content_length_responses - start.content_length_responses,
+            content_length_responses: self.content_length_responses
+                - start.content_length_responses,
         }
     }
 }
@@ -117,7 +120,9 @@ impl RecordParser {
             if self.remaining == 0 {
                 counters.tls_records.fetch_add(1, Ordering::Relaxed);
                 let length = u16::from_be_bytes([self.header[3], self.header[4]]) as u64 + 5;
-                counters.tls_record_bytes.fetch_add(length, Ordering::Relaxed);
+                counters
+                    .tls_record_bytes
+                    .fetch_add(length, Ordering::Relaxed);
                 self.filled = 0;
             }
         }

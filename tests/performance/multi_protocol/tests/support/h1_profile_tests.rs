@@ -5,7 +5,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn tls_records_survive_every_header_and_payload_split() {
-    let wire = [22, 3, 3, 0, 2, 1, 2, 23, 3, 3, 0, 3, 7, 8, 9, 23, 3, 3, 0, 0];
+    let wire = [
+        22, 3, 3, 0, 2, 1, 2, 23, 3, 3, 0, 3, 7, 8, 9, 23, 3, 3, 0, 0,
+    ];
     for chunk in 1..=wire.len() {
         let counters = Arc::new(Counters::default());
         let mut parser = RecordParser::default();
