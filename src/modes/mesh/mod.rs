@@ -794,16 +794,15 @@ impl MeshRuntimeConfig {
         let workload_svid_cert_path = env_config.gateway_svid_cert_path.clone();
         let workload_svid_key_path = env_config.gateway_svid_key_path.clone();
         let workload_svid_trust_bundle_path = env_config.gateway_svid_trust_bundle_path.clone();
-        let ca_backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
-            .map_err(|_| {
-                format!(
-                    "Invalid FERRUM_MESH_CA_BACKEND {}; expected internal, spire, or none",
-                    crate::startup::quoted_config_value(
-                        "FERRUM_MESH_CA_BACKEND",
-                        &env_config.mesh_ca_backend
-                    )
+        let ca_backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend).map_err(|_| {
+            format!(
+                "Invalid FERRUM_MESH_CA_BACKEND {}; expected internal, spire, or none",
+                crate::startup::quoted_config_value(
+                    "FERRUM_MESH_CA_BACKEND",
+                    &env_config.mesh_ca_backend
                 )
-            })?;
+            )
+        })?;
         let xds_node_cluster = resolve_ferrum_var("FERRUM_MESH_XDS_NODE_CLUSTER")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| env_config.namespace.clone());
@@ -16684,16 +16683,15 @@ async fn start_mesh_ca_backend_svid_source(
     mesh_background_handles: &mut Vec<JoinHandle<()>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<MeshCaBackendSource>, anyhow::Error> {
-    let backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Invalid FERRUM_MESH_CA_BACKEND {}; expected internal, spire, or none",
-                crate::startup::quoted_config_value(
-                    "FERRUM_MESH_CA_BACKEND",
-                    &env_config.mesh_ca_backend
-                )
+    let backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend).map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid FERRUM_MESH_CA_BACKEND {}; expected internal, spire, or none",
+            crate::startup::quoted_config_value(
+                "FERRUM_MESH_CA_BACKEND",
+                &env_config.mesh_ca_backend
             )
-        })?;
+        )
+    })?;
     if backend == CaBackend::None {
         return Ok(None);
     }
@@ -18187,7 +18185,10 @@ fn load_mesh_frontend_tls(
         )
     }
     .map_err(|e| {
-        anyhow::anyhow!("Invalid mesh frontend TLS configuration: {:?}", e.to_string())
+        anyhow::anyhow!(
+            "Invalid mesh frontend TLS configuration: {:?}",
+            e.to_string()
+        )
     })?;
     tls::enable_early_data(&mut tls_config, tls_policy);
     if env_config.ktls_enabled.could_be_enabled() {
@@ -21468,7 +21469,10 @@ mod tests {
         result.expect("DestinationRule still applies");
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 765431);
         assert_eq!(config.proxies[0].tcp_idle_timeout_seconds, Some(765432));
-        assert_eq!(config.upstreams[0].subsets.as_ref().unwrap()[0].name, subset);
+        assert_eq!(
+            config.upstreams[0].subsets.as_ref().unwrap()[0].name,
+            subset
+        );
         for message in [
             "DestinationRule has no matching upstream",
             "DestinationRule subsets overwriting existing upstream.subsets",
@@ -31951,8 +31955,10 @@ mod tests {
                     // the field and reason without its supplied address.
                     let (plan, log) = capture_mesh_diagnostics(|| runtime.listener_plan());
                     assert!(
-                        !plan.iter().any(|listener| listener.kind
-                            == MeshListenerKind::TransparentInboundCapture),
+                        !plan
+                            .iter()
+                            .any(|listener| listener.kind
+                                == MeshListenerKind::TransparentInboundCapture),
                         "an invalid capture address warn-skips in the infallible plan"
                     );
                     assert!(log.contains("FERRUM_MESH_INBOUND_LISTEN_ADDR"), "{log}");

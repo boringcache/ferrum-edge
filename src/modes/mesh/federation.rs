@@ -1439,7 +1439,11 @@ mod tests {
         );
         assert!(!store.snapshot().bundles.contains_key(&domain));
         let output = logs.output();
-        assert_eq!(output.matches("poll_interval_seconds=").count(), 2, "{output}");
+        assert_eq!(
+            output.matches("poll_interval_seconds=").count(),
+            2,
+            "{output}"
+        );
         for field in [
             "cluster=",
             "trust_domain=",
