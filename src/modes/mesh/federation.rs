@@ -44,6 +44,7 @@ use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
 };
 use crate::plugins::utils::http_client::PluginHttpClient;
+use crate::startup::sanitize_startup_cause;
 #[cfg(test)]
 use crate::util::backoff::{
     BACKOFF_MAX_SECS, jittered_backoff_with_entropy as common_jittered_backoff_with_entropy,
@@ -675,16 +676,19 @@ fn poll_targets_for_multi_cluster(
         // the rest of the federation surface continues to function.
         if let Err(err) = validate_federation_endpoint(endpoint) {
             warn!(
-                cluster = %remote.name,
-                trust_domain = %remote.trust_domain,
-                error = %err,
+                cluster = %sanitize_startup_cause(format!("{:?}", remote.name.to_string()), &[]),
+                trust_domain = %sanitize_startup_cause(
+                    format!("{:?}", remote.trust_domain.to_string()),
+                    &[]
+                ),
+                error = %sanitize_startup_cause(&err, &[]),
                 "Dropping federation_endpoint that failed SSRF/scheme validation"
             );
             continue;
         }
         if targets.len() >= MAX_MESH_REMOTE_CLUSTERS {
             warn!(
-                cluster = %remote.name,
+                cluster = %sanitize_startup_cause(format!("{:?}", remote.name.to_string()), &[]),
                 max_remote_clusters = MAX_MESH_REMOTE_CLUSTERS,
                 "Skipping federation_endpoint beyond remote-cluster target cap"
             );
@@ -985,7 +989,7 @@ async fn poll_federation_loop(
                     cluster = %cluster_name,
                     trust_domain = %trust_domain,
                     endpoint = %endpoint_for_logs,
-                    error = %err,
+                    error = %sanitize_startup_cause(&err, &[]),
                     fail_open = config.fail_open,
                     "SPIFFE federation poll failed; keeping last-good bundle if any"
                 );

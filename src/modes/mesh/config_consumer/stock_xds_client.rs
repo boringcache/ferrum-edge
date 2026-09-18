@@ -281,7 +281,7 @@ pub fn apply_stock_policy_reload_candidate(
         }
         Err(error) => {
             warn!(
-                error = %error,
+                error = %crate::startup::sanitize_startup_cause(&error, &[]),
                 "Failed to reload the stock xDS mesh policy document; keeping the last good \
                  policy baseline and raising config_rejected"
             );
@@ -1638,8 +1638,14 @@ async fn run_stock_ads_stream(
                         // a view the control plane will now contradict.
                         if pending.take().is_some() {
                             warn!(
-                                node_id = %config.node_id,
-                                namespace = %config.namespace,
+                                node_id = %crate::startup::sanitize_startup_cause(
+                                    format!("{:?}", config.node_id.to_string()),
+                                    &[]
+                                ),
+                                namespace = %crate::startup::sanitize_startup_cause(
+                                    format!("{:?}", config.namespace.to_string()),
+                                    &[]
+                                ),
                                 "Discarded debounced stock xDS slice after NACK"
                             );
                         }
@@ -1688,7 +1694,10 @@ async fn run_stock_ads_stream(
                         }
                         Err(_) => {
                             warn!(
-                                node_id = %config.node_id,
+                                node_id = %crate::startup::sanitize_startup_cause(
+                                    format!("{:?}", config.node_id.to_string()),
+                                    &[]
+                                ),
                                 type_url = stock_log_type_label("policy-reload"),
                                 "Reloaded mesh policy document failed slice construction; keeping \
                                  the last good slice and raising config_rejected"
@@ -1820,8 +1829,14 @@ async fn handle_stock_response(
         };
         if type_url == SDS_TYPE_URL {
             warn!(
-                node_id = %config.node_id,
-                namespace = %config.namespace,
+                node_id = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", config.node_id.to_string()),
+                    &[]
+                ),
+                namespace = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", config.namespace.to_string()),
+                    &[]
+                ),
                 type_url = type_label,
                 reason,
                 refused_resources = response.resources.len(),
@@ -1830,7 +1845,10 @@ async fn handle_stock_response(
             );
         }
         warn!(
-            node_id = %config.node_id,
+            node_id = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.node_id.to_string()),
+                &[]
+            ),
             type_url = type_label,
             reason,
             "Closing stock xDS stream after an unsolicited unsupported resource type"
@@ -1885,8 +1903,14 @@ async fn handle_stock_response(
             .await
             .map_err(StockOutboundError::into_response_error)?;
         warn!(
-            node_id = %config.node_id,
-            namespace = %config.namespace,
+            node_id = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.node_id.to_string()),
+                &[]
+            ),
+            namespace = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.namespace.to_string()),
+                &[]
+            ),
             type_url = type_label,
             consecutive_nacks = consecutive,
             blocking_first_slice,
@@ -1900,7 +1924,10 @@ async fn handle_stock_response(
         }
         if consecutive >= STOCK_CONSECUTIVE_NACK_LIMIT {
             warn!(
-                node_id = %config.node_id,
+                node_id = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", config.node_id.to_string()),
+                    &[]
+                ),
                 type_url = type_label,
                 consecutive_nacks = consecutive,
                 "Stock xDS NACK circuit breaker tripped; closing the stream to trigger \
@@ -1998,8 +2025,14 @@ async fn handle_stock_response(
             // surface it rather than tearing the stream down. The validation
             // error can echo remote resource names, so it is omitted from logs.
             warn!(
-                node_id = %config.node_id,
-                namespace = %config.namespace,
+                node_id = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", config.node_id.to_string()),
+                    &[]
+                ),
+                namespace = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", config.namespace.to_string()),
+                    &[]
+                ),
                 type_url = type_label,
                 "Stock xDS discovery did not produce a valid mesh slice; keeping the last good slice"
             );
@@ -2108,8 +2141,14 @@ fn log_refusals(
         *by_reason.entry(refusal.reason).or_insert(0) += 1;
     }
     warn!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
+        node_id = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.node_id.to_string()),
+            &[]
+        ),
+        namespace = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.namespace.to_string()),
+            &[]
+        ),
         refused_resources = refusals.len(),
         reasons = ?by_reason,
         "Stock xDS control plane sent resources the Ferrum stock profile does not model; they \
@@ -2117,7 +2156,10 @@ fn log_refusals(
     );
     for refusal in refusals.iter().take(STOCK_REFUSAL_LOG_LIMIT) {
         warn!(
-            node_id = %config.node_id,
+            node_id = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.node_id.to_string()),
+                &[]
+            ),
             type_url = refusal.type_label,
             reason = refusal.reason,
             "Refused a stock xDS resource"
@@ -2125,7 +2167,10 @@ fn log_refusals(
     }
     if refusals.len() > STOCK_REFUSAL_LOG_LIMIT {
         warn!(
-            node_id = %config.node_id,
+            node_id = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.node_id.to_string()),
+                &[]
+            ),
             suppressed = refusals.len() - STOCK_REFUSAL_LOG_LIMIT,
             "Additional stock xDS refusals suppressed by the per-apply log bound"
         );
@@ -2581,7 +2626,7 @@ pub async fn start_stock_policy_watcher_with_shutdown(
             Ok(stream) => stream,
             Err(e) => {
                 warn!(
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
                     "Failed to register SIGHUP handler for the stock xDS mesh policy \
                      document; it will not reload until restart"
                 );

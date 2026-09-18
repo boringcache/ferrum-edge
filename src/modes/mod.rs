@@ -231,7 +231,10 @@ pub(crate) fn start_acme_renewal_scheduler(
             &env_config.acme_renew_challenge_type,
         ) else {
             warn!(
-                value = %env_config.acme_renew_challenge_type,
+                value = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", env_config.acme_renew_challenge_type),
+                    &[]
+                ),
                 "invalid FERRUM_ACME_RENEW_CHALLENGE_TYPE; ACME renewal scheduler disabled"
             );
             return None;
@@ -289,7 +292,7 @@ async fn handle_startup_plugin_migrations_with_list(
                 "Could not determine pending custom-plugin migrations ({}). \
                  Run FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up to verify \
                  schema if you have plugins with bundled migrations.",
-                e
+                crate::startup::sanitize_startup_cause(&e, &[])
             );
             return Ok(());
         }
@@ -352,7 +355,7 @@ async fn handle_startup_plugin_migrations_with_list(
              traffic that depends on the new schema, or set \
              FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true to auto-apply at startup.",
             pending.len(),
-            pending_description
+            crate::startup::sanitize_startup_cause(format!("{pending_description:?}"), &[])
         );
     }
 
@@ -410,14 +413,16 @@ pub(crate) fn apply_config_validation_rejection(
                 "Full config load rejected by validation or row decode ({}); backend is reachable \
                  so KEEPING admin API writable to repair the offending resource in-band, serving \
                  last known-good runtime config: {}",
-                context, err
+                context,
+                crate::startup::sanitize_startup_cause(err, &[])
             );
         } else {
             error!(
                 "Full config load rejected by validation or row decode ({}); backend is reachable \
                  but deferred migrations are still pending, so admin writes stay BLOCKED until \
                  the schema is applied; serving last known-good runtime config: {}",
-                context, err
+                context,
+                crate::startup::sanitize_startup_cause(err, &[])
             );
         }
     } else {

@@ -170,7 +170,7 @@ pub fn apply_file_config_candidate(
         Err(e) => {
             error!(
                 "Configuration reload failed, keeping previous config: {}",
-                e
+                crate::startup::sanitize_startup_cause(&e, &[])
             );
             config_rejected.store(true, Ordering::Relaxed);
         }
@@ -796,7 +796,7 @@ pub async fn serve(
         effective_reserved_ports(&env_config, &prebound, suppress_env_admin_https_reservation);
     if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
         for msg in &errors {
-            error!("{}", msg);
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
         }
         return Err(anyhow::anyhow!(
             "Stream proxy port conflicts with gateway reserved ports"
@@ -971,7 +971,10 @@ pub async fn serve(
             }
             Ok(None) => None,
             Err(e) => {
-                error!("TLS configuration validation failed: {:#}", e);
+                error!(
+                    "TLS configuration validation failed: {}",
+                    crate::startup::sanitize_startup_cause(&e, &[])
+                );
                 shutdown_file_background_startup_tasks(
                     &shutdown_tx,
                     &proxy_state,
@@ -1166,7 +1169,10 @@ pub async fn serve(
         ) {
             Ok(candidate) => candidate,
             Err(e) => {
-                error!("Admin TLS configuration failed: {:#}", e);
+                error!(
+                    "Admin TLS configuration failed: {}",
+                    crate::startup::sanitize_startup_cause(&e, &[])
+                );
                 shutdown_file_background_startup_tasks(
                     &shutdown_tx,
                     &proxy_state,
@@ -1638,7 +1644,7 @@ pub async fn serve(
         warn!(
             "Gateway startup failed after spawning listener / background tasks: {}; \
              draining spawned tasks before returning",
-            e
+            crate::startup::sanitize_startup_cause(&e, &[])
         );
         if let Err(listener_err) = serve_handles.shutdown_and_join().await {
             return Err(listener_err.context(format!("Gateway startup failed: {e}")));

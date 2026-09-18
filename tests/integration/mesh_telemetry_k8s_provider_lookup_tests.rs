@@ -172,9 +172,10 @@ fn k8s_telemetry_missing_mesh_config_provider_warns_and_skips() {
         "missing provider reference must not surface a tracing provider"
     );
     assert!(
-        warnings.iter().any(|warning| warning.contains(
-            "Telemetry default/sample references unknown meshConfig extensionProvider 'missing-provider'"
-        )),
+        warnings.iter().any(|warning| warning.contains(concat!(
+            "Telemetry \"default\"/\"sample\" references unknown meshConfig ",
+            "extensionProvider \"missing-provider\""
+        ))),
         "missing provider should emit an operator-visible warning: {warnings:?}"
     );
 }
@@ -236,9 +237,10 @@ extensionProviders:
         "non-tracing extensionProvider must not surface a tracing provider"
     );
     assert!(
-        warnings.iter().any(|warning| warning.contains(
-            "Telemetry default/sample references meshConfig extensionProvider 'ext-authz' which is declared but not a tracing provider type"
-        )),
+        warnings.iter().any(|warning| warning.contains(concat!(
+            "Telemetry \"default\"/\"sample\" references meshConfig extensionProvider ",
+            "\"ext-authz\" which is declared but not a tracing provider type"
+        ))),
         "warning should distinguish declared-but-not-tracing from unknown: {warnings:?}"
     );
 }

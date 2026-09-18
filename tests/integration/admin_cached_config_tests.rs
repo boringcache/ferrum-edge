@@ -8960,7 +8960,7 @@ async fn batch_rejects_stream_port_conflict_with_persisted_proxy() {
         "batch persisted a conflicting stream port: {body:?}"
     );
     assert!(
-        body.to_string().contains("Duplicate listen_port 19014"),
+        body.to_string().contains(r#"Duplicate listen_port \"19014\""#),
         "expected the canonical listener-group conflict diagnostic: {body:?}"
     );
     let (status, _, _) = admin_get(&base_url, "/proxies/batch-port-conflict", &token).await;

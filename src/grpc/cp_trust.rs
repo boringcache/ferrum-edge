@@ -426,7 +426,7 @@ impl PinnedTrustBundleSource {
     /// mount, so it falls back to the unpinned contract where every referenced
     /// file needs its own `material_sha256`.
     pub fn pin(path: &str) -> Result<Self, TrustBundleLoadError> {
-        let subject = format!("CP/DP trust bundle '{path}'");
+        let subject = format!("CP/DP trust bundle {path:?}");
         let bundle_path = Path::new(path);
 
         if let Some(mount_dir) = bundle_path.parent() {
@@ -467,7 +467,7 @@ impl PinnedTrustBundleSource {
                 return Err(TrustBundleLoadError::new(
                     TrustBundleRejectReason::SourceGenerationUnsupported,
                     format!(
-                        "{subject} is served from a projected '{PROJECTED_GENERATION_LINK}' \
+                        "{subject} is served from a projected `{PROJECTED_GENERATION_LINK}` \
                          generation, which this platform cannot pin. Ferrum refuses to fall back \
                          to re-resolving the live symlink per file, because that is exactly how a \
                          rotation can pair one generation's namespace policy with another \
@@ -615,7 +615,7 @@ fn read_pinned_material(
         return Err(TrustBundleLoadError::new(
             TrustBundleRejectReason::SourceGenerationEscape,
             format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' names no file inside the pinned \
+                "CP/DP trust bundle {origin:?}: key {kid:?} names no file inside the pinned \
                  projected generation"
             ),
         ));
@@ -637,7 +637,7 @@ fn read_pinned_material(
             return Err(TrustBundleLoadError::new(
                 TrustBundleRejectReason::SourceGenerationUnstable,
                 format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
+                    "CP/DP trust bundle {origin:?}: key {kid:?} could not be resolved inside the \
                      pinned projected generation: {e}"
                 ),
             ));
@@ -654,7 +654,7 @@ fn read_pinned_material(
             return Err(TrustBundleLoadError::new(
                 reason,
                 format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' could not be resolved inside the \
+                    "CP/DP trust bundle {origin:?}: key {kid:?} could not be resolved inside the \
                      pinned projected generation: {e}"
                 ),
             ));
@@ -707,7 +707,7 @@ fn resolve_entry_material(
         return Err(TrustBundleLoadError::new(
             TrustBundleRejectReason::DocumentInvalid,
             format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' must declare exactly one of \
+                "CP/DP trust bundle {origin:?}: key {kid:?} must declare exactly one of \
                  `secret`, `secret_env`, `secret_path`, `public_key_pem`, or \
                  `public_key_path` (found {source_count})"
             ),
@@ -719,7 +719,7 @@ fn resolve_entry_material(
             TrustBundleLoadError::new(
                 TrustBundleRejectReason::MaterialIntegrityMalformed,
                 format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' declares a `material_sha256` \
+                    "CP/DP trust bundle {origin:?}: key {kid:?} declares a `material_sha256` \
                      that is not exactly 64 lowercase hexadecimal digits"
                 ),
             )
@@ -738,7 +738,7 @@ fn resolve_entry_material(
                 return Err(TrustBundleLoadError::new(
                     TrustBundleRejectReason::DocumentInvalid,
                     format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' declares `material_sha256` \
+                        "CP/DP trust bundle {origin:?}: key {kid:?} declares `material_sha256` \
                          without `secret_path` or `public_key_path`. Inline and \
                          environment-backed material is read atomically with the document and \
                          carries no separate integrity binding."
@@ -750,7 +750,7 @@ fn resolve_entry_material(
     };
 
     let subject = format!(
-        "CP/DP trust bundle '{origin}' key '{kid}' {} file",
+        "CP/DP trust bundle {origin:?} key {kid:?} {} file",
         if entry.secret_path.is_some() {
             "secret"
         } else {
@@ -769,7 +769,7 @@ fn resolve_entry_material(
         return Err(TrustBundleLoadError::new(
             TrustBundleRejectReason::SourceGenerationEscape,
             format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' references material through a `..` \
+                "CP/DP trust bundle {origin:?}: key {kid:?} references material through a `..` \
                  path component"
             ),
         ));
@@ -782,7 +782,7 @@ fn resolve_entry_material(
                 return Err(TrustBundleLoadError::new(
                     TrustBundleRejectReason::MaterialIntegrityUnbound,
                     format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' resolves material outside a \
+                        "CP/DP trust bundle {origin:?}: key {kid:?} resolves material outside a \
                          pinned projected generation, so nothing proves the bytes read belong to \
                          the generation the document itself was read from — a rotation can pair \
                          one generation's namespace ceiling with another's key material. Declare \
@@ -808,7 +808,7 @@ fn resolve_entry_material(
         return Err(TrustBundleLoadError::new(
             TrustBundleRejectReason::MaterialIntegrityMismatch,
             format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' material does not match the \
+                "CP/DP trust bundle {origin:?}: key {kid:?} material does not match the \
                  `material_sha256` the document binds it to"
             ),
         ));
@@ -1262,20 +1262,20 @@ impl CpDpTrustBundle {
         let document: TrustBundleDocument = crate::util::deserialization::from_json_str(raw)
             .map_err(|e| {
                 invalid(format!(
-                    "CP/DP trust bundle '{origin}' is not valid JSON: {e}"
+                    "CP/DP trust bundle {origin:?} is not valid JSON: {e}"
                 ))
             })?;
         if let Some(version) = document.version
             && version != 1
         {
             return Err(invalid(format!(
-                "CP/DP trust bundle '{origin}' declares unsupported version <redacted scalar>; \
+                "CP/DP trust bundle {origin:?} declares unsupported version <redacted scalar>; \
                  only version 1 is understood"
             )));
         }
         if document.keys.is_empty() {
             return Err(invalid(format!(
-                "CP/DP trust bundle '{origin}' declares no keys; a control plane with no \
+                "CP/DP trust bundle {origin:?} declares no keys; a control plane with no \
                  verification credential can authorize nothing"
             )));
         }
@@ -1294,7 +1294,7 @@ impl CpDpTrustBundle {
                     return Err(TrustBundleLoadError::new(
                         TrustBundleRejectReason::MaterialUnreadable,
                         format!(
-                            "CP/DP trust bundle '{origin}' resolves more than \
+                            "CP/DP trust bundle {origin:?} resolves more than \
                              {TRUST_MATERIAL_TOTAL_MAX_BYTES} bytes of path-backed key material \
                              in one candidate"
                         ),
@@ -1322,7 +1322,7 @@ impl CpDpTrustBundle {
                 // would make which namespaces a token can reach depend on map
                 // ordering.
                 return Err(invalid(format!(
-                    "CP/DP trust bundle '{origin}' declares duplicate kid '{}'; key selection \
+                    "CP/DP trust bundle {origin:?} declares duplicate `kid` {:?}; key selection \
                      must be unambiguous",
                     key.kid
                 )));
@@ -1964,7 +1964,7 @@ impl std::fmt::Debug for TrustBundleKeyDocument {
 /// variable *name*; no key material of either credential is included.
 fn fleet_secret_reuse_error(origin: &str, kid: &str) -> String {
     format!(
-        "CP/DP trust bundle '{origin}': key '{kid}' is backed by the fleet-wide \
+        "CP/DP trust bundle {origin:?}: key {kid:?} is backed by the fleet-wide \
          {FLEET_SECRET_ENV}. Every data plane holds that value, so any of them could name this \
          `kid` and reach this credential's namespaces — the cross-tenant forgery advisory \
          GHSA-3f2j-wwqw-grmg exists to close. Give each credential its own material, or use an \
@@ -1987,23 +1987,23 @@ impl TrustBundleKeyDocument {
         let kid = self.kid.trim().to_string();
         if kid.is_empty() {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': every key requires a non-empty `kid`"
+                "CP/DP trust bundle {origin:?}: every key requires a non-empty `kid`"
             ));
         }
         if kid.len() > MAX_KEY_ID_LEN {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': `kid` exceeds {MAX_KEY_ID_LEN} bytes"
+                "CP/DP trust bundle {origin:?}: `kid` exceeds {MAX_KEY_ID_LEN} bytes"
             ));
         }
         if kid.chars().any(char::is_control) {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': `kid` must not contain control characters"
+                "CP/DP trust bundle {origin:?}: `kid` must not contain control characters"
             ));
         }
 
         let algorithm: Algorithm = self.algorithm.trim().parse().map_err(|_| {
             format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' declares unsupported algorithm \
+                "CP/DP trust bundle {origin:?}: key {kid:?} declares unsupported algorithm \
                  <redacted scalar>"
             )
         })?;
@@ -2011,7 +2011,7 @@ impl TrustBundleKeyDocument {
             && !crate::fips::policy::is_approved_jwt_algorithm(self.algorithm.as_str())
         {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' declares a JWS algorithm outside \
+                "CP/DP trust bundle {origin:?}: key {kid:?} declares a JWS algorithm outside \
                  Ferrum's approved set while FIPS mode is enforced"
             ));
         }
@@ -2021,12 +2021,12 @@ impl TrustBundleKeyDocument {
             let namespace = raw.trim();
             if namespace.is_empty() {
                 return Err(format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' lists an empty namespace"
+                    "CP/DP trust bundle {origin:?}: key {kid:?} lists an empty namespace"
                 ));
             }
             if namespace.chars().any(char::is_control) {
                 return Err(format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' lists a namespace containing \
+                    "CP/DP trust bundle {origin:?}: key {kid:?} lists a namespace containing \
                      control characters"
                 ));
             }
@@ -2037,7 +2037,7 @@ impl TrustBundleKeyDocument {
             // authorize nothing. That is almost certainly an operator mistake,
             // and accepting it silently would hide a broken tenant rollout.
             return Err(format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' must list at least one namespace"
+                "CP/DP trust bundle {origin:?}: key {kid:?} must list at least one namespace"
             ));
         }
 
@@ -2053,7 +2053,7 @@ impl TrustBundleKeyDocument {
 
         if secret_sources + public_sources != 1 {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' must declare exactly one of \
+                "CP/DP trust bundle {origin:?}: key {kid:?} must declare exactly one of \
                  `secret`, `secret_env`, `secret_path`, `public_key_pem`, or `public_key_path` \
                  (found {})",
                 secret_sources + public_sources
@@ -2061,14 +2061,14 @@ impl TrustBundleKeyDocument {
         }
         if symmetric && public_sources == 1 {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' declares symmetric algorithm \
-                 '{algorithm:?}' with public-key material"
+                "CP/DP trust bundle {origin:?}: key {kid:?} declares symmetric algorithm \
+                 \"{algorithm:?}\" with public-key material"
             ));
         }
         if !symmetric && secret_sources == 1 {
             return Err(format!(
-                "CP/DP trust bundle '{origin}': key '{kid}' declares asymmetric algorithm \
-                 '{algorithm:?}' with symmetric secret material"
+                "CP/DP trust bundle {origin:?}: key {kid:?} declares asymmetric algorithm \
+                 \"{algorithm:?}\" with symmetric secret material"
             ));
         }
 
@@ -2086,32 +2086,32 @@ impl TrustBundleKeyDocument {
                 }
                 std::env::var(var).map_err(|_| {
                     format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' references environment \
-                         variable '{var}', which is unset or not valid UTF-8"
+                        "CP/DP trust bundle {origin:?}: key {kid:?} references environment \
+                         variable {var:?}, which is unset or not valid UTF-8"
                     )
                 })?
             } else if self.secret_path.is_some() {
                 let raw = material.ok_or_else(|| {
                     format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' has no readable secret source"
+                        "CP/DP trust bundle {origin:?}: key {kid:?} has no readable secret source"
                     )
                 })?;
                 decode_trust_utf8(
                     raw,
-                    &format!("CP/DP trust bundle '{origin}' key '{kid}' secret file"),
+                    &format!("CP/DP trust bundle {origin:?} key {kid:?} secret file"),
                 )?
                 .trim()
                 .to_string()
             } else {
                 // Unreachable: the source-count check above admits exactly one.
                 return Err(format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' has no readable secret source"
+                    "CP/DP trust bundle {origin:?}: key {kid:?} has no readable secret source"
                 ));
             };
             if secret.len() < MIN_HS_SECRET_LEN {
                 // Length only — the value itself is never rendered.
                 return Err(format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' symmetric secret must be at \
+                    "CP/DP trust bundle {origin:?}: key {kid:?} symmetric secret must be at \
                      least {MIN_HS_SECRET_LEN} bytes"
                 ));
             }
@@ -2132,17 +2132,17 @@ impl TrustBundleKeyDocument {
             } else if self.public_key_path.is_some() {
                 let raw = material.ok_or_else(|| {
                     format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' has no readable public key \
+                        "CP/DP trust bundle {origin:?}: key {kid:?} has no readable public key \
                          source"
                     )
                 })?;
                 decode_trust_utf8(
                     raw,
-                    &format!("CP/DP trust bundle '{origin}' key '{kid}' public key file"),
+                    &format!("CP/DP trust bundle {origin:?} key {kid:?} public key file"),
                 )?
             } else {
                 return Err(format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' has no readable public key source"
+                    "CP/DP trust bundle {origin:?}: key {kid:?} has no readable public key source"
                 ));
             };
             let bytes = pem.as_bytes();
@@ -2158,14 +2158,14 @@ impl TrustBundleKeyDocument {
                 Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
                     // Unreachable: `symmetric` covers these above.
                     return Err(format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' algorithm/material mismatch"
+                        "CP/DP trust bundle {origin:?}: key {kid:?} algorithm/material mismatch"
                     ));
                 }
             };
             let decoding_key = parsed.map_err(|e| {
                 format!(
-                    "CP/DP trust bundle '{origin}': key '{kid}' public key is not valid PEM for \
-                     '{algorithm:?}': {e}"
+                    "CP/DP trust bundle {origin:?}: key {kid:?} public key is not valid PEM for \
+                     \"{algorithm:?}\": {e}"
                 )
             })?;
             let identity_material = canonical_public_key_identity_material(bytes);

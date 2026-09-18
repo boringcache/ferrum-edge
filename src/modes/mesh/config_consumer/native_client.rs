@@ -270,7 +270,10 @@ pub async fn start_native_mesh_client_with_shutdown(
             Ok(attempt) => {
                 if attempt.is_endpoint_failure() {
                     warn!(
-                        cp_url = %cp_url,
+                        cp_url = %crate::startup::sanitize_startup_cause(
+                            format!("{:?}", cp_url.to_string()),
+                            &[]
+                        ),
                         outcome = attempt.as_metric_label(),
                         "Native MeshSubscribe stream ended; rotating to the next configured CP"
                     );
@@ -294,7 +297,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                     .filter(|status| status.code() == tonic::Code::ResourceExhausted);
                 if let Some(status) = admission_refusal {
                     error!(
-                        cp_url = %cp_url,
+                        cp_url = %crate::startup::sanitize_startup_cause(
+                            format!("{:?}", cp_url.to_string()),
+                            &[]
+                        ),
                         outcome = MeshStreamAttempt::AdmissionRefused.as_metric_label(),
                         status = %status.message(),
                         "Control plane REFUSED the native MeshSubscribe stream for \
@@ -330,18 +336,24 @@ pub async fn start_native_mesh_client_with_shutdown(
                 match observed_class_from_error(&e).filter(|_| admission_refusal.is_none()) {
                     Some(class) => {
                         error!(
-                            cp_url = %cp_url,
+                            cp_url = %crate::startup::sanitize_startup_cause(
+                                format!("{:?}", cp_url.to_string()),
+                                &[]
+                            ),
                             outcome = attempt.as_metric_label(),
                             native_tls_class = class.as_str(),
-                            error = %e,
+                            error = %crate::startup::sanitize_startup_cause(&e, &[]),
                             "Native MeshSubscribe connection failed"
                         );
                     }
                     None if admission_refusal.is_none() => {
                         error!(
-                            cp_url = %cp_url,
+                            cp_url = %crate::startup::sanitize_startup_cause(
+                                format!("{:?}", cp_url.to_string()),
+                                &[]
+                            ),
                             outcome = attempt.as_metric_label(),
-                            error = %e,
+                            error = %crate::startup::sanitize_startup_cause(&e, &[]),
                             "Native MeshSubscribe connection failed"
                         );
                     }
@@ -555,7 +567,10 @@ async fn connect_mesh_subscribe(
             }
             _ = &mut silence_deadline, if heartbeats_observed => {
                 warn!(
-                    cp_url = %cp_url,
+                    cp_url = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", cp_url.to_string()),
+                        &[]
+                    ),
                     max_silence_secs = config.timings.max_silence.as_secs(),
                     "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
                 );
@@ -598,7 +613,10 @@ async fn connect_mesh_subscribe(
                     .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
                     if let Err(err) = sent {
                         warn!(
-                            version = %version,
+                            version = %crate::startup::sanitize_startup_cause(
+                                format!("{:?}", version.to_string()),
+                                &[]
+                            ),
                             code = ?err.code(),
                             "Failed to report mesh slice runtime verdict to control plane"
                         );
@@ -702,7 +720,10 @@ async fn connect_mesh_subscribe(
                 .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
                 if let Err(err) = sent {
                     warn!(
-                        version = %slice.version,
+                        version = %crate::startup::sanitize_startup_cause(
+                            format!("{:?}", slice.version.to_string()),
+                            &[]
+                        ),
                         code = ?err.code(),
                         "Failed to report mesh slice ACK to control plane"
                     );
@@ -737,7 +758,10 @@ async fn connect_mesh_subscribe(
                     .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
                     if let Err(err) = sent {
                         warn!(
-                            version = %update.version,
+                            version = %crate::startup::sanitize_startup_cause(
+                                format!("{:?}", update.version.to_string()),
+                                &[]
+                            ),
                             code = ?err.code(),
                             "Failed to report mesh slice NACK to control plane"
                         );
@@ -760,7 +784,10 @@ async fn connect_mesh_subscribe(
                     return Err(anyhow::Error::new(rejection));
                 }
                 warn!(
-                    cp_url = %cp_url,
+                    cp_url = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", cp_url.to_string()),
+                        &[]
+                    ),
                     reason = rejection.reason_label(),
                     "Ignoring invalid native MeshSubscribe update; keeping last-good slice"
                 );

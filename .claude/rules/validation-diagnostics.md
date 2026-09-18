@@ -66,3 +66,10 @@ paths:
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
   and Kubernetes port/weight/concurrency/sampling diagnostics. JSON Display
   strings must be Debug-escaped even when a sibling guard already does so.
+
+- Scope of #5591: plugin diagnostics are converted per family under #5594; the
+  renderer withholds their single-quoted spans fail-closed in the meantime; the
+  known disclosure classes there are apostrophe-leading `'{value}'`
+  interpolations and retained regex-library errors. This PR finishes WAF,
+  CP trust-bundle and SQL row diagnostics, stream-port/other early emissions,
+  and the Istio port-level rejection; other plugin families stay under #5594.

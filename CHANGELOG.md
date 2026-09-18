@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Close round-17 startup diagnostic disclosures (#5591): discard WAF custom-rule
+  regex errors, escape CP trust identifiers and SQL row IDs, sanitize early
+  configuration warnings/errors and stream-port conflicts, and withhold Istio
+  port-level values. Remaining plugin families are tracked in #5594.
+
 - Startup failures now print the full cause chain (#5589), including mesh field
   paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
   classify serde families from the bare inner error, separately from document

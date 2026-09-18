@@ -3,6 +3,23 @@ use ferrum_edge::startup::render_startup_error;
 use serde_json::json;
 
 #[test]
+fn waf_custom_pattern_sets_do_not_retain_regex_library_errors() {
+    for (target, set) in [("url_path", "url_path"), ("body_text", "body_bytes")] {
+        let config = json!({"include_default_rules": false, "custom_rules": [{
+            "id": "fixture", "category": "test", "target": target,
+            "pattern": "UNREGISTERED_PATTERN_5591["
+        }]});
+        let error = validate_plugin_config("waf", &config).unwrap_err();
+        assert!(!error.contains("UNREGISTERED_PATTERN_5591"), "{error}");
+        let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains("`pattern`"), "{rendered}");
+        assert!(rendered.contains(&format!("`{set}`")), "{rendered}");
+        assert!(rendered.contains("rule indexes [0]"), "{rendered}");
+        assert!(rendered.contains("invalid or too complex"), "{rendered}");
+    }
+}
+
+#[test]
 fn constructor_object_guards_withhold_complete_json_values() {
     for plugin in [
         "access_control",

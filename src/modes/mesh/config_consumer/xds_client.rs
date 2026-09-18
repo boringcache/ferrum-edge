@@ -813,7 +813,10 @@ pub async fn start_xds_client_with_shutdown(
             Ok(attempt) => {
                 if attempt.is_endpoint_failure() {
                     warn!(
-                        cp_url = %cp_url,
+                        cp_url = %crate::startup::sanitize_startup_cause(
+                            format!("{:?}", cp_url.to_string()),
+                            &[]
+                        ),
                         outcome = attempt.as_metric_label(),
                         "xDS ADS stream ended; rotating to the next configured CP"
                     );
@@ -838,9 +841,12 @@ pub async fn start_xds_client_with_shutdown(
                     },
                 };
                 error!(
-                    cp_url = %cp_url,
+                    cp_url = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", cp_url.to_string()),
+                        &[]
+                    ),
                     outcome = attempt.as_metric_label(),
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
                     "xDS ADS attempt failed"
                 );
                 attempt
@@ -1203,8 +1209,14 @@ fn discard_pending_xds_slice_after_nack(
     let discarded = pending_slice.take().is_some();
     if discarded {
         warn!(
-            node_id = %config.node_id,
-            namespace = %config.namespace,
+            node_id = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.node_id.to_string()),
+                &[]
+            ),
+            namespace = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.namespace.to_string()),
+                &[]
+            ),
             type_url = xds_type_url_log_label(nacked_type_url),
             "Discarded debounced xDS slice after NACK to avoid applying mixed-version resources"
         );
@@ -1275,7 +1287,10 @@ async fn handle_ads_response(
         nack.response_nonce = response.nonce.clone();
         send_ads_request(tx, nack, XDS_OUTBOUND_BOUND).await?;
         warn!(
-            node_id = %config.node_id,
+            node_id = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", config.node_id.to_string()),
+                &[]
+            ),
             type_url = xds_type_url_log_label(&type_url),
             "Received unknown xDS type_url; sent NACK"
         );
@@ -1350,12 +1365,21 @@ async fn handle_ads_response(
             let consecutive_after = nack_circuit_breaker.consecutive_nacks(&type_url) + 1;
             if blocking_first_slice {
                 warn!(
-                    node_id = %config.node_id,
-                    namespace = %config.namespace,
+                    node_id = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", config.node_id.to_string()),
+                        &[]
+                    ),
+                    namespace = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", config.namespace.to_string()),
+                        &[]
+                    ),
                     type_url = xds_type_url_log_label(&type_url),
                     consecutive_nacks = consecutive_after,
                     nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
-                    error = %bounded_xds_log_value(&e),
+                    error = %crate::startup::sanitize_startup_cause(
+                        &bounded_xds_log_value(&e),
+                        &[]
+                    ),
                     "First mesh slice blocked: NACKing a required xDS type before initial convergence; \
                      repeated NACKs will trip the circuit breaker and force CP failover/reconnect"
                 );
@@ -1365,9 +1389,15 @@ async fn handle_ads_response(
                 );
             } else {
                 warn!(
-                    node_id = %config.node_id,
+                    node_id = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", config.node_id.to_string()),
+                        &[]
+                    ),
                     type_url = xds_type_url_log_label(&type_url),
-                    error = %bounded_xds_log_value(&e),
+                    error = %crate::startup::sanitize_startup_cause(
+                        &bounded_xds_log_value(&e),
+                        &[]
+                    ),
                     "NACKing invalid xDS ADS response"
                 );
             }
@@ -1396,8 +1426,14 @@ fn trip_nack_circuit_if_needed(
     }
 
     warn!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
+        node_id = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.node_id.to_string()),
+            &[]
+        ),
+        namespace = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.namespace.to_string()),
+            &[]
+        ),
         consecutive_nacks,
         nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
         "xDS ADS NACK circuit breaker tripped; closing stream to trigger reconnect/failover"
@@ -1594,8 +1630,14 @@ fn reverse_translate(
                     return Err(e);
                 }
                 warn!(
-                    resource_name = %bounded_xds_log_value(&resource.name),
-                    error = %bounded_xds_log_value(&e),
+                    resource_name = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
+                        &[]
+                    ),
+                    error = %crate::startup::sanitize_startup_cause(
+                        &bounded_xds_log_value(&e),
+                        &[]
+                    ),
                     "xDS ECDS resource failed TypedExtensionConfig decode; skipping"
                 );
                 continue;
@@ -1644,9 +1686,15 @@ fn reverse_translate(
                     ));
                 }
                 warn!(
-                    resource_name = %bounded_xds_log_value(&typed_extension.name),
-                    inner_type_url = %inner.type_url,
-                    error = %e,
+                    resource_name = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", bounded_xds_log_value(&typed_extension.name).to_string()),
+                        &[]
+                    ),
+                    inner_type_url = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", inner.type_url.to_string()),
+                        &[]
+                    ),
+                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
                     "xDS ECDS DR-carrier payload failed JSON decode; DR will be missing from slice"
                 );
             }
@@ -1745,8 +1793,11 @@ fn reverse_translate(
             }
             Err(e) => {
                 warn!(
-                    resource_name = %bounded_xds_log_value(&resource.name),
-                    error = %e,
+                    resource_name = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
+                        &[]
+                    ),
+                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
                     "xDS RTDS resource failed Runtime decode; skipping"
                 );
             }
@@ -2216,7 +2267,10 @@ fn retain_visible_cors_policies(
     let dropped = declared.saturating_sub(retained.len());
     if dropped > 0 {
         warn!(
-            workload_namespace = %workload_namespace,
+            workload_namespace = %crate::startup::sanitize_startup_cause(
+                format!("{:?}", workload_namespace.to_string()),
+                &[]
+            ),
             dropped,
             "Dropped xDS VirtualService CORS carrier entries not exported to this namespace"
         );
@@ -2509,9 +2563,18 @@ fn mesh_slice_carrier_inner<'a>(
         }
         if warn_on_non_reserved_name {
             warn!(
-                resource_name = %bounded_xds_log_value(&resource.name),
-                expected_name = %expected_name,
-                inner_type_url = %inner.type_url,
+                resource_name = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
+                    &[]
+                ),
+                expected_name = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", expected_name.to_string()),
+                    &[]
+                ),
+                inner_type_url = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", inner.type_url.to_string()),
+                    &[]
+                ),
                 "xDS ECDS resource used reserved Ferrum mesh-slice carrier type_url with non-reserved name; skipping"
             );
         }

@@ -153,7 +153,7 @@ pub fn load_config_from_file(
             if mode & 0o004 != 0 {
                 warn!(
                     "Config file {} is world-readable (mode {:o}). Consider restricting permissions as it may contain credentials.",
-                    file_path.display(),
+                    crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[]),
                     mode & 0o777
                 );
             }

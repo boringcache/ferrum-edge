@@ -11,6 +11,7 @@
 //!   control characters to prevent log injection attacks.
 
 use crate::config::plugin_trigger::PluginTrigger;
+use crate::startup::sanitize_startup_cause;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -5362,7 +5363,7 @@ impl GatewayConfig {
                     }
                     Some(port) if port < 1 => {
                         errors.push(format!(
-                            "Stream proxy {:?} has invalid listen_port {} (must be >= 1)",
+                            "Stream proxy {:?} has invalid listen_port \"{}\" (must be >= 1)",
                             proxy.id, port
                         ));
                     }
@@ -5389,7 +5390,7 @@ impl GatewayConfig {
                 && port == 0
             {
                 errors.push(format!(
-                    "HTTP proxy {:?} has invalid listen_port {} (must be >= 1)",
+                    "HTTP proxy {:?} has invalid listen_port \"{}\" (must be >= 1)",
                     proxy.id, port
                 ));
             }
@@ -5473,7 +5474,8 @@ impl GatewayConfig {
                 let mixed_passthrough = proxies_on_port.iter().any(|p| p.passthrough);
                 if mixed_passthrough {
                     errors.push(format!(
-                        "Duplicate listen_port {} mixes passthrough and non-passthrough proxies — \
+                        "Duplicate listen_port \"{}\" mixes passthrough and non-passthrough \
+                         proxies — \
                          a shared stream listener is built from one representative before any route \
                          is selected, so every candidate on a port must agree on passthrough",
                         port
@@ -5486,14 +5488,19 @@ impl GatewayConfig {
                     .map(|p| p.id.as_str())
                     .collect();
                 errors.push(format!(
-                    "Duplicate listen_port {} — proxies sharing a port must form one shared listener: \
+                    "Duplicate listen_port \"{}\" — proxies sharing a port must form one shared \
+                     listener: \
                      all passthrough: true, all opaque tcp listeners with at least one declaring hosts \
                      (SNI routing), or an L4 stream_match group. Offending: {}",
                     port,
                     if non_sni.is_empty() {
                         "no candidate declares hosts or stream_match".to_string()
                     } else {
-                        non_sni.join(", ")
+                        non_sni
+                            .iter()
+                            .map(|id| format!("{id:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 ));
                 continue;
@@ -5510,11 +5517,16 @@ impl GatewayConfig {
                 .collect();
             if !pp_enabled.is_empty() && pp_enabled.len() != proxies_on_port.len() {
                 errors.push(format!(
-                    "Shared listen_port {} mixes stream_proxy_protocol settings ({} enable it) — \
+                    "Shared listen_port \"{}\" mixes stream_proxy_protocol settings \
+                     ({} enable it) — \
                      the PROXY header is parsed before SNI/L4 match resolution, so every proxy sharing a \
                      port must agree on stream_proxy_protocol",
                     port,
-                    pp_enabled.join(", ")
+                    pp_enabled
+                        .iter()
+                        .map(|id| format!("{id:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
 
@@ -5530,7 +5542,8 @@ impl GatewayConfig {
                 .any(|p| p.effective_scheme() != representative.effective_scheme());
             if mixed_scheme {
                 errors.push(format!(
-                    "Shared listen_port {} mixes backend schemes — every candidate must use the same tcp/tcps listener scheme",
+                    "Shared listen_port \"{}\" mixes backend schemes — every candidate must use \
+                     the same tcp/tcps listener scheme",
                     port
                 ));
             }
@@ -5539,7 +5552,8 @@ impl GatewayConfig {
                 .any(|p| p.frontend_tls != representative.frontend_tls);
             if mixed_frontend_tls {
                 errors.push(format!(
-                    "Shared listen_port {} mixes frontend_tls settings — every candidate must agree before route resolution",
+                    "Shared listen_port \"{}\" mixes frontend_tls settings — every candidate \
+                     must agree before route resolution",
                     port
                 ));
             }
@@ -5557,7 +5571,8 @@ impl GatewayConfig {
                 });
                 if mixed_backend_tls {
                     errors.push(format!(
-                        "Shared listen_port {} mixes backend TLS listener settings — every tcps candidate must use the same verifier and client identity sources",
+                        "Shared listen_port \"{}\" mixes backend TLS listener settings — every \
+                         tcps candidate must use the same verifier and client identity sources",
                         port
                     ));
                 }
@@ -5577,7 +5592,8 @@ impl GatewayConfig {
                     .count();
                 if catch_all > 1 {
                     errors.push(format!(
-                        "L4 stream_match port {} has {catch_all} catch-all proxies — at most one unconstrained match is allowed",
+                        "L4 stream_match port \"{}\" has {catch_all} catch-all proxies — at most \
+                         one unconstrained match is allowed",
                         port
                     ));
                 }
@@ -5602,7 +5618,8 @@ impl GatewayConfig {
                 .count();
             if catch_all_count > 1 {
                 errors.push(format!(
-                    "SNI-routed port {} has {} proxies with empty hosts — at most one catch-all is allowed",
+                    "SNI-routed port \"{}\" has {} proxies with empty hosts — at most one \
+                     catch-all is allowed",
                     port, catch_all_count
                 ));
             }
@@ -5620,7 +5637,7 @@ impl GatewayConfig {
                         continue;
                     }
                     errors.push(format!(
-                        "SNI-routed proxies {:?} and {:?} on port {} have overlapping hosts — \
+                        "SNI-routed proxies {:?} and {:?} on port \"{}\" have overlapping hosts — \
                          each SNI hostname must route to exactly one matcher-free proxy (or ordered stream_match criteria)",
                         a.id, b.id, port
                     ));
@@ -5651,7 +5668,8 @@ impl GatewayConfig {
                 && reserved_ports.contains(&port)
             {
                 errors.push(format!(
-                    "Stream proxy {:?} listen_port {} conflicts with a gateway reserved port \
+                    "Stream proxy {:?} `listen_port` \"{}\" conflicts with a gateway \
+                     reserved port \
                      (proxy/admin/gRPC listener)",
                     proxy.id, port
                 ));
@@ -6872,8 +6890,8 @@ impl CountryMmdbLoadSession {
         }
         let retained = self.retained_snapshots.get(path_key)?;
         tracing::warn!(
-            db_path = %path,
-            error = %error,
+            db_path = %sanitize_startup_cause(format!("{:?}", path.to_string()), &[]),
+            error = %sanitize_startup_cause(&error, &[]),
             plugin = "geo_restriction",
             retained_snapshot_bytes = retained.size_bytes(),
             "MaxMind database temporarily unavailable during node-local refresh; retaining the last known good snapshot so geo enforcement is not downgraded to the on_lookup_failure fallback"

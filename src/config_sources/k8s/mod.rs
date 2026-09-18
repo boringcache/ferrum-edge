@@ -77,6 +77,7 @@ use crate::config::types::{
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::{MeshConfig, WorkloadSelector};
 use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
+use crate::startup::sanitize_startup_cause;
 
 /// Marker phrase carried by a translation error for an object that is **valid**
 /// under the pinned Gateway API CRD schema but names a shape Ferrum does not
@@ -3479,7 +3480,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
             if !value.is_string() {
                 tracing::warn!(
                     direction = direction,
-                    header = %key,
+                    header = %sanitize_startup_cause(format!("{:?}", key.to_string()), &[]),
                     value_kind = json_value_kind(value),
                     "VirtualService headers.{}.set entry has non-string value; entry will be dropped",
                     direction,
@@ -3492,7 +3493,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
             if !value.is_string() {
                 tracing::warn!(
                     direction = direction,
-                    header = %key,
+                    header = %sanitize_startup_cause(format!("{:?}", key.to_string()), &[]),
                     value_kind = json_value_kind(value),
                     "VirtualService headers.{}.add entry has non-string value; entry will be dropped",
                     direction,

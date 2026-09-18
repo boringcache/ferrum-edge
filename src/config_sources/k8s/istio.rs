@@ -45,6 +45,7 @@ use crate::config::types::{
     validate_system_trust_roots_skip_verify_pairing, validate_tls_material_source_field,
 };
 use crate::plugins::mesh::workload_metrics::validate_istio_telemetry_config;
+use crate::startup::sanitize_startup_cause;
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -192,8 +193,14 @@ fn authorization_policy(
     }
     if rules.is_empty() && action == PolicyAction::Allow {
         tracing::warn!(
-            namespace = %object.metadata.namespace,
-            policy = %object.metadata.name,
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            policy = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.name.to_string()),
+                &[]
+            ),
             "Istio ALLOW AuthorizationPolicy has no rules; emitting synthetic never-match allow rule to preserve allow-nothing semantics",
         );
         rules.push(allow_nothing_rule());
@@ -1396,8 +1403,14 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
     for field in ["outputPayloadToHeader", "fromCookies"] {
         if rule.get(field).is_some() {
             tracing::warn!(
-                namespace = %object.metadata.namespace,
-                resource = %object.metadata.name,
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.namespace.to_string()),
+                    &[]
+                ),
+                resource = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.name.to_string()),
+                    &[]
+                ),
                 field = field,
                 "RequestAuthentication jwtRules[] field is recognized but not enforced; \
                  surfaced in status deferred_fields",
@@ -1749,20 +1762,16 @@ fn translate_port_level_settings(
                 "trafficPolicy.portLevelSettings[].port.number must be an integer",
             )
         })?;
-        if port_u64 == 0 || port_u64 > u16::MAX as u64 {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "trafficPolicy.portLevelSettings[].port.number must be 1-65535 (got {port_u64})"
-                ),
-            ));
-        }
-        let port = port_u64 as u16;
+        let port = port_from_u64(
+            object,
+            port_u64,
+            "trafficPolicy.portLevelSettings[].port.number",
+        )?;
 
         if !seen_ports.insert(port) {
             return Err(invalid_resource(
                 object,
-                format!("trafficPolicy.portLevelSettings has duplicate port {port}"),
+                format!("trafficPolicy.portLevelSettings has duplicate port \"{port}\""),
             ));
         }
         let policy =
@@ -2506,9 +2515,15 @@ fn translate_locality_lb_setting(
             // trip this raw-string dedupe.
             if !seen.insert(raw.to_string()) {
                 tracing::warn!(
-                    resource = %object.metadata.name,
-                    namespace = %object.metadata.namespace,
-                    key = %key,
+                    resource = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.namespace.to_string()),
+                        &[]
+                    ),
+                    key = %sanitize_startup_cause(format!("{:?}", key.to_string()), &[]),
                     index = idx,
                     "DestinationRule localityLbSetting.failoverPriority contains a duplicate \
                      identical entry; each list position remains a match step (expected values \
@@ -2807,8 +2822,14 @@ fn translate_outlier_detection(
     for field in DEFERRED_OUTLIER_DETECTION_FIELDS {
         if value.get(field).is_some() {
             tracing::warn!(
-                namespace = %object.metadata.namespace,
-                resource = %object.metadata.name,
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.namespace.to_string()),
+                    &[]
+                ),
+                resource = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.name.to_string()),
+                    &[]
+                ),
                 field = field,
                 "DestinationRule outlierDetection field is parsed but not applied; surfaced in \
                  status deferred_fields",
@@ -5009,7 +5030,7 @@ fn virtual_service_routes(
                 .filter(|delay| delay.was_clamped())
             {
                 let warning = format!(
-                    "VirtualService {}/{} http[{index}].fault.delay.fixedDelay is {} ms; \
+                    "VirtualService {:?}/{:?} http[{index}].fault.delay.fixedDelay is \"{}\" ms; \
                      clamping to Ferrum's {} ms fault-delay cap",
                     object.metadata.namespace,
                     object.metadata.name,
@@ -5017,12 +5038,25 @@ fn virtual_service_routes(
                     delay.applied_ms,
                 );
                 tracing::warn!(
-                    resource = %object.metadata.name,
-                    namespace = %object.metadata.namespace,
+                    resource = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.namespace.to_string()),
+                        &[]
+                    ),
                     http_route_index = index,
-                    requested_delay_ms = delay.requested_ms,
-                    applied_delay_ms = delay.applied_ms,
-                    "{warning}"
+                    requested_delay_ms = %sanitize_startup_cause(
+                        format!("{:?}", delay.requested_ms.to_string()),
+                        &[]
+                    ),
+                    applied_delay_ms = %sanitize_startup_cause(
+                        format!("{:?}", delay.applied_ms.to_string()),
+                        &[]
+                    ),
+                    "{}",
+                    sanitize_startup_cause(&warning, &[])
                 );
                 acc.warnings.push(warning);
             }
@@ -6246,8 +6280,11 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
     // predicate and the emitted config can never disagree on representability.
     if !cors_policy_translatable(cors) {
         tracing::warn!(
-            namespace = %object.metadata.namespace,
-            name = %object.metadata.name,
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            name = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch, or the legacy allowOrigin exact list, \
              within the bounded matcher count/size and with a compilable, bounded-complexity \
@@ -7446,17 +7483,24 @@ fn telemetry_tracing_provider(
         }
         other => {
             let warning = format!(
-                "Telemetry {}/{} tracing.providers[] name '{}' is not a recognised inline \
+                "Telemetry {:?}/{:?} tracing.providers[] name {:?} is not a recognised inline \
                  provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
                  meshConfig.extensionProviders lookup only resolves entries shaped as \
                  `{{name: \"...\"}}` (no extra fields) — provider skipped",
                 object.metadata.namespace, object.metadata.name, other
             );
             tracing::warn!(
-                resource = %object.metadata.name,
-                namespace = %object.metadata.namespace,
-                provider_name = other,
-                "{warning}"
+                resource = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.namespace.to_string()),
+                    &[]
+                ),
+                provider_name = %sanitize_startup_cause(format!("{:?}", other.to_string()), &[]),
+                "{}",
+                sanitize_startup_cause(&warning, &[])
             );
             acc.warnings.push(warning);
             return Ok(None);
@@ -7487,22 +7531,28 @@ fn default_telemetry_tracing_providers(
 fn warn_missing_mesh_config_provider(acc: &mut K8sAccumulator, object: &K8sObject, name: &str) {
     let warning = if acc.mesh_config_registry.is_known_non_tracing_provider(name) {
         format!(
-            "Telemetry {}/{} references meshConfig extensionProvider '{}' which is declared but \
+            "Telemetry {:?}/{:?} references meshConfig extensionProvider {:?} which is \
+             declared but \
              not a tracing provider type Ferrum supports (zipkin/datadog/lightstep/opentelemetry); \
              provider skipped",
             object.metadata.namespace, object.metadata.name, name
         )
     } else {
         format!(
-            "Telemetry {}/{} references unknown meshConfig extensionProvider '{}'; provider skipped",
+            "Telemetry {:?}/{:?} references unknown meshConfig extensionProvider {:?}; \
+             provider skipped",
             object.metadata.namespace, object.metadata.name, name
         )
     };
     tracing::warn!(
-        resource = %object.metadata.name,
-        namespace = %object.metadata.namespace,
-        provider_name = name,
-        "{warning}"
+        resource = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
+        namespace = %sanitize_startup_cause(
+            format!("{:?}", object.metadata.namespace.to_string()),
+            &[]
+        ),
+        provider_name = %sanitize_startup_cause(format!("{:?}", name.to_string()), &[]),
+        "{}",
+        sanitize_startup_cause(&warning, &[])
     );
     acc.warnings.push(warning);
 }
@@ -11846,7 +11896,9 @@ mod tests {
             result
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("unknown meshConfig extensionProvider 'zipkin'")),
+                .any(|warning| {
+                    warning.contains("unknown meshConfig extensionProvider \"zipkin\"")
+                }),
             "unknown name-only provider should produce an operator-visible warning"
         );
     }
@@ -20396,7 +20448,7 @@ extensionProviders:
         .expect_err("port out of range must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("portLevelSettings") && msg.contains("1-65535"),
+            msg.contains("portLevelSettings") && msg.contains("between 1 and 65535"),
             "expected port out-of-range error, got {msg}"
         );
 
@@ -20419,7 +20471,7 @@ extensionProviders:
         )
         .expect_err("port zero must fail");
         assert!(
-            err.to_string().contains("1-65535"),
+            err.to_string().contains("between 1 and 65535"),
             "expected port zero error, got {err}"
         );
     }

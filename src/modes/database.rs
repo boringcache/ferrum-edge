@@ -1008,7 +1008,9 @@ fn bounded_rejection_errors_for_log(errors: &[String]) -> Vec<String> {
     errors
         .iter()
         .take(3)
-        .map(|error| truncate_for_log(error, 256))
+        .map(|error| {
+            truncate_for_log(&crate::startup::sanitize_startup_cause(error, &[]), 256)
+        })
         .collect()
 }
 
@@ -1317,7 +1319,7 @@ pub async fn run(
                         "Startup quarantined an unconstructible plugin config; \
                          it is omitted from the plugin cache and must be deleted or \
                          repaired through the admin API: {}",
-                        message
+                        crate::startup::sanitize_startup_cause(message, &[])
                     );
                 }
                 error!(
@@ -1358,8 +1360,8 @@ pub async fn run(
                 // the configured backup for pod restart resilience.
                 warn!(
                     "Database load failed ({}), attempting backup file: {}",
-                    crate::util::deserialization::sanitize_custom_message(&e.to_string()),
-                    path
+                    crate::startup::sanitize_startup_cause(&e, &[&effective_url]),
+                    crate::startup::sanitize_startup_cause(format!("{path:?}"), &[])
                 );
                 match load_config_backup(path, &env_config.namespace) {
                     // Result-shaped backup loader (#3153); startup seeds
@@ -1374,9 +1376,7 @@ pub async fn run(
                                  starting with backup config, enabling admin writes for in-band \
                                  repair after the recovery migration gate, and publishing \
                                  config_rejected immediately: {}",
-                                crate::util::deserialization::sanitize_custom_message(
-                                    &e.to_string(),
-                                )
+                                crate::startup::sanitize_startup_cause(&e, &[&effective_url])
                             );
                         }
                         // The backup carries no gateway trust state, and cannot:
@@ -1406,7 +1406,10 @@ pub async fn run(
                              Database polling will retry and update when DB recovers. \
                              Gateway-to-mesh identity is refused until an authoritative \
                              database load settles this namespace's trust state.",
-                            env_config.namespace,
+                            crate::startup::sanitize_startup_cause(
+                                format!("{:?}", env_config.namespace),
+                                &[]
+                            ),
                             cfg.proxies.len(),
                             cfg.consumers.len()
                         );
@@ -1444,7 +1447,7 @@ pub async fn run(
     let reserved_ports = env_config.reserved_gateway_ports();
     if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
         for msg in &errors {
-            error!("{}", msg);
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
         }
         return Err(anyhow::anyhow!(
             "Stream proxy port conflicts with gateway reserved ports"
@@ -1684,7 +1687,10 @@ pub async fn run(
             None
         }
         Err(e) => {
-            error!("TLS configuration validation failed: {:#}", e);
+            error!(
+                "TLS configuration validation failed: {}",
+                crate::startup::sanitize_startup_cause(&e, &[])
+            );
             if let Err(listener_err) = shutdown_database_runtime_tasks(
                 &shutdown_tx,
                 &proxy_state,
@@ -2195,7 +2201,10 @@ pub async fn run(
                 candidate
             }
             Err(e) => {
-                error!("Failed to load admin TLS configuration: {:#}", e);
+                error!(
+                    "Failed to load admin TLS configuration: {}",
+                    crate::startup::sanitize_startup_cause(&e, &[])
+                );
                 if let Err(listener_err) = shutdown_database_runtime_tasks(
                     &shutdown_tx,
                     &proxy_state,
@@ -2294,7 +2303,7 @@ pub async fn run(
         warn!(
             "Gateway startup failed after spawning listener / background tasks: {}; \
              draining spawned tasks before returning",
-            e
+            crate::startup::sanitize_startup_cause(&e, &[])
         );
         if let Err(listener_err) =
             shutdown_database_runtime_tasks(&shutdown_tx, &proxy_state, handles, background_handles)

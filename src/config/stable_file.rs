@@ -36,6 +36,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
+use crate::startup::sanitize_startup_cause;
+
 /// Hard ceiling for ordinary file-mode gateway configuration documents.
 pub const MAX_GATEWAY_CONFIG_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
@@ -412,7 +414,7 @@ pub(crate) fn read_stable_file_with_between_probes(
                 warn!(
                     attempt,
                     max_attempts = options.max_attempts,
-                    path = %display_path,
+                    path = %sanitize_startup_cause(format!("{:?}", display_path.to_string()), &[]),
                     source = options.source_name,
                     reason,
                     "Configuration file read was unstable; retrying"

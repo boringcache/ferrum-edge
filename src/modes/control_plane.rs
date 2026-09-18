@@ -53,7 +53,7 @@ use crate::k8s_controller::{
 use crate::modes::file::ListenerJoinHandle;
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::startup_security;
-use crate::startup::wait_for_start_signals;
+use crate::startup::{sanitize_startup_cause, wait_for_start_signals};
 use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 use crate::xds::XdsAdsServer;
 
@@ -667,8 +667,8 @@ async fn load_incremental_config_multi(
                     return Err(error);
                 }
                 error!(
-                    namespace = %ns,
-                    error = %error,
+                    namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                    error = %sanitize_startup_cause(&error, &[]),
                     "CP incremental load failed for namespace; keeping last-known-good cursor and continuing other namespaces"
                 );
                 load_failures.push((ns.clone(), error.to_string()));
@@ -751,8 +751,8 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
                 }
                 Err(error) => {
                     error!(
-                        namespace = %ns,
-                        error = %error,
+                        namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                        error = %sanitize_startup_cause(&error, &[]),
                         "CP full config rejected for namespace; retaining last-known-good resources"
                     );
                     acc.apply_rejected(previous, ns, error.to_string());
@@ -761,15 +761,15 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
             Err(error) => {
                 if crate::modes::is_poll_validation_rejection(&error) {
                     error!(
-                        namespace = %ns,
-                        error = %error,
+                        namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                        error = %sanitize_startup_cause(&error, &[]),
                         "CP full config load rejected for namespace; retaining last-known-good resources"
                     );
                     acc.apply_rejected(previous, ns, error.to_string());
                 } else {
                     error!(
-                        namespace = %ns,
-                        error = %error,
+                        namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                        error = %sanitize_startup_cause(&error, &[]),
                         "CP full config load failed for namespace; retaining last-known-good resources"
                     );
                     acc.apply_failed(previous, ns);
@@ -1044,8 +1044,8 @@ async fn load_full_config_multi_with_sequence(
             }
             Err(error) => {
                 error!(
-                    namespace = %ns,
-                    error = %error,
+                    namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                    error = %sanitize_startup_cause(&error, &[]),
                     "CP could not capture the change-sequence boundary for namespace before a \
                      full reload; retaining last-known-good resources, leaving its cursor \
                      unchanged, and skipping its resource load and broadcast"
@@ -1270,8 +1270,9 @@ pub(crate) fn compose_incremental_partitions(
         } else {
             for message in &errors {
                 error!(
-                    namespace = %ns,
-                    "CP incremental config rejected for namespace: {message}"
+                    namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                    "CP incremental config rejected for namespace: {}",
+                    sanitize_startup_cause(message, &[])
                 );
             }
             rejected.push((ns.clone(), errors));
@@ -1712,7 +1713,10 @@ fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow:
     }
 
     for message in &validation_errors {
-        error!("CP full config rejected: {}", message);
+        error!(
+            "CP full config rejected: {}",
+            crate::startup::sanitize_startup_cause(message, &[])
+        );
     }
     // Return the typed marker (not a bare `anyhow::bail!`) so the CP poll loop
     // can distinguish this reachable-but-invalid snapshot from a connectivity
@@ -2177,7 +2181,7 @@ pub async fn run(
                          namespace(s): [{}]. Data planes in those namespaces cannot subscribe \
                          until a credential is bound to them.",
                         unreachable.len(),
-                        unreachable.join(", ")
+                        sanitize_startup_cause(format!("{unreachable:?}"), &[])
                     );
                 }
             }
@@ -2564,7 +2568,10 @@ pub async fn run(
                 candidate
             }
             Err(e) => {
-                error!("Failed to load admin TLS configuration: {:#}", e);
+                error!(
+                    "Failed to load admin TLS configuration: {}",
+                    crate::startup::sanitize_startup_cause(&e, &[])
+                );
                 return Err(e);
             }
         };
@@ -3427,12 +3434,18 @@ pub async fn run(
                                     )
                                 {
                                     for msg in &errors {
-                                        warn!("CP config field validation: {}", msg);
+                                        warn!(
+                                            "CP config field validation: {}",
+                                            sanitize_startup_cause(msg, &[])
+                                        );
                                     }
                                 }
                                 if let Err(errors) = compose.config.validate_hosts() {
                                     for msg in &errors {
-                                        warn!("CP config validation: {}", msg);
+                                        warn!(
+                                            "CP config validation: {}",
+                                            sanitize_startup_cause(msg, &[])
+                                        );
                                     }
                                 }
 

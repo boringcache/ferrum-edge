@@ -4100,3 +4100,53 @@ fn consumer_identity_uniqueness_queries_the_identity_index() {
         "identity uniqueness must not scan the consumers table:\n{body}"
     );
 }
+
+#[tokio::test]
+async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
+    for (table, column, malformed) in [
+        ("proxies", "hosts", "[7]"),
+        ("consumers", "credentials", "[7]"),
+        ("upstreams", "targets", "[7]"),
+        ("plugin_configs", "config", "{"),
+    ] {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("rows.db").display()
+        );
+        let store =
+            DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                .await
+                .unwrap();
+        let token = "UNREGISTERED_ROW_5591";
+        match table {
+            "proxies" => store.create_proxy(&make_http_proxy(token)).await.unwrap(),
+            "consumers" => {
+                store
+                    .create_consumer(&make_consumer(token, "fixture"))
+                    .await
+                    .unwrap();
+            }
+            "upstreams" => store.create_upstream(&make_upstream(token)).await.unwrap(),
+            "plugin_configs" => {
+                store
+                    .create_plugin_config(&make_global_tcp_throttle(token))
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        sqlx::query(&format!("UPDATE {table} SET {column} = ? WHERE id = ?"))
+            .bind(malformed)
+            .bind(token)
+            .execute(&store.pool())
+            .await
+            .unwrap();
+        let error = store.load_full_config("ferrum").await.unwrap_err();
+        assert!(ferrum_edge::_test_support::is_row_decode_rejection(&error));
+        let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+        assert!(rendered.contains("SQL row decode rejected"), "{table}: {rendered}");
+        assert!(rendered.contains(column), "{table}: {rendered}");
+        assert!(!rendered.contains(token), "{table}: {rendered}");
+    }
+}

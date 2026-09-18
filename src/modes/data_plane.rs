@@ -291,7 +291,10 @@ pub async fn run(
             None
         }
         Err(e) => {
-            error!("TLS configuration validation failed: {:#}", e);
+            error!(
+                "TLS configuration validation failed: {}",
+                crate::startup::sanitize_startup_cause(&e, &[])
+            );
             return Err(e);
         }
     };
@@ -917,7 +920,10 @@ pub async fn run(
                 candidate
             }
             Err(e) => {
-                error!("Failed to load admin TLS configuration: {:#}", e);
+                error!(
+                    "Failed to load admin TLS configuration: {}",
+                    crate::startup::sanitize_startup_cause(&e, &[])
+                );
                 return Err(e);
             }
         };
@@ -1003,10 +1009,13 @@ pub async fn run(
     let failures = proxy_state.stream_listener_manager.reconcile().await;
     for (proxy_id, port, err) in &failures {
         error!(
-            proxy_id = %proxy_id,
-            port = port,
+            proxy_id = %crate::startup::sanitize_startup_cause(
+                format!("{proxy_id:?}"),
+                &[]
+            ),
+            port = %crate::startup::sanitize_startup_cause(format!("\"{port}\""), &[]),
             "Stream listener failed to bind at startup (non-fatal in DP mode): {}",
-            err
+            crate::startup::sanitize_startup_cause(err, &[])
         );
     }
     wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;

@@ -5999,7 +5999,8 @@ impl DatabaseStore {
                 let credentials: HashMap<String, serde_json::Value> =
                     config_decode::from_json_str(&credentials_json).map_err(|error| {
                         anyhow::anyhow!(
-                            "Consumer {}: failed to parse credentials JSON while checking mTLS uniqueness: {}",
+                            "Consumer {:?}: failed to parse credentials JSON while checking \
+                             mTLS uniqueness: {}",
                             consumer_id,
                             error
                         )
@@ -12278,7 +12279,7 @@ fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error
         .transpose()
         .map_err(|e| {
             anyhow::anyhow!(
-                "Proxy {}: failed to serialize stream_match JSON: {}",
+                "Proxy {:?}: failed to serialize stream_match JSON: {}",
                 proxy.id,
                 e
             )
@@ -12303,20 +12304,20 @@ fn row_to_proxy_inner(
     let pid = id.clone();
     let scheme_str: String = row
         .try_get::<String, _>("backend_scheme")
-        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read backend_scheme: {}", pid, e))?;
+        .map_err(|e| anyhow::anyhow!("Proxy {:?}: failed to read backend_scheme: {}", pid, e))?;
     let backend_scheme =
-        parse_scheme(&scheme_str).map_err(|e| anyhow::anyhow!("Proxy {}: {}", pid, e))?;
+        parse_scheme(&scheme_str).map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?;
     let auth_mode_str: String = row
         .try_get("auth_mode")
-        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;
+        .map_err(|e| anyhow::anyhow!("Proxy {:?}: failed to read auth_mode: {}", pid, e))?;
 
     let hosts_str = required_utf8_text_column(row, "hosts").map_err(|error| {
-        anyhow::anyhow!("Proxy {}: failed to read hosts column: {}", pid, error)
+        anyhow::anyhow!("Proxy {:?}: failed to read hosts column: {}", pid, error)
     })?;
     let hosts: Vec<String> = config_decode::from_json_str(&hosts_str).map_err(|e| {
         // Do not embed the raw hosts column — poll/startup rejection logs
         // surface this message (issue #2997 redaction).
-        anyhow::anyhow!("Proxy {}: failed to parse hosts JSON: {}", pid, e)
+        anyhow::anyhow!("Proxy {:?}: failed to parse hosts JSON: {}", pid, e)
     })?;
 
     Ok(Proxy {
@@ -12390,7 +12391,7 @@ fn row_to_proxy_inner(
         circuit_breaker: match optional_utf8_text_column(row, "circuit_breaker")? {
             Some(s) => Some(
                 config_decode::from_json_str::<CircuitBreakerConfig>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e)
+                    anyhow::anyhow!("Proxy {:?}: failed to parse circuit_breaker JSON: {}", pid, e)
                 })?,
             ),
             None => None,
@@ -12398,7 +12399,7 @@ fn row_to_proxy_inner(
         retry: match optional_utf8_text_column(row, "retry")? {
             Some(s) => Some(
                 config_decode::from_json_str::<RetryConfig>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
+                    anyhow::anyhow!("Proxy {:?}: failed to parse retry JSON: {}", pid, e)
                 })?,
             ),
             None => None,
@@ -12495,7 +12496,7 @@ fn row_to_proxy_inner(
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
             Some(s) => Some(
                 config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
+                    anyhow::anyhow!("Proxy {:?}: failed to parse allowed_methods JSON: {}", pid, e)
                 })?,
             ),
             None => None,
@@ -12503,7 +12504,7 @@ fn row_to_proxy_inner(
         allowed_ws_origins: match optional_utf8_text_column(row, "allowed_ws_origins")? {
             Some(s) => config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Proxy {}: failed to parse allowed_ws_origins JSON: {}",
+                    "Proxy {:?}: failed to parse allowed_ws_origins JSON: {}",
                     pid,
                     e
                 )
@@ -12532,7 +12533,7 @@ fn row_to_proxy_inner(
                         crate::config::types::BackendProxyProtocol::parse(trimmed).ok_or_else(
                             || {
                                 anyhow::anyhow!(
-                                    "Proxy {}: invalid backend_proxy_protocol value",
+                                    "Proxy {:?}: invalid backend_proxy_protocol value",
                                     pid
                                 )
                             },
@@ -12545,7 +12546,7 @@ fn row_to_proxy_inner(
         stream_match: match optional_utf8_text_column(row, "stream_match")? {
             Some(s) => Some(
                 config_decode::from_json_str::<StreamMatchCriteria>(&s).map_err(|_| {
-                    anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON", pid)
+                    anyhow::anyhow!("Proxy {:?}: failed to parse stream_match JSON", pid)
                 })?,
             ),
             None => None,
@@ -12645,14 +12646,14 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, anyhow::Error> {
     let creds_str = required_utf8_text_column(row, "credentials").map_err(|e| {
         anyhow::anyhow!(
-            "Consumer {}: failed to read credentials column: {}",
+            "Consumer {:?}: failed to read credentials column: {}",
             id_preview,
             e
         )
     })?;
     let credentials = config_decode::from_json_str(&creds_str).map_err(|e| {
         anyhow::anyhow!(
-            "Consumer {}: failed to parse credentials JSON: {}",
+            "Consumer {:?}: failed to parse credentials JSON: {}",
             id_preview,
             e
         )
@@ -12660,7 +12661,7 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
 
     let acl_groups_str = required_utf8_text_column(row, "acl_groups").map_err(|e| {
         anyhow::anyhow!(
-            "Consumer {}: failed to read acl_groups column: {}",
+            "Consumer {:?}: failed to read acl_groups column: {}",
             id_preview,
             e
         )
@@ -12669,7 +12670,7 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
         // Never embed the raw acl_groups column in the error — poll rejection
         // logs would otherwise leak row content (issue #2997).
         anyhow::anyhow!(
-            "Consumer {}: failed to parse acl_groups JSON: {}",
+            "Consumer {:?}: failed to parse acl_groups JSON: {}",
             id_preview,
             e
         )
@@ -12717,21 +12718,21 @@ fn row_to_plugin_config_inner(
 ) -> Result<PluginConfig, anyhow::Error> {
     let config_str = required_utf8_text_column(row, "config").map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to read config column: {}",
+            "PluginConfig {:?}: failed to read config column: {}",
             id_preview,
             e
         )
     })?;
     let config_val = config_decode::from_json_str(&config_str).map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to parse config JSON: {}",
+            "PluginConfig {:?}: failed to parse config JSON: {}",
             id_preview,
             e
         )
     })?;
     let scope_str: String = row.try_get("scope").map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to read scope column: {}",
+            "PluginConfig {:?}: failed to read scope column: {}",
             id_preview,
             e
         )
@@ -12739,7 +12740,7 @@ fn row_to_plugin_config_inner(
 
     let trigger = optional_utf8_text_column(row, "trigger_json").map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to read trigger_json column: {}",
+            "PluginConfig {:?}: failed to read trigger_json column: {}",
             id_preview,
             e
         )
@@ -12750,7 +12751,7 @@ fn row_to_plugin_config_inner(
         // operator scoped away.
         Some(raw) => Some(config_decode::from_json_str(&raw).map_err(|e| {
             anyhow::anyhow!(
-                "PluginConfig {}: failed to parse trigger JSON: {}",
+                "PluginConfig {:?}: failed to parse trigger JSON: {}",
                 id_preview,
                 e
             )
@@ -12913,14 +12914,14 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
 fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
     let targets_str = required_utf8_text_column(row, "targets").map_err(|e| {
         anyhow::anyhow!(
-            "Upstream {}: failed to read targets column: {}",
+            "Upstream {:?}: failed to read targets column: {}",
             id_preview,
             e
         )
     })?;
     let targets: Vec<UpstreamTarget> = config_decode::from_json_str(&targets_str).map_err(|e| {
         anyhow::anyhow!(
-            "Upstream {}: failed to parse targets JSON: {}",
+            "Upstream {:?}: failed to parse targets JSON: {}",
             id_preview,
             e
         )
@@ -12928,7 +12929,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let algo_str = required_utf8_text_column(row, "algorithm").map_err(|e| {
         anyhow::anyhow!(
-            "Upstream {}: failed to read algorithm column: {}",
+            "Upstream {:?}: failed to read algorithm column: {}",
             id_preview,
             e
         )
@@ -12938,14 +12939,14 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
             // Do not embed the raw algorithm column — hostile/oversized DB
             // values must not reach poll/startup rejection logs through either
             // this message or serde's unknown-variant error (issue #2997).
-            anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
+            anyhow::anyhow!("Upstream {:?}: failed to parse algorithm", id_preview)
         })?;
 
     let health_checks: Option<HealthCheckConfig> =
         match optional_utf8_text_column(row, "health_checks")? {
             Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse health_checks JSON: {}",
+                    "Upstream {:?}: failed to parse health_checks JSON: {}",
                     id_preview,
                     e
                 )
@@ -12957,7 +12958,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         match optional_utf8_text_column(row, "service_discovery")? {
             Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse service_discovery JSON: {}",
+                    "Upstream {:?}: failed to parse service_discovery JSON: {}",
                     id_preview,
                     e
                 )
@@ -12969,7 +12970,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         match optional_utf8_text_column(row, "hash_on_cookie_config")? {
             Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
+                    "Upstream {:?}: failed to parse hash_on_cookie_config JSON: {}",
                     id_preview,
                     e
                 )
@@ -12986,7 +12987,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
     let subsets = match optional_utf8_text_column(row, "subsets")? {
         Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
             anyhow::anyhow!(
-                "Upstream {}: failed to parse subsets JSON: {}",
+                "Upstream {:?}: failed to parse subsets JSON: {}",
                 id_preview,
                 e
             )
@@ -12998,7 +12999,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         match optional_utf8_text_column(row, "backend_tls_san_allow_list")? {
             Some(s) => config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse backend_tls_san_allow_list JSON: {}",
+                    "Upstream {:?}: failed to parse backend_tls_san_allow_list JSON: {}",
                     id_preview,
                     e
                 )
@@ -13198,8 +13199,8 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
     let diff_raw = required_utf8_text_column(row, "diff")?;
     let diff = config_decode::from_json_str(&diff_raw).unwrap_or_else(|e| {
         warn!(
-            audit_event_id = %id,
-            error = %e,
+            audit_event_id = %crate::startup::sanitize_startup_cause(format!("{id:?}"), &[]),
+            error = %crate::startup::sanitize_startup_cause(e, &[]),
             "Audit event diff column is not valid JSON; returning empty diff"
         );
         serde_json::json!({})
@@ -13231,7 +13232,7 @@ fn serialize_api_spec_string_list(
 ) -> Result<String, anyhow::Error> {
     serde_json::to_string(values).map_err(|e| {
         anyhow::anyhow!(
-            "ApiSpec {}: failed to serialize {} JSON: {}",
+            "ApiSpec {:?}: failed to serialize {} JSON: {}",
             spec_id,
             field,
             e
@@ -13258,7 +13259,7 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             .unwrap_or_else(|_| {
                 warn!(
                     column,
-                    value = %raw,
+                    value = %crate::startup::sanitize_startup_cause(format!("{raw:?}"), &[]),
                     "Could not parse datetime column, falling back to Utc::now()"
                 );
                 Utc::now()
@@ -13266,7 +13267,7 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
         Err(error) => {
             warn!(
                 column,
-                error = %error,
+                error = %crate::startup::sanitize_startup_cause(error, &[]),
                 "Could not read datetime column, falling back to Utc::now()"
             );
             Utc::now()

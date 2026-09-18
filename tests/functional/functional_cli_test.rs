@@ -4399,6 +4399,22 @@ async fn functional_cli_plugin_diagnostics_withhold_all_supplied_values() {
         (token, serde_json::json!({}), "Unknown plugin"),
         (
             "waf",
+            serde_json::json!({"include_default_rules": false, "custom_rules": [{
+                "id": "fixture", "category": "test", "target": "body_text",
+                "pattern": "UNREGISTERED_REVIEW_TOKEN_5589["
+            }]}),
+            "`pattern` set for `body_bytes` at rule indexes [0] is invalid or too complex",
+        ),
+        (
+            "waf",
+            serde_json::json!({"include_default_rules": false, "custom_rules": [{
+                "id": "fixture", "category": "test", "target": "url_path",
+                "pattern": "UNREGISTERED_REVIEW_TOKEN_5589["
+            }]}),
+            "`pattern` set for `url_path` at rule indexes [0] is invalid or too complex",
+        ),
+        (
+            "waf",
             serde_json::json!({"stream": {"signatures": [{"id": token}]}}),
             "requires `pattern`",
         ),
@@ -4556,5 +4572,170 @@ async fn functional_cli_backup_validation_sanitizes_early_emissions() {
             "{diagnostic}"
         );
         assert!(!diagnostic.contains(token), "{diagnostic}");
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_cp_startup_withholds_apostrophe_leading_trust_kid() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("'UNREGISTERED_TRUST_PATH_5591.json");
+    let document = serde_json::json!({"version": 1, "keys": [{
+        "kid": "'UNREGISTERED_TRUST_KID_5591", "algorithm": "bogus",
+        "secret": "synthetic-trust-secret-at-least-32-characters", "namespaces": ["ferrum"]
+    }]});
+    std::fs::write(&path, document.to_string()).unwrap();
+    let mut command = installed_cli_command(&directory, &["run", "-m", "cp"]);
+    command
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", "sqlite::memory:")
+        .env("FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH", &path)
+        .env("FERRUM_CP_GRPC_LISTEN_ADDR", "127.0.0.1:0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "synthetic-admin-secret-at-least-32-characters",
+        );
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(diagnostic.contains("unsupported algorithm"), "{diagnostic}");
+    for token in [
+        "UNREGISTERED_TRUST_KID_5591",
+        "UNREGISTERED_TRUST_PATH_5591",
+        "synthetic-trust-secret-at-least-32-characters",
+    ] {
+        assert!(!diagnostic.contains(token), "{diagnostic}");
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_sql_row_rejection_withholds_every_resource_id() {
+    use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+
+    let directory = TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("rows.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let token = "UNREGISTERED_ROW_5591";
+    let proxy = serde_json::from_value(serde_json::json!({
+        "id": token, "listen_path": "/", "backend_scheme": "http",
+        "backend_host": "localhost", "backend_port": 8080
+    }))
+    .unwrap();
+    store.create_proxy(&proxy).await.unwrap();
+    sqlx::query("UPDATE proxies SET hosts = ? WHERE id = ?")
+        .bind("[7]")
+        .bind(token)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    let mut command = installed_cli_command(&directory, &["run", "-m", "database"]);
+    command
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", &db_url)
+        .env("FERRUM_PROXY_HTTP_PORT", "0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "synthetic-admin-secret-at-least-32-characters",
+        );
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(diagnostic.contains("SQL row decode rejected"), "{diagnostic}");
+    assert!(diagnostic.contains("failed to parse hosts JSON"), "{diagnostic}");
+    assert!(!diagnostic.contains(token), "{diagnostic}");
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_stream_port_rejection_sanitizes_early_emissions() {
+    use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+
+    for mode in ["file", "database"] {
+        let directory = TempDir::new().unwrap();
+        // Hold the reservation: rejection must precede any listener bind.
+        let reservation = reserve_port().await.unwrap();
+        let port = reservation.port;
+        let token = "UNREGISTERED_PROXY5591";
+        let proxy = serde_json::json!({
+            "id": token, "listen_port": port, "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1", "backend_port": 8080
+        });
+        let mut command = installed_cli_command(&directory, &["run", "-m", mode]);
+        command
+            .env("FERRUM_PROXY_HTTP_PORT", port.to_string())
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_LOG_LEVEL", "warn")
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-at-least-32-characters",
+            );
+        if mode == "file" {
+            let path = directory.path().join("UNREGISTERED_STREAM_PATH_5591.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "version": "1", "proxies": [proxy], "plugin_configs": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+            command.env("FERRUM_FILE_CONFIG_PATH", path);
+        } else {
+            let db_url = format!(
+                "sqlite:{}?mode=rwc",
+                directory.path().join("stream.db").display()
+            );
+            let store =
+                DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                    .await
+                    .unwrap();
+            store
+                .create_proxy(&serde_json::from_value(proxy).unwrap())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE proxies SET created_at = ? WHERE id = ?")
+                .bind("UNREGISTERED_TIMESTAMP_5591")
+                .bind(token)
+                .execute(&store.pool())
+                .await
+                .unwrap();
+            store.pool().close().await;
+            command
+                .env("FERRUM_DB_TYPE", "sqlite")
+                .env("FERRUM_DB_URL", db_url);
+        }
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{mode}: {diagnostic}");
+        assert!(
+            diagnostic.contains("conflicts with a gateway reserved port"),
+            "{mode}: {diagnostic}"
+        );
+        assert!(!diagnostic.contains(token), "{mode}: {diagnostic}");
+        for withheld in [
+            "UNREGISTERED_STREAM_PATH_5591",
+            "UNREGISTERED_TIMESTAMP_5591",
+        ] {
+            assert!(!diagnostic.contains(withheld), "{mode}: {diagnostic}");
+        }
+        if mode == "database" {
+            assert!(
+                diagnostic.contains("Could not parse datetime column"),
+                "{diagnostic}"
+            );
+        }
+        assert!(
+            diagnostic.contains("`listen_port` <redacted scalar>"),
+            "{mode}: {diagnostic}"
+        );
     }
 }

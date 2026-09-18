@@ -1586,7 +1586,7 @@ fn duplicate_key_ids_are_refused_as_ambiguous_selection() {
     .to_string();
     let error = CpDpTrustBundle::from_document_str(&document, "dup-bundle", None)
         .expect_err("duplicate kids must be refused");
-    assert!(error.contains("duplicate kid"), "got: {error}");
+    assert!(error.contains("duplicate `kid`"), "got: {error}");
 }
 
 #[test]

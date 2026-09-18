@@ -83,7 +83,7 @@ pub fn refresh_dp_grpc_tls_config_if_changed(
         Err(error) => {
             tracing::warn!(
                 revision,
-                error = %error,
+                error = %crate::startup::sanitize_startup_cause(&error, &[]),
                 "{} gRPC TLS source revision changed but rebuild failed; keeping previous mesh client TLS material",
                 reload.label
             );

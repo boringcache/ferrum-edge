@@ -86,7 +86,7 @@ use crate::modes::mesh::slice::{
 };
 use crate::modes::startup_security;
 use crate::proxy::{self, GatewayTrustCommit, ProxyState};
-use crate::startup::wait_for_start_signals;
+use crate::startup::{sanitize_startup_cause, wait_for_start_signals};
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
@@ -1132,7 +1132,8 @@ impl MeshRuntimeConfig {
             Err(e) => {
                 warn!(
                     "Planning mesh TCP capture listeners for IPv4 only: invalid IPv6 capture \
-                     settings: {e}"
+                     settings: {}",
+                    sanitize_startup_cause(&e, &[])
                 );
                 false
             }
@@ -1164,9 +1165,14 @@ impl MeshRuntimeConfig {
                 .collect(),
             Err(e) => {
                 warn!(
-                    configured = %configured,
+                    configured = %sanitize_startup_cause(
+                        format!("{:?}", configured.to_string()),
+                        &[]
+                    ),
                     ?direction,
-                    "Mesh TCP capture listener plan falls back to the configured address alone: {e}"
+                    "Mesh TCP capture listener plan falls back to the configured \
+                     address alone: {}",
+                    sanitize_startup_cause(&e, &[])
                 );
                 vec![MeshListener {
                     direction,
@@ -1235,12 +1241,18 @@ impl MeshRuntimeConfig {
         let addr = match node_waypoint_ingress_capture_addr() {
             Ok(addr) => addr,
             Err(e) => {
-                warn!("Skipping the NodeWaypoint transparent inbound capture listener: {e}");
+                warn!(
+                    "Skipping the NodeWaypoint transparent inbound capture listener: {}",
+                    sanitize_startup_cause(&e, &[])
+                );
                 return None;
             }
         };
         if let Err(e) = validate_ingress_capture_addr(addr) {
-            warn!("Skipping the NodeWaypoint transparent inbound capture listener: {e}");
+            warn!(
+                "Skipping the NodeWaypoint transparent inbound capture listener: {}",
+                sanitize_startup_cause(&e, &[])
+            );
             return None;
         }
         Some(MeshListener {
@@ -1375,7 +1387,10 @@ impl MeshRuntimeConfig {
         let settings = match crate::capture::udp_capture_settings_from_env() {
             Ok(s) => s,
             Err(e) => {
-                warn!("Skipping mesh UDP capture listener: {e}");
+                warn!(
+                    "Skipping mesh UDP capture listener: {}",
+                    sanitize_startup_cause(&e, &[])
+                );
                 return None;
             }
         };
@@ -1673,9 +1688,18 @@ fn prepare_normalized_gateway_config_for_mesh(
                 .filter(|listener| {
                     if !listener.endpoint_is_valid(&runtime.unix_socket_allowed_roots) {
                         warn!(
-                            listener_port = listener.port,
-                            endpoint_host = %listener.endpoint_host,
-                            endpoint_port = listener.endpoint_port,
+                            listener_port = %sanitize_startup_cause(
+                                format!("{:?}", listener.port.to_string()),
+                                &[]
+                            ),
+                            endpoint_host = %sanitize_startup_cause(
+                                format!("{:?}", listener.endpoint_host.to_string()),
+                                &[]
+                            ),
+                            endpoint_port = %sanitize_startup_cause(
+                                format!("{:?}", listener.endpoint_port.to_string()),
+                                &[]
+                            ),
                             has_unix_path = listener.endpoint_unix_path.is_some(),
                             "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
                              (neither a loopback host:port nor a contained, admissible unix socket path); \
@@ -1685,7 +1709,10 @@ fn prepare_normalized_gateway_config_for_mesh(
                     }
                     if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
                         warn!(
-                            listener_port = listener.port,
+                            listener_port = %sanitize_startup_cause(
+                                format!("{:?}", listener.port.to_string()),
+                                &[]
+                            ),
                             "Dropping carried Sidecar ingress[] listener with no stamped owner identity \
                              (no local service anchor); failing closed rather than grouping it under \
                              another listener's service host"
@@ -2444,17 +2471,32 @@ fn materialize_node_waypoint_udp_listeners(
             };
             if service_port.port == 0 {
                 warn!(
-                    service = %service.name,
-                    namespace = %service.namespace,
+                    service = %sanitize_startup_cause(
+                        format!("{:?}", service.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", service.namespace.to_string()),
+                        &[]
+                    ),
                     "Skipping NodeWaypoint UDP/DTLS listener: service port 0 is not bindable"
                 );
                 continue;
             }
             if reserved_ports.contains(&service_port.port) {
                 warn!(
-                    service = %service.name,
-                    namespace = %service.namespace,
-                    service_port = service_port.port,
+                    service = %sanitize_startup_cause(
+                        format!("{:?}", service.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", service.namespace.to_string()),
+                        &[]
+                    ),
+                    service_port = %sanitize_startup_cause(
+                        format!("{:?}", service_port.port.to_string()),
+                        &[]
+                    ),
                     "Skipping NodeWaypoint UDP/DTLS listener: the port is already claimed by a \
                      mesh runtime listener or another stream proxy in this generation"
                 );
@@ -2488,9 +2530,18 @@ fn materialize_node_waypoint_udp_listeners(
                 .collect();
             if !service.cluster_ips.is_empty() && cluster_ips.len() != service.cluster_ips.len() {
                 warn!(
-                    service = %service.name,
-                    namespace = %service.namespace,
-                    service_port = service_port.port,
+                    service = %sanitize_startup_cause(
+                        format!("{:?}", service.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", service.namespace.to_string()),
+                        &[]
+                    ),
+                    service_port = %sanitize_startup_cause(
+                        format!("{:?}", service_port.port.to_string()),
+                        &[]
+                    ),
                     reason = "inadmissible_cluster_ip",
                     "Skipping NodeWaypoint UDP/DTLS listener: every declared ClusterIP must be a \
                      valid unicast Service destination; unspecified, loopback, multicast, and \
@@ -2511,7 +2562,10 @@ fn materialize_node_waypoint_udp_listeners(
                 warn!(
                     service_len = service.name.len(),
                     namespace_len = service.namespace.len(),
-                    service_port = service_port.port,
+                    service_port = %sanitize_startup_cause(
+                        format!("{:?}", service_port.port.to_string()),
+                        &[]
+                    ),
                     reason = "unencodable_service_identity",
                     "Skipping NodeWaypoint UDP/DTLS listener: namespace and service name must \
                      each be a non-empty identity of at most 63 bytes so the generated proxy \
@@ -2571,9 +2625,12 @@ fn materialize_node_waypoint_udp_listeners(
         if dtls_count > 0 && dtls_count != candidates.len() {
             let claimants = candidates.iter().map(claimant_label).collect::<Vec<_>>();
             warn!(
-                listen_port = port,
+                listen_port = %sanitize_startup_cause(format!("{:?}", port.to_string()), &[]),
                 reason = "mixed_frontend_posture",
-                services = %capped_join(&claimants, 8),
+                services = %sanitize_startup_cause(
+                    format!("{:?}", (capped_join(&claimants, 8)).to_string()),
+                    &[]
+                ),
                 "Refusing every NodeWaypoint UDP/DTLS listener on this port: its mesh services \
                  disagree on frontend posture (plain `udp` beside terminating `dtls`). One bound \
                  datagram socket speaks one protocol, and that choice is made before a datagram's \
@@ -2590,9 +2647,12 @@ fn materialize_node_waypoint_udp_listeners(
         if dtls_count > 1 {
             let claimants = candidates.iter().map(claimant_label).collect::<Vec<_>>();
             warn!(
-                listen_port = port,
+                listen_port = %sanitize_startup_cause(format!("{:?}", port.to_string()), &[]),
                 reason = "multiple_dtls_claimants",
-                services = %capped_join(&claimants, 8),
+                services = %sanitize_startup_cause(
+                    format!("{:?}", (capped_join(&claimants, 8)).to_string()),
+                    &[]
+                ),
                 "Refusing every NodeWaypoint DTLS listener on this port: more than one mesh \
                  service declares it, and one DTLS server carries a single frontend identity and \
                  client verifier that is chosen before any handshake state exists. Give the \
@@ -2625,10 +2685,13 @@ fn materialize_node_waypoint_udp_listeners(
                     .map(claimant_label)
                     .collect::<Vec<_>>();
                 warn!(
-                    listen_port = port,
+                    listen_port = %sanitize_startup_cause(format!("{:?}", port.to_string()), &[]),
                     reason = "duplicate_destination_claim",
-                    destination = %ip,
-                    services = %capped_join(&names, 8),
+                    destination = %sanitize_startup_cause(format!("{:?}", ip.to_string()), &[]),
+                    services = %sanitize_startup_cause(
+                        format!("{:?}", (capped_join(&names, 8)).to_string()),
+                        &[]
+                    ),
                     "Refusing every NodeWaypoint UDP/DTLS claimant of this exact destination: two \
                      or more mesh services publish the same ClusterIP on the same port, so a \
                      received datagram's local destination cannot name one owner"
@@ -2650,9 +2713,15 @@ fn materialize_node_waypoint_udp_listeners(
             if candidate.cluster_ips.is_empty() {
                 if shared_port {
                     warn!(
-                        listen_port = port,
+                        listen_port = %sanitize_startup_cause(
+                            format!("{:?}", port.to_string()),
+                            &[]
+                        ),
                         reason = "headless_service_on_shared_port",
-                        service = %claimant_label(&candidate),
+                        service = %sanitize_startup_cause(
+                            format!("{:?}", (claimant_label(&candidate)).to_string()),
+                            &[]
+                        ),
                         "Refusing this NodeWaypoint UDP/DTLS listener: the service publishes no \
                          ClusterIP, so it has no exact destination to demultiplex on, and the \
                          direct-node-address boundary it would otherwise use requires a port with \
@@ -2725,7 +2794,10 @@ fn materialize_node_waypoint_udp_listeners(
 
     if !vip_less_ports.is_empty() {
         warn!(
-            services = %capped_join(&vip_less_ports, 8),
+            services = %sanitize_startup_cause(
+                format!("{:?}", (capped_join(&vip_less_ports, 8)).to_string()),
+                &[]
+            ),
             "NodeWaypoint UDP/DTLS listeners were materialized for services that publish no \
              ClusterIP; their Service DNS name resolves to pod addresses, so the transparent \
              Service-path steering has no address to match and those ports are reachable only \
@@ -2994,10 +3066,22 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
 
     warn!(
         topology = "node_waypoint",
-        udp_services = %capped_join(&udp_services, 8),
-        udp_proxies = %capped_join(&udp_proxies, 8),
-        udp_upstreams = %capped_join(&udp_upstreams, 8),
-        scoped_policies = %capped_join(&scoped_policies, 8),
+        udp_services = %sanitize_startup_cause(
+            format!("{:?}", (capped_join(&udp_services, 8)).to_string()),
+            &[]
+        ),
+        udp_proxies = %sanitize_startup_cause(
+            format!("{:?}", (capped_join(&udp_proxies, 8)).to_string()),
+            &[]
+        ),
+        udp_upstreams = %sanitize_startup_cause(
+            format!("{:?}", (capped_join(&udp_upstreams, 8)).to_string()),
+            &[]
+        ),
+        scoped_policies = %sanitize_startup_cause(
+            format!("{:?}", (capped_join(&scoped_policies, 8)).to_string()),
+            &[]
+        ),
         "Disabling NodeWaypoint UDP/DTLS paths because enforcing namespace/selector-scoped \
          AuthorizationPolicies require per-source-pod identity, but the NodeWaypoint UDP/DTLS \
          path has no trustworthy per-datagram/session pod identity. The slice is still applied \
@@ -4241,9 +4325,12 @@ async fn wait_for_initial_mesh_config(
                         ),
                     );
                     warn!(
-                        mesh_slice_version = %slice.version,
+                        mesh_slice_version = %sanitize_startup_cause(
+                            format!("{:?}", slice.version.to_string()),
+                            &[]
+                        ),
                         revision_rolled_back,
-                        error = %e,
+                        error = %sanitize_startup_cause(&e, &[]),
                         "Ignoring invalid initial mesh slice"
                     );
                 }
@@ -6005,7 +6092,10 @@ fn materialize_sidecar_inbound_proxies(
                 mesh.local_ingress_listeners.clear();
             }
             warn!(
-                local_spiffe,
+                local_spiffe = %sanitize_startup_cause(
+                    format!("{:?}", local_spiffe.to_string()),
+                    &[]
+                ),
                 "Sidecar ingress[] declared but no listener resolved into a routable inbound \
                  route (all entries unsupported, or no local service anchored them); failing \
                  closed — emitting NO default service-port inbound routes for this workload"
@@ -6120,10 +6210,22 @@ fn materialize_sidecar_inbound_proxies(
                 // rejects it for non-xDS slices) defensively rather than route to :0.
                 let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
                     warn!(
-                        service = %service.name,
-                        namespace = %service.namespace,
-                        service_port = service_port.port,
-                        target_port = ?service_port.target_port,
+                        service = %sanitize_startup_cause(
+                            format!("{:?}", service.name.to_string()),
+                            &[]
+                        ),
+                        namespace = %sanitize_startup_cause(
+                            format!("{:?}", service.namespace.to_string()),
+                            &[]
+                        ),
+                        service_port = %sanitize_startup_cause(
+                            format!("{:?}", service_port.port.to_string()),
+                            &[]
+                        ),
+                        target_port = %sanitize_startup_cause(
+                            format!("{:?}", format!("{:?}", service_port.target_port)),
+                            &[]
+                        ),
                         "Cannot resolve a usable local backend port for an inbound mesh route \
                          (no resolvable Service targetPort, and no port name/number match among \
                          multiple container ports). Set targetPort, name the ports consistently, \
@@ -6201,10 +6303,22 @@ fn materialize_sidecar_inbound_proxies(
                 let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
                 let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
                     warn!(
-                        service = %service.name,
-                        namespace = %service.namespace,
-                        service_port = service_port.port,
-                        target_port = ?service_port.target_port,
+                        service = %sanitize_startup_cause(
+                            format!("{:?}", service.name.to_string()),
+                            &[]
+                        ),
+                        namespace = %sanitize_startup_cause(
+                            format!("{:?}", service.namespace.to_string()),
+                            &[]
+                        ),
+                        service_port = %sanitize_startup_cause(
+                            format!("{:?}", service_port.port.to_string()),
+                            &[]
+                        ),
+                        target_port = %sanitize_startup_cause(
+                            format!("{:?}", format!("{:?}", service_port.target_port)),
+                            &[]
+                        ),
                         "Cannot resolve a usable local backend port for an inbound raw-TCP mesh \
                          route (no resolvable Service targetPort, and no port name/number match \
                          among multiple container ports). Set targetPort or name ports \
@@ -6255,9 +6369,18 @@ fn materialize_sidecar_inbound_proxies(
         tcp_routes.retain(|route| {
             if http_inbound_backend_ports.contains(&route.match_port) {
                 warn!(
-                    service = %route.service_name,
-                    namespace = %route.namespace,
-                    app_port = route.match_port,
+                    service = %sanitize_startup_cause(
+                        format!("{:?}", route.service_name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", route.namespace.to_string()),
+                        &[]
+                    ),
+                    app_port = %sanitize_startup_cause(
+                        format!("{:?}", route.match_port.to_string()),
+                        &[]
+                    ),
                     "A stream-family inbound port collides with an HTTP-family inbound route on \
                      the same container port; the HTTP route wins. Not installing a raw-TCP \
                      inbound entry for this port (it would bypass HTTP routing, mesh authz, and \
@@ -6330,11 +6453,26 @@ fn admit_sidecar_ingress_listeners<'a>(
         .filter(|listener| {
             if !listener.endpoint_is_valid(&runtime.unix_socket_allowed_roots) {
                 warn!(
-                    local_spiffe,
-                    listener_port = listener.port,
-                    endpoint_host = %listener.endpoint_host,
-                    endpoint_port = listener.endpoint_port,
-                    protocol = ?listener.protocol,
+                    local_spiffe = %sanitize_startup_cause(
+                        format!("{:?}", local_spiffe.to_string()),
+                        &[]
+                    ),
+                    listener_port = %sanitize_startup_cause(
+                        format!("{:?}", listener.port.to_string()),
+                        &[]
+                    ),
+                    endpoint_host = %sanitize_startup_cause(
+                        format!("{:?}", listener.endpoint_host.to_string()),
+                        &[]
+                    ),
+                    endpoint_port = %sanitize_startup_cause(
+                        format!("{:?}", listener.endpoint_port.to_string()),
+                        &[]
+                    ),
+                    protocol = %sanitize_startup_cause(
+                        format!("{:?}", format!("{:?}", listener.protocol)),
+                        &[]
+                    ),
                     has_unix_path = listener.endpoint_unix_path.is_some(),
                     "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
                      or unsupported/inconsistent protocol (neither a modeled loopback host:port \
@@ -6345,8 +6483,14 @@ fn admit_sidecar_ingress_listeners<'a>(
             }
             if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
                 warn!(
-                    local_spiffe,
-                    listener_port = listener.port,
+                    local_spiffe = %sanitize_startup_cause(
+                        format!("{:?}", local_spiffe.to_string()),
+                        &[]
+                    ),
+                    listener_port = %sanitize_startup_cause(
+                        format!("{:?}", listener.port.to_string()),
+                        &[]
+                    ),
                     "Dropping carried Sidecar ingress[] listener with no stamped owner identity \
                      (no local service anchor); failing closed rather than routing it under \
                      another listener's service host"
@@ -6373,8 +6517,8 @@ fn admit_sidecar_ingress_listeners<'a>(
         .collect();
     for port in &ambiguous_listener_ports {
         warn!(
-            local_spiffe,
-            listener_port = *port,
+            local_spiffe = %sanitize_startup_cause(format!("{:?}", local_spiffe.to_string()), &[]),
+            listener_port = %sanitize_startup_cause(format!("{:?}", (*port).to_string()), &[]),
             "Duplicate Sidecar ingress[] listener port after carrier re-validation; dropping all \
              entries for that port rather than selecting by carrier order"
         );
@@ -6399,8 +6543,14 @@ fn admit_sidecar_ingress_listeners<'a>(
             };
             if listener.endpoint_unix_path.is_some() {
                 warn!(
-                    local_spiffe,
-                    listener_port = listener.port,
+                    local_spiffe = %sanitize_startup_cause(
+                        format!("{:?}", local_spiffe.to_string()),
+                        &[]
+                    ),
+                    listener_port = %sanitize_startup_cause(
+                        format!("{:?}", listener.port.to_string()),
+                        &[]
+                    ),
                     bind = %bind_ip,
                     "Sidecar ingress[] dedicated bind cannot own a TCP listener for a unix \
                      defaultEndpoint; failing closed rather than accepting the bind as inert metadata"
@@ -6410,8 +6560,14 @@ fn admit_sidecar_ingress_listeners<'a>(
             if claimed_ports.contains(&listener.port) || bind_overrides.contains_key(&listener.port)
             {
                 warn!(
-                    local_spiffe,
-                    listener_port = listener.port,
+                    local_spiffe = %sanitize_startup_cause(
+                        format!("{:?}", local_spiffe.to_string()),
+                        &[]
+                    ),
+                    listener_port = %sanitize_startup_cause(
+                        format!("{:?}", listener.port.to_string()),
+                        &[]
+                    ),
                     bind = %bind_ip,
                     "Sidecar ingress[] dedicated bind conflicts with an owned Gateway/stream/mesh \
                      listener port; failing closed rather than accepting the bind as inert metadata"
@@ -6566,7 +6722,7 @@ fn materialize_sidecar_ingress_listener_proxies(
         // drops listeners in this case; this is a defensive backstop.) Stream
         // relays above are already installed.
         warn!(
-            local_spiffe,
+            local_spiffe = %sanitize_startup_cause(format!("{:?}", local_spiffe.to_string()), &[]),
             "Sidecar ingress[] declared HTTP listeners but no local service resolved to anchor \
              the listener host identity; skipping HTTP ingress materialization"
         );
@@ -7619,8 +7775,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
         }
         if service.cluster_ips.is_empty() {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
                 tcp_ports = tcp_ports.len(),
                 "In-mesh service declares stream-family (TCP) ports but carries no cluster_ips; \
                  raw-TCP egress maps captured original destinations to services strictly by \
@@ -7847,8 +8006,11 @@ fn materialize_mesh_outbound_udp_upstreams(
         }
         if service.cluster_ips.is_empty() {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
                 udp_ports = udp_ports.len(),
                 "In-mesh service declares UDP ports but carries no cluster_ips; UDP egress maps \
                  captured original destinations to services strictly by service VIP (a datagram \
@@ -8073,8 +8235,14 @@ fn materialize_mesh_external_udp_egress_upstreams(
                 .any(|port_spec| matches!(port_spec.protocol, AppProtocol::Udp));
             if declares_udp_port {
                 warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
+                    service_entry = %sanitize_startup_cause(
+                        format!("{:?}", entry.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", entry.namespace.to_string()),
+                        &[]
+                    ),
                     field = "hosts[]",
                     "Skipping source-side external UDP egress: the ServiceEntry declares no host, \
                      which the EgressGateway refuses to admit at all, so any route materialized \
@@ -8089,8 +8257,14 @@ fn materialize_mesh_external_udp_egress_upstreams(
             }
             if port_spec.port == 0 {
                 warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
+                    service_entry = %sanitize_startup_cause(
+                        format!("{:?}", entry.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", entry.namespace.to_string()),
+                        &[]
+                    ),
                     field = "ports[].number",
                     "Skipping source-side external UDP egress for ServiceEntry port 0"
                 );
@@ -8098,9 +8272,18 @@ fn materialize_mesh_external_udp_egress_upstreams(
             }
             let Some(gateway) = runtime.egress_gateway.as_ref() else {
                 warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
-                    port = port_spec.port,
+                    service_entry = %sanitize_startup_cause(
+                        format!("{:?}", entry.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", entry.namespace.to_string()),
+                        &[]
+                    ),
+                    port = %sanitize_startup_cause(
+                        format!("{:?}", port_spec.port.to_string()),
+                        &[]
+                    ),
                     field = "FERRUM_MESH_EGRESS_GATEWAY_ADDR",
                     "Skipping source-side external UDP egress: no EgressGateway endpoint is \
                      configured. Set FERRUM_MESH_EGRESS_GATEWAY_ADDR and \
@@ -8112,11 +8295,23 @@ fn materialize_mesh_external_udp_egress_upstreams(
             };
             if entry.resolution != Resolution::Static {
                 warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
-                    port = port_spec.port,
+                    service_entry = %sanitize_startup_cause(
+                        format!("{:?}", entry.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", entry.namespace.to_string()),
+                        &[]
+                    ),
+                    port = %sanitize_startup_cause(
+                        format!("{:?}", port_spec.port.to_string()),
+                        &[]
+                    ),
                     field = "resolution",
-                    resolution = ?entry.resolution,
+                    resolution = %sanitize_startup_cause(
+                        format!("{:?}", format!("{:?}", entry.resolution)),
+                        &[]
+                    ),
                     "Skipping source-side external UDP egress: only STATIC resolution declares \
                      the endpoint addresses a captured datagram can be matched against (a UDP \
                      datagram carries no Host), so a DNS/NONE entry cannot be source-routed"
@@ -8129,9 +8324,18 @@ fn materialize_mesh_external_udp_egress_upstreams(
             let endpoints = resolve_static_udp_dial_endpoints(entry, port_spec, None);
             if endpoints.is_empty() {
                 warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
-                    port = port_spec.port,
+                    service_entry = %sanitize_startup_cause(
+                        format!("{:?}", entry.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", entry.namespace.to_string()),
+                        &[]
+                    ),
+                    port = %sanitize_startup_cause(
+                        format!("{:?}", port_spec.port.to_string()),
+                        &[]
+                    ),
                     field = "endpoints[]",
                     "Skipping source-side external UDP egress: the STATIC entry declares no \
                      usable IP-literal endpoint to match captured datagrams against"
@@ -8141,8 +8345,14 @@ fn materialize_mesh_external_udp_egress_upstreams(
             for endpoint in &endpoints {
                 if routes.len() >= MAX_EGRESS_UDP_DESTINATIONS {
                     warn!(
-                        service_entry = %entry.name,
-                        namespace = %entry.namespace,
+                        service_entry = %sanitize_startup_cause(
+                            format!("{:?}", entry.name.to_string()),
+                            &[]
+                        ),
+                        namespace = %sanitize_startup_cause(
+                            format!("{:?}", entry.namespace.to_string()),
+                            &[]
+                        ),
                         field = "external_udp_egress_routes",
                         max_routes = MAX_EGRESS_UDP_DESTINATIONS,
                         "Skipping source-side external UDP egress routes beyond the total route cap"
@@ -8155,10 +8365,22 @@ fn materialize_mesh_external_udp_egress_upstreams(
                 let dest_ip = endpoint.host.clone();
                 if !claimed.insert((dest_ip.clone(), port_spec.port)) {
                     warn!(
-                        service_entry = %entry.name,
-                        namespace = %entry.namespace,
-                        address = %dest_ip,
-                        port = port_spec.port,
+                        service_entry = %sanitize_startup_cause(
+                            format!("{:?}", entry.name.to_string()),
+                            &[]
+                        ),
+                        namespace = %sanitize_startup_cause(
+                            format!("{:?}", entry.namespace.to_string()),
+                            &[]
+                        ),
+                        address = %sanitize_startup_cause(
+                            format!("{:?}", dest_ip.to_string()),
+                            &[]
+                        ),
+                        port = %sanitize_startup_cause(
+                            format!("{:?}", port_spec.port.to_string()),
+                            &[]
+                        ),
                         "Skipping source-side external UDP egress endpoint: another ServiceEntry \
                          already claimed this address and port"
                     );
@@ -8494,8 +8716,11 @@ fn build_outbound_mesh_targets(
     for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
         if require_node_waypoint_metadata && workload.node_waypoint.is_none() {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
                 workload_spiffe = %workload.spiffe_id,
                 "Skipping NodeWaypoint service target without destination node_waypoint metadata; \
                  secured NodeWaypoint transport is required in this identity posture"
@@ -8803,9 +9028,15 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
         .collect();
     if remote_workloads.is_empty() {
         warn!(
-            service = %service.name,
-            namespace = %service.namespace,
-            service_port = service_port.port,
+            service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", service.namespace.to_string()),
+                &[]
+            ),
+            service_port = %sanitize_startup_cause(
+                format!("{:?}", service_port.port.to_string()),
+                &[]
+            ),
             "Skipping cross-cluster egress: no reachable remote workload (every remote endpoint \
              lacks an address or has an unresolved targetPort for this port; the east-west gateway \
              would have no backend to forward the SNI to)"
@@ -8856,11 +9087,20 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
             &representative.trust_domain,
         ) else {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                network = network.unwrap_or("<none>"),
-                trust_domain = %representative.trust_domain.as_str(),
-                service_fqdn = %base_fqdn,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                network = %sanitize_startup_cause(
+                    format!("{:?}", (network.unwrap_or("<none>")).to_string()),
+                    &[]
+                ),
+                trust_domain = %sanitize_startup_cause(
+                    format!("{:?}", (representative.trust_domain.as_str()).to_string()),
+                    &[]
+                ),
+                service_fqdn = %sanitize_startup_cause(format!("{:?}", base_fqdn.to_string()), &[]),
                 "Skipping cross-cluster egress: no EastWestGateway on the remote network whose \
                  sni_hosts claim the destination service FQDN AND whose trust domain matches the \
                  remote workloads' (fail closed; never broaden to a different-network catch-all or \
@@ -8870,9 +9110,12 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
         };
         if gateway.host.is_empty() || gateway.port == 0 {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                gateway = %gateway.name,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                gateway = %sanitize_startup_cause(format!("{:?}", gateway.name.to_string()), &[]),
                 "Skipping cross-cluster egress: EastWestGateway has no usable host:port"
             );
             continue;
@@ -9006,10 +9249,19 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
             > 1
         {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                gateway_host = %target.host,
-                gateway_port = target.port,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                gateway_host = %sanitize_startup_cause(
+                    format!("{:?}", target.host.to_string()),
+                    &[]
+                ),
+                gateway_port = %sanitize_startup_cause(
+                    format!("{:?}", target.port.to_string()),
+                    &[]
+                ),
                 "Skipping cross-cluster egress target: multiple trust domains resolve to the same \
                  east-west gateway endpoint (fail closed; an SNI-passthrough gateway LB-picks the \
                  backend, so a shared endpoint cannot pin a trust domain — declare a distinct \
@@ -9074,16 +9326,25 @@ fn append_cross_cluster_sidecar_l4_targets(
             &workload.trust_domain,
         ) else {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                network = workload.network.as_deref().unwrap_or("<none>"),
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                network = %sanitize_startup_cause(
+                    format!("{:?}", (workload.network.as_deref().unwrap_or("<none>")).to_string()),
+                    &[]
+                ),
                 "Skipping cross-cluster Sidecar L4 workload without a matching east-west gateway"
             );
             continue;
         };
         if gateway.host.trim().is_empty() || gateway.port == 0 {
-            warn!(service = %service.name, gateway = %gateway.name,
-                "Skipping cross-cluster Sidecar L4 workload with an unusable gateway endpoint");
+            warn!(
+                service = %sanitize_startup_cause(format!("{:?}", service.name), &[]),
+                gateway = %sanitize_startup_cause(format!("{:?}", gateway.name), &[]),
+                "Skipping cross-cluster Sidecar L4 workload with an unusable gateway endpoint"
+            );
             continue;
         }
         let app_port = match service_port.target_port.as_ref() {
@@ -9171,9 +9432,15 @@ fn append_cross_cluster_sidecar_l4_targets(
             .is_some_and(|domains| domains.len() > 1)
         {
             warn!(
-                service = %service.name,
-                gateway_host = %item.dial_endpoint.0,
-                gateway_port = item.dial_endpoint.1,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                gateway_host = %sanitize_startup_cause(
+                    format!("{:?}", item.dial_endpoint.0.to_string()),
+                    &[]
+                ),
+                gateway_port = %sanitize_startup_cause(
+                    format!("{:?}", item.dial_endpoint.1.to_string()),
+                    &[]
+                ),
                 "Skipping ambiguous cross-cluster Sidecar L4 target: one gateway endpoint serves multiple trust domains"
             );
             continue;
@@ -9348,9 +9615,15 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
         .collect();
     if remote_workloads.is_empty() {
         warn!(
-            service = %service.name,
-            namespace = %service.namespace,
-            service_port = service_port.port,
+            service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", service.namespace.to_string()),
+                &[]
+            ),
+            service_port = %sanitize_startup_cause(
+                format!("{:?}", service_port.port.to_string()),
+                &[]
+            ),
             "Skipping Ambient cross-cluster egress: no reachable remote workload (every remote \
              endpoint lacks an address or has an unresolved targetPort for this port)"
         );
@@ -9399,12 +9672,21 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
             &workload.trust_domain,
         ) else {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                network = workload.network.as_deref().unwrap_or("<none>"),
-                trust_domain = %workload.trust_domain.as_str(),
-                service_fqdn = %base_fqdn,
-                dial_sni = %dial_sni,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                network = %sanitize_startup_cause(
+                    format!("{:?}", (workload.network.as_deref().unwrap_or("<none>")).to_string()),
+                    &[]
+                ),
+                trust_domain = %sanitize_startup_cause(
+                    format!("{:?}", (workload.trust_domain.as_str()).to_string()),
+                    &[]
+                ),
+                service_fqdn = %sanitize_startup_cause(format!("{:?}", base_fqdn.to_string()), &[]),
+                dial_sni = %sanitize_startup_cause(format!("{:?}", dial_sni.to_string()), &[]),
                 "Skipping Ambient cross-cluster egress for a remote workload: no EastWestGateway on \
                  its network whose sni_hosts claim the destination service FQDN OR the per-port \
                  alias being dialed AND whose trust domain matches (fail closed; never broaden to a \
@@ -9414,9 +9696,12 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
         };
         if gateway.host.is_empty() || gateway.port == 0 {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                gateway = %gateway.name,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                gateway = %sanitize_startup_cause(format!("{:?}", gateway.name.to_string()), &[]),
                 "Skipping Ambient cross-cluster egress: EastWestGateway has no usable host:port"
             );
             continue;
@@ -9542,10 +9827,19 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
             > 1
         {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                gateway_host = %entry.dial_endpoint.0,
-                gateway_port = entry.dial_endpoint.1,
+                service = %sanitize_startup_cause(format!("{:?}", service.name.to_string()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", service.namespace.to_string()),
+                    &[]
+                ),
+                gateway_host = %sanitize_startup_cause(
+                    format!("{:?}", entry.dial_endpoint.0.to_string()),
+                    &[]
+                ),
+                gateway_port = %sanitize_startup_cause(
+                    format!("{:?}", entry.dial_endpoint.1.to_string()),
+                    &[]
+                ),
                 "Skipping Ambient cross-cluster egress target: multiple trust domains resolve to \
                  the same east-west gateway dial endpoint (fail closed; an SNI-passthrough gateway \
                  terminates one outer TLS identity, so a shared endpoint cannot pin a trust domain \
@@ -9991,8 +10285,11 @@ fn synthesize_mesh_outbound_cors_plugins(
         };
         if matching.len() > 1 {
             warn!(
-                service = %service_fqdn,
-                applied = %format!("{}/{}", policy.namespace, policy.name),
+                service = %sanitize_startup_cause(format!("{:?}", service_fqdn.to_string()), &[]),
+                applied = %sanitize_startup_cause(
+                    format!("{:?}", (format!("{}/{}", policy.namespace, policy.name)).to_string()),
+                    &[]
+                ),
                 total_matches = matching.len(),
                 "Multiple VirtualService CORS policies target one service; applying the \
                  first by (namespace, name) — host-level mesh CORS takes one policy per host"
@@ -10490,9 +10787,12 @@ fn apply_destination_rules(
                     ports
                 } else {
                     warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
+                        rule = %sanitize_startup_cause(format!("{:?}", dr.name.to_string()), &[]),
+                        upstream = %sanitize_startup_cause(
+                            format!("{:?}", upstream.id.to_string()),
+                            &[]
+                        ),
+                        port = %sanitize_startup_cause(format!("{:?}", port.to_string()), &[]),
                         "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
                     );
                     continue;
@@ -10822,7 +11122,10 @@ fn apply_destination_rules(
         // reaching here means a producer sent a rule this subscriber's lookup
         // path never covered.
         warn!(
-            client_namespace = %client_namespace,
+            client_namespace = %sanitize_startup_cause(
+                format!("{:?}", client_namespace.to_string()),
+                &[]
+            ),
             refused = refused_out_of_lookup_path,
             "Refused DestinationRules declared outside Istio's client/service/root \
              lookup namespaces before materialization"
@@ -11415,7 +11718,10 @@ fn apply_traffic_policy_tls_to_backend_config(
                     slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
                     if runtime.workload_svid_trust_bundle_path.is_none() {
                         warn!(
-                            identity = %identity,
+                            identity = %sanitize_startup_cause(
+                                format!("{:?}", identity.to_string()),
+                                &[]
+                            ),
                             "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale CA and falling back to global/default trust"
                         );
                     }
@@ -11462,7 +11768,7 @@ fn apply_traffic_policy_tls_to_backend_config(
         // error. Treat as a no-op rather than panic on the cold path.
         MtlsMode::Strict | MtlsMode::Permissive => {
             warn!(
-                identity = %identity,
+                identity = %sanitize_startup_cause(format!("{:?}", identity.to_string()), &[]),
                 mode = ?tls.mode,
                 "DestinationRule trafficPolicy.tls.mode is a server-side mode and cannot apply to client-side backend TLS; ignoring"
             );
@@ -11497,8 +11803,8 @@ fn bounded_backend_tls_sni(identity: &str, sni: Option<&str>) -> Option<String> 
         Ok(()) => Some(sni.to_ascii_lowercase()),
         Err(error) => {
             warn!(
-                identity = %identity,
-                error = %error,
+                identity = %sanitize_startup_cause(format!("{:?}", identity.to_string()), &[]),
+                error = %sanitize_startup_cause(&error, &[]),
                 "DestinationRule trafficPolicy.tls.sni is invalid for backend TLS; dropping SNI override"
             );
             None
@@ -11510,7 +11816,7 @@ fn bounded_backend_tls_san_allow_list(identity: &str, sans: &[String]) -> Vec<St
     let mut bounded = Vec::with_capacity(sans.len().min(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES));
     if sans.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
         warn!(
-            identity = %identity,
+            identity = %sanitize_startup_cause(format!("{:?}", identity.to_string()), &[]),
             count = sans.len(),
             max = MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
             "DestinationRule subjectAltNames exceeds backend TLS SAN allow-list limit; dropping extra entries"
@@ -11520,7 +11826,7 @@ fn bounded_backend_tls_san_allow_list(identity: &str, sans: &[String]) -> Vec<St
     for san in sans.iter().take(MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES) {
         if san.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH {
             warn!(
-                identity = %identity,
+                identity = %sanitize_startup_cause(format!("{:?}", identity.to_string()), &[]),
                 len = san.len(),
                 max = MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
                 "DestinationRule subjectAltNames entry exceeds backend TLS SAN allow-list entry limit; dropping entry"
@@ -11529,8 +11835,8 @@ fn bounded_backend_tls_san_allow_list(identity: &str, sans: &[String]) -> Vec<St
         }
         if let Err(error) = crate::config::types::validate_backend_tls_san_allow_list_entry(san) {
             warn!(
-                identity = %identity,
-                error = %error,
+                identity = %sanitize_startup_cause(format!("{:?}", identity.to_string()), &[]),
+                error = %sanitize_startup_cause(&error, &[]),
                 "DestinationRule subjectAltNames entry is invalid for backend TLS SAN allow-list; dropping entry"
             );
             continue;
@@ -11867,10 +12173,22 @@ fn build_egress_proxies_and_upstreams(
                 // to an opaque UDP relay. Any future unclassified protocol is
                 // skipped the same way instead of panicking.
                 warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
-                    port = port_spec.port,
-                    protocol = ?port_spec.protocol,
+                    service_entry = %sanitize_startup_cause(
+                        format!("{:?}", entry.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", entry.namespace.to_string()),
+                        &[]
+                    ),
+                    port = %sanitize_startup_cause(
+                        format!("{:?}", port_spec.port.to_string()),
+                        &[]
+                    ),
+                    protocol = %sanitize_startup_cause(
+                        format!("{:?}", format!("{:?}", port_spec.protocol)),
+                        &[]
+                    ),
                     "Skipping ServiceEntry port for egress gateway: this port protocol has no \
                      egress-gateway backend scheme (a `dtls` port is unrepresentable at the \
                      terminate-and-re-originate egress boundary; declare it `udp` for opaque \
@@ -11882,10 +12200,22 @@ fn build_egress_proxies_and_upstreams(
             if egress_is_stream_protocol(port_spec.protocol) {
                 if !egress_stream_enabled {
                     warn!(
-                        service_entry = %entry.name,
-                        namespace = %entry.namespace,
-                        port = port_spec.port,
-                        protocol = ?port_spec.protocol,
+                        service_entry = %sanitize_startup_cause(
+                            format!("{:?}", entry.name.to_string()),
+                            &[]
+                        ),
+                        namespace = %sanitize_startup_cause(
+                            format!("{:?}", entry.namespace.to_string()),
+                            &[]
+                        ),
+                        port = %sanitize_startup_cause(
+                            format!("{:?}", port_spec.port.to_string()),
+                            &[]
+                        ),
+                        protocol = %sanitize_startup_cause(
+                            format!("{:?}", format!("{:?}", port_spec.protocol)),
+                            &[]
+                        ),
                         "Skipping stream egress ServiceEntry port: stream-family egress is \
                          disabled. Set FERRUM_MESH_EGRESS_STREAM_ENABLED=true to materialize \
                          per-port stream egress listeners (they terminate SVID-mTLS and run \
@@ -11967,9 +12297,9 @@ fn build_udp_egress_destinations_for_entry(
 ) {
     if !egress_stream_enabled {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            port = port_spec.port,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
             "Skipping UDP egress ServiceEntry port: stream-family egress is disabled. Set \
              FERRUM_MESH_EGRESS_STREAM_ENABLED=true to admit datagram-over-mesh egress \
              destinations (relayed over the gateway's authenticated mesh CONNECT terminator, \
@@ -11980,8 +12310,8 @@ fn build_udp_egress_destinations_for_entry(
 
     if port_spec.port == 0 {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
             field = "ports[].number",
             "Skipping UDP egress ServiceEntry port 0: a CONNECT authority cannot name port 0"
         );
@@ -12013,10 +12343,10 @@ fn build_udp_egress_destinations_for_entry(
     // resolve the authority — exactly the STATIC-endpoint bypass this must not do.
     if static_endpoints.as_ref().is_some_and(|eps| eps.is_empty()) {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
             field = "endpoints[]",
-            port = port_spec.port,
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
             "Skipping STATIC UDP egress ServiceEntry port: it declares no usable IP-literal \
              endpoint, and a STATIC destination must never be reached by DNS-resolving its host"
         );
@@ -12028,10 +12358,16 @@ fn build_udp_egress_destinations_for_entry(
         let host = host.trim();
         if host.is_empty() {
             warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
+                service_entry = %sanitize_startup_cause(
+                    format!("{:?}", entry.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", entry.namespace.to_string()),
+                    &[]
+                ),
                 field = "hosts[]",
-                port = port_spec.port,
+                port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
                 "Skipping empty UDP egress ServiceEntry host"
             );
             continue;
@@ -12052,11 +12388,17 @@ fn build_udp_egress_destinations_for_entry(
         ) || host.contains('*')
         {
             warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
+                service_entry = %sanitize_startup_cause(
+                    format!("{:?}", entry.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", entry.namespace.to_string()),
+                    &[]
+                ),
                 field = "hosts[]",
-                host = %host,
-                port = port_spec.port,
+                host = %sanitize_startup_cause(format!("{:?}", host.to_string()), &[]),
+                port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
                 "Skipping wildcard UDP egress ServiceEntry host: datagram-over-mesh egress \
                  admits exact authority hosts only (the CONNECT authority is matched \
                  exactly), so a wildcard cannot be honored without guessing the \
@@ -12106,9 +12448,9 @@ fn build_udp_egress_destinations_for_entry(
 
     if admitted_for_port == 0 {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            port = port_spec.port,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
             "UDP egress ServiceEntry port admitted no destination; datagram-over-mesh egress \
              stays denied for it"
         );
@@ -12159,11 +12501,17 @@ fn resolve_static_udp_dial_endpoints(
         let address = endpoint.address.trim();
         let Ok(ip) = address.parse::<std::net::IpAddr>() else {
             warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
+                service_entry = %sanitize_startup_cause(
+                    format!("{:?}", entry.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", entry.namespace.to_string()),
+                    &[]
+                ),
                 field = "endpoints[].address",
-                address = %address,
-                port = port_spec.port,
+                address = %sanitize_startup_cause(format!("{:?}", address.to_string()), &[]),
+                port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
                 "Skipping UDP egress ServiceEntry endpoint whose address is not an IP literal"
             );
             continue;
@@ -12175,11 +12523,17 @@ fn resolve_static_udp_dial_endpoints(
         };
         if port == 0 {
             warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
+                service_entry = %sanitize_startup_cause(
+                    format!("{:?}", entry.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", entry.namespace.to_string()),
+                    &[]
+                ),
                 field = "endpoints[].ports",
-                address = %address,
-                port = port_spec.port,
+                address = %sanitize_startup_cause(format!("{:?}", address.to_string()), &[]),
+                port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
                 "Skipping UDP egress ServiceEntry endpoint that resolves to dial port 0"
             );
             continue;
@@ -12193,10 +12547,16 @@ fn resolve_static_udp_dial_endpoints(
         }
         if endpoints.len() >= MAX_EGRESS_UDP_DIAL_ENDPOINTS {
             warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
+                service_entry = %sanitize_startup_cause(
+                    format!("{:?}", entry.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", entry.namespace.to_string()),
+                    &[]
+                ),
                 field = "endpoints[]",
-                port = port_spec.port,
+                port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
                 max_endpoints = MAX_EGRESS_UDP_DIAL_ENDPOINTS,
                 "Dropping UDP egress ServiceEntry endpoints beyond the per-destination cap"
             );
@@ -12229,11 +12589,11 @@ fn push_udp_egress_destination(
     let host = host.to_ascii_lowercase();
     if destinations.len() >= MAX_EGRESS_UDP_DESTINATIONS {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
             field = "egress_udp_destinations",
-            host = %host,
-            port,
+            host = %sanitize_startup_cause(format!("{:?}", host.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port.to_string()), &[]),
             max_destinations = MAX_EGRESS_UDP_DESTINATIONS,
             "Skipping UDP egress ServiceEntry destination: total admitted destinations \
              would exceed the allowlist cap"
@@ -12242,10 +12602,10 @@ fn push_udp_egress_destination(
     }
     if !materialized_udp_destinations.insert((host.clone(), port)) {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            host = %host,
-            port,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            host = %sanitize_startup_cause(format!("{:?}", host.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port.to_string()), &[]),
             "Skipping UDP egress ServiceEntry destination: another ServiceEntry already \
              admitted this host and port"
         );
@@ -12282,9 +12642,9 @@ fn build_http_egress_for_entry(
         .collect();
     if proxy_hosts.is_empty() {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            port = port_spec.port,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
             "Skipping egress ServiceEntry port because its hosts were already materialized as HTTP-family"
         );
         return;
@@ -12364,9 +12724,12 @@ fn build_stream_egress_for_entry(
 ) {
     if port_spec.port == 0 {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            protocol = ?port_spec.protocol,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            protocol = %sanitize_startup_cause(
+                format!("{:?}", format!("{:?}", port_spec.protocol)),
+                &[]
+            ),
             "Skipping stream egress ServiceEntry port 0: stream proxy listen_port must be >= 1"
         );
         return;
@@ -12374,10 +12737,13 @@ fn build_stream_egress_for_entry(
 
     if mesh_reserved_ports.contains(&port_spec.port) {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            port = port_spec.port,
-            protocol = ?port_spec.protocol,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
+            protocol = %sanitize_startup_cause(
+                format!("{:?}", format!("{:?}", port_spec.protocol)),
+                &[]
+            ),
             "Skipping stream egress ServiceEntry port: collides with a mesh gateway listener port \
              (would fail to bind at runtime). Operators should choose a different ServiceEntry \
              port or relocate the egress gateway listener."
@@ -12387,10 +12753,13 @@ fn build_stream_egress_for_entry(
 
     if materialized_stream_ports.contains(&port_spec.port) {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
-            port = port_spec.port,
-            protocol = ?port_spec.protocol,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
+            protocol = %sanitize_startup_cause(
+                format!("{:?}", format!("{:?}", port_spec.protocol)),
+                &[]
+            ),
             "Skipping stream egress ServiceEntry port: another ServiceEntry already \
              materialized a stream proxy on this listen_port"
         );
@@ -12420,11 +12789,11 @@ fn build_stream_egress_for_entry(
         entry.endpoints.len(),
     ) {
         warn!(
-            service_entry = %entry.name,
-            namespace = %entry.namespace,
+            service_entry = %sanitize_startup_cause(format!("{:?}", entry.name.to_string()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", entry.namespace.to_string()), &[]),
             field = "hosts[]",
-            host = %representative_host,
-            port = port_spec.port,
+            host = %sanitize_startup_cause(format!("{:?}", representative_host.to_string()), &[]),
+            port = %sanitize_startup_cause(format!("{:?}", port_spec.port.to_string()), &[]),
             "Skipping wildcard stream-family egress ServiceEntry host: without \
              resolution: STATIC and a non-empty endpoints[], the wildcard host itself \
              becomes the upstream dial target and cannot be resolved. Declare concrete \
@@ -13647,7 +14016,7 @@ fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
         provider["jwks"] = serde_json::json!(jwks);
     } else {
         warn!(
-            issuer = %rule.issuer,
+            issuer = %sanitize_startup_cause(format!("{:?}", rule.issuer.to_string()), &[]),
             "Skipping MeshRequestAuthentication JWT rule with no jwks_uri or jwks"
         );
         return None;
@@ -15761,7 +16130,7 @@ async fn arm_mesh_runtime_startup(
                 // start discovery with an unknown auth posture. An empty map
                 // here still fails closed per-cluster in `start_cluster` for any
                 // RemoteCluster that references a (now-absent) credential.
-                error!("{err}");
+                error!("{}", sanitize_startup_cause(&err, &[]));
                 std::sync::Arc::new(std::collections::HashMap::new())
             }
         };
@@ -16784,7 +17153,7 @@ async fn start_spire_agent_mesh_svid_source(
                     && !error.is_cancelled()
                 {
                     warn!(
-                        error = %error,
+                        error = %sanitize_startup_cause(&error, &[]),
                         "SPIRE Workload API SVID fetch task exited unexpectedly"
                     );
                 }
@@ -16796,7 +17165,7 @@ async fn start_spire_agent_mesh_svid_source(
                     Err(error) if error.is_cancelled() => {}
                     Err(error) => {
                         warn!(
-                            error = %error,
+                            error = %sanitize_startup_cause(&error, &[]),
                             "SPIRE Workload API SVID fetch task failed while stopping"
                         );
                     }
@@ -16988,7 +17357,7 @@ async fn run_internal_mesh_svid_rotation_loop(
                     &spiffe_id, "internal",
                 );
                 warn!(
-                    error = %error,
+                    error = %sanitize_startup_cause(&error, &[]),
                     spiffe_id = %spiffe_id,
                     retry_after_ms,
                     "internal mesh CA SVID rotation failed; keeping current identity"
@@ -17131,7 +17500,7 @@ fn build_mesh_workload_api_attestors(
         Ok(attestor) => attestors.push(Arc::new(attestor)),
         Err(error) => {
             debug!(
-                error = %error,
+                error = %sanitize_startup_cause(&error, &[]),
                 "dev static attestor not available for the Workload API (expected in production)"
             );
         }
@@ -17173,7 +17542,7 @@ async fn rotate_mesh_jwt_authority_if_due(
         Ok(generation) => generation,
         Err(error) => {
             warn!(
-                error = %error,
+                error = %sanitize_startup_cause(&error, &[]),
                 spiffe_id = %spiffe_id,
                 "JWT-SVID signing key rotation did not complete; keeping the current key and \
                  every already-minted token verifiable"
@@ -17434,7 +17803,7 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
             // startup (also independently enforced by `load_gateway_svid_bundle`),
             // previous-bundle-retained on live reload.
             error!(
-                %error,
+                error = %sanitize_startup_cause(&error, &[]),
                 "Failed to load gateway SVID material for the mesh inbound SPIFFE peer \
                  verifier (startup: fatal; live reload: previous trust bundle retained)"
             );
@@ -17449,7 +17818,7 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
         effective_trust_bundles.as_ref(),
     ) {
         warn!(
-            %error,
+            error = %sanitize_startup_cause(&error, &[]),
             "Unable to build complete mesh inbound SPIFFE trust bundle; keeping previous trust"
         );
         return None;
@@ -19644,7 +20013,7 @@ async fn apply_mesh_slice_generation(
         Err(e) => {
             warn!(
                 mesh_slice_version = %base_slice.version,
-                error = %e,
+                error = %sanitize_startup_cause(&e, &[]),
                 "Ignoring invalid mesh slice update"
             );
             MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::ConfigBuild)
@@ -20051,7 +20420,7 @@ impl MeshStartupOwner {
     async fn fail_with(self, err: anyhow::Error) -> anyhow::Error {
         warn!(
             "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
-            err
+            sanitize_startup_cause(&err, &[])
         );
         let _ = self.shutdown_tx.send(true);
         // Stop the Workload API first so its socket artifact is gone before the
@@ -20127,7 +20496,7 @@ async fn fail_mesh_pre_owner(
 ) -> anyhow::Error {
     warn!(
         "Mesh runtime startup failed after spawning config consumers: {}; draining before returning",
-        err
+        sanitize_startup_cause(&err, &[])
     );
     let _ = shutdown_tx.send(true);
     join_mesh_background_handles(handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
@@ -21175,7 +21544,10 @@ fn spawn_sock_ops_consumer_task(
                 crate::ebpf::event_consumer::production::run_pinned_consumer(consumer, shutdown_rx)
                     .await
             {
-                tracing::warn!(error = %err, "SOCK_OPS ringbuf consumer task exited with error");
+                tracing::warn!(
+                    error = %sanitize_startup_cause(&err, &[]),
+                    "SOCK_OPS ringbuf consumer task exited with error"
+                );
             }
         }))
     }
@@ -21205,7 +21577,10 @@ fn spawn_orig_dst_bridge_task(
         if let Err(err) =
             crate::ebpf::orig_dst_bridge::run_orig_dst_bridge(resolver, shutdown_rx).await
         {
-            tracing::warn!(error = %err, "Node-waypoint orig-dst bridge task exited with error");
+            tracing::warn!(
+                error = %sanitize_startup_cause(&err, &[]),
+                "Node-waypoint orig-dst bridge task exited with error"
+            );
         }
     })
 }

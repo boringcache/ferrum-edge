@@ -43,6 +43,7 @@ use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use crate::modes::mesh::revision::MeshRevisionContentIdentity;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, slice_content_identity};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::startup::sanitize_startup_cause;
 
 /// On-disk shape of the localized mesh config document.
 ///
@@ -150,7 +151,7 @@ fn read_mesh_file_bytes(path: &Path) -> Result<String, anyhow::Error> {
                 warn!(
                     "Mesh config file {} is world-readable (mode {:o}). Consider restricting \
                      permissions as it may contain trust material.",
-                    path.display(),
+                    sanitize_startup_cause(format!("{path:?}"), &[]),
                     mode & 0o777
                 );
             }
@@ -433,7 +434,7 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                         let latest = latest_requested.load(Ordering::Acquire);
                         if !mesh_reload_generation_is_current(generation, latest) {
                             info!(
-                                file_path = %path,
+                                file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                                 generation,
                                 latest,
                                 "{}", messages.stale_generation
@@ -445,7 +446,7 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                                 MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
                             ) {
                                 info!(
-                                    file_path = %path,
+                                    file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                                     mesh_slice_version = result.version.as_deref().unwrap_or(""),
                                     generation,
                                     outcome = ?result.apply,
@@ -457,23 +458,23 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                     }
                     Ok(Err(e)) => {
                         warn!(
-                            file_path = %path,
+                            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
-                            error = %e,
+                            error = %sanitize_startup_cause(&e, &[]),
                             "{}", messages.load_failed
                         );
                         mark_mesh_local_reload_rejected(recovery);
                     }
                     Err(join_error) if join_error.is_cancelled() => {
                         info!(
-                            file_path = %path,
+                            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
                             "{}", messages.join_cancelled
                         );
                     }
                     Err(join_error) => {
                         warn!(
-                            file_path = %path,
+                            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
                             error = %join_error,
                             "{}", messages.worker_panicked
@@ -937,7 +938,7 @@ pub fn apply_mesh_file_reload_candidate(
         }
         Err(error) => {
             warn!(
-                error = %error,
+                error = %sanitize_startup_cause(&error, &[]),
                 "Failed to reload mesh config file; keeping the last good mesh slice and \
                  raising config_rejected"
             );
@@ -979,7 +980,7 @@ pub async fn start_mesh_file_source_with_shutdown(
             Ok(stream) => stream,
             Err(e) => {
                 warn!(
-                    error = %e,
+                    error = %sanitize_startup_cause(&e, &[]),
                     "Failed to register SIGHUP handler for mesh file source; the mesh \
                      document will not reload until restart"
                 );
@@ -1006,7 +1007,7 @@ pub async fn start_mesh_file_source_with_shutdown(
     #[cfg(not(unix))]
     {
         info!(
-            file_path = %path,
+            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
             "Mesh file source loaded; live reload is Unix-only (SIGHUP), restart to pick up \
              changes"
         );

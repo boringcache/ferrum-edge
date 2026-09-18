@@ -852,29 +852,34 @@ impl PatternBuilder {
         if self.patterns.is_empty() {
             return Ok(None);
         }
-        RegexSetBuilder::new(self.patterns)
+        let set = RegexSetBuilder::new(&self.patterns)
             .build()
-            .map(|set| {
-                Some(TextRuleSet {
-                    set,
-                    refs: self.refs,
-                })
-            })
-            .map_err(|e| format!("waf: failed to build {label} RegexSet: {e}"))
+            .map_err(|_| self.rejection(label))?;
+        Ok(Some(TextRuleSet {
+            set,
+            refs: self.refs,
+        }))
     }
 
     fn finish_bytes(self, label: &str) -> Result<Option<BytesRuleSet>, String> {
         if self.patterns.is_empty() {
             return Ok(None);
         }
-        BytesRegexSet::new(self.patterns)
-            .map(|set| {
-                Some(BytesRuleSet {
-                    set,
-                    refs: self.refs,
-                })
-            })
-            .map_err(|e| format!("waf: failed to build {label} bytes RegexSet: {e}"))
+        let set = BytesRegexSet::new(&self.patterns).map_err(|_| self.rejection(label))?;
+        Ok(Some(BytesRuleSet {
+            set,
+            refs: self.refs,
+        }))
+    }
+
+    fn rejection(&self, label: &str) -> String {
+        // Regex errors can echo patterns without quotes. Keep only schema/set
+        // context and source rule indexes, including aggregate size failures.
+        let indexes: Vec<_> = self.refs.iter().map(|rule| rule.rule_index).collect();
+        format!(
+            "waf: `pattern` set for `{label}` at rule indexes {indexes:?} is invalid \
+             or too complex"
+        )
     }
 }
 
