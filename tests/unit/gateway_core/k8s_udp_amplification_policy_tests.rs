@@ -483,7 +483,7 @@ fn unmaterialized_parent_reports_amplification_not_programmed() {
             assert_eq!(name, "dns");
             assert_eq!(
                 message,
-                "UDPRoute parentRef does not match any known Gateway listener in namespace 'default'"
+                r#"UDPRoute parentRef does not match any known Gateway listener in namespace "default""#
             );
         }
         other => panic!("expected InvalidResource for unmatched parentRef, got {other:?}"),
