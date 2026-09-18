@@ -8459,7 +8459,8 @@ fn begin_half_close(state: &mut CopyDirectionState, write_watermark: Option<&Ato
     state.phase = CopyPhase::ShuttingDown;
 }
 
-/// Errnos a half-close may legitimately raise because the peer is already gone.
+/// Failures a half-close may legitimately raise because the peer is already
+/// gone.
 ///
 /// The write-path set ([`is_post_eof_benign_write_error`]) is the base.
 /// `poll_shutdown` adds one spelling of its own: on a real socket it is
@@ -8471,12 +8472,60 @@ fn begin_half_close(state: &mut CopyDirectionState, write_watermark: Option<&Ato
 /// reclassified. Admitting it here only avoids double-reporting ordinary
 /// teardown.
 ///
+/// **Not every relay writer is a socket, so the set is not errnos alone.** The
+/// HBONE inbound byte tunnel hands this loop hyper's `H2Upgraded`
+/// (`hbone_proxy.rs`, `TokioIo::new(upgraded)`), whose `poll_shutdown` funnels
+/// *every* h2 close reason through `io::Error::new(ErrorKind::Other, …)` —
+/// including the `RST_STREAM(NO_ERROR)` a client sends when it is simply done
+/// with a tunnel whose other half already finished. None of the errnos above
+/// can reach this function from that writer, so the reason itself is the
+/// signal: an `h2::Error` in the source chain reporting `NO_ERROR` or `CANCEL`
+/// is the same graceful teardown hyper's own read half already treats as clean
+/// EOF ([`half_close_h2_reason_is_graceful`]). Every other reason stays a real
+/// write-side failure.
+///
 /// `ConnectionAborted` stays excluded for the reason
 /// [`is_post_eof_benign_write_error`] documents: on Linux it can be a kernel
 /// abort, not a close-race signal.
-fn is_benign_half_close_error(kind: std::io::ErrorKind) -> bool {
-    is_post_eof_benign_write_error(StreamIoSide::Write, kind)
-        || matches!(kind, std::io::ErrorKind::NotConnected)
+fn is_benign_half_close_error(e: &std::io::Error) -> bool {
+    is_post_eof_benign_write_error(StreamIoSide::Write, e.kind())
+        || matches!(e.kind(), std::io::ErrorKind::NotConnected)
+        || half_close_h2_reason_is_graceful(e)
+}
+
+/// The h2 half of [`is_benign_half_close_error`]: `NO_ERROR` and `CANCEL` are
+/// the two reasons that mean "this stream is simply over".
+///
+/// The FIRST `h2::Error` in the chain decides, so a real reason is never
+/// overridden by something further down. Typed only, matching
+/// `retry::error_chain_is_protocol_nack` — a reason inferred from a message
+/// would reclassify a genuine truncation as graceful.
+///
+/// The walk starts at `get_ref()` because `io::Error::source()` returns the
+/// *inner* error's source and skips the inner error itself; on the production
+/// chain that inner error is hyper's own `Error`, whose cause is the
+/// `h2::Error`, so both the direct and the nested wrapping are covered.
+///
+/// Error path only.
+fn half_close_h2_reason_is_graceful(e: &std::io::Error) -> bool {
+    let graceful = |h2_err: &h2::Error| {
+        let reason = h2_err.reason();
+        reason == Some(h2::Reason::NO_ERROR) || reason == Some(h2::Reason::CANCEL)
+    };
+    if let Some(h2_err) = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<h2::Error>())
+    {
+        return graceful(h2_err);
+    }
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+            return graceful(h2_err);
+        }
+        source = std::error::Error::source(err);
+    }
+    false
 }
 
 /// Resolve a completed half-close into this direction's result, and release the
@@ -8499,7 +8548,7 @@ fn is_benign_half_close_error(kind: std::io::ErrorKind) -> bool {
 /// * the direction must actually have owed a flush — a writer that already
 ///   flushed everything it accepted truncates nothing when its half-close
 ///   fails; and
-/// * the errno must not be a benign peer-already-gone one
+/// * the failure must not be a benign peer-already-gone one
 ///   ([`is_benign_half_close_error`]). Surfacing those would additionally make
 ///   an ordinary close race depend on the opposite direction's grace window and
 ///   on `both_directions_transferred`.
@@ -8520,7 +8569,7 @@ fn finish_half_close(
         wm.store(u64::MAX, Ordering::Relaxed);
     }
     match outcome {
-        Err(e) if owed_flush && !is_benign_half_close_error(e.kind()) => {
+        Err(e) if owed_flush && !is_benign_half_close_error(&e) => {
             Poll::Ready(Err((StreamIoSide::Write, e)))
         }
         _ => match state.terminal_read_error.take() {

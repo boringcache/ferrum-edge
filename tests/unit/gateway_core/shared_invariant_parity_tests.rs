@@ -2397,13 +2397,39 @@ const RELAY_CALL_SITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Where both entry points are defined, and the one file excluded from the scan
+/// below: `tcp_proxy.rs`'s own crate-internal `bidirectional_copy_for_test*`
+/// wrappers call the plain relay by its bare name.
+const RELAY_DEFINITION_FILE: &str = "src/proxy/tcp_proxy.rs";
+
+/// The bare name inside a path-qualified entry point.
+///
+/// The scan matches this as well as the module-qualified spelling, so a call
+/// site that wrote `use crate::proxy::tcp_proxy::bidirectional_copy_for_relay;`
+/// and then called it bare lands in `calling` and has to be listed. It cannot
+/// match a declaration instead of a call: both definitions carry a generic
+/// parameter list (`…_for_relay<C, B>(`) and the `_test_support` wrapper is
+/// `…_for_fenced_relay_for_test(`, so in neither case does a `(` follow the
+/// name. Prose mentions are stripped by
+/// `admission_source_without_line_comments` before the scan.
+fn bare_entry_point(entry_point: &str) -> &str {
+    match entry_point.rsplit_once("::") {
+        Some((_, name)) => name,
+        None => entry_point,
+    }
+}
+
 #[test]
 fn every_tunnelled_relay_path_shares_one_flushing_byte_pump() {
     let calling: BTreeSet<String> = production_sources()
         .into_iter()
-        .filter(|(_, text)| {
+        .filter(|(path, text)| {
+            if path.as_str() == RELAY_DEFINITION_FILE {
+                return false;
+            }
             let code = admission_source_without_line_comments(text);
-            code.contains(RELAY_ENTRY_POINT) || code.contains(FENCED_RELAY_ENTRY_POINT)
+            code.contains(bare_entry_point(RELAY_ENTRY_POINT))
+                || code.contains(bare_entry_point(FENCED_RELAY_ENTRY_POINT))
         })
         .map(|(path, _)| path)
         .collect();

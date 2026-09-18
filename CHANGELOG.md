@@ -350,7 +350,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the bytes already credited never left the writer. Nothing else changes
   about teardown: a half-close with nothing outstanding, and the benign
   peer-already-gone errnos (`EPIPE`, `ECONNRESET`, `WriteZero`, `ENOTCONN`),
-  stay graceful exactly as they were.
+  stay graceful exactly as they were. Not every relay writer is a socket, so
+  the benign set is not errnos alone: the HBONE HTTP/2 CONNECT byte tunnel's
+  client leg is hyper's `H2Upgraded`, which funnels every h2 close reason —
+  including the `RST_STREAM(NO_ERROR)` a client sends when it is simply
+  discarding a stream it is done with — through `ErrorKind::Other`. A
+  half-close carrying an `h2::Error` whose reason is `NO_ERROR` or `CANCEL` is
+  therefore graceful too, so an ordinary tunnel abort racing the app's EOF is
+  not counted as a relay failure; every other reason stays a real write-side
+  failure.
   Operators running TLS backends with a non-zero `backend_write_timeout_ms` can
   therefore see `backend write inactivity timeout` where the timer had
   previously gone inert — see `docs/tcp_udp_proxy.md` -> "TCP Backend Timeouts".
