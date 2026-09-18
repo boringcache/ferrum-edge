@@ -8952,7 +8952,10 @@ fn assert_rendered_mesh_diagnostic(error: String, expected: &[&str], withheld: &
         "{rendered}"
     );
     for fragment in expected {
-        assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        assert!(
+            rendered.contains(fragment),
+            "missing {fragment:?}: {rendered}"
+        );
     }
     for fragment in withheld {
         assert!(

@@ -1001,7 +1001,10 @@ fn rendered_effective_metric_plan_budget_withholds_proxy_identity_and_values() {
         .err()
         .expect("composed metric families must still exceed the budget");
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-    assert!(rendered.contains("proxy_id=<redacted scalar>"), "{rendered}");
+    assert!(
+        rendered.contains("proxy_id=<redacted scalar>"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("exceed 16384 encoded bytes across surviving families"),
         "{rendered}"

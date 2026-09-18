@@ -2590,7 +2590,10 @@ fn assert_rendered_route_diagnostic(config: serde_json::Value, expected: &[&str]
     let error = MeshRouteDispatch::new(&config).expect_err("invalid route must be rejected");
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
     for fragment in expected {
-        assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        assert!(
+            rendered.contains(fragment),
+            "missing {fragment:?}: {rendered}"
+        );
     }
     for fragment in ["MESH_DIAG", "mesh_diag", "8675309", "true"] {
         assert!(

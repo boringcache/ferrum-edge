@@ -4038,9 +4038,9 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
             .iter()
             .enumerate()
             .map(|(idx, item)| {
-                let raw = item.as_str().ok_or_else(|| {
-                    format!("`trust_domain_aliases[{idx}]` must be a string")
-                })?;
+                let raw = item
+                    .as_str()
+                    .ok_or_else(|| format!("`trust_domain_aliases[{idx}]` must be a string"))?;
                 TrustDomain::new(raw).map_err(|_| {
                     format!("`trust_domain_aliases[{idx}]` is not a valid trust domain")
                 })
@@ -4172,14 +4172,11 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                     let mut set = HashSet::with_capacity(ids.len());
                     for (idx, id) in ids.iter().enumerate() {
                         let Some(raw_id) = id.as_str() else {
-                            return Err(format!(
-                                "`asserts[{idx}]` must be a SPIFFE id string"
-                            ));
+                            return Err(format!("`asserts[{idx}]` must be a SPIFFE id string"));
                         };
                         let raw_id = raw_id.trim();
-                        let parsed = SpiffeId::new(raw_id).map_err(|_| {
-                            format!("`asserts[{idx}]` is not a valid SPIFFE id")
-                        })?;
+                        let parsed = SpiffeId::new(raw_id)
+                            .map_err(|_| format!("`asserts[{idx}]` is not a valid SPIFFE id"))?;
                         set.insert(parsed.as_str().to_string());
                     }
                     AssertionGrant::FrontedIdentities(Arc::new(set))

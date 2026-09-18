@@ -552,9 +552,15 @@ fn unknown_effective_baggage_gate_keeps_index_and_withholds_supplied_key() {
         "`_effective_mesh_authz_baggage_gates[1]`",
         "unknown configuration key(s)",
     ] {
-        assert!(rendered.contains(expected), "missing {expected:?}: {rendered}");
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
     }
     for withheld in ["MESH_GATE_KEY_MARKER", "MESH_GATE_VALUE_MARKER"] {
-        assert!(!rendered.contains(withheld), "leaked {withheld}: {rendered}");
+        assert!(
+            !rendered.contains(withheld),
+            "leaked {withheld}: {rendered}"
+        );
     }
 }

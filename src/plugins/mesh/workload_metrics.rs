@@ -505,10 +505,10 @@ impl WorkloadMetrics {
         } else {
             trace_exporters_from_providers(&tracing_providers, &service_name, config, http_client)
                 .map_err(|_| {
-                    "workload_metrics: could not construct tracing exporter; check \
+                "workload_metrics: could not construct tracing exporter; check \
                      `tracing_provider` / `tracing_providers` and exporter options"
-                        .to_string()
-                })?
+                    .to_string()
+            })?
         };
         let direction_emit = parse_direction_emit(config)?;
 
@@ -1757,9 +1757,8 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                         "workload_metrics: `metrics.tag_overrides[{idx}].operation` is required for metric tag {name:?}"
                     )
                 })?;
-            let operation = parse_tag_operation(name, operation).map_err(|error| {
-                format!("`metrics.tag_overrides[{idx}].operation`: {error}")
-            })?;
+            let operation = parse_tag_operation(name, operation)
+                .map_err(|error| format!("`metrics.tag_overrides[{idx}].operation`: {error}"))?;
             let selector = match entry.get("metric") {
                 None | Some(Value::Null) => MetricSelector::All,
                 Some(Value::String(metric)) => metric_selector(metric).ok_or_else(|| {
@@ -1926,8 +1925,9 @@ pub(crate) fn validate_istio_telemetry_config(
         })?;
     }
     if let Some(metrics) = metrics {
-        let metrics = serde_json::to_value(metrics)
-            .map_err(|_| "workload_metrics: could not serialize translated `metrics`".to_string())?;
+        let metrics = serde_json::to_value(metrics).map_err(|_| {
+            "workload_metrics: could not serialize translated `metrics`".to_string()
+        })?;
         parse_metric_config(Some(&metrics))?;
     }
     Ok(())

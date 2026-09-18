@@ -1077,7 +1077,10 @@ fn rendered_metric_tag_diagnostics_withhold_names_operations_and_cel_payloads() 
             .expect("invalid metric override must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for fragment in [field, reason] {
-            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
         }
         for fragment in ["MESH_DIAG_SECRET", "8675309", "true"] {
             assert!(

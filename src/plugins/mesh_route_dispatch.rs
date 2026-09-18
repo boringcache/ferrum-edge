@@ -2822,7 +2822,10 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("backend_host` must not be empty"), "got: {err}");
+        assert!(
+            err.contains("backend_host` must not be empty"),
+            "got: {err}"
+        );
     }
 
     #[test]
