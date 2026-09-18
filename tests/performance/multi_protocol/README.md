@@ -317,7 +317,62 @@ If uncertainty still overlaps, report inconclusive and schedule a longer
 predeclared experiment. Optional stopping does not make this exploratory interval
 a confirmatory test. Inspect every sample's p99 as well as RPS.
 
-#### Maximum safe dispatch inputs
+#### Same-image environment experiments (#5588 section 4)
+
+The runner reads the branch-committed `experiment.json` before any build or
+startup. An enabled manifest adds named `ferrum-exp-*` arms for its one protocol
+when Ferrum is selected. Its first arm is the `ferrum` reference; every arm uses
+the same image, configuration, startup function, payloads, offered concurrency,
+phases and strict validity rules. Only `FERRUM_EXTRA_ENV` differs. Values are
+literal public benchmark settings, never shell source or credentials. Image
+overrides, duplicate names/keys and shell syntax are rejected. Ambient
+`FERRUM_EXTRA_ENV` and `--baseline-image` cannot be combined with an active
+manifest. The resolved arm names enter the ordinary expected matrix and paired
+comparisons; the exact experiment manifest is copied into the run artifact.
+Disable the manifest after an experiment so later default runs do not silently
+acquire extra arms.
+
+The cutoff experiment compares `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` against
+`1` at 10240, 71680, 512000, 1048576 and 5242880 bytes. A scoped hosted dispatch
+uses duration 30, concurrency 200, iterations 1, skips `envoy kong tyk krakend`
+and skips `http2 http3 grpcs wss tcp-tls udp udp-dtls`. The default two pairs give
+30 samples (direct plus two Ferrum arms, five sizes). Orders are direct/0/1
+then 1/0/direct. Estimated benchmark envelope: `2 × 15 × (30 + 15) / 60 + 5 =
+27.5 minutes`, within the 75-minute step. Two pairs are exploratory and have a
+wide Student-t interval; they cannot establish a general performance claim.
+
+Passive `/proc/<pid>/io` snapshots add `rchar`, `wchar`, `syscr`, `syscw`,
+`read_bytes`, `write_bytes`, and `cancelled_write_bytes`. The same measurement
+bracket and slack as CPU apply. Missing, decreasing or discontinuous counters
+produce `io_error`, never fabricated zeros. On hosted Linux, passwordless sudo
+runs only the passive sampler so it can read container PIDs across UIDs; a stop
+file terminates and reaps it. Without sudo, permission failures remain explicit.
+`rchar`/`wchar` and `syscr`/`syscw` are Linux read/write accounting, **not** total
+network bytes, every socket syscall, copied bytes, allocations, or TLS records.
+`read_bytes`/`write_bytes` are storage I/O and may be zero for busy sockets.
+
+H1 samples also contain `phases.h1_profile`, measured as client counter deltas
+at the common boundaries. Per-worker counters avoid cross-worker atomic
+contention. `tls_records` counts complete received TLS wire records below
+rustls, and `tls_record_bytes` includes their five-byte headers. The parser
+handles split/coalesced socket reads without retaining payloads or changing
+writes/flushes. Encrypted TLS 1.3 control messages cannot be distinguished from
+application records. Handshake/warmup/drain are excluded by boundary snapshots;
+records and requests spanning a boundary need not share attribution. Parser
+errors invalidate the **TLS profile**, even when useful-work validation passes.
+`body_data_frames`/`body_data_bytes` count client Hyper response data frames,
+not upstream Ferrum frames or H1 chunks. `chunked_responses` and
+`content_length_responses` observe framing headers. All counters include
+in-flight work at the boundary; normalize them as approximate diagnostics, not
+exact per-completed-request costs. Instrumentation is identical across arms
+and adds client CPU overhead. The existing full-body echo validation remains.
+
+Allocation counts, internal copies and adapter CPU require a separate profiling
+build or permitted tracing/sampling; these passive counters cannot identify
+them. Do not infer a zero-copy production path or restore Content-Length from
+this echo experiment. See the audit for evidence and keep/reject dispositions.
+
+#### Maximum safe dispatch inputs (ordinary matrix)
 
 For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 `iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative

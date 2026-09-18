@@ -64,6 +64,8 @@ BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
 HOST_ID=""
+EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
+EXPERIMENT_ARMS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -219,12 +221,17 @@ BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
 sampler_pid=""
+sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
 
 cleanup() {
     echo "[cleanup] stopping all processes..."
     if [ -n "$sampler_pid" ]; then
-        kill -TERM "$sampler_pid" 2>/dev/null || true
+        if [ -n "$sampler_stop_file" ]; then
+            touch "$sampler_stop_file"
+        else
+            kill -TERM "$sampler_pid" 2>/dev/null || true
+        fi
         wait "$sampler_pid" || true
     fi
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
@@ -785,19 +792,37 @@ run_bench() {
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     if $PROCESS_USAGE; then
         : > "$usage"
-        python3 "$SCRIPT_DIR/process_usage.py" \
-            --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
-            --output "$usage" --interval 0.5 &
-        sampler_pid=$!
+        # /proc/<container-pid>/io requires ptrace read permission across UIDs.
+        # Elevate ONLY the passive reader. A stop file avoids signalling sudo's
+        # root-owned monitor; the client remains an ordinary direct invocation.
+        if sudo -n true 2>/dev/null; then
+            sampler_stop_file="$usage.stop"
+            rm -f "$sampler_stop_file"
+            sudo -n python3 "$SCRIPT_DIR/process_usage.py" \
+                --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                --output "$usage" --interval 0.5 --parent-pid "$$" \
+                --stop-file "$sampler_stop_file" &
+            sampler_pid=$!
+        else
+            sampler_stop_file=""
+            python3 "$SCRIPT_DIR/process_usage.py" \
+                --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                --output "$usage" --interval 0.5 &
+            sampler_pid=$!
+        fi
         # Wait for the first observation and installed signal handlers. Without
         # readiness, an immediately failing client could leave SIGINT ignored.
         local sampler_wait=0
-        while [ ! -s "$usage" ] && kill -0 "$sampler_pid" 2>/dev/null && [ "$sampler_wait" -lt 100 ]; do
+        while [ ! -s "$usage" ] && [ "$sampler_wait" -lt 100 ]; do
             sleep 0.05
             sampler_wait=$(( sampler_wait + 1 ))
         done
         if [ ! -s "$usage" ]; then
-            kill -TERM "$sampler_pid" 2>/dev/null || true
+            if [ -n "$sampler_stop_file" ]; then
+                touch "$sampler_stop_file"
+            else
+                kill -TERM "$sampler_pid" 2>/dev/null || true
+            fi
             wait "$sampler_pid" || true
             sampler_pid=""
         fi
@@ -823,9 +848,14 @@ run_bench() {
             || rc=$?
     fi
     if [ -n "$sampler_pid" ]; then
-        kill -INT "$sampler_pid" 2>/dev/null || true
+        if [ -n "$sampler_stop_file" ]; then
+            touch "$sampler_stop_file"
+        else
+            kill -INT "$sampler_pid" 2>/dev/null || true
+        fi
         wait "$sampler_pid" || true
         sampler_pid=""
+        sampler_stop_file=""
     fi
     # Capture after the timed load, while the gateway still exists. Keep these
     # below a subdirectory so summary globs cannot mistake stats for samples.
@@ -888,6 +918,20 @@ main() {
     if [ -n "$BASELINE_IMAGE" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
         expected_gateways+=" ferrum-baseline"
     fi
+    if [ -f "$EXPERIMENT_MANIFEST" ]; then
+        EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
+            "$EXPERIMENT_MANIFEST" "$PROTOCOL")
+        if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
+            if [ -n "$BASELINE_IMAGE" ] || [ -n "${FERRUM_EXTRA_ENV:-}" ]; then
+                echo "[experiment] manifest cannot be mixed with baseline-image or ambient FERRUM_EXTRA_ENV" >&2
+                exit 2
+            fi
+            expected_gateways+=" $EXPERIMENT_ARMS"
+            cp "$EXPERIMENT_MANIFEST" "$OUTPUT_DIR/experiment.json"
+        else
+            EXPERIMENT_ARMS=""
+        fi
+    fi
     if [ -r /proc/sys/kernel/random/boot_id ]; then
         HOST_ID=$(cat /proc/sys/kernel/random/boot_id)
     else
@@ -930,7 +974,16 @@ PYEOF
                 start_backend
                 case "$gw" in
                     direct) ;;
-                    ferrum) start_ferrum ;;
+                    ferrum|ferrum-exp-*)
+                        if [ -n "$EXPERIMENT_ARMS" ]; then
+                            local arm_env
+                            arm_env=$(python3 "$SCRIPT_DIR/experiment_arms.py" env \
+                                "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw") || exit 2
+                            FERRUM_EXTRA_ENV="$arm_env" start_ferrum
+                        else
+                            start_ferrum
+                        fi
+                        ;;
                     ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
                     envoy) start_envoy ;;
                     kong) start_kong ;;
