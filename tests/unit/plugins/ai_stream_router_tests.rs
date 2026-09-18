@@ -369,7 +369,10 @@ fn rendered_unknown_config_retains_root_or_second_provider_context_without_suppl
     for (key, payload) in [
         ("suppliedKey918273", json!("payloadValue918273")),
         ("918273", json!({"payloadKey918273": "payloadValue918273"})),
-        ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+        (
+            "'suppliedKey918273\"\\\n`suppliedTail918273`",
+            json!([918273]),
+        ),
     ] {
         for nested in [false, true] {
             let mut config = openai_and_anthropic_config();
@@ -395,7 +398,10 @@ fn rendered_unknown_config_retains_root_or_second_provider_context_without_suppl
                 rendered.contains(&format!("ai_stream_router: `{path}`:")),
                 "{rendered}"
             );
-            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains("unknown configuration key(s)"),
+                "{rendered}"
+            );
             assert!(
                 rendered.contains(&format!("did you mean `{suggestion}`?")),
                 "{rendered}"

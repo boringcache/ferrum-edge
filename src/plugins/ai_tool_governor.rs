@@ -7351,9 +7351,8 @@ fn parse_approval(
         return Err("ai_tool_governor: `approval.endpoint_url` must not be empty".to_string());
     }
 
-    let parsed = url::Url::parse(endpoint_url).map_err(|_| {
-        "ai_tool_governor: `approval.endpoint_url` is not a valid URL".to_string()
-    })?;
+    let parsed = url::Url::parse(endpoint_url)
+        .map_err(|_| "ai_tool_governor: `approval.endpoint_url` is not a valid URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(
             "ai_tool_governor: `approval.endpoint_url` must be an http/https URL".to_string(),

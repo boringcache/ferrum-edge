@@ -2092,9 +2092,11 @@ impl AiTranscriptAudit {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
         {
             if !allow_insecure_loopback {
-                return Err("ai_transcript_audit: `sink.endpoint_url` must use https://; \
+                return Err(
+                    "ai_transcript_audit: `sink.endpoint_url` must use https://; \
                      local cleartext collectors require `sink.allow_insecure_loopback`: true"
-                    .to_string());
+                        .to_string(),
+                );
             }
             let loopback = endpoint_hostname.eq_ignore_ascii_case("localhost")
                 || endpoint_hostname

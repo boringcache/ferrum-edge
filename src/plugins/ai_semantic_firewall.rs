@@ -3240,9 +3240,9 @@ fn validate_provider_endpoint(
         );
     }
 
-    let host = parsed
-        .host()
-        .ok_or_else(|| "ai_semantic_firewall: `provider.endpoint` must include a host".to_string())?;
+    let host = parsed.host().ok_or_else(|| {
+        "ai_semantic_firewall: `provider.endpoint` must include a host".to_string()
+    })?;
     let (literal_ip, warmup_hostname) = match host {
         Host::Ipv4(ip) => (Some(std::net::IpAddr::V4(ip)), None),
         Host::Ipv6(ip) => (Some(std::net::IpAddr::V6(ip)), None),

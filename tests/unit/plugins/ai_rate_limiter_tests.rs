@@ -27,7 +27,10 @@ fn rendered_unknown_config_retains_context_and_suggestion_without_supplied_data(
     for (key, payload) in [
         ("suppliedKey918273", json!("payloadValue918273")),
         ("918273", json!({"payloadKey918273": "payloadValue918273"})),
-        ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+        (
+            "'suppliedKey918273\"\\\n`suppliedTail918273`",
+            json!([918273]),
+        ),
     ] {
         let error = AiRateLimiter::new(
             &json!({"token_limit": 100, "expose_headerz": payload, (key): payload}),
@@ -36,9 +39,18 @@ fn rendered_unknown_config_retains_context_and_suggestion_without_supplied_data(
         .err()
         .expect("unknown keys must reject admission");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-        assert!(rendered.contains("ai_rate_limiter: `config`:"), "{rendered}");
-        assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
-        assert!(rendered.contains("did you mean `expose_headers`?"), "{rendered}");
+        assert!(
+            rendered.contains("ai_rate_limiter: `config`:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("did you mean `expose_headers`?"),
+            "{rendered}"
+        );
         for supplied in ["918273", "expose_headerz", "payloadKey", "payloadValue"] {
             assert!(!rendered.contains(supplied), "{rendered}");
         }
@@ -127,7 +139,11 @@ fn rendered_backend_identity_errors_retain_plugin_category_without_ids_or_namesp
             0,
         );
         for (http_client, config_id, category) in [
-            (PluginHttpClient::default(), supplied, "invalid plugin config id"),
+            (
+                PluginHttpClient::default(),
+                supplied,
+                "invalid plugin config id",
+            ),
             (client, "valid-policy", "invalid Redis namespace"),
         ] {
             let error = AiRateLimiter::new_with_config_id(

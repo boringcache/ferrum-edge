@@ -354,10 +354,9 @@ struct OAuth2Cache {
 
 impl OAuth2Cache {
     fn new(service_account_json: String) -> Result<Self, String> {
-        let service_account: Value = serde_json::from_str(&service_account_json)
-            .map_err(|_| {
-                "ai_federation: invalid `google_service_account_json`: invalid JSON".to_string()
-            })?;
+        let service_account: Value = serde_json::from_str(&service_account_json).map_err(|_| {
+            "ai_federation: invalid `google_service_account_json`: invalid JSON".to_string()
+        })?;
         let client_email = service_account["client_email"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -373,11 +372,10 @@ impl OAuth2Cache {
             .unwrap_or("https://oauth2.googleapis.com/token")
             .to_string();
         validate_google_token_uri(&token_uri)?;
-        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-            .map_err(|_| {
-                "ai_federation: invalid service account `private_key`: invalid RSA private key"
-                    .to_string()
-            })?;
+        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|_| {
+            "ai_federation: invalid service account `private_key`: invalid RSA private key"
+                .to_string()
+        })?;
 
         Ok(Self {
             cache: ArcSwapOption::empty(),
@@ -930,8 +928,9 @@ fn validate_base_url(
         ));
     }
 
-    let host = normalized_url_hostname(&parsed)
-        .ok_or_else(|| format!("ai_federation: provider {provider_name:?} `base_url` has no host"))?;
+    let host = normalized_url_hostname(&parsed).ok_or_else(|| {
+        format!("ai_federation: provider {provider_name:?} `base_url` has no host")
+    })?;
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(

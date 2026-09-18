@@ -7302,7 +7302,10 @@ async fn metadata_only_empty_redaction_patterns_rejected() {
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
     assert!(rendered.contains("`mode` <redacted scalar>"), "{rendered}");
     assert!(rendered.contains("`redaction.builtins: []`"), "{rendered}");
-    assert!(rendered.contains("unredacted request-derived data"), "{rendered}");
+    assert!(
+        rendered.contains("unredacted request-derived data"),
+        "{rendered}"
+    );
     assert!(rendered.contains("`full_body`"), "{rendered}");
     assert!(!rendered.contains("metadata_only"), "{rendered}");
 
@@ -12807,7 +12810,10 @@ fn assert_rendered_unknown_transcript_config(
         rendered.contains(&format!("ai_transcript_audit: `{path}`:")),
         "{rendered}"
     );
-    assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+    assert!(
+        rendered.contains("unknown configuration key(s)"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains(&format!("did you mean `{suggestion}`?")),
         "{rendered}"
@@ -12832,7 +12838,10 @@ fn rendered_unknown_transcript_sections_retain_fixed_context_without_supplied_da
         for (key, payload) in [
             ("suppliedKey918273", json!("payloadValue918273")),
             ("918273", json!({"payloadKey918273": "payloadValue918273"})),
-            ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+            (
+                "'suppliedKey918273\"\\\n`suppliedTail918273`",
+                json!([918273]),
+            ),
         ] {
             let mut config = config_with_sink("https://audit.example.com/ingest", json!({}));
             let path = match section {
@@ -12926,9 +12935,18 @@ fn rendered_invalid_grpc_method_keys_preserve_the_earlier_typed_rejection() {
             .expect("invalid method keys must reject before method-config parsing");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains("ai_transcript_audit:"), "{rendered}");
-        assert!(rendered.contains("`grpc.methods` key must be"), "{rendered}");
-        assert!(rendered.contains("`/package.Service/Method` path"), "{rendered}");
-        assert!(!rendered.contains("unknown configuration key"), "{rendered}");
+        assert!(
+            rendered.contains("`grpc.methods` key must be"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("`/package.Service/Method` path"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("unknown configuration key"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("918273"), "{rendered}");
     }
 }
@@ -12952,8 +12970,14 @@ fn transcript_config_header_diagnostics_withhold_keys_and_secret_references() {
         let error = validate_plugin_config("ai_transcript_audit", &config).unwrap_err();
         let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains("`sink.custom_headers`"), "{rendered}");
-        assert!(!rendered.contains("unregistered_header_secret"), "{rendered}");
-        assert!(!rendered.contains("unregistered_reference_secret"), "{rendered}");
+        assert!(
+            !rendered.contains("unregistered_header_secret"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("unregistered_reference_secret"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("918273"), "{rendered}");
     }
 }
@@ -12983,8 +13007,8 @@ fn transcript_config_limit_diagnostics_withhold_supplied_and_derived_sizes() {
             vec!["91827"],
         ),
     ] {
-        let error = validate_plugin_config("ai_transcript_audit", &json!({"limits": limits}))
-            .unwrap_err();
+        let error =
+            validate_plugin_config("ai_transcript_audit", &json!({"limits": limits})).unwrap_err();
         let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains("must be"), "{rendered}");

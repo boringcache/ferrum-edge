@@ -5639,7 +5639,8 @@ fn validate_semantic_embedding_endpoint(
         .map_err(|_| "ai_semantic_cache: `semantic_embedding_endpoint` must be a valid URL")?;
     if !matches!(parsed_endpoint.scheme(), "http" | "https") {
         return Err(
-            "ai_semantic_cache: `semantic_embedding_endpoint` must use `http` or `https`".to_string(),
+            "ai_semantic_cache: `semantic_embedding_endpoint` must use `http` or `https`"
+                .to_string(),
         );
     }
     let authority_start = parsed_endpoint.scheme().len() + "://".len();

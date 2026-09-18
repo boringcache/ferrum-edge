@@ -389,7 +389,10 @@ fn assert_rendered_unknown_governor_config(
         rendered.contains(&format!("ai_tool_governor: `{path}`:")),
         "{rendered}"
     );
-    assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+    assert!(
+        rendered.contains("unknown configuration key(s)"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains(&format!("did you mean `{suggestion}`?")),
         "{rendered}"
@@ -411,7 +414,10 @@ fn rendered_unknown_fixed_sections_retain_schema_context_without_supplied_data()
         for (key, payload) in [
             ("suppliedKey918273", json!("payloadValue918273")),
             ("918273", json!({"payloadKey918273": "payloadValue918273"})),
-            ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+            (
+                "'suppliedKey918273\"\\\n`suppliedTail918273`",
+                json!([918273]),
+            ),
         ] {
             let mut config = baseline_allow_policy();
             let path = if section.is_empty() {

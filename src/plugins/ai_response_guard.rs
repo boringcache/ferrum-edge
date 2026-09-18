@@ -5043,7 +5043,9 @@ fn reject_unknown_keys(value: &Value, allowed: &[&str], path: &str) -> Result<()
         return Ok(());
     };
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("ai_response_guard: unknown field `{path}` key {key:?}"));
+        return Err(format!(
+            "ai_response_guard: unknown field `{path}` key {key:?}"
+        ));
     }
     Ok(())
 }

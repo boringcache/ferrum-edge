@@ -4238,11 +4238,7 @@ fn ai_family_config_diagnostics_withhold_hostile_strings_and_keep_schema_context
                 json!({"cache_multimodal": secret}),
                 "`cache_multimodal`",
             ),
-            (
-                "ai_semantic_firewall",
-                json!({"mode": secret}),
-                "`mode`",
-            ),
+            ("ai_semantic_firewall", json!({"mode": secret}), "`mode`"),
             (
                 "ai_federation",
                 json!({"providers": [{
@@ -4263,11 +4259,7 @@ fn ai_family_config_diagnostics_withhold_hostile_strings_and_keep_schema_context
                 json!({"tools": {(secret): {"action": secret}}}),
                 "`action`",
             ),
-            (
-                "ai_transcript_audit",
-                json!({"mode": secret}),
-                "`mode`",
-            ),
+            ("ai_transcript_audit", json!({"mode": secret}), "`mode`"),
         ] {
             let error = validate_plugin_config(plugin, &config).expect_err(plugin);
             assert!(error.contains(field), "{plugin}: {error}");
@@ -4298,7 +4290,10 @@ fn ai_config_numeric_diagnostics_withhold_document_scalars() {
                 "providers": [{"name": "route", "provider_type": "openai", "api_key": "test"}],
                 "fallback_on_status_codes": [299]
             }),
-            vec!["`fallback_on_status_codes`", "cannot replay committed success"],
+            vec![
+                "`fallback_on_status_codes`",
+                "cannot replay committed success",
+            ],
             vec!["299"],
         ),
         (
@@ -4332,8 +4327,16 @@ fn ai_bespoke_unknown_key_diagnostics_preserve_only_schema_paths() {
 
     let key = "'unregistered_ai_key\"\\\n`document`";
     for (plugin, config, context) in [
-        ("ai_request_guard", json!({(key): true}), "`max_tokens_limit`"),
-        ("ai_prompt_compressor", json!({(key): true}), "`compress_roles`"),
+        (
+            "ai_request_guard",
+            json!({(key): true}),
+            "`max_tokens_limit`",
+        ),
+        (
+            "ai_prompt_compressor",
+            json!({(key): true}),
+            "`compress_roles`",
+        ),
         ("ai_token_metrics", json!({(key): true}), "`provider`"),
         ("ai_federation", json!({(key): true}), "`config`"),
         (

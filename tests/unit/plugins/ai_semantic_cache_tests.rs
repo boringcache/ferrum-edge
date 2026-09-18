@@ -3554,7 +3554,10 @@ fn rendered_unknown_config_retains_context_and_suggestion_without_supplied_data(
     for (key, payload) in [
         ("suppliedKey918273", json!("payloadValue918273")),
         ("918273", json!({"payloadKey918273": "payloadValue918273"})),
-        ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+        (
+            "'suppliedKey918273\"\\\n`suppliedTail918273`",
+            json!([918273]),
+        ),
     ] {
         let error = AiSemanticCache::new(
             &json!({"ttl_secondz": payload, (key): payload}),
@@ -3563,9 +3566,18 @@ fn rendered_unknown_config_retains_context_and_suggestion_without_supplied_data(
         .err()
         .expect("unknown keys must reject admission");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-        assert!(rendered.contains("ai_semantic_cache: `config`:"), "{rendered}");
-        assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
-        assert!(rendered.contains("did you mean `ttl_seconds`?"), "{rendered}");
+        assert!(
+            rendered.contains("ai_semantic_cache: `config`:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("did you mean `ttl_seconds`?"),
+            "{rendered}"
+        );
         for supplied in ["918273", "ttl_secondz", "payloadKey", "payloadValue"] {
             assert!(!rendered.contains(supplied), "{rendered}");
         }
