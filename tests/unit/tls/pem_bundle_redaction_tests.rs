@@ -266,3 +266,77 @@ fn rendered_crl_parse_error_omits_malformed_pem_and_hostile_filename() {
         );
     }
 }
+
+#[test]
+fn backend_constructor_errors_keep_material_context_without_paths_or_payloads() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::tls::TlsPolicy;
+    use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
+    use std::path::Path;
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let policy = TlsPolicy::from_env_config(&EnvConfig::default()).unwrap();
+    let proxy = serde_json::from_value(serde_json::json!({
+        "id": "diagnostic-backend",
+        "name": "diagnostic-backend",
+        "listen_path": "/",
+        "backend_scheme": "https",
+        "backend_host": "localhost",
+        "backend_port": 443,
+    }))
+    .unwrap();
+    let build = |cert, key| {
+        BackendTlsConfigBuilder {
+            proxy: &proxy,
+            policy: Some(&policy),
+            global_ca: None,
+            global_no_verify: false,
+            global_client_cert: cert,
+            global_client_key: key,
+            crls: &[],
+        }
+        .build_rustls()
+        .unwrap_err()
+    };
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("'TLS_BACKEND_MISSING_MARKER.pem");
+    assert_rendered_material_error(
+        build(Some(&missing), Some(&missing)).into(),
+        &["`backend TLS client certificate`", "Failed to read"],
+        &["TLS_BACKEND_MISSING_MARKER"],
+    );
+    assert_rendered_material_error(
+        build(Some(&missing), None).into(),
+        &["`backend TLS client certificate`", "the private key is missing"],
+        &["TLS_BACKEND_MISSING_MARKER"],
+    );
+    assert_rendered_material_error(
+        build(None, Some(&missing)).into(),
+        &["`backend TLS client private key`", "the certificate is missing"],
+        &["TLS_BACKEND_MISSING_MARKER"],
+    );
+
+    let valid_pem = generate_self_signed_cert(&["localhost"]);
+    let malformed_bundle = format!(
+        "{valid_pem}-----BEGIN CERTIFICATE-----\n'{PEM_MARKER}\n-----END CERTIFICATE-----\n"
+    );
+    let malformed = write_pem(&dir, "'TLS_BACKEND_CERT_MARKER.pem", &malformed_bundle);
+    assert_rendered_material_error(
+        build(Some(Path::new(&malformed)), Some(&missing)).into(),
+        &[
+            "`backend TLS client certificate`",
+            "record #2",
+            "malformed PEM certificate record",
+        ],
+        &["TLS_BACKEND_CERT_MARKER", PEM_MARKER, &malformed],
+    );
+    let cert = write_pem(&dir, "'TLS_BACKEND_VALID_CERT_MARKER.pem", &valid_pem);
+    let malformed_key =
+        format!("-----BEGIN PRIVATE KEY-----\n'{PEM_MARKER}\n-----END PRIVATE KEY-----\n");
+    let key = write_pem(&dir, "'TLS_BACKEND_KEY_MARKER.pem", &malformed_key);
+    assert_rendered_material_error(
+        build(Some(Path::new(&cert)), Some(Path::new(&key))).into(),
+        &["`backend TLS client private key`", "private key", "is malformed"],
+        &["TLS_BACKEND_KEY_MARKER", PEM_MARKER, &key],
+    );
+}

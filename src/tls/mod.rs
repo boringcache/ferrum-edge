@@ -559,9 +559,9 @@ pub fn days_until_next_update(next_update_unix: i64, now_unix: i64) -> i64 {
 ///
 /// Expired revocation material is refused outright — at reload and at startup
 /// alike — so this warning is the only advance notice an operator gets that a
-/// refresh loop has stopped. It names the already-redacted source display id
-/// and the remaining days; it never renders CRL or OCSP bytes, issuer names,
-/// or serial numbers.
+/// refresh loop has stopped. It withholds the source display id (which can
+/// still contain a configured filesystem path) and reports the remaining days;
+/// it never renders CRL or OCSP bytes, issuer names, or serial numbers.
 ///
 /// `warning_days == 0` disables the warning, matching
 /// `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS`.
@@ -585,7 +585,7 @@ pub(crate) fn warn_if_revocation_material_near_expiry(
     }
     warn!(
         revocation_material = material_kind,
-        source = %display_source_id,
+        source = %crate::startup::sanitize_startup_scalar(display_source_id),
         days_until_next_update = remaining_days,
         warning_days,
         "Revocation material expires within the configured warning window. Ferrum refuses \
@@ -660,7 +660,7 @@ pub fn load_crls(path: Option<&str>, expiry_warning_days: u64) -> Result<CrlList
     info!(
         "Loaded {} CRL(s) from {} for certificate revocation checking",
         crls.len(),
-        material.display_source_id
+        crate::startup::sanitize_startup_scalar(&material.display_source_id)
     );
     Ok(Arc::new(crls))
 }
@@ -712,7 +712,7 @@ impl TlsPolicy {
 
         if versions.is_empty() {
             return Err(anyhow::anyhow!(
-                "No valid TLS versions selected (min={}, max={})",
+                "No valid TLS versions selected (`FERRUM_TLS_MIN_VERSION`={:?}, `FERRUM_TLS_MAX_VERSION`={:?})",
                 min,
                 max
             ));
@@ -849,7 +849,7 @@ fn default_cipher_suites(
         .collect();
     if suites.is_empty() {
         return Err(anyhow::anyhow!(
-            "the active crypto provider implements none of Ferrum's default cipher suites; this \
+            "the active crypto provider implements none of the default Ferrum cipher suites; this \
              indicates a build whose crypto features are inconsistent"
         ));
     }
@@ -875,7 +875,7 @@ fn default_kx_groups(
         .collect();
     if groups.is_empty() {
         return Err(anyhow::anyhow!(
-            "the active crypto provider implements none of Ferrum's default key-exchange groups; \
+            "the active crypto provider implements none of the default Ferrum key-exchange groups; \
              this indicates a build whose crypto features are inconsistent"
         ));
     }
@@ -945,10 +945,10 @@ fn parse_cipher_suites(
             }
             unknown => {
                 return Err(anyhow::anyhow!(
-                    "Unknown cipher suite '{}'. Supported TLS 1.3: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256. \
-                 Supported TLS 1.2: ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256, \
-                 ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305, \
-                 ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384",
+                    "`FERRUM_TLS_CIPHER_SUITES`: Unknown cipher suite {:?}. Supported TLS 1.3: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. \
+                 Supported TLS 1.2: `ECDHE-ECDSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES128-GCM-SHA256`, \
+                 `ECDHE-ECDSA-CHACHA20-POLY1305`, `ECDHE-RSA-CHACHA20-POLY1305`, \
+                 `ECDHE-ECDSA-AES256-GCM-SHA384`, `ECDHE-RSA-AES256-GCM-SHA384`",
                     unknown
                 ));
             }
@@ -959,15 +959,17 @@ fn parse_cipher_suites(
         // negotiating something the operator did not choose.
         let suite = lookup_cipher_suite(provider, id).ok_or_else(|| {
             anyhow::anyhow!(
-                "Cipher suite '{}' is not implemented by this build's crypto provider. See \
-                 docs/fips.md for the suites available in a FIPS build.",
+                "`FERRUM_TLS_CIPHER_SUITES`: Cipher suite {:?} is not implemented by the crypto provider in this build. See \
+                 `docs/fips.md` for the suites available in a FIPS build.",
                 name
             )
         })?;
         suites.push(suite);
     }
     if suites.is_empty() {
-        return Err(anyhow::anyhow!("No cipher suites specified"));
+        return Err(anyhow::anyhow!(
+            "`FERRUM_TLS_CIPHER_SUITES`: No cipher suites specified"
+        ));
     }
     Ok(suites)
 }
@@ -985,22 +987,24 @@ fn parse_kx_groups(
             "secp384r1" | "p-384" | "p384" => rustls::NamedGroup::secp384r1,
             unknown => {
                 return Err(anyhow::anyhow!(
-                    "Unknown curve/group '{}'. Supported: X25519, secp256r1 (P-256), secp384r1 (P-384)",
+                    "`FERRUM_TLS_CURVES`: Unknown curve/group {:?}. Supported: `X25519`, `secp256r1` (`P-256`), `secp384r1` (`P-384`)",
                     unknown
                 ));
             }
         };
         let group = lookup_kx_group(provider, group_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "Curve/group '{}' is not implemented by this build's crypto provider. See \
-                 docs/fips.md for the groups available in a FIPS build.",
+                "`FERRUM_TLS_CURVES`: Curve/group {:?} is not implemented by the crypto provider in this build. See \
+                 `docs/fips.md` for the groups available in a FIPS build.",
                 name
             )
         })?;
         groups.push(group);
     }
     if groups.is_empty() {
-        return Err(anyhow::anyhow!("No curves/groups specified"));
+        return Err(anyhow::anyhow!(
+            "`FERRUM_TLS_CURVES`: No curves/groups specified"
+        ));
     }
     Ok(groups)
 }
@@ -1420,11 +1424,13 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         (false, Some(client_auth_roots)) => {
             info!(
                 "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (roots: {})",
-                cert_source_display,
-                key_source_display,
-                client_ca_material
-                    .as_ref()
-                    .map_or("<none>", |material| material.display_source_id.as_str()),
+                crate::startup::sanitize_startup_scalar(cert_source_display),
+                crate::startup::sanitize_startup_scalar(key_source_display),
+                crate::startup::sanitize_startup_scalar(
+                    client_ca_material
+                        .as_ref()
+                        .map_or("<none>", |material| material.display_source_id.as_str())
+                ),
                 client_auth_roots.len()
             );
 
@@ -1474,7 +1480,8 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         // No verification mode (for testing only)
         warn!(
             "TLS configuration loaded with certificate verification DISABLED (testing mode) from cert source: {}, key source: {}",
-            cert_source_display, key_source_display
+            crate::startup::sanitize_startup_scalar(cert_source_display),
+            crate::startup::sanitize_startup_scalar(key_source_display)
         );
 
         builder
@@ -1492,7 +1499,8 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         // No client certificate verification
         info!(
             "TLS configuration loaded without client certificate verification from cert source: {}, key source: {}",
-            cert_source_display, key_source_display
+            crate::startup::sanitize_startup_scalar(cert_source_display),
+            crate::startup::sanitize_startup_scalar(key_source_display)
         );
 
         builder
@@ -1625,7 +1633,14 @@ fn acme_tls_alpn_pkcs11_cert_resolver(
     uri: &CertSourceUri,
     ocsp_response: Vec<u8>,
 ) -> Result<Arc<crate::tls::acme::AcmeTlsAlpnResolver>, anyhow::Error> {
-    let mut certified_key = crate::tls::pkcs11::certified_key_from_uri(cert_chain, uri)?;
+    let mut certified_key =
+        crate::tls::pkcs11::certified_key_from_uri(cert_chain, uri).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to configure `server TLS private key` from PKCS#11 source {:?}: token key configuration failed: {:?}",
+                uri.source_id(),
+                error.to_string()
+            )
+        })?;
     if !ocsp_response.is_empty() {
         certified_key.ocsp = Some(ocsp_response);
     }
@@ -1641,7 +1656,7 @@ fn acme_tls_alpn_pkcs11_cert_resolver(
     _ocsp_response: Vec<u8>,
 ) -> Result<Arc<crate::tls::acme::AcmeTlsAlpnResolver>, anyhow::Error> {
     Err(anyhow::anyhow!(
-        "PKCS#11 TLS key source '{}' requires building ferrum-edge with the 'pkcs11' cargo feature",
+        "PKCS#11 TLS key source {:?} requires building ferrum-edge with the `pkcs11` Cargo feature",
         uri.source_id()
     ))
 }
@@ -2059,8 +2074,8 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                     mesh_client_auth = ?client_auth,
                     "Mesh TLS configuration loaded with SPIFFE trust-domain-validating \
                      client verifier from cert: {}, key: {}",
-                    identity.cert_path(),
-                    identity.key_path(),
+                    crate::startup::sanitize_startup_scalar(identity.cert_path()),
+                    crate::startup::sanitize_startup_scalar(identity.key_path()),
                 );
                 builder
                     .with_client_cert_verifier(verifier)
@@ -2097,9 +2112,9 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                     mesh_client_auth = ?client_auth,
                     "Mesh TLS configuration loaded with {:?} client auth from cert: {}, key: {}, client CA: {}",
                     client_auth,
-                    identity.cert_path(),
-                    identity.key_path(),
-                    ca_bundle.path,
+                    crate::startup::sanitize_startup_scalar(identity.cert_path()),
+                    crate::startup::sanitize_startup_scalar(identity.key_path()),
+                    crate::startup::sanitize_startup_scalar(ca_bundle.path),
                 );
 
                 builder
@@ -2110,8 +2125,8 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
         MeshClientAuth::None => {
             info!(
                 "Mesh TLS configuration loaded without client auth from cert: {}, key: {}",
-                identity.cert_path(),
-                identity.key_path(),
+                crate::startup::sanitize_startup_scalar(identity.cert_path()),
+                crate::startup::sanitize_startup_scalar(identity.key_path()),
             );
             builder
                 .with_no_client_auth()

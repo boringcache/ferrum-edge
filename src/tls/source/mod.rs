@@ -17,7 +17,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
-use thiserror::Error;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
@@ -556,26 +555,20 @@ fn uri_file_path(identifier: &str) -> Option<String> {
     Some(identifier.to_string())
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum MaterialError {
-    #[error("failed to read TLS material from {source_id}: {source}")]
     Io {
         source_id: String,
-        #[source]
         source: std::io::Error,
     },
-    #[error("TLS material source scheme {scheme} is not supported by this runtime loader")]
     UnsupportedScheme { scheme: &'static str },
-    #[error("failed to resolve TLS material source {source_id}: {details}")]
     Secret { source_id: String, details: String },
-    #[error("invalid TLS material source {source_id}: {details}")]
     InvalidSource { source_id: String, details: String },
     /// Source material exceeded `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
     ///
     /// The Display form is intentionally source-redacted: it never includes
     /// filesystem paths, provider identifiers, secret names/values, PEM
     /// fragments, or credentials.
-    #[error("TLS {kind} material exceeds the configured maximum of {max_bytes} bytes")]
     Oversized {
         kind: MaterialKind,
         max_bytes: usize,
@@ -583,12 +576,55 @@ pub enum MaterialError {
     /// The closed failure class used when admission or resolution exceeds the
     /// configured end-to-end source deadline. It intentionally carries no URI,
     /// provider response, credential, or other attacker-shaped detail.
-    #[error("TLS material source resolution timed out")]
     DeadlineExceeded,
     /// The closed failure class used when bounded execution infrastructure is
     /// unavailable. Details from task panics/channel failures are withheld.
-    #[error("TLS material source executor is unavailable")]
     ExecutorUnavailable,
+}
+
+impl fmt::Display for MaterialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { source_id, source } => write!(
+                f,
+                "failed to read TLS material from {source_id:?}: {:?}",
+                source.to_string()
+            ),
+            Self::UnsupportedScheme { scheme } => write!(
+                f,
+                "TLS material source scheme {scheme:?} is not supported by this runtime loader"
+            ),
+            Self::Secret { source_id, details } => write!(
+                f,
+                "failed to resolve TLS material source {source_id:?}: {details:?}"
+            ),
+            Self::InvalidSource { source_id, details } => write!(
+                f,
+                "invalid TLS material source {source_id:?}: {details:?}"
+            ),
+            Self::Oversized { kind, max_bytes } => write!(
+                f,
+                "TLS {kind} material exceeds the configured maximum of \"{max_bytes}\" bytes"
+            ),
+            Self::DeadlineExceeded => f.write_str("TLS material source resolution timed out"),
+            Self::ExecutorUnavailable => {
+                f.write_str("TLS material source executor is unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MaterialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // OS errors carry only a system error code and its fixed message.
+            // Custom I/O errors can contain provider payloads and further raw
+            // causes. Keep them accessible in the typed field, but never expose
+            // them below the safely quoted Display through error-chain rendering.
+            Self::Io { source, .. } if source.raw_os_error().is_some() => Some(source),
+            _ => None,
+        }
+    }
 }
 
 impl MaterialError {
@@ -1121,8 +1157,8 @@ fn load_file_material_with(
     fallback_kind: MaterialKind,
     max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
-    // File paths remain verbatim for I/O diagnostics (operator-authored local
-    // configuration). Oversized rejections never interpolate the path.
+    // Keep the path for typed callers; Display quotes it for withholding by
+    // configuration diagnostics. Oversized rejections never include the path.
     let source_id = path.display().to_string();
 
     // Metadata precheck is only an optimization. Growth, non-regular files,
@@ -1327,9 +1363,8 @@ fn load_managed_material_with(
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Managed,
-        // `managed::ManagedMaterial`, not a `MaterializedMaterial`. `managed`
-        // is not a secret-provider scheme, so its id is local configuration and
-        // is already safe as a display label.
+        // `managed::ManagedMaterial`, not a `MaterializedMaterial`. This local
+        // configuration id still needs quoting/sanitizing at diagnostic sites.
         material.source_id,
         material.kind,
         material.version,
@@ -1372,8 +1407,8 @@ fn load_acme_material_with(
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Acme,
-        // `acme::AcmeMaterial`, not a `MaterializedMaterial` — see the managed
-        // loader above for why this id is already safe to display.
+        // `acme::AcmeMaterial`, not a `MaterializedMaterial`; like the managed
+        // id above, this still needs quoting/sanitizing at diagnostic sites.
         material.source_id,
         material.kind,
         material.version,
