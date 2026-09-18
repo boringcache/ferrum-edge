@@ -1597,7 +1597,10 @@ async fn test_statsd_short_prefix_small_entry_budget_still_emits() {
 
 #[test]
 fn startup_diagnostics_withhold_statsd_tag_keys() {
-    for key in ["'diagnostic-secret-5594", "safe' diagnostic-secret-5594\"\\\n"] {
+    for key in [
+        "'diagnostic-secret-5594",
+        "safe' diagnostic-secret-5594\"\\\n",
+    ] {
         let error = validate_tag_key(key).unwrap_err();
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains("statsd_logging: tag key"), "{rendered}");

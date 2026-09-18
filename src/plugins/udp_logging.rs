@@ -365,11 +365,9 @@ pub(crate) fn materialize_dtls_material(
     // verification is intentionally disabled, a missing or malformed declared
     // source must not pass admission and become a latent rollout defect.
     let configured_root_store = match ca_path {
-        Some(ca_path) => Some(
-            crate::dtls::load_root_store_from_pem(ca_path).map_err(|_| {
-                "udp_logging: DTLS CA materialization failed for `dtls_ca_cert_path`".to_string()
-            })?,
-        ),
+        Some(ca_path) => Some(crate::dtls::load_root_store_from_pem(ca_path).map_err(|_| {
+            "udp_logging: DTLS CA materialization failed for `dtls_ca_cert_path`".to_string()
+        })?),
         None => None,
     };
 
