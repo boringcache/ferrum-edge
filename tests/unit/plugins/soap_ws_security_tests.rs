@@ -9432,7 +9432,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for &fragment in *expected {
-            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
         }
         for supplied in [
             "SECURITY_DIAGNOSTIC_CANARY",
@@ -9442,7 +9445,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "16384",
             "true",
         ] {
-            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
         }
     }
 }
@@ -9499,7 +9505,11 @@ fn unknown_key_diagnostics_preserve_every_schema_path_and_credential_ordinal() {
         ("/nonce", "config.nonce", "replay_scpoe", "replay_scope"),
     ] {
         let mut config = base.clone();
-        let object = config.pointer_mut(pointer).unwrap().as_object_mut().unwrap();
+        let object = config
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
         // Pair the missing required credential field with its structured typo.
         if pointer == "/username_token/credentials/1" {
             object.remove("password");
@@ -9508,7 +9518,10 @@ fn unknown_key_diagnostics_preserve_every_schema_path_and_credential_ordinal() {
             typo.to_string(),
             json!({"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]}),
         );
-        object.insert("CALLER_KEY_CANARY".to_string(), json!("CALLER_VALUE_CANARY"));
+        object.insert(
+            "CALLER_KEY_CANARY".to_string(),
+            json!("CALLER_VALUE_CANARY"),
+        );
         object.insert(
             "975318642".to_string(),
             json!(["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}]),
@@ -9523,11 +9536,17 @@ fn unknown_key_diagnostics_preserve_every_schema_path_and_credential_ordinal() {
             "unknown configuration key(s)".to_string(),
             format!("did you mean `{suggestion}`?"),
         ] {
-            assert!(rendered.contains(&expected), "missing {expected:?}: {rendered}");
+            assert!(
+                rendered.contains(&expected),
+                "missing {expected:?}: {rendered}"
+            );
         }
         assert!(!rendered.contains(typo), "leaked {typo:?}: {rendered}");
         for supplied in ["CALLER_", "8675309", "975318642", "payload"] {
-            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
         }
     }
 }

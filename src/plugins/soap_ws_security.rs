@@ -1788,9 +1788,7 @@ impl SoapWsSecurity {
             })?;
 
             let public_key_der = load_rsa_public_key_from_cert(&cert).map_err(|e| {
-                format!(
-                    "soap_ws_security: `config.x509_signature.trusted_certs[{index}]`: {e}"
-                )
+                format!("soap_ws_security: `config.x509_signature.trusted_certs[{index}]`: {e}")
             })?;
 
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
@@ -2020,9 +2018,7 @@ impl SoapWsSecurity {
             })?;
 
             let public_key_der = load_rsa_public_key_from_cert(&cert).map_err(|e| {
-                format!(
-                    "soap_ws_security: `config.saml.trusted_signing_certs[{index}]`: {e}"
-                )
+                format!("soap_ws_security: `config.saml.trusted_signing_certs[{index}]`: {e}")
             })?;
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
@@ -2127,7 +2123,8 @@ impl SoapWsSecurity {
         // PasswordDigest request; refuse the contradiction at admission rather
         // than failing closed on live traffic.
         if max_nonce_cache_bytes < max_nonce_encoded_length {
-            let expected = format!("at least `max_encoded_length` (\"{max_nonce_encoded_length}\")");
+            let expected =
+                format!("at least `max_encoded_length` (\"{max_nonce_encoded_length}\")");
             let path = "config.nonce";
             return Err(type_error(path, "max_total_cache_bytes", &expected));
         }

@@ -2465,7 +2465,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for &fragment in *expected {
-            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
         }
         for supplied in [
             "SECURITY_DIAGNOSTIC_CANARY",
@@ -2475,7 +2478,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "16384",
             "true",
         ] {
-            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
         }
     }
 }

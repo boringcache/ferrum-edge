@@ -638,7 +638,12 @@ impl OpenapiValidator {
         // Fail closed on typos before any default is applied: a misspelled
         // enforcement control would otherwise construct successfully with the
         // weaker default still in force (GHSA-692x-352q-6gm8).
-        reject_unknown_keys(object, "config", CONFIG_KEYS, "openapi_validator: `config`: ")?;
+        reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_KEYS,
+            "openapi_validator: `config`: ",
+        )?;
 
         let mode = parse_mode(optional_string(object, "enforcement_mode")?.unwrap_or("block"))?;
         let validate_request = optional_bool(object, "validate_request")?.unwrap_or(true);
@@ -1607,10 +1612,13 @@ fn parse_operation(
         ));
     }
     let path_template = optional_string(object, "path_template")?
-        .ok_or_else(|| format!("openapi_validator: `operations[{index}].path_template` is required"))?
+        .ok_or_else(|| {
+            format!("openapi_validator: `operations[{index}].path_template` is required")
+        })?
         .to_string();
-    let path_regex_raw = optional_string(object, "path_regex")?
-        .ok_or_else(|| format!("openapi_validator: `operations[{index}].path_regex` is required"))?;
+    let path_regex_raw = optional_string(object, "path_regex")?.ok_or_else(|| {
+        format!("openapi_validator: `operations[{index}].path_regex` is required")
+    })?;
     // Anchor operator-supplied patterns so a loose regex like `/users/\d+`
     // cannot substring-match an unintended superstring path such as
     // `/admin/users/1/secret` and thus validate a request against the wrong
@@ -2177,7 +2185,11 @@ fn parse_property_encoding(
     let explode = match object.get("explode") {
         None => style == EncodingStyle::Form,
         Some(Value::Bool(value)) => *value,
-        Some(_) => return Err(format!("`encoding[{property:?}].explode` must be a boolean")),
+        Some(_) => {
+            return Err(format!(
+                "`encoding[{property:?}].explode` must be a boolean"
+            ));
+        }
     };
     let allow_reserved = match object.get("allowReserved") {
         None => false,
@@ -2380,7 +2392,9 @@ fn parse_property_encoding(
                     validate_concrete_media_type(media_type, &media_path)?;
                     let media_base = normalize_media_type(media_type);
                     if media_base == "multipart/form-data" {
-                        return Err(format!("`{media_path}` does not support multipart/form-data"));
+                        return Err(format!(
+                            "`{media_path}` does not support multipart/form-data"
+                        ));
                     }
                     let media_object = media_value
                         .as_object()

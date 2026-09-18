@@ -9908,7 +9908,10 @@ fn insert_unknown_diagnostic_keys(value: &mut Value, typo: &str) {
         typo.to_string(),
         json!({"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]}),
     );
-    object.insert("CALLER_KEY_CANARY".to_string(), json!("CALLER_VALUE_CANARY"));
+    object.insert(
+        "CALLER_KEY_CANARY".to_string(),
+        json!("CALLER_VALUE_CANARY"),
+    );
     object.insert(
         "975318642".to_string(),
         json!(["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}]),
@@ -9924,7 +9927,10 @@ fn assert_unknown_key_context(config: Value, paths: &[&str], typo: &str, suggest
         "unknown configuration key(s)".to_string(),
         format!("did you mean `{suggestion}`?"),
     ] {
-        assert!(rendered.contains(&expected), "missing {expected:?}: {rendered}");
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected:?}: {rendered}"
+        );
     }
     for path in paths {
         assert!(
@@ -9943,7 +9949,10 @@ fn assert_unknown_key_context(config: Value, paths: &[&str], typo: &str, suggest
         "payload",
         "multipart/form-data",
     ] {
-        assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        assert!(
+            !rendered.contains(supplied),
+            "leaked {supplied:?}: {rendered}"
+        );
     }
 }
 
@@ -9958,12 +9967,7 @@ fn unknown_key_diagnostics_preserve_fixed_paths_and_second_operation() {
             "request_status_coed",
             "request_status_code",
         ),
-        (
-            "/operations/1",
-            "config.operations[1]",
-            "mehtod",
-            "method",
-        ),
+        ("/operations/1", "config.operations[1]", "mehtod", "method"),
         (
             "/operations/1/responses/418",
             "config.operations[1].responses",
@@ -10029,10 +10033,7 @@ fn unknown_encoding_keys_preserve_header_context_without_document_map_keys() {
                     json!({"content": {(media): {"schema": {"type": "string"}}}})
                 };
                 let (path, typo, suggestion) = if target == "content_media" {
-                    insert_unknown_diagnostic_keys(
-                        &mut header_object["content"][media],
-                        "scheam",
-                    );
+                    insert_unknown_diagnostic_keys(&mut header_object["content"][media], "scheam");
                     ("encoding.headers.content", "scheam", "schema")
                 } else {
                     insert_unknown_diagnostic_keys(&mut header_object, "requried");
@@ -10137,7 +10138,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for &fragment in *expected {
-            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
         }
         for supplied in [
             "SECURITY_DIAGNOSTIC_CANARY",
@@ -10147,7 +10151,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "16384",
             "true",
         ] {
-            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
         }
     }
 }

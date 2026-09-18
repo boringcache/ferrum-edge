@@ -838,14 +838,13 @@ impl OidcRelyingParty {
             .and_then(Value::as_object)
             .ok_or_else(|| "oidc_relying_party: `session` object is required".to_string())?;
         reject_unknown_fields(session_obj, SESSION_FIELDS, "session")?;
-        let behavior_obj = match config_obj.get("behavior") {
-            Some(Value::Null) | None => None,
-            Some(value) => Some(
-                value
-                    .as_object()
-                    .ok_or_else(|| "oidc_relying_party: `behavior` must be an object".to_string())?,
-            ),
-        };
+        let behavior_obj =
+            match config_obj.get("behavior") {
+                Some(Value::Null) | None => None,
+                Some(value) => Some(value.as_object().ok_or_else(|| {
+                    "oidc_relying_party: `behavior` must be an object".to_string()
+                })?),
+            };
         if let Some(behavior_obj) = behavior_obj {
             reject_unknown_fields(behavior_obj, BEHAVIOR_FIELDS, "behavior")?;
         }
@@ -906,7 +905,9 @@ impl OidcRelyingParty {
         let client_id = required_string(provider_obj, "client_id", "provider[0]")?;
         let scopes = parse_string_array(provider_obj, "scopes", "provider[0]")?;
         if scopes.is_empty() || !scopes.iter().any(|scope| scope == "openid") {
-            return Err("oidc_relying_party: `provider[0].scopes` must include `openid`".to_string());
+            return Err(
+                "oidc_relying_party: `provider[0].scopes` must include `openid`".to_string(),
+            );
         }
         let redirect_uri = required_string(provider_obj, "redirect_uri", "provider[0]")?;
         validate_redirect_uri(&redirect_uri)?;
@@ -1043,7 +1044,9 @@ impl OidcRelyingParty {
             DEFAULT_SESSION_MAX_COOKIE_BYTES,
         )?;
         if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
-            return Err("oidc_relying_party: `session.max_cookie_bytes` must be <= 8000".to_string());
+            return Err(
+                "oidc_relying_party: `session.max_cookie_bytes` must be <= 8000".to_string(),
+            );
         }
         if max_cookie_bytes < MIN_SESSION_MAX_COOKIE_BYTES {
             return Err(format!(
@@ -1071,7 +1074,8 @@ impl OidcRelyingParty {
         )?);
         if state_ttl.is_zero() {
             return Err(
-                "oidc_relying_party: `behavior.state_ttl_secs` must be greater than zero".to_string(),
+                "oidc_relying_party: `behavior.state_ttl_secs` must be greater than zero"
+                    .to_string(),
             );
         }
         if state_ttl.as_secs() > MAX_STATE_TTL_SECS {
@@ -3043,7 +3047,9 @@ fn parse_client_auth(
                 "ES256" => Algorithm::ES256,
                 "ES384" => Algorithm::ES384,
                 "EdDSA" => Algorithm::EdDSA,
-                _ => return Err("oidc_relying_party: unsupported `private_key_jwt_alg`".to_string()),
+                _ => {
+                    return Err("oidc_relying_party: unsupported `private_key_jwt_alg`".to_string());
+                }
             };
             let encoding_key = match alg {
                 Algorithm::ES256 | Algorithm::ES384 => EncodingKey::from_ec_pem(pem.as_bytes())
@@ -3052,10 +3058,12 @@ fn parse_client_auth(
                             .to_string()
                     })?,
                 Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|_| {
-                    "oidc_relying_party: `client_auth.private_key_pem` is invalid EdDSA PEM".to_string()
+                    "oidc_relying_party: `client_auth.private_key_pem` is invalid EdDSA PEM"
+                        .to_string()
                 })?,
                 _ => EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| {
-                    "oidc_relying_party: `client_auth.private_key_pem` is invalid RSA PEM".to_string()
+                    "oidc_relying_party: `client_auth.private_key_pem` is invalid RSA PEM"
+                        .to_string()
                 })?,
             };
             // Parsing the PEM only proves it is a well-formed key of that

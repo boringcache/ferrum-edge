@@ -3241,7 +3241,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for &fragment in *expected {
-            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
         }
         for supplied in [
             "SECURITY_DIAGNOSTIC_CANARY",
@@ -3251,7 +3254,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "16384",
             "true",
         ] {
-            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
         }
     }
 }
@@ -3305,7 +3311,9 @@ async fn successful_ca_bundle_load_log_withholds_source_path() {
 async fn ca_bundle_admission_diagnostics_withhold_source_and_parser_payloads() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("'LDAP_DIAGNOSTIC_CANARY-missing.pem");
-    let malformed = directory.path().join("'LDAP_DIAGNOSTIC_CANARY-malformed.pem");
+    let malformed = directory
+        .path()
+        .join("'LDAP_DIAGNOSTIC_CANARY-malformed.pem");
     std::fs::write(
         &malformed,
         b"-----BEGIN CERTIFICATE-----\nLDAP_DIAGNOSTIC_CANARY!\n-----END CERTIFICATE-----\n",
@@ -3332,7 +3340,10 @@ async fn ca_bundle_admission_diagnostics_withhold_source_and_parser_payloads() {
         .err()
         .expect("invalid CA source must still reject admission");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-        assert!(rendered.contains("`FERRUM_TLS_CA_BUNDLE_PATH`"), "{rendered}");
+        assert!(
+            rendered.contains("`FERRUM_TLS_CA_BUNDLE_PATH`"),
+            "{rendered}"
+        );
         assert!(rendered.contains(reason), "{rendered}");
         assert!(!rendered.contains("LDAP_DIAGNOSTIC_CANARY"), "{rendered}");
     }

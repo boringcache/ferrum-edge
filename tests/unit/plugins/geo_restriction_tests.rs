@@ -193,7 +193,9 @@ fn test_new_invalid_db_path_succeeds_with_none_reader() {
 #[tokio::test(flavor = "current_thread")]
 async fn unavailable_database_constructor_log_withholds_source_path() {
     let directory = TempDir::new().unwrap();
-    let path = directory.path().join("'GEO_CONSTRUCTOR_PATH_CANARY`-missing.mmdb");
+    let path = directory
+        .path()
+        .join("'GEO_CONSTRUCTOR_PATH_CANARY`-missing.mmdb");
     let missing_error = std::fs::metadata(&path).unwrap_err();
     assert_eq!(missing_error.kind(), std::io::ErrorKind::NotFound);
 
@@ -223,7 +225,10 @@ async fn unavailable_database_constructor_log_withholds_source_path() {
         .lines()
         .find(|line| line.contains("`on_lookup_failure` is not set"))
         .expect("omitted failure policy must still emit its default warning");
-    assert!(default_warning.trim_start().starts_with("WARN "), "{output}");
+    assert!(
+        default_warning.trim_start().starts_with("WARN "),
+        "{output}"
+    );
     assert!(
         default_warning.contains("defaulting to `allow` (fail-open)"),
         "{output}"
@@ -1480,7 +1485,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             .expect_err("invalid configuration must still be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for &fragment in *expected {
-            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
         }
         for supplied in [
             "SECURITY_DIAGNOSTIC_CANARY",
@@ -1490,7 +1498,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "16384",
             "true",
         ] {
-            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
         }
     }
 }

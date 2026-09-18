@@ -1600,7 +1600,9 @@ fn parse_client_auth(
 ) -> Result<ClientAuth, String> {
     let auth = match config.get("client_auth") {
         Some(value) => value.as_object().cloned().ok_or_else(|| {
-            format!("oauth2_introspection: `provider[{provider_idx}].client_auth` must be an object")
+            format!(
+                "oauth2_introspection: `provider[{provider_idx}].client_auth` must be an object"
+            )
         })?,
         None => Map::new(),
     };
