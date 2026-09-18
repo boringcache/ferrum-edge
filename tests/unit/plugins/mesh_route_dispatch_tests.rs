@@ -1957,7 +1957,7 @@ mod grpc_route_predicate_dispatch {
 
         assert!(
             translation.warnings.iter().any(|warning| {
-                warning.contains("GRPCRoute default/grpc")
+                warning.contains("GRPCRoute \"default\"/\"grpc\"")
                     && warning.contains("Gateway API forbids merging")
             }),
             "the rejection must be reported: {:?}",

@@ -434,7 +434,10 @@ fn rendered_extension_unknown_keys_keep_fixed_context_without_document_content()
                 rendered.contains(&format!("malformed {which} extension")),
                 "{rendered}"
             );
-            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains("unknown configuration key(s)"),
+                "{rendered}"
+            );
             assert!(
                 rendered.contains(&format!("did you mean `{suggestion}`?")),
                 "{rendered}"
