@@ -546,7 +546,8 @@ fn backend_tls_policy_mixed_covered_and_uncovered_backends_fails_closed() {
         "warning must name the offending field: {warning}"
     );
     assert!(
-        warning.contains("Service default/reviews") && warning.contains("Service default/ratings"),
+        warning.contains("Service \"default\"/\"reviews\"")
+            && warning.contains("Service \"default\"/\"ratings\""),
         "warning must identify both sides: {warning}"
     );
     assert!(
@@ -877,7 +878,7 @@ fn backend_tls_policy_status_reports_invalid_ca_certificate_ref() {
         .and_then(Value::as_str)
         .unwrap_or_default();
     assert!(
-        message.contains("caCertificateRefs[0]") && message.contains("default/missing-ca"),
+        message.contains("caCertificateRefs[0]") && message.contains("\"default\"/\"missing-ca\""),
         "message must be field-specific: {message}"
     );
 }

@@ -80,7 +80,7 @@ async fn test_tcp_logging_tls_rejects_invalid_ca_bundle_at_construction() {
     )
     .err()
     .expect("an all-malformed CA bundle must be rejected at construction");
-    assert!(error.contains("record #1"), "got: {error}");
+    assert_eq!(error, "TCP logging: invalid CA bundle");
 }
 
 #[tokio::test]
@@ -105,8 +105,7 @@ async fn test_tcp_logging_tls_rejects_mixed_ca_bundle_at_construction() {
     )
     .err()
     .expect("a malformed later CA record must reject plugin construction");
-    assert!(error.contains("TCP logging CA bundle"), "got: {error}");
-    assert!(error.contains("record #2"), "got: {error}");
+    assert_eq!(error, "TCP logging: invalid CA bundle");
 }
 
 #[tokio::test]

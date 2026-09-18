@@ -476,7 +476,7 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
     for (config, expected) in [
         (
             json!({"log_respnose_body": true}),
-            "transaction_debugger: unknown configuration keys: log_respnose_body",
+            "transaction_debugger: unknown configuration keys at `config`: \"log_respnose_body\"",
         ),
         (
             json!({
@@ -484,11 +484,11 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
                 "redacted_headers": [],
                 "a_unknown": false
             }),
-            "transaction_debugger: unknown configuration keys: a_unknown, z_unknown",
+            "transaction_debugger: unknown configuration keys at `config`: \"a_unknown, z_unknown\"",
         ),
         (
             json!({"schema_reff": "debug"}),
-            "transaction_debugger: unknown configuration keys: schema_reff",
+            "transaction_debugger: unknown configuration keys at `config`: \"schema_reff\"",
         ),
     ] {
         assert_eq!(TransactionDebugger::new(&config).err().unwrap(), expected);
@@ -542,7 +542,7 @@ fn test_shared_validation_matches_transaction_debugger_config_surface() {
     .expect_err("shared validation must reject unknown keys");
     assert_eq!(
         unknown,
-        "transaction_debugger: unknown configuration keys: unknown"
+        "transaction_debugger: unknown configuration keys at `config`: \"unknown\""
     );
 }
 

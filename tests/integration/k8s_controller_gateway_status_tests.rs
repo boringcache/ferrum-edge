@@ -1022,7 +1022,7 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
     let update = gateway_update(&objects, "edge");
     assert_listener_refused(&update, "plain", "ProtocolConflict");
     assert_listener_refused(&update, "secure", "ProtocolConflict");
-    let expected_message = "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+    let expected_message = "Port \"8443\" is claimed by both plaintext and an effective TLS-serving \
          frontend shape, so every conflicting claim on this port is refused \
          (Conflicted).";
     for name in ["plain", "secure"] {
@@ -1149,16 +1149,20 @@ fn http_and_raw_tcp_listeners_sharing_a_port_both_report_conflicted() {
         assert_eq!(conflict.reason, "ProtocolConflict");
         assert_eq!(
             conflict.message,
-            "Port 8080 is claimed by incompatible protocol families on the same TCP \
+            "Port \"8080\" is claimed by incompatible protocol families on the same TCP \
              transport (HTTP-family vs raw stream), so every conflicting claim on this \
              port is refused (Conflicted)."
         );
     }
     assert!(
         translation.warnings.iter().any(|warning| {
-            warning.contains("Gateway default/edge listener http rejected: ProtocolConflict")
+            warning.contains(
+                "Gateway \"default\"/\"edge\" listener \"http\" rejected: ProtocolConflict",
+            )
         }) && translation.warnings.iter().any(|warning| {
-            warning.contains("Gateway default/edge listener tcp rejected: ProtocolConflict")
+            warning.contains(
+                "Gateway \"default\"/\"edge\" listener \"tcp\" rejected: ProtocolConflict",
+            )
         }),
         "warnings must agree with status withdrawal: {:?}",
         translation.warnings
@@ -2126,7 +2130,7 @@ fn different_certificate_sets_across_namespaces_refuse_every_effective_claim() {
     let edge_b = gateway_update_with_options(&objects, options.clone(), "edge-b");
     assert_listener_refused(&edge_b, "https", "HostnameConflict");
 
-    let expected_message = "Port 8443 has incompatible effective TLS credential sets across \
+    let expected_message = "Port \"8443\" has incompatible effective TLS credential sets across \
          namespaces, so every conflicting claim on this port is refused \
          (Conflicted).";
     for (update, gateway) in [
