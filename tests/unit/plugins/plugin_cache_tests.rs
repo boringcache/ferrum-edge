@@ -1534,7 +1534,7 @@ fn test_workload_metrics_effective_plan_budget_rejects_multi_family_over_cap() {
         .err()
         .expect("composed different-family plans above 16384 must fail closed");
     assert!(
-        error.contains("proxy_id=p1"),
+        error.contains("proxy_id=\"p1\""),
         "diagnostic must identify the proxy without echoing plans: {error}"
     );
     assert!(
