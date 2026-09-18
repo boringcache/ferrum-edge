@@ -59,7 +59,7 @@ impl HttpMethod {
             "PUT" => Ok(Self::Put),
             "PATCH" => Ok(Self::Patch),
             other => Err(format!(
-                "unsupported method '{other}'; only POST, PUT, PATCH are allowed"
+                "unsupported method {other:?} for `method`; only `POST`, `PUT`, `PATCH` are allowed"
             )),
         }
     }
@@ -71,15 +71,15 @@ impl HttpMethod {
 impl WebhookChannel {
     pub fn new(name: &str, value: &Value) -> Result<Self, String> {
         let url = resolve_optional_string(value, "url", "url_env", name)?
-            .ok_or_else(|| format!("channel '{name}' (webhook): 'url' is required"))?;
+            .ok_or_else(|| format!("channel {name:?} (webhook): `url` is required"))?;
         validate_url(&url, name)?;
 
         let method = match value.get("method") {
             Some(v) => v
                 .as_str()
-                .ok_or_else(|| format!("channel '{name}' (webhook): 'method' must be a string"))
+                .ok_or_else(|| format!("channel {name:?} (webhook): `method` must be a string"))
                 .and_then(|s| {
-                    HttpMethod::parse(s).map_err(|e| format!("channel '{name}' (webhook): {e}"))
+                    HttpMethod::parse(s).map_err(|e| format!("channel {name:?} (webhook): {e}"))
                 })?,
             None => HttpMethod::Post,
         };
@@ -88,17 +88,17 @@ impl WebhookChannel {
         let mut has_content_type = false;
         if let Some(headers_val) = value.get("headers") {
             let map = headers_val.as_object().ok_or_else(|| {
-                format!("channel '{name}' (webhook): 'headers' must be an object")
+                format!("channel {name:?} (webhook): `headers` must be an object")
             })?;
             for (k, v) in map {
                 let s = v.as_str().ok_or_else(|| {
-                    format!("channel '{name}' (webhook): headers['{k}'] must be a string")
+                    format!("channel {name:?} (webhook): `headers` key {k:?} must be a string")
                 })?;
-                let header_name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-                    format!("channel '{name}' (webhook): invalid header name '{k}': {e}")
+                let header_name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                    format!("channel {name:?} (webhook): invalid header name {k:?} in `headers`")
                 })?;
-                let header_value = HeaderValue::from_str(s).map_err(|e| {
-                    format!("channel '{name}' (webhook): invalid header value for '{k}': {e}")
+                let header_value = HeaderValue::from_str(s).map_err(|_| {
+                    format!("channel {name:?} (webhook): invalid header value for key {k:?} in `headers`")
                 })?;
                 if header_name.as_str().eq_ignore_ascii_case("content-type") {
                     has_content_type = true;
@@ -111,10 +111,10 @@ impl WebhookChannel {
         let body_template = value
             .get("body_template")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("channel '{name}' (webhook): 'body_template' is required"))?
+            .ok_or_else(|| format!("channel {name:?} (webhook): `body_template` is required"))?
             .to_string();
         validate_template(&body_template)
-            .map_err(|e| format!("channel '{name}' (webhook): invalid 'body_template': {e}"))?;
+            .map_err(|e| format!("channel {name:?} (webhook): invalid `body_template`: {e}"))?;
 
         if !has_content_type {
             headers.push((

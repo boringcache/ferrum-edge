@@ -8,6 +8,7 @@
 //! the fail-closed rejections around it.
 
 use ferrum_edge::admin::api_specs::{ExtractError, SpecFormat, extract};
+use ferrum_edge::startup::render_startup_error;
 use serde_json::{Value, json};
 
 fn proxy_block() -> &'static str {
@@ -351,6 +352,113 @@ fn unknown_x_ferrum_validate_bypass_key_is_rejected() {
         error.to_string().contains("methdos"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn rendered_extension_unknown_keys_keep_fixed_context_without_document_content() {
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "EXTRACTOR_TITLE", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": "extractor-diagnostics-proxy",
+            "backend_host": "backend.internal",
+            "backend_port": 443
+        },
+        "x-ferrum-validate": {"request": {}, "response": {}, "bypass": {}},
+        "x-ferrum-plugins": [
+            {"plugin_name": "cors", "config": {}},
+            {"plugin_name": "openapi_validator", "config": {"bypass": {}}}
+        ],
+        "paths": {"/items": {"get": {"responses": {"204": {"description": "ok"}}}}}
+    });
+    extract(spec.to_string().as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect("both extension paths and the preceding plugin must be valid");
+
+    for (pointer, path, which, typo, suggestion) in [
+        (
+            "/x-ferrum-validate",
+            "x-ferrum-validate",
+            "x-ferrum-validate",
+            "fail_on_missing_response_scehma",
+            "fail_on_missing_response_schema",
+        ),
+        (
+            "/x-ferrum-validate/request",
+            "x-ferrum-validate.request",
+            "x-ferrum-validate",
+            "content_typs",
+            "content_types",
+        ),
+        (
+            "/x-ferrum-validate/response",
+            "x-ferrum-validate.response",
+            "x-ferrum-validate",
+            "content_typs",
+            "content_types",
+        ),
+        (
+            "/x-ferrum-validate/bypass",
+            "x-ferrum-validate.bypass",
+            "x-ferrum-validate",
+            "methdos",
+            "methods",
+        ),
+        (
+            "/x-ferrum-plugins/1/config/bypass",
+            "x-ferrum-plugins.bypass",
+            "x-ferrum-plugins",
+            "methdos",
+            "methods",
+        ),
+    ] {
+        for supplied in [
+            "EXTRACTOR_UNKNOWN_KEY",
+            "876543210",
+            "x-ferrum-validate.request[876543210]",
+            "'EXTRACTOR_UNKNOWN_KEY\"\\\n`config`",
+        ] {
+            let mut invalid = spec.clone();
+            let object = invalid.pointer_mut(pointer).unwrap();
+            object[typo] = json!("'EXTRACTOR_SCALAR_VALUE\"\\\n`config`");
+            object[supplied] = json!({"EXTRACTOR_PAYLOAD_KEY": "EXTRACTOR_PAYLOAD_VALUE"});
+            object["EXTRACTOR_ARRAY_KEY"] =
+                json!([{"EXTRACTOR_NESTED_KEY": "EXTRACTOR_NESTED_VALUE"}, 765432109]);
+            let error = extract_err(&invalid.to_string());
+            let ExtractError::MalformedExtension { which: actual, .. } = &error else {
+                panic!("unexpected extraction error: {error}");
+            };
+            assert_eq!(*actual, which, "unexpected extension: {error}");
+            let rendered = render_startup_error(anyhow::Error::msg(error.to_string()), &[]);
+            assert!(rendered.contains(&format!("`{path}`:")), "{rendered}");
+            assert!(
+                rendered.contains(&format!("malformed {which} extension")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("did you mean `{suggestion}`?")),
+                "{rendered}"
+            );
+            for marker in [
+                supplied,
+                typo,
+                "EXTRACTOR_UNKNOWN_KEY",
+                "EXTRACTOR_SCALAR_VALUE",
+                "EXTRACTOR_PAYLOAD_KEY",
+                "EXTRACTOR_PAYLOAD_VALUE",
+                "EXTRACTOR_ARRAY_KEY",
+                "EXTRACTOR_NESTED_KEY",
+                "EXTRACTOR_NESTED_VALUE",
+                "EXTRACTOR_TITLE",
+                "extractor-diagnostics-proxy",
+                "backend.internal",
+                "876543210",
+                "765432109",
+            ] {
+                assert!(!rendered.contains(marker), "{marker} leaked: {rendered}");
+            }
+        }
+    }
 }
 
 #[test]

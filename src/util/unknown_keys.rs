@@ -10,8 +10,13 @@ use serde_json::{Map, Value};
 /// Reject keys that are not in `allowed`, with a path-qualified error and a
 /// spelling suggestion when the typo is close enough to be useful.
 ///
-/// `error_prefix` is prepended verbatim (for example `"proxy_alerts: "` or
-/// `""`). Unknown keys are sorted for stable diagnostics.
+/// `allowed` and `error_prefix` must be schema-authored, never document content.
+/// The prefix is prepended verbatim (for example `"proxy_alerts: "` or `""`),
+/// and suggestions from `allowed` use backticks so startup rendering keeps them.
+/// `path` can contain document keys (channel, tool, operation, or rule names),
+/// so the complete qualified key is Debug-escaped and withheld by the renderer.
+/// A plain string cannot distinguish schema segments from document segments.
+/// Unknown keys are sorted for stable diagnostics.
 pub fn reject_unknown_keys(
     object: &Map<String, Value>,
     path: &str,
@@ -29,11 +34,14 @@ pub fn reject_unknown_keys(
     unknown.sort_unstable();
     let details: Vec<String> = unknown
         .into_iter()
-        .map(|key| match suggest_key(key, allowed) {
-            Some(suggestion) => {
-                format!("'{path}.{key}' (did you mean '{suggestion}'?)")
+        .map(|key| {
+            let qualified_key = format!("{path}.{key}");
+            match suggest_key(key, allowed) {
+                Some(suggestion) => {
+                    format!("{qualified_key:?} (did you mean `{suggestion}`?)")
+                }
+                None => format!("{qualified_key:?}"),
             }
-            None => format!("'{path}.{key}'"),
         })
         .collect();
     Err(format!(

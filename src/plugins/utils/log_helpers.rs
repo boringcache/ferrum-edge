@@ -127,12 +127,12 @@ fn admit_batch_u64(
         Some(value) => {
             let Some(parsed) = value.as_u64() else {
                 return Err(format!(
-                    "{plugin_name}: '{key}' must be an unsigned integer"
+                    "{plugin_name}: `{key}` must be an unsigned integer"
                 ));
             };
             if !(minimum..=maximum).contains(&parsed) {
                 return Err(format!(
-                    "{plugin_name}: '{key}' must be between {minimum} and {maximum}"
+                    "{plugin_name}: `{key}` must be between {minimum} and {maximum}"
                 ));
             }
             Ok(parsed)
@@ -293,25 +293,25 @@ pub fn parse_http_endpoint(
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            format!("{plugin_name}: 'endpoint_url' is required — logs will have nowhere to send")
+            format!("{plugin_name}: `endpoint_url` is required — logs will have nowhere to send")
         })?
         .to_string();
 
     let parsed_url = Url::parse(&endpoint_url)
-        .map_err(|error| format!("{plugin_name}: invalid 'endpoint_url': {error}"))?;
+        .map_err(|_| format!("{plugin_name}: invalid `endpoint_url`: invalid URL"))?;
 
     match parsed_url.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "{plugin_name}: 'endpoint_url' must use http:// or https:// (got '{scheme}')"
+                "{plugin_name}: `endpoint_url` must use http:// or https:// (got {scheme:?})"
             ));
         }
     }
 
     if !has_non_empty_authority(&endpoint_url) {
         return Err(format!(
-            "{plugin_name}: 'endpoint_url' must include a hostname or IP address"
+            "{plugin_name}: `endpoint_url` must include a hostname or IP address"
         ));
     }
 
@@ -329,13 +329,13 @@ pub fn parse_http_endpoint(
     // whichever boundary fires first.
     if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
         return Err(format!(
-            "{plugin_name}: 'endpoint_url' must not contain user information; \
+            "{plugin_name}: `endpoint_url` must not contain user information; \
              use custom_headers instead"
         ));
     }
 
     let host = parsed_url.host().ok_or_else(|| {
-        format!("{plugin_name}: 'endpoint_url' must include a hostname or IP address")
+        format!("{plugin_name}: `endpoint_url` must include a hostname or IP address")
     })?;
     let hostname = match host {
         Host::Domain(hostname) => hostname.to_string(),
@@ -387,7 +387,7 @@ fn screen_endpoint_ip_policy(
     match backend_allow_ips.deny_reason(&ip) {
         None => Ok(()),
         Some(reason) => Err(format!(
-            "{plugin_name}: 'endpoint_url' address {ip} is blocked by the backend egress \
+            "{plugin_name}: `endpoint_url` address \"{ip}\" is blocked by the backend egress \
              policy ({reason}); refusing to send log data there. Adjust \
              FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS or point the sink at an \
              allowed address."
@@ -416,7 +416,7 @@ pub fn screen_url_host_egress(
     match backend_allow_ips.deny_reason(&ip) {
         None => Ok(()),
         Some(reason) => Err(format!(
-            "{plugin_name}: '{field}' address {ip} is blocked by the backend egress policy \
+            "{plugin_name}: `{field}` address \"{ip}\" is blocked by the backend egress policy \
              ({reason}); adjust FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS or point \
              it at an allowed address."
         )),
@@ -434,16 +434,16 @@ pub fn parse_custom_headers(
 
     let map = custom_headers_value
         .as_object()
-        .ok_or_else(|| format!("{plugin_name}: 'custom_headers' must be an object"))?;
+        .ok_or_else(|| format!("{plugin_name}: `custom_headers` must be an object"))?;
     for (key, value) in map {
         let value = value
             .as_str()
-            .ok_or_else(|| format!("{plugin_name}: custom_headers['{key}'] must be a string"))?;
-        let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
-            format!("{plugin_name}: invalid custom_headers name '{key}': {error}")
+            .ok_or_else(|| format!("{plugin_name}: `custom_headers` key {key:?} must be a string"))?;
+        let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+            format!("{plugin_name}: invalid `custom_headers` name {key:?}: invalid HTTP header name")
         })?;
-        let header_value = HeaderValue::from_str(value).map_err(|error| {
-            format!("{plugin_name}: invalid custom_headers value for '{key}': {error}")
+        let header_value = HeaderValue::from_str(value).map_err(|_| {
+            format!("{plugin_name}: invalid `custom_headers` value for key {key:?}: invalid HTTP header value")
         })?;
         custom_headers.retain(|(existing, _)| *existing != header_name);
         custom_headers.push((header_name, header_value));

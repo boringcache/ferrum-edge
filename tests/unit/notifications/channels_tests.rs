@@ -92,7 +92,7 @@ fn parse_channels_rejects_unknown_type() {
         "ops": { "type": "smoke_signal", "webhook_url": "https://x" }
     }))
     .unwrap_err();
-    assert!(err.contains("unknown 'type'"), "got: {err}");
+    assert!(err.contains("unknown `type`"), "got: {err}");
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn parse_channels_rejects_missing_type() {
         "ops": { "webhook_url": "https://hooks.slack.com/x" }
     }))
     .unwrap_err();
-    assert!(err.contains("'type' is required"), "got: {err}");
+    assert!(err.contains("`type` is required"), "got: {err}");
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn parse_channels_rejects_missing_webhook_url() {
         "ops": { "type": "slack" }
     }))
     .unwrap_err();
-    assert!(err.contains("'webhook_url' is required"), "got: {err}");
+    assert!(err.contains("`webhook_url` is required"), "got: {err}");
 }
 
 #[test]
@@ -264,7 +264,7 @@ fn parse_channels_rejects_type_key_typo_with_suggestion() {
     }))
     .expect_err("type key typo must fail closed");
     assert!(
-        err.contains("did you mean 'type' instead of 'typee'"),
+        err.contains("did you mean `type` instead of \"typee\""),
         "missing type-key suggestion: {err}"
     );
 }
@@ -541,7 +541,7 @@ fn webhook_rejects_unbalanced_template_at_construction() {
         }),
     )
     .unwrap_err();
-    assert!(err.contains("invalid 'body_template'"), "got: {err}");
+    assert!(err.contains("invalid `body_template`"), "got: {err}");
 }
 
 #[test]
@@ -996,4 +996,62 @@ fn discord_channel_constructor_smoke() {
         }),
     )
     .unwrap();
+}
+
+#[test]
+fn startup_diagnostics_withhold_channel_keys_types_and_webhook_headers() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (config, context) in [
+        (json!({secret: {"type": "slack"}}), "channel name"),
+        (json!({"ops": {"type": secret}}), "unknown `type`"),
+        (
+            json!({"ops": {"type": "webhook", "url": "https://example.com", "method": secret}}),
+            "`method`",
+        ),
+        (
+            json!({"ops": {"type": "webhook", "url": "https://example.com", "headers": {secret: true}}}),
+            "`headers`",
+        ),
+        (
+            json!({"ops": {"type": "webhook", "url": "https://example.com", "headers": {secret: "safe"}}}),
+            "`headers`",
+        ),
+    ] {
+        let error = parse_channels(&config).expect_err("invalid channel must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(context), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("diagnostic-secret-5594"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("true"), "{rendered}");
+    }
+
+    for kind in ["slack", "teams", "discord", "webhook", "email"] {
+        let config = json!({"CHANNEL_CANARY": {
+            "type": kind, "typee": true, secret: "VALUE_CANARY"
+        }});
+        let error = parse_channels(&config).expect_err("unknown keys must fail admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("`channels`: unknown configuration key"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("did you mean `type`"), "{rendered}");
+        for withheld in [
+            "CHANNEL_CANARY",
+            "VALUE_CANARY",
+            "diagnostic-secret-5594",
+            "true",
+            "typee",
+        ] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+
+    let error = parse_channels(&json!({"ops": {"typee": "slack"}})).unwrap_err();
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains("`type` is required"), "{rendered}");
+    assert!(rendered.contains("did you mean `type`"), "{rendered}");
+    assert!(!rendered.contains("typee"), "{rendered}");
 }

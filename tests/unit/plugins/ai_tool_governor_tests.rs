@@ -558,7 +558,7 @@ fn rejects_enforcement_relevant_unknown_keys_with_path_and_suggestion() {
         );
         if let Some(expected) = suggestion {
             assert!(
-                err.contains(&format!("did you mean '{expected}'")),
+                err.contains(&format!("did you mean `{expected}`")),
                 "{label}: missing suggestion for {expected}: {err}"
             );
         }
@@ -645,7 +645,7 @@ fn shared_admission_and_failure_policy_for_unknown_keys() {
     let err = validate_plugin_config("ai_tool_governor", &config)
         .expect_err("shared admission must use the strict constructor");
     assert!(err.contains("config.tools.search.required_arg"), "{err}");
-    assert!(err.contains("did you mean 'required_args'"), "{err}");
+    assert!(err.contains("did you mean `required_args`"), "{err}");
     assert_eq!(
         plugin_failure_policy("ai_tool_governor"),
         Some(PluginFailurePolicy::FailClosed)

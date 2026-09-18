@@ -115,7 +115,7 @@ async fn test_loki_logging_rejects_malformed_endpoint_url() {
         default_client(),
     );
     match result {
-        Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
+        Err(e) => assert!(e.contains("invalid `endpoint_url`")),
         Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
     }
 }
@@ -1661,4 +1661,31 @@ async fn test_loki_terminal_and_exhausted_delivery_counts_batch_discard() {
         "constructing a replacement instance must not reset process sink-loss counters"
     );
     drop(replacement);
+}
+
+#[test]
+fn startup_diagnostics_withhold_loki_config_keys_and_label_names() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (extra, context) in [
+        (json!({secret: true}), "at `config`"),
+        (json!({"labels": {secret: "safe"}}), "label name"),
+        (
+            json!({"labels": {"diagnostic_secret_5594": 987654321}}),
+            "`labels`",
+        ),
+    ] {
+        let mut config = json!({"endpoint_url": "http://logs.example.com/loki/api/v1/push"});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = LokiLogging::new(&config, default_client())
+            .err()
+            .expect("invalid Loki configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(context), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+        assert!(!rendered.contains("diagnostic_secret_5594"), "{rendered}");
+        assert!(!rendered.contains("987654321"), "{rendered}");
+    }
 }
