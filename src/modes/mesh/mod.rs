@@ -1143,7 +1143,7 @@ impl MeshRuntimeConfig {
                 warn!(
                     "Planning mesh TCP capture listeners for IPv4 only: invalid IPv6 capture \
                      settings: {}",
-                    sanitize_startup_scalar(&e)
+                    sanitize_startup_cause(&e, &[])
                 );
                 false
             }
@@ -1396,7 +1396,7 @@ impl MeshRuntimeConfig {
             Err(e) => {
                 warn!(
                     "Skipping mesh UDP capture listener: {}",
-                    sanitize_startup_scalar(&e)
+                    sanitize_startup_cause(&e, &[])
                 );
                 return None;
             }
@@ -31728,6 +31728,36 @@ mod tests {
                     "Ambient must NOT emit a host-netns UDP capture listener; it uses the \
                      per-pod-netns producer instead"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_capture_plan_warnings_keep_fields_and_reasons_without_values() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "sidecar"),
+                ("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "'UNREGISTERED_capture\"\\value"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "'UNREGISTERED_capture\"\\value"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let ((), log) = capture_mesh_diagnostics(|| {
+                    assert!(!runtime.sidecar_capture_ipv6_enabled());
+                    assert!(runtime.udp_capture_listener().is_none());
+                });
+                assert!(log.contains("FERRUM_MESH_CAPTURE_IPV6_ENABLED"), "{log}");
+                assert!(log.contains("FERRUM_MESH_CAPTURE_UDP_ENABLED"), "{log}");
+                assert_eq!(log.matches("Expected true, false, 1, or 0").count(), 2, "{log}");
+                assert!(!log.contains("UNREGISTERED_capture"), "{log}");
             },
         );
     }

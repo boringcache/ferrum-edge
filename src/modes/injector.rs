@@ -3593,7 +3593,7 @@ mod tests {
             .expect_err("mixed wildcard annotation rejected");
 
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
-        assert!(err.contains("wildcard '*' must be the only includeOutboundPorts token"));
+        assert!(err.contains("wildcard `*` must be the only includeOutboundPorts token"));
     }
 
     #[test]
@@ -5121,7 +5121,7 @@ mod tests {
 
         assert!(err.contains("ferrum.io/includeOutboundPorts"));
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
-        assert!(err.contains("cannot be combined with wildcard '*'"));
+        assert!(err.contains("cannot be combined with wildcard `*`"));
     }
 
     // Deduplication on the exclude-CIDR path: a CIDR repeated across env and
