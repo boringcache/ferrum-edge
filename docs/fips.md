@@ -184,7 +184,7 @@ channel — a failed-job rerun therefore
 reuses the artifact the skipped producer published at an earlier attempt.
 Each
 claimed shard selects profiles from the policy checker's single inventory by
-ordinal modulo three and fails closed if it selects none. The seven claimed
+ordinal modulo three and fails closed if it selects none. The eight claimed
 combinations therefore remain checker-owned while running in parallel with
 clippy and test-binary compile after the shorter build-only producer.
 Non-cold consumers, fork runs included, fail closed if no producer handoff
@@ -723,6 +723,7 @@ each, then compiles each against the real module:
 | `fips,pkcs11` | Supported — signing happens inside the operator's token, which carries its own validation (`outside-boundary`); Ferrum's local randomness and RSA verification on this path use the selected module, and the PKCS#11 leaf certificate goes through the same key-strength admission |
 | `fips,ebpf` | Supported — the eBPF capture path performs no cryptography |
 | `fips,bench-h1-profile` | Supported — default-off diagnostic counters forward the existing allocator and I/O calls without changing cryptographic operations or provider selection; the combination receives the same resolved-graph audit and hosted compile gate |
+| `fips,bench-pool-profile` | Supported — includes the H1 allocator observer and adds sampled pool counters without changing cryptographic operations or provider selection; the combination receives the same resolved-graph audit and hosted compile gate |
 | `fips,cloud-secrets` | **Builds, refused at runtime** (above) |
 
 ## Verifying a deployment

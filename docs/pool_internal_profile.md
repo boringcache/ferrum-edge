@@ -7,6 +7,11 @@ schema, four allocation scopes, exporter or H1 report. There is one global
 allocator: the existing Jemalloc forwarding wrapper. No new dependency, cache,
 pool ownership scheme, retry, wait, readiness poll or production policy is added.
 
+The existing FIPS optional-feature inventory includes `fips,bench-pool-profile`,
+which transitively enables the H1 observer. Its resolved dependency graph and
+compilation receive the same hosted gates; this is functional coverage, not
+a separate cryptographic certification claim.
+
 The branch starts at PR5614's `3cd9296c2fea0a21d385c723999142d34b89f006`, itself
 based on PR5602. Those parents remain root-owned. PR5602 recorded adaptive
 70 KiB H2 and gRPC correctness failures; PR5613 owns guard diagnosis. This lane
