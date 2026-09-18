@@ -240,7 +240,7 @@ impl SpiffeIdentity {
                 Err("spiffe_identity: no configuration fields are supported".to_string())
             }
             other => Err(format!(
-                "spiffe_identity: config must be an object, got: {other:?}",
+                "spiffe_identity: `config` must be an object, got: {other:?}",
                 other = other.to_string()
             )),
         }

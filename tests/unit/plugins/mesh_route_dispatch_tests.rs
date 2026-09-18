@@ -2585,3 +2585,135 @@ async fn redirect_prefix_rewrite_keeps_dot_names_literal_and_refuses_dot_segment
         }
     }
 }
+
+fn assert_rendered_route_diagnostic(config: serde_json::Value, expected: &[&str]) {
+    let error = MeshRouteDispatch::new(&config).expect_err("invalid route must be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for fragment in expected {
+        assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+    }
+    for fragment in ["MESH_DIAG", "mesh_diag", "8675309", "true"] {
+        assert!(
+            !rendered.contains(fragment),
+            "disclosed {fragment:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn mesh_route_rendered_match_errors_withhold_header_keys_and_patterns() {
+    let cases = [
+        (
+            json!({"headers": {"'MESH_DIAG_KEY\"\\`\n": "MESH_DIAG_VALUE"}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.headers`",
+                "not a valid HTTP header",
+            ],
+        ),
+        (
+            json!({"headers": {"'MESH_DIAG_KEY": "a", "'mesh_diag_key": "b"}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.headers`",
+                "duplicate header",
+            ],
+        ),
+        (
+            json!({"headers": {"'MESH_DIAG_KEY": {"regex": "[MESH_DIAG_PATTERN"}}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.headers`",
+                "`regex`",
+                "invalid regex",
+            ],
+        ),
+        (
+            json!({"headers": {"'MESH_DIAG_KEY": {"prefix": ""}}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.headers`",
+                "`prefix`",
+                "must not be empty",
+            ],
+        ),
+        (
+            json!({"methods": [{"regex": "[MESH_DIAG_PATTERN"}]}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.methods[0].regex`",
+                "invalid regex",
+            ],
+        ),
+        (
+            json!({"authority": {"regex": "[MESH_DIAG_PATTERN"}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.authority.regex`",
+                "invalid or too complex",
+            ],
+        ),
+        (
+            json!({"uri": {"regex": "[MESH_DIAG_PATTERN"}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.uri.regex`",
+                "invalid or too complex",
+            ],
+        ),
+        (
+            json!({"methods": ["GET"], "ignore_uri_case": true}),
+            vec![
+                "`mesh_route_dispatch.rules[0].match.ignore_uri_case`",
+                "requires a uri predicate",
+            ],
+        ),
+    ];
+    for (match_config, expected) in cases {
+        assert_rendered_route_diagnostic(
+            json!({"rules": [{
+                "match": match_config,
+                "destination": {"upstream_id": "MESH_DIAG_UPSTREAM"}
+            }]}),
+            &expected,
+        );
+    }
+}
+
+#[test]
+fn mesh_route_rendered_action_errors_keep_fields_bounds_and_fixed_suggestions() {
+    let cases = [
+        (
+            json!({"fault": {}}),
+            vec!["`mesh_route_dispatch.rules[0].fault`", "`delay` or `abort`"],
+        ),
+        (
+            json!({"rewrite": {}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].rewrite`",
+                "`uri` or `authority`",
+            ],
+        ),
+        (
+            json!({"fault": {"delay": {"duration_ms": 8675309, "percentage": 100}}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].fault.delay.duration_ms`",
+                "<= 60000",
+                "<redacted scalar>",
+            ],
+        ),
+        (
+            json!({"fault": {"abort": {"percentage": 8675309, "status_code": 503}}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].fault.abort.percentage`",
+                "[0.0, 100.0]",
+                "<redacted scalar>",
+            ],
+        ),
+        (
+            json!({"redirect": {"scheme": "'MESH_DIAG_SCHEME\"\\`"}}),
+            vec![
+                "`mesh_route_dispatch.rules[0].redirect.scheme`",
+                "`http` or `https`",
+            ],
+        ),
+    ];
+    for (mut rule, expected) in cases {
+        rule["match"] = json!({"methods": ["GET"]});
+        rule["destination"] = json!({"upstream_id": "MESH_DIAG_UPSTREAM"});
+        assert_rendered_route_diagnostic(json!({"rules": [rule]}), &expected);
+    }
+}

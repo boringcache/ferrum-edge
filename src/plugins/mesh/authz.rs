@@ -602,7 +602,7 @@ fn parse_node_waypoint_route_upstreams(
             NodeWaypointRouteUpstreamConfig,
         >(value.clone())
         .map(|upstreams| (true, upstreams))
-        .map_err(|error| format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")),
+        .map_err(|error| format!("mesh_authz: invalid `node_waypoint_route_upstreams`: {error}")),
         None => Ok((false, Vec::new())),
     }
 }
@@ -1633,7 +1633,7 @@ impl MeshAuthz {
             Value::Null => {}
             _ => {
                 return Err(
-                    "mesh_authz: config must be a JSON object; a scalar or array root would \
+                    "mesh_authz: `config` must be a JSON object; a scalar or array root would \
                      silently build a policy-free instance that allows every request"
                         .to_string(),
                 );
@@ -1655,11 +1655,11 @@ impl MeshAuthz {
             crate::util::deserialization::from_json_value::<
                 crate::util::json_object::JsonObject<MeshSlice>,
             >(value.clone())
-            .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
+            .map_err(|e| format!("mesh_authz: invalid `mesh_slice`: {e}"))?
             .0
         } else if let Some(value) = config.get("mesh_policies") {
             let mesh_policies = crate::util::json_object::from_json_object_vec_value(value.clone())
-                .map_err(|e| format!("mesh_authz: invalid mesh_policies: {e}"))?;
+                .map_err(|e| format!("mesh_authz: invalid `mesh_policies`: {e}"))?;
             MeshSlice {
                 mesh_policies,
                 ..MeshSlice::default()
@@ -1682,12 +1682,15 @@ impl MeshAuthz {
         if let Some(value) = config.get("namespace") {
             let namespace = value
                 .as_str()
-                .ok_or_else(|| "mesh_authz: namespace must be a string".to_string())?;
+                .ok_or_else(|| "mesh_authz: `namespace` must be a string".to_string())?;
             slice.namespace = namespace.to_string();
         }
         if let Some(value) = config.get("labels") {
             let labels = serde_json::from_value::<BTreeMap<String, String>>(value.clone())
-                .map_err(|e| format!("mesh_authz: invalid labels: {e}"))?;
+                .map_err(|_| {
+                    "mesh_authz: invalid `labels`: expected an object with string values"
+                        .to_string()
+                })?;
             slice.labels = labels;
             // An explicit `labels` override is the DP resolving its AUTHORITATIVE
             // identity (the documented way to pin a workload's labels — see
@@ -1851,7 +1854,7 @@ impl MeshAuthz {
         if policy_set_is_one_workload && workload_providers.len() > 1 {
             return Err(
                 "mesh_authz: this workload is selected by CUSTOM AuthorizationPolicies naming \
-                 more than one meshConfig.extensionProviders entry; Istio permits at most one \
+                 more than one `meshConfig.extensionProviders` entry; Istio permits at most one \
                  external authorization provider per workload"
                     .to_string(),
             );
@@ -2546,7 +2549,7 @@ fn validate_waypoint_target_ref_evidence(slice: &MeshSlice) -> Result<(), String
     match offender {
         Some(policy) => Err(format!(
             "mesh_authz: waypoint slice carries an enforcing GatewayClass-targeted policy \
-             '{}/{}' but no authoritative waypoint gateway class; refusing the slice rather \
+             {:?}/{:?} but no authoritative waypoint gateway class (`waypoint_gateway_class`); refusing the slice rather \
              than dropping the policy into allow-by-default",
             policy.namespace, policy.name
         )),
@@ -2590,7 +2593,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
             PolicyScope::Namespace { .. } => {
                 if !has_proxy_namespace {
                     return Err(format!(
-                        "mesh_authz: policy '{}' uses namespace scope but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                        "mesh_authz: policy {:?} uses namespace scope but no proxy namespace is configured; set `mesh_slice.namespace` or `namespace`",
                         policy.name
                     ));
                 }
@@ -2606,7 +2609,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                 if let Some(selector_namespace) = selector.namespace.as_ref() {
                     if !has_proxy_namespace {
                         return Err(format!(
-                            "mesh_authz: policy '{}' uses workload selector namespace '{}' but no proxy namespace is configured; set mesh_slice.namespace or namespace",
+                            "mesh_authz: policy {:?} uses workload selector namespace {:?} but no proxy namespace is configured; set `mesh_slice.namespace` or `namespace`",
                             policy.name, selector_namespace
                         ));
                     }
@@ -2636,7 +2639,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                         // exemption, consistent with the slice-path branches and
                         // the per-pod missing-scope `has_scoped_policies` check).
                         return Err(format!(
-                            "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
+                            "mesh_authz: policy {:?} uses a workload selector with labels {:?} but \
                              no proxy labels are configured; set `labels` so the policy can be \
                              scoped to this workload",
                             policy.name, selector.labels
@@ -2669,9 +2672,9 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                         // warn-and-tolerate path below, mirroring the per-pod
                         // missing-scope `has_scoped_policies` audit exemption.
                         return Err(format!(
-                            "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
+                            "mesh_authz: policy {:?} uses a workload selector with labels {:?} but \
                              the slice resolved no proxy labels for this ambiguous shared-SPIFFE \
-                             workload; set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS so the \
+                             workload; set `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` so the \
                              policy can be scoped to this workload",
                             policy.name, selector.labels
                         ));
@@ -2740,9 +2743,9 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // mirroring the per-pod missing-scope `has_scoped_policies` audit
                     // exemption.
                     return Err(format!(
-                        "mesh_authz: policy '{}' uses a workload selector with labels {:?} that the \
-                         ambiguous shared-SPIFFE slice's partial label intersection {:?} cannot \
-                         resolve; set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS so the policy \
+                        "mesh_authz: policy {:?} uses a workload selector with labels {:?} that the \
+                         ambiguous shared-SPIFFE slice cannot resolve from its partial label intersection {:?}; \
+                         set `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` so the policy \
                          can be scoped to this workload",
                         policy.name, selector.labels, slice.labels
                     ));
@@ -3977,8 +3980,8 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
         for (rule_idx, rule) in policy.rules.iter().enumerate() {
             if rule.when.len() > MAX_MESH_RULE_CONDITIONS {
                 return Err(format!(
-                    "mesh_authz: policy '{}'/{} rule {} has more than \
-                     {MAX_MESH_RULE_CONDITIONS} when conditions",
+                    "mesh_authz: policy {:?}/{:?} `rules[{}].when` has more than \
+                     {MAX_MESH_RULE_CONDITIONS} conditions",
                     policy.namespace, policy.name, rule_idx
                 ));
             }
@@ -3990,7 +3993,7 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
                     && let Some(issue) = issues.first()
                 {
                     return Err(format!(
-                        "mesh_authz: invalid condition in policy '{}'/{} rule {} when {} key '{}' {}: {}",
+                        "mesh_authz: invalid condition in policy {:?}/{:?} `rules[{}].when[{}]` key {:?} `{}`: {}",
                         policy.namespace,
                         policy.name,
                         rule_idx,
@@ -4019,7 +4022,7 @@ fn parse_scoping_flag(config: &Value, key: &str) -> Result<bool, String> {
     match config.get(key) {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("mesh_authz: {key} must be a boolean")),
+        Some(_) => Err(format!("mesh_authz: `{key}` must be a boolean")),
     }
 }
 
@@ -4028,15 +4031,17 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => items
             .iter()
-            .map(|item| {
-                let raw = item
-                    .as_str()
-                    .ok_or_else(|| "trust_domain_aliases entries must be strings".to_string())?;
-                TrustDomain::new(raw)
-                    .map_err(|e| format!("invalid trust_domain_aliases entry '{raw}': {e}"))
+            .enumerate()
+            .map(|(idx, item)| {
+                let raw = item.as_str().ok_or_else(|| {
+                    format!("`trust_domain_aliases[{idx}]` must be a string")
+                })?;
+                TrustDomain::new(raw).map_err(|_| {
+                    format!("`trust_domain_aliases[{idx}]` is not a valid trust domain")
+                })
             })
             .collect(),
-        Some(_) => Err("trust_domain_aliases must be an array of strings".to_string()),
+        Some(_) => Err("`trust_domain_aliases` must be an array of strings".to_string()),
     }
 }
 
@@ -4108,7 +4113,7 @@ pub(crate) fn parse_trusted_hbone_assertors(
         Some(Value::Array(items)) => items,
         Some(_) => {
             return Err(
-                "trusted_hbone_assertors must be an array of strings or objects".to_string(),
+                "`trusted_hbone_assertors` must be an array of strings or objects".to_string(),
             );
         }
     };
@@ -4119,7 +4124,11 @@ pub(crate) fn parse_trusted_hbone_assertors(
     // mesh_authz plugin active.
     items
         .iter()
-        .map(parse_trusted_hbone_assertor_entry)
+        .enumerate()
+        .map(|(idx, item)| {
+            parse_trusted_hbone_assertor_entry(item)
+                .map_err(|error| format!("`trusted_hbone_assertors[{idx}]`: {error}"))
+        })
         .collect::<Result<Vec<_>, _>>()
         .map(TrustedAssertorIndex::from_assertors)
 }
@@ -4139,7 +4148,7 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
             )?;
             let Some(raw) = map.get("assertor").and_then(Value::as_str) else {
                 return Err(
-                    "trusted_hbone_assertors object entries must carry a string 'assertor'"
+                    "`trusted_hbone_assertors` object entries must carry a string `assertor`"
                         .to_string(),
                 );
             };
@@ -4151,24 +4160,20 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                 (None, None) => AssertionGrant::SameNamespace,
                 (Some(_), Some(_)) => {
                     return Err(format!(
-                        "trusted_hbone_assertors entry '{trimmed}' must not set both 'asserts' and 'scope'"
+                        "`trusted_hbone_assertors` entry {trimmed:?} must not set both `asserts` and `scope`"
                     ));
                 }
                 (Some(Value::Array(ids)), None) => {
                     let mut set = HashSet::with_capacity(ids.len());
-                    for id in ids {
+                    for (idx, id) in ids.iter().enumerate() {
                         let Some(raw_id) = id.as_str() else {
-                            return Err(
-                                "trusted_hbone_assertors 'asserts' entries must be SPIFFE id \
-                                 strings"
-                                    .to_string(),
-                            );
+                            return Err(format!(
+                                "`asserts[{idx}]` must be a SPIFFE id string"
+                            ));
                         };
                         let raw_id = raw_id.trim();
-                        let parsed = SpiffeId::new(raw_id).map_err(|e| {
-                            format!(
-                                "invalid trusted_hbone_assertors 'asserts' SPIFFE id '{raw_id}': {e}"
-                            )
+                        let parsed = SpiffeId::new(raw_id).map_err(|_| {
+                            format!("`asserts[{idx}]` is not a valid SPIFFE id")
                         })?;
                         set.insert(parsed.as_str().to_string());
                     }
@@ -4176,7 +4181,7 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                 }
                 (Some(_), None) => {
                     return Err(format!(
-                        "trusted_hbone_assertors entry '{trimmed}' field 'asserts' must be an array of SPIFFE id strings"
+                        "`trusted_hbone_assertors` entry {trimmed:?} field `asserts` must be an array of SPIFFE id strings"
                     ));
                 }
                 (None, Some(Value::String(scope))) => match scope.trim() {
@@ -4184,8 +4189,8 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                     "mesh_wide" => {
                         if !matches!(&matcher, AssertorMatcher::Spiffe(_)) {
                             return Err(format!(
-                                "trusted_hbone_assertors entry '{trimmed}' scope 'mesh_wide' \
-                                 requires an exact 'spiffe://' assertor; bare service-account \
+                                "`trusted_hbone_assertors` entry {trimmed:?} scope `mesh_wide` \
+                                 requires an exact `spiffe://` assertor; bare service-account \
                                  matchers are namespace-blind"
                             ));
                         }
@@ -4200,39 +4205,39 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                     }
                     other => {
                         return Err(format!(
-                            "trusted_hbone_assertors entry '{trimmed}' has unknown scope '{other}' \
-                             (expected 'same_namespace' or 'mesh_wide')"
+                            "`trusted_hbone_assertors` entry {trimmed:?} has unknown `scope` {other:?} \
+                             (expected `same_namespace` or `mesh_wide`)"
                         ));
                     }
                 },
                 (None, Some(_)) => {
                     return Err(format!(
-                        "trusted_hbone_assertors entry '{trimmed}' field 'scope' must be a string"
+                        "`trusted_hbone_assertors` entry {trimmed:?} field `scope` must be a string"
                     ));
                 }
             };
             Ok(TrustedAssertor { matcher, grant })
         }
-        _ => Err("trusted_hbone_assertors entries must be strings or objects".to_string()),
+        _ => Err("`trusted_hbone_assertors` entries must be strings or objects".to_string()),
     }
 }
 
 fn parse_assertor_matcher(raw: &str) -> Result<AssertorMatcher, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("trusted_hbone_assertors entries must not be empty".to_string());
+        return Err("`trusted_hbone_assertors` entries must not be empty".to_string());
     }
     if trimmed.starts_with("spiffe://") {
         SpiffeId::new(trimmed)
             .map(AssertorMatcher::Spiffe)
-            .map_err(|e| format!("invalid trusted_hbone_assertors SPIFFE id '{trimmed}': {e}"))
+            .map_err(|_| "`trusted_hbone_assertors` contains an invalid SPIFFE id".to_string())
     } else {
         // Reject anything that looks like an attempted URI but isn't a SPIFFE
         // id (e.g. typo'd scheme) instead of silently treating it as a
         // service-account name.
         if trimmed.contains("://") {
             return Err(format!(
-                "trusted_hbone_assertors entry '{trimmed}' looks like a URI but is not a 'spiffe://' SPIFFE id"
+                "`trusted_hbone_assertors` entry {trimmed:?} looks like a URI but is not a `spiffe://` SPIFFE id"
             ));
         }
         Ok(AssertorMatcher::ServiceAccount(trimmed.to_string()))
