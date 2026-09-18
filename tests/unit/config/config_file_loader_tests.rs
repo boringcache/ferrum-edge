@@ -2698,7 +2698,7 @@ fn test_torn_trailing_plugin_configs_rejected_by_resource_counts() {
         "expected resource_counts diagnostic, got: {message}"
     );
     assert!(
-        message.contains("plugin_configs=2") && message.contains("plugin_configs=1"),
+        message.contains(r#"plugin_configs="2""#) && message.contains("plugin_configs=1"),
         "diagnostic should show declared vs observed plugin counts: {message}"
     );
 }

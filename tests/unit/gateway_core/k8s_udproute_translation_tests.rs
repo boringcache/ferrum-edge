@@ -250,7 +250,7 @@ fn udp_route_without_materialized_listener_opens_no_listener() {
 
     assert!(result.config.proxies.is_empty());
     assert!(result.warnings.iter().any(|warning| {
-        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+        warning.contains(r#"UDPRoute "default"/"dns" has no valid attached Gateway listener"#)
     }));
 }
 
@@ -305,7 +305,8 @@ fn udp_route_rejects_non_service_backend_kind() {
 
     let message = err.to_string();
     assert!(
-        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+        message
+            .contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
     );
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
@@ -578,7 +579,7 @@ fn udp_route_rejects_present_service_import_with_invalid_kind_status_parity() {
         .expect_err("UDPRoute must reject ServiceImport backends");
     let message = err.to_string();
     assert!(message.contains(
-        "unsupported backendRef target group 'multicluster.x-k8s.io' kind 'ServiceImport'"
+        r#"unsupported backendRef target group "multicluster.x-k8s.io" kind "ServiceImport""#
     ));
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 
@@ -653,7 +654,7 @@ fn udp_route_service_import_reference_grant_cannot_override_invalid_kind() {
         .expect_err("a ServiceImport grant must not authorize UDPRoute");
     let message = err.to_string();
     assert!(message.contains(
-        "unsupported backendRef target group 'multicluster.x-k8s.io' kind 'ServiceImport'"
+        r#"unsupported backendRef target group "multicluster.x-k8s.io" kind "ServiceImport""#
     ));
     assert!(!message.contains("ReferenceGrant"));
 
@@ -791,7 +792,7 @@ fn parentless_l4_routes_keep_the_backend_port_fallback() {
     let udp = translate_k8s_objects(&udp_objects, options()).expect("translation succeeds");
     assert!(udp.config.proxies.is_empty());
     assert!(udp.warnings.iter().any(|warning| {
-        warning.contains("UDPRoute default/dns has no valid attached Gateway listener")
+        warning.contains(r#"UDPRoute "default"/"dns" has no valid attached Gateway listener"#)
     }));
 
     let tcp_route = l4_route(
@@ -1153,7 +1154,8 @@ fn udp_route_unsupported_backend_kind_in_a_set_fails_the_whole_rule_closed() {
 
     let message = err.to_string();
     assert!(
-        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+        message
+            .contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
     );
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
@@ -1195,7 +1197,8 @@ fn udp_route_zero_weight_leg_still_has_its_target_kind_validated() {
 
     let message = err.to_string();
     assert!(
-        message.contains("unsupported backendRef target group 'example.com' kind 'DatagramSink'")
+        message
+            .contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
     );
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }

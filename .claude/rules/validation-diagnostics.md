@@ -64,8 +64,10 @@ paths:
   admission. Notification unknown-key failures retain the fixed `channels`
   schema context separately from supplied channel names and keys. Shared helper
   context that may contain document keys is Debug-escaped as a whole; callers
-  must supply a separate fixed
-  schema field when one is available. SQL literals, fixed migration/listener/fault labels,
+  must supply a separate fixed schema field when one is available. WAF
+  rule/signature ordinals and API-spec extension request/response/bypass paths
+  preserve this separate fixed context; supplied override IDs and extension
+  keys never enter the visible prefix. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
 - The constructor audit includes root/nested JSON object guards, file-mode
