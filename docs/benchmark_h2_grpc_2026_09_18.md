@@ -21,10 +21,15 @@ Raw artifacts on that run are named:
 - `gateways-protocol-bench-http2-d4d7b7c7110c48cf3945837cb0762e489f52a8f4`
 - `gateways-protocol-bench-grpcs-d4d7b7c7110c48cf3945837cb0762e489f52a8f4`
 
-Canonical samples are `run_1/pairs/pair_*/*.json`. Files at `run_1/*.json`
-duplicate the last pair and must not be counted again. Each sample has stderr
-and cumulative gateway/backend diagnostics; the artifacts also contain the
-actual route YAML, manifests, order balance, image identities and runner log.
+Canonical samples are `run_1/pairs/pair_*/*.json`. The root
+`run_1/<gateway>_<protocol>_<size>.json` files are four-pair aggregate summaries:
+they contain the canonical records in `samples`, summed request/error/byte/
+duration fields, aggregate rates and conservative per-sample latency maxima
+(with a request-weighted average latency). Some inherited metadata, including
+the root `h2_observation`, comes from the last sample. These summaries must not
+be counted as additional independent observations. Each canonical sample has
+stderr and cumulative gateway/backend diagnostics; the artifacts also contain
+the actual route YAML, manifests, order balance, image identities and runner log.
 
 Each protocol used four counterbalanced pairs, a repeated direct control,
 15-second measurement windows and 200 offered workers. H2 used 71,680 bytes;
@@ -35,6 +40,12 @@ successful requests. There were no reported phase/close timeouts, stalled
 workers, client/backend event suppression, capture errors or incomplete process
 CPU brackets in these 36 samples. Tonic's detached backend driver remains
 unobserved; an empty backend event list does not certify transport health.
+
+The campaign records contain no client gRPC reconnects. The subsequent observer
+repair makes failed/cancelled reconnects and socket retirement invalidate the
+current physical identity while retaining the channel ID. It does not change
+these measured failure counts or their existing connection attribution, and
+does not establish a throughput gain or a production transport fix.
 
 Both hosted VMs reported four visible CPUs, AMD EPYC 9V74, Microsoft hypervisor,
 15 GiB displayed memory and Ubuntu runner image `20260907.300.1`. The initial
