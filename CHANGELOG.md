@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Outbound registry enforcement now uses listener direction** (PR #5595).
+  Distinct inbound and outbound bind addresses could share a numeric port,
+  causing the port-only registry gate to enforce egress membership on an
+  inbound HBONE CONNECT. Every registry instance now skips the listener-stamped
+  Inbound direction before any lookup, metric, or rejection; outbound and
+  non-mesh listeners retain the existing port scope. The #5583 per-instance
+  reuse classification stands: scoped instances remain reusable, while
+  unscoped instances retain the fail-closed default for their non-mesh
+  enforcement. A blanket refusal would impose one CONNECT and inner connection
+  per operation, repeat gRPC's nested HTTP/2 handshake, and revoke live
+  advertised tunnels with `reuse_withdrawn` on REGISTRY_ONLY publication.
+  As defense in depth, mesh startup and `ferrum-edge validate` now reject any
+  planned inbound/outbound TCP listeners sharing a nonzero port number, even
+  on different addresses; UDP capture and port `0` are excluded. **Operators
+  relying on same-port-number inbound/outbound binds must choose distinct TCP
+  ports before restarting.** This follow-up corrects the port-separation
+  premise recorded in the original #5583 entry below; that historical entry
+  is preserved.
 - Bump the optional `cryptoki` dependency (feature `pkcs11`) from 0.12.0 to 0.12.1 for
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
@@ -292,12 +310,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RequestAuthentication` is in play (correct and permanent — the fence bounds
   the mTLS leaf, not a bearer token's own lifetime); `__mesh_bpf_metrics` is
   classified reusable (it implements no request hook at all); and
-  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) explicitly
-  refuses reuse. Its listener scope contains only numeric ports and can match an
-  HBONE listener when inbound and outbound listeners share a port on different
-  bind addresses. Because the fence does not re-run registry membership checks,
-  refusing reuse prevents a pooled inner connection from retaining access after
-  its destination is removed.
+  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) is
+  classified per INSTANCE, `!outbound_listen_ports.is_empty()`. It is injected
+  as a `PluginScope::Global` row and globals enter every proxy chain, so it is
+  in every inbound admitting chain; the outbound-port list gates the request
+  hook's ENFORCEMENT, not the plugin's membership. What keeps it out of the
+  CONNECT's decision is that its port gate is the first statement of the hook,
+  so a request on a port the instance does not name returns `Continue` before
+  any registry lookup, metric, or rejection — and auto-injection names exactly
+  the outbound-direction capture ports, while only an inbound listener
+  terminates an HBONE CONNECT. A blanket `false` would have withheld inbound
+  reuse mesh-wide on a REGISTRY_ONLY mesh and revoked every already-reusable
+  inbound tunnel when the policy was applied; a blanket `true` would have
+  granted reuse to an operator-managed UNSCOPED instance, which really does
+  enforce on the inbound listener, so that shape keeps the fail-closed default.
 - **A live HBONE tunnel loses inner reuse when its chain stops permitting it**
   (issue #5583). The admission snapshot records whether reuse was advertised —
   the same value the header was stamped from — and every admission-fence sweep
