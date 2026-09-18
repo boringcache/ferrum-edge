@@ -330,7 +330,7 @@ async fn test_http_logging_rejects_invalid_header_name() {
     );
     match result {
         Err(e) => assert!(
-            e.contains("invalid custom_headers name"),
+            e.contains("invalid `custom_headers` name"),
             "Expected header name validation error, got: {e}"
         ),
         Ok(_) => panic!("Expected invalid header name to be rejected"),
@@ -351,7 +351,7 @@ async fn test_http_logging_rejects_invalid_header_value() {
     );
     match result {
         Err(e) => assert!(
-            e.contains("invalid custom_headers value"),
+            e.contains("invalid `custom_headers` value"),
             "Expected header value validation error, got: {e}"
         ),
         Ok(_) => panic!("Expected invalid header value to be rejected"),
