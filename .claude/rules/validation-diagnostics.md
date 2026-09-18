@@ -44,6 +44,10 @@ paths:
   Migration/backup version diagnostics omit values even before rendering.
   Regex-library errors can reproduce patterns bare: replace them with the
   field/index and a fixed rejection reason.
+- Plugin cache construction/composition, optional omission, startup and reload
+  emissions quote supplied identities/priorities and sanitize before tracing.
+  Captured-log regressions cover global, proxy and proxy-group rejection paths;
+  constructor causes still depend on the producer convention above.
 - Known converted sites: mesh config validators (services/cluster IPs, workload
   identities, hosts, policy/targetRefs names, CIDRs, ext-authz and JWT headers,
   trust bundles, remote clusters/gateways); CORS origin/method/header checks;

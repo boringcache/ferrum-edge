@@ -3364,7 +3364,8 @@ async fn batch_admission_rejects_equal_effective_correlation_priorities() {
         "equal correlation priorities were admitted: {body}"
     );
     assert!(
-        body.to_string().contains("duplicate effective priority 50"),
+        body.to_string()
+            .contains(r#"duplicate effective priority \"50\""#),
         "unexpected correlation-priority admission response: {body}"
     );
 }

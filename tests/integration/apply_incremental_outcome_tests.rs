@@ -1795,7 +1795,7 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
         panic!("equal effective correlation priorities must reject reload");
     };
     assert!(errors.iter().any(|error| {
-        error.contains("correlation_id") && error.contains("duplicate effective priority 40")
+        error.contains("correlation_id") && error.contains("duplicate effective priority \"40\"")
     }));
     assert_eq!(
         state.config.load().plugin_configs[0].priority_override,
