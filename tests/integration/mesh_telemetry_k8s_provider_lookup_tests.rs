@@ -970,7 +970,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "OTLP: 'endpoint' must be a valid URL",
+            "OTLP: `endpoint` must be a valid URL",
         ),
     ];
 
