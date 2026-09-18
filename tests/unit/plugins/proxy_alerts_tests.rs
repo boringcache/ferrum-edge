@@ -2741,7 +2741,10 @@ fn startup_diagnostics_preserve_alert_paths_and_withhold_document_values() {
     config["rules"][0]["threshold_percent"] = json!(987654321);
     let error = ProxyAlerts::new(&config, http_client()).unwrap_err();
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-    assert!(rendered.contains("`threshold_percent` must be in"), "{rendered}");
+    assert!(
+        rendered.contains("`threshold_percent` must be in"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
     assert!(!rendered.contains("987654321"), "{rendered}");
 }

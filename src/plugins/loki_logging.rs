@@ -403,9 +403,9 @@ impl LokiLogging {
                 .ok_or_else(|| "loki_logging: `labels` must be an object".to_string())?;
             for (key, value) in labels_obj {
                 validate_loki_label_name(key)?;
-                let label = value
-                    .as_str()
-                    .ok_or_else(|| format!("loki_logging: `labels` key {key:?} must be a string"))?;
+                let label = value.as_str().ok_or_else(|| {
+                    format!("loki_logging: `labels` key {key:?} must be a string")
+                })?;
                 if label.chars().count() > LOKI_MAX_LABEL_VALUE_CHARS {
                     return Err(format!(
                         "loki_logging: `labels` key {key:?} must be at most {LOKI_MAX_LABEL_VALUE_CHARS} characters"
@@ -435,7 +435,8 @@ impl LokiLogging {
         let authorization_header = match optional_non_empty_string(config, "authorization_header")?
         {
             Some(value) => Some(HeaderValue::from_str(&value).map_err(|_| {
-                "loki_logging: invalid `authorization_header`: invalid HTTP header value".to_string()
+                "loki_logging: invalid `authorization_header`: invalid HTTP header value"
+                    .to_string()
             })?),
             None => None,
         };
