@@ -44,7 +44,7 @@ seccomp/sysctl/memlock evidence accompany every completed capability attempt.
 Hosted-only driver, after the workflow's compile commands:
 
 ```sh
-sudo --preserve-env=GITHUB_ACTIONS,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
   python3 tests/performance/multi_protocol/h3_proof/hosted.py \
   --suite capability-v1 --output "$RUNNER_TEMP/h3-proof"
 ```
@@ -52,6 +52,41 @@ sudo --preserve-env=GITHUB_ACTIONS,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GI
 Never run these commands locally under this assignment. No hosted result is
 asserted by committing this implementation. Root must inspect exact-head CI
 and artifacts before relying on any capability.
+
+The driver requires `GITHUB_ACTIONS=true`, `RUNNER_ENVIRONMENT=github-hosted`,
+Linux/X64 runner metadata and the native Linux x86_64 platform. Sudo preserves
+the hosted-environment variable, and the nested driver checks it again.
+`commands.sh` lists every process command explicitly. Python invokes that fixed
+repository-relative shell path with literal argv and passes command-specific
+inputs as named environment data, validated against finite choices or data formats.
+There is no computed executable, forwarded argv, evaluated shell text or policy
+exemption. Command records retain the launcher argv, action, data and working
+directory alongside output, truncation, return code and timing.
+The initial head's [trusted policy job](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35402162742/job/105784199719)
+rejected `hosted.py` for an opaque process command. The policy's Python reader
+requires literal argv elements (apart from its unrelated, exact Git-diff
+exception); it does not infer a bound from callers of a generic argv wrapper.
+Both Python process sites now expose the shell file for normal source scanning.
+
+Before isolation, the privileged driver creates a fresh root-owned
+`/tmp/ferrum-h3-proof` tree. It retains the same repository-relative script paths
+and installs the compiled observer/PMU at fixed absolute paths. Directories are
+0755, source/object files 0644 and binaries 0755; UID 65534 can read/execute them
+but cannot modify them. Existing staging paths are rejected. Staged source and
+object hashes must equal their checkout/build counterparts, and both inventories
+are retained. The disposable runner owns cleanup; checkout permissions are not
+changed. This also avoids traversing private runner checkout ancestors after
+dropping privilege.
+
+The first hosted attempt at `ee7a0cc3`
+([job 105784199368](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35402162913/job/105784199368))
+compiled all three C outputs and passed the evidence tests, then failed at runtime:
+the fixture's absolute checkout path returned `EACCES`, and TX/RX CO-RE loading
+failed on `sock.sk_cookie.counter`. Staging repairs fixture access; the cookie
+declaration/read now names `__sk_common.skc_cookie.counter`, the actual member
+behind [Linux's `sk_cookie` macro](https://github.com/torvalds/linux/blob/v6.17/include/net/sock.h).
+The same run lacked `run_bpf_filter` in BTF, which remains explicitly unsupported.
+These repairs still require fresh hosted policy, compile and runtime validation.
 
 ## What the probes establish
 

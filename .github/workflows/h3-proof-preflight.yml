@@ -68,6 +68,7 @@ jobs:
       - name: Static syntax and evidence contract self-tests
         run: |
           set -euo pipefail
+          bash -n tests/performance/multi_protocol/h3_proof/commands.sh
           python3 -m py_compile tests/performance/multi_protocol/h3_proof/*.py
           python3 -m unittest discover -v -s tests/performance/multi_protocol/h3_proof \
             -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/h3-proof/contract-tests.log"
@@ -75,7 +76,7 @@ jobs:
       - name: Capability probes and real isolated fixtures
         run: |
           set -euo pipefail
-          sudo --preserve-env=GITHUB_ACTIONS,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
             python3 tests/performance/multi_protocol/h3_proof/hosted.py \
             --suite capability-v1 --output "$RUNNER_TEMP/h3-proof" \
             2>&1 | tee "$RUNNER_TEMP/h3-proof/driver.log"

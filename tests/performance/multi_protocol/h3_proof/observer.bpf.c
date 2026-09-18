@@ -37,7 +37,8 @@ static __always_inline __u64 identity(struct sock *sk)
         loss(READ_FAILED); return 0;
     }
     if (ns != c->netns) return 0;
-    if (BPF_CORE_READ_INTO(&cookie, sk, sk_cookie.counter)) {
+    // sk_cookie is a kernel C macro, not a BTF member of struct sock.
+    if (BPF_CORE_READ_INTO(&cookie, sk, __sk_common.skc_cookie.counter)) {
         loss(READ_FAILED); return 0;
     }
     // SO_COOKIE in the fixture assigns it before any traffic. Never join zero.
