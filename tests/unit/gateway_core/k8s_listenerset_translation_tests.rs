@@ -900,7 +900,9 @@ fn duplicate_gateway_listener_section_fails_closed() {
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
     assert!(translation.warnings.iter().any(|warning| {
-        warning.contains(r#"Gateway "default"/"edge" listener "b-duplicate" rejected: HostnameConflict"#)
+        warning.contains(
+            r#"Gateway "default"/"edge" listener "b-duplicate" rejected: HostnameConflict"#,
+        )
     }));
     let duplicate_key = GatewayApiListenerKey {
         namespace: "default".to_string(),
@@ -981,7 +983,7 @@ fn incompatible_gateway_listener_protocol_fails_closed() {
         assert_eq!(conflict.reason, "ProtocolConflict");
         assert_eq!(
             conflict.message,
-            "Port 80 is claimed by incompatible protocol families on the same TCP \
+            "Port \"80\" is claimed by incompatible protocol families on the same TCP \
              transport (HTTP-family vs raw stream), so every conflicting claim on this \
              port is refused (Conflicted)."
         );
@@ -1046,7 +1048,7 @@ fn three_claim_http_tcp_http_protocol_conflict_is_order_independent() {
             assert!(
                 translation.warnings.iter().any(|warning| {
                     warning.contains(&format!(
-                        "Gateway default/edge listener {name} rejected: ProtocolConflict"
+                        r#"Gateway "default"/"edge" listener {name:?} rejected: ProtocolConflict"#
                     ))
                 }),
                 "order {:?} warnings must refuse {name}: {:?}",
@@ -1280,7 +1282,8 @@ fn udp_coexists_when_http_and_tcp_protocol_conflict_on_same_port() {
     );
     assert!(
         !translation.warnings.iter().any(|warning| {
-            warning.contains("Gateway default/edge listener udp rejected: ProtocolConflict")
+            warning
+                .contains(r#"Gateway "default"/"edge" listener "udp" rejected: ProtocolConflict"#)
         }),
         "UDP must not receive ProtocolConflict warnings: {:?}",
         translation.warnings

@@ -499,7 +499,7 @@ async fn test_tcp_logging_rejects_unknown_keys_with_suggestion() {
     assert!(
         err.contains("unknown configuration key")
             && err.contains("tlls")
-            && err.contains("did you mean 'tls'?"),
+            && err.contains("did you mean `tls`?"),
         "got: {err}"
     );
 }
