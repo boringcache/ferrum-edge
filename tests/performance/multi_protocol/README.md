@@ -980,3 +980,16 @@ The JSON output breaks connect failures into `refused / timeout / reset / tls_er
 - **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.
 - **Heartbeat is intentionally low-rate** (default 1 req/sec/conn). The point is to test connection capacity, not RPS — a high heartbeat rate would conflate the two and give a different (RPS-bound) breaking point.
 - **Connect attempts are spread over `--ramp-seconds`** so the *client* doesn't SYN-flood itself. With N=50K and ramp=30s that's ~1666 connects/sec, well within typical client capacity given proper ulimit.
+
+### Separate H2/native-gRPC acquisition profile lane (#5588)
+
+The default-off `bench-pool-profile` feature and new manual
+`pool-internal-profile.yml` workflow observe sampled pool acquisition polls,
+allocator requests, RR groups, probes/readiness, cloning and coalesced creation.
+See [the coverage and campaign contract](../../../docs/pool_internal_profile.md).
+Use the separate `--pool-profile calibration|profile` selector; ordinary
+`experiment.json` stays disabled. Four same-host pairs and direct controls cover
+both protocols at 10/70/500 KiB and 1/5 MiB with fixed adaptive=false. The report
+retains failed/missing observations and distinguishes useful traffic from profile
+completeness. CPU stacks, hardware cache evidence and downstream stream-credit
+wait remain unavailable; correctness disposition and dispatch belong to root.

@@ -21,6 +21,7 @@
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
+#   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
 #   --h1-profile calibration|cutoff (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
@@ -69,6 +70,7 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
+POOL_PROFILE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -85,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
+        --pool-profile) POOL_PROFILE="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -123,6 +126,15 @@ if [ -n "$H1_PROFILE" ]; then
     [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
 fi
 
+# Independent fixed-policy pool lane; ordinary experiment.json stays disabled.
+if [ -n "$POOL_PROFILE" ]; then
+    [ -z "$H1_PROFILE" ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+    python3 "$SCRIPT_DIR/pool_internal_profile.py" validate-selection \
+        "$POOL_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
+        "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
+    H2_OBSERVE=1
+fi
+
 # UDP protocols are fixed to 1 KB regardless of caller.
 case "$PROTOCOL" in
     udp|udp-dtls) PAYLOAD_SIZES="1024" ;;
@@ -139,6 +151,7 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 # A committed data manifest is the experiment input to the frozen hosted job.
 H3_BUDGET=0
 GATEWAY_LOG_LEVEL=error
+if [ -n "$POOL_PROFILE" ]; then GATEWAY_LOG_LEVEL=warn,ferrum_h2_observe=debug; fi
 if [ "$PROTOCOL" = http3 ]; then
     H3_BUDGET=$(python3 "$SCRIPT_DIR/h3_experiment.py" settings \
         "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}")
@@ -349,8 +362,13 @@ start_ferrum() {
     if [ "$H2_OBSERVE" -eq 1 ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         config_file="$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
-        python3 "$SCRIPT_DIR/experiment_arms.py" materialize "$EXPERIMENT_MANIFEST" \
-            "$PROTOCOL" "$gw" "$config_src" "$config_file" "$root_output/manifest.json" || return 2
+        if [ -n "$POOL_PROFILE" ]; then
+            python3 "$SCRIPT_DIR/pool_internal_profile.py" materialize \
+                "$PROTOCOL" "$gw" "$config_src" "$config_file" "$root_output/manifest.json" || return 2
+        else
+            python3 "$SCRIPT_DIR/experiment_arms.py" materialize "$EXPERIMENT_MANIFEST" \
+                "$PROTOCOL" "$gw" "$config_src" "$config_file" "$root_output/manifest.json" || return 2
+        fi
     fi
     echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_src")..."
 
@@ -378,6 +396,12 @@ start_ferrum() {
         if [ "$gw" = ferrum-exp-cutoff-one ]; then
             extra_env+=(-e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1)
         fi
+    fi
+    if [ -n "$POOL_PROFILE" ]; then
+        extra_env+=(-e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1
+                    -e FERRUM_ADMIN_HTTP_PORT=9000
+                    -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32
+                    -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false)
     fi
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
@@ -417,7 +441,11 @@ start_ferrum() {
         "${extra_env[@]}" \
         "$FERRUM_IMAGE")
 
-    if [ "$H2_OBSERVE" -eq 1 ]; then
+    if [ -n "$POOL_PROFILE" ]; then
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/pool_internal_profile.py" runtime \
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" || return 2
+    elif [ "$H2_OBSERVE" -eq 1 ]; then
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/experiment_arms.py" verify-runtime \
                 "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw" "$root_output/manifest.json" || return 2
@@ -863,6 +891,11 @@ run_bench() {
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
     fi
+    if [ -n "$POOL_PROFILE" ] && [ "$target" = gateway ]; then
+        if [ "$POOL_PROFILE" != calibration ] || [ "$gateway" != ferrum-baseline ]; then
+            sampler_args+=(--pool-profile)
+        fi
+    fi
     if [ "$PROTOCOL" = http3 ] && [ "$H3_BUDGET" -ne 0 ]; then
         sampler_args+=(--http3)
         case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
@@ -1005,7 +1038,7 @@ main() {
     if [ "$H1_PROFILE" = cutoff ]; then
         expected_gateways+=" ferrum-exp-cutoff-one"
     fi
-    if [ -z "$H1_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
+    if [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
         EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
             "$EXPERIMENT_MANIFEST" "$PROTOCOL")
         if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
@@ -1054,6 +1087,10 @@ PYEOF
     if [ -n "$H1_PROFILE" ]; then
         cp "$SCRIPT_DIR/h1_profile_manifest.json" "$root_output/h1_profile_manifest.json"
         cp "$SCRIPT_DIR/h1_profile_schema.json" "$root_output/h1_profile_schema.json"
+    fi
+    if [ -n "$POOL_PROFILE" ]; then
+        cp "$SCRIPT_DIR/pool_profile_manifest.json" "$root_output/pool_profile_manifest.json"
+        cp "$SCRIPT_DIR/pool_profile_schema.json" "$root_output/pool_profile_schema.json"
     fi
     build_binaries
     # Save immutable image IDs as well as operator-supplied tags for revision A/B.

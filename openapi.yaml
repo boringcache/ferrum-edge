@@ -1874,6 +1874,18 @@ paths:
         `ferrum_h1_profile_*` counters and completeness metadata. These are bounded
         Rust allocator, source-copy, body-poll and frontend AsyncWrite observations;
         they do not report native allocation traffic or actual syscall counts.
+        Default-off `bench-pool-profile` builds retain that H1 contract and add
+        fixed `ferrum_pool_profile_*` integer fields (schema 1, sample_every 64).
+        Family (h2/grpc), purpose (request/capability), phase and outcome are
+        bounded source-defined dimensions encoded in field names, without labels.
+        Counters report sampled synchronous execution/allocator requests, total
+        acquisition wall time, readiness outcomes, clones and creation/coalescing.
+        Elapsed poll time is not CPU time or downstream stream-credit wait.
+        PID, slot capacity/registration, missing slots, unpublished tails, loss
+        and allocator/counter overflow accompany them. Missing or incomplete
+        observations must not be treated as zero. The complete fixed field list
+        is `tests/performance/multi_protocol/pool_profile_schema.json`; coverage
+        and observer-cost limitations are documented in `docs/pool_internal_profile.md`.
         Returns gateway metrics in Prometheus exposition format. **Gated by
         default**: the caller must present a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originate from a

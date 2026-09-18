@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "issue": 5588,
+  "dependencies": [
+    5602,
+    5614
+  ],
+  "protocols": [
+    "http2",
+    "grpcs"
+  ],
+  "pairs": 4,
+  "duration": 15,
+  "offered_workers": 200,
+  "payload_sizes": [
+    10240,
+    71680,
+    512000,
+    1048576,
+    5242880
+  ],
+  "scaled_workers": [
+    200,
+    200,
+    200,
+    100,
+    50
+  ],
+  "campaigns": {
+    "calibration": {
+      "ferrum": "H1 plus pool observer",
+      "ferrum-baseline": "H1 observer only"
+    },
+    "profile": {
+      "ferrum": "pool observer repetition A",
+      "ferrum-baseline": "same image repetition B"
+    }
+  },
+  "adaptive_window": false,
+  "correctness_disposition": "pending root; PR5602 adaptive70KiB failures remain; PR5613 owns diagnosis",
+  "cpu_stacks": "not collected",
+  "direct": "every pair",
+  "wallclock_budget_seconds_per_campaign": 3600
+}

@@ -357,6 +357,8 @@ aya-log = { version = "0.2", optional = true }
 default = ["crypto-ring"]
 # Hosted measurement only; no production policy or allocator substitution.
 bench-h1-profile = []
+# Separate pool schema; reuse the existing allocator without changing H1 counters.
+bench-pool-profile = ["bench-h1-profile"]
 
 # ── Cryptographic backend (mutually exclusive) ─────────────────────────────
 #
