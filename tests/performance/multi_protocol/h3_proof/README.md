@@ -7,6 +7,10 @@ gateway behavior nor closes #5588. Dependency PR #5602 and the existing H3 1.33.
 observations retain their original limits. Shared harness and production files
 are deliberately outside this directory's integration contract.
 
+The first repaired run's [retained capability results](../../../../docs/benchmark_h3_preflight_2026_09_18.md)
+show positive fixture GSO/GRO evidence and explicit partial/unsupported paths.
+They do not establish gateway behavior.
+
 ## Hosted registration and root commands
 
 `.github/workflows/h3-proof-preflight.yml` registers **H3 observer compile and
@@ -86,7 +90,8 @@ failed on `sock.sk_cookie.counter`. Staging repairs fixture access; the cookie
 declaration/read now names `__sk_common.skc_cookie.counter`, the actual member
 behind [Linux's `sk_cookie` macro](https://github.com/torvalds/linux/blob/v6.17/include/net/sock.h).
 The same run lacked `run_bpf_filter` in BTF, which remains explicitly unsupported.
-These repairs still require fresh hosted policy, compile and runtime validation.
+The repaired capability lane passed at `16a981d5`; its results are retained in
+the report above. Final integration still requires all exact-head hosted gates.
 
 ## What the probes establish
 
