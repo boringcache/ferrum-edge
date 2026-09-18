@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "name": "5588-h1-cutoff-zero-versus-one",
   "protocol": "http1-tls",
   "arms": [

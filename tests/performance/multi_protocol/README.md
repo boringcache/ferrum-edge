@@ -332,6 +332,15 @@ comparisons; the exact experiment manifest is copied into the run artifact.
 Disable the manifest after an experiment so later default runs do not silently
 acquire extra arms.
 
+The committed cutoff manifest is disabled after its completed hosted run.
+See [audit section 4](../../../docs/benchmark_audit_2026_09_17.md#section-4--same-image-http11-framing-experiment)
+for the measured revision, retained raw observations and inconclusive intervals.
+Commit `enabled: true` before repeating that scope. The combined aggregate
+accepts the download action's flat single-protocol layout and displays every
+declared arm; ambiguous flat downloads fail instead of guessing a protocol.
+The frozen per-protocol workflow summary still lists only built-in gateways;
+use the raw paired files and combined aggregate for extra experiment arms.
+
 The cutoff experiment compares `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` against
 `1` at 10240, 71680, 512000, 1048576 and 5242880 bytes. A scoped hosted dispatch
 uses duration 30, concurrency 200, iterations 1, skips `envoy kong tyk krakend`
@@ -414,7 +423,8 @@ quantiles are the maximum per-sample quantiles, explicitly labelled, because
 quantiles cannot be pooled without histograms. All constituent observations are
 validated. The rolling regression evaluator restarts its window when
 `protocol_perf_budgets.json.workload_revision` changes, excluding missing/older
-markers; this revision is `2026-09-18.phased-bounded-echo.v1`. The historical
+markers; this revision is `2026-09-18.phased-h1-profile.v2` because H1 client
+frame/header/TLS observations change measurement overhead. The historical
 H1 paired-ratio reference remains unchanged. The
 combined artifact also contains flattened `observed-samples.json` and
 `paired-comparisons.json`; use those or the raw samples for analysis. The frozen
