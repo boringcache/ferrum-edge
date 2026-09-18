@@ -62,7 +62,10 @@ paths:
   annotation overrides; shared unknown-key suggestions, rate-window/request/frame
   bounds, and socket-host/egress errors. Shared helper context that may contain
   document keys is Debug-escaped as a whole; callers must supply a separate fixed
-  schema field when one is available. SQL literals, fixed migration/listener/fault labels,
+  schema field when one is available. WAF rule/signature ordinals and API-spec
+  extension request/response/bypass paths preserve this separate fixed context;
+  supplied override IDs and extension keys never enter the visible prefix.
+  SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
 - The constructor audit includes root/nested JSON object guards, file-mode
