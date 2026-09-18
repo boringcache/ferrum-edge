@@ -74,6 +74,13 @@ fn response(s: &mut Streams<Bytes, client::Peer>) -> StreamRef<Bytes> {
     let (mut stream, _) = s
         .send_request(Request::builder().uri("https://fixture.invalid/").body(()).unwrap(), true, None)
         .unwrap();
+    // send_request only queues opening HEADERS. Drive the real prioritizer and
+    // codec before receiving a response; an unflushed stream is still idle.
+    let (io, _peer) = tokio::io::duplex(4096);
+    let mut codec = Codec::new(io);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(s.poll_complete(&mut cx, &mut codec), Poll::Ready(Ok(()))));
     let headers = frame::Headers::new(
         stream.stream_id(),
         frame::Pseudo::response(http::StatusCode::OK),
