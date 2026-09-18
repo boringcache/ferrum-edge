@@ -4474,7 +4474,10 @@ async fn functional_cli_plaintext_basic_auth_withholds_consumer_ids() {
     // Consumer ids must start alphanumeric and contain only [A-Za-z0-9._-], so a
     // quote-bearing id is refused by ID validation before the Basic-auth check;
     // the id itself must still be withheld from the rendered rejection.
-    for token in ["UNREGISTERED_CONSUMER_5589", "UNREGISTERED-CONSUMER.5589_tail"] {
+    for token in [
+        "UNREGISTERED_CONSUMER_5589",
+        "UNREGISTERED-CONSUMER.5589_tail",
+    ] {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("consumer.json");
         let document = serde_json::json!({
