@@ -478,6 +478,7 @@ jobs:
           data = {}
           samples = {}
           latest = {}
+          unknown_plan_protocols = set()
 
           for proto_artifact in sorted(root.iterdir()):
               if not proto_artifact.is_dir(): continue
@@ -490,7 +491,11 @@ jobs:
               if len(parts) < 5: continue
               protocol = "-".join(parts[3:-1])
               for run_dir in sorted(proto_artifact.glob("run_*")):
-                  for key in expected_rows(run_dir):
+                  planned_rows = expected_rows(run_dir)
+                  if planned_rows is None:
+                      unknown_plan_protocols.add(protocol)
+                      planned_rows = []
+                  for key in planned_rows:
                       samples.setdefault(protocol, {}).setdefault(key, [])
                       data.setdefault(protocol, {}).setdefault(key, [])
                   for f in sorted(run_dir.glob(f"*_{protocol}_*.json")):
@@ -525,6 +530,8 @@ jobs:
           tied = 0
           for proto, buckets in data.items():
               sizes = sorted({s for (_, s) in buckets})
+              if proto in unknown_plan_protocols:
+                  continue
               for s in sizes:
                   contenders = [(g, sum(buckets[(g, s)]) / len(buckets[(g, s)]))
                                 for g in ("ferrum", "envoy", "kong", "tyk", "krakend")
@@ -547,6 +554,12 @@ jobs:
                   scenarios += 1
 
           lines.append(f"**Validity:** {invalid} scenario(s) excluded for errors, zero work, bad byte accounting, or incomplete iterations; {tied} exact tie(s) excluded.\n")
+          if unknown_plan_protocols:
+              protocols = ", ".join(sorted(unknown_plan_protocols))
+              lines.append(
+                  f"**Unknown plan:** scoreboard ranking suppressed for {protocols} because "
+                  "a run manifest was missing or malformed; observed rows remain below for diagnosis.\n"
+              )
           lines.append("Raw throughput tables retain invalid observations for diagnosis; they are not error-free performance claims.\n")
           if scenarios:
               lines.append(f"## Scoreboard — gateway wins across {scenarios} head-to-head (protocol, payload) scenarios\n")

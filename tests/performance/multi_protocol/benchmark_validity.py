@@ -53,15 +53,21 @@ def throughput_value(sample):
 def expected_rows(run_directory):
     """New runs record the plan before startup, including gateways that fail.
 
-    A truncated or absent manifest degrades to the observed rows rather than
-    aborting the summary: the run that most needs diagnostics is the one whose
-    artifacts are incomplete.
+    Return ``None`` when the plan is unavailable so callers can retain observed
+    rows for diagnosis without treating them as a complete benchmark matrix.
     """
     manifest = run_directory / "manifest.json"
     try:
         plan = json.loads(manifest.read_text())
         gateways = plan["gateways"]
-        sizes = [int(size) for size in plan["payload_sizes"]]
+        sizes = plan["payload_sizes"]
+        if not isinstance(gateways, list) or not all(
+                isinstance(gateway, str) and gateway for gateway in gateways):
+            raise ValueError("invalid gateway plan")
+        if not isinstance(sizes, list) or not all(
+                isinstance(size, int) and not isinstance(size, bool) and size > 0
+                for size in sizes):
+            raise ValueError("invalid payload-size plan")
     except (OSError, ValueError, TypeError, KeyError):
-        return []  # Older or truncated artifacts can still be inspected.
+        return None
     return [(gateway, size) for gateway in gateways for size in sizes]
