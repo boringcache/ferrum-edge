@@ -15,6 +15,7 @@ from h2_diagnostics import parse_gauges
 from h2_guard_observation import FIELDS, annotate, parse_line
 from prepare import SHA256, extract_source, patch_source
 from verify import verify_campaign
+from lint import compare
 
 
 def row(**updates):
@@ -38,6 +39,38 @@ def usage():
 
 
 class GuardObservationTests(unittest.TestCase):
+    def test_lint_gate_rejects_new_changed_duplicate_and_incomplete_diagnostics(self):
+        warning = dict(reason="compiler-message", message=dict(
+            level="warning", code=dict(code="clippy::question_mark"), message="use ?",
+            spans=[dict(is_primary=True, file_name="src/upstream.rs", line_start=1,
+                        text=[dict(text="match existing {}")])]))
+        completed = dict(reason="build-finished", success=True)
+        with tempfile.TemporaryDirectory() as directory:
+            before, after = Path(directory) / "before", Path(directory) / "after"
+
+            def write(path, records):
+                path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+            write(before, [warning, completed])
+            shifted = copy.deepcopy(warning)
+            shifted["message"]["spans"][0]["line_start"] = 99
+            write(after, [shifted, completed])
+            self.assertEqual(compare(before, after)["new_diagnostics"], 0)
+            write(after, [completed])
+            self.assertEqual(compare(before, after)["new_diagnostics"], 0)
+            changed = copy.deepcopy(warning)
+            changed["message"]["spans"][0]["text"][0]["text"] = "match observation {}"
+            error = copy.deepcopy(warning)
+            error["message"]["level"] = "error"
+            unclassified = copy.deepcopy(warning)
+            unclassified["message"]["code"] = None
+            for records in ([changed, completed], [warning, warning, completed],
+                            [error, completed], [unclassified, completed], [warning],
+                            [dict(reason="build-finished", success=False)]):
+                write(after, records)
+                with self.assertRaises(ValueError):
+                    compare(before, after)
+
     def sample(self):
         return dict(gateway="ferrum", total_errors=361, phases=dict(
             setup_start_unix_secs=1789689600, setup_start_monotonic_secs=0,

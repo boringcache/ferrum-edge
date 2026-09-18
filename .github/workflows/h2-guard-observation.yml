@@ -47,6 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.19-observation"
+          upstream="$RUNNER_TEMP/h2-guard/upstream"
           evidence="$RUNNER_TEMP/h2-guard/evidence"
           rustc --version --verbose > "$evidence/rustc.txt"
           cargo --version --verbose > "$evidence/cargo.txt"
@@ -54,7 +55,13 @@ jobs:
           # source as well as the reviewed patch/preimage/postimage hashes.
           cargo fmt --manifest-path "$crate/Cargo.toml" --all
           cargo fmt --manifest-path "$crate/Cargo.toml" --all -- --check
-          cargo clippy --manifest-path "$crate/Cargo.toml" --locked --lib --tests -- -D warnings 2>&1 | tee "$evidence/clippy.log"
+          # New Clippy versions report warnings in this immutable dependency.
+          # Compare both complete same-toolchain builds; every new/changed
+          # diagnostic and every compiler error fails. No lint is suppressed.
+          cargo fmt --manifest-path "$upstream/Cargo.toml" --all
+          cargo clippy --manifest-path "$upstream/Cargo.toml" --locked --lib --tests --message-format=json > "$evidence/clippy-upstream.jsonl"
+          cargo clippy --manifest-path "$crate/Cargo.toml" --locked --lib --tests --message-format=json > "$evidence/clippy-observed.jsonl"
+          python3 tests/performance/multi_protocol/h2_guard/lint.py "$evidence/clippy-upstream.jsonl" "$evidence/clippy-observed.jsonl" > "$evidence/clippy-comparison.json"
           cargo test --manifest-path "$crate/Cargo.toml" --locked --lib guard_observation -- --nocapture 2>&1 | tee "$evidence/guard-tests.log"
           cargo test --manifest-path "$crate/Cargo.toml" --locked --lib data_frame_budget 2>&1 | tee "$evidence/upstream-budget-tests.log"
       - name: Check selected reqwest and native Hyper dependency chains

@@ -56,8 +56,8 @@ def patch_source(source, provenance):
     for name, hashes in provenance["files"].items():
         if sha((source / name).read_bytes()) != hashes["before"]:
             raise ValueError("h2 preimage mismatch: " + name)
-    subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i",
-                    str(ASSETS / "h2-0.4.19.patch")], cwd=source, check=True)
+    subprocess.run(["patch", "--batch", "--fuzz=0", "-p1"],
+                   input=patch, cwd=source, check=True)
     for name, hashes in provenance["files"].items():
         if sha((source / name).read_bytes()) != hashes["after"]:
             raise ValueError("h2 postimage mismatch: " + name)
@@ -129,6 +129,9 @@ def main():
     source = context / VENDOR
     source.mkdir()
     extract_source(raw, source)
+    # Keep an unmodified copy of the verified archive for same-toolchain lint
+    # comparison. Do not alter upstream code merely to silence newer Clippy.
+    shutil.copytree(source, output / "upstream")
     patch_source(source, provenance)
     select_dependency(context, evidence)
     identity = dict(source=provenance, checkout=os.environ["GITHUB_SHA"],

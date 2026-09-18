@@ -64,6 +64,15 @@ budget tests, checks both dependency chains, and runs the harness tests.
 Artifacts retain the input archive, patch/assets, generated source, selection
 diff, compiler identities and logs. No local project execution is required.
 
+Clippy runs on both an unmodified copy of the checksum-verified archive and the
+instrumented copy with the same toolchain and flags. Existing upstream warnings
+are retained in both JSON logs; every new or changed diagnostic fails, as does
+every compiler error, missing completion record or non-Clippy warning. Matching
+uses the lint code, message, file, primary source text and multiplicity, so moving
+line numbers cannot hide a new warning. This avoids changing upstream behavior
+just to address style warnings in newer Clippy. Ordinary repository lint gates
+are unchanged.
+
 After the workflow is registered on the default branch, root can dispatch
 `h2-guard-observation.yml` at the reviewed ref with `run_campaign=true`.
 The default `false` runs checks only. The campaign uses the explicitly selected
