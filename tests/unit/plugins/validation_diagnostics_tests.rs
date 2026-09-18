@@ -96,7 +96,7 @@ fn waf_rule_and_exemption_diagnostics_withhold_quote_bearing_values() {
         ),
         (
             json!({"custom_rules": [{
-                "id": token, "category": "test", "target": "body", "pattern": "ok",
+                "id": token, "category": "test", "target": "body_text", "pattern": "ok",
                 "fp_filters": [format!("{token}[")]
             }]}),
             "`fp_filters`",

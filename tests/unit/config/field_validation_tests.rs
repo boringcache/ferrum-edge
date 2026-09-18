@@ -2479,7 +2479,7 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
         .validate_all_fields(30)
         .expect("legacy star must not fail load validation");
     let output = logs.contents();
-    let warn_count = output.matches("`allowed_ws_origins` contains '*'").count();
+    let warn_count = output.matches("`allowed_ws_origins` contains `*`").count();
     assert_eq!(
         warn_count, 1,
         "exactly one warning per proxy, got: {output}"

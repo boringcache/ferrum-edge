@@ -425,7 +425,7 @@ fn test_transaction_debugger_rejects_invalid_body_capture_options() {
         ),
         (
             json!({"log_request_body": true, "max_request_body_bytes": 8193}),
-            "'max_request_body_bytes' must be <= 8192 (got 8193)",
+            "`max_request_body_bytes` must be <= 8192 (got \"8193\")",
         ),
         (
             json!({"log_response_body": true, "max_response_body_bytes": -1}),

@@ -1631,7 +1631,7 @@ fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K
     let parsed = raw.parse::<u64>().map_err(|_| {
         invalid_resource(
             object,
-            format!("{field} must be a numeric port between 1 and 65535"),
+            format!("{field} must be a numeric port between 1 and 65535 (got {raw:?})"),
         )
     })?;
     port_from_u64(object, parsed, field)

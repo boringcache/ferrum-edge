@@ -2474,7 +2474,7 @@ pub(crate) fn port_from_u64(
     if raw == 0 || raw > u16::MAX as u64 {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 1 and 65535"),
+            format!("{field} must be between 1 and 65535 (got \"{raw}\")"),
         ));
     }
     Ok(raw as u16)
