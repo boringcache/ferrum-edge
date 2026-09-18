@@ -14233,6 +14233,12 @@ async fn handle_connection(
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
 
+    #[cfg(feature = "bench-h1-profile")]
+    let stream = crate::h1_profile::io::ObservedIo::new(
+        stream,
+        crate::h1_profile::io::Layer::ClearMixed,
+    );
+
     // Observe raw H1 framing before Hyper normalizes TE-first CL+TE requests.
     // The adapter disables itself for the H2 prior-knowledge preface.
     let (stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
@@ -22258,6 +22264,11 @@ async fn handle_tls_connection(
         }
     }
 
+    #[cfg(feature = "bench-h1-profile")]
+    let stream = crate::h1_profile::io::ObservedIo::new(
+        stream,
+        crate::h1_profile::io::Layer::TlsWireMixed,
+    );
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = crate::tls::accept_with_optional_timeout(
         &acceptor,
@@ -22321,6 +22332,13 @@ async fn handle_tls_connection(
         .server_name()
         .map(str::to_ascii_lowercase);
 
+    #[cfg(feature = "bench-h1-profile")]
+    let profile_layer = if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+        crate::h1_profile::io::Layer::TlsH2Plain
+    } else {
+        crate::h1_profile::io::Layer::TlsNonH2Plain
+    };
+
     // Observe decrypted H1 framing before Hyper normalizes TE-first CL+TE
     // requests. ALPN `h2` is already HTTP/2: skip the observer so those
     // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
@@ -22339,6 +22357,8 @@ async fn handle_tls_connection(
             );
             (io, Some(signals))
         };
+    #[cfg(feature = "bench-h1-profile")]
+    let tls_stream = crate::h1_profile::io::ObservedIo::new(tls_stream, profile_layer);
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
     // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.

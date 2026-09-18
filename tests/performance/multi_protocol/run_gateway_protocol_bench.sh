@@ -21,6 +21,7 @@
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
+#   --h1-profile calibration|cutoff (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -67,6 +68,7 @@ HOST_ID=""
 EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
+H1_PROFILE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -82,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --adaptive) ADAPTIVE=true; shift ;;
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
+        --h1-profile) H1_PROFILE="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -110,6 +113,14 @@ if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
 fi
 if [ "$PROCESS_USAGE" != true ]; then
     echo "[warn] process_usage unavailable; samples are diagnostic and invalid for paired comparisons" >&2
+fi
+
+# Separate manual H1 lane: never selects or rewrites the active H2 manifest.
+if [ -n "$H1_PROFILE" ]; then
+    python3 "$SCRIPT_DIR/h1_internal_profile.py" validate-selection \
+        "$H1_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
+        "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
+    [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
 fi
 
 # UDP protocols are fixed to 1 KB regardless of caller.
@@ -360,6 +371,14 @@ start_ferrum() {
             extra_env+=(-e "$pair")
         done
     fi
+    if [ -n "$H1_PROFILE" ]; then
+        extra_env+=(-e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1
+                    -e FERRUM_ADMIN_HTTP_PORT=9000
+                    -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
+        if [ "$gw" = ferrum-exp-cutoff-one ]; then
+            extra_env+=(-e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1)
+        fi
+    fi
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
         -v "$CERT_DIR:/etc/ferrum/tls:ro" \
@@ -402,6 +421,13 @@ start_ferrum() {
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/experiment_arms.py" verify-runtime \
                 "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw" "$root_output/manifest.json" || return 2
+    fi
+    if [ -n "$H1_PROFILE" ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
     fi
     wait_for_gateway
 }
@@ -831,6 +857,9 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
+    if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
+        sampler_args+=(--h1-profile)
+    fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
     fi
@@ -973,7 +1002,10 @@ main() {
     if [ "$H3_BUDGET" -ne 0 ] && [[ " $expected_gateways " == *" envoy "* ]]; then
         expected_gateways+=" envoy-limit-4"
     fi
-    if [ -f "$EXPERIMENT_MANIFEST" ]; then
+    if [ "$H1_PROFILE" = cutoff ]; then
+        expected_gateways+=" ferrum-exp-cutoff-one"
+    fi
+    if [ -z "$H1_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
         EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
             "$EXPERIMENT_MANIFEST" "$PROTOCOL")
         if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
@@ -1019,14 +1051,21 @@ PYEOF
         cp "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}" "$root_output/h3_experiment.json"
     fi
 
+    if [ -n "$H1_PROFILE" ]; then
+        cp "$SCRIPT_DIR/h1_profile_manifest.json" "$root_output/h1_profile_manifest.json"
+        cp "$SCRIPT_DIR/h1_profile_schema.json" "$root_output/h1_profile_schema.json"
+    fi
     build_binaries
     # Save immutable image IDs as well as operator-supplied tags for revision A/B.
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
-    if [ "$H2_OBSERVE" -eq 1 ]; then
+    if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ]; then
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
+        if [ -n "$BASELINE_IMAGE" ]; then
+            BASELINE_IMAGE=$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')
+        fi
     fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \

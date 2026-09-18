@@ -355,6 +355,8 @@ aya-log = { version = "0.2", optional = true }
 # builds that never use external secret providers.
 [features]
 default = ["crypto-ring"]
+# Hosted measurement only; no production policy or allocator substitution.
+bench-h1-profile = []
 
 # ── Cryptographic backend (mutually exclusive) ─────────────────────────────
 #
