@@ -1872,7 +1872,7 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         panic!("misspelled ip_restriction allow list must reject reload");
     };
     assert!(errors.iter().any(|error| {
-        error.contains("ip_restriction") && error.contains("unknown configuration field 'alow'")
+        error.contains("ip_restriction") && error.contains("unknown configuration field \"alow\"")
     }));
     assert_eq!(
         state.config.load().plugin_configs[0].config,
@@ -2008,7 +2008,7 @@ async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
     assert!(errors.iter().any(|error| {
         error.contains("grpc_web")
             && error.contains("config.expose_header")
-            && error.contains("did you mean 'expose_headers'")
+            && error.contains("did you mean `expose_headers`")
     }));
     assert_eq!(
         state.config.load().plugin_configs[0].config,

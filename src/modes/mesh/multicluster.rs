@@ -2330,7 +2330,10 @@ mod tests {
             assert!(endpoints.workloads.is_empty());
         });
         assert!(logs.contains("no federated trust bundle"), "{logs}");
-        assert!(logs.contains("control_plane_url refuses link-local"), "{logs}");
+        assert!(
+            logs.contains("control_plane_url refuses link-local"),
+            "{logs}"
+        );
         assert!(logs.contains("dropped_workloads=1"), "{logs}");
         for value in [
             "UNREGISTERED",

@@ -407,7 +407,7 @@ fn test_hmac_auth_unknown_key_diagnostic_names_the_plugin_and_the_key() {
         "diagnostic must be plugin-qualified: {error}"
     );
     assert!(
-        error.contains("'config.replay_scop'"),
+        error.contains("\"config.replay_scop\""),
         "diagnostic must name the offending key: {error}"
     );
     assert!(

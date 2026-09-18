@@ -1474,7 +1474,7 @@ fn required_max_entry_bytes_from_error(err: &str) -> usize {
     };
     let rest = &err[offset + marker.len()..];
     let digits = rest.split(" bytes").next().unwrap_or(rest);
-    match digits.parse() {
+    match digits.trim_matches('"').parse() {
         Ok(value) => value,
         Err(_) => panic!("required bytes not an integer: {err}"),
     }
@@ -1593,4 +1593,14 @@ async fn test_statsd_short_prefix_small_entry_budget_still_emits() {
         payload.contains("ferrum.request.count:1|c"),
         "collector must receive HTTP metrics: {payload}"
     );
+}
+
+#[test]
+fn startup_diagnostics_withhold_statsd_tag_keys() {
+    for key in ["'diagnostic-secret-5594", "safe' diagnostic-secret-5594\"\\\n"] {
+        let error = validate_tag_key(key).unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("statsd_logging: tag key"), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+    }
 }

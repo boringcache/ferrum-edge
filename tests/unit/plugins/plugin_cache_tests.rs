@@ -2349,11 +2349,11 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
     assert!(
-        error.contains("'config.vary_by_header'"),
+        error.contains("\"config.vary_by_header\""),
         "reload error must path-qualify Vary typo: {error}"
     );
     assert!(
-        error.contains("'config.cache_key_include_consumr'"),
+        error.contains("\"config.cache_key_include_consumr\""),
         "reload error must path-qualify consumer typo: {error}"
     );
 
@@ -2457,11 +2457,11 @@ fn test_ws_rate_limiting_unknown_key_reload_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
     assert!(
-        error.contains("'config.frames_per_secod'"),
+        error.contains("\"config.frames_per_secod\""),
         "reload error must path-qualify FPS typo: {error}"
     );
     assert!(
-        error.contains("'config.redis_tsl'"),
+        error.contains("\"config.redis_tsl\""),
         "reload error must path-qualify TLS typo: {error}"
     );
 
@@ -5510,7 +5510,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert!(
         error
             .to_string()
-            .contains("jwt_auth: unknown config key 'audience'"),
+            .contains("jwt_auth: unknown config key \"audience\""),
         "unexpected reload error: {error}"
     );
 

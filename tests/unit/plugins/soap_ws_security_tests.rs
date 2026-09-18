@@ -4577,7 +4577,7 @@ fn test_unknown_nested_key_is_rejected_with_suggestion() {
         .expect("misspelling must be rejected");
     assert!(
         err.contains("config.timestamp.clock_skew_second")
-            && err.contains("did you mean 'clock_skew_seconds'"),
+            && err.contains("did you mean `clock_skew_seconds`"),
         "unexpected error: {err}"
     );
 }

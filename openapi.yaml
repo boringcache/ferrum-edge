@@ -23534,11 +23534,12 @@ components:
           default: []
           description: |
             Optional frontend listener ports where the registry is enforced.
-            Empty means enforce on every HTTP-family request that reaches
-            the plugin (operator-managed default). Mesh auto-injection sets
-            this to the outbound capture listener port so the global plugin
-            does not apply to inbound listeners. Ports must be 1–65535;
-            use `[]` for intentional global scope.
+            Every instance skips the listener-stamped Inbound mesh direction
+            before any registry decision, even on a matching port. Empty means
+            enforce on every other HTTP-family request, including non-mesh
+            listeners (operator-managed default). Mesh auto-injection names
+            the outbound capture listener ports. Ports must be 1–65535; use
+            `[]` for intentional global scope.
         namespace:
           type: string
           default: ferrum

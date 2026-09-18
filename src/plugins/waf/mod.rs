@@ -337,7 +337,7 @@ impl Waf {
 
         // Reject unknown keys before any defaults so a typo cannot admit a
         // weaker policy while construction reports success.
-        reject_unknown_keys(object, "config", WAF_CONFIG_KEYS, "waf: ")?;
+        reject_unknown_keys(object, "config", WAF_CONFIG_KEYS, "waf: `config`: ")?;
 
         let mode = parse_global_mode(
             optional_string(object, "mode")?
@@ -2216,7 +2216,12 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
     let object = value
         .as_object()
         .ok_or_else(|| "waf: 'scoring' must be an object".to_string())?;
-    reject_unknown_keys(object, "config.scoring", SCORING_CONFIG_KEYS, "waf: ")?;
+    reject_unknown_keys(
+        object,
+        "config.scoring",
+        SCORING_CONFIG_KEYS,
+        "waf: `config.scoring`: ",
+    )?;
     if !optional_bool(object, "enabled")?.unwrap_or(true) {
         return Ok(None);
     }

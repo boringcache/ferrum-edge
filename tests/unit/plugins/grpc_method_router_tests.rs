@@ -708,7 +708,7 @@ fn test_zero_max_requests_rejected() {
     );
     let err = result.err().expect("max_requests=0 should be rejected");
     assert!(
-        err.contains("'max_requests' must be greater than zero"),
+        err.contains("`max_requests` must be greater than zero"),
         "got: {err}"
     );
 }
@@ -725,7 +725,7 @@ fn test_zero_window_seconds_rejected() {
     );
     let err = result.err().expect("window_seconds=0 should be rejected");
     assert!(
-        err.contains("'window_seconds' must be greater than zero"),
+        err.contains("`window_seconds` must be greater than zero"),
         "got: {err}"
     );
 }

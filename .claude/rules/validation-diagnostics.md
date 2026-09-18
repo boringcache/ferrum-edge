@@ -58,9 +58,33 @@ paths:
   row-decode and admission diagnostics; conf/env/pool parsers and namespace/file
   load messages; CP namespace rejection, mesh startup paths, xDS carriers,
   federation/remote clusters, probe/injector names, node-agent addresses/paths,
-  and revision identities. SQL literals, fixed migration/listener/fault labels,
+  and revision identities; capture boolean/port/mark/UID/CIDR parsing and
+  annotation overrides; shared unknown-key suggestions, rate-window/request/frame
+  bounds, socket-host/egress errors, and notification channel/SMTP/template
+  admission. Notification unknown-key failures retain the fixed `channels`
+  schema context separately from supplied channel names and keys. Shared helper
+  context that may contain document keys is Debug-escaped as a whole; callers
+  must supply a separate fixed schema field when one is available. WAF
+  rule/signature ordinals and API-spec extension request/response/bypass paths
+  preserve this separate fixed context; supplied override IDs and extension
+  keys never enter the visible prefix. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
+- The #5594 logging/observability conversion covers HTTP/TCP/UDP/WebSocket,
+  Kafka, file/stdout/syslog/StatsD logging, OpenTelemetry, Prometheus, transaction
+  log schemas/exporters and proxy alerts. Alert rules, recovery settings and
+  quiet-hour entries preserve fixed ordinals independently of supplied names;
+  log-schema paths and socket diagnostics retain fixed fields and reasons.
+  Registered rendered-output and captured-log tests cover constructor and
+  configuration-admission messages. Runtime transport logs outside this
+  configuration scope are not certified by the mechanical producer guard.
+- The #5594 security conversion covers authentication/authorization, IP/GeoIP,
+  JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
+  admission. Fixed schema paths and credential/operation ordinals survive
+  rendering while supplied credentials, keys, identities, paths, patterns and
+  parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor logs
+  sanitize configured paths at emission. Registered rendered/captured regressions
+  and existing rejection/reload-retention assertions cover these boundaries.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
@@ -68,14 +92,19 @@ paths:
   strings must be Debug-escaped even when a sibling guard already does so.
 
 - Scope of #5591: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
-  `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, and `src/plugins/waf`.
+  `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, `src/capture`, and
+  `src/plugins/waf`.
   Other plugin families remain under #5594. Withholding is conditional on safe
   producer interpolation: apostrophe-leading single-quoted values, bare values,
   and retained third-party parser text can still expose supplied data. Do not
   describe the renderer alone as fail-closed for arbitrary diagnostic text.
 - The mechanical producer/emitter contract is
   `tests/unit/cli/diagnostic_source_guard_tests.rs` (registered in `cli/mod.rs`).
-  It scans every Rust file in the above roots, including multiline/nested macros
+  Its explicit `ROOTS` list covers the above roots except `src/capture`, whose
+  generated shell commands also use quoted interpolation. Capture parsing has
+  rendered-output and captured-log regressions. The guard scans every Rust file
+  in its roots, plus the converted shared unknown-key, rate-limit, and socket-host
+  helpers and notifications, including multiline/nested macros
   and raw strings, for single-quoted interpolation in diagnostic macros and for
   named error/message captures in `warn!`/`error!` without a sanitizer call in
   that statement. Its exact, commented exception list contains SQL query syntax,

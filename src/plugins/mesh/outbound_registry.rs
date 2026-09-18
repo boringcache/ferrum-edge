@@ -36,15 +36,24 @@
 //!   candidate suffix after the request host's first label and probe a
 //!   precomputed `HashSet`, so cost does not grow with unrelated wildcard
 //!   count.
-//! - An empty registry is valid and fails closed: every request is rejected,
+//! - An empty registry is valid and fails closed: every enforced request is rejected,
 //!   but the plugin remains installed so REGISTRY_ONLY never silently falls
 //!   back to ALLOW_ANY.
-//! - Auto-injected mesh instances are scoped to the outbound capture listener
-//!   port, so inbound sidecar/ambient traffic is not gated by an outbound
-//!   policy. Operator-managed instances without `outbound_listen_ports`
-//!   preserve the historical behavior and enforce wherever the plugin runs.
+//! - Every instance skips requests stamped with the Inbound mesh direction:
+//!   inbound sidecar/ambient traffic is never egress, even when its listener
+//!   shares a numeric port with an outbound listener. Auto-injected instances
+//!   also scope enforcement to the outbound capture listener ports.
+//!   Operator-managed instances without `outbound_listen_ports` enforce on
+//!   every other direction, including non-mesh listeners.
 //!   Port `0` is rejected at construction; intentional global scope is only
 //!   represented by an empty `outbound_listen_ports` vector.
+//! - Reuse is advertised only for CONNECTs the registry did not decide.
+//!   `allows_hbone_inner_reuse_for` shares the enforcement gate using the
+//!   admitting listener's direction and port, recorded for every later sweep.
+//!   A matching Outbound listener can terminate an authenticated CONNECT (for
+//!   example NodeWaypoint capture); its scoped registry verdict is not reusable
+//!   because the fence never re-runs the lookup. Unscoped instances always
+//!   refuse reuse, including on Inbound listeners they skip.
 //!
 //! ## Wire compatibility
 //!
@@ -61,8 +70,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::modes::mesh::MeshTrafficDirection;
 use crate::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
+    HTTP_FAMILY_PROTOCOLS, HboneReuseContext, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    priority,
 };
 use crate::util::json_object::JsonObject;
 
@@ -97,10 +108,10 @@ pub struct OutboundRegistryConfig {
     #[serde(default = "default_reject_status")]
     pub reject_status: u16,
     /// Optional frontend listener ports where the registry should be enforced.
-    /// Mesh auto-injection sets this to the outbound capture listener port so
-    /// the global plugin does not apply to inbound listeners. Empty keeps
-    /// operator-managed plugin instances backwards compatible and enforces on
-    /// every HTTP-family request that reaches this plugin. Entries must be
+    /// The listener-stamped Inbound mesh direction always skips enforcement,
+    /// independently of this list. Mesh auto-injection sets this to the
+    /// outbound capture listener ports. Empty enforces on every HTTP-family
+    /// request in any other direction, including non-mesh listeners. Entries must be
     /// `>= 1`; port `0` is rejected (use `[]` for intentional global scope).
     #[serde(default)]
     pub outbound_listen_ports: Vec<u16>,
@@ -290,9 +301,20 @@ impl OutboundRegistry {
 
     #[inline]
     fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {
+        self.should_enforce_for_request_facts(ctx.mesh_direction, ctx.frontend_listen_port)
+    }
+
+    #[inline]
+    fn should_enforce_for_request_facts(
+        &self,
+        mesh_direction: Option<MeshTrafficDirection>,
+        frontend_listen_port: Option<u16>,
+    ) -> bool {
+        if mesh_direction == Some(MeshTrafficDirection::Inbound) {
+            return false;
+        }
         self.outbound_listen_ports.is_empty()
-            || ctx
-                .frontend_listen_port
+            || frontend_listen_port
                 .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())
     }
 
@@ -512,41 +534,18 @@ impl Plugin for OutboundRegistry {
         HTTP_FAMILY_PROTOCOLS
     }
 
-    /// Reusable exactly while this instance is scoped to explicit listener
-    /// ports, because only an UNSCOPED one can decide an HBONE CONNECT.
-    ///
-    /// The whole hook sits behind one gate. `should_enforce_for_request` is the
-    /// FIRST statement of `Self::on_request_received`, it reads nothing but
-    /// `self.outbound_listen_ports` and `ctx.frontend_listen_port`, and a
-    /// request arriving on a port this instance does not name returns
-    /// `Continue` before any registry lookup, any Prometheus record, and any
-    /// rejection. Such a request decided nothing, so eliding it costs nothing —
-    /// which is what a reused inner connection does to the CONNECTs it saves.
-    ///
-    /// A PORT-SCOPED instance therefore decides only on the listener ports it
-    /// names, and an HBONE CONNECT is only ever terminated by an INBOUND
-    /// listener. Mesh auto-injection names exactly the OUTBOUND-direction
-    /// capture ports — `mesh_outbound_registry_listen_ports` filters
-    /// `MeshRuntimeConfig::listener_plan()` to
-    /// `MeshTrafficDirection::Outbound`, and `inject_mesh_global_plugins`
-    /// REMOVES the plugin outright when that set is empty rather than
-    /// installing an unscoped one — so under `outboundTrafficPolicy:
-    /// REGISTRY_ONLY` this plugin does sit in every inbound chain (it is a
-    /// `PluginScope::Global` row, and globals enter every proxy chain) but
-    /// never decides one. Refusing reuse for it would take inner-connection
-    /// reuse away from every inbound tunnel on a REGISTRY_ONLY mesh, and
-    /// revoke the live ones, for a gate that answered `Continue` on all of
-    /// them.
-    ///
-    /// An UNSCOPED instance (`outbound_listen_ports: []` — the operator-managed
-    /// generic Host allowlist this module documents, and what
-    /// `Self::deny_all` builds) enforces wherever it runs, including on a
-    /// listener that terminates HBONE. Its registry verdict is then a
-    /// per-operation decision no sweep re-issues: the fence re-issues the
-    /// authorize chain and the peer's mTLS credential, never this allowlist. So
-    /// it takes the fail-closed answer, and one CONNECT per operation.
-    fn allows_hbone_inner_reuse(&self) -> bool {
+    /// Reuse is advertised only for CONNECTs the registry did not decide.
+    /// A matching outbound (or non-mesh) listener can terminate CONNECT too;
+    /// port scoping alone does not make its registry verdict reusable. Share
+    /// the request hook's gate so every sweep judges the recorded admission
+    /// facts against the current scope without re-running the registry lookup.
+    /// Unscoped instances, including `deny_all`, remain fail-closed.
+    fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {
         !self.outbound_listen_ports.is_empty()
+            && !self.should_enforce_for_request_facts(
+                admission.mesh_direction,
+                admission.frontend_listen_port,
+            )
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
