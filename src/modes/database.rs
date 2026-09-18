@@ -959,8 +959,8 @@ fn log_rejected_delta_decision(decision: &RejectedDeltaDecision, errors: &[Strin
             resource_category = category,
             validation_category = validation_category,
             consecutive_identical_rejections = decision.consecutive,
-            backoff_seconds = backoff_seconds,
-            change_set_hash = %change_set_hash,
+            backoff_seconds = %sanitize_startup_scalar(backoff_seconds),
+            change_set_hash = %sanitize_startup_scalar(&change_set_hash),
             error_count = error_count,
             validation_errors = ?errors_for_log,
             "Incremental config update rejected by validation; keeping poll cursor unchanged and backing off before retry"
@@ -969,16 +969,16 @@ fn log_rejected_delta_decision(decision: &RejectedDeltaDecision, errors: &[Strin
             resource_category = category,
             validation_category = validation_category,
             consecutive_identical_rejections = decision.consecutive,
-            backoff_seconds = backoff_seconds,
-            change_set_hash = %change_set_hash,
+            backoff_seconds = %sanitize_startup_scalar(backoff_seconds),
+            change_set_hash = %sanitize_startup_scalar(&change_set_hash),
             "Repeated database delta rejection; increasing bounded retry backoff"
         ),
         RejectedDeltaLogAction::Escalation => error!(
             resource_category = category,
             validation_category = validation_category,
             consecutive_identical_rejections = decision.consecutive,
-            backoff_seconds = backoff_seconds,
-            change_set_hash = %change_set_hash,
+            backoff_seconds = %sanitize_startup_scalar(backoff_seconds),
+            change_set_hash = %sanitize_startup_scalar(&change_set_hash),
             error_count = error_count,
             validation_errors = ?errors_for_log,
             "Repeated database delta rejection reached threshold; attempting authoritative full reload"
@@ -987,8 +987,8 @@ fn log_rejected_delta_decision(decision: &RejectedDeltaDecision, errors: &[Strin
             resource_category = category,
             validation_category = validation_category,
             consecutive_identical_rejections = decision.consecutive,
-            backoff_seconds = backoff_seconds,
-            change_set_hash = %change_set_hash,
+            backoff_seconds = %sanitize_startup_scalar(backoff_seconds),
+            change_set_hash = %sanitize_startup_scalar(&change_set_hash),
             error_count = error_count,
             validation_errors = ?errors_for_log,
             "Database delta rejection category changed; resetting rejected-delta backoff state"
@@ -997,11 +997,29 @@ fn log_rejected_delta_decision(decision: &RejectedDeltaDecision, errors: &[Strin
             resource_category = category,
             validation_category = validation_category,
             consecutive_identical_rejections = decision.consecutive,
-            backoff_seconds = backoff_seconds,
-            change_set_hash = %change_set_hash,
+            backoff_seconds = %sanitize_startup_scalar(backoff_seconds),
+            change_set_hash = %sanitize_startup_scalar(&change_set_hash),
             "Repeated database delta rejection unchanged; retry log suppressed"
         ),
     }
+}
+
+// Keep the database tracing target; the capture regression covers these and
+// CP's sibling emitters. Opaque provider errors may contain bare supplied values.
+pub(super) fn log_database_dns_change(hostname: &str, previous: &[IpAddr], current: &[IpAddr]) {
+    info!(
+        "Database DNS changed for {}: {} -> {}, reconnecting pool",
+        sanitize_startup_scalar(hostname),
+        sanitize_startup_scalar(format!("{previous:?}")),
+        sanitize_startup_scalar(format!("{current:?}"))
+    );
+}
+
+pub(super) fn log_database_dns_reconnect_failure(hostname: &str, _error: &anyhow::Error) {
+    error!(
+        "Failed to reconnect database pool after DNS change for {}: database reconnect failed",
+        sanitize_startup_scalar(hostname)
+    );
 }
 
 fn bounded_rejection_errors_for_log(errors: &[String]) -> Vec<String> {
@@ -1130,11 +1148,10 @@ pub async fn run(
                         && !DatabaseStore::is_non_transient_init_error(&e)
                     {
                         warn!(
-                            "All database URLs failed ({}). \
+                            "All database URLs failed. \
                              FERRUM_DB_CONFIG_BACKUP_PATH is set — bootstrapping \
                              from backup with a lazy pool. Polling will retry \
                              primary and {} failover URL(s) in the background.",
-                            e,
                             failover_urls.len()
                         );
                         bootstrap_from_backup = true;
@@ -1179,12 +1196,10 @@ pub async fn run(
                         info!("Read replica configured but suppressed until primary failback")
                     }
                     Ok(()) => info!("Read replica connected for admin reads"),
-                    Err(e) => {
-                        let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
+                    Err(_error) => {
                         warn!(
-                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds: {}",
-                            db_backend::redact_url(replica_url),
-                            safe_error
+                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds",
+                            sanitize_startup_scalar(replica_url)
                         );
                     }
                 }
@@ -1226,11 +1241,10 @@ pub async fn run(
                 // blocking admin writes unnecessarily.
                 bootstrap_from_backup = false;
             }
-            Err(e) => {
+            Err(_error) => {
                 warn!(
                     "Backup bootstrap: database still unreachable at startup migration \
-                     attempt ({}); polling will retry in the background",
-                    e
+                     attempt; polling will retry in the background"
                 );
             }
         }
@@ -1357,9 +1371,8 @@ pub async fn run(
                 // Database unreachable, or reachable-but-invalid snapshot — try
                 // the configured backup for pod restart resilience.
                 warn!(
-                    "Database load failed ({}), attempting backup file: {}",
-                    crate::startup::sanitize_startup_cause(&e, &[&effective_url]),
-                    crate::startup::sanitize_startup_cause(format!("{path:?}"), &[])
+                    "Database load failed, attempting backup file: {}",
+                    sanitize_startup_scalar(path)
                 );
                 match load_config_backup(path, &env_config.namespace) {
                     // Result-shaped backup loader (#3153); startup seeds
@@ -1399,15 +1412,12 @@ pub async fn run(
                         // generation atomically through the ordinary
                         // `update_config` / `ArcSwap` reload path.
                         warn!(
-                            "Starting with backup config for namespace {:?} \
+                            "Starting with backup config for namespace {} \
                              ({} proxies, {} consumers). \
                              Database polling will retry and update when DB recovers. \
                              Gateway-to-mesh identity is refused until an authoritative \
                              database load settles this namespace's trust state.",
-                            crate::startup::sanitize_startup_cause(
-                                format!("{:?}", env_config.namespace),
-                                &[]
-                            ),
+                            sanitize_startup_scalar(&env_config.namespace),
                             cfg.proxies.len(),
                             cfg.consumers.len()
                         );
@@ -1686,8 +1696,7 @@ pub async fn run(
         }
         Err(e) => {
             error!(
-                "TLS configuration validation failed: {}",
-                crate::startup::sanitize_startup_cause(&e, &[])
+                "TLS configuration validation failed: frontend certificate, key, or client trust material could not be loaded"
             );
             if let Err(listener_err) = shutdown_database_runtime_tasks(
                 &shutdown_tx,
@@ -1728,7 +1737,7 @@ pub async fn run(
         && handles.watcher_handle.is_some()
     {
         info!(
-            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            interval_secs = %sanitize_startup_scalar(env_config.frontend_tls_watch_interval_seconds),
             "Frontend TLS live reload enabled for proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
@@ -2200,8 +2209,7 @@ pub async fn run(
             }
             Err(e) => {
                 error!(
-                    "Failed to load admin TLS configuration: {}",
-                    crate::startup::sanitize_startup_cause(&e, &[])
+                    "Failed to load admin TLS configuration: certificate, key, or client trust material could not be loaded"
                 );
                 if let Err(listener_err) = shutdown_database_runtime_tasks(
                     &shutdown_tx,
@@ -2301,7 +2309,7 @@ pub async fn run(
         warn!(
             "Gateway startup failed after spawning listener / background tasks: {}; \
              draining spawned tasks before returning",
-            crate::startup::sanitize_startup_cause(&e, &[])
+            crate::modes::file::listener_failure_for_log(&e)
         );
         if let Err(listener_err) =
             shutdown_database_runtime_tasks(&shutdown_tx, &proxy_state, handles, background_handles)
@@ -2409,7 +2417,7 @@ pub async fn run(
             info!(
                 "Backend change-stream config reloads enabled (coalesced wake-up only; the \
                  durable sequence cursor and the {}s poll interval remain authoritative)",
-                env_config.db_poll_interval
+                sanitize_startup_scalar(env_config.db_poll_interval)
             );
             background_handles.push(handle);
         }
@@ -2417,7 +2425,7 @@ pub async fn run(
             info!(
                 "Change-stream config reloads requested but not active for this backend/topology; \
                  continuing with {}s periodic polling only",
-                env_config.db_poll_interval
+                sanitize_startup_scalar(env_config.db_poll_interval)
             );
         }
         None => {}
@@ -2534,10 +2542,10 @@ pub async fn run(
                                 None => false, // first resolution, just seed
                             };
                             if needs_reconnect {
-                                info!(
-                                    "Database DNS changed for {:?}: {:?} -> {:?}, reconnecting \
-                                     pool",
-                                    hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
+                                log_database_dns_change(
+                                    hostname,
+                                    last_db_ips.as_deref().unwrap_or(&[]),
+                                    &ips,
                                 );
                                 match db_poll.reconnect(&db_url_for_reconnect).await {
                                     Ok(_) => {
@@ -2551,12 +2559,8 @@ pub async fn run(
                                         last_db_ips = Some(ips);
                                         force_full_reload = true;
                                     }
-                                    Err(e) => {
-                                        error!(
-                                            "Failed to reconnect database pool after DNS change \
-                                             for {:?}: {}",
-                                            hostname, e
-                                        );
+                                    Err(error) => {
+                                        log_database_dns_reconnect_failure(hostname, &error);
                                     }
                                 }
                             } else {
@@ -2640,8 +2644,7 @@ pub async fn run(
                                             .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                     } else {
                                         error!(
-                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
-                                            e
+                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
                                         );
                                         database_delta_poll_metrics_for_poll
                                             .record_config_source_unavailable(
@@ -2829,8 +2832,7 @@ pub async fn run(
                                                                 .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                                         } else {
                                                             warn!(
-                                                                "Authoritative primary full reload failed after repeated rejected delta; keeping last known-good runtime config: {}",
-                                                                e
+                                                                "Authoritative primary full reload failed after repeated rejected delta; keeping last known-good runtime config"
                                                             );
                                                             match db_poll
                                                                 .try_failover_reconnect(
@@ -2906,21 +2908,19 @@ pub async fn run(
                                                                                         DatabasePollFailureReason::Connectivity,
                                                                                     );
                                                                                 warn!(
-                                                                                    "Authoritative failover full reload also failed after repeated rejected delta; keeping last known-good runtime config: {}",
-                                                                                    e2
+                                                                                    "Authoritative failover full reload also failed after repeated rejected delta; keeping last known-good runtime config"
                                                                                 );
                                                                             }
                                                                         }
                                                                     }
                                                                 }
-                                                                Err(e2) => {
+                                                                Err(_error) => {
                                                                     database_delta_poll_metrics_for_poll
                                                                         .record_config_source_unavailable(
                                                                             DatabasePollFailureReason::Connectivity,
                                                                         );
                                                                     warn!(
-                                                                        "Database failover reconnect failed after rejected-delta escalation reload error: {}",
-                                                                        e2
+                                                                        "Database failover reconnect failed after rejected-delta escalation reload error"
                                                                     );
                                                                 }
                                                             }
@@ -2962,13 +2962,11 @@ pub async fn run(
                                 Err(e) => {
                                     if db_backend::is_incremental_full_reload_required(&e) {
                                         info!(
-                                            "Consumer change detected; using authoritative full reload for credential rehydration: {}",
-                                            e
+                                            "Consumer change detected; using authoritative full reload for credential rehydration"
                                         );
                                     } else {
                                         warn!(
-                                            "Authoritative primary incremental poll failed, falling back to full reload: {}",
-                                            e
+                                            "Authoritative primary incremental poll failed, falling back to full reload"
                                         );
                                     }
                                     match load_full_config_with_sequence(&db_poll, &poll_namespace).await
@@ -3087,8 +3085,7 @@ pub async fn run(
                                                                             DatabasePollFailureReason::Connectivity,
                                                                         );
                                                                     warn!(
-                                                                        "Authoritative primary failover reload also failed (using cached): {}",
-                                                                        e3
+                                                                        "Authoritative primary failover reload also failed (using cached)"
                                                                     );
                                                                 }
                                                             }
@@ -3100,8 +3097,7 @@ pub async fn run(
                                                                 DatabasePollFailureReason::Connectivity,
                                                             );
                                                         warn!(
-                                                            "Authoritative primary full config reload also failed (using cached): {}",
-                                                            e2
+                                                            "Authoritative primary full config reload also failed (using cached)"
                                                         );
                                                     }
                                                 }
@@ -3160,8 +3156,7 @@ pub async fn run(
                                                 DatabasePollFailureReason::Connectivity,
                                             );
                                         warn!(
-                                            "Authoritative primary full config reload failed (using cached): {}",
-                                            e
+                                            "Authoritative primary full config reload failed (using cached)"
                                         );
                                     }
                                 }
@@ -3271,10 +3266,10 @@ pub(crate) async fn load_full_config_with_sequence(
     // the process unable to publish fresh config at all.
     let sequence = match db.latest_change_sequence(namespace).await {
         Ok(sequence) => sequence,
-        Err(error) => {
+        Err(_error) => {
             warn!(
-                namespace = %namespace,
-                error = %error,
+                namespace = %sanitize_startup_scalar(namespace),
+                error = "database change-sequence lookup failed",
                 "full reload could not read the config_changes watermark; continuing with \
                  sequence 0 so the reload still publishes (the next incremental poll re-reads \
                  the retained change log)"
@@ -3352,7 +3347,7 @@ async fn try_publish_full_reload_after_gate(
             proxy_count,
             upstream_count,
             apply_ms = apply_elapsed.as_millis() as u64,
-            threshold_ms,
+            threshold_ms = %sanitize_startup_scalar(threshold_ms),
             topology_epoch = cursor.topology_epoch,
             sequence = cursor.sequence,
             committed,
@@ -3442,14 +3437,22 @@ fn commit_full_reload_poll_state(
                     "Database configuration candidate rejected during full apply ({}); \
                      raising config_rejected and keeping previous runtime config and poll cursor: {}",
                     context,
-                    errors.join("; ")
+                    errors
+                        .iter()
+                        .map(|error| crate::startup::sanitize_startup_cause(error, &[]))
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 );
             } else {
                 debug!(
                     "Database configuration candidate still rejected during full apply ({}); \
                      keeping previous runtime config and poll cursor: {}",
                     context,
-                    errors.join("; ")
+                    errors
+                        .iter()
+                        .map(|error| crate::startup::sanitize_startup_cause(error, &[]))
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 );
             }
             false
@@ -3488,11 +3491,11 @@ async fn mark_db_available_after_successful_poll_load(
     // recovery generation. Probe/apply failures restore NEED_RECONCILE so the
     // next successful poll retries; callers must not publish the loaded config
     // when this helper returns false.
-    if let Err(e) = db.maybe_apply_deferred_migrations().await {
+    if let Err(_error) = db.maybe_apply_deferred_migrations().await {
         warn!(
-            "Deferred migrations failed despite successful {}: {}. \
+            "Deferred migrations failed despite successful {}. \
              Admin writes remain blocked until schema is applied.",
-            context, e
+            context
         );
         db_available.store(false, Ordering::Relaxed);
         return false;
@@ -3518,14 +3521,14 @@ async fn mark_db_available_after_successful_poll_load(
                     db_available.store(true, Ordering::Relaxed);
                     true
                 }
-                Err(e) => {
+                Err(_error) => {
                     plugin_migration_reconcile_state
                         .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                     warn!(
-                        "Custom-plugin migration reconciliation failed after {}: {}. \
+                        "Custom-plugin migration reconciliation failed after {}. \
                          Admin writes and recovered config publication remain blocked until \
                          plugin schema is reconciled.",
-                        context, e
+                        context
                     );
                     db_available.store(false, Ordering::Relaxed);
                     false
@@ -3589,9 +3592,101 @@ async fn record_config_validation_rejection_after_recovery_migration_gate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+
+    // A scoped subscriber and a file writer also capture current-thread Tokio
+    // tasks without installing a process-global subscriber or environment.
+    pub(crate) fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::sync::Mutex::new(output.reopen().unwrap()))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, run);
+        (result, std::fs::read_to_string(output.path()).unwrap())
+    }
+
+    #[test]
+    fn dns_recovery_emissions_withhold_every_endpoint_and_provider_payload() {
+        let hostname = "'unregistered-dns-host\"\\\n";
+        let previous = ["192.0.2.81".parse().unwrap()];
+        let current = ["2001:db8::82".parse().unwrap()];
+        let provider_error = anyhow::anyhow!(
+            "provider rejected bare-unregistered-provider-value at postgres://user:password@host/db"
+        );
+        let (_, logs) = capture_logs(|| {
+            log_database_dns_change(hostname, &previous, &current);
+            log_database_dns_reconnect_failure(hostname, &provider_error);
+            crate::modes::control_plane::log_database_dns_change(hostname, &previous, &current);
+            crate::modes::control_plane::log_database_dns_reconnect_failure(
+                hostname,
+                &provider_error,
+            );
+        });
+
+        assert_eq!(logs.matches("Database DNS changed").count(), 2);
+        assert_eq!(logs.matches("reconnecting pool").count(), 2);
+        assert_eq!(logs.matches("database reconnect failed").count(), 2);
+        assert!(logs.contains("modes::database"), "{logs}");
+        assert!(logs.contains("modes::control_plane"), "{logs}");
+        for value in [
+            "unregistered-dns-host",
+            "192.0.2.81",
+            "2001:db8::82",
+            "bare-unregistered-provider-value",
+            "postgres://",
+            "password",
+        ] {
+            assert!(!logs.contains(value), "disclosed {value}: {logs}");
+        }
+    }
+
+    #[test]
+    fn rejected_full_reload_emits_each_safe_reason_and_preserves_the_cursor() {
+        let previous = Some(LiveApplyCursor::new(1, 7));
+        let mut cursor = previous;
+        let rejected = AtomicBool::new(false);
+        let runtime = RuntimeConfigApply::at_epoch("ferrum", 1, 0);
+        let errors = vec![
+            "`proxies[0].name`: invalid value \"unterminated-canary".to_string(),
+            format!(
+                "`proxies[1].upstream_id`: missing reference {:?}",
+                "'reference-canary"
+            ),
+        ];
+        let (_, logs) = capture_logs(|| {
+            // Exercise both the first-rejection error and repeated debug event.
+            for _ in 0..2 {
+                assert!(!commit_full_reload_poll_state(
+                    "full reload",
+                    proxy::ConfigApplyOutcome::Rejected {
+                        errors: errors.clone(),
+                    },
+                    &mut cursor,
+                    LiveApplyCursor::new(1, 42),
+                    &rejected,
+                    &runtime,
+                    0,
+                ));
+            }
+        });
+
+        assert_eq!(cursor, previous);
+        assert!(rejected.load(Ordering::Relaxed));
+        assert!(logs.contains("raising config_rejected"), "{logs}");
+        assert!(logs.contains("still rejected"), "{logs}");
+        assert_eq!(logs.matches("`proxies[0].name`: invalid value").count(), 2);
+        assert_eq!(
+            logs.matches("`proxies[1].upstream_id`: missing reference").count(),
+            2
+        );
+        assert!(!logs.contains("unterminated-canary"), "{logs}");
+        assert!(!logs.contains("reference-canary"), "{logs}");
+    }
 
     #[test]
     fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
