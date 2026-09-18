@@ -652,7 +652,7 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            err.contains("outbound_listen_ports") && err.contains("0"),
+            err.contains("`outbound_listen_ports`") && err.contains("must be >= 1"),
             "got: {err}"
         );
     }

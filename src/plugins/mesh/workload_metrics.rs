@@ -3629,7 +3629,7 @@ mod tests {
         }))
         .err()
         .expect("unknown provider kind should fail");
-        assert!(err.contains("invalid tracing_provider config"), "{err}");
+        assert!(err.contains("invalid `tracing_provider` config"), "{err}");
     }
 
     #[test]
