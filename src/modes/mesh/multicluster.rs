@@ -2427,9 +2427,10 @@ mod tests {
             "Installed remote-cluster endpoints",
             "workloads=1",
             "remote endpoint fetch or admission failed",
-            "poll_interval_seconds=",
-            "max_stale_seconds=",
-            "production_mode=",
+            "control_plane=<redacted scalar>",
+            "poll_interval_seconds=<redacted scalar>",
+            "max_stale_seconds=<redacted scalar>",
+            "production_mode=<redacted scalar>",
         ] {
             assert!(logs.contains(expected), "{logs}");
         }
@@ -2439,12 +2440,19 @@ mod tests {
             "private-remote.invalid",
             "private-service",
             "192.0.2.211",
-            "49387",
-            "87654",
-            "76543",
             "true",
         ] {
             assert!(!logs.contains(value), "{logs}");
+        }
+        // Legitimate timestamps can contain a short numeric canary as a substring.
+        // Complete numeric tokens still detect a supplied port or duration leak.
+        for value in ["49387", "87654", "76543"] {
+            assert!(
+                !logs
+                    .split(|ch: char| !ch.is_ascii_digit())
+                    .any(|token| token == value),
+                "{value}: {logs}"
+            );
         }
     }
 
