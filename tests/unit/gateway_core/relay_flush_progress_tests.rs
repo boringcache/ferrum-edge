@@ -199,7 +199,10 @@ async fn a_buffered_backend_writer_is_flushed_while_the_client_reader_is_pending
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
     let (backend, mut backend_peer) = buffered_leg(PEER_BUFFER);
 
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
         client,
@@ -278,7 +281,10 @@ async fn the_fenced_h2_byte_tunnel_relay_flushes_a_buffering_writer_too() {
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
     let (backend, mut backend_peer) = buffered_leg(PEER_BUFFER);
 
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = tokio::spawn(bidirectional_copy_for_fenced_relay_for_test(
         client,
@@ -412,7 +418,10 @@ async fn one_accepted_batch_owes_exactly_one_flush() {
     let (buffered, mut backend_peer) = buffered_leg(PEER_BUFFER);
     let backend = FlushCounting::new(buffered, Arc::clone(&flushes));
 
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
         client,
@@ -468,7 +477,10 @@ async fn half_close_delivers_buffered_bytes_in_both_directions_with_exact_counte
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
     let (backend, mut backend_peer) = buffered_leg(PEER_BUFFER);
 
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
     client_peer.shutdown().await.expect("client half-close");
 
     let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
@@ -535,7 +547,10 @@ async fn half_close_delivers_buffered_bytes_in_both_directions_with_exact_counte
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_writer_that_never_completes_its_flush_still_trips_the_write_timeout() {
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = bidirectional_copy_for_test_with_timeouts(
         client,
@@ -580,7 +595,10 @@ async fn a_writer_that_never_completes_its_flush_still_trips_the_write_timeout()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_flush_is_attributed_to_the_write_side() {
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = bidirectional_copy_for_test_with_timeouts(
         client,
@@ -625,7 +643,10 @@ async fn a_failing_flush_is_attributed_to_the_write_side() {
 async fn admission_revocation_still_cuts_a_relay_whose_writer_holds_bytes() {
     let token = tokio_util::sync::CancellationToken::new();
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = tokio::spawn(bidirectional_copy_for_fenced_relay_for_test(
         client,
@@ -676,7 +697,10 @@ async fn the_authorization_deadline_still_fires_with_a_buffering_writer() {
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
     let (backend, mut backend_peer) = buffered_leg(PEER_BUFFER);
 
-    client_peer.write_all(REQUEST).await.expect("client request");
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
 
     let relay = tokio::spawn(bidirectional_copy_with_authorization_for_test(
         client,
