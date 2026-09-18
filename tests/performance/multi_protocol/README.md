@@ -491,9 +491,17 @@ The campaign supplies `--h2-observe` to each client and `BENCH_H2_OBSERVE=1` to
 the benchmark backend. Events extend #5601's `TransportEvent` and `PhaseReport`:
 monotonic process-relative timestamps, actual coordinator boundaries for setup,
 warmup, measurement, drain and transport close, operation, worker, channel and
-physical connection identity. `connection_id=0` means unknown, including an RPC
-spanning a reconnect. gRPC channel IDs are explicitly separate from physical
-socket IDs. Client H2 driver results are joined after worker drain with a
+physical connection identity. `connection_id=0` means unknown. gRPC attributes
+an RPC error to a nonzero physical socket only when the same association is
+present before and after the RPC. Every connector attempt invalidates it before
+the connect future is polled; failed or cancelled attempts leave it unknown.
+Only the latest attempt can publish a successful connection, and dropping an
+older socket cannot clear a newer identity. Socket retirement clears its own
+current association. Channel IDs remain available independently. This observes
+TCP socket ownership, not a per-stream wire ID or proof of TLS/H2 readiness;
+Tonic still owns those handshakes and its detached driver. An RPC spanning a
+reconnect or retirement is conservatively unknown even if it used the old
+socket. Client H2 driver results are joined after worker drain with a
 five-second **observation** bound. This is not proof of graceful H2 close.
 Tonic hides its detached driver results; its socket-drop events do not certify
 close correctness, and events after the final snapshot are not captured.
@@ -550,8 +558,13 @@ only if the captured reasons require it; no production fix is justified here.
 
 Hosted `Benchmark Harness Tests` reaches regression cases for typed remote
 GOAWAY/RST distinction, cyclic/large error chains, log suppression independent
-of counts, monotonic phase attribution, effective route materialization, gauge
-failure handling and rejection of a failed paired repetition. Local execution
+of counts, monotonic phase attribution, gRPC connector cancellation/failure,
+out-of-order cloned connect futures, older socket retirement, cancellation
+during Tonic TLS negotiation and a real Tonic RPC after transport loss and
+refused reconnect (Linux), effective route
+materialization, gauge failure handling and rejection of a failed paired
+repetition. Connector tests use leased loopback sockets and explicit lifecycle
+signals under a five-second async deadline. Local execution
 was prohibited for this change; hosted compilation/tests and root's independent
 artifact audit remain required before drawing conclusions.
 
