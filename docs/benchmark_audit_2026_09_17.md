@@ -337,13 +337,37 @@ mechanisms and testable hypotheses, not claims from a CPU profile.
    `shared_invariant_parity_tests.rs::every_tunnelled_relay_path_shares_one_flushing_byte_pump`
    (structural sibling inventory).
 
-   **What this does not establish.** Whether the omission caused the CI
-   WSS/5 MiB timeouts is still unproven. A scoped `gateways-protocol-benchmark`
-   comparison of this branch against `main` is recorded on the pull request for
-   issue #5588; treat it as corroboration only. The benchmark's own variance at
-   these payloads is comparable to the differences under investigation, and the
-   regression tests — which fail on the unfixed loop and pass on the fixed one —
-   are the proof of the defect and of its repair.
+   **Hosted corroboration (2026-09-18).** Two scoped
+   `gateways-protocol-benchmark` runs with identical inputs — ferrum only,
+   http2 + grpcs + wss, 70 KiB and 5 MiB, `iterations=2` — on
+   [`main` at `606b898a4`](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35327641299)
+   and on
+   [the fix at `c9a0c3d5c`](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35327635467):
+
+   | Ferrum sample | main, errors (it. 1 / 2) | fix, errors (it. 1 / 2) |
+   |---|---:|---:|
+   | WSS / 5 MiB | **24 / 24** | **0 / 0** |
+   | WSS / 70 KiB | 0 / 0 | 0 / 0 |
+   | HTTP/2 / 70 KiB | 0 / 0 | 0 / 0 |
+   | HTTP/2 / 5 MiB | 0 / 0 | 0 / 0 |
+   | gRPC / 70 KiB, 5 MiB | 0 / 0 | 0 / 0 |
+
+   Every WSS/5 MiB error on `main` is the tracker's signature,
+   `ws echo error: timed out waiting 30s for echo`, and the gateway-free
+   `direct` WSS/5 MiB baseline completed error-free in both arms (171.0 and
+   179.5 RPS), so the failure is on the gateway path rather than in the harness
+   or the backend. Twenty-four of twenty-five workers losing their in-flight
+   echo is the end-of-run shape a relay that parks holding unflushed ciphertext
+   produces.
+
+   **What this does not establish.** Two iterations per arm on one host pair is
+   corroboration, not a causal proof, and it does not rule out a second
+   contributing mechanism at that payload. RPS across these runs is **not**
+   usable: the two arms move in opposite directions by payload (WSS/70 KiB
+   favours `main` by ~60%, HTTP/2 by ~70% the other way) with zero errors on
+   both sides, which is the cross-run CPU variance this report warns about
+   throughout. The regression tests — which cannot pass on the unfixed loop —
+   remain the proof of the defect and of its repair.
 
 2. **Measure HTTP/1.1 framing and TLS write cadence.**
    Ferrum's benchmark already disables response buffering and body-size limits,
