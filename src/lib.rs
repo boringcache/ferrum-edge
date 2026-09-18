@@ -4255,6 +4255,43 @@ pub mod _test_support {
         .await
     }
 
+    /// The production relay entry point the HTTP/2 CONNECT byte tunnel runs
+    /// (`bidirectional_copy_for_fenced_relay`), so tests can exercise the
+    /// HBONE/mesh sibling of the shared copy loop together with the mesh
+    /// admission fence's revocation bound.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bidirectional_copy_for_fenced_relay_for_test<C, B>(
+        client: C,
+        backend: B,
+        idle_timeout: Option<std::time::Duration>,
+        half_close_cap: Option<std::time::Duration>,
+        backend_read_timeout: Option<std::time::Duration>,
+        backend_write_timeout: Option<std::time::Duration>,
+        buf_size: usize,
+        revocation: Option<tokio_util::sync::CancellationToken>,
+    ) -> StreamCopyResult
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        crate::proxy::tcp_proxy::bidirectional_copy_for_fenced_relay(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            backend_read_timeout,
+            backend_write_timeout,
+            buf_size,
+            revocation.map(|token| {
+                crate::proxy::tcp_proxy::RelayRevocation::new(
+                    token,
+                    crate::proxy::hbone_admission_fence::HBONE_ADMISSION_REVOKED_MESSAGE,
+                )
+            }),
+        )
+        .await
+    }
+
     /// Connect to a WebSocket backend using production dialer settings that
     /// are relevant to unit tests.
     pub async fn connect_websocket_backend_for_test(
