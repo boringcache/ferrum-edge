@@ -2484,7 +2484,12 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
         warn_count, 1,
         "exactly one warning per proxy, got: {output}"
     );
-    assert!(output.contains("star-proxy"), "warning must name the proxy");
+    // The warning is emitted through the diagnostic sanitizer, so the proxy id
+    // (a document value) is withheld at emission; the field name survives.
+    assert!(
+        !output.contains("star-proxy") && output.contains("Proxy <redacted scalar>"),
+        "warning must withhold the proxy id at emission: {output}"
+    );
     assert!(
         output.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
         "warning must carry the admission guidance: {output}"
