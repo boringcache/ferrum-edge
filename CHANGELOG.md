@@ -324,6 +324,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the point of the change, and it is the only behaviour difference an operator
   should expect.
 
+### Fixed
+
+- **A buffering relay writer no longer holds bytes while the reader is parked**
+  (issue #5588). `poll_copy_direction` — the one byte pump behind userspace
+  TCP/TLS, WebSocket tunnel mode, mesh TCP inbound/egress, and the HBONE
+  HTTP/2 CONNECT byte tunnel — accepted bytes into the writer, returned to
+  polling the reader, and parked there without flushing. That is only safe for
+  a writer that hands everything straight to the transport: `tokio-rustls`
+  accepts plaintext and returns `Ok(n)` for ciphertext it could not push, so a
+  relayed request or WebSocket reply could sit in the TLS writer while the peer
+  that owed the next read waited on it — neither side moving again. Each
+  direction now tracks whether the writer is still holding accepted bytes and
+  flushes before parking, matching tokio's own `CopyBuffer`. An unbuffered
+  writer's flush is a no-op and the flush is owed once per accepted batch, so
+  the plain-TCP hot path gains no syscall. `backend_write_timeout` now stays
+  armed across an in-flight flush, so a writer that took the bytes and cannot
+  let go of them trips the write deadline instead of only the idle timeout;
+  half-close behaviour, cancellation, the authorization-lifetime and
+  admission-revocation bounds, and per-direction byte/error attribution are
+  unchanged.
+
 ## [0.9.5] - 2026-09-13
 
 Release from main introducing resource labels in tagged artifacts. Includes the

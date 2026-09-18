@@ -316,6 +316,35 @@ mechanisms and testable hypotheses, not claims from a CPU profile.
    tunnels also need parity checks. Preserve idle/write deadlines, half-close
    behavior, cancellation and error attribution when adding flush progress.
 
+   **Outcome (2026-09-18): confirmed and fixed.** The defect reproduces through
+   actual rustls backpressure against the production loop, not an extracted
+   copy: with a TLS transport window smaller than one encrypted record,
+   `tokio-rustls` accepts the whole plaintext, retains the ciphertext it could
+   not push, and the far peer holds a partial record it cannot decrypt while the
+   relay parks on a still-open client. `poll_copy_direction` now tracks whether
+   the writer is holding accepted bytes (`CopyDirectionState::needs_flush`) and
+   flushes before parking on a pending reader, mirroring tokio's `CopyBuffer`.
+   The flush is owed once per accepted batch and an unbuffered writer's
+   `poll_flush` is a no-op, so the plain-TCP hot path gains no syscall.
+   `backend_write_timeout` stays armed across an in-flight flush, so a writer
+   that cannot let go of accepted bytes trips the write deadline rather than
+   only the idle timeout; half-close, cancellation, the authorization-lifetime
+   and admission-revocation bounds, and per-direction byte/error attribution are
+   asserted unchanged. Coverage:
+   `tests/unit/gateway_core/relay_flush_progress_tests.rs` (behavioral, through
+   `bidirectional_copy_for_relay`, `bidirectional_copy_for_fenced_relay` — the
+   HBONE H2 CONNECT byte tunnel — and the authorization-bounded entry point) and
+   `shared_invariant_parity_tests.rs::every_tunnelled_relay_path_shares_one_flushing_byte_pump`
+   (structural sibling inventory).
+
+   **What this does not establish.** Whether the omission caused the CI
+   WSS/5 MiB timeouts is still unproven. A scoped `gateways-protocol-benchmark`
+   comparison of this branch against `main` is recorded on the pull request for
+   issue #5588; treat it as corroboration only. The benchmark's own variance at
+   these payloads is comparable to the differences under investigation, and the
+   regression tests — which fail on the unfixed loop and pass on the fixed one —
+   are the proof of the defect and of its repair.
+
 2. **Measure HTTP/1.1 framing and TLS write cadence.**
    Ferrum's benchmark already disables response buffering and body-size limits,
    selecting `direct_streaming_body`; recommending “turn on streaming” or
