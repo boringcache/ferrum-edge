@@ -1008,8 +1008,8 @@ fn replay_scope_diagnostics_preserve_schema_and_suggestions_when_rendered() {
         "927451",
         "true",
     ] {
-        let error = ReplayScope::parse("jwks_auth", "provider[3].dpop_replay_scope", value)
-            .unwrap_err();
+        let error =
+            ReplayScope::parse("jwks_auth", "provider[3].dpop_replay_scope", value).unwrap_err();
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
         for expected in [
             "`provider[3].dpop_replay_scope`",

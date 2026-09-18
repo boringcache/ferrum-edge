@@ -75,7 +75,10 @@ fn unknown_key_diagnostics_withhold_document_keys_and_entire_untrusted_paths() {
             )
             .unwrap_err();
             let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
-            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains("unknown configuration key(s)"),
+                "{rendered}"
+            );
             assert!(rendered.contains("did you mean `action`?"), "{rendered}");
             for withheld in [
                 supplied,
@@ -123,7 +126,10 @@ fn socket_host_diagnostics_keep_fields_and_reasons_without_supplied_hosts() {
             "must be a valid hostname or IP address",
         ),
     ] {
-        for label in ["tcp_logging", "channel ''UNREGISTERED_CHANNEL\"\\\n`host`' (email)"] {
+        for label in [
+            "tcp_logging",
+            "channel ''UNREGISTERED_CHANNEL\"\\\n`host`' (email)",
+        ] {
             let error = parse_socket_host(label, "host", host).unwrap_err();
             let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
             assert!(rendered.contains("<redacted scalar>: `host`"), "{rendered}");
