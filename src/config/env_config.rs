@@ -7655,7 +7655,7 @@ impl EnvConfig {
             // Only values under `QUIC_INITIAL_MTU_MIN` (1200) can reach here in
             // practice, so the leaked rendering is always 1-4 digits.
             return Err(format!(
-                "FERRUM_HTTP3_INITIAL_MTU ({}) is outside quinn's legal range [{}, {}]",
+                "FERRUM_HTTP3_INITIAL_MTU ({}) is outside the legal QUIC range [{}, {}]",
                 crate::startup::quoted_config_value(
                     "FERRUM_HTTP3_INITIAL_MTU",
                     &self.http3_initial_mtu.to_string()
