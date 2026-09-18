@@ -44,7 +44,7 @@ use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
 };
 use crate::plugins::utils::http_client::PluginHttpClient;
-use crate::startup::sanitize_startup_cause;
+use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar};
 #[cfg(test)]
 use crate::util::backoff::{
     BACKOFF_MAX_SECS, jittered_backoff_with_entropy as common_jittered_backoff_with_entropy,
@@ -539,7 +539,7 @@ pub(crate) fn parse_federation_document(
                     Some("jwt-svid") => {
                         let kid = key.kid.unwrap_or_default();
                         if kid.is_empty() {
-                            return Err("federation bundle jwt-svid key missing 'kid'".to_string());
+                            return Err("federation bundle jwt-svid key missing `kid`".to_string());
                         }
                         // Re-serialise the JWK fields back to JSON so downstream
                         // JWT consumers can parse it as a JWK. We intentionally
@@ -559,7 +559,7 @@ pub(crate) fn parse_federation_document(
                         debug!("Skipping SPIFFE JWKS key with unsupported `use` <redacted scalar>");
                     }
                     None => {
-                        return Err("federation bundle JWKS key missing 'use' claim".to_string());
+                        return Err("federation bundle JWKS key missing `use` claim".to_string());
                     }
                 }
             }
@@ -735,12 +735,12 @@ pub fn spawn_federation_poller(
         let endpoint = target.endpoint.clone();
         let endpoint_for_logs = sanitize_endpoint_for_logging(&endpoint);
         info!(
-            cluster = %cluster_name,
-            trust_domain = %trust_domain,
-            endpoint = %endpoint_for_logs,
-            poll_interval_seconds = task_config.poll_interval.as_secs(),
-            max_stale_seconds = task_config.max_stale_age.map(|age| age.as_secs()),
-            fail_open = task_config.fail_open,
+            cluster = %sanitize_startup_scalar(&cluster_name),
+            trust_domain = %sanitize_startup_scalar(&trust_domain),
+            endpoint = %sanitize_startup_scalar(&endpoint_for_logs),
+            poll_interval_seconds = %sanitize_startup_scalar(task_config.poll_interval.as_secs()),
+            max_stale_seconds = %sanitize_startup_scalar(format!("{:?}", task_config.max_stale_age.map(|age| age.as_secs()))),
+            fail_open = %sanitize_startup_scalar(task_config.fail_open),
             "Spawning SPIFFE federation poller"
         );
         // Register a generation token so the poll task's install is gated by it
@@ -866,12 +866,12 @@ impl FederationPollerManager {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let endpoint_for_logs = sanitize_endpoint_for_logging(&target.endpoint);
         info!(
-            cluster = %target.cluster_name,
-            trust_domain = %target.trust_domain,
-            endpoint = %endpoint_for_logs,
-            poll_interval_seconds = config.poll_interval.as_secs(),
-            max_stale_seconds = config.max_stale_age.map(|age| age.as_secs()),
-            fail_open = config.fail_open,
+            cluster = %sanitize_startup_scalar(&target.cluster_name),
+            trust_domain = %sanitize_startup_scalar(&target.trust_domain),
+            endpoint = %sanitize_startup_scalar(&endpoint_for_logs),
+            poll_interval_seconds = %sanitize_startup_scalar(config.poll_interval.as_secs()),
+            max_stale_seconds = %sanitize_startup_scalar(format!("{:?}", config.max_stale_age.map(|age| age.as_secs()))),
+            fail_open = %sanitize_startup_scalar(config.fail_open),
             "Spawning SPIFFE federation poller"
         );
         // Register a generation token BEFORE spawning so the poll task's install
@@ -977,20 +977,20 @@ async fn poll_federation_loop(
             }
             Ok(false) => {
                 debug!(
-                    cluster = %cluster_name,
-                    trust_domain = %trust_domain,
-                    endpoint = %endpoint_for_logs,
+                    cluster = %sanitize_startup_scalar(&cluster_name),
+                    trust_domain = %sanitize_startup_scalar(&trust_domain),
+                    endpoint = %sanitize_startup_scalar(&endpoint_for_logs),
                     "SPIFFE federation poll result was discarded because the poller generation is stale"
                 );
                 return;
             }
             Err(err) => {
                 warn!(
-                    cluster = %cluster_name,
-                    trust_domain = %trust_domain,
-                    endpoint = %endpoint_for_logs,
+                    cluster = %sanitize_startup_scalar(&cluster_name),
+                    trust_domain = %sanitize_startup_scalar(&trust_domain),
+                    endpoint = %sanitize_startup_scalar(&endpoint_for_logs),
                     error = %sanitize_startup_cause(&err, &[]),
-                    fail_open = config.fail_open,
+                    fail_open = %sanitize_startup_scalar(config.fail_open),
                     "SPIFFE federation poll failed; keeping last-good bundle if any"
                 );
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_federation_poll_failure(
@@ -1032,10 +1032,10 @@ fn expire_stale_bundle_after_failure(
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     if store.expire_stale_bundle(cluster_name, trust_domain, now, max_stale_age) {
         warn!(
-            cluster = %cluster_name,
-            trust_domain = %trust_domain,
-            endpoint = %endpoint_for_logs,
-            max_stale_seconds = max_stale_age.as_secs(),
+            cluster = %sanitize_startup_scalar(cluster_name),
+            trust_domain = %sanitize_startup_scalar(trust_domain),
+            endpoint = %sanitize_startup_scalar(endpoint_for_logs),
+            max_stale_seconds = %sanitize_startup_scalar(max_stale_age.as_secs()),
             "Expired last-good SPIFFE federation bundle after bounded staleness window"
         );
     }
@@ -1063,6 +1063,10 @@ async fn fetch_and_install_bundle(
     // of those components may reach the unauthenticated metrics surface.
     // The request itself still goes to the original URL.
     let endpoint_for_logs = sanitize_endpoint_for_logging(endpoint);
+    // The origin remains a supplied configuration scalar. The HTTP helper also
+    // emits its diagnostic URL in slow/retry events, so withhold it there while
+    // retaining the existing origin-based metrics identity in the poll loop.
+    let endpoint_diagnostic = sanitize_startup_scalar(&endpoint_for_logs);
     let request = http_client
         .get()
         .map_err(|e| format!("HTTP request failed: {e}"))?
@@ -1070,7 +1074,7 @@ async fn fetch_and_install_bundle(
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(config.request_timeout);
     let response = http_client
-        .execute_redacted(request, "mesh_federation_poll", &endpoint_for_logs)
+        .execute_redacted(request, "mesh_federation_poll", &endpoint_diagnostic)
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
     let status = response.status();
@@ -1083,7 +1087,7 @@ async fn fetch_and_install_bundle(
         && cl_value as usize > FEDERATION_MAX_BODY_BYTES
     {
         return Err(format!(
-            "federation response Content-Length {} exceeds {} byte cap",
+            "federation response Content-Length \"{}\" exceeds {} byte cap",
             cl_value, FEDERATION_MAX_BODY_BYTES
         ));
     }
@@ -1112,9 +1116,9 @@ async fn fetch_and_install_bundle(
     }
     store.record_poll_success_if_live(cluster_name, trust_domain, now, task_generation);
     info!(
-        cluster = %cluster_name,
-        trust_domain = %trust_domain,
-        endpoint = %endpoint_for_logs,
+        cluster = %sanitize_startup_scalar(cluster_name),
+        trust_domain = %sanitize_startup_scalar(trust_domain),
+        endpoint = %sanitize_startup_scalar(&endpoint_for_logs),
         "Installed federated trust bundle"
     );
     Ok(true)
@@ -1134,7 +1138,7 @@ async fn read_bounded_body(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             let error_class = crate::retry::classify_reqwest_error(&e);
-            format!("{error_class} reading federation response body from {endpoint_for_logs}")
+            format!("{error_class} reading federation response body from {endpoint_for_logs:?}")
         })?;
         if buf.len().saturating_add(chunk.len()) > max_bytes {
             return Err(format!(
@@ -1357,6 +1361,157 @@ mod tests {
     use super::*;
     use crate::identity::TrustDomain;
     use crate::modes::mesh::config::TrustBundle;
+    use crate::modes::mesh::config_consumer::common::diagnostic_test_support::DiagnosticLogs;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn federation_lifecycle_emissions_withhold_each_configured_field() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let logs = DiagnosticLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let cluster = "'UNREGISTERED_CLUSTER5591\"\\\n";
+        let domain = td("unregistered-td5591.example");
+        let endpoint = "https://unregistered-host5591.example/private?token=secret";
+        let store = FederationStore::new();
+        let config = FederationPollerConfig {
+            poll_interval: Duration::from_secs(918273),
+            request_timeout: Duration::from_secs(1),
+            max_stale_age: Some(Duration::from_secs(918274)),
+            fail_open: true,
+        };
+        let multi_cluster = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: vec![RemoteCluster {
+                name: cluster.to_string(),
+                trust_domain: domain.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some(endpoint.to_string()),
+                discovery_credential_ref: None,
+            }],
+            east_west_gateways: Vec::new(),
+        };
+        let (_, shutdown_rx) = watch::channel(true);
+        let handles = spawn_federation_poller(
+            Some(&multi_cluster),
+            Some(config.clone()),
+            PluginHttpClient::default(),
+            store.clone(),
+            shutdown_rx,
+        )
+        .unwrap();
+        assert_eq!(handles.tasks.len(), 1);
+        // Retire before yielding: these startup-emission assertions need no
+        // remote endpoint or background network request.
+        for handle in handles.tasks {
+            handle.abort();
+        }
+        let mut manager =
+            FederationPollerManager::new(Some(config), PluginHttpClient::default(), store.clone());
+        manager.reconcile(Some(&multi_cluster));
+        assert_eq!(manager.running_cluster_names(), vec![cluster.to_string()]);
+        manager.shutdown();
+
+        let generation = store.register(cluster);
+        assert!(store.install(
+            cluster,
+            domain.clone(),
+            FederatedBundle {
+                bundle: TrustBundle {
+                    trust_domain: domain.clone(),
+                    x509_authorities: vec![sample_cert_base64()],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                fetched_at_unix_seconds: 1,
+                endpoint: endpoint.to_string(),
+                cluster_name: cluster.to_string(),
+            },
+            generation,
+        ));
+        expire_stale_bundle_after_failure(
+            &store,
+            cluster,
+            &domain,
+            Some(Duration::from_secs(918274)),
+            &sanitize_endpoint_for_logging(endpoint),
+        );
+        assert!(!store.snapshot().bundles.contains_key(&domain));
+        let output = logs.output();
+        assert_eq!(output.matches("poll_interval_seconds=").count(), 2, "{output}");
+        for field in [
+            "cluster=",
+            "trust_domain=",
+            "endpoint=",
+            "max_stale_seconds=",
+            "fail_open=",
+        ] {
+            assert!(output.contains(field), "{output}");
+        }
+        for secret in [
+            "UNREGISTERED_CLUSTER5591",
+            "unregistered-td5591",
+            "unregistered-host5591",
+            "918273",
+            "918274",
+            "true",
+        ] {
+            assert!(!output.contains(secret), "{output}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_federation_poll_keeps_reason_without_supplied_values() {
+        let logs = DiagnosticLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let store = FederationStore::new();
+        let cluster = "'UNREGISTERED_POLL_CLUSTER5591";
+        let generation = store.register(cluster);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let poll = poll_federation_loop(
+            RemoteClusterPollTarget {
+                cluster_name: cluster.to_string(),
+                trust_domain: td("unregistered-poll-td5591.example"),
+                // Invalid URI fails request construction, before any network I/O.
+                endpoint: "://UNREGISTERED_POLL_ENDPOINT5591".to_string(),
+            },
+            store.clone(),
+            FederationPollerConfig {
+                poll_interval: Duration::from_secs(918275),
+                request_timeout: Duration::from_secs(1),
+                max_stale_age: None,
+                fail_open: true,
+            },
+            PluginHttpClient::default(),
+            shutdown_rx,
+            generation,
+        );
+        let stop_after_failure = async {
+            while !logs.output().contains("error=") {
+                tokio::task::yield_now().await;
+            }
+            shutdown_tx.send(true).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(poll, stop_after_failure);
+        })
+        .await
+        .expect("failed poll must observe shutdown");
+        assert!(store.snapshot().bundles.is_empty());
+        let output = logs.output();
+        assert!(output.contains("HTTP request failed"), "{output}");
+        assert!(output.contains("fail_open="), "{output}");
+        for secret in [
+            "UNREGISTERED_POLL_CLUSTER5591",
+            "unregistered-poll-td5591",
+            "UNREGISTERED_POLL_ENDPOINT5591",
+            "918275",
+            "true",
+        ] {
+            assert!(!output.contains(secret), "{output}");
+        }
+    }
 
     fn td(s: &str) -> TrustDomain {
         TrustDomain::new(s).expect("valid trust domain")

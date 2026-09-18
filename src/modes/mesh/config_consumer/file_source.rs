@@ -43,7 +43,7 @@ use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use crate::modes::mesh::revision::MeshRevisionContentIdentity;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, slice_content_identity};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-use crate::startup::sanitize_startup_cause;
+use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar};
 
 /// On-disk shape of the localized mesh config document.
 ///
@@ -86,7 +86,12 @@ pub async fn load_mesh_slice_from_file_off_thread(
     tokio::task::spawn_blocking(move || load_mesh_slice_from_file(&path, request))
         .await
         .map_err(|error| {
-            anyhow::anyhow!("Mesh configuration file validation worker failed: {error}")
+            let reason = if error.is_cancelled() {
+                "cancelled"
+            } else {
+                "panicked"
+            };
+            anyhow::anyhow!("Mesh configuration file validation worker failed: {reason}")
         })?
 }
 
@@ -447,7 +452,7 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                             ) {
                                 info!(
                                     file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
-                                    mesh_slice_version = result.version.as_deref().unwrap_or(""),
+                                    mesh_slice_version = %sanitize_startup_scalar(result.version.as_deref().unwrap_or("")),
                                     generation,
                                     outcome = ?result.apply,
                                     "{}", messages.reloaded
@@ -472,11 +477,11 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                             "{}", messages.join_cancelled
                         );
                     }
-                    Err(join_error) => {
+                    Err(_) => {
                         warn!(
                             file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
-                            error = %join_error,
+                            error = "reload worker panicked (details withheld)",
                             "{}", messages.worker_panicked
                         );
                         mark_mesh_local_reload_rejected(recovery);
@@ -927,7 +932,7 @@ pub fn apply_mesh_file_reload_candidate(
                 }
                 MeshSliceInstall::Quarantined(rejection) => {
                     warn!(
-                        ?rejection,
+                        rejection = %sanitize_startup_cause(&rejection, &[]),
                         "Mesh file reload quarantined by the revision gate; keeping the last \
                          good mesh slice and raising config_rejected"
                     );
@@ -1056,5 +1061,79 @@ fn stop_accepting_reload_candidates<T>(
     if let Some((_, handle)) = in_flight.take() {
         handle.abort();
         drop(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::common::diagnostic_test_support::DiagnosticLogs;
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_emissions_withhold_versions_and_panic_payloads() {
+        for panic_worker in [false, true] {
+            let logs = DiagnosticLogs::default();
+            let _guard = tracing::subscriber::set_default(logs.subscriber());
+            let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+            let (notify_tx, notify_rx) = tokio::sync::mpsc::channel(1);
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let applied = std::cell::Cell::new(0);
+            notify_tx.send(()).await.unwrap();
+            let reload = run_mesh_local_reload_loop(
+                notify_rx,
+                &mut shutdown_rx,
+                "'UNREGISTERED_PATH5591\"\\\n",
+                &recovery,
+                &MESH_FILE_RELOAD_MESSAGES,
+                || {
+                    tokio::spawn(async move {
+                        if panic_worker {
+                            panic!("UNREGISTERED_PANIC5591 '\"\\\n");
+                        }
+                        Ok(())
+                    })
+                },
+                |()| {
+                    applied.set(applied.get() + 1);
+                    shutdown_tx.send(true).unwrap();
+                    MeshLocalReloadResult {
+                        apply: MeshLocalReloadApply::Applied,
+                        version: Some("'UNREGISTERED_VERSION5591\"\\\n".to_string()),
+                    }
+                },
+            );
+            let stop_after_rejection = async {
+                if panic_worker {
+                    while !recovery.is_rejected() {
+                        tokio::task::yield_now().await;
+                    }
+                    shutdown_tx.send(true).unwrap();
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(reload, stop_after_rejection);
+            })
+            .await
+            .expect("reload must complete and observe shutdown");
+            assert_eq!(recovery.is_rejected(), panic_worker);
+            assert_eq!(applied.get(), usize::from(!panic_worker));
+            let output = logs.output();
+            assert!(output.contains("file_path="), "{output}");
+            assert!(output.contains("generation=1"), "{output}");
+            if panic_worker {
+                assert!(output.contains("error="), "{output}");
+                assert!(output.contains("panicked"), "{output}");
+            } else {
+                assert!(output.contains("mesh_slice_version="), "{output}");
+                assert!(output.contains("outcome=Applied"), "{output}");
+            }
+            for secret in [
+                "UNREGISTERED_PATH5591",
+                "UNREGISTERED_VERSION5591",
+                "UNREGISTERED_PANIC5591",
+            ] {
+                assert!(!output.contains(secret), "{output}");
+            }
+        }
     }
 }
