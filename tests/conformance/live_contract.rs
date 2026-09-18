@@ -1960,10 +1960,7 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
         }
     }
 
-    let client_logs = non_comment_lines(&bash_function_body(
-        source,
-        "native_rotation_client_logs",
-    ));
+    let client_logs = non_comment_lines(&bash_function_body(source, "native_rotation_client_logs"));
     for required in [
         "logs \"pod/$NATIVE_ROTATION_NODE_ID\"",
         "-c ferrum-edge",
@@ -1983,7 +1980,9 @@ fn native_rotation_observation_violations(source: &str) -> Vec<String> {
     ] {
         let body = non_comment_lines(&bash_function_body(source, function));
         if !body.contains("native_rotation_client_logs > \"$client_file\"") {
-            errors.push(format!("rotation client log provenance missing in {function}"));
+            errors.push(format!(
+                "rotation client log provenance missing in {function}"
+            ));
         }
     }
 
