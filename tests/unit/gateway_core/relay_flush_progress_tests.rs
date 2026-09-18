@@ -19,8 +19,12 @@
 //!
 //! * `bidirectional_copy_for_test_with_timeouts` — userspace TCP/TLS and
 //!   WebSocket tunnel mode (`bidirectional_copy_for_relay`);
-//! * `bidirectional_copy_for_fenced_relay_for_test` — the HBONE HTTP/2 CONNECT
-//!   byte tunnel, under the mesh admission fence's revocation bound;
+//! * `bidirectional_copy_for_fenced_relay_for_test` — the fenced entry point
+//!   the HBONE HTTP/2 CONNECT byte tunnel enters, under the mesh admission
+//!   fence's revocation bound. The tunnel's own H2 leg cannot be the buffering
+//!   writer (`H2ConnectTunnel::poll_flush` is a compile-time no-op); the
+//!   direction a buffering writer stalls on HBONE is backend→client, through
+//!   the inbound mTLS `TlsStream`;
 //! * `bidirectional_copy_with_authorization_for_test` — the authorization
 //!   lifetime bound.
 //!
@@ -53,6 +57,14 @@ const RELAY_HALF_CLOSE_CAP: Option<Duration> = Some(Duration::from_secs(300));
 /// unfixed loop never delivers at all, so this only has to exceed scheduling
 /// noise.
 const DELIVERY_WINDOW: Duration = Duration::from_secs(5);
+
+/// The authorization bound is an absolute `Instant` armed before the relay is
+/// spawned, so the delivery asserted under it has to land inside it and there
+/// is no signal to sequence on — the deadline cannot be shortened once set. The
+/// remedy is margin: six times the 500 ms this started at, which still bounds
+/// the test at three seconds but leaves the whole spawn/poll/write/flush
+/// sequence far more room than a saturated runner needs.
+const AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(3);
 
 const RELAY_BUFFER: usize = 8 * 1024;
 const PEER_BUFFER: usize = 64 * 1024;
@@ -113,7 +125,39 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FlushCounting<S> {
 /// A writer that accepts every byte and never lets go of one: `poll_flush`
 /// stays `Pending` forever. Models a TLS writer whose transport has stopped
 /// draining, so the relay owes a flush it cannot complete.
-struct AcceptsButNeverFlushes;
+///
+/// `accepted` is the observable signal a test sequences on. "The relay has
+/// handed the payload to the stalled writer" is a state, not an elapsed
+/// duration; waiting on a sleep only approximates it and can miss entirely on a
+/// saturated runner, which is exactly the hosted-CI condition this repository
+/// keeps hitting.
+struct AcceptsButNeverFlushes {
+    accepted: Arc<AtomicUsize>,
+    /// `Pending` from `poll_shutdown` as well, so a wedged writer's half-close
+    /// never resolves either. `false` keeps the ordinary
+    /// "flush stalls, shutdown still works" shape.
+    wedge_shutdown: bool,
+}
+
+impl AcceptsButNeverFlushes {
+    /// A writer whose flush never completes. Returns the writer and the
+    /// accepted-byte counter to sequence on.
+    fn new() -> (Self, Arc<AtomicUsize>) {
+        Self::with_wedged_shutdown(false)
+    }
+
+    /// The same writer, whose `poll_shutdown` never completes either — a
+    /// backend that took the bytes and whose transport then stopped moving
+    /// altogether, so the half-close it implies can never be performed.
+    fn with_wedged_shutdown(wedge_shutdown: bool) -> (Self, Arc<AtomicUsize>) {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let writer = Self {
+            accepted: Arc::clone(&accepted),
+            wedge_shutdown,
+        };
+        (writer, accepted)
+    }
+}
 
 impl AsyncRead for AcceptsButNeverFlushes {
     fn poll_read(
@@ -131,6 +175,7 @@ impl AsyncWrite for AcceptsButNeverFlushes {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.accepted.fetch_add(buf.len(), Ordering::SeqCst);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -139,11 +184,87 @@ impl AsyncWrite for AcceptsButNeverFlushes {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.wedge_shutdown {
+            return Poll::Pending;
+        }
         Poll::Ready(Ok(()))
     }
 }
 
+/// A writer that accepts every byte, flushes, and then fails its half-close
+/// with `kind`. `poll_shutdown` implies a flush attempt, not a completed one:
+/// when it fails, the bytes this direction already credited never left.
+///
+/// Its read half reports EOF rather than `Pending`, so the opposite direction
+/// finishes on its own instead of parking for the relay's (deliberately long)
+/// idle timeout.
+struct AcceptsThenFailsShutdown {
+    kind: io::ErrorKind,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl AcceptsThenFailsShutdown {
+    fn new(kind: io::ErrorKind) -> (Self, Arc<AtomicUsize>) {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let writer = Self {
+            kind,
+            accepted: Arc::clone(&accepted),
+        };
+        (writer, accepted)
+    }
+}
+
+impl AsyncRead for AcceptsThenFailsShutdown {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for AcceptsThenFailsShutdown {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.accepted.fetch_add(buf.len(), Ordering::SeqCst);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::new(self.kind, SHUTDOWN_FAILURE_TEXT)))
+    }
+}
+
+/// Wait, bounded, until a fixture counter reaches `expected`.
+///
+/// The relay has to have polled before a test can act on "the writer is holding
+/// the payload" or "the flush already completed". Those are states, and this
+/// observes them; a sleep long enough to usually cover them is what fails on a
+/// saturated runner.
+async fn wait_until_at_least(counter: &AtomicUsize, expected: usize, what: &str) {
+    let poll_until = async {
+        while counter.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    let observed = tokio::time::timeout(DELIVERY_WINDOW, poll_until).await;
+    assert!(
+        observed.is_ok(),
+        "the relay must reach {expected} {what}, observed {}",
+        counter.load(Ordering::SeqCst)
+    );
+}
+
 const FLUSH_FAILURE_TEXT: &str = "simulated transport abort during flush";
+const SHUTDOWN_FAILURE_TEXT: &str = "simulated transport abort during half-close";
 
 /// A writer that accepts every byte and then fails the flush. The failure is
 /// raised by the flush, not by a write, so it must still be attributed to the
@@ -273,11 +394,21 @@ async fn a_buffered_client_writer_is_flushed_while_the_backend_reader_is_pending
     assert_eq!(result.bytes_backend_to_client, RESPONSE.len() as u64);
 }
 
-/// The HBONE HTTP/2 CONNECT byte tunnel runs the same copy loop through
-/// `bidirectional_copy_for_fenced_relay`. Exercise it the same way, so the
-/// sibling the audit named is covered behaviorally and not only structurally.
+/// The fenced entry point — `bidirectional_copy_for_fenced_relay`, which the
+/// HBONE HTTP/2 CONNECT byte tunnel enters — runs the same copy loop. Exercise
+/// it the same way, so the sibling the audit named is covered behaviorally and
+/// not only structurally.
+///
+/// This proves the SHARED PUMP, not an H2 byte tunnel: the buffering writer is
+/// a `BufWriter`. On HBONE itself the H2 leg can never be the writer that holds
+/// bytes — `H2ConnectTunnel::poll_flush` (`src/proxy/hbone_pool.rs`) is a
+/// compile-time `Poll::Ready(Ok(()))` because the h2 driver flushes on its own.
+/// The direction that a buffering writer can stall there is backend→client on
+/// the inbound fenced relay, where the bytes reach the peer through the inbound
+/// mTLS `TlsStream`; `a_rustls_writer_holding_ciphertext_is_flushed_while_the_reader_is_pending`
+/// is the rustls-backpressure coverage for that writer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_fenced_h2_byte_tunnel_relay_flushes_a_buffering_writer_too() {
+async fn the_fenced_relay_entry_point_shares_the_flushing_pump() {
     let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
     let (backend, mut backend_peer) = buffered_leg(PEER_BUFFER);
 
@@ -552,9 +683,10 @@ async fn a_writer_that_never_completes_its_flush_still_trips_the_write_timeout()
         .await
         .expect("client request");
 
+    let (backend, _accepted) = AcceptsButNeverFlushes::new();
     let relay = bidirectional_copy_for_test_with_timeouts(
         client,
-        AcceptsButNeverFlushes,
+        backend,
         None,
         None,
         None,
@@ -587,6 +719,215 @@ async fn a_writer_that_never_completes_its_flush_still_trips_the_write_timeout()
         REQUEST.len() as u64,
         "bytes the writer already accepted stay credited, matching the splice path"
     );
+    drop(client_peer);
+}
+
+/// The half-close is the other place a writer can sit holding bytes it
+/// accepted, and it is the one the first round of this fix left unbounded.
+/// `poll_shutdown` implies a flush *attempt*, not a completed one, so the
+/// write-stall deadline has to survive `begin_half_close` and go inert only
+/// when the shutdown resolves.
+///
+/// The configuration is the one that makes it load-bearing: idle timeout and
+/// half-close cap both disabled — a documented long-lived-TCP setting — leave
+/// `backend_write_timeout_ms` as the only timer that still describes this
+/// direction. A non-zero write timeout also keeps the relay on the
+/// direction-tracking path rather than tokio's all-bounds-disabled fast path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wedged_half_close_still_trips_the_write_timeout_with_no_other_bound() {
+    let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
+    // EOF on the client leg is what drives this direction into the half-close;
+    // the bytes written before it stay readable, then the reader sees EOF.
+    client_peer.shutdown().await.expect("client half-close");
+
+    let (backend, accepted) = AcceptsButNeverFlushes::with_wedged_shutdown(true);
+    // The third and fourth arguments are the idle timeout and the half-close
+    // cap: `tcp_idle_timeout_seconds: 0` and `tcp_half_close_max_wait_seconds:
+    // 0`. Only `backend_write_timeout` is left.
+    let relay = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        None,
+        None,
+        None,
+        Some(Duration::from_millis(1500)),
+        RELAY_BUFFER,
+    );
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(10), relay)
+        .await
+        .expect("the write deadline must bound a half-close that cannot complete");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        REQUEST.len(),
+        "the writer must have taken the request before the half-close wedged"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "the write deadline must fire within timeout + a watchdog tick: {elapsed:?}"
+    );
+    let (dir, class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("a wedged half-close must surface the backend write inactivity timeout");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Write));
+    assert!(
+        msg.contains("backend write inactivity"),
+        "failure message must name the write inactivity deadline, got: {msg}"
+    );
+    assert_eq!(
+        result.bytes_client_to_backend,
+        REQUEST.len() as u64,
+        "bytes the writer already accepted stay credited, matching the splice path"
+    );
+    drop(client_peer);
+}
+
+/// A `poll_shutdown` that fails did not perform the flush it implies: the bytes
+/// this direction already credited never left the writer. Reporting the
+/// direction as a clean completion would hide that tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_half_close_whose_shutdown_fails_is_reported_as_a_write_failure() {
+    let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
+    client_peer.shutdown().await.expect("client half-close");
+
+    let (backend, accepted) = AcceptsThenFailsShutdown::new(io::ErrorKind::ConnectionAborted);
+    let relay = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        RELAY_BUFFER,
+    );
+    let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
+        .await
+        .expect("a failing half-close must end the relay rather than park it");
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        REQUEST.len(),
+        "the writer must have taken the request before failing its half-close"
+    );
+    let (dir, class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("an accepted-but-undelivered tail is not a clean completion");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*class, ErrorClass::ConnectionClosed);
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Write),
+        "the half-close belongs to the writer, so the failure is write-side"
+    );
+    assert!(
+        msg.contains(SHUTDOWN_FAILURE_TEXT),
+        "the transport's own message must survive classification, got: {msg}"
+    );
+    assert_eq!(
+        result.bytes_client_to_backend,
+        REQUEST.len() as u64,
+        "bytes accepted before the failing half-close stay credited"
+    );
+    drop(client_peer);
+}
+
+/// The propagation is scoped to what the finding is about: a tail the writer
+/// accepted and never delivered. A direction that owes no flush — its writer
+/// already flushed everything it took — truncates nothing when its half-close
+/// fails, and stays a clean completion. Without that scope, every teardown on a
+/// connection that carried its bytes successfully would become an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_half_close_with_nothing_outstanding_stays_a_clean_completion() {
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let (failing, accepted) = AcceptsThenFailsShutdown::new(io::ErrorKind::ConnectionAborted);
+    let backend = FlushCounting::new(failing, Arc::clone(&flushes));
+    let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
+
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
+
+    let relay = tokio::spawn(bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        RELAY_BUFFER,
+    ));
+
+    // A completed flush is what clears the debt, so half-close the client only
+    // once one has been observed: the relay then reaches `poll_shutdown` owing
+    // nothing, which is the state under test.
+    wait_until_at_least(&accepted, REQUEST.len(), "accepted bytes").await;
+    wait_until_at_least(&flushes, 1, "completed flushes").await;
+    client_peer.shutdown().await.expect("client half-close");
+
+    let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
+        .await
+        .expect("the relay must finish once the half-close resolves")
+        .expect("relay task");
+    assert!(
+        result.first_failure.is_none(),
+        "a half-close that truncates nothing must stay graceful, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_client_to_backend, REQUEST.len() as u64);
+    drop(client_peer);
+}
+
+/// The counterpart bound: a benign write-after-close errno on the half-close is
+/// the tail of the peer's own `close_notify`/FIN dance, and stays a clean
+/// completion exactly as it did before this arm propagated anything. Widening
+/// the propagation to cover these would turn ordinary teardown into
+/// `total_errors`, which is what `is_post_eof_benign_write_error` exists to
+/// prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_benign_write_after_close_half_close_stays_a_clean_completion() {
+    let (client, mut client_peer) = tokio::io::duplex(PEER_BUFFER);
+    client_peer
+        .write_all(REQUEST)
+        .await
+        .expect("client request");
+    client_peer.shutdown().await.expect("client half-close");
+
+    let (backend, accepted) = AcceptsThenFailsShutdown::new(io::ErrorKind::BrokenPipe);
+    let relay = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        RELAY_BUFFER,
+    );
+    let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
+        .await
+        .expect("a benign half-close failure must still end the relay promptly");
+
+    assert_eq!(accepted.load(Ordering::SeqCst), REQUEST.len());
+    assert!(
+        result.first_failure.is_none(),
+        "a benign write-after-close half-close must stay graceful, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_client_to_backend, REQUEST.len() as u64);
     drop(client_peer);
 }
 
@@ -648,9 +989,10 @@ async fn admission_revocation_still_cuts_a_relay_whose_writer_holds_bytes() {
         .await
         .expect("client request");
 
+    let (backend, accepted) = AcceptsButNeverFlushes::new();
     let relay = tokio::spawn(bidirectional_copy_for_fenced_relay_for_test(
         client,
-        AcceptsButNeverFlushes,
+        backend,
         RELAY_IDLE_TIMEOUT,
         RELAY_HALF_CLOSE_CAP,
         None,
@@ -659,9 +1001,10 @@ async fn admission_revocation_still_cuts_a_relay_whose_writer_holds_bytes() {
         Some(token.clone()),
     ));
 
-    // Let the relay accept the request into the stalled writer first, so the
-    // revocation has to interrupt a direction that is parked mid-flush.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The revocation has to interrupt a direction that is parked mid-flush, so
+    // wait for the writer to have actually taken the request rather than for a
+    // duration that usually covers it.
+    wait_until_at_least(&accepted, REQUEST.len(), "accepted bytes").await;
     token.cancel();
 
     let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
@@ -705,7 +1048,7 @@ async fn the_authorization_deadline_still_fires_with_a_buffering_writer() {
     let relay = tokio::spawn(bidirectional_copy_with_authorization_for_test(
         client,
         backend,
-        tokio::time::Instant::now() + Duration::from_millis(500),
+        tokio::time::Instant::now() + AUTHORIZATION_LIFETIME,
         Arc::clone(&expired),
         RELAY_BUFFER,
     ));
@@ -717,7 +1060,7 @@ async fn the_authorization_deadline_still_fires_with_a_buffering_writer() {
         .expect("backend read");
     assert_eq!(seen, REQUEST);
 
-    let result = tokio::time::timeout(DELIVERY_WINDOW, relay)
+    let result = tokio::time::timeout(AUTHORIZATION_LIFETIME + DELIVERY_WINDOW, relay)
         .await
         .expect("the authorization deadline must end the relay")
         .expect("relay task");

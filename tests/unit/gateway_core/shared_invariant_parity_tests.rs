@@ -2354,21 +2354,74 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
 // admission-revocation bounds.
 // ---------------------------------------------------------------------------
 
+/// The two entry points into the shared relay.
+const RELAY_ENTRY_POINT: &str = "tcp_proxy::bidirectional_copy_for_relay(";
+const FENCED_RELAY_ENTRY_POINT: &str = "tcp_proxy::bidirectional_copy_for_fenced_relay(";
+
+/// Every `src/**/*.rs` file that calls one of them, as `(path, entry point,
+/// what it carries)`. This table is compared for **set equality** against the
+/// files that actually call either entry point, not merely checked from the
+/// table outwards: a fifth call site — a new tunnelled protocol, or a second
+/// copy of an existing one — fails the build until it is listed here and
+/// inherits the invariant.
+const RELAY_CALL_SITES: &[(&str, &str, &str)] = &[
+    (
+        "src/proxy/hbone_proxy.rs",
+        FENCED_RELAY_ENTRY_POINT,
+        "HBONE HTTP/2 CONNECT byte tunnel, under the mesh admission fence",
+    ),
+    (
+        "src/proxy/mesh_tcp_egress.rs",
+        RELAY_ENTRY_POINT,
+        "mesh captured raw-TCP egress, over an H2 CONNECT tunnel",
+    ),
+    (
+        "src/proxy/mesh_tcp_inbound.rs",
+        RELAY_ENTRY_POINT,
+        "mesh captured raw-TCP inbound, to the loopback app",
+    ),
+    (
+        "src/proxy/mod.rs",
+        RELAY_ENTRY_POINT,
+        "raw TCP/TLS passthrough and WebSocket tunnel mode",
+    ),
+    // Not a datapath: `_test_support` re-exports the fenced entry point so
+    // `relay_flush_progress_tests.rs` can drive the production relay rather
+    // than a re-typed copy of it. It belongs in the set-equality table because
+    // it genuinely calls the entry point; leaving it out would need a
+    // by-name exclusion, which is the hole this table exists to close.
+    (
+        "src/lib.rs",
+        FENCED_RELAY_ENTRY_POINT,
+        "`_test_support` re-export, not a datapath",
+    ),
+];
+
 #[test]
 fn every_tunnelled_relay_path_shares_one_flushing_byte_pump() {
-    const RELAY: &str = "tcp_proxy::bidirectional_copy_for_relay(";
-    const FENCED: &str = "tcp_proxy::bidirectional_copy_for_fenced_relay(";
-    for (path, entry_point) in [
-        // WebSocket tunnel mode.
-        ("src/proxy/mod.rs", RELAY),
-        ("src/proxy/mesh_tcp_inbound.rs", RELAY),
-        ("src/proxy/mesh_tcp_egress.rs", RELAY),
-        // HBONE HTTP/2 CONNECT byte tunnel, under the admission fence.
-        ("src/proxy/hbone_proxy.rs", FENCED),
-    ] {
+    let calling: BTreeSet<String> = production_sources()
+        .into_iter()
+        .filter(|(_, text)| {
+            let code = admission_source_without_line_comments(text);
+            code.contains(RELAY_ENTRY_POINT) || code.contains(FENCED_RELAY_ENTRY_POINT)
+        })
+        .map(|(path, _)| path)
+        .collect();
+    let expected: BTreeSet<String> = RELAY_CALL_SITES
+        .iter()
+        .map(|(path, _, _)| (*path).to_string())
+        .collect();
+    assert_eq!(
+        calling, expected,
+        "a call site reaching the shared relay changed; every tunnelled path must keep \
+         using the one flushing copy loop, and each one belongs in RELAY_CALL_SITES"
+    );
+
+    for &(path, entry_point, carries) in RELAY_CALL_SITES {
         assert!(
             admission_source_without_line_comments(&source(path)).contains(entry_point),
-            "{path}: tunnelled relays must reuse the shared `tcp_proxy` copy loop"
+            "{path} ({carries}): must reach the shared `tcp_proxy` copy loop through \
+             `{entry_point}`"
         );
     }
 
@@ -2386,6 +2439,11 @@ fn every_tunnelled_relay_path_shares_one_flushing_byte_pump() {
     assert!(
         pump.contains("writer.as_mut().poll_flush(cx)"),
         "the reader-pending branch must flush the writer before parking"
+    );
+    assert!(
+        pump.contains("finish_half_close(outcome, state, write_watermark)"),
+        "the half-close must resolve through `finish_half_close`, so a `poll_shutdown` \
+         that fails is not reported as a clean completion"
     );
 
     // Only `tcp_proxy.rs` may reach for tokio's bidirectional copy, and there

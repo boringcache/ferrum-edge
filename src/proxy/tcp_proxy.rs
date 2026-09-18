@@ -8437,17 +8437,95 @@ enum CopyReadOutcome {
 
 /// Enter the half-close phase for one direction.
 ///
-/// `AsyncWrite::poll_shutdown` implies a flush, so anything the writer is
-/// still holding leaves with the half-close and the write-stall deadline goes
-/// inert here — the same point it did before flush tracking existed. What
-/// bounds a writer that cannot complete its half-close is the idle timeout and
-/// the half-close hard cap, unchanged.
+/// `AsyncWrite::poll_shutdown` implies a flush *attempt* — not a completed one
+/// and not a successful one. A writer that is still holding bytes it accepted
+/// therefore stays under the write-stall deadline across the half-close: the
+/// watermark keeps the timestamp of the last accepted write, and only
+/// [`finish_half_close`] makes it inert. Disarming here instead would leave
+/// `tcp_idle_timeout_seconds: 0` + `tcp_half_close_max_wait_seconds: 0` +
+/// a non-zero `backend_write_timeout_ms` with nothing at all bounding a
+/// `poll_shutdown` that never resolves — the relay's own buffer is empty by
+/// then, so the watermark is the only timer still describing this direction.
+///
+/// When the direction owes no flush the watermark is already inert; storing
+/// the sentinel keeps that explicit instead of resting on the caller's
+/// history.
 fn begin_half_close(state: &mut CopyDirectionState, write_watermark: Option<&AtomicU64>) {
+    if !state.needs_flush && let Some(wm) = write_watermark {
+        wm.store(u64::MAX, Ordering::Relaxed);
+    }
+    state.phase = CopyPhase::ShuttingDown;
+}
+
+/// Errnos a half-close may legitimately raise because the peer is already gone.
+///
+/// The write-path set ([`is_post_eof_benign_write_error`]) is the base.
+/// `poll_shutdown` adds one spelling of its own: on a real socket it is
+/// `shutdown(SHUT_WR)`, and a peer that has already reset the connection makes
+/// that syscall fail with `ENOTCONN` rather than with any of the write errnos.
+/// It is the same teardown race seen through a different syscall, and the half
+/// that actually lost data still reports it — a peer that vanished mid-relay
+/// surfaces `ECONNRESET` on the opposite direction's *read*, which is never
+/// reclassified. Admitting it here only avoids double-reporting ordinary
+/// teardown.
+///
+/// `ConnectionAborted` stays excluded for the reason
+/// [`is_post_eof_benign_write_error`] documents: on Linux it can be a kernel
+/// abort, not a close-race signal.
+fn is_benign_half_close_error(kind: std::io::ErrorKind) -> bool {
+    is_post_eof_benign_write_error(StreamIoSide::Write, kind)
+        || matches!(kind, std::io::ErrorKind::NotConnected)
+}
+
+/// Resolve a completed half-close into this direction's result, and release the
+/// write-stall deadline.
+///
+/// **Deadline.** The half-close has resolved, so nothing this direction
+/// accepted is still owed to the writer and the watermark goes inert HERE
+/// rather than at [`begin_half_close`]. That is what keeps
+/// `backend_write_timeout` on a writer whose implied flush never completes,
+/// which is otherwise unbounded when the idle timeout and the half-close cap
+/// are both disabled.
+///
+/// **Result.** `poll_shutdown` implies a flush attempt, not a completed one. A
+/// failure means the bytes this direction already credited never left the
+/// writer, so reporting a clean completion would hide a truncated tail. Two
+/// conditions narrow that to exactly the tail the report is about, because this
+/// arm discarded every shutdown error before and widening it too far would turn
+/// routine teardown into `total_errors`:
+///
+/// * the direction must actually have owed a flush — a writer that already
+///   flushed everything it accepted truncates nothing when its half-close
+///   fails; and
+/// * the errno must not be a benign peer-already-gone one
+///   ([`is_benign_half_close_error`]). Surfacing those would additionally make
+///   an ordinary close race depend on the opposite direction's grace window and
+///   on `both_directions_transferred`.
+///
+/// A qualifying shutdown failure outranks `terminal_read_error`: the only value
+/// ever stored there is a userspace-rustls close-without-notify read, which
+/// both `classify_phase1_copy_failure` and `drain_half_close_direction` already
+/// treat as clean EOF, so nothing is lost by reporting the write failure in its
+/// place.
+fn finish_half_close(
+    outcome: Result<(), std::io::Error>,
+    state: &mut CopyDirectionState,
+    write_watermark: Option<&AtomicU64>,
+) -> Poll<Result<(), (StreamIoSide, std::io::Error)>> {
+    let owed_flush = state.needs_flush;
     state.needs_flush = false;
     if let Some(wm) = write_watermark {
         wm.store(u64::MAX, Ordering::Relaxed);
     }
-    state.phase = CopyPhase::ShuttingDown;
+    match outcome {
+        Err(e) if owed_flush && !is_benign_half_close_error(e.kind()) => {
+            Poll::Ready(Err((StreamIoSide::Write, e)))
+        }
+        _ => match state.terminal_read_error.take() {
+            Some(e) => Poll::Ready(Err((StreamIoSide::Read, e))),
+            None => Poll::Ready(Ok(())),
+        },
+    }
 }
 
 // The queue state and watermark are private. Keep their deterministic
@@ -8552,8 +8630,13 @@ fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
 /// this function flushes before parking. Without that, a buffering writer —
 /// every `tokio-rustls` stream under transport backpressure — could hold a
 /// WebSocket reply or a tunnelled response while both peers waited on each
-/// other. The write-stall deadline stays armed across an in-flight flush, so
-/// `backend_write_timeout` still covers a writer that cannot let go of them.
+/// other. The write-stall deadline stays armed across an in-flight flush AND
+/// across the half-close that follows it ([`begin_half_close`] /
+/// [`finish_half_close`]), so `backend_write_timeout` covers a writer that
+/// cannot let go of accepted bytes in either phase. A `poll_shutdown` that
+/// fails while the writer still owes a flush, with an errno that is not a
+/// benign peer-already-gone one, ends the direction as a write-side failure
+/// rather than as a clean completion ([`finish_half_close`]).
 ///
 /// `read_watermark` / `write_watermark` are per-direction inactivity
 /// timestamps polled by the `bidirectional_copy` watchdog. Shared via
@@ -8579,12 +8662,9 @@ where
             CopyPhase::Done => return Poll::Ready(Ok(())),
             CopyPhase::ShuttingDown => {
                 return match writer.as_mut().poll_shutdown(cx) {
-                    Poll::Ready(_) => {
+                    Poll::Ready(outcome) => {
                         state.phase = CopyPhase::Done;
-                        match state.terminal_read_error.take() {
-                            Some(e) => Poll::Ready(Err((StreamIoSide::Read, e))),
-                            None => Poll::Ready(Ok(())),
-                        }
+                        finish_half_close(outcome, state, write_watermark)
                     }
                     Poll::Pending => Poll::Pending,
                 };

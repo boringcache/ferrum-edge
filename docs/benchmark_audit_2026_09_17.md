@@ -326,16 +326,36 @@ mechanisms and testable hypotheses, not claims from a CPU profile.
    flushes before parking on a pending reader, mirroring tokio's `CopyBuffer`.
    The flush is owed once per accepted batch and an unbuffered writer's
    `poll_flush` is a no-op, so the plain-TCP hot path gains no syscall.
-   `backend_write_timeout` stays armed across an in-flight flush, so a writer
-   that cannot let go of accepted bytes trips the write deadline rather than
-   only the idle timeout; half-close, cancellation, the authorization-lifetime
-   and admission-revocation bounds, and per-direction byte/error attribution are
-   asserted unchanged. Coverage:
+   `backend_write_timeout` stays armed across an in-flight flush *and* across
+   the half-close that follows it, going inert only when `poll_shutdown`
+   resolves, so a writer that cannot let go of accepted bytes trips the write
+   deadline in either phase — including with `tcp_idle_timeout_seconds: 0` and
+   `tcp_half_close_max_wait_seconds: 0`, where it is the only bound left. A
+   `poll_shutdown` that fails while the writer still owes a flush ends the
+   direction as a write-side failure rather than a clean completion; a
+   half-close with nothing outstanding, and the benign peer-already-gone errnos,
+   stay graceful. Half-close byte delivery, cancellation, the
+   authorization-lifetime and admission-revocation bounds, and per-direction
+   byte/error attribution are asserted unchanged. Coverage:
    `tests/unit/gateway_core/relay_flush_progress_tests.rs` (behavioral, through
-   `bidirectional_copy_for_relay`, `bidirectional_copy_for_fenced_relay` — the
-   HBONE H2 CONNECT byte tunnel — and the authorization-bounded entry point) and
+   `bidirectional_copy_for_relay`, the fenced entry point
+   `bidirectional_copy_for_fenced_relay`, and the authorization-bounded entry
+   point) and
    `shared_invariant_parity_tests.rs::every_tunnelled_relay_path_shares_one_flushing_byte_pump`
-   (structural sibling inventory).
+   (set equality over every `src/**/*.rs` file that calls either entry point, so
+   a fifth call site fails the build until it is listed).
+
+   **What the fenced-relay test does and does not cover.** An earlier revision
+   of this amendment called it "`bidirectional_copy_for_fenced_relay` — the
+   HBONE H2 CONNECT byte tunnel", which overstates it. The test proves that the
+   fenced entry point runs the same flushing pump; its buffering writer is a
+   `BufWriter`, and it does not reproduce an H2 byte tunnel.
+   `H2ConnectTunnel::poll_flush` is a compile-time `Poll::Ready(Ok(()))` —
+   the h2 driver flushes on its own — so the H2 CONNECT leg can never be the
+   writer that holds bytes. The direction a buffering writer can stall on HBONE
+   is the opposite one: backend→client on the inbound fenced relay, where the
+   bytes reach the peer through the inbound mTLS `TlsStream`. That writer's
+   behaviour is what the rustls-backpressure test covers.
 
    **Hosted corroboration (2026-09-18).** Two scoped
    `gateways-protocol-benchmark` runs with identical inputs — ferrum only,
@@ -360,7 +380,9 @@ mechanisms and testable hypotheses, not claims from a CPU profile.
    echo is the end-of-run shape a relay that parks holding unflushed ciphertext
    produces.
 
-   **What this does not establish.** Two iterations per arm on one host pair is
+   **What this does not establish.** The two runs started four seconds apart on
+   **separate** hosted runners, not sequentially on one host, so nothing here
+   controls for machine-to-machine variation. Two iterations per arm is
    corroboration, not a causal proof, and it does not rule out a second
    contributing mechanism at that payload. RPS across these runs is **not**
    usable: the two arms move in opposite directions by payload (WSS/70 KiB

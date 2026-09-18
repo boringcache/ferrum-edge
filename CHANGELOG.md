@@ -339,9 +339,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flushes before parking, matching tokio's own `CopyBuffer`. An unbuffered
   writer's flush is a no-op and the flush is owed once per accepted batch, so
   the plain-TCP hot path gains no syscall. `backend_write_timeout` now stays
-  armed across an in-flight flush, so a writer that took the bytes and cannot
-  let go of them trips the write deadline instead of only the idle timeout;
-  half-close behaviour, cancellation, the authorization-lifetime and
+  armed across an in-flight flush *and* across the half-close that follows it,
+  going inert only when `poll_shutdown` resolves, so a writer that took the
+  bytes and cannot let go of them trips the write deadline in either phase —
+  including with `tcp_idle_timeout_seconds: 0` and
+  `tcp_half_close_max_wait_seconds: 0`, the long-lived-TCP configuration in
+  which it is the only timer left. A `poll_shutdown` that fails *while the
+  writer still owes a flush* now ends the direction as a write-side failure
+  rather than a clean completion, because the flush it implies did not happen
+  and the bytes already credited never left the writer. Nothing else changes
+  about teardown: a half-close with nothing outstanding, and the benign
+  peer-already-gone errnos (`EPIPE`, `ECONNRESET`, `WriteZero`, `ENOTCONN`),
+  stay graceful exactly as they were.
+  Operators running TLS backends with a non-zero `backend_write_timeout_ms` can
+  therefore see `backend write inactivity timeout` where the timer had
+  previously gone inert — see `docs/tcp_udp_proxy.md` -> "TCP Backend Timeouts".
+  Half-close byte delivery, cancellation, the authorization-lifetime and
   admission-revocation bounds, and per-direction byte/error attribution are
   unchanged.
 
