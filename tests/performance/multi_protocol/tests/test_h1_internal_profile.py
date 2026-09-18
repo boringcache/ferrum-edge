@@ -55,6 +55,12 @@ class H1InternalProfileTests(unittest.TestCase):
             lambda c: c["timeline"][1]["h1_profile"]["counters"].update(lost_events=1),
             lambda c: c["timeline"][1]["h1_profile"]["counters"].update(unpublished_events=1),
             lambda c: c.update(capture_complete=False),
+            lambda c: c.update(timeline=None),
+            lambda c: c["timeline"][1].update(h1_profile=[]),
+            lambda c: c["timeline"][1]["h1_profile"].update(counters=[]),
+            lambda c: c["timeline"][1]["h1_profile"]["counters"].update(alloc_process_alloc_calls=True),
+            lambda c: c["timeline"][1]["h1_profile"].update(capture_secs=float("nan")),
+            lambda c: c["timeline"][1].update(unix_secs=1),
         ]
         for mutate in mutations:
             data = copy.deepcopy(capture())
@@ -62,6 +68,9 @@ class H1InternalProfileTests(unittest.TestCase):
             result = profile.profile_bracket(data, phases)
             self.assertFalse(result["complete"])
             self.assertTrue(result["issues"])
+        for invalid in (None, [], dict(measurement_start_unix_secs=float("nan"), measurement_secs=1),
+                        dict(measurement_start_unix_secs=10, measurement_secs=-1)):
+            self.assertFalse(profile.profile_bracket(capture(), invalid)["complete"])
 
     def test_selection_preserves_declared_policy_and_h2_manifest(self):
         args = ["cutoff", "http1-tls", "4", "15", "200", "ferrum", "10240 5242880", "", ""]
@@ -79,6 +88,9 @@ class H1InternalProfileTests(unittest.TestCase):
             root = Path(directory)
             (root / "manifest.json").write_text(json.dumps(dict(
                 pairs=4, gateways=["direct", "ferrum", "ferrum-exp-cutoff-one"], payload_sizes=[5242880])))
+            malformed = root / "pairs/pair_001/direct_http1-tls_5242880.json"
+            malformed.parent.mkdir(parents=True)
+            malformed.write_text("[]")
             result = profile.report(root, "cutoff")
             self.assertEqual(len(result["observations"]), 12)
             self.assertFalse(result["traffic_complete"])

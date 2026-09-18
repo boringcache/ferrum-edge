@@ -6,6 +6,7 @@ Use the existing CIDR-authenticated loopback endpoint on a disposable runner.
 
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -64,12 +65,50 @@ def snapshot(sample_id=0):
 def profile_bracket(usage, phases):
     result = dict(complete=False, issues=[], publication_complete=False,
                   coverage="published Rust/source-site counts only; not native or syscall coverage")
+    if not isinstance(usage, dict) or not isinstance(phases, dict):
+        result["issues"].append("malformed capture or measurement boundaries")
+        return result
     start = phases.get("measurement_start_unix_secs")
     duration = phases.get("measurement_secs")
-    if not isinstance(start, (float, int)) or not isinstance(duration, (float, int)):
+    if (type(start) not in (float, int) or type(duration) not in (float, int)
+            or not math.isfinite(start) or not math.isfinite(duration) or duration <= 0):
         result["issues"].append("missing measurement boundaries")
         return result
     timeline = usage.get("timeline", [])
+    if not isinstance(timeline, list) or not timeline:
+        result["issues"].append("missing or malformed capture timeline")
+        return result
+    for row in timeline:
+        if (not isinstance(row, dict) or type(row.get("unix_secs")) not in (float, int)
+                or not math.isfinite(row["unix_secs"]) or not isinstance(row.get("processes"), list)
+                or any(not isinstance(p, dict) or not {"pid", "start_ticks", "role"} <= p.keys()
+                       or type(p["pid"]) is not int or type(p["start_ticks"]) is not int
+                       or p["pid"] <= 0 or p["start_ticks"] < 0 or not isinstance(p["role"], str)
+                       for p in row["processes"])):
+            result["issues"].append("malformed process capture")
+            return result
+        if "h1_profile" not in row:
+            continue
+        profile = row["h1_profile"]
+        if (not isinstance(profile, dict) or type(profile.get("unix_secs")) not in (float, int)
+                or not math.isfinite(profile["unix_secs"])
+                or type(profile.get("capture_secs", 0)) not in (float, int)
+                or not math.isfinite(profile.get("capture_secs", 0))
+                or profile.get("capture_secs", 0) < 0):
+            result["issues"].append("malformed profile capture")
+            return result
+        if "counters" in profile:
+            counters = profile["counters"]
+            if (not isinstance(counters, dict) or counters.keys() != FIELDS
+                    or any(type(value) is not int or not 0 <= value <= 2**64 - 1
+                           for value in counters.values())
+                    or counters["schema"] != SCHEMA["version"]
+                    or counters["allocator_installed"] != 1):
+                result["issues"].append("malformed profile counters")
+                return result
+    if any(b["unix_secs"] < a["unix_secs"] for a, b in zip(timeline, timeline[1:])):
+        result["issues"].append("capture clock moved backwards")
+        return result
     before = [row for row in timeline if "h1_profile" in row and
               row["h1_profile"]["unix_secs"] + row["h1_profile"].get("capture_secs", 0) <= start]
     after = [row for row in timeline if "h1_profile" in row and
@@ -192,10 +231,16 @@ def report(directory, mode):
                 path = folder / f"{gateway}_http1-tls_{size}.json"
                 try:
                     sample = json.loads(path.read_text())
+                    if not isinstance(sample, dict):
+                        raise ValueError("sample must be an object")
                 except (OSError, ValueError):
                     sample = {"error": "missing or malformed sample"}
+                try:
+                    traffic_issues = sample_issues(sample)
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    traffic_issues = ["malformed sample fields"]
                 row = dict(pair=pair, gateway=gateway, payload=size, sample=sample,
-                           traffic_issues=sample_issues(sample))
+                           traffic_issues=traffic_issues)
                 if row["traffic_issues"]:
                     report["traffic_complete"] = False
                 expected = gateway != "direct" and not (mode == "calibration" and gateway == "ferrum-baseline")
