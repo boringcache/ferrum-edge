@@ -31,8 +31,8 @@ fn mesh_runtime_rejects_equal_tcp_ports_on_different_addresses() {
         assert_eq!(
             error,
             format!(
-                "`{inbound_setting}` (10.0.0.5:15008) must use a different TCP port number from \
-                 `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (127.0.0.1:15008); both use port 15008"
+                "`{inbound_setting}` (\"10.0.0.5:15008\") must use a different TCP port number from \
+                 `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (\"127.0.0.1:15008\"); both use port \"15008\""
             )
         );
         env.unset(inbound_setting);

@@ -1232,8 +1232,8 @@ impl MeshRuntimeConfig {
                         _ => "FERRUM_MESH_INBOUND_LISTEN_ADDR",
                     };
                     return Err(format!(
-                        "`{inbound_setting}` ({:?}) must use a different TCP port number from \
-                         `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` ({:?}); both use port {:?}",
+                        "`{inbound_setting}` (\"{}\") must use a different TCP port number from \
+                         `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (\"{}\"); both use port \"{}\"",
                         inbound.addr,
                         outbound.addr,
                         inbound.addr.port(),
