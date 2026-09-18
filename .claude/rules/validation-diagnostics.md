@@ -58,7 +58,8 @@ paths:
   row-decode and admission diagnostics; conf/env/pool parsers and namespace/file
   load messages; CP namespace rejection, mesh startup paths, xDS carriers,
   federation/remote clusters, probe/injector names, node-agent addresses/paths,
-  and revision identities. SQL literals, fixed migration/listener/fault labels,
+  and revision identities; capture boolean/port/mark/UID/CIDR parsing and
+  annotation overrides. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
 - The constructor audit includes root/nested JSON object guards, file-mode
@@ -68,14 +69,18 @@ paths:
   strings must be Debug-escaped even when a sibling guard already does so.
 
 - Scope of #5591: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
-  `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, and `src/plugins/waf`.
+  `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, `src/capture`, and
+  `src/plugins/waf`.
   Other plugin families remain under #5594. Withholding is conditional on safe
   producer interpolation: apostrophe-leading single-quoted values, bare values,
   and retained third-party parser text can still expose supplied data. Do not
   describe the renderer alone as fail-closed for arbitrary diagnostic text.
 - The mechanical producer/emitter contract is
   `tests/unit/cli/diagnostic_source_guard_tests.rs` (registered in `cli/mod.rs`).
-  It scans every Rust file in the above roots, including multiline/nested macros
+  Its explicit `ROOTS` list covers the above roots except `src/capture`, whose
+  generated shell commands also use quoted interpolation. Capture parsing has
+  rendered-output and captured-log regressions. The guard scans every Rust file
+  in its roots, including multiline/nested macros
   and raw strings, for single-quoted interpolation in diagnostic macros and for
   named error/message captures in `warn!`/`error!` without a sanitizer call in
   that statement. Its exact, commented exception list contains SQL query syntax,

@@ -300,6 +300,7 @@ def history_metric(
     *,
     runner_class: str | None,
     build_profile: str | None,
+    workload_revision: str | None = None,
 ) -> list[float]:
     if not isinstance(history_doc, dict):
         return []
@@ -309,6 +310,8 @@ def history_metric(
         return values
     for point in points:
         if not isinstance(point, dict):
+            continue
+        if point.get("workload_revision") != workload_revision:
             continue
         if runner_class and point.get("runner_class") != runner_class:
             continue
@@ -750,6 +753,7 @@ def evaluate(
                         if isinstance(results.get("runner_class"), str)
                         else None
                     ),
+                    workload_revision=budgets.get("workload_revision"),
                     build_profile=(
                         results.get("build_profile")
                         if isinstance(results.get("build_profile"), str)
@@ -830,6 +834,7 @@ def evaluate(
     status = "failed" if failures else ("alert" if alerts else "ok")
     return {
         "budget_version": budgets.get("budget_version"),
+        "workload_revision": budgets.get("workload_revision"),
         "enforcement": enforcement,
         "status": status,
         "alerts": alerts,
@@ -851,6 +856,7 @@ def build_trends_point(
         "runner_class": results.get("runner_class"),
         "build_profile": results.get("build_profile"),
         "budget_version": evaluation.get("budget_version"),
+        "workload_revision": evaluation.get("workload_revision"),
         "protocols": evaluation.get("protocols", {}),
         "scenarios": {
             key: value
@@ -866,7 +872,8 @@ def merge_history(
 ) -> dict[str, Any]:
     points = []
     if isinstance(history_doc, dict) and isinstance(history_doc.get("points"), list):
-        points.extend(history_doc["points"])
+        points.extend(p for p in history_doc["points"] if isinstance(p, dict)
+                      and p.get("workload_revision") == point.get("workload_revision"))
     points.append(point)
     return {
         "schema_version": 1,

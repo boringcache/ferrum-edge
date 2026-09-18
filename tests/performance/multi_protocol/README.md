@@ -180,6 +180,342 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
+### Phases and observed concurrency (tracker #5588, section 1)
+
+Every throughput protocol uses the same five phases:
+
+1. **Setup:** establish all client transports, including the sequential H2,
+   gRPC and H3 pools. Register workers before spawning them so setup failures
+   and panics release the barrier and remain errors.
+2. **Warmup:** each surviving worker sends one echo with the measured payload
+   and the same strict status/body validation. Warmup work is reported separately.
+3. **Measurement barrier:** wait until every surviving worker has finished its
+   warmup response. Publish one common monotonic start and exclusive deadline.
+4. **Measurement:** offer closed-loop requests until that deadline. Only exact,
+   validated echoes completed before it enter `total_requests`, `total_bytes`,
+   latency histograms and RPS. A worker error is retained even during warmup/drain.
+5. **Drain:** stop new offers, finish outstanding exchanges, and join workers.
+   Successful late echoes enter `drain_requests`/`drain_bytes`, never nominal
+   throughput. Preflight allows 30 seconds plus one second per started 128 KiB
+   of payload (70 seconds at 5 MiB), naming stalled worker IDs/states on timeout;
+   the outer client kill-switch scales by the same payload allowance. Worker
+   results are collected concurrently with a shared 30-second drain bound;
+   completed workers remain accounted when a hung worker is aborted. Failed or
+   aborted workers invalidate the sample. H3 endpoints then explicitly close
+   and wait for idle, reported as `transport_close_secs` and
+   `transport_close_timed_out`; a close timeout does not change echo errors.
+
+TCP/TLS previously ran an unbounded pipelined writer. Both TCP variants now
+offer one full-duplex echo per worker, using chunked writes and concurrent reads
+to retain large-payload progress. This changes the TCP workload; old TCP rates
+are not a paired reference for this harness. Offered work, connection topology,
+payload scaling and warmup are identical for every gateway within a new pair.
+The separate `saturate` command is unchanged.
+
+Raw samples add these fields without removing the existing scalar report:
+
+| Field | Meaning |
+|-------|---------|
+| `phases` | `setup_secs`, `warmup_secs`, `barrier_secs`, `measurement_secs` (nominal), `measurement_elapsed_secs` (actual), `measurement_start_unix_secs`, `client_usage`, `drain_secs`, `transport_close_secs`, `transport_close_timed_out`, `preflight_bound_secs`, `stalled_workers`, `timed_out` |
+| `warmup_requests` | Validated warmup echoes, excluded from throughput |
+| `drain_requests`, `drain_bytes` | Validated completions after the exclusive deadline |
+| `observed.active_workers` | Sampled live workers: `min`, `max`, arithmetic sample `mean` |
+| `observed.active_connections` | Sampled actual client transport lifetimes, counted by connection drivers/socket owners; UDP counts connected sockets |
+| `observed.active_streams` | Sampled locally admitted exchanges still awaiting complete validation; TCP/WS/UDP count echo exchanges |
+| `observed.queued_requests` | Sampled offered requests waiting for client admission |
+| `observed.queue_time_ns`, `admissions` | Total client admission wait and admitted request count for measured offers (including offers admitted during drain) |
+| `observed.workers_at_barrier`, `workers_retired_before_deadline` | Actual barrier participants and early retirements, including setup/warmup failures |
+| `observed.samples`, `sampling_interval_ms` | Observation count and requested 10 ms cadence; scheduler delays are possible |
+| `pair`, `host_id`, `gateway_order`, `order_position` | Same-host pair identity and executed order |
+| `process_usage` | Client boundary CPU deltas and lifetime peak RSS; passive CPU/RSS samples for backend and gateway PIDs discovered with `docker top` |
+
+H1/H2/gRPC admission is observed at the first request-body frame polled by the
+transport; H3 uses successful stream opening. These are **client-local** streams
+and queues, not server active-request counters or a measurement of kernel/QUIC
+flow-control queues. `active_connections` includes idle pooled transports.
+Worker/stream gauges are sampled, not exact extrema or time-weighted averages.
+No requested count is substituted for an observation. `effective_concurrency`
+continues to mean the **offered** worker count.
+
+Gateway/backend process sampling uses Linux `/proc` at 500 ms. Linux hosted
+runners enable it by default; `--no-process-usage`, or absent `/proc`, produces
+`process_usage.available: false` and diagnostic samples that are **invalid for
+paired comparison**, while allowing the runner to continue off Linux. Docker
+host-network prerequisites still apply. The runner launches `proto_bench`
+directly under `timeout`/`gtimeout`. A passive sampler discovers the client among
+its children and never launches commands. The runner waits for sampler readiness,
+then signals and reaps it after the load. The full series remains in
+`diagnostics/*_process_usage.json`.
+
+The client now calls `getrusage(RUSAGE_SELF)` at measurement publication and at
+the end boundary, before drain. `phases.client_usage` carries its CPU delta,
+complete bracket, measured elapsed time and process-lifetime peak RSS at that
+boundary. This replaces the passive client bracket in `process_usage.measurement`,
+so client exit cannot erase its ending observation. RSS is a lifetime high-water
+mark, not an estimate of peak memory exclusively during measurement. The measured
+elapsed duration must be between the nominal duration and nominal + max(100 ms,
+5%); later coordinator wakeups invalidate the sample.
+
+`process_usage.measurement` requires a complete bracket for **every required
+role** (client/backend, plus gateway for proxied samples). Gateway/backend records
+must remain observable at every sampler tick between their boundary snapshots.
+A PID that was never observable remains in `missing_pids` for diagnosis without
+invalidating a healthy sibling. At least one gateway PID must be observed, and
+every observed gateway PID must span the measurement window; even a PID observed
+once that exits mid-window invalidates the sample. PID identity includes start
+time to prevent reuse from bridging a gap. Sampled records report
+`boundary_slack_secs`, `bracket_secs` and sampled RSS.
+Sampler-lifetime counters include setup, warmup and drain. The sampler adds
+shared-runner overhead; throughput and direct ratios do not isolate proxy CPU
+cost. External dependencies such as Tyk's Redis are not in gateway PID accounting.
+
+### Paired comparison procedure
+
+`run_gateway_protocol_bench.sh` accepts only EVEN `--pairs` counts from 2 through
+12, default **2 per invocation**. Each pair includes direct and every supported
+gateway, with a fresh backend per arm. Successive orders reverse; each two-pair
+block rotates its first gateway. Any even count balances mean position exactly
+by reversal for any number of arms; it need not visit each individual position
+equally often. `position_balance.json` and the combined summary show every arm's
+positions and mean. The frozen workflow's `iterations` repeats the entire suite;
+its historical `--skip-direct` flag is ignored so every pair has a fresh direct
+baseline. Two pairs are a budget-conscious diagnostic default (Student-t with
+one degree of freedom); predeclare at least **four** pairs for performance claims
+and budget that experiment separately.
+
+For a revision experiment, make both images available on the **same hosted
+runner**, pin their digests, and run, for example:
+
+```bash
+FERRUM_IMAGE=ferrum-edge@sha256:<candidate-digest> \
+  bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh http3 \
+  --baseline-image ferrum-edge@sha256:<baseline-digest> \
+  --gateways 'ferrum envoy' --payload-sizes '10240' \
+  --duration 30 --pairs 6 --skip-build --output-dir results/http3/run_1
+```
+
+The reference appears as `ferrum-baseline`. Keep configuration identical except
+for the stated experiment; `images.txt` records immutable image IDs and labels.
+Never compare separate hosted VMs as revision pairs. Without a baseline image,
+the suite compares direct/gateway and Ferrum/competitor pairs; it does **not**
+claim a revision A/B. The existing frozen workflow has no baseline-image input;
+revision experiments require a runner with both images provisioned separately.
+
+`paired_comparisons.json` uses matched per-pair log throughput ratios and a
+two-sided Student-t 95% interval, requiring an even count of at least two clean pairs with equal
+host, payload, duration and offered concurrency. An invalid or missing pair
+invalidates the comparison; no observations are dropped. Adaptive extension is
+**off by default** and requires `--adaptive`. If enabled and an interval overlaps
+no gain, the runner considers one extra block of the same number of pairs with
+**double duration for every arm**. It projects total wall time from Bash `SECONDS`
+and measured base seconds per pair: elapsed + 2 × base-pair cost × added pairs ×
+1.25 + 60 seconds. It extends only within `--wallclock-budget-seconds` (default
+4200, per invocation); otherwise the manifest records `extension_skipped: budget`
+and the projection. Disabled/not-needed decisions are also recorded. Set this
+budget to the remaining outer job allowance when calling the runner repeatedly.
+If uncertainty still overlaps, report inconclusive and schedule a longer
+predeclared experiment. Optional stopping does not make this exploratory interval
+a confirmatory test. Inspect every sample's p99 as well as RPS.
+
+#### Same-image environment experiments (#5588 section 4)
+
+The runner reads the branch-committed `experiment.json` before any build or
+startup. An enabled manifest adds named `ferrum-exp-*` arms for its one protocol
+when Ferrum is selected. Its first arm is the `ferrum` reference; every arm uses
+the same image, configuration, startup function, payloads, offered concurrency,
+phases and strict validity rules. Only `FERRUM_EXTRA_ENV` differs. Values are
+literal public benchmark settings, never shell source or credentials. Image
+overrides, duplicate names/keys and shell syntax are rejected. Ambient
+`FERRUM_EXTRA_ENV` and `--baseline-image` cannot be combined with an active
+manifest. The resolved arm names enter the ordinary expected matrix and paired
+comparisons; the exact experiment manifest is copied into the run artifact.
+Disable the manifest after an experiment so later default runs do not silently
+acquire extra arms.
+
+The committed cutoff manifest is disabled after its completed hosted run.
+See [audit section 4](../../../docs/benchmark_audit_2026_09_17.md#section-4--same-image-http11-framing-experiment)
+for the measured revision, retained raw observations and inconclusive intervals.
+Commit `enabled: true` before repeating that scope. The combined aggregate
+accepts the download action's flat single-protocol layout and displays every
+declared arm; ambiguous flat downloads fail instead of guessing a protocol.
+The frozen per-protocol workflow summary still lists only built-in gateways;
+use the raw paired files and combined aggregate for extra experiment arms.
+
+The cutoff experiment compares `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` against
+`1` at 10240, 71680, 512000, 1048576 and 5242880 bytes. A scoped hosted dispatch
+uses duration 30, concurrency 200, iterations 1, skips `envoy kong tyk krakend`
+and skips `http2 http3 grpcs wss tcp-tls udp udp-dtls`. The default two pairs give
+30 samples (direct plus two Ferrum arms, five sizes). Orders are direct/0/1
+then 1/0/direct. Estimated benchmark envelope: `2 × 15 × (30 + 15) / 60 + 5 =
+27.5 minutes`, within the 75-minute step. Two pairs are exploratory and have a
+wide Student-t interval; they cannot establish a general performance claim.
+
+Passive `/proc/<pid>/io` snapshots add `rchar`, `wchar`, `syscr`, `syscw`,
+`read_bytes`, `write_bytes`, and `cancelled_write_bytes`. The same measurement
+bracket and slack as CPU apply. Missing, decreasing or discontinuous counters
+produce `io_error`, never fabricated zeros. On hosted Linux, passwordless sudo
+runs only the passive sampler so it can read container PIDs across UIDs; a stop
+file terminates and reaps it. Without sudo, permission failures remain explicit.
+`rchar`/`wchar` and `syscr`/`syscw` are Linux read/write accounting, **not** total
+network bytes, every socket syscall, copied bytes, allocations, or TLS records.
+`read_bytes`/`write_bytes` are storage I/O and may be zero for busy sockets.
+
+H1 samples also contain `phases.h1_profile`, measured as client counter deltas
+at the common boundaries. Per-worker counters avoid cross-worker atomic
+contention. `tls_records` counts complete received TLS wire records below
+rustls, and `tls_record_bytes` includes their five-byte headers. The parser
+handles split/coalesced socket reads without retaining payloads or changing
+writes/flushes. Encrypted TLS 1.3 control messages cannot be distinguished from
+application records. Handshake/warmup/drain are excluded by boundary snapshots;
+records and requests spanning a boundary need not share attribution. Parser
+errors invalidate the **TLS profile**, even when useful-work validation passes.
+`body_data_frames`/`body_data_bytes` count client Hyper response data frames,
+not upstream Ferrum frames or H1 chunks. `chunked_responses` and
+`content_length_responses` observe framing headers. All counters include
+in-flight work at the boundary; normalize them as approximate diagnostics, not
+exact per-completed-request costs. Instrumentation is identical across arms
+and adds client CPU overhead. The existing full-body echo validation remains.
+
+Allocation counts, internal copies and adapter CPU require a separate profiling
+build or permitted tracing/sampling; these passive counters cannot identify
+them. Do not infer a zero-copy production path or restore Content-Length from
+this echo experiment. See the audit for evidence and keep/reject dispositions.
+
+#### Maximum safe dispatch inputs (ordinary matrix)
+
+For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
+`iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative
+planning envelope allocates 15 seconds overhead per call and five minutes fixed
+headroom; slow starts, warmups, or failures can still exceed it. Keep at least ten
+minutes below the frozen 75-minute step. The frozen dispatcher cannot set pairs
+or adaptive flags and therefore uses **2 pairs, adaptive off**.
+
+| Duration × iterations × pairs | Projected minutes | Dispatch guidance |
+|---|---:|---|
+| 10 × 1 × 2 | 30 | Default |
+| 15 × 1 × 2 | 35 | Within envelope |
+| 15 × 2 × 2 | 65 | Maximum at 15 seconds |
+| 5 × 3 × 2 | 65 | Maximum for three iterations |
+| 15 × 3 × 2 | 95 | Unsafe; reduce iterations |
+| 15 × 1 × 4 | 65 | Separately provisioned four-pair experiment |
+
+#### Known limitations
+
+- Measurement-start skew: watch-channel wakeups shorten individual workers'
+  effective windows; barrier-parked workers count as active, so the worker gauge
+  cannot reveal this skew, and longer durations reduce its relative effect.
+- Passive CPU bracket slack: gateway/backend boundary samples can include up to
+  roughly one sampler interval on either side (plus scheduling delay), which is
+  material at five seconds; client self-snapshots remove the client exit gap but
+  still expose coordinator wakeup slack.
+- Mixed-duration pooling: an enabled extension pools D and 2D pairs in one
+  log-ratio interval, so heteroscedasticity can change interval coverage/width
+  even though both arms within each pair share their duration.
+- Extension trigger rate: any uncertain reference × arm × size comparison can
+  request the full-matrix extension; its real-world frequency remains unmeasured.
+- Unmodelled order effects: equal mean position does not model drift or varying
+  separation between compared arms; ratio noise can still vary across pairs.
+
+### HTTP/3 transport experiment (#5588, section 2)
+
+`h3_experiment.json` enables the hosted experiment without changing the frozen
+matrix job. `H3_EXPERIMENT_MANIFEST` can select another data manifest; setting
+`enabled: false` disables it. With Envoy selected, the runner adds
+`envoy-limit-4` to the same counterbalanced pairs as `envoy` (limit 100), Ferrum,
+and direct. Both Envoy arms retain pinned 1.33.5, SNI `localhost`, CA validation,
+windows, timeouts, and strict HTTP 200/exact-body validation. Generated configs,
+image IDs/digests, the experiment manifest, and host socket settings are artifacts.
+
+| Offered workers | Client QUIC connections | Limit 4 admission ceiling | Limit 100 ceiling |
+|---:|---:|---:|---:|
+| 200 | 21 | 84 | 200 |
+| 100 | 11 | 44 | 100 |
+| 50 | 6 | 24 | 50 |
+
+These are downstream ceilings from the fixed round-robin worker assignment;
+`observed.active_streams` reports client admission during load. The experiment
+changes the upstream and downstream limits together. The backend's timestamped
+`H3_PROFILE` records show upstream connection
+IDs, peer ports, accepted/completed echoes and bytes. Per-connection measurement
+deltas and per-thread CPU brackets accompany each sample. They include sampling
+slack; neither identifies which Envoy thread owns an individual UDP socket.
+
+The downstream limit is applied to
+`udp_listener_config.quic_options.quic_protocol_options`, which constructs the
+QUIC transport. Changing only the similarly named HCM options did **not** cap
+downstream admission in the first hosted experiment: all 200/100/50 streams
+remained admitted. Compare the observed queues and locally active exchanges
+with the transport ceiling: local validation can outlive transport stream
+closure, so the local gauge is not an exact server stream count. Previous
+claims that the historical HCM setting necessarily admitted
+only 84/44/24 streams were incorrect.
+
+H3 waits 750 ms at the ready barrier and after worker drain, identically for all
+arms, to bracket fast client and upstream sockets with the passive sampler.
+The former is `barrier_secs`, the latter `observation_hold_secs`; neither time
+enters measured throughput. Envoy histogram records are retained separately
+from its named scalar counters. The aggregate accepts the single-artifact flat
+layout as well as multiple artifact directories; missing runs fail explicitly.
+
+The enabled experiment requires a disposable Linux runner with passwordless
+`sudo sysctl`. It sets `rmem_default`, `wmem_default`, `rmem_max`, and `wmem_max`
+before any arm to 4,194,304 bytes. Ferrum/Quinn inherit the defaults; Envoy uses
+explicit downstream and upstream `SO_RCVBUF`/`SO_SNDBUF` requests of 2,097,152
+bytes because Linux doubles explicit requests. Equal **effective per-socket**
+budgets must be observed before a sample is accepted. This does not equalize the
+number of sockets or total gateway memory. No production config knob is added.
+
+The existing passive 500 ms sampler now also reads `/proc/net/snmp`,
+`/proc/net/udp{,6}`, thread stat files, and `NETLINK_SOCK_DIAG` for this experiment.
+`INET_DIAG_SKMEMINFO` gives the same kernel receive/send limits as `getsockopt`,
+verified against a live UDP socket in hosted tests. Socket cookies prevent inode
+reuse from producing false deltas. The sampler neither executes commands nor
+injects descriptors into another process. Kernel UDP deltas cover the shared
+host namespace; socket deltas are narrower. The backend peer port identifies
+upstream sockets, including unconnected Quinn endpoints. Missing observations,
+counter resets, incomplete brackets, and unverified buffer parity stay explicit.
+
+Envoy stats are sampled via its loopback admin endpoint and retained in full.
+Pinned 1.33.5 repeatedly adds cumulative `SO_RXQ_OVFL` values; its reported drops
+are **not loss totals** ([upstream correction #38652](https://github.com/envoyproxy/envoy/pull/38652)).
+Use independent kernel/socket deltas. `TOO_MANY_RTOS`, idle-close, and watchdog
+counters remain raw, timestamped observations. Both gateways use info logging;
+startup and per-payload logs have Docker timestamps, exposing BPF/GRO/GSO
+warnings. No warning is not positive proof of an optimized path: record
+unsupported/unverified unless logs or other observations positively establish it.
+
+H3 endpoints close explicitly after worker drain under one shared five-second
+deadline, and all drivers are joined or aborted/reaped. `phases.transport_events`
+retains connection IDs, UNIX timestamps, raw closure reasons and final Quinn
+stats, labelled setup/warmup, measurement, drain, or transport close. Timestamped
+server counters between payloads distinguish retired connections from measured
+failures; do not infer request loss merely from a post-measurement closure.
+
+For the scoped hosted run use duration 10, concurrency 200, iterations 1, skip
+protocols `http1-tls http2 grpcs wss tcp-tls udp udp-dtls`, skip gateways
+`kong tyk krakend`, and skip sizes `71680 512000`. The runner defaults to two
+pairs: 24 samples across four arms and three sizes. Adaptive extension is off;
+two-pair intervals are diagnostic, not a confirmatory performance claim.
+
+Raw JSON lives under `pairs/pair_NNN/`. Root `<gateway>_<protocol>_<size>.json`
+keeps the legacy totals/rate fields and adds `samples` plus `expected_pairs`.
+Rates use total measured requests / total measured seconds; summary latency
+quantiles are the maximum per-sample quantiles, explicitly labelled, because
+quantiles cannot be pooled without histograms. All constituent observations are
+validated. The rolling regression evaluator restarts its window when
+`protocol_perf_budgets.json.workload_revision` changes, excluding missing/older
+markers; this revision is `2026-09-18.h1-h3-observation.v3`, accounting for H1
+frame/header/TLS observation overhead and H3 observation holds and explicit
+retirement instrumentation. The historical
+H1 paired-ratio reference remains unchanged. The
+combined artifact also contains flattened `observed-samples.json` and
+`paired-comparisons.json`; use those or the raw samples for analysis. The frozen
+matrix summary remains diagnostic; the aggregate job reports paired intervals.
+
+Hosted `Benchmark Harness Tests` runs the phase/worker/admission tests in
+`tests/metrics_tests.rs` and the Python ordering, pairing, aggregation, resource
+parser and validity tests. No matrix-job workflow changes are needed.
+
 For the September 2026 multi-gateway investigation, see the
 [benchmark audit](../../../docs/benchmark_audit_2026_09_17.md). The gateway
 workflow's **combined** summary now reports validity across every iteration:
@@ -187,8 +523,10 @@ errors, zero successful work, missing iterations, or inconsistent echo byte
 totals exclude a scenario from the scoreboard. Raw rates remain diagnostic.
 Each run records its expected matrix before startup (`manifest.json`) and saves
 backend/gateway logs plus Envoy counters under `diagnostics/` after the timed
-samples. A green workflow alone does not certify an error-free benchmark;
-inspect the validity tables.
+samples. If that manifest is missing or malformed, ranking is suppressed for
+the affected protocol while observed rows remain available for diagnosis. A
+green workflow alone does not certify an error-free benchmark; inspect the
+validity tables.
 
 The per-protocol summary rendered inside the matrix job still shows raw
 throughput only. `Trusted Cross Build Policy` freezes that job's bytes against

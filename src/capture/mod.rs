@@ -4567,7 +4567,10 @@ iptables() {{
         }
         for (name, expected) in [
             ("..", "host capture interface name must not be `.` or `..`"),
-            ("-veth", "host capture interface name must not start with `-`"),
+            (
+                "-veth",
+                "host capture interface name must not start with `-`",
+            ),
             (
                 "veth+",
                 "host capture interface name must contain only ASCII letters, digits, `.`, `_`, or `-` (a `+` suffix would be an iptables prefix wildcard)",

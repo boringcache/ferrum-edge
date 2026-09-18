@@ -11,7 +11,8 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -383,13 +384,48 @@ async fn run_udp_echo(addr: SocketAddr) -> anyhow::Result<()> {
 
 async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> anyhow::Result<()> {
     let endpoint = quinn::Endpoint::server(server_config, addr).context("creating h3 endpoint")?;
+    let profile = std::env::var("H3_PROFILE").is_ok_and(|value| value != "0");
+    let mut connection_id = 0u64;
 
     loop {
         let Some(incoming) = endpoint.accept().await else {
             break;
         };
+        connection_id += 1;
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
+            let accepted = Arc::new(AtomicU64::new(0));
+            let completed = Arc::new(AtomicU64::new(0));
+            let bytes = Arc::new(AtomicU64::new(0));
+            if profile {
+                let transport = conn.clone();
+                let accepted = accepted.clone();
+                let completed = completed.clone();
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let unix_secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+                        eprintln!(
+                            "H3_PROFILE {}",
+                            serde_json::json!({
+                                "unix_secs": unix_secs,
+                                "connection_id": connection_id,
+                                "peer": transport.remote_address().to_string(),
+                                "accepted": accepted.load(Ordering::Relaxed),
+                                "completed": completed.load(Ordering::Relaxed),
+                                "bytes": bytes.load(Ordering::Relaxed),
+                                "close_reason": transport.close_reason().map(|e| e.to_string()),
+                            })
+                        );
+                        if transport.close_reason().is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                });
+            }
             let Ok(mut conn) =
                 h3::server::Connection::<_, bytes::Bytes>::new(h3_quinn::Connection::new(conn))
                     .await
@@ -398,6 +434,9 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
             };
 
             while let Ok(Some(resolver)) = conn.accept().await {
+                let accepted = accepted.clone();
+                let completed = completed.clone();
+                let bytes = bytes.clone();
                 tokio::spawn(async move {
                     let Ok((req, mut stream)) = resolver.resolve_request().await else {
                         return;
@@ -405,6 +444,9 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
                     let path = req.uri().path().to_string();
 
                     if path == "/echo" {
+                        if profile {
+                            accepted.fetch_add(1, Ordering::Relaxed);
+                        }
                         // Collect request body from H3 stream
                         let mut body_data = Vec::new();
                         while let Ok(Some(chunk)) = stream.recv_data().await {
@@ -416,9 +458,18 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
                             .header("content-length", body_data.len().to_string())
                             .body(())
                             .unwrap();
-                        let _ = stream.send_response(resp).await;
-                        let _ = stream.send_data(bytes::Bytes::from(body_data)).await;
-                        let _ = stream.finish().await;
+                        let body_len = body_data.len();
+                        if stream.send_response(resp).await.is_ok()
+                            && stream
+                                .send_data(bytes::Bytes::from(body_data))
+                                .await
+                                .is_ok()
+                            && stream.finish().await.is_ok()
+                            && profile
+                        {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                            bytes.fetch_add(body_len as u64, Ordering::Relaxed);
+                        }
                         return;
                     }
 
