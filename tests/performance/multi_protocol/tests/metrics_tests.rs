@@ -412,9 +412,18 @@ fn transport_events_distinguish_measured_failures_from_retired_connections() {
         .collect();
     assert_eq!(
         phases,
-        ["setup_or_warmup", "measurement", "drain", "transport_close", "transport_close"]
+        [
+            "setup_or_warmup",
+            "measurement",
+            "drain",
+            "transport_close",
+            "transport_close"
+        ]
     );
-    assert!(report.transport_events.iter().all(|event| {
-        event.detail == "TOO_MANY_RTOS raw observation"
-    }));
+    assert!(
+        report
+            .transport_events
+            .iter()
+            .all(|event| { event.detail == "TOO_MANY_RTOS raw observation" })
+    );
 }

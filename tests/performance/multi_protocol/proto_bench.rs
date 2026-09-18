@@ -592,7 +592,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         events.push(TransportEvent::new(
             connection_id,
             "connected",
-            format!("local={} peer={}", endpoint.local_addr()?, conn.remote_address()),
+            format!(
+                "local={} peer={}",
+                endpoint.local_addr()?,
+                conn.remote_address()
+            ),
         ));
         transports.push(conn.clone());
         let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
@@ -769,7 +773,10 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         events.push(TransportEvent::new(
             connection_id,
             "local_close_requested",
-            format!("benchmark drained; stats={:?}", transports[connection_id].stats()),
+            format!(
+                "benchmark drained; stats={:?}",
+                transports[connection_id].stats()
+            ),
         ));
         endpoint.close(0u32.into(), b"benchmark drained");
     }
@@ -783,9 +790,17 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             if let Some(phases) = &mut combined.phases {
                 phases.transport_close_timed_out = true;
             }
-            events.push(TransportEvent::new(connection_id, "idle_timeout", String::new()));
+            events.push(TransportEvent::new(
+                connection_id,
+                "idle_timeout",
+                String::new(),
+            ));
         } else {
-            events.push(TransportEvent::new(connection_id, "endpoint_idle", String::new()));
+            events.push(TransportEvent::new(
+                connection_id,
+                "endpoint_idle",
+                String::new(),
+            ));
         }
     }
     for (connection_id, mut driver) in drivers.into_iter().enumerate() {
