@@ -47,6 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Outbound registry reuse now follows CONNECT enforcement context** (PR #5595).
+  Distinct inbound and outbound bind addresses could share a numeric port,
+  causing the port-only registry gate to enforce egress membership on an
+  inbound HBONE CONNECT. Every registry instance now skips the listener-stamped
+  Inbound direction before any lookup, metric, or rejection; outbound and
+  non-mesh listeners retain the existing port scope. Reuse is advertised only
+  for CONNECTs the registry did not decide. The context-aware classifier uses
+  the SAME direction/port predicate as enforcement and retains those facts on
+  the admission snapshot for every sweep. A scoped registry on a matching
+  Outbound listener that terminates CONNECT now withholds reuse; withdrawing
+  its destination refuses the next CONNECT. A scope change that makes an
+  advertised tunnel's original listener enforce the registry revokes it with
+  `reuse_withdrawn`. Unscoped instances remain fail-closed. Inbound reuse and
+  live advertised tunnels still survive REGISTRY_ONLY publication.
+  As defense in depth, mesh startup and `ferrum-edge validate` now reject any
+  planned inbound/outbound TCP listeners sharing a nonzero port number, even
+  on different addresses; UDP capture and port `0` are excluded. **Operators
+  relying on same-port-number inbound/outbound binds must choose distinct TCP
+  ports before restarting.** This follow-up corrects #5583's assumption that
+  only inbound listeners terminate CONNECT; NodeWaypoint capture is Outbound
+  and can terminate an authenticated CONNECT against a configured route.
 - Bump the optional `cryptoki` dependency (feature `pkcs11`) from 0.12.0 to 0.12.1 for
   RUSTSEC-2026-0286: `Session::get_attributes` could build an out-of-bounds slice when
   decoding `CKA_ALLOWED_MECHANISMS` (crash or adjacent heap disclosure). Lockfile-only
@@ -330,20 +351,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RequestAuthentication` is in play (correct and permanent — the fence bounds
   the mTLS leaf, not a bearer token's own lifetime); `__mesh_bpf_metrics` is
   classified reusable (it implements no request hook at all); and
-  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) is
-  classified per INSTANCE, `!outbound_listen_ports.is_empty()`. It is injected
-  as a `PluginScope::Global` row and globals enter every proxy chain, so it is
-  in every inbound admitting chain; the outbound-port list gates the request
-  hook's ENFORCEMENT, not the plugin's membership. What keeps it out of the
-  CONNECT's decision is that its port gate is the first statement of the hook,
-  so a request on a port the instance does not name returns `Continue` before
-  any registry lookup, metric, or rejection — and auto-injection names exactly
-  the outbound-direction capture ports, while only an inbound listener
-  terminates an HBONE CONNECT. A blanket `false` would have withheld inbound
-  reuse mesh-wide on a REGISTRY_ONLY mesh and revoked every already-reusable
-  inbound tunnel when the policy was applied; a blanket `true` would have
-  granted reuse to an operator-managed UNSCOPED instance, which really does
-  enforce on the inbound listener, so that shape keeps the fail-closed default.
+  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) enters
+  inbound chains as a `PluginScope::Global` row even when enforcement skips
+  them. Its original per-instance classification is superseded by PR #5595's
+  context-aware classification above: reuse is advertised only for CONNECTs
+  the registry did not decide, with unscoped instances always fail-closed.
 - **A live HBONE tunnel loses inner reuse when its chain stops permitting it**
   (issue #5583). The admission snapshot records whether reuse was advertised —
   the same value the header was stamped from — and every admission-fence sweep
@@ -361,6 +373,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or charge operations a reused tunnel previously carried without one; that is
   the point of the change, and it is the only behaviour difference an operator
   should expect.
+
+### Fixed
+
+- **A buffering relay writer no longer holds bytes while the reader is parked**
+  (issue #5588). `poll_copy_direction` — the one byte pump behind userspace
+  TCP/TLS, WebSocket tunnel mode, mesh TCP inbound/egress, and the HBONE
+  HTTP/2 CONNECT byte tunnel — accepted bytes into the writer, returned to
+  polling the reader, and parked there without flushing. That is only safe for
+  a writer that hands everything straight to the transport: `tokio-rustls`
+  accepts plaintext and returns `Ok(n)` for ciphertext it could not push, so a
+  relayed request or WebSocket reply could sit in the TLS writer while the peer
+  that owed the next read waited on it — neither side moving again. Each
+  direction now tracks whether the writer is still holding accepted bytes and
+  flushes before parking, matching tokio's own `CopyBuffer`. An unbuffered
+  writer's flush is a no-op and the flush is owed once per accepted batch, so
+  the plain-TCP hot path gains no syscall. `backend_write_timeout` now stays
+  armed across an in-flight flush *and* across the half-close that follows it,
+  going inert only when `poll_shutdown` resolves, so a writer that took the
+  bytes and cannot let go of them trips the write deadline in either phase —
+  including with `tcp_idle_timeout_seconds: 0` and
+  `tcp_half_close_max_wait_seconds: 0`, the long-lived-TCP configuration in
+  which it is the only timer left. A `poll_shutdown` that fails *while the
+  writer still owes a flush* now ends the direction as a write-side failure
+  rather than a clean completion, because the flush it implies did not happen
+  and the bytes already credited never left the writer. Nothing else changes
+  about teardown: a half-close with nothing outstanding, and the benign
+  peer-already-gone errnos (`EPIPE`, `ECONNRESET`, `WriteZero`, `ENOTCONN`),
+  stay graceful exactly as they were. Not every relay writer is a socket, so
+  the benign set is not errnos alone: the HBONE HTTP/2 CONNECT byte tunnel's
+  client leg is hyper's `H2Upgraded`, which funnels every h2 close reason —
+  including the `RST_STREAM(NO_ERROR)` a client sends when it is simply
+  discarding a stream it is done with — through `ErrorKind::Other`. A
+  half-close carrying an `h2::Error` whose reason is `NO_ERROR` or `CANCEL` is
+  therefore graceful too, so an ordinary tunnel abort racing the app's EOF is
+  not counted as a relay failure; every other reason stays a real write-side
+  failure.
+  Operators running TLS backends with a non-zero `backend_write_timeout_ms` can
+  therefore see `backend write inactivity timeout` where the timer had
+  previously gone inert — see `docs/tcp_udp_proxy.md` -> "TCP Backend Timeouts".
+  Half-close byte delivery, cancellation, the authorization-lifetime and
+  admission-revocation bounds, and per-direction byte/error attribution are
+  unchanged.
 
 ## [0.9.5] - 2026-09-13
 

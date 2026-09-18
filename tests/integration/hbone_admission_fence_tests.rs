@@ -92,7 +92,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTrafficDirection, prepare_gateway_config_for_mesh,
 };
-use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
+use ferrum_edge::plugins::{HboneReuseContext, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
     AdmittedHboneTunnel, AdmittedLeafExpiry, HboneAdmissionSnapshot, HbonePeerCredential,
     HboneRelayDestinationGate, HboneRevocationReason,
@@ -469,6 +469,10 @@ fn synthetic_snapshot(
         // there is no synthetic fixture for it, because the thing under test is
         // the chain the dispatcher itself resolves.
         advertised_inner_reuse: false,
+        reuse_context: HboneReuseContext {
+            mesh_direction: None,
+            frontend_listen_port: None,
+        },
     }
 }
 
@@ -493,6 +497,7 @@ fn dual_gate_snapshot(proxy: Arc<Proxy>, admission_sweep_epoch: u64) -> HboneAdm
     ctx.peer_spiffe_id = Some(SpiffeId::new(CLIENT_SPIFFE).expect("client spiffe id"));
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     HboneAdmissionSnapshot {
+        reuse_context: HboneReuseContext::from(&ctx),
         ctx,
         proxy,
         upstream_target: None,
@@ -541,6 +546,16 @@ async fn start_inbound_gateway(
     state: ProxyState,
     server_config: std::sync::Arc<rustls::ServerConfig>,
 ) -> (SocketAddr, watch::Sender<bool>) {
+    start_gateway_with_direction(state, server_config, MeshTrafficDirection::Inbound).await
+}
+
+/// The real accept loop and dispatcher with an explicit listener stamp. An
+/// Outbound listener can terminate a matching authenticated CONNECT too.
+async fn start_gateway_with_direction(
+    state: ProxyState,
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+    direction: MeshTrafficDirection,
+) -> (SocketAddr, watch::Sender<bool>) {
     let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind gateway");
@@ -552,7 +567,7 @@ async fn start_inbound_gateway(
             state,
             shutdown_rx,
             Some(server_config),
-            Some(MeshTrafficDirection::Inbound),
+            Some(direction),
         )
         .await;
     });
@@ -3499,7 +3514,7 @@ fn assert_registry_only_gate_is_injected(config: &GatewayConfig) {
         row.config["outbound_listen_ports"],
         json!([REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT]),
         "the injected gate must be scoped to the OUTBOUND capture port; an unscoped instance \
-         would decide on the inbound HBONE listener too, and would then be right to refuse reuse"
+         keeps the fail-closed reuse classification because it enforces on non-mesh listeners"
     );
     assert_eq!(
         row.config["registry"],
@@ -3512,19 +3527,12 @@ fn assert_registry_only_gate_is_injected(config: &GatewayConfig) {
 /// `REGISTRY_ONLY` must neither withhold inbound reuse nor revoke the tunnels
 /// that already have it.
 ///
-/// `mesh_outbound_registry` is injected `PluginScope::Global`, and a global
-/// plugin enters EVERY proxy chain — including the one that admits an inbound
-/// HBONE CONNECT. What keeps it out of that decision is its port gate, the
-/// first statement of its hook: the CONNECT arrives on the inbound listener,
-/// which is not an outbound capture port, so the hook returns `Continue` before
-/// any registry lookup. A blanket `false` classification would therefore have
-/// turned inner reuse off mesh-wide for a common Istio posture — and, because
-/// eligibility is re-judged on every sweep, revoked every already-reusable
-/// inbound tunnel the moment an operator applied the policy.
-///
-/// Both halves are asserted against the production dispatcher: a live tunnel
-/// survives the publication still carrying bytes, and a fresh CONNECT under the
-/// new generation is admitted AND advertised.
+/// The Global registry row enters the inbound admitting chain, but its first
+/// hook statement skips the Inbound direction before any registry lookup.
+/// A blanket `false` would withhold reuse and revoke live advertised tunnels
+/// even on disjoint ports. Both halves run through the production dispatcher:
+/// the live tunnel survives publication carrying bytes, and a fresh CONNECT is
+/// admitted AND advertised. The next test covers a colliding numeric scope.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
@@ -3544,6 +3552,7 @@ async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse
     ));
     let (gateway_addr, shutdown_tx) =
         start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    assert_ne!(gateway_addr.port(), REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT);
     let (mut sender, conn_task) =
         connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
@@ -3572,6 +3581,7 @@ async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse
         state.update_config(registry_only),
         ConfigApplyOutcome::Applied
     );
+
     wait_for_settled_sweeps(&state).await;
 
     assert_eq!(
@@ -3602,6 +3612,258 @@ async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse
         Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
         "and it must not cost the new tunnel its capability either"
     );
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// A numeric scope that CONTAINS the actual HBONE listener port must still
+/// leave inbound CONNECTs admitted and reusable. No second socket is needed:
+/// the production gate sees exactly the colliding scope and stamped direction
+/// that same-port binds on distinct addresses used to produce. Startup now
+/// rejects that listener plan; this independently proves the request boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_colliding_registry_scope_skips_inbound_connects_and_advertises_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let mut runtime = registry_only_runtime();
+    runtime.outbound_listen_addr.set_port(gateway_addr.port());
+    let registry_only = prepared_config_from_mesh_with_runtime(
+        Some(backend_addr.port()),
+        None,
+        registry_only_mesh(),
+        Vec::new(),
+        runtime,
+    );
+    let row = registry_only
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_outbound_registry")
+        .expect("a nonzero outbound scope must inject the registry");
+    assert!(row.enabled);
+    assert_eq!(row.scope, PluginScope::Global);
+    assert_eq!(
+        row.config["outbound_listen_ports"],
+        json!([gateway_addr.port()])
+    );
+    assert_eq!(row.config["registry"], json!([]));
+
+    // Re-publish the same collision as an operator-managed global as well.
+    // This proves the boundary does not depend on an auto-injected row id.
+    let mut operator_row = row.clone();
+    operator_row.id = "operator-colliding-outbound-registry".to_string();
+    let operator_config = prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![operator_row],
+    );
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+    for config in [registry_only, operator_config] {
+        assert_eq!(state.update_config(config), ConfigApplyOutcome::Applied);
+        wait_for_settled_sweeps(&state).await;
+        let (response, request_body) = send_connect(&mut sender, None).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an empty registry would reject this CONNECT if the matching port armed enforcement"
+        );
+        assert_eq!(
+            tunnel_reuse_advertisement(&response).as_deref(),
+            Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+            "the Inbound direction gate makes a colliding scoped instance reusable"
+        );
+        let mut tunnel = Tunnel {
+            request_body,
+            response_body: response.into_body(),
+        };
+        echo_round_trip(&mut tunnel, b"inbound-with-colliding-registry-port").await;
+        assert_eq!(revocation_counts(&state), [0; 9]);
+    }
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// An operator registry with a priority override deliberately exercises
+/// `PluginInstanceWrapper` as well as the registry's context-aware answer.
+fn operator_registry_plugin(port: u16) -> PluginConfig {
+    let mut row = unclassified_plugin();
+    row.id = "operator-outbound-registry".to_string();
+    row.plugin_name = "mesh_outbound_registry".to_string();
+    row.config = json!({
+        "registry": [CONNECT_AUTHORITY],
+        "outbound_listen_ports": [port],
+    });
+    row.priority_override = Some(ferrum_edge::plugins::priority::MESH_OUTBOUND_REGISTRY);
+    row
+}
+
+/// NodeWaypoint capture also stamps Outbound and supplies an authenticated
+/// principal. This fixture uses mTLS to supply that principal without eBPF or
+/// netns setup, then runs the production dispatcher and CONNECT terminator.
+/// Only registry membership changes: route and authorization remain identical.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outbound_terminated_connect_decided_by_the_registry_never_advertises_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) = start_gateway_with_direction(
+        state.clone(),
+        hbone_server_config(&certs),
+        MeshTrafficDirection::Outbound,
+    )
+    .await;
+    let mut config = prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![operator_registry_plugin(gateway_addr.port())],
+    );
+    assert_eq!(
+        state.update_config(config.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response),
+        None,
+        "this CONNECT spent a registry verdict that no fence sweep re-issues"
+    );
+    assert_eq!(
+        state
+            .hbone_admission_fence
+            .inspect_live_tunnels(|snapshot| {
+                (
+                    snapshot.reuse_context,
+                    snapshot.advertised_inner_reuse,
+                    snapshot
+                        .ctx
+                        .peer_spiffe_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                )
+            }),
+        vec![(
+            HboneReuseContext {
+                mesh_direction: Some(MeshTrafficDirection::Outbound),
+                frontend_listen_port: Some(gateway_addr.port()),
+            },
+            false,
+            Some(CLIENT_SPIFFE.to_string()),
+        )]
+    );
+    let mut tunnel = Tunnel {
+        request_body,
+        response_body: response.into_body(),
+    };
+    echo_round_trip(&mut tunnel, b"registered-outbound-connect").await;
+
+    let registry = config
+        .plugin_configs
+        .iter_mut()
+        .find(|row| row.id == "operator-outbound-registry")
+        .expect("operator registry");
+    registry.config["registry"] = json!([]);
+    registry.updated_at += chrono::Duration::seconds(1);
+    assert_eq!(state.update_config(config), ConfigApplyOutcome::Applied);
+    wait_for_settled_sweeps(&state).await;
+
+    // This unadvertised tunnel may finish its original operation; the source
+    // must make a fresh CONNECT for the next one, on the same outer H2 session.
+    echo_round_trip(&mut tunnel, b"finish-original-operation").await;
+    assert_eq!(revocation_counts(&state), [0; 9]);
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "withdrawing only the registry entry must refuse the next CONNECT"
+    );
+    assert_eq!(tunnel_reuse_advertisement(&response), None);
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// A scoped instance initially skips this Outbound listener. Expanding its
+/// scope must withdraw the capability using the ORIGINAL listener facts,
+/// even though sweeps have no live request to obtain those facts from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_scope_change_refolds_the_recorded_outbound_admission_facts() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) = start_gateway_with_direction(
+        state.clone(),
+        hbone_server_config(&certs),
+        MeshTrafficDirection::Outbound,
+    )
+    .await;
+    let other_port = if gateway_addr.port() == 1 { 2 } else { 1 };
+    let mut config = prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![operator_registry_plugin(other_port)],
+    );
+    assert_eq!(
+        state.update_config(config.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+    let (response, request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tunnel_reuse_advertisement(&response).as_deref(),
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "the nonmatching scope skipped this CONNECT, including through the instance wrapper"
+    );
+    let mut tunnel = Tunnel {
+        request_body,
+        response_body: response.into_body(),
+    };
+    echo_round_trip(&mut tunnel, b"before-outbound-scope-expansion").await;
+
+    let registry = config
+        .plugin_configs
+        .iter_mut()
+        .find(|row| row.id == "operator-outbound-registry")
+        .expect("operator registry");
+    registry.config["outbound_listen_ports"] = json!([gateway_addr.port()]);
+    registry.updated_at += chrono::Duration::seconds(1);
+    assert_eq!(state.update_config(config), ConfigApplyOutcome::Applied);
+    assert_tunnel_closed(&mut tunnel.response_body).await;
+    wait_for_no_live_tunnels(&state).await;
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 1, 0]);
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the destination is still registered, so a fresh per-operation CONNECT is admitted"
+    );
+    assert_eq!(tunnel_reuse_advertisement(&response), None);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
