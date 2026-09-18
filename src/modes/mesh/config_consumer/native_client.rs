@@ -174,7 +174,7 @@ pub async fn start_native_mesh_client_with_shutdown(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         cp_urls = cp_urls.len(),
-        liveness_bound_secs = config.timings.liveness_bound_seconds(),
+        liveness_bound_secs = %sanitize_startup_scalar(config.timings.liveness_bound_seconds()),
         "Native mesh client starting"
     );
 
@@ -475,7 +475,7 @@ async fn connect_mesh_subscribe(
     info!(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
-        cp_url = %cp_url,
+        cp_url = %sanitize_startup_scalar(cp_url),
         "Connected to CP, subscribing for native mesh config"
     );
 
@@ -572,7 +572,7 @@ async fn connect_mesh_subscribe(
                         format!("{:?}", cp_url.to_string()),
                         &[]
                     ),
-                    max_silence_secs = config.timings.max_silence.as_secs(),
+                    max_silence_secs = %sanitize_startup_scalar(config.timings.max_silence.as_secs()),
                     "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
                 );
                 return Ok(MeshStreamAttempt::HeartbeatSilenceTimeout);

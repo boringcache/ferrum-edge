@@ -828,7 +828,7 @@ pub async fn start_stock_xds_client_with_shutdown(
         cluster = %sanitize_startup_scalar(config.cluster.as_str()),
         xds_urls = xds_urls.len(),
         authorization = config.credential.is_configured(),
-        liveness_bound_secs = config.timings.liveness_bound_seconds(),
+        liveness_bound_secs = %sanitize_startup_scalar(config.timings.liveness_bound_seconds()),
         "Stock xDS mesh client starting (third-party control plane; discovery only)"
     );
 

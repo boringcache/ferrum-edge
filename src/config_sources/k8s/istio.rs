@@ -862,7 +862,7 @@ fn service_account_principal_pattern(
                 object,
                 format!(
                     "rules[].from[].source.{field} {service_account:?} must be \
-                     '<serviceaccount>' or '<namespace>/<serviceaccount>'"
+                     `<serviceaccount>` or `<namespace>/<serviceaccount>`"
                 ),
             ));
         }
@@ -8939,7 +8939,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("rules[].to[].operation.someUnsupportedField")
+                .contains("rules[].to[].operation[\"someUnsupportedField\"]")
         );
         assert!(err.to_string().contains("unsupported"));
     }
@@ -18068,7 +18068,7 @@ extensionProviders:
         let err = result.expect_err("unsupported source field must reject the resource");
         assert!(
             err.to_string()
-                .contains("source.someFutureField is unsupported"),
+                .contains("source[\"someFutureField\"] is unsupported"),
             "error should name the unsupported field, got: {err}"
         );
     }
@@ -19393,7 +19393,7 @@ extensionProviders:
         .expect_err("unsupported TLS mode must fail");
         assert!(
             err.to_string()
-                .contains("trafficPolicy.tls.mode 'BANANA' is unsupported"),
+                .contains("trafficPolicy.tls.mode \"BANANA\" is unsupported"),
             "got: {err}"
         );
     }

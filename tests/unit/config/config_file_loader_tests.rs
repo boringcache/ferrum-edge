@@ -2927,7 +2927,7 @@ fn file_loader_normalizes_mixed_case_hosts_sni_san_and_blank_optional_ids() {
     // File mode intentionally validates fields BEFORE normalize_fields() (see
     // file_loader::load_config_from_file and Proxy::validate_fields_inner). A
     // wire `proxy_id: ""` on a global plugin is therefore Some("") at field
-    // validation and fails with "scope 'global' must not have proxy_id" before
+    // validation and fails with "scope `global` must not have proxy_id" before
     // PluginConfig::normalize_fields can clear blank → None. Omit proxy_id here
     // (the admitted form); blank custom_id still proves optional-id clearing
     // because validate_string_field accepts whitespace-only values.

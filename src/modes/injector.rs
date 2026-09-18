@@ -2289,7 +2289,7 @@ fn resolve_named_container_port(
     let unresolved = || {
         format!(
             "container {container_name:?} {probe_field} names port {port_name:?} \
-which is not declared in that container's ports; refusing injection so the \
+which is not declared in the container ports; refusing injection so the \
 kubelet probe is not captured by inbound mesh redirect"
         )
     };

@@ -297,8 +297,9 @@ at rendering; interpolating a document scalar bare is a defect, not an exception
 to the convention. Parser errors use custom sanitization; the exact bare YAML
 `duplicate entry with key` family preserves its key as a backticked duplicate
 field, without classifying path-prefixed text.
-For withheld CIDRs, use the field path to locate the value; the reason and prefix
-length remain visible. Localized mesh, stock-xDS, gateway migration, and backup
+For withheld CIDRs, use the field path to locate the value; the reason and allowed
+prefix-length bounds remain visible, while the supplied prefix is withheld.
+Localized mesh, stock-xDS, gateway migration, and backup
 version rejections withhold the supplied `version` and retain the supported
 version and reason, including migration warnings. Database-mode `validate`
 checks a configured JSON backup through the same loader without a database dial.
