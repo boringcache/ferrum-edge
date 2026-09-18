@@ -921,7 +921,7 @@ impl MeshRuntimeConfig {
             ));
         }
 
-        Ok(Self {
+        let runtime = Self {
             node_id,
             namespace: env_config.namespace.clone(),
             cp_urls,
@@ -975,7 +975,10 @@ impl MeshRuntimeConfig {
             egress_stream_allow_plaintext: env_config.mesh_egress_stream_allow_plaintext,
             request_auth_require_exp: env_config.mesh_request_auth_require_exp,
             locality_lb_strict: env_config.mesh_locality_lb_strict,
-        })
+        };
+        // Shared by `run` and `ferrum-edge validate`, before any listener binds.
+        runtime.validate_listener_direction_ports()?;
+        Ok(runtime)
     }
 
     fn native_client_config(&self) -> NativeMeshClientConfig {
@@ -1201,6 +1204,43 @@ impl MeshRuntimeConfig {
             .map_err(|e| format!("FERRUM_MESH_OUTBOUND_LISTEN_ADDR: {e}"))?;
         sidecar_capture_listener_addrs(self.inbound_listen_addr, ipv6_capture)
             .map_err(|e| format!("FERRUM_MESH_INBOUND_LISTEN_ADDR: {e}"))?;
+        Ok(())
+    }
+
+    /// Keep inbound and outbound TCP listener port numbers distinct, even on
+    /// different bind addresses. The registry's direction gate is the primary
+    /// boundary; this startup check is defense in depth for port-scoped policy.
+    /// UDP capture may share a TCP port number, and port zero is not a scope.
+    pub fn validate_listener_direction_ports(&self) -> Result<(), String> {
+        let listeners = self.listener_plan();
+        for inbound in listeners.iter().filter(|listener| {
+            listener.direction == MeshTrafficDirection::Inbound
+                && listener.kind != MeshListenerKind::PlaintextUdpCapture
+                && listener.addr.port() != 0
+        }) {
+            for outbound in listeners.iter().filter(|listener| {
+                listener.direction == MeshTrafficDirection::Outbound
+                    && listener.kind != MeshListenerKind::PlaintextUdpCapture
+                    && listener.addr.port() != 0
+            }) {
+                if inbound.addr.port() == outbound.addr.port() {
+                    let inbound_setting = match inbound.kind {
+                        MeshListenerKind::HboneTermination => "FERRUM_MESH_HBONE_LISTEN_ADDR",
+                        _ if self.topology == MeshTopology::EgressGateway => {
+                            "FERRUM_MESH_EGRESS_LISTEN_ADDR"
+                        }
+                        _ => "FERRUM_MESH_INBOUND_LISTEN_ADDR",
+                    };
+                    return Err(format!(
+                        "`{inbound_setting}` ({:?}) must use a different TCP port number from \
+                         `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` ({:?}); both use port {:?}",
+                        inbound.addr,
+                        outbound.addr,
+                        inbound.addr.port(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -14358,6 +14398,12 @@ fn prepare_mesh_runtime_before_owner(
     runtime
         .validate_capture_listener_families()
         .map_err(|e| anyhow::anyhow!("Invalid mesh TCP capture listener settings: {e}"))?;
+
+    // Also cover callers that construct MeshRuntimeConfig directly instead of
+    // using from_env_config. This preparation still precedes every bind.
+    runtime
+        .validate_listener_direction_ports()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh listener direction settings: {e}"))?;
 
     if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
         let _ = take_mesh_startup_fault_inject();

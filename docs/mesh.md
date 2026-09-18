@@ -6778,9 +6778,9 @@ Mesh-specific environment variables are listed below. For the full reference of 
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_MESH_INBOUND_LISTEN_ADDR` | `0.0.0.0:15006` | Sidecar inbound mTLS listener |
-| `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | `127.0.0.1:15001` | Sidecar/ambient outbound capture listener |
-| `FERRUM_MESH_HBONE_LISTEN_ADDR` | `0.0.0.0:15008` | Ambient HBONE listener |
+| `FERRUM_MESH_INBOUND_LISTEN_ADDR` | `0.0.0.0:15006` | Sidecar inbound mTLS listener; its nonzero TCP port number must differ from the planned outbound capture listener's, even on different addresses |
+| `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` | `127.0.0.1:15001` | Sidecar/ambient outbound capture listener; startup and `validate` reject a nonzero TCP port number shared with any planned inbound TCP listener, even on different addresses |
+| `FERRUM_MESH_HBONE_LISTEN_ADDR` | `0.0.0.0:15008` | Ambient HBONE listener; its nonzero TCP port number must differ from the planned outbound capture listener's. UDP capture may share an inbound TCP port number; port `0` is excluded from this check |
 | `FERRUM_MESH_EAST_WEST_LISTEN_PORT` | `15443` | East-west gateway shared listener port |
 | `FERRUM_MESH_EGRESS_LISTEN_ADDR` | `0.0.0.0:15090` | Egress gateway mTLS listener |
 | `FERRUM_MESH_EGRESS_HBONE_PORT` | `15008` | Destination HBONE transport port dialed for Ambient/Waypoint mesh egress (the peer's HBONE listener). Stamped as the `mesh.hbone_port` upstream tag |
