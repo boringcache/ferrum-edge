@@ -8,10 +8,62 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_plan import stamp_sample
-from process_usage import client_pids, measurement_usage, sample_processes
+from process_usage import IO_FIELDS, client_pids, measurement_usage, parse_io, sample_processes
 
 
 class PassiveUsageTests(unittest.TestCase):
+    def test_io_parser_requires_every_counter_and_preserves_zero(self):
+        text = "\n".join(f"{key}: {index}" for index, key in enumerate(IO_FIELDS))
+        self.assertEqual(parse_io(text), dict(zip(IO_FIELDS, range(len(IO_FIELDS)))))
+        with self.assertRaises(KeyError):
+            parse_io("rchar: 0")
+        with self.assertRaises(ValueError):
+            parse_io(text.replace("rchar: 0", "rchar: -1"))
+
+    def test_io_delta_requires_continuous_monotonic_bracket(self):
+        timeline = [dict(unix_secs=t, processes=[dict(
+            pid=42, role="gateway", start_ticks=1, cpu_seconds=t, rss_bytes=1024,
+            io={key: n * 100 for key in IO_FIELDS})]) for n, t in enumerate((0.9, 1.5, 2.1))]
+        phases = dict(measurement_start_unix_secs=1, measurement_secs=1)
+        row = measurement_usage(dict(timeline=timeline), phases)[0]
+        self.assertEqual(row["io"], {key: 200 for key in IO_FIELDS})
+        timeline[1]["processes"][0]["io"]["syscw"] = 201
+        self.assertIn("io_error", measurement_usage(dict(timeline=timeline), phases)[0])
+        del timeline[1]["processes"][0]["io"]
+        row = measurement_usage(dict(timeline=timeline), phases)[0]
+        self.assertNotIn("io", row)
+        self.assertIn("io_error", row)
+
+    def test_privileged_reader_stop_file_preserves_optional_h3_observations(self):
+        for http3 in (False, True):
+            with self.subTest(http3=http3), tempfile.TemporaryDirectory() as directory:
+                output, stop = Path(directory) / "usage.json", Path(directory) / "stop"
+                stop.touch()
+                with patch("process_usage.signal.signal"), \
+                        patch("process_usage.os.sysconf", return_value=100), \
+                        patch("process_usage.client_pids", return_value=[]) as discover, \
+                        patch("process_usage.capture", return_value=None), \
+                        patch("process_usage.thread_snapshot", return_value=[{"tid": 7}]), \
+                        patch("process_usage.transport_snapshot", return_value={"observed": True}) as transport:
+                    sample_processes(1, [2], output, 0.5, parent_pid=42, stop_file=stop,
+                                     http3=http3, envoy=True)
+                report = json.loads(output.read_text())
+                self.assertTrue(report["capture_complete"])
+                discover.assert_called_with(42)
+                self.assertEqual(len(report["timeline"]), 2)
+                for snapshot in report["timeline"]:
+                    if http3:
+                        self.assertEqual(snapshot["transport"], {"observed": True})
+                        self.assertEqual({row["role"] for row in snapshot["threads"]},
+                                         {"gateway", "backend"})
+                    else:
+                        self.assertNotIn("transport", snapshot)
+                        self.assertNotIn("threads", snapshot)
+                if http3:
+                    transport.assert_called_with(True)
+                else:
+                    transport.assert_not_called()
+
     def test_client_boundary_capture_replaces_a_missing_passive_endpoint(self):
         phases = dict(measurement_start_unix_secs=1, measurement_secs=1,
                       client_usage=dict(pid=3, role="client", complete_bracket=True,

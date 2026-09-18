@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "name": "5588-h1-cutoff-zero-versus-one",
+  "protocol": "http1-tls",
+  "arms": [
+    {
+      "gateway": "ferrum",
+      "FERRUM_EXTRA_ENV": "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0"
+    },
+    {
+      "gateway": "ferrum-exp-cutoff-one",
+      "FERRUM_EXTRA_ENV": "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1"
+    }
+  ]
+}

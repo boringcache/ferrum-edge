@@ -317,35 +317,71 @@ If uncertainty still overlaps, report inconclusive and schedule a longer
 predeclared experiment. Optional stopping does not make this exploratory interval
 a confirmatory test. Inspect every sample's p99 as well as RPS.
 
-#### Diagnostic Ferrum environment overlay
+#### Same-image environment experiments (#5588 section 4)
 
-`Trusted Cross Build Policy` freezes the `benchmark` matrix job byte-for-byte
-and that job exports no environment of its own, so a pull request cannot set
-`FERRUM_EXTRA_ENV` on a hosted run. `ferrum_experiment.env` is the
-branch-committed equivalent: the runner reads each `FERRUM_<NAME>=<value>` line
-and appends it to the Ferrum container's `-e` list **after** the harness
-defaults, so an overlay line wins. `#` comments and blank lines are ignored and
-any other line is reported and skipped.
+The runner reads the branch-committed `experiment.json` before any build or
+startup. An enabled manifest adds named `ferrum-exp-*` arms for its one protocol
+when Ferrum is selected. Its first arm is the `ferrum` reference; every arm uses
+the same image, configuration, startup function, payloads, offered concurrency,
+phases and strict validity rules. Only `FERRUM_EXTRA_ENV` differs. Values are
+literal public benchmark settings, never shell source or credentials. Image
+overrides, duplicate names/keys and shell syntax are rejected. Ambient
+`FERRUM_EXTRA_ENV` and `--baseline-image` cannot be combined with an active
+manifest. The resolved arm names enter the ordinary expected matrix and paired
+comparisons; the exact experiment manifest is copied into the run artifact.
+Disable the manifest after an experiment so later default runs do not silently
+acquire extra arms.
 
-The overlay reaches the `ferrum` and `ferrum-baseline` arms only, so a populated
-file makes the run **diagnostic**: Ferrum is no longer configured the way the
-comparison configures it, and the run's rates are not a paired performance
-measurement. `manifest.json` records the active overlay under
-`ferrum_env_overlay` so an artifact states that on its own. Keep the file empty
-(comments only) on `main`.
+The committed cutoff manifest is disabled after its completed hosted run.
+See [audit section 4](../../../docs/benchmark_audit_2026_09_17.md#section-4--same-image-http11-framing-experiment)
+for the measured revision, retained raw observations and inconclusive intervals.
+Commit `enabled: true` before repeating that scope. The combined aggregate
+accepts the download action's flat single-protocol layout and displays every
+declared arm; ambiguous flat downloads fail instead of guessing a protocol.
+The frozen per-protocol workflow summary still lists only built-in gateways;
+use the raw paired files and combined aggregate for extra experiment arms.
 
-The tracker #5588 section-3 failure diagnosis used `FERRUM_LOG_LEVEL=warn`. The
-harness default is `error`, at which Ferrum still logs `HTTP/2 backend request
-failed`, `HTTP/2 pool connection failed` and `gRPC: backend request failed` with
-their classified `error_kind`; `warn` adds the body-read and
-capability/establishment paths that sit one level below.
+The cutoff experiment compares `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` against
+`1` at 10240, 71680, 512000, 1048576 and 5242880 bytes. A scoped hosted dispatch
+uses duration 30, concurrency 200, iterations 1, skips `envoy kong tyk krakend`
+and skips `http2 http3 grpcs wss tcp-tls udp udp-dtls`. The default two pairs give
+30 samples (direct plus two Ferrum arms, five sizes). Orders are direct/0/1
+then 1/0/direct. Estimated benchmark envelope: `2 × 15 × (30 + 15) / 60 + 5 =
+27.5 minutes`, within the 75-minute step. Two pairs are exploratory and have a
+wide Student-t interval; they cannot establish a general performance claim.
 
-Client-side transport failures are reported too: `proto_bench` prints one
-bounded stderr line per failing worker with the error's whole `source()` chain
-(`  gRPC unary_echo error: …`, `  HTTP/2 send_request error: …`). Before this a
-sample could report 159 gRPC errors with an empty stderr file.
+Passive `/proc/<pid>/io` snapshots add `rchar`, `wchar`, `syscr`, `syscw`,
+`read_bytes`, `write_bytes`, and `cancelled_write_bytes`. The same measurement
+bracket and slack as CPU apply. Missing, decreasing or discontinuous counters
+produce `io_error`, never fabricated zeros. On hosted Linux, passwordless sudo
+runs only the passive sampler so it can read container PIDs across UIDs; a stop
+file terminates and reaps it. Without sudo, permission failures remain explicit.
+`rchar`/`wchar` and `syscr`/`syscw` are Linux read/write accounting, **not** total
+network bytes, every socket syscall, copied bytes, allocations, or TLS records.
+`read_bytes`/`write_bytes` are storage I/O and may be zero for busy sockets.
 
-#### Maximum safe dispatch inputs
+H1 samples also contain `phases.h1_profile`, measured as client counter deltas
+at the common boundaries. Per-worker counters avoid cross-worker atomic
+contention. `tls_records` counts complete received TLS wire records below
+rustls, and `tls_record_bytes` includes their five-byte headers. The parser
+handles split/coalesced socket reads without retaining payloads or changing
+writes/flushes. Encrypted TLS 1.3 control messages cannot be distinguished from
+application records. Handshake/warmup/drain are excluded by boundary snapshots;
+records and requests spanning a boundary need not share attribution. Parser
+errors invalidate the **TLS profile**, even when useful-work validation passes.
+`body_data_frames`/`body_data_bytes` count client Hyper response data frames,
+not upstream Ferrum frames or H1 chunks. `chunked_responses` and
+`content_length_responses` observe framing headers. All counters include
+in-flight work at the boundary; normalize them as approximate diagnostics, not
+exact per-completed-request costs. Instrumentation is identical across arms
+and adds client CPU overhead. The existing full-body echo validation remains.
+
+Allocation counts, internal copies and adapter CPU require a separate profiling
+build or permitted tracing/sampling; these passive counters cannot identify
+them. Do not infer a zero-copy production path or restore Content-Length from
+this echo experiment. See the audit for evidence and keep/reject dispositions.
+
+#### Maximum safe dispatch inputs (ordinary matrix)
 
 For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 `iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative
@@ -380,6 +416,87 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
 
+### HTTP/3 transport experiment (#5588, section 2)
+
+`h3_experiment.json` enables the hosted experiment without changing the frozen
+matrix job. `H3_EXPERIMENT_MANIFEST` can select another data manifest; setting
+`enabled: false` disables it. With Envoy selected, the runner adds
+`envoy-limit-4` to the same counterbalanced pairs as `envoy` (limit 100), Ferrum,
+and direct. Both Envoy arms retain pinned 1.33.5, SNI `localhost`, CA validation,
+windows, timeouts, and strict HTTP 200/exact-body validation. Generated configs,
+image IDs/digests, the experiment manifest, and host socket settings are artifacts.
+
+| Offered workers | Client QUIC connections | Limit 4 admission ceiling | Limit 100 ceiling |
+|---:|---:|---:|---:|
+| 200 | 21 | 84 | 200 |
+| 100 | 11 | 44 | 100 |
+| 50 | 6 | 24 | 50 |
+
+These are downstream ceilings from the fixed round-robin worker assignment;
+`observed.active_streams` reports client admission during load. The experiment
+changes the upstream and downstream limits together. The backend's timestamped
+`H3_PROFILE` records show upstream connection
+IDs, peer ports, accepted/completed echoes and bytes. Per-connection measurement
+deltas and per-thread CPU brackets accompany each sample. They include sampling
+slack; neither identifies which Envoy thread owns an individual UDP socket.
+
+The downstream limit is applied to
+`udp_listener_config.quic_options.quic_protocol_options`, which constructs the
+QUIC transport. Changing only the similarly named HCM options did **not** cap
+downstream admission in the first hosted experiment: all 200/100/50 streams
+remained admitted. Compare the observed queues and locally active exchanges
+with the transport ceiling: local validation can outlive transport stream
+closure, so the local gauge is not an exact server stream count. Previous
+claims that the historical HCM setting necessarily admitted
+only 84/44/24 streams were incorrect.
+
+H3 waits 750 ms at the ready barrier and after worker drain, identically for all
+arms, to bracket fast client and upstream sockets with the passive sampler.
+The former is `barrier_secs`, the latter `observation_hold_secs`; neither time
+enters measured throughput. Envoy histogram records are retained separately
+from its named scalar counters. The aggregate accepts the single-artifact flat
+layout as well as multiple artifact directories; missing runs fail explicitly.
+
+The enabled experiment requires a disposable Linux runner with passwordless
+`sudo sysctl`. It sets `rmem_default`, `wmem_default`, `rmem_max`, and `wmem_max`
+before any arm to 4,194,304 bytes. Ferrum/Quinn inherit the defaults; Envoy uses
+explicit downstream and upstream `SO_RCVBUF`/`SO_SNDBUF` requests of 2,097,152
+bytes because Linux doubles explicit requests. Equal **effective per-socket**
+budgets must be observed before a sample is accepted. This does not equalize the
+number of sockets or total gateway memory. No production config knob is added.
+
+The existing passive 500 ms sampler now also reads `/proc/net/snmp`,
+`/proc/net/udp{,6}`, thread stat files, and `NETLINK_SOCK_DIAG` for this experiment.
+`INET_DIAG_SKMEMINFO` gives the same kernel receive/send limits as `getsockopt`,
+verified against a live UDP socket in hosted tests. Socket cookies prevent inode
+reuse from producing false deltas. The sampler neither executes commands nor
+injects descriptors into another process. Kernel UDP deltas cover the shared
+host namespace; socket deltas are narrower. The backend peer port identifies
+upstream sockets, including unconnected Quinn endpoints. Missing observations,
+counter resets, incomplete brackets, and unverified buffer parity stay explicit.
+
+Envoy stats are sampled via its loopback admin endpoint and retained in full.
+Pinned 1.33.5 repeatedly adds cumulative `SO_RXQ_OVFL` values; its reported drops
+are **not loss totals** ([upstream correction #38652](https://github.com/envoyproxy/envoy/pull/38652)).
+Use independent kernel/socket deltas. `TOO_MANY_RTOS`, idle-close, and watchdog
+counters remain raw, timestamped observations. Both gateways use info logging;
+startup and per-payload logs have Docker timestamps, exposing BPF/GRO/GSO
+warnings. No warning is not positive proof of an optimized path: record
+unsupported/unverified unless logs or other observations positively establish it.
+
+H3 endpoints close explicitly after worker drain under one shared five-second
+deadline, and all drivers are joined or aborted/reaped. `phases.transport_events`
+retains connection IDs, UNIX timestamps, raw closure reasons and final Quinn
+stats, labelled setup/warmup, measurement, drain, or transport close. Timestamped
+server counters between payloads distinguish retired connections from measured
+failures; do not infer request loss merely from a post-measurement closure.
+
+For the scoped hosted run use duration 10, concurrency 200, iterations 1, skip
+protocols `http1-tls http2 grpcs wss tcp-tls udp udp-dtls`, skip gateways
+`kong tyk krakend`, and skip sizes `71680 512000`. The runner defaults to two
+pairs: 24 samples across four arms and three sizes. Adaptive extension is off;
+two-pair intervals are diagnostic, not a confirmatory performance claim.
+
 Raw JSON lives under `pairs/pair_NNN/`. Root `<gateway>_<protocol>_<size>.json`
 keeps the legacy totals/rate fields and adds `samples` plus `expected_pairs`.
 Rates use total measured requests / total measured seconds; summary latency
@@ -387,7 +504,9 @@ quantiles are the maximum per-sample quantiles, explicitly labelled, because
 quantiles cannot be pooled without histograms. All constituent observations are
 validated. The rolling regression evaluator restarts its window when
 `protocol_perf_budgets.json.workload_revision` changes, excluding missing/older
-markers; this revision is `2026-09-18.phased-bounded-echo.v1`. The historical
+markers; this revision is `2026-09-18.h1-h3-observation.v3`, accounting for H1
+frame/header/TLS observation overhead and H3 observation holds and explicit
+retirement instrumentation. The historical
 H1 paired-ratio reference remains unchanged. The
 combined artifact also contains flattened `observed-samples.json` and
 `paired-comparisons.json`; use those or the raw samples for analysis. The frozen

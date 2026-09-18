@@ -13,8 +13,9 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
 use bytes::Buf;
+use multi_protocol_perf::h1_profile::{Counters, ObservedTls};
 use multi_protocol_perf::metrics::BenchMetrics;
-use multi_protocol_perf::phases::{Connections, Phases};
+use multi_protocol_perf::phases::{Connections, Phases, TransportEvent};
 use multi_protocol_perf::tls_utils;
 use multi_protocol_perf::transport::{ObservedBody, ObservedChannel, echo_exchange, request_body};
 
@@ -325,6 +326,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         let authority = authority.clone();
         let tls_connector = tls_connector.clone();
         let payload = payload.clone();
+        let h1_counters = phases.h1_counters();
         let mut metrics = phases.worker();
         let connections = connections.clone();
         handles.push(tokio::spawn(async move {
@@ -332,6 +334,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
             async fn connect_h1(
                 addr: SocketAddr,
                 connections: &Connections,
+                counters: &Arc<Counters>,
                 tls: &Option<(
                     tokio_rustls::TlsConnector,
                     rustls::pki_types::ServerName<'static>,
@@ -340,6 +343,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                 let tcp = tokio::net::TcpStream::connect(addr).await?;
                 let _ = tcp.set_nodelay(true);
                 if let Some((connector, server_name)) = tls {
+                    let tcp = ObservedTls::new(tcp, counters.clone());
                     let tls_stream = connector.connect(server_name.clone(), tcp).await?;
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
@@ -361,14 +365,14 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                 }
             }
 
-            let mut send_req = connect_h1(addr, &connections, &tls_connector).await?;
+            let mut send_req = connect_h1(addr, &connections, &h1_counters, &tls_connector).await?;
             let mut reconnects: u64 = 0;
 
             while metrics.next_request().await {
                 // Reconnect if the connection was closed
                 if send_req.is_closed() {
                     reconnects += 1;
-                    send_req = connect_h1(addr, &connections, &tls_connector).await?;
+                    send_req = connect_h1(addr, &connections, &h1_counters, &tls_connector).await?;
                 }
 
                 let req = hyper::Request::post(&path)
@@ -380,7 +384,15 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                     Ok(resp) => {
                         use http_body_util::BodyExt;
                         let status = resp.status();
-                        match resp.into_body().collect().await {
+                        h1_counters.response_headers(resp.headers());
+                        let counters = h1_counters.clone();
+                        let body = resp.into_body().map_frame(move |frame| {
+                            if let Some(data) = frame.data_ref() {
+                                counters.data_frame(data.len());
+                            }
+                            frame
+                        });
+                        match body.collect().await {
                             Ok(body) => {
                                 let bytes = body.to_bytes();
                                 let latency = start.elapsed().as_micros() as u64;
@@ -609,8 +621,9 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         .context("invalid address")?;
     let path = url.path().to_string();
 
-    let mut phases =
-        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let mut phases = Phases::new(Duration::from_secs(args.duration))
+        .with_payload(args.payload_size)
+        .with_observation_settle(Duration::from_millis(750));
     let connections = phases.connections();
     let client_cfg = tls_utils::make_h3_client_config_insecure();
 
@@ -631,7 +644,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         Vec::with_capacity(num_conns);
 
     let mut endpoints = Vec::with_capacity(num_conns);
-    for _ in 0..num_conns {
+    let mut drivers = Vec::with_capacity(num_conns);
+    let mut transports = Vec::with_capacity(num_conns);
+    let mut events = Vec::new();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    for connection_id in 0..num_conns {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
         endpoint.set_default_client_config(client_cfg.clone());
 
@@ -640,16 +657,31 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("quinn connect: {e}"))?
             .await
             .map_err(|e| anyhow::anyhow!("quinn connect: {e}"))?;
-        let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn))
+        events.push(TransportEvent::new(
+            connection_id,
+            "connected",
+            format!(
+                "local={} peer={}",
+                endpoint.local_addr()?,
+                conn.remote_address()
+            ),
+        ));
+        transports.push(conn.clone());
+        let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
             .await
             .map_err(|e| anyhow::anyhow!("h3 handshake: {e}"))?;
         endpoints.push(endpoint);
         let connection = connections.opened();
         // h3 driver must be polled concurrently to process connection frames
-        tokio::spawn(async move {
+        drivers.push(tokio::spawn(async move {
             let _connection = connection;
-            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        });
+            let result = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            TransportEvent::new(
+                connection_id,
+                "driver_closed",
+                format!("h3={result:?}; quic={:?}", conn.close_reason()),
+            )
+        }));
         senders.push(send_req);
     }
 
@@ -658,6 +690,8 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     // Distribute concurrent tasks across the connection pool
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
+        let event_tx = event_tx.clone();
+        let connection_id = i as usize % num_conns;
         let mut send_req = senders[i as usize % num_conns].clone();
         let full_uri = full_uri.clone();
         let payload = payload.clone();
@@ -675,11 +709,21 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                         metrics.admitted();
                         if let Err(e) = stream.send_data(payload.clone()).await {
                             eprintln!("  h3 send_data error: {e}");
+                            let _ = event_tx.send(TransportEvent::new(
+                                connection_id,
+                                "send_data_failed",
+                                e.to_string(),
+                            ));
                             metrics.record_error();
                             break;
                         }
                         if let Err(e) = stream.finish().await {
                             eprintln!("  h3 finish error: {e}");
+                            let _ = event_tx.send(TransportEvent::new(
+                                connection_id,
+                                "finish_failed",
+                                e.to_string(),
+                            ));
                             metrics.record_error();
                             break;
                         }
@@ -714,6 +758,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(e) = recv_err {
+                                    let _ = event_tx.send(TransportEvent::new(
+                                        connection_id,
+                                        "recv_data_failed",
+                                        e.clone(),
+                                    ));
                                     eprintln!(
                                         "  h3 recv_data error after {} bytes (expected {}): {}",
                                         body_bytes,
@@ -738,12 +787,22 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                         latency,
                                         &[],
                                     ) {
+                                        let _ = event_tx.send(TransportEvent::new(
+                                            connection_id,
+                                            "echo_validation_failed",
+                                            format!("status={status} bytes={body_bytes}"),
+                                        ));
                                         break;
                                     }
                                 }
                             }
                             Err(e) => {
                                 eprintln!("  h3 recv_response error: {e}");
+                                let _ = event_tx.send(TransportEvent::new(
+                                    connection_id,
+                                    "recv_response_failed",
+                                    e.to_string(),
+                                ));
                                 metrics.record_error();
                                 break;
                             }
@@ -751,6 +810,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         eprintln!("  h3 send_request error: {e}");
+                        let _ = event_tx.send(TransportEvent::new(
+                            connection_id,
+                            "send_request_failed",
+                            e.to_string(),
+                        ));
                         metrics.record_error();
                         break;
                     }
@@ -761,12 +825,33 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     }
 
     let mut combined = phases.finish(handles).await;
+    while let Ok(event) = event_rx.try_recv() {
+        events.push(event);
+    }
+    // Preserve live sockets for an ending passive observation. No requests are
+    // offered here, and this time is excluded from measured work and drain.
+    let observation_started = Instant::now();
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    if let Some(phases) = &mut combined.phases {
+        phases.observation_hold_secs = observation_started.elapsed().as_secs_f64();
+    }
     let close_started = Instant::now();
-    for endpoint in &endpoints {
+    events.push(TransportEvent::new(0, "retirement_started", String::new()));
+    drop(senders);
+    for (connection_id, endpoint) in endpoints.iter().enumerate() {
+        events.push(TransportEvent::new(
+            connection_id,
+            "local_close_requested",
+            format!(
+                "benchmark drained; stats={:?}",
+                transports[connection_id].stats()
+            ),
+        ));
         endpoint.close(0u32.into(), b"benchmark drained");
     }
-    for endpoint in endpoints {
-        if tokio::time::timeout(Duration::from_secs(5), endpoint.wait_idle())
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for (connection_id, endpoint) in endpoints.into_iter().enumerate() {
+        if tokio::time::timeout_at(close_deadline, endpoint.wait_idle())
             .await
             .is_err()
         {
@@ -774,10 +859,53 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             if let Some(phases) = &mut combined.phases {
                 phases.transport_close_timed_out = true;
             }
+            events.push(TransportEvent::new(
+                connection_id,
+                "idle_timeout",
+                String::new(),
+            ));
+        } else {
+            events.push(TransportEvent::new(
+                connection_id,
+                "endpoint_idle",
+                String::new(),
+            ));
+        }
+    }
+    for (connection_id, mut driver) in drivers.into_iter().enumerate() {
+        match tokio::time::timeout_at(close_deadline, &mut driver).await {
+            Ok(Ok(event)) => events.push(event),
+            Ok(Err(error)) => {
+                events.push(TransportEvent::new(
+                    connection_id,
+                    "driver_join_failed",
+                    error.to_string(),
+                ));
+                if let Some(phases) = &mut combined.phases {
+                    phases.transport_close_timed_out = true;
+                }
+            }
+            Err(error) => {
+                driver.abort();
+                let _ = driver.await;
+                events.push(TransportEvent::new(
+                    connection_id,
+                    "driver_join_failed",
+                    error.to_string(),
+                ));
+                if let Some(phases) = &mut combined.phases {
+                    phases.transport_close_timed_out = true;
+                }
+            }
         }
     }
     if let Some(phases) = &mut combined.phases {
         phases.transport_close_secs = close_started.elapsed().as_secs_f64();
+        phases.transport_close_start_unix_secs = events
+            .iter()
+            .find(|event| event.event == "retirement_started")
+            .map(|event| event.unix_secs);
+        phases.set_transport_events(events);
     }
     print_results(&combined, "HTTP/3", args);
     Ok(())

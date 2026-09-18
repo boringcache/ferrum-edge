@@ -68,6 +68,8 @@ BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
 HOST_ID=""
+EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
+EXPERIMENT_ARMS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -125,6 +127,23 @@ esac
 # lands in the expected location. Resolving to absolute upfront decouples the two.
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+
+# A committed data manifest is the experiment input to the frozen hosted job.
+H3_BUDGET=0
+GATEWAY_LOG_LEVEL=error
+if [ "$PROTOCOL" = http3 ]; then
+    H3_BUDGET=$(python3 "$SCRIPT_DIR/h3_experiment.py" settings \
+        "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}")
+    if [ "$H3_BUDGET" -ne 0 ]; then
+        GATEWAY_LOG_LEVEL=info
+        # Defaults are effective kernel bytes. Apply identically before creating
+        # client, backend and either gateway; Envoy's explicit options read back
+        # the same limits. This is scoped to the disposable hosted runner.
+        sudo -n sysctl -w "net.core.rmem_max=$H3_BUDGET" "net.core.wmem_max=$H3_BUDGET" \
+            "net.core.rmem_default=$H3_BUDGET" "net.core.wmem_default=$H3_BUDGET" \
+            > "$OUTPUT_DIR/socket_budget.txt"
+    fi
+fi
 
 # ── Gateway × protocol support matrix ─────────────────────────────────────────
 # Returns 0 if the gateway supports the protocol, 1 otherwise.
@@ -223,12 +242,17 @@ BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
 sampler_pid=""
+sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
 
 cleanup() {
     echo "[cleanup] stopping all processes..."
     if [ -n "$sampler_pid" ]; then
-        kill -TERM "$sampler_pid" 2>/dev/null || true
+        if [ -n "$sampler_stop_file" ]; then
+            touch "$sampler_stop_file"
+        else
+            kill -TERM "$sampler_pid" 2>/dev/null || true
+        fi
         wait "$sampler_pid" || true
     fi
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
@@ -276,7 +300,7 @@ start_backend() {
     local saved_pwd
     saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
-    ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
+    H3_PROFILE="$H3_BUDGET" ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
@@ -382,7 +406,7 @@ start_ferrum() {
         -e "FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/key.pem" \
         -e "FERRUM_DTLS_CERT_PATH=/etc/ferrum/tls/cert.pem" \
         -e "FERRUM_DTLS_KEY_PATH=/etc/ferrum/tls/key.pem" \
-        -e "FERRUM_LOG_LEVEL=error" \
+        -e "FERRUM_LOG_LEVEL=$GATEWAY_LOG_LEVEL" \
         -e "FERRUM_ADD_VIA_HEADER=false" \
         -e "FERRUM_ADD_FORWARDED_HEADER=false" \
         -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
@@ -443,13 +467,18 @@ start_envoy() {
         -e "s|KEY_PATH|/certs/key.pem|g" \
         -e "s|CA_PATH|/certs/ca.pem|g" \
         "$cfg_src" > "$cfg_dst"
+    if [ "$PROTOCOL" = http3 ] && [ "$H3_BUDGET" -ne 0 ]; then
+        python3 "$SCRIPT_DIR/h3_experiment.py" envoy "$cfg_dst" "$cfg_dst" \
+            "${ENVOY_STREAM_LIMIT:-100}" "$H3_BUDGET"
+    fi
 
     echo "[envoy] starting..."
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$cfg_dst:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
         "$ENVOY_IMAGE" \
-        envoy -c /etc/envoy/envoy.yaml --concurrency "$(nproc 2>/dev/null || echo 4)" -l error --disable-hot-restart)
+        envoy -c /etc/envoy/envoy.yaml --concurrency "$(nproc 2>/dev/null || echo 4)" \
+        -l "$GATEWAY_LOG_LEVEL" --disable-hot-restart)
 
     wait_for_gateway
 }
@@ -825,21 +854,44 @@ run_bench() {
         gateway_pids=$(docker top "$GATEWAY_CID" -eo pid | tail -n +2 | tr '\n' ' ' || true)
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
+    local sampler_args=()
+    if [ "$PROTOCOL" = http3 ] && [ "$H3_BUDGET" -ne 0 ]; then
+        sampler_args+=(--http3)
+        case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
+    fi
     if $PROCESS_USAGE; then
         : > "$usage"
-        python3 "$SCRIPT_DIR/process_usage.py" \
-            --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
-            --output "$usage" --interval 0.5 &
-        sampler_pid=$!
+        # /proc/<container-pid>/io requires ptrace read permission across UIDs.
+        # Elevate ONLY the passive reader. A stop file avoids signalling sudo's
+        # root-owned monitor; the client remains an ordinary direct invocation.
+        if sudo -n true 2>/dev/null; then
+            sampler_stop_file="$usage.stop"
+            rm -f "$sampler_stop_file"
+            sudo -n python3 "$SCRIPT_DIR/process_usage.py" \
+                --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                --output "$usage" --interval 0.5 --parent-pid "$$" \
+                --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            sampler_pid=$!
+        else
+            sampler_stop_file=""
+            python3 "$SCRIPT_DIR/process_usage.py" \
+                --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                --output "$usage" --interval 0.5 "${sampler_args[@]}" &
+            sampler_pid=$!
+        fi
         # Wait for the first observation and installed signal handlers. Without
         # readiness, an immediately failing client could leave SIGINT ignored.
         local sampler_wait=0
-        while [ ! -s "$usage" ] && kill -0 "$sampler_pid" 2>/dev/null && [ "$sampler_wait" -lt 100 ]; do
+        while [ ! -s "$usage" ] && [ "$sampler_wait" -lt 100 ]; do
             sleep 0.05
             sampler_wait=$(( sampler_wait + 1 ))
         done
         if [ ! -s "$usage" ]; then
-            kill -TERM "$sampler_pid" 2>/dev/null || true
+            if [ -n "$sampler_stop_file" ]; then
+                touch "$sampler_stop_file"
+            else
+                kill -TERM "$sampler_pid" 2>/dev/null || true
+            fi
             wait "$sampler_pid" || true
             sampler_pid=""
         fi
@@ -865,9 +917,14 @@ run_bench() {
             || rc=$?
     fi
     if [ -n "$sampler_pid" ]; then
-        kill -INT "$sampler_pid" 2>/dev/null || true
+        if [ -n "$sampler_stop_file" ]; then
+            touch "$sampler_stop_file"
+        else
+            kill -INT "$sampler_pid" 2>/dev/null || true
+        fi
         wait "$sampler_pid" || true
         sampler_pid=""
+        sampler_stop_file=""
     fi
     # Capture after the timed load, while the gateway still exists. Keep these
     # below a subdirectory so summary globs cannot mistake stats for samples.
@@ -877,11 +934,11 @@ run_bench() {
     # the capture exists to diagnose.
     cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
-        docker logs "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
-        if [ "$gateway" = "envoy" ]; then
+        docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
+        if [[ "$gateway" == envoy* ]]; then
             curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
-                > "$diagnostics/envoy_${payload}_stats.json" \
-                2> "$diagnostics/envoy_${payload}_stats.err" || true
+                > "$diagnostics/${gateway}_${payload}_stats.json" \
+                2> "$diagnostics/${gateway}_${payload}_stats.err" || true
         fi
     fi
 
@@ -930,6 +987,23 @@ main() {
     if [ -n "$BASELINE_IMAGE" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
         expected_gateways+=" ferrum-baseline"
     fi
+    if [ "$H3_BUDGET" -ne 0 ] && [[ " $expected_gateways " == *" envoy "* ]]; then
+        expected_gateways+=" envoy-limit-4"
+    fi
+    if [ -f "$EXPERIMENT_MANIFEST" ]; then
+        EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
+            "$EXPERIMENT_MANIFEST" "$PROTOCOL")
+        if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
+            if [ -n "$BASELINE_IMAGE" ] || [ -n "${FERRUM_EXTRA_ENV:-}" ]; then
+                echo "[experiment] manifest cannot be mixed with baseline-image or ambient FERRUM_EXTRA_ENV" >&2
+                exit 2
+            fi
+            expected_gateways+=" $EXPERIMENT_ARMS"
+            cp "$EXPERIMENT_MANIFEST" "$OUTPUT_DIR/experiment.json"
+        else
+            EXPERIMENT_ARMS=""
+        fi
+    fi
     if [ -r /proc/sys/kernel/random/boot_id ]; then
         HOST_ID=$(cat /proc/sys/kernel/random/boot_id)
     else
@@ -947,12 +1021,19 @@ with open(sys.argv[1], "w") as manifest:
                "ferrum_env_overlay": sys.argv[6:],
                "sample_schema": 2}, manifest)
 PYEOF
+    if [ "$H3_BUDGET" -ne 0 ]; then
+        cp "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}" "$root_output/h3_experiment.json"
+    fi
 
     build_binaries
     # Save immutable image IDs as well as operator-supplied tags for revision A/B.
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
+    if [[ " $expected_gateways " == *" envoy "* ]]; then
+        docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
+            >> "$root_output/images.txt"
+    fi
     local requested_pairs="$PAIRS"
     local final_pairs="$PAIRS"
     local extended=false
@@ -975,13 +1056,31 @@ PYEOF
                 start_backend
                 case "$gw" in
                     direct) ;;
-                    ferrum) start_ferrum ;;
+                    ferrum|ferrum-exp-*)
+                        if [ -n "$EXPERIMENT_ARMS" ]; then
+                            local arm_env
+                            arm_env=$(python3 "$SCRIPT_DIR/experiment_arms.py" env \
+                                "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw") || exit 2
+                            FERRUM_EXTRA_ENV="$arm_env" start_ferrum
+                        else
+                            start_ferrum
+                        fi
+                        ;;
                     ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
-                    envoy) start_envoy ;;
+                    envoy) ENVOY_STREAM_LIMIT=100 start_envoy ;;
+                    envoy-limit-4) ENVOY_STREAM_LIMIT=4 start_envoy ;;
                     kong) start_kong ;;
                     tyk) start_tyk ;;
                     krakend) start_krakend ;;
                 esac || { echo "[main] $gw failed to start"; stop_gateway; continue; }
+                if [ -n "$GATEWAY_CID" ]; then
+                    mkdir -p "$OUTPUT_DIR/diagnostics"
+                    docker logs --timestamps "$GATEWAY_CID" \
+                        > "$OUTPUT_DIR/diagnostics/${gw}_startup.log" 2>&1 || true
+                    if [[ "$gw" == envoy* ]]; then
+                        cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+                    fi
+                fi
                 for size in $PAYLOAD_SIZES; do
                     if [ "$gw" = direct ]; then
                         run_bench "$gw" "$size" direct

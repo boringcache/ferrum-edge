@@ -83,6 +83,12 @@ def sample_issues(sample):
                     issues.append(f"incomplete {role} measurement bracket")
     if sample.get("error"):
         issues.append(str(sample["error"]))
+    if sample.get("h3_experiment"):
+        transport = sample.get("transport_diagnostics") or {}
+        if transport.get("complete_bracket") is not True:
+            issues.append("incomplete H3 transport observations")
+        if transport.get("equal_socket_budget_verified") is not True:
+            issues.append("H3 socket budget parity unverified")
     errors = sample.get("total_errors")
     if not isinstance(errors, int) or isinstance(errors, bool) or errors < 0:
         issues.append("missing/invalid error count")

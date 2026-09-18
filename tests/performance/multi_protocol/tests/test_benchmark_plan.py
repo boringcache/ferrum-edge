@@ -6,8 +6,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from benchmark_plan import (extension_decision, gateway_order, paired_comparison,
-                            position_balance, read_comparisons, summarize, write_summaries)
+from benchmark_plan import (extension_decision, gateway_order, normalize_artifact_layout,
+                            ordered_gateways, paired_comparison, position_balance,
+                            protocol_runs, read_comparisons, summarize, write_summaries)
 from benchmark_validity import sample_issues
 from process_usage import measurement_usage, parse_stat
 
@@ -19,6 +20,50 @@ def sample(pair, rps=10):
 
 
 class PairedPlanTests(unittest.TestCase):
+    def test_single_and_multiple_artifact_layouts_are_both_discovered(self):
+        for nested in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                container = root / "gateways-protocol-bench-http3-sha" if nested else root
+                run = container / "run_1"
+                run.mkdir(parents=True)
+                (run / "envoy_http3_10240.json").write_text('{"protocol":"http3"}')
+                self.assertEqual(protocol_runs(root), [("http3", run)])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                protocol_runs(directory)
+
+    def test_tables_include_all_experiment_arms(self):
+        self.assertEqual(
+            ordered_gateways(["ferrum-exp-b", "ferrum", "direct", "ferrum-exp-a", "ferrum"]),
+            ["direct", "ferrum", "ferrum-exp-a", "ferrum-exp-b"],
+        )
+
+    def test_single_download_is_wrapped_without_changing_raw_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run_1"
+            run.mkdir()
+            (run / "paired_comparisons.json").write_text('[{"accepted": false}]\n')
+            normalize_artifact_layout(root, ["http1-tls"], "a" * 40)
+            files = list(root.glob("*/run_*/paired_comparisons.json"))
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].read_text(), '[{"accepted": false}]\n')
+            normalize_artifact_layout(root, ["http1-tls"], "a" * 40)
+            self.assertEqual(list(root.glob("*/run_*/paired_comparisons.json")), files)
+
+    def test_flat_download_never_guesses_a_protocol_or_overwrites_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "run_1").mkdir()
+            for protocols in ([], ["http2", "http3"], ["../escape"]):
+                with self.assertRaises(ValueError):
+                    normalize_artifact_layout(root, protocols, "a" * 40)
+            (root / ("gateways-protocol-bench-http2-" + "a" * 40)).mkdir()
+            with self.assertRaises(FileExistsError):
+                normalize_artifact_layout(root, ["http2"], "a" * 40)
+            self.assertTrue((root / "run_1").is_dir())
+
     def test_every_even_pair_count_has_equal_mean_position_for_any_arm_count(self):
         for count in range(2, 8):
             gateways = [f"arm-{i}" for i in range(count)]
