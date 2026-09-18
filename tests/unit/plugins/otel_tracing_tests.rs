@@ -265,7 +265,10 @@ async fn test_otel_tracing_rejects_non_http_endpoint_scheme() {
     .err()
     .expect("non-http endpoint scheme must be rejected");
 
-    assert!(err.contains("http or https"), "got: {err}");
+    assert!(
+        err.contains("`endpoint` scheme must be `http` or `https`"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
