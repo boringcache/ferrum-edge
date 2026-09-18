@@ -123,12 +123,13 @@ async fn borrowed_success_and_fifo_handoff_have_distinct_counters() {
     assert_eq!(delta(&before, "borrowed_send_success"), 1);
     assert_eq!(delta(&before, "egress_sent"), 0);
     probe.release_backend_sends();
-    for _ in 0..5000 {
-        if probe.committed_sends().len() == 2 {
-            break;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while probe.committed_sends().len() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("released writer must commit both queued datagrams");
     assert_eq!(
         probe.committed_sends(),
         vec![b"first".to_vec(), b"second".to_vec()]
