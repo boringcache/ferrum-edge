@@ -1251,7 +1251,7 @@ impl MeshRuntimeConfig {
             Err(e) => {
                 warn!(
                     "Skipping the NodeWaypoint transparent inbound capture listener: {}",
-                    sanitize_startup_scalar(&e)
+                    sanitize_startup_cause(&e, &[])
                 );
                 return None;
             }
@@ -1259,7 +1259,7 @@ impl MeshRuntimeConfig {
         if let Err(e) = validate_ingress_capture_addr(addr) {
             warn!(
                 "Skipping the NodeWaypoint transparent inbound capture listener: {}",
-                sanitize_startup_scalar(&e)
+                sanitize_startup_cause(&e, &[])
             );
             return None;
         }
@@ -31947,16 +31947,17 @@ mod tests {
                     let runtime =
                         MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
 
-                    // The plan silently omits it — that is exactly why the
-                    // serving path cannot rely on planning alone.
+                    // Planning omits the listener, but the warning must retain
+                    // the field and reason without its supplied address.
+                    let (plan, log) = capture_mesh_diagnostics(|| runtime.listener_plan());
                     assert!(
-                        !runtime
-                            .listener_plan()
-                            .iter()
-                            .any(|listener| listener.kind
-                                == MeshListenerKind::TransparentInboundCapture),
+                        !plan.iter().any(|listener| listener.kind
+                            == MeshListenerKind::TransparentInboundCapture),
                         "an invalid capture address warn-skips in the infallible plan"
                     );
+                    assert!(log.contains("FERRUM_MESH_INBOUND_LISTEN_ADDR"), "{log}");
+                    assert!(log.contains(expected), "{log}");
+                    assert!(!log.contains(addr), "{log}");
 
                     let err = runtime
                         .validate_transparent_inbound_capture_settings()
