@@ -39,8 +39,8 @@ use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_re
 use crate::plugins::utils::openai_error::proxy_has_openai_auth_error_envelope_plugin;
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
-    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
-    create_plugin_with_http_client_and_config_id,
+    HboneReuseContext, Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol,
+    ResponsePresentationPolicy, create_plugin_with_http_client_and_config_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -1150,14 +1150,18 @@ impl Plugin for PluginInstanceWrapper {
     /// `mesh_authz` out of every fence sweep — the stranded-decision failure the
     /// reuse classification exists to prevent, and one the reuse half could not
     /// see, because a wrapper reports on its own behalf — while dropping
-    /// `allows_hbone_inner_reuse` would fail closed but turn the capability off
-    /// for every route an operator happens to have given a `priority_override`
-    /// or a trigger. Neither may depend on how a plugin row was configured.
+    /// `allows_hbone_inner_reuse_for` would lose context-aware opt-ins such as
+    /// the registry's skipped CONNECTs on rows with `priority_override` or a
+    /// trigger. Forward both classifiers and the admitting listener facts;
+    /// neither contract depends on how a row was configured.
     fn reevaluates_live_admission(&self) -> bool {
         self.inner.reevaluates_live_admission()
     }
     fn allows_hbone_inner_reuse(&self) -> bool {
         self.inner.allows_hbone_inner_reuse()
+    }
+    fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {
+        self.inner.allows_hbone_inner_reuse_for(admission)
     }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()

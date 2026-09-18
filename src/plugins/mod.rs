@@ -2247,6 +2247,25 @@ pub(crate) enum BackendDispatchState {
     AmbiguousFailure,
 }
 
+/// Listener facts used to classify an admitted HBONE CONNECT for inner reuse.
+/// Captured once at admission and retained unchanged for later fence sweeps.
+/// Classification must be pure: it may inspect these facts and plugin config,
+/// but must not run request hooks, consume a budget, or consult an external service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HboneReuseContext {
+    pub mesh_direction: Option<MeshTrafficDirection>,
+    pub frontend_listen_port: Option<u16>,
+}
+
+impl From<&RequestContext> for HboneReuseContext {
+    fn from(ctx: &RequestContext) -> Self {
+        Self {
+            mesh_direction: ctx.mesh_direction,
+            frontend_listen_port: ctx.frontend_listen_port,
+        }
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -11306,7 +11325,8 @@ pub trait Plugin: Send + Sync {
     /// The destination stamps
     /// [`crate::modes::mesh::hbone::TUNNEL_REUSE_HEADER`] on a CONNECT `200`
     /// only when every plugin in the ADMITTING request view returns `true`
-    /// here, so one `false` anywhere in the chain forces one CONNECT — and one
+    /// from [`Self::allows_hbone_inner_reuse_for`], which defaults to this
+    /// method. One `false` anywhere in the chain forces one CONNECT — and one
     /// full destination admission decision — per application operation, exactly
     /// as before reuse existed.
     ///
@@ -11352,10 +11372,20 @@ pub trait Plugin: Send + Sync {
     /// two markers are independent: changing a plugin's authorize marker can
     /// never, on its own, make it reusable.
     ///
-    /// Every reusable built-in therefore overrides this method explicitly, and
-    /// so must every one that becomes reusable later.
+    /// Every reusable built-in therefore overrides this method or the
+    /// context-aware classification explicitly, as must any new opt-in.
     fn allows_hbone_inner_reuse(&self) -> bool {
         false
+    }
+
+    /// Classify reuse for the listener facts of the admitting CONNECT.
+    /// The default preserves the context-free classification, including its
+    /// literal-false default for unclassified plugins. A context-aware override
+    /// has the same safety contract as [`Self::allows_hbone_inner_reuse`].
+    /// Both admission and every sweep use this method with the SAME recorded
+    /// facts; only the plugin generation may change.
+    fn allows_hbone_inner_reuse_for(&self, _admission: &HboneReuseContext) -> bool {
+        self.allows_hbone_inner_reuse()
     }
 
     /// Returns hostnames that this plugin will send traffic to.
