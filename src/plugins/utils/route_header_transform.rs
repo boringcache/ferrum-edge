@@ -377,7 +377,7 @@ mod tests {
         ]))
         .unwrap();
         let err = parse_route_header_transforms(&raw, "ctx").unwrap_err();
-        assert!(err.contains("add/update/remove"), "got: {err}");
+        assert!(err.contains("`add`/`update`/`remove`"), "got: {err}");
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
         ]))
         .unwrap();
         let err = parse_route_header_transforms(&raw, "ctx").unwrap_err();
-        assert!(err.contains("must be \"header\""), "got: {err}");
+        assert!(err.contains("must be `header`"), "got: {err}");
     }
 
     #[test]
@@ -397,7 +397,7 @@ mod tests {
         ]))
         .unwrap();
         let err = parse_route_header_transforms(&raw, "ctx").unwrap_err();
-        assert!(err.contains("value is required"), "got: {err}");
+        assert!(err.contains(".value` is required"), "got: {err}");
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
         assert!(
             parse_route_header_transforms(&empty, "ctx")
                 .unwrap_err()
-                .contains("key must not be empty")
+                .contains(".key` must not be empty")
         );
         let bad: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(serde_json::json!([
             {"operation": "remove", "target": "header", "key": "X Y"},
