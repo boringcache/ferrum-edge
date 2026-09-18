@@ -2604,7 +2604,7 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let error = cache
         .rebuild(&replacement)
         .expect_err("malformed replacement CA must reject cache publication");
-    assert!(error.contains("record #2"), "got: {error}");
+    assert!(error.contains("ws_logging: invalid CA bundle"), "got: {error}");
 
     let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
