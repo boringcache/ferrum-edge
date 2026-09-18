@@ -336,6 +336,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the point of the change, and it is the only behaviour difference an operator
   should expect.
 
+### Fixed
+
+- **A buffering relay writer no longer holds bytes while the reader is parked**
+  (issue #5588). `poll_copy_direction` — the one byte pump behind userspace
+  TCP/TLS, WebSocket tunnel mode, mesh TCP inbound/egress, and the HBONE
+  HTTP/2 CONNECT byte tunnel — accepted bytes into the writer, returned to
+  polling the reader, and parked there without flushing. That is only safe for
+  a writer that hands everything straight to the transport: `tokio-rustls`
+  accepts plaintext and returns `Ok(n)` for ciphertext it could not push, so a
+  relayed request or WebSocket reply could sit in the TLS writer while the peer
+  that owed the next read waited on it — neither side moving again. Each
+  direction now tracks whether the writer is still holding accepted bytes and
+  flushes before parking, matching tokio's own `CopyBuffer`. An unbuffered
+  writer's flush is a no-op and the flush is owed once per accepted batch, so
+  the plain-TCP hot path gains no syscall. `backend_write_timeout` now stays
+  armed across an in-flight flush *and* across the half-close that follows it,
+  going inert only when `poll_shutdown` resolves, so a writer that took the
+  bytes and cannot let go of them trips the write deadline in either phase —
+  including with `tcp_idle_timeout_seconds: 0` and
+  `tcp_half_close_max_wait_seconds: 0`, the long-lived-TCP configuration in
+  which it is the only timer left. A `poll_shutdown` that fails *while the
+  writer still owes a flush* now ends the direction as a write-side failure
+  rather than a clean completion, because the flush it implies did not happen
+  and the bytes already credited never left the writer. Nothing else changes
+  about teardown: a half-close with nothing outstanding, and the benign
+  peer-already-gone errnos (`EPIPE`, `ECONNRESET`, `WriteZero`, `ENOTCONN`),
+  stay graceful exactly as they were. Not every relay writer is a socket, so
+  the benign set is not errnos alone: the HBONE HTTP/2 CONNECT byte tunnel's
+  client leg is hyper's `H2Upgraded`, which funnels every h2 close reason —
+  including the `RST_STREAM(NO_ERROR)` a client sends when it is simply
+  discarding a stream it is done with — through `ErrorKind::Other`. A
+  half-close carrying an `h2::Error` whose reason is `NO_ERROR` or `CANCEL` is
+  therefore graceful too, so an ordinary tunnel abort racing the app's EOF is
+  not counted as a relay failure; every other reason stays a real write-side
+  failure.
+  Operators running TLS backends with a non-zero `backend_write_timeout_ms` can
+  therefore see `backend write inactivity timeout` where the timer had
+  previously gone inert — see `docs/tcp_udp_proxy.md` -> "TCP Backend Timeouts".
+  Half-close byte delivery, cancellation, the authorization-lifetime and
+  admission-revocation bounds, and per-direction byte/error attribution are
+  unchanged.
+
 ## [0.9.5] - 2026-09-13
 
 Release from main introducing resource labels in tagged artifacts. Includes the

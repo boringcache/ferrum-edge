@@ -562,7 +562,13 @@ proxies:
 `backend_read_timeout_ms` and `backend_write_timeout_ms` apply to TCP proxies as **per-direction inactivity timeouts**. They are enforced by a watchdog that polls per-direction watermarks:
 
 - **`backend_read_timeout_ms`**: fires when the backend stops producing bytes (b2c direction goes stale). The watermark is refreshed on every successful read from the backend.
-- **`backend_write_timeout_ms`**: fires when progress stalls while client bytes are queued for the backend. The watermark is refreshed on every partial `write()` that accepts bytes and disarmed when the queue drains. A client that sends a subscription request and then only receives backend pushes does not trip this timer; a subsequent client write arms it again. This lifecycle is shared by userspace, splice, io_uring and kTLS forwarding.
+- **`backend_write_timeout_ms`**: fires when progress stalls while client bytes are queued for the backend. The watermark is refreshed on every partial `write()` that accepts bytes. A client that sends a subscription request and then only receives backend pushes does not trip this timer; a subsequent client write arms it again.
+
+**When the write watermark disarms is not the same on every path** (issue #5588). The splice, io_uring and kTLS loops disarm it the moment the queued bytes are handed to the destination file descriptor: there is no userspace write buffer between the relay and the socket, so "accepted" is "delivered". The **userspace direction-tracking relay** disarms it when the writer's **flush completes** — not when the relay's own buffer drains — and, while a flush is still owed, keeps it armed across the half-close (`poll_shutdown`) until that resolves. A direction that reaches EOF owing nothing is inert from that moment. `tokio-rustls` accepts plaintext and returns `Ok(n)` for ciphertext it could not push to the transport, so on a TLS backend "the relay has nothing queued" does not mean "the backend can see it".
+
+Operator-visible consequence, TLS backends only: with a non-zero `backend_write_timeout_ms`, a backend whose socket has stopped draining while rustls holds accepted ciphertext now trips this timer and reports `backend write inactivity timeout` with `error_class=read_write_timeout` on the client→backend direction. Before, the watermark had already gone inert at the moment the writer said `Ok`, and that connection fell through to `tcp_idle_timeout_seconds` — or, with the idle timeout and `tcp_half_close_max_wait_seconds` both disabled, to no bound at all. Plain-TCP backends are unchanged: `TcpStream`'s flush is a no-op, so both disarm points coincide. Raise `backend_write_timeout_ms` (or set it to `0`) if a TLS backend is legitimately slower than the configured window at accepting a large write. Note that this also bounds the half-close: a direction that reaches EOF with a flush still outstanding is now cut by `backend_write_timeout_ms` — at the shipped defaults 30,000 ms, ten times tighter than the 300 s `tcp_half_close_max_wait_seconds` — so a deliberately raised half-close cap no longer describes that case on its own.
+
+The same reasoning applies to the half-close itself. `poll_shutdown` performs the writer's implied flush, so when it *fails* while the writer is still holding bytes it accepted, the relay reports that direction as a write-side failure instead of a clean completion — the tail it already counted never reached the peer. A half-close with nothing outstanding, and the benign peer-already-gone failures, remain graceful and produce no `error_class`. Benign means the errnos `EPIPE`, `ECONNRESET`, `WriteZero` and `ENOTCONN` — and, on the HBONE HTTP/2 CONNECT byte tunnel, whose writer is hyper's `H2Upgraded` and can raise none of them, an h2 close reason of `NO_ERROR` or `CANCEL`. Every other h2 reason stays a write-side failure.
 
 Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement for long-lived TCP workloads (database keep-alives, message-broker streams, SSH/IMAP passthrough). When disabled, the TCP relay relies solely on `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive.
 
@@ -664,8 +670,19 @@ summary; a fallback reports `splice=false`. Peer certificate identity (mTLS),
 SNI, `on_stream_connect` plugin ordering, `tcp_idle_timeout_seconds`,
 `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`,
 `backend_write_timeout_ms`, byte accounting, and first-failure direction
-attribution are identical on both paths — the kTLS socket carries plaintext to
-userspace, so it feeds the same splice loops as a plain-to-plain relay.
+attribution are configured, enforced and reported identically on both paths —
+the kTLS socket carries plaintext to userspace, so it feeds the same splice
+loops as a plain-to-plain relay.
+
+One deliberate difference remains inside `backend_write_timeout_ms`, and it is
+about *when the watermark disarms*, not about the timer's meaning or its
+attribution (issue #5588). A handed-off kTLS connection splices to a file
+descriptor and disarms on hand-off. The buffered fallback writes through
+`tokio-rustls`, which can accept plaintext and retain the ciphertext, so it
+disarms only once the flush completes and keeps the deadline armed across the
+half-close. The buffered path therefore covers a window the spliced path does
+not have: bytes accepted by the writer but not yet on the wire. See
+"TCP Backend Timeouts" above.
 
 SNI is the one value with no shared source: the buffered path reads
 `ServerConnection::server_name()`, while `UnbufferedServerConnection` exposes no

@@ -580,6 +580,81 @@ records the first measured H1 experiment and its limits.
    tunnels also need parity checks. Preserve idle/write deadlines, half-close
    behavior, cancellation and error attribution when adding flush progress.
 
+   **Outcome (2026-09-18): confirmed and fixed.** The defect reproduces through
+   actual rustls backpressure against the production loop, not an extracted
+   copy: with a TLS transport window smaller than one encrypted record,
+   `tokio-rustls` accepts the whole plaintext, retains the ciphertext it could
+   not push, and the far peer holds a partial record it cannot decrypt while the
+   relay parks on a still-open client. `poll_copy_direction` now tracks whether
+   the writer is holding accepted bytes (`CopyDirectionState::needs_flush`) and
+   flushes before parking on a pending reader, mirroring tokio's `CopyBuffer`.
+   The flush is owed once per accepted batch and an unbuffered writer's
+   `poll_flush` is a no-op, so the plain-TCP hot path gains no syscall.
+   `backend_write_timeout` stays armed across an in-flight flush *and* across
+   the half-close that follows it, going inert only when `poll_shutdown`
+   resolves, so a writer that cannot let go of accepted bytes trips the write
+   deadline in either phase — including with `tcp_idle_timeout_seconds: 0` and
+   `tcp_half_close_max_wait_seconds: 0`, where it is the only bound left. A
+   `poll_shutdown` that fails while the writer still owes a flush ends the
+   direction as a write-side failure rather than a clean completion; a
+   half-close with nothing outstanding, and the benign peer-already-gone errnos,
+   stay graceful. Half-close byte delivery, cancellation, the
+   authorization-lifetime and admission-revocation bounds, and per-direction
+   byte/error attribution are asserted unchanged. Coverage:
+   `tests/unit/gateway_core/relay_flush_progress_tests.rs` (behavioral, through
+   `bidirectional_copy_for_relay`, the fenced entry point
+   `bidirectional_copy_for_fenced_relay`, and the authorization-bounded entry
+   point) and
+   `shared_invariant_parity_tests.rs::every_tunnelled_relay_path_shares_one_flushing_byte_pump`
+   (set equality over every `src/**/*.rs` file that calls either entry point, so
+   a fifth call site fails the build until it is listed).
+
+   **What the fenced-relay test does and does not cover.** An earlier revision
+   of this amendment called it "`bidirectional_copy_for_fenced_relay` — the
+   HBONE H2 CONNECT byte tunnel", which overstates it. The test proves that the
+   fenced entry point runs the same flushing pump; its buffering writer is a
+   `BufWriter`, and it does not reproduce an H2 byte tunnel.
+   `H2ConnectTunnel::poll_flush` is a compile-time `Poll::Ready(Ok(()))` —
+   the h2 driver flushes on its own — so the H2 CONNECT leg can never be the
+   writer that holds bytes. The direction a buffering writer can stall on HBONE
+   is the opposite one: backend→client on the inbound fenced relay, where the
+   bytes reach the peer through the inbound mTLS `TlsStream`. That writer's
+   behaviour is what the rustls-backpressure test covers.
+
+   **Hosted corroboration (2026-09-18).** Two scoped
+   `gateways-protocol-benchmark` runs with identical inputs — ferrum only,
+   http2 + grpcs + wss, 70 KiB and 5 MiB, `iterations=2` — on
+   [`main` at `606b898a4`](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35327641299)
+   and on
+   [the fix at `c9a0c3d5c`](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35327635467):
+
+   | Ferrum sample | main, errors (it. 1 / 2) | fix, errors (it. 1 / 2) |
+   |---|---:|---:|
+   | WSS / 5 MiB | **24 / 24** | **0 / 0** |
+   | WSS / 70 KiB | 0 / 0 | 0 / 0 |
+   | HTTP/2 / 70 KiB | 0 / 0 | 0 / 0 |
+   | HTTP/2 / 5 MiB | 0 / 0 | 0 / 0 |
+   | gRPC / 70 KiB, 5 MiB | 0 / 0 | 0 / 0 |
+
+   Every WSS/5 MiB error on `main` is the tracker's signature,
+   `ws echo error: timed out waiting 30s for echo`, and the gateway-free
+   `direct` WSS/5 MiB baseline completed error-free in both arms (171.0 and
+   179.5 RPS), so the failure is on the gateway path rather than in the harness
+   or the backend. Twenty-four of twenty-five workers losing their in-flight
+   echo is the end-of-run shape a relay that parks holding unflushed ciphertext
+   produces.
+
+   **What this does not establish.** The two runs started four seconds apart on
+   **separate** hosted runners, not sequentially on one host, so nothing here
+   controls for machine-to-machine variation. Two iterations per arm is
+   corroboration, not a causal proof, and it does not rule out a second
+   contributing mechanism at that payload. RPS across these runs is **not**
+   usable: the two arms move in opposite directions by payload (WSS/70 KiB
+   favours `main` by ~60%, HTTP/2 by ~70% the other way) with zero errors on
+   both sides, which is the cross-run CPU variance this report warns about
+   throughout. The regression tests — which cannot pass on the unfixed loop —
+   remain the proof of the defect and of its repair.
+
 2. **Measure HTTP/1.1 framing and TLS write cadence.**
    Ferrum's benchmark already disables response buffering and body-size limits,
    selecting `direct_streaming_body`; recommending “turn on streaming” or
