@@ -552,30 +552,30 @@ mod tests {
     fn constructor_rejects_malformed_filter_config() {
         for (config, expected) in [
             (json!("bad"), "config must be an object"),
-            (json!({ "filter": "bad" }), "filter must be an object"),
+            (json!({ "filter": "bad" }), "`filter` must be an object"),
             (
                 json!({ "filter": { "status_code_min": "500" } }),
-                "filter.status_code_min must be an integer",
+                "`filter.status_code_min` must be an integer",
             ),
             (
                 json!({ "filter": { "status_code_max": 70000 } }),
-                "filter.status_code_max must be between 0 and 65535",
+                "`filter.status_code_max` must be between 0 and 65535",
             ),
             (
                 json!({ "filter": { "min_latency_ms": "250" } }),
-                "filter.min_latency_ms must be an integer",
+                "`filter.min_latency_ms` must be an integer",
             ),
             (
                 json!({ "filter": { "errors_only": "true" } }),
-                "filter.errors_only must be a boolean",
+                "`filter.errors_only` must be a boolean",
             ),
             (
                 json!({ "filter": { "status_code_min": 500, "status_code_max": 499 } }),
-                "filter.status_code_min must be less than or equal to filter.status_code_max",
+                "`filter.status_code_min` must be less than or equal to `filter.status_code_max`",
             ),
             (
                 json!({ "filter": { "expression": null } }),
-                "filter.expression is invalid",
+                "`filter.expression` is invalid",
             ),
             (
                 json!({
