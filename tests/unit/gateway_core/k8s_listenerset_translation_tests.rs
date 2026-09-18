@@ -900,7 +900,9 @@ fn duplicate_gateway_listener_section_fails_closed() {
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
     assert!(translation.warnings.iter().any(|warning| {
-        warning.contains(r#"Gateway "default"/"edge" listener "b-duplicate" rejected: HostnameConflict"#)
+        warning.contains(
+            r#"Gateway "default"/"edge" listener "b-duplicate" rejected: HostnameConflict"#,
+        )
     }));
     let duplicate_key = GatewayApiListenerKey {
         namespace: "default".to_string(),

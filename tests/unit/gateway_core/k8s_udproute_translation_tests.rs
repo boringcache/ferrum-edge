@@ -305,7 +305,8 @@ fn udp_route_rejects_non_service_backend_kind() {
 
     let message = err.to_string();
     assert!(
-        message.contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
+        message
+            .contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
     );
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
@@ -1153,7 +1154,8 @@ fn udp_route_unsupported_backend_kind_in_a_set_fails_the_whole_rule_closed() {
 
     let message = err.to_string();
     assert!(
-        message.contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
+        message
+            .contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
     );
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
@@ -1195,7 +1197,8 @@ fn udp_route_zero_weight_leg_still_has_its_target_kind_validated() {
 
     let message = err.to_string();
     assert!(
-        message.contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
+        message
+            .contains(r#"unsupported backendRef target group "example.com" kind "DatagramSink""#)
     );
     assert!(message.contains("UDPRoute only supports core Service backendRefs"));
 }
