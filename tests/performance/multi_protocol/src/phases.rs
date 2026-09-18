@@ -182,7 +182,11 @@ pub struct Gauge {
 
 impl Gauge {
     fn observe(&mut self, value: usize, count: usize) {
-        self.min = if count == 1 { value } else { self.min.min(value) };
+        self.min = if count == 1 {
+            value
+        } else {
+            self.min.min(value)
+        };
         self.max = self.max.max(value);
         self.mean += (value as f64 - self.mean) / count as f64;
     }
@@ -326,10 +330,9 @@ impl Phases {
                 }
                 observed.samples += 1;
                 observed.active_workers.observe(workers, observed.samples);
-                observed.active_connections.observe(
-                    self.connections.0.load(Ordering::Relaxed),
-                    observed.samples,
-                );
+                observed
+                    .active_connections
+                    .observe(self.connections.0.load(Ordering::Relaxed), observed.samples);
                 observed.active_streams.observe(streams, observed.samples);
                 observed.queued_requests.observe(queued, observed.samples);
                 tokio::time::sleep_until(

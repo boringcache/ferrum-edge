@@ -37,10 +37,7 @@ where
     Ok(())
 }
 
-pub fn request_body(
-    bytes: Bytes,
-    admission: Option<Admission>,
-) -> ObservedBody {
+pub fn request_body(bytes: Bytes, admission: Option<Admission>) -> ObservedBody {
     ObservedBody {
         body: http_body_util::Full::new(bytes),
         admission,
@@ -156,11 +153,13 @@ impl Service<http::Uri> for Connections {
             let host = uri.host().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing host")
             })?;
-            let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") {
-                443
-            } else {
-                80
-            });
+            let port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    80
+                });
             let stream = tokio::net::TcpStream::connect((host, port)).await?;
             stream.set_nodelay(true)?;
             Ok(hyper_util::rt::TokioIo::new(CountedIo {

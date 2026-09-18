@@ -118,12 +118,10 @@ async fn setup_failure_and_measured_worker_loss_release_barriers_and_reduce_obse
         metrics.record_error();
         Ok(metrics.finish_worker())
     });
-    let combined = tokio::time::timeout(
-        Duration::from_secs(2),
-        phases.finish(vec![failed, retired]),
-    )
-    .await
-    .unwrap();
+    let combined =
+        tokio::time::timeout(Duration::from_secs(2), phases.finish(vec![failed, retired]))
+            .await
+            .unwrap();
     assert_eq!(combined.total_errors, 2);
     let observed = combined.observed.unwrap();
     assert_eq!(observed.workers_at_barrier, 1);
