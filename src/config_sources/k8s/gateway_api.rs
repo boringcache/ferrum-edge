@@ -9154,9 +9154,13 @@ mod tests {
             result.config.proxies[0].id.contains("api-a"),
             "oldest route must win the conflicting host/path"
         );
-        assert!(result.warnings.iter().any(
-            |warning| warning.contains("api-b") && warning.contains("winner is \"default\"/\"api-a\"")
-        ));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("api-b")
+                    && warning.contains("winner is \"default\"/\"api-a\""))
+        );
     }
 
     #[test]
@@ -9278,7 +9282,8 @@ mod tests {
         assert!(result.config.validate_unique_listen_paths().is_ok());
         assert!(result.warnings.iter().any(|warning| {
             warning.contains("api-new")
-                && warning.contains("parent=\"gateway.networking.k8s.io/Gateway/default/edge-a/*/*\"")
+                && warning
+                    .contains("parent=\"gateway.networking.k8s.io/Gateway/default/edge-a/*/*\"")
                 && warning.contains("winner is \"default\"/\"api-old\"")
         }));
     }

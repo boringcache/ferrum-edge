@@ -300,7 +300,9 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
     let errors = mesh.validate();
 
     assert!(
-        errors.iter().any(|e| e.contains("port_level_settings[\"0\"]")),
+        errors
+            .iter()
+            .any(|e| e.contains("port_level_settings[\"0\"]")),
         "expected DestinationRule port-level settings error, got: {errors:?}"
     );
     assert!(
@@ -2649,7 +2651,8 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
     };
 
     let errors = mesh.validate();
-    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+    let rendered =
+        ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
     assert!(
         rendered.contains("port_level_settings[<redacted scalar>].tls.mode"),
         "{rendered}"

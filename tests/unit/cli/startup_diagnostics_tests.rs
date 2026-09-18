@@ -442,7 +442,9 @@ async fn mongo_failover_emissions_withhold_invalid_options_before_network_io() {
             std::slice::from_ref(&url),
         )
         .await;
-        let error = result.err().expect("invalid options must reject the connection");
+        let error = result
+            .err()
+            .expect("invalid options must reject the connection");
         assert!(error.to_string().contains("All MongoDB URLs failed"));
         assert!(error.to_string().contains("Tried 1 failover URL(s)"));
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
