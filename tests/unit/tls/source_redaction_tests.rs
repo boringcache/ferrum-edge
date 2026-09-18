@@ -21,12 +21,18 @@ fn assert_rendered(error: anyhow::Error, expected: &[&str]) {
         &[],
     );
     for &expected in expected {
-        assert!(rendered.contains(expected), "missing {expected:?}: {rendered}");
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
     }
     assert!(rendered.contains("`backend_tls_client_cert_path`"));
     let rendered = rendered.to_ascii_lowercase();
     for withheld in ["tls_source_marker", "tls_provider_marker", "927451", "true"] {
-        assert!(!rendered.contains(withheld), "leaked {withheld}: {rendered}");
+        assert!(
+            !rendered.contains(withheld),
+            "leaked {withheld}: {rendered}"
+        );
     }
 }
 
@@ -102,7 +108,10 @@ fn typed_io_fields_and_os_error_causes_remain_available() {
     };
     let cause = std::error::Error::source(&error).unwrap();
     assert_eq!(
-        cause.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),
+        cause
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
         Some(2)
     );
     let MaterialError::Io { source_id, source } = error else {

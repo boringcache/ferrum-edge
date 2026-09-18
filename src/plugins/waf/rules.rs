@@ -1131,7 +1131,12 @@ fn parse_target(value: &Value, path: &str) -> Result<RuleTarget, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "waf: rule target must be a string or object".to_string())?;
-    reject_unknown_keys(object, path, TARGET_OBJECT_KEYS, &format!("waf: `{path}`: "))?;
+    reject_unknown_keys(
+        object,
+        path,
+        TARGET_OBJECT_KEYS,
+        &format!("waf: `{path}`: "),
+    )?;
     let raw = required_string(object, "type")?;
     let names = optional_string_vec(object, "names")?;
     let path_field = optional_string(object, "path")?;
