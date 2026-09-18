@@ -578,6 +578,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     let mut drivers = Vec::with_capacity(num_conns);
     let mut transports = Vec::with_capacity(num_conns);
     let mut events = Vec::new();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     for connection_id in 0..num_conns {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
         endpoint.set_default_client_config(client_cfg.clone());
@@ -616,6 +617,8 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     // Distribute concurrent tasks across the connection pool
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
+        let event_tx = event_tx.clone();
+        let connection_id = i as usize % num_conns;
         let mut send_req = senders[i as usize % num_conns].clone();
         let full_uri = full_uri.clone();
         let payload = payload.clone();
@@ -633,11 +636,21 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                         metrics.admitted();
                         if let Err(e) = stream.send_data(payload.clone()).await {
                             eprintln!("  h3 send_data error: {e}");
+                            let _ = event_tx.send(TransportEvent::new(
+                                connection_id,
+                                "send_data_failed",
+                                e.to_string(),
+                            ));
                             metrics.record_error();
                             break;
                         }
                         if let Err(e) = stream.finish().await {
                             eprintln!("  h3 finish error: {e}");
+                            let _ = event_tx.send(TransportEvent::new(
+                                connection_id,
+                                "finish_failed",
+                                e.to_string(),
+                            ));
                             metrics.record_error();
                             break;
                         }
@@ -672,6 +685,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(e) = recv_err {
+                                    let _ = event_tx.send(TransportEvent::new(
+                                        connection_id,
+                                        "recv_data_failed",
+                                        e.clone(),
+                                    ));
                                     eprintln!(
                                         "  h3 recv_data error after {} bytes (expected {}): {}",
                                         body_bytes,
@@ -695,12 +713,22 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                         body_matches,
                                         latency,
                                     ) {
+                                        let _ = event_tx.send(TransportEvent::new(
+                                            connection_id,
+                                            "echo_validation_failed",
+                                            format!("status={status} bytes={body_bytes}"),
+                                        ));
                                         break;
                                     }
                                 }
                             }
                             Err(e) => {
                                 eprintln!("  h3 recv_response error: {e}");
+                                let _ = event_tx.send(TransportEvent::new(
+                                    connection_id,
+                                    "recv_response_failed",
+                                    e.to_string(),
+                                ));
                                 metrics.record_error();
                                 break;
                             }
@@ -708,6 +736,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         eprintln!("  h3 send_request error: {e}");
+                        let _ = event_tx.send(TransportEvent::new(
+                            connection_id,
+                            "send_request_failed",
+                            e.to_string(),
+                        ));
                         metrics.record_error();
                         break;
                     }
@@ -718,7 +751,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     }
 
     let mut combined = phases.finish(handles).await;
+    while let Ok(event) = event_rx.try_recv() {
+        events.push(event);
+    }
     let close_started = Instant::now();
+    events.push(TransportEvent::new(0, "retirement_started", String::new()));
     drop(senders);
     for (connection_id, endpoint) in endpoints.iter().enumerate() {
         events.push(TransportEvent::new(
@@ -774,7 +811,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         phases.transport_close_secs = close_started.elapsed().as_secs_f64();
         phases.transport_close_start_unix_secs = events
             .iter()
-            .find(|event| event.event == "local_close_requested")
+            .find(|event| event.event == "retirement_started")
             .map(|event| event.unix_secs);
         phases.set_transport_events(events);
     }

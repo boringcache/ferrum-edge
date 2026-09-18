@@ -2,12 +2,15 @@ import json
 import socket
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from h3_experiment import envoy_config, load_experiment, topology
-from transport_diagnostics import counter_delta, parse_diag, parse_snmp, parse_udp, udp_sockets
+from benchmark_validity import sample_issues
+from transport_diagnostics import (backend_distribution, counter_delta, parse_diag,
+                                   parse_snmp, parse_udp, summarize_transport, udp_sockets)
 
 
 class TransportDiagnosticsTests(unittest.TestCase):
@@ -55,6 +58,45 @@ class TransportDiagnosticsTests(unittest.TestCase):
         self.assertEqual(row["cookie"], [10, 20])
         with self.assertRaises(ValueError):
             parse_diag(payload[:-1])
+
+    def test_transport_brackets_preserve_inflated_stats_and_missing_sockets(self):
+        phases = dict(measurement_start_unix_secs=10, measurement_secs=1)
+        sock = dict(inode=42, cookie=[1, 2], socket_drops=3, proc_drops=3,
+                    so_rcvbuf=4194304, so_sndbuf=4194304)
+        left = dict(unix_secs=9.9, errors=[], sockets=[sock], udp_snmp=dict(RcvbufErrors=3),
+                    envoy_stats=dict(downstream_rx_datagram_dropped=100000))
+        right = dict(unix_secs=11.1, errors=[], sockets=[dict(sock, socket_drops=5, proc_drops=5)],
+                     udp_snmp=dict(RcvbufErrors=5),
+                     envoy_stats=dict(downstream_rx_datagram_dropped=900000))
+        timeline = [dict(transport=row) for row in (left, right)]
+        result = summarize_transport(timeline, phases)
+        self.assertEqual(result["udp_snmp_delta"], dict(RcvbufErrors=2))
+        self.assertEqual(result["envoy_delta"]["downstream_rx_datagram_dropped"], 800000)
+        self.assertEqual(result["sockets"][0]["delta"], dict(socket_drops=2, proc_drops=2))
+        self.assertAlmostEqual(result["boundary_slack_secs"], 0.2)
+        right["sockets"][0]["cookie"] = [3, 4]  # reused inode
+        result = summarize_transport(timeline, phases)
+        self.assertFalse(result["sockets"][0]["complete_bracket"])
+        self.assertIsNone(result["sockets"][0]["delta"]["socket_drops"])
+        self.assertFalse(summarize_transport(timeline[:1], phases)["complete_bracket"])
+
+    def test_backend_distribution_is_per_connection_and_bracketed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "backend.log"
+            rows = [dict(connection_id=1, peer="127.0.0.1:44444", unix_secs=t,
+                         accepted=n, completed=n, bytes=n * 10240)
+                    for t, n in ((9.9, 3), (11.1, 7))]
+            path.write_text("banner\n" + "\n".join("H3_PROFILE " + json.dumps(row) for row in rows))
+            result = backend_distribution(path, dict(measurement_start_unix_secs=10,
+                                                     measurement_secs=1))
+            self.assertEqual(result[0]["delta"]["completed"], 4)
+            self.assertEqual(result[0]["peer"], "127.0.0.1:44444")
+            self.assertTrue(result[0]["complete_bracket"])
+
+    def test_experiment_does_not_accept_unverified_socket_parity(self):
+        issues = sample_issues(dict(h3_experiment={"enabled": True}))
+        self.assertIn("incomplete H3 transport observations", issues)
+        self.assertIn("H3 socket budget parity unverified", issues)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux socket diagnostics")
     def test_passive_readback_matches_getsockopt_on_a_live_socket(self):

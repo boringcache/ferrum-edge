@@ -6,6 +6,7 @@ prevent inode reuse from being mistaken for a counter delta.
 """
 
 import json
+import re
 import socket
 import struct
 import time
@@ -151,6 +152,8 @@ def summarize_transport(timeline, phases):
         last = next((row for row in right.get("sockets", [])
                      if row["inode"] == first["inode"] and row["cookie"] == first["cookie"]), None)
         sockets.append(dict(first, complete_bracket=last is not None,
+                            end_so_rcvbuf=(last or {}).get("so_rcvbuf"),
+                            end_so_sndbuf=(last or {}).get("so_sndbuf"),
                             delta=counter_delta({key: first[key] for key in ("socket_drops", "proc_drops")
                                                  if key in first}, last or {})))
     result["sockets"] = sockets
@@ -231,6 +234,15 @@ def annotate_experiment(sample, path, usage_path):
     sample["h3_experiment"] = dict(plan, topology=topology(sample["effective_concurrency"], limit),
                                    topology_limit_applies=gateway.startswith("envoy"))
     diagnostics = sample.get("transport_diagnostics", {})
+    if gateway != "direct":
+        startup = Path(usage_path).parent / f"{gateway}_startup.log"
+        try:
+            lines = startup.read_text().splitlines()
+            diagnostics["startup_transport_messages"] = [line for line in lines
+                if re.search(r"\b(bpf|gro|gso|reuseport)\b", line, re.IGNORECASE)]
+            diagnostics["optimized_path"] = "unverified; warnings alone cannot prove use"
+        except OSError as error:
+            diagnostics["startup_capture_error"] = str(error)
     try:
         backend_log = str(usage_path).replace("_process_usage.json", "_backend.log")
         distribution = backend_distribution(backend_log, sample.get("phases") or {})
@@ -249,7 +261,9 @@ def annotate_experiment(sample, path, usage_path):
             "backend", "gateway_downstream", "gateway_upstream"}
         diagnostics["equal_socket_budget_verified"] = (
             expected_roles <= {row["role"] for row in relevant}
-            and all(row.get("so_rcvbuf") == row.get("so_sndbuf") == plan["socket_buffer_bytes"]
+            and all(row.get("so_rcvbuf") == row.get("so_sndbuf")
+                    == row.get("end_so_rcvbuf") == row.get("end_so_sndbuf")
+                    == plan["socket_buffer_bytes"]
                     and row["complete_bracket"] for row in relevant))
     except (OSError, ValueError, KeyError) as error:
         diagnostics["profile_error"] = str(error)
