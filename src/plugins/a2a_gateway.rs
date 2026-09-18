@@ -195,7 +195,7 @@ impl A2aBinding {
             "rest" | "http_json" | "http+json" => Ok(Self::Rest),
             "grpc" => Ok(Self::Grpc),
             other => Err(format!(
-                "a2a_gateway: detection.bindings entries must be jsonrpc, rest, or grpc, got {other:?}"
+                "a2a_gateway: `detection.bindings` entries must be `jsonrpc`, `rest`, or `grpc`, got {other:?}"
             )),
         }
     }
@@ -221,7 +221,7 @@ impl PolicyAction {
             "allow" => Ok(Self::Allow),
             "deny" => Ok(Self::Deny),
             other => Err(format!(
-                "a2a_gateway: `{field}` must be allow or deny, got {other:?}"
+                "a2a_gateway: `{field}` must be `allow` or `deny`, got {other:?}"
             )),
         }
     }
@@ -519,13 +519,13 @@ impl A2aGateway {
     pub fn new(config: &Value) -> Result<Self, String> {
         let object = config
             .as_object()
-            .ok_or_else(|| "a2a_gateway: config must be an object".to_string())?;
-        reject_unknown_keys(object, "config", A2A_CONFIG_KEYS, "a2a_gateway: ")?;
+            .ok_or_else(|| "a2a_gateway: `config` must be an object".to_string())?;
+        reject_unknown_keys(object, "config", A2A_CONFIG_KEYS, "a2a_gateway: `config`: ")?;
         let enabled = optional_bool(object, "enabled")?.unwrap_or(true);
         let mode = optional_string(object, "mode")?.unwrap_or("transparent_proxy");
         if mode != "transparent_proxy" {
             return Err(format!(
-                "a2a_gateway: 'mode' must be transparent_proxy in V1, got {mode:?}"
+                "a2a_gateway: `mode` must be `transparent_proxy` in V1, got {mode:?}"
             ));
         }
         let endpoint = parse_endpoint(object)?;
@@ -1881,7 +1881,7 @@ fn parse_endpoint(object: &Map<String, Value>) -> Result<A2aEndpointConfig, Stri
             endpoint,
             "config.endpoint",
             A2A_ENDPOINT_KEYS,
-            "a2a_gateway: ",
+            "a2a_gateway: `config.endpoint`: ",
         )?;
     }
     let path = optional_string_from_object(endpoint, "path")?
@@ -1893,14 +1893,14 @@ fn parse_endpoint(object: &Map<String, Value>) -> Result<A2aEndpointConfig, Stri
     let protocol_versions = optional_string_vec_from_object(endpoint, "protocol_versions")?
         .unwrap_or_else(|| vec![DEFAULT_PROTOCOL_VERSION.to_string()]);
     if protocol_versions.is_empty() {
-        return Err("a2a_gateway: 'endpoint.protocol_versions' must not be empty".to_string());
+        return Err("a2a_gateway: `endpoint.protocol_versions` must not be empty".to_string());
     }
     if protocol_versions
         .iter()
         .any(|value| value.trim().is_empty())
     {
         return Err(
-            "a2a_gateway: 'endpoint.protocol_versions' entries must not be empty".to_string(),
+            "a2a_gateway: `endpoint.protocol_versions` entries must not be empty".to_string(),
         );
     }
     let grpc_services = parse_grpc_services(endpoint)?;
@@ -1938,9 +1938,9 @@ fn parse_grpc_services(
     };
     let items = items
         .as_array()
-        .ok_or_else(|| "a2a_gateway: 'endpoint.grpc_services' must be an array".to_string())?;
+        .ok_or_else(|| "a2a_gateway: `endpoint.grpc_services` must be an array".to_string())?;
     if items.is_empty() {
-        return Err("a2a_gateway: 'endpoint.grpc_services' must not be empty".to_string());
+        return Err("a2a_gateway: `endpoint.grpc_services` must not be empty".to_string());
     }
     let mut services = HashMap::with_capacity(items.len());
     for item in items {
@@ -1955,9 +1955,9 @@ fn parse_grpc_services(
                 let published = card_schema_name(published);
                 let declared = card_schema_name(declared);
                 return Err(format!(
-                    "a2a_gateway: endpoint.grpc_services entry {service:?} is a published A2A \
-                     service whose Agent Card layout is {published:?}; it cannot declare \
-                     card_schema {declared:?}"
+                    "a2a_gateway: `endpoint.grpc_services` entry {service:?} is a published A2A \
+                     service whose Agent Card layout is `{published}`; it cannot declare \
+                     `card_schema` {declared:?}"
                 ));
             }
             (Some(published), _) => published,
@@ -1968,7 +1968,7 @@ fn parse_grpc_services(
         };
         if services.insert(service.to_string(), schema).is_some() {
             return Err(format!(
-                "a2a_gateway: duplicate endpoint.grpc_services entry {service:?}"
+                "a2a_gateway: duplicate `endpoint.grpc_services` entry {service:?}"
             ));
         }
     }
@@ -2001,7 +2001,7 @@ fn parse_grpc_service_entry(item: &Value) -> Result<(&str, Option<A2aGrpcCardSch
                 entry,
                 "config.endpoint.grpc_services[]",
                 A2A_GRPC_SERVICE_ENTRY_KEYS,
-                "a2a_gateway: ",
+                "a2a_gateway: `config.endpoint.grpc_services[]`: ",
             )?;
             let service = match optional_string(entry, "service")? {
                 Some(service) => service,
@@ -2022,7 +2022,7 @@ fn parse_grpc_service_entry(item: &Value) -> Result<(&str, Option<A2aGrpcCardSch
 }
 
 const GRPC_SERVICE_ENTRY_NEEDS_SERVICE: &str =
-    "a2a_gateway: 'endpoint.grpc_services' object entries require 'service'";
+    "a2a_gateway: `endpoint.grpc_services` object entries require `service`";
 
 fn parse_card_schema(value: &str) -> Result<A2aGrpcCardSchema, String> {
     match value {
@@ -2030,8 +2030,8 @@ fn parse_card_schema(value: &str) -> Result<A2aGrpcCardSchema, String> {
         CARD_SCHEMA_A2A_10 => Ok(A2aGrpcCardSchema::A2a10),
         CARD_SCHEMA_NONE => Ok(A2aGrpcCardSchema::Undeclared),
         other => Err(format!(
-            "a2a_gateway: 'endpoint.grpc_services[].card_schema' must be {CARD_SCHEMA_A2A_03:?}, \
-             {CARD_SCHEMA_A2A_10:?}, or {CARD_SCHEMA_NONE:?}, got {other:?}"
+            "a2a_gateway: `endpoint.grpc_services[].card_schema` must be `{CARD_SCHEMA_A2A_03}`, \
+             `{CARD_SCHEMA_A2A_10}`, or `{CARD_SCHEMA_NONE}`, got {other:?}"
         )),
     }
 }
@@ -2051,7 +2051,7 @@ fn parse_detection(object: &Map<String, Value>) -> Result<A2aDetectionConfig, St
             detection,
             "config.detection",
             A2A_DETECTION_KEYS,
-            "a2a_gateway: ",
+            "a2a_gateway: `config.detection`: ",
         )?;
     }
     let bindings = optional_string_vec_from_object(detection, "bindings")?.unwrap_or_else(|| {
@@ -2062,7 +2062,7 @@ fn parse_detection(object: &Map<String, Value>) -> Result<A2aDetectionConfig, St
         ]
     });
     if bindings.is_empty() {
-        return Err("a2a_gateway: 'detection.bindings' must not be empty".to_string());
+        return Err("a2a_gateway: `detection.bindings` must not be empty".to_string());
     }
     let mut binding_set = HashSet::with_capacity(bindings.len());
     for binding in bindings {
@@ -2094,7 +2094,7 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
             discovery,
             "config.discovery",
             A2A_DISCOVERY_KEYS,
-            "a2a_gateway: ",
+            "a2a_gateway: `config.discovery`: ",
         )?;
     }
     let public_base_url = match optional_string_from_object(discovery, "public_base_url")? {
@@ -2111,12 +2111,12 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
         optional_string_vec_from_object(discovery, "allowed_public_origins")?.unwrap_or_default()
     {
         let parsed = parse_public_base_url(&origin).map_err(|_| {
-            "a2a_gateway: discovery.allowed_public_origins must contain absolute origins"
+            "a2a_gateway: `discovery.allowed_public_origins` must contain absolute origins"
                 .to_string()
         })?;
         if parsed.path() != "/" {
             return Err(
-                "a2a_gateway: discovery.allowed_public_origins must not contain paths".to_string(),
+                "a2a_gateway: `discovery.allowed_public_origins` must not contain paths".to_string(),
             );
         }
         allowed_public_origins.insert(parsed.origin().ascii_serialization());
@@ -2126,7 +2126,7 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
         && (!trust_forwarded_headers || allowed_public_origins.is_empty())
     {
         return Err(
-            "a2a_gateway: discovery.rewrite_agent_card_urls requires discovery.public_base_url or discovery.trust_forwarded_headers with nonempty discovery.allowed_public_origins; set discovery.rewrite_agent_card_urls=false for explicit passthrough".to_string(),
+            "a2a_gateway: `discovery.rewrite_agent_card_urls` requires `discovery.public_base_url` or `discovery.trust_forwarded_headers` with nonempty `discovery.allowed_public_origins`; set `discovery.rewrite_agent_card_urls=false` for explicit passthrough".to_string(),
         );
     }
     Ok(A2aDiscoveryConfig {
@@ -2187,16 +2187,16 @@ fn parse_observability(object: &Map<String, Value>) -> Result<A2aObservabilityCo
             observability,
             "config.observability",
             A2A_OBSERVABILITY_KEYS,
-            "a2a_gateway: ",
+            "a2a_gateway: `config.observability`: ",
         )?;
     }
     let max_payload_size = optional_u64_from_object(observability, "max_payload_size")?
         .unwrap_or(DEFAULT_MAX_DETECTION_BODY_BYTES);
     let max_payload_size = usize::try_from(max_payload_size)
-        .map_err(|_| "a2a_gateway: 'observability.max_payload_size' is too large".to_string())?;
+        .map_err(|_| "a2a_gateway: `observability.max_payload_size` is too large".to_string())?;
     if max_payload_size == 0 {
         return Err(
-            "a2a_gateway: 'observability.max_payload_size' must be greater than zero".to_string(),
+            "a2a_gateway: `observability.max_payload_size` must be greater than zero".to_string(),
         );
     }
     Ok(A2aObservabilityConfig {
@@ -2209,7 +2209,12 @@ fn parse_observability(object: &Map<String, Value>) -> Result<A2aObservabilityCo
 fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> {
     let policy = optional_object(object, "policy")?;
     if let Some(policy) = policy {
-        reject_unknown_keys(policy, "config.policy", A2A_POLICY_KEYS, "a2a_gateway: ")?;
+        reject_unknown_keys(
+            policy,
+            "config.policy",
+            A2A_POLICY_KEYS,
+            "a2a_gateway: `config.policy`: ",
+        )?;
     }
     let default_action = PolicyAction::parse(
         optional_string_from_object(policy, "default_action")?
@@ -2227,31 +2232,34 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
         }
         let methods_object = methods_value
             .as_object()
-            .ok_or_else(|| "a2a_gateway: 'policy.methods' must be an object".to_string())?;
+            .ok_or_else(|| "a2a_gateway: `policy.methods` must be an object".to_string())?;
         for (method, value) in methods_object {
-            let canonical_method = canonical_policy_method(method)
-                .ok_or_else(|| format!("a2a_gateway: unsupported policy method name {method:?}"))?;
+            let canonical_method = canonical_policy_method(method).ok_or_else(|| {
+                format!("a2a_gateway: `policy.methods` has unsupported policy method name {method:?}")
+            })?;
             let object = value.as_object().ok_or_else(|| {
-                format!("a2a_gateway: policy.methods[{method:?}] must be an object")
+                format!("a2a_gateway: `policy.methods` entry {method:?} must be an object")
             })?;
             reject_unknown_keys(
                 object,
-                &format!("config.policy.methods.{method}"),
+                "config.policy.methods.*",
                 A2A_POLICY_METHOD_KEYS,
-                "a2a_gateway: ",
+                "a2a_gateway: `config.policy.methods.*`: ",
             )?;
             let action = PolicyAction::parse(
                 optional_string(object, "action")?.ok_or_else(|| {
-                    format!("a2a_gateway: policy.methods[{method:?}].action is required")
+                    format!(
+                        "a2a_gateway: `policy.methods.*.action` is required for method {method:?}"
+                    )
                 })?,
-                &format!("policy.methods[{method:?}].action"),
+                "policy.methods.*.action",
             )?;
             if methods
                 .insert(canonical_method.to_string(), action)
                 .is_some()
             {
                 return Err(format!(
-                    "a2a_gateway: duplicate policy method name {canonical_method:?}"
+                    "a2a_gateway: `policy.methods` has duplicate policy method name {canonical_method:?}"
                 ));
             }
         }
@@ -4306,7 +4314,7 @@ fn optional_u64_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("a2a_gateway: '{key}' must be a positive integer"))
+            .ok_or_else(|| format!("a2a_gateway: `{key}` must be a positive integer"))
             .map(Some),
         Some(other) => Err(format!(
             "a2a_gateway: `{key}` must be a positive integer, got {other:?}",
@@ -4327,12 +4335,12 @@ fn optional_string_vec_from_object(
     }
     let array = value
         .as_array()
-        .ok_or_else(|| format!("a2a_gateway: '{key}' must be an array"))?;
+        .ok_or_else(|| format!("a2a_gateway: `{key}` must be an array"))?;
     let mut values = Vec::with_capacity(array.len());
     for (idx, item) in array.iter().enumerate() {
         values.push(
             item.as_str()
-                .ok_or_else(|| format!("a2a_gateway: '{key}[{idx}]' must be a string"))?
+                .ok_or_else(|| format!("a2a_gateway: `{key}[{idx}]` must be a string"))?
                 .to_string(),
         );
     }
@@ -4341,19 +4349,19 @@ fn optional_string_vec_from_object(
 
 fn validate_path(path: &str, field: &str) -> Result<(), String> {
     if path.is_empty() || !path.starts_with('/') {
-        return Err(format!("a2a_gateway: '{field}' must be a non-empty path"));
+        return Err(format!("a2a_gateway: `{field}` must be a non-empty path"));
     }
     Ok(())
 }
 
 fn validate_header_name(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err(format!("a2a_gateway: '{field}' must not be empty"));
+        return Err(format!("a2a_gateway: `{field}` must not be empty"));
     }
     http::header::HeaderName::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| {
-            format!("a2a_gateway: '{field}' must be a valid HTTP header name, got {value:?}")
+            format!("a2a_gateway: `{field}` must be a valid HTTP header name, got {value:?}")
         })
 }
 
@@ -4376,26 +4384,26 @@ fn validate_header_name(value: &str, field: &str) -> Result<(), String> {
 /// client.
 fn parse_public_base_url(value: &str) -> Result<Url, String> {
     if value.len() > MAX_AGENT_CARD_URL_BYTES {
-        return Err("a2a_gateway: discovery.public_base_url is too long".to_string());
+        return Err("a2a_gateway: `discovery.public_base_url` is too long".to_string());
     }
     let parsed = Url::parse(value)
-        .map_err(|error| format!("a2a_gateway: discovery.public_base_url invalid: {error}"))?;
+        .map_err(|_| "a2a_gateway: `discovery.public_base_url` must be a valid URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(
-            "a2a_gateway: discovery.public_base_url scheme must be http or https".to_string(),
+            "a2a_gateway: `discovery.public_base_url` scheme must be `http` or `https`".to_string(),
         );
     }
     if parsed.host_str().is_none_or(|host| host.is_empty()) {
-        return Err("a2a_gateway: discovery.public_base_url missing host".to_string());
+        return Err("a2a_gateway: `discovery.public_base_url` missing host".to_string());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(
-            "a2a_gateway: discovery.public_base_url must not contain credentials".to_string(),
+            "a2a_gateway: `discovery.public_base_url` must not contain credentials".to_string(),
         );
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(
-            "a2a_gateway: discovery.public_base_url must not contain query or fragment".to_string(),
+            "a2a_gateway: `discovery.public_base_url` must not contain query or fragment".to_string(),
         );
     }
     // Checked AFTER parsing so a wrong scheme or a missing host still names the
@@ -4409,14 +4417,14 @@ fn parse_public_base_url(value: &str) -> Result<Url, String> {
         .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         return Err(
-            "a2a_gateway: discovery.public_base_url must not contain whitespace or control \
+            "a2a_gateway: `discovery.public_base_url` must not contain whitespace or control \
              characters"
                 .to_string(),
         );
     }
     if !has_explicit_http_authority_spelling(value) {
         return Err(
-            "a2a_gateway: discovery.public_base_url must spell an explicit http:// or https:// \
+            "a2a_gateway: `discovery.public_base_url` must spell an explicit `http://` or `https://` \
              authority"
                 .to_string(),
         );
@@ -4441,7 +4449,7 @@ fn validate_grpc_service(value: &str) -> Result<(), String> {
             .any(|part| part.is_empty() || !is_valid_grpc_identifier(part))
     {
         return Err(format!(
-            "a2a_gateway: endpoint.grpc_services entries must be valid gRPC service names, got {value:?}"
+            "a2a_gateway: `endpoint.grpc_services` entries must be valid gRPC service names, got {value:?}"
         ));
     }
     Ok(())
