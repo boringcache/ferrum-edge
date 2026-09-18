@@ -117,8 +117,10 @@ The shell retains the static `timeout`/`gtimeout` client invocation; a passive
 Client CPU now comes from its own `getrusage` snapshots at the measurement
 boundaries, with lifetime peak RSS recorded at the end; every required process
 role must have a complete bracket. Never-observed transient gateway PIDs are
-diagnostic, while at least one gateway PID must span the whole window. Only even
-pair counts are accepted, and the combined summary exposes position balance.
+diagnostic. At least one gateway PID must be observed, and every observed gateway
+PID must span the measurement window; even a PID observed once that exits
+mid-window invalidates the sample. Only even pair counts are accepted, and the
+combined summary exposes position balance.
 Adaptive extension is opt-in and gated on measured per-pair cost and remaining
 wall-clock budget; the frozen job defaults to two pairs without extension.
 Use at least four predeclared pairs for a performance claim. Invalid pairs remain invalid; unresolved

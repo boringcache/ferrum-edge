@@ -2,6 +2,23 @@ use multi_protocol_perf::metrics::{BenchMetrics, collect_results};
 use multi_protocol_perf::phases::{CompletionPhase, Phases, classify_completion};
 use std::time::{Duration, Instant};
 
+// Include the binary's private TCP worker tests in the hosted integration target.
+#[allow(dead_code)]
+#[path = "../proto_bench.rs"]
+mod proto_bench;
+
+#[test]
+fn worker_transport_close_timeouts_are_ored_without_counting_errors() {
+    let mut combined = BenchMetrics::new();
+    for timed_out in [false, true, false] {
+        let mut worker = BenchMetrics::new();
+        worker.transport_close_timed_out = timed_out;
+        combined.merge(&worker);
+    }
+    assert!(combined.transport_close_timed_out);
+    assert_eq!(combined.total_errors, 0);
+}
+
 #[tokio::test]
 async fn failed_and_panicked_workers_are_counted_alongside_completed_work() {
     let successful = tokio::spawn(async {

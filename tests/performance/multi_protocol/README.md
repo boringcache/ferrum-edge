@@ -260,9 +260,11 @@ elapsed duration must be between the nominal duration and nominal + max(100 ms,
 role** (client/backend, plus gateway for proxied samples). Gateway/backend records
 must remain observable at every sampler tick between their boundary snapshots.
 A PID that was never observable remains in `missing_pids` for diagnosis without
-invalidating a healthy sibling; at least one continuously observed gateway PID
-is required. PID identity includes start time to prevent reuse from bridging a
-gap. Sampled records report `boundary_slack_secs`, `bracket_secs` and sampled RSS.
+invalidating a healthy sibling. At least one gateway PID must be observed, and
+every observed gateway PID must span the measurement window; even a PID observed
+once that exits mid-window invalidates the sample. PID identity includes start
+time to prevent reuse from bridging a gap. Sampled records report
+`boundary_slack_secs`, `bracket_secs` and sampled RSS.
 Sampler-lifetime counters include setup, warmup and drain. The sampler adds
 shared-runner overhead; throughput and direct ratios do not isolate proxy CPU
 cost. External dependencies such as Tyk's Redis are not in gateway PID accounting.

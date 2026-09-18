@@ -1018,14 +1018,20 @@ where
             }
         }
     }
-    if !matches!(
-        tokio::time::timeout(Duration::from_secs(5), write.shutdown()).await,
-        Ok(Ok(()))
-    ) {
-        metrics.record_error();
+    match tokio::time::timeout(Duration::from_secs(5), write.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("{label} shutdown failed: {error}"),
+        Err(_) => {
+            eprintln!("{label} shutdown timed out");
+            metrics.transport_close_timed_out = true;
+        }
     }
     Ok(metrics.finish_worker())
 }
+
+#[cfg(test)]
+#[path = "tests/support/tcp_echo_tests.rs"]
+mod tcp_echo_tests;
 
 async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid TCP target address")?;

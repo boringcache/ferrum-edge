@@ -35,6 +35,7 @@ pub struct BenchMetrics {
     pub warmup_requests: u64,
     pub drain_requests: u64,
     pub drain_bytes: u64,
+    pub transport_close_timed_out: bool,
     pub phases: Option<PhaseReport>,
     pub observed: Option<Observed>,
     worker: Option<Worker>,
@@ -58,6 +59,7 @@ impl BenchMetrics {
             warmup_requests: 0,
             drain_requests: 0,
             drain_bytes: 0,
+            transport_close_timed_out: false,
             phases: None,
             observed: None,
             worker: None,
@@ -128,6 +130,7 @@ impl BenchMetrics {
         self.warmup_requests += other.warmup_requests;
         self.drain_requests += other.drain_requests;
         self.drain_bytes += other.drain_bytes;
+        self.transport_close_timed_out |= other.transport_close_timed_out;
     }
 
     /// Generate a wrk-like text report.

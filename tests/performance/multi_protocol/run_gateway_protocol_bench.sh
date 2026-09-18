@@ -83,10 +83,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# DURATION is used in Bash arithmetic below. Validate it before arithmetic
-# expansion so caller-controlled values cannot be evaluated as expressions.
+# DURATION and PAYLOAD_SIZES reach Bash arithmetic below. Validate first so
+# caller-controlled values cannot be evaluated as expressions.
 if [[ ! $DURATION =~ ^[0-9]+$ ]]; then
     echo "--duration must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]; then
+    echo "--payload-sizes must be non-negative integers separated by single spaces" >&2
     exit 2
 fi
 

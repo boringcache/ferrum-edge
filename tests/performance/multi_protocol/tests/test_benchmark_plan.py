@@ -42,6 +42,32 @@ class PairedPlanTests(unittest.TestCase):
         self.assertNotIn('require Linux /proc', source)
         self.assertIn("tr '\\n' ' ' || true)", source)
 
+    def test_runner_rejects_invalid_payload_sizes_before_work_or_udp_override(self):
+        runner = Path(__file__).resolve().parents[1] / "run_gateway_protocol_bench.sh"
+        for protocol in ("http2", "udp", "udp-dtls"):
+            for sizes in ("", "-1", "1+1", "64  128", " 64", "64 ", "64\t128",
+                          "64\n128", "a[$(printf invalid)]"):
+                with self.subTest(protocol=protocol, sizes=sizes):
+                    result = subprocess.run(
+                        ["bash", str(runner), protocol, "--payload-sizes", sizes],
+                        cwd=Path(__file__).resolve().parents[4],
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("--payload-sizes must be", result.stderr)
+        # The next validation rejects the run before any build or gateway startup.
+        for sizes in ("64", "10240 71680 512000 1048576 5242880"):
+            result = subprocess.run(
+                ["bash", str(runner), "http2", "--payload-sizes", sizes, "--pairs", "3"],
+                cwd=Path(__file__).resolve().parents[4],
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("EVEN", result.stderr)
+            self.assertNotIn("--payload-sizes must be", result.stderr)
+        source = runner.read_text()
+        validation = source.index("[[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]")
+        self.assertLess(validation, source.index('udp|udp-dtls) PAYLOAD_SIZES="1024"'))
+        self.assertLess(validation, source.index("local bench_wallclock=$(("))
+
     def test_adaptive_extension_is_opt_in_and_budget_gated(self):
         self.assertEqual(extension_decision(False, True, 100, 20, 2, 1000)
                          ["extension_skipped"], "disabled")

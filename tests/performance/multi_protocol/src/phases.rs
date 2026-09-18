@@ -409,6 +409,7 @@ impl Phases {
                 }
             };
         phases.drain_secs = drain.elapsed().as_secs_f64();
+        phases.transport_close_timed_out |= combined.transport_close_timed_out;
         for slot in &self.slots {
             observed.queue_time_ns += slot.queue_ns.load(Ordering::Relaxed);
             observed.admissions += slot.admissions.load(Ordering::Relaxed);
