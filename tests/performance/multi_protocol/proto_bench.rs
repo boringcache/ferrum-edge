@@ -207,6 +207,12 @@ fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
     }
 }
 
+/// `error_body` is echoed back on an unexpected status so the gateway's own
+/// refusal is identifiable. Three distinct Ferrum 502 bodies
+/// (`Backend unavailable`, `Client disconnected`, `Invalid backend URL`) are all
+/// exactly 31 bytes, so the length alone names no cause. Pass an empty slice
+/// where the body was streamed and not retained.
+#[allow(clippy::too_many_arguments)]
 fn record_http_echo_result(
     metrics: &mut BenchMetrics,
     protocol: &str,
@@ -215,9 +221,11 @@ fn record_http_echo_result(
     expected_len: usize,
     body_matches: bool,
     latency_us: u64,
+    error_body: &[u8],
 ) -> bool {
     if status != http::StatusCode::OK {
-        eprintln!("  {protocol} unexpected status {status} (body {body_len} bytes)");
+        let snippet = String::from_utf8_lossy(&error_body[..error_body.len().min(200)]);
+        eprintln!("  {protocol} unexpected status {status} (body {body_len} bytes): {snippet}");
         metrics.record_error();
         return false;
     }
@@ -384,6 +392,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                                     payload.len(),
                                     bytes.as_ref() == payload.as_ref(),
                                     latency,
+                                    bytes.as_ref(),
                                 ) {
                                     break;
                                 }
@@ -562,6 +571,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                                     payload.len(),
                                     bytes.as_ref() == payload.as_ref(),
                                     latency,
+                                    bytes.as_ref(),
                                 ) {
                                     break;
                                 }
@@ -726,6 +736,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                         payload.len(),
                                         body_matches,
                                         latency,
+                                        &[],
                                     ) {
                                         break;
                                     }
