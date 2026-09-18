@@ -2,6 +2,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -10,6 +12,7 @@ use hyper::body::Body;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tonic::codegen::Service;
 
+use crate::h2_observation::Observer;
 use crate::phases::{Admission, ConnectionGuard, Connections};
 
 /// Bound offered TCP work to one full-duplex echo, including on split TLS I/O.
@@ -108,6 +111,56 @@ impl Service<GrpcRequest> for ObservedChannel {
 pub struct CountedIo {
     stream: tokio::net::TcpStream,
     _connection: ConnectionGuard,
+    observation: Option<(Observer, usize, usize)>,
+}
+
+impl Drop for CountedIo {
+    fn drop(&mut self) {
+        if let Some((observer, connection_id, channel_id)) = &self.observation {
+            observer.record(
+                *connection_id,
+                None,
+                Some(*channel_id),
+                "socket_dropped",
+                None,
+            );
+        }
+    }
+}
+
+/// Tonic owns its driver. Observe each physical connector invocation, including
+/// reconnects, without changing Channel's admission, TLS or retry behavior.
+#[derive(Clone)]
+pub struct GrpcConnector {
+    pub connections: Connections,
+    pub observer: Observer,
+    pub channel_id: usize,
+    pub current_connection: Arc<AtomicUsize>,
+}
+
+impl Service<http::Uri> for GrpcConnector {
+    type Response = hyper_util::rt::TokioIo<CountedIo>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let mut connections = self.connections.clone();
+        let observer = self.observer.clone();
+        let channel_id = self.channel_id;
+        let current = self.current_connection.clone();
+        Box::pin(async move {
+            let mut io = connections.call(uri).await?;
+            let id = observer.connection_id();
+            current.store(id, Ordering::Release);
+            observer.record(id, None, Some(channel_id), "socket_opened", None);
+            io.inner_mut().observation = Some((observer, id, channel_id));
+            Ok(io)
+        })
+    }
 }
 
 pub fn authority_host(uri: &http::Uri) -> std::io::Result<&str> {
@@ -173,6 +226,7 @@ impl Service<http::Uri> for Connections {
             Ok(hyper_util::rt::TokioIo::new(CountedIo {
                 stream,
                 _connection: connections.opened(),
+                observation: None,
             }))
         })
     }

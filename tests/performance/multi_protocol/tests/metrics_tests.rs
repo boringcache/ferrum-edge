@@ -10,6 +10,9 @@ mod proto_bench;
 #[path = "support/h1_profile_tests.rs"]
 mod h1_profile_tests;
 
+#[path = "support/h2_observation_tests.rs"]
+mod h2_observation_tests;
+
 #[test]
 fn worker_transport_close_timeouts_are_ored_without_counting_errors() {
     let mut combined = BenchMetrics::new();

@@ -320,10 +320,11 @@ a confirmatory test. Inspect every sample's p99 as well as RPS.
 #### Same-image environment experiments (#5588 section 4)
 
 The runner reads the branch-committed `experiment.json` before any build or
-startup. An enabled manifest adds named `ferrum-exp-*` arms for its one protocol
+startup. An enabled manifest adds named `ferrum-exp-*` arms for its declared protocols
 when Ferrum is selected. Its first arm is the `ferrum` reference; every arm uses
 the same image, configuration, startup function, payloads, offered concurrency,
-phases and strict validity rules. Only `FERRUM_EXTRA_ENV` differs. Values are
+phases and strict validity rules. Environment experiments vary `FERRUM_EXTRA_ENV`;
+the H2 campaign below also materializes the matching route override. Values are
 literal public benchmark settings, never shell source or credentials. Image
 overrides, duplicate names/keys and shell syntax are rejected. Ambient
 `FERRUM_EXTRA_ENV` and `--baseline-image` cannot be combined with an active
@@ -332,10 +333,11 @@ comparisons; the exact experiment manifest is copied into the run artifact.
 Disable the manifest after an experiment so later default runs do not silently
 acquire extra arms.
 
-The committed cutoff manifest is disabled after its completed hosted run.
+The cutoff manifest is archived, disabled, at `experiments/5588-h1-cutoff.json`.
 See [audit section 4](../../../docs/benchmark_audit_2026_09_17.md#section-4--same-image-http11-framing-experiment)
 for the measured revision, retained raw observations and inconclusive intervals.
-Commit `enabled: true` before repeating that scope. The combined aggregate
+Copy it to `experiment.json` and commit `enabled: true` before repeating that scope.
+The combined aggregate
 accepts the download action's flat single-protocol layout and displays every
 declared arm; ambiguous flat downloads fail instead of guessing a protocol.
 The frozen per-protocol workflow summary still lists only built-in gateways;
@@ -415,6 +417,138 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
+
+### H2/gRPC transport observation campaign (#5588, section 3)
+
+This is a **planned diagnostic experiment, with no new measured results**. The
+adaptive-window explanation remains a hypothesis. Hosted run
+[35348523042](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35348523042)
+measured `cdac4e06b09416f531935d429c1ccfeec2dad39f`, including #5598 and #5599,
+with an unconditional `FERRUM_LOG_LEVEL=warn` overlay. Three H2/70 KiB samples
+failed with 170/178/186 errors; one was clean. The 534 failures comprise 417
+body errors, 115 HTTP 502s and two send errors. Their displayed H2 reason does
+not prove the originating hop, GOAWAY versus RST, initiator, or flood subtype.
+The four clean native gRPC samples at each measured size do not resolve the
+historical 10/70 KiB failures. The later `d302bfb05` refusal-body snippet and
+`0aaa56b9a` WS send-error diagnostic were **not measured** by that run. The old
+overlay and its duplicate parser are removed; its artifact provenance remains
+part of this history.
+
+`experiment.json` now contains this campaign, **disabled by default**. Root can
+enable it in a reviewed commit, then use the existing
+`gateways-protocol-benchmark.yml` dispatch inputs:
+
+| Input | Exact value |
+|---|---|
+| `duration` | `15` |
+| `concurrency` | `200` |
+| `iterations` | `1` |
+| `skip_gateways` | `envoy kong tyk krakend` |
+| `skip_protocols` | `http1-tls http3 wss tcp-tls udp udp-dtls` |
+| `skip_payload_sizes` | `512000 1048576 5242880` |
+
+The validated campaign selects **four pairs**, overriding the ordinary two-pair
+default, and narrows H2 to **71680 bytes**, while native gRPC retains **10240 and
+71680 bytes**. It rejects changed duration/concurrency, omitted required sizes,
+extra gateways, ambient environment overlays, revision-baseline images and
+adaptive duration extension. Each pair includes direct, `ferrum` (adaptive on)
+and `ferrum-exp-fixed` (adaptive off); the existing rotated/reversed order is
+recorded in `position_balance.json`. There are 12 H2 and 24 gRPC observations.
+All arms of each protocol use the same image and hosted VM, with a fresh backend
+per arm and repeated direct controls. The workflow uses separate VMs for H2 and
+gRPC: **cross-protocol rates are not paired**. A conservative envelope is about
+11 minutes for H2 and 17 for gRPC, excluding image/build time; the existing
+4200-second harness budget and 75-minute workflow step remain in force.
+
+For each Ferrum arm, `diagnostics/<arm>_config.yaml` is the actual mounted route
+file. Materialization requires exactly the expected window/frame/stream and
+keepalive fields, changes its explicit `pool_http2_adaptive_window` value, and
+reads the result back. An environment-only flag cannot override the route YAML.
+`manifest.json.effective_h2_arms` records the route SHA-256, exact arm environment
+and effective builder inputs. The runner pins the resolved image ID, verifies
+the running containers' relevant environment (including absence of a shadowing
+`RUST_LOG`) and records their image IDs; `images.txt` also retains image identity. The route
+files differ only in the adaptive flag. Both retain 5/30/30-second backend
+connect/read/write timeouts, 8/32 MiB configured window inputs, 1 MiB maximum
+frames, 1000 streams and configured pool width 16. Adaptive-on resets Hyper's
+initial windows to 65,535 bytes; fixed retains 8/32 MiB. These are derived builder
+settings verified against the pinned source and generated inputs, **not observed
+negotiated windows**. The client's and echo backend's window settings are held
+constant. No admission, pool scheduling, flood/reset protection, retry, response
+buffering, timeout, status/body/trailer or offered-concurrency policy is varied.
+
+H2 observations require `--ca-cert`, enabling CA and server-name verification
+equally for direct and both Ferrum arms. This tightens the historical H2 client's
+insecure verifier, so old/new rates are not a controlled comparison. Native
+gRPC keeps its CA/localhost SNI verification and 8 MiB message limits. Exact
+HTTP 200/body equality and tonic's status/trailer processing plus exact protobuf
+payload equality remain mandatory. A clean RPC is not an independent wire
+trailer audit.
+
+The campaign supplies `--h2-observe` to each client and `BENCH_H2_OBSERVE=1` to
+the benchmark backend. Events extend #5601's `TransportEvent` and `PhaseReport`:
+monotonic process-relative timestamps, actual coordinator boundaries for setup,
+warmup, measurement, drain and transport close, operation, worker, channel and
+physical connection identity. `connection_id=0` means unknown, including an RPC
+spanning a reconnect. gRPC channel IDs are explicitly separate from physical
+socket IDs. Client H2 driver results are joined after worker drain with a
+five-second **observation** bound. This is not proof of graceful H2 close.
+Tonic hides its detached driver results; its socket-drop events do not certify
+close correctness, and events after the final snapshot are not captured.
+
+Typed `h2::Error` sources provide numeric reason, `goaway`/`reset`/`io`/`other`
+and `remote`/`local_library`/`local_user`/`unknown` where the API preserves them.
+A bare reason never implies a frame type or initiator. Client storage is capped
+at 512 events per sample; source chains at eight entries and 2048 escaped bytes.
+Counters (`total_errors`, `transport_errors_total`, `transport_events_total`,
+`transport_events_suppressed`) remain independent of retained event count. Backend
+H2 listeners each cap at 512 lifetime events and emit a limit marker. Their
+`H2_TRANSPORT` records reuse the same event representation; sample attribution
+uses client wall-clock boundaries and is explicitly marked as cross-process
+correlation with unmeasured clock skew. Raw cumulative backend/gateway logs are
+retained: do not sum repeated payload snapshots as new events.
+
+Existing gateway driver logs hide typed causes behind generic Hyper Display
+text. A narrow diagnostic at those existing termination sites is enabled with
+`FERRUM_LOG_LEVEL=warn,ferrum_h2_observe=debug`, identically in both arms. Its
+fixed-cardinality hop/reason/kind/initiator fields include process-local driver
+identity, monotonic time and lifetime. It emits at most 512 terminal records per
+gateway lifetime, with a limit marker on the last. It never renders error text,
+GOAWAY debug bytes, peer addresses, pool keys, headers, bodies or credentials.
+Ordinary warn/error production logging is unchanged. Frontend auto-driver
+records can include H1/readiness traffic and forced handler retirement; `ok`
+does not assert graceful transport closure. No whole-protocol debug/trace filter
+is enabled. Connection IDs are local to each process, not cross-hop correlation
+tokens; gateway events have wall-clock timing but no invented client phase.
+
+At 500 ms, the existing passive sampler also reads allowlisted gauges from
+loopback-authenticated `/metrics`. The raw measured samples distinguish resident
+H2/gRPC pool entries and frontend active connections/requests from configured
+shards. Missing, malformed or inaccessible gauges are reported, never zero-filled.
+Resident pool entries include idle transports; neither they nor client-local
+active-stream gauges prove per-backend stream occupancy or 200/16 multiplexing.
+Scrape overhead is equal between the two Ferrum arms, but direct ratios still
+include shared-host client/backend and observer cost.
+
+Failures stay in raw samples, stderr and cumulative logs. The existing paired
+validator rejects a comparison if any declared repetition is missing or invalid;
+the campaign also rejects missing gauge observations, incomplete diagnostic
+capture, captured client/backend transport errors or an incomplete H2 driver
+observation. Inspect every repetition, including
+warmup/drain failures and clean controls; bounded logs or zero observed events
+are not proof of zero transport faults. Do not average surviving workers into a
+performance win. The next investigation is to compare failure incidence/reasons
+and observed occupancy between the two effective settings. GOAWAY debug subtype,
+DATA-length/END_STREAM distributions, per-backend active streams, tonic backend
+driver results and exact cross-hop identity remain gaps. Add narrower observation
+only if the captured reasons require it; no production fix is justified here.
+
+Hosted `Benchmark Harness Tests` reaches regression cases for typed remote
+GOAWAY/RST distinction, cyclic/large error chains, log suppression independent
+of counts, monotonic phase attribution, effective route materialization, gauge
+failure handling and rejection of a failed paired repetition. Local execution
+was prohibited for this change; hosted compilation/tests and root's independent
+artifact audit remain required before drawing conclusions.
 
 ### HTTP/3 transport experiment (#5588, section 2)
 

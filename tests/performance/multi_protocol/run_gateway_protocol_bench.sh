@@ -33,10 +33,6 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
-# Branch-committed Ferrum environment overlay (see `ferrum_env_overlay_pairs`).
-FERRUM_ENV_OVERLAY_FILE="$SCRIPT_DIR/ferrum_experiment.env"
-FERRUM_ENV_OVERLAY=()
-
 # ── Portable `timeout` command (GNU coreutils) ──────────────────────────────
 # macOS/BSD ships without `timeout`; Homebrew installs it as `gtimeout`.
 if command -v timeout >/dev/null 2>&1; then
@@ -70,6 +66,7 @@ ORDER_POSITION=0
 HOST_ID=""
 EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
+H2_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -300,7 +297,8 @@ start_backend() {
     local saved_pwd
     saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
-    H3_PROFILE="$H3_BUDGET" ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
+    BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
+        ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
@@ -333,36 +331,16 @@ prepare_ferrum_config() {
     echo "$runtime_config"
 }
 
-# Read `ferrum_experiment.env` into FERRUM_ENV_OVERLAY. Blank lines and `#`
-# comments are ignored; every other line must be a KEY=VALUE pair whose key is a
-# FERRUM_-prefixed shouting-snake-case name, so a stray line cannot become a
-# `docker run` argument. Malformed lines are reported and skipped rather than
-# silently dropped.
-ferrum_env_overlay_pairs() {
-    FERRUM_ENV_OVERLAY=()
-    [ -r "$FERRUM_ENV_OVERLAY_FILE" ] || return 0
-    local line
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        case "$line" in
-            ''|'#'*) continue ;;
-        esac
-        if [[ ! $line =~ ^FERRUM_[A-Z0-9_]*=.*$ ]]; then
-            echo "[ferrum] ignoring malformed overlay line: $line" >&2
-            continue
-        fi
-        FERRUM_ENV_OVERLAY+=("$line")
-    done < "$FERRUM_ENV_OVERLAY_FILE"
-    if [ ${#FERRUM_ENV_OVERLAY[@]} -gt 0 ]; then
-        echo "[ferrum] DIAGNOSTIC overlay active: ${FERRUM_ENV_OVERLAY[*]}" >&2
-    fi
-}
-
 start_ferrum() {
     local config_src="$SCRIPT_DIR/configs/$(ferrum_config_name)"
     local config_file
     config_file=$(prepare_ferrum_config "$config_src" "/etc/ferrum/tls/ca.pem")
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        config_file="$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        python3 "$SCRIPT_DIR/experiment_arms.py" materialize "$EXPERIMENT_MANIFEST" \
+            "$PROTOCOL" "$gw" "$config_src" "$config_file" "$root_output/manifest.json" || return 2
+    fi
     echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_src")..."
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
@@ -382,19 +360,6 @@ start_ferrum() {
             extra_env+=(-e "$pair")
         done
     fi
-    # Branch-committed overlay for the same purpose. `Trusted Cross Build Policy`
-    # freezes the benchmark matrix job byte-for-byte and that job exports no
-    # environment of its own, so a committed file is the ONLY way a pull request
-    # can enable a diagnostic Ferrum setting (for example FERRUM_LOG_LEVEL=warn,
-    # which surfaces the backend dispatch error classes the default `error` level
-    # hides) on a hosted run. Empty in the committed tree: a populated overlay
-    # changes Ferrum's runtime configuration for that arm only, so such a run is
-    # diagnostic and its rates are NOT a paired performance measurement.
-    ferrum_env_overlay_pairs
-    for pair in "${FERRUM_ENV_OVERLAY[@]}"; do
-        extra_env+=(-e "$pair")
-    done
-
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
         -v "$CERT_DIR:/etc/ferrum/tls:ro" \
@@ -433,6 +398,11 @@ start_ferrum() {
         "${extra_env[@]}" \
         "$FERRUM_IMAGE")
 
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/experiment_arms.py" verify-runtime \
+                "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw" "$root_output/manifest.json" || return 2
+    fi
     wait_for_gateway
 }
 
@@ -828,6 +798,12 @@ run_bench() {
         bench_target="${params[1]}"
     fi
     local extra_args=("${params[@]:3}")
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        extra_args+=(--h2-observe)
+        if [ "$PROTOCOL" = http2 ]; then
+            extra_args+=(--ca-cert "$CERT_DIR/ca.pem")
+        fi
+    fi
     local effective_concurrency
     effective_concurrency=$(scale_concurrency_for_payload "$payload" "$CONCURRENCY")
 
@@ -855,6 +831,9 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
+    if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
+        sampler_args+=(--h2-gauges)
+    fi
     if [ "$PROTOCOL" = http3 ] && [ "$H3_BUDGET" -ne 0 ]; then
         sampler_args+=(--http3)
         case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
@@ -956,6 +935,10 @@ run_bench() {
     python3 "$SCRIPT_DIR/benchmark_plan.py" stamp \
         "$out" "$gateway" "$payload" "$effective_concurrency" \
         "$PAIR" "$ORDER_POSITION" "$HOST_ID" "$usage" "$GATEWAY_ORDER"
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
+            "$diagnostics/${gateway}_${payload}_backend.log"
+    fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
@@ -1000,6 +983,19 @@ main() {
             fi
             expected_gateways+=" $EXPERIMENT_ARMS"
             cp "$EXPERIMENT_MANIFEST" "$OUTPUT_DIR/experiment.json"
+            local campaign
+            campaign=$(python3 "$SCRIPT_DIR/experiment_arms.py" campaign \
+                "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$DURATION" "$CONCURRENCY" \
+                "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
+            if [ -n "$campaign" ]; then
+                H2_OBSERVE=1
+                PAIRS="${campaign%% *}"
+                PAYLOAD_SIZES="${campaign#* }"
+                if ! $PROCESS_USAGE; then
+                    echo "[experiment] H2 campaign requires process observations" >&2
+                    exit 2
+                fi
+            fi
         else
             EXPERIMENT_ARMS=""
         fi
@@ -1010,15 +1006,14 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    ferrum_env_overlay_pairs
     python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" \
-        "$HOST_ID" "${FERRUM_ENV_OVERLAY[@]}" <<'PYEOF'
+        "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
                "payload_sizes": [int(size) for size in sys.argv[3].split()],
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
-               "ferrum_env_overlay": sys.argv[6:],
+               "h2_observation_enabled": sys.argv[6] == "1",
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -1030,6 +1025,10 @@ PYEOF
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
+        FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
+    fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"
