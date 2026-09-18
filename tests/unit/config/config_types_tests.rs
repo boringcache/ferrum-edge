@@ -7001,7 +7001,7 @@ fn dedup_and_request_derived_a2a_gateway_are_rejected() {
         "the error must name the configuration that is actually unprovable: {joined}"
     );
     assert!(
-        joined.contains("Set discovery.public_base_url"),
+        joined.contains("Set `discovery.public_base_url`"),
         "the error must name the remedy: {joined}"
     );
     assert!(

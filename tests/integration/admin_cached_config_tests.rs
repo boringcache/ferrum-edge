@@ -3208,7 +3208,7 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
         (
             "correlation-unknown-key",
             json!({"echo_downsteam": false}),
-            "correlation_id: unknown config field(s): echo_downsteam",
+            "correlation_id: unknown config field(s): \"echo_downsteam\"",
         ),
         (
             "correlation-managed-header",
@@ -3260,7 +3260,10 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
             "malformed correlation config was admitted: {body}"
         );
         assert!(
-            body.to_string().contains(expected_error),
+            body["error"]
+                .as_str()
+                .expect("admin error string")
+                .contains(expected_error),
             "unexpected admin validation response: {body}"
         );
     }
@@ -3500,8 +3503,10 @@ async fn test_admin_create_rejects_unknown_adaptive_concurrency_policy_keys() {
     let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
     assert_eq!(status, 400, "unknown adaptive key was admitted: {body}");
     assert!(
-        body.to_string()
-            .contains("adaptive_concurrency: unknown config key 'max_limt'"),
+        body["error"]
+            .as_str()
+            .expect("admin error string")
+            .contains("adaptive_concurrency: unknown config key \"max_limt\""),
         "unexpected admin validation response: {body}"
     );
 }
