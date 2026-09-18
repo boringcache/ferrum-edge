@@ -47,6 +47,25 @@ class BenchmarkValidityTests(unittest.TestCase):
     def test_zero_work_is_not_an_error_free_sample(self):
         self.assertTrue(sample_issues(dict(clean(), total_requests=0, total_bytes=0, rps=0)))
 
+    def test_phase_records_require_full_barrier_and_resource_evidence(self):
+        sample = dict(clean(), sample_schema=2, duration_secs=2, effective_concurrency=2,
+                      warmup_requests=2,
+                      phases=dict(measurement_secs=2, timed_out=False),
+                      observed=dict(samples=5, workers_at_barrier=2,
+                                    workers_retired_before_deadline=0),
+                      process_usage=dict(processes=[dict(pid=i, role=role) for i, role in
+                                                    enumerate(("client", "backend", "gateway"))]))
+        for name in ("active_workers", "active_connections", "active_streams", "queued_requests"):
+            sample["observed"][name] = dict(min=0, max=2, mean=1)
+        self.assertEqual(sample_issues(sample), [])
+        for field, value in (("phases", None), ("observed", None),
+                             ("warmup_requests", 1), ("process_usage", {})):
+            self.assertTrue(sample_issues(dict(sample, **{field: value})))
+        self.assertTrue(sample_issues(dict(sample, phases=dict(measurement_secs=2, timed_out=True))))
+        self.assertTrue(sample_issues(dict(sample, observed=dict(
+            samples=5, workers_at_barrier=2, workers_retired_before_deadline=1))))
+        self.assertTrue(sample_issues(dict(sample, process_usage=dict(processes=42))))
+
     def test_failure_placeholders_and_malformed_measurements(self):
         for sample in [{}, {"error": "bench wallclock timeout", "rps": 0},
                        dict(clean(), total_bytes=10239), dict(clean(), total_errors=None),

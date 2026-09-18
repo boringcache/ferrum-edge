@@ -15,6 +15,59 @@ def _is_number(value):
 
 def sample_issues(sample):
     issues = []
+    if not isinstance(sample, dict):
+        return ["invalid sample object"]
+    if "samples" in sample:
+        children = sample["samples"]
+        expected = sample.get("expected_pairs")
+        if (not isinstance(children, list) or not isinstance(expected, int)
+                or isinstance(expected, bool) or expected < 3 or len(children) != expected):
+            issues.append("incomplete paired samples")
+        elif any(not isinstance(child, dict) or "samples" in child for child in children):
+            issues.append("invalid nested sample")
+        else:
+            if [child.get("pair") for child in children] != list(range(1, expected + 1)):
+                issues.append("missing/duplicate/out-of-order pair IDs")
+            for index, child in enumerate(children, 1):
+                issues.extend(f"pair {index}: {issue}" for issue in sample_issues(child))
+    elif sample.get("sample_schema") == 2:
+        phases = sample.get("phases") or {}
+        observed = sample.get("observed") or {}
+        if not isinstance(phases, dict) or not isinstance(observed, dict):
+            issues.append("invalid phase/concurrency record")
+        else:
+            duration = phases.get("measurement_secs")
+            if (not _is_number(duration) or not math.isfinite(duration) or duration <= 0
+                    or duration != sample.get("duration_secs") or phases.get("timed_out")):
+                issues.append("invalid/incomplete measurement phase")
+            count = observed.get("samples")
+            if (not isinstance(count, int) or isinstance(count, bool) or count <= 0
+                    or observed.get("workers_retired_before_deadline") != 0):
+                issues.append("missing observations or retired workers")
+            for name in ("active_workers", "active_connections", "active_streams", "queued_requests"):
+                gauge = observed.get(name)
+                if (not isinstance(gauge, dict)
+                        or any(not _is_number(gauge.get(field))
+                               or not math.isfinite(gauge[field]) for field in ("min", "max", "mean"))
+                        or not 0 <= gauge["min"] <= gauge["mean"] <= gauge["max"]):
+                    issues.append(f"missing/invalid observed {name}")
+            if (observed.get("workers_at_barrier") != sample.get("effective_concurrency")
+                    or sample.get("warmup_requests") != sample.get("effective_concurrency")):
+                issues.append("incomplete setup/warmup barrier")
+        usage = sample.get("process_usage") or {}
+        if (not isinstance(usage, dict) or usage.get("error")
+                or not isinstance(usage.get("processes"), list) or not usage["processes"]):
+            issues.append("missing per-process resource capture")
+        elif usage.get("missing_pids"):
+            issues.append("incomplete per-process resource capture")
+        else:
+            roles = {process.get("role") for process in usage["processes"]
+                     if isinstance(process, dict)}
+            required = {"client", "backend"}
+            if sample.get("gateway") != "direct":
+                required.add("gateway")
+            if not required <= roles:
+                issues.append("missing process roles")
     if sample.get("error"):
         issues.append(str(sample["error"]))
     errors = sample.get("total_errors")

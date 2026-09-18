@@ -180,6 +180,122 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
+### Phases and observed concurrency (tracker #5588, section 1)
+
+Every throughput protocol uses the same five phases:
+
+1. **Setup:** establish all client transports, including the sequential H2,
+   gRPC and H3 pools. Register workers before spawning them so setup failures
+   and panics release the barrier and remain errors.
+2. **Warmup:** each surviving worker sends one echo with the measured payload
+   and the same strict status/body validation. Warmup work is reported separately.
+3. **Measurement barrier:** wait until every surviving worker has finished its
+   warmup response. Publish one common monotonic start and exclusive deadline.
+4. **Measurement:** offer closed-loop requests until that deadline. Only exact,
+   validated echoes completed before it enter `total_requests`, `total_bytes`,
+   latency histograms and RPS. A worker error is retained even during warmup/drain.
+5. **Drain:** stop new offers, finish outstanding exchanges, and join workers.
+   Successful late echoes enter `drain_requests`/`drain_bytes`, never nominal
+   throughput. Preflight and request drain each have a 30-second bound; failed
+   or aborted workers invalidate the sample. H3 endpoints then explicitly close
+   and wait for idle, reported as `transport_close_secs` (outside measurement).
+
+TCP/TLS previously ran an unbounded pipelined writer. Both TCP variants now
+offer one full-duplex echo per worker, using chunked writes and concurrent reads
+to retain large-payload progress. This changes the TCP workload; old TCP rates
+are not a paired reference for this harness. Offered work, connection topology,
+payload scaling and warmup are identical for every gateway within a new pair.
+The separate `saturate` command is unchanged.
+
+Raw samples add these fields without removing the existing scalar report:
+
+| Field | Meaning |
+|-------|---------|
+| `phases` | `setup_secs`, `warmup_secs`, `barrier_secs`, `measurement_secs`, `measurement_start_unix_secs`, `drain_secs`, `transport_close_secs`, `timed_out` |
+| `warmup_requests` | Validated warmup echoes, excluded from throughput |
+| `drain_requests`, `drain_bytes` | Validated completions after the exclusive deadline |
+| `observed.active_workers` | Sampled live workers: `min`, `max`, arithmetic sample `mean` |
+| `observed.active_connections` | Sampled actual client transport lifetimes, counted by connection drivers/socket owners; UDP counts connected sockets |
+| `observed.active_streams` | Sampled locally admitted exchanges still awaiting complete validation; TCP/WS/UDP count echo exchanges |
+| `observed.queued_requests` | Sampled offered requests waiting for client admission |
+| `observed.queue_time_ns`, `admissions` | Total client admission wait and admitted request count for measured offers (including offers admitted during drain) |
+| `observed.workers_at_barrier`, `workers_retired_before_deadline` | Actual barrier participants and early retirements, including setup/warmup failures |
+| `observed.samples`, `sampling_interval_ms` | Observation count and requested 10 ms cadence; scheduler delays are possible |
+| `pair`, `host_id`, `gateway_order`, `order_position` | Same-host pair identity and executed order |
+| `process_usage` | Per-PID CPU deltas and sampled peak RSS for client, backend and all gateway PIDs discovered with `docker top`; exact whole-client CPU/RSS from `wait` resource accounting |
+
+H1/H2/gRPC admission is observed at the first request-body frame polled by the
+transport; H3 uses successful stream opening. These are **client-local** streams
+and queues, not server active-request counters or a measurement of kernel/QUIC
+flow-control queues. `active_connections` includes idle pooled transports.
+Worker/stream gauges are sampled, not exact extrema or time-weighted averages.
+No requested count is substituted for an observation. `effective_concurrency`
+continues to mean the **offered** worker count.
+
+Process sampling is Linux-only (`/proc`, 100 ms); this runner targets the hosted
+Linux lane. `diagnostics/*_process_usage.json` retains the full timestamped series.
+`process_usage.measurement` brackets the measured interval per PID and reports
+`boundary_slack_secs`, `bracket_secs`, `complete_bracket`, and sampled peak RSS.
+A process that exits before the ending sample has an incomplete bracket, not a
+fabricated zero CPU value. Whole-invocation counters explicitly include setup,
+warmup and drain. The sampler itself adds shared-runner overhead; these rates and
+direct ratios still do not isolate proxy CPU cost. Optional external dependencies
+such as Tyk's Redis are not included in gateway PID accounting.
+
+### Paired comparison procedure
+
+`run_gateway_protocol_bench.sh` runs at least three pairs **per invocation**
+(`--pairs`, default 3). Each pair includes direct and every supported gateway,
+with a fresh backend per arm. Successive orders reverse; each two-pair block
+rotates its first gateway. Six pairs give exact position balance for three arms;
+three pairs are a minimum replication floor, not exact position balance.
+The frozen workflow's `iterations` repeats this entire suite. Its historical
+`--skip-direct` flag is accepted but ignored: every pair needs a fresh direct
+baseline. Budget long full-matrix runs accordingly.
+
+For a revision experiment, make both images available on the **same hosted
+runner**, pin their digests, and run, for example:
+
+```bash
+FERRUM_IMAGE=ferrum-edge@sha256:<candidate-digest> \
+  bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh http3 \
+  --baseline-image ferrum-edge@sha256:<baseline-digest> \
+  --gateways 'ferrum envoy' --payload-sizes '10240' \
+  --duration 30 --pairs 6 --skip-build --output-dir results/http3/run_1
+```
+
+The reference appears as `ferrum-baseline`. Keep configuration identical except
+for the stated experiment; `images.txt` records immutable image IDs and labels.
+Never compare separate hosted VMs as revision pairs. Without a baseline image,
+the suite compares direct/gateway and Ferrum/competitor pairs; it does **not**
+claim a revision A/B. The existing frozen workflow has no baseline-image input;
+revision experiments require a runner with both images provisioned separately.
+
+`paired_comparisons.json` uses matched per-pair log throughput ratios and a
+two-sided Student-t 95% interval, requiring at least three clean pairs with equal
+host, payload, duration and offered concurrency. An invalid or missing pair
+invalidates the comparison; no observations are dropped. If uncertainty overlaps
+no gain, the harness adds one bounded block of the same number of pairs with
+**double duration for every arm**, retaining the initial block. If uncertainty
+still overlaps, report the comparison as inconclusive and schedule a longer
+predeclared experiment; optional stopping does not make this exploratory interval
+a confirmatory statistical test. Inspect every sample's p99 as well as RPS.
+`--no-adaptive` is only for smoke checks, not performance claims.
+
+Raw JSON lives under `pairs/pair_NNN/`. Root `<gateway>_<protocol>_<size>.json`
+keeps the legacy totals/rate fields and adds `samples` plus `expected_pairs`.
+Rates use total measured requests / total measured seconds; summary latency
+quantiles are the maximum per-sample quantiles, explicitly labelled, because
+quantiles cannot be pooled without histograms. All constituent observations are
+validated. Existing budget/reference JSON files need no schema change. The
+combined artifact also contains flattened `observed-samples.json` and
+`paired-comparisons.json`; use those or the raw samples for analysis. The frozen
+matrix summary remains diagnostic; the aggregate job reports paired intervals.
+
+Hosted `Benchmark Harness Tests` runs the phase/worker/admission tests in
+`tests/metrics_tests.rs` and the Python ordering, pairing, aggregation, resource
+parser and validity tests. No matrix-job workflow changes are needed.
+
 For the September 2026 multi-gateway investigation, see the
 [benchmark audit](../../../docs/benchmark_audit_2026_09_17.md). The gateway
 workflow's **combined** summary now reports validity across every iteration:

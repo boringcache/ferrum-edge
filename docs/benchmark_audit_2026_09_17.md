@@ -78,7 +78,8 @@ with errors. Re-rendering the artifacts with the revised validity rules
 excludes 16 of 31 opposed scenarios. The remaining 15 still include old H3
 measurements: passing validity checks does not prove configuration parity.
 
-The following limitations remain even after the reporting repair:
+The following limitations applied after the initial reporting repair (the
+section-1 harness follow-up below addresses timing, observations and pairing):
 
 - Client, backend, and gateway share a runner. Throughput includes their CPU,
   memory, scheduling, and TLS costs. Direct/gateway RPS differences are useful
@@ -96,6 +97,35 @@ The following limitations remain even after the reporting repair:
   `effective_concurrency` is a requested worker count, not observed active
   streams. Record worker loss and actual concurrency/queueing in a future
   harness revision; invalidate any failed sample rather than retrying it away.
+
+**Section 1 harness follow-up (#5588).** The new client establishes transports,
+warms each worker with one validated echo, waits at a common measurement barrier,
+and drains admitted exchanges separately. Only completions before the exclusive
+deadline enter throughput and latency; warmup and drain counts/times are retained.
+H3 endpoints explicitly close after drain. Sampled worker, physical client
+connection, locally admitted stream/exchange and client admission-queue gauges
+replace inference from requested `effective_concurrency`. Queue totals, barrier
+participation and worker retirement are recorded in every raw sample. Server
+stream admission and kernel/QUIC queue depths remain separate transport questions.
+
+The runner now performs at least three counterbalanced same-host pairs per
+invocation, repeats direct in every pair, and supports a separately provisioned
+`ferrum-baseline` image for revision comparisons. Per-PID gateway/client/backend
+CPU and RSS series include explicit measurement brackets and sampling slack.
+Paired log-ratio intervals that overlap no gain trigger one bounded extra block
+at double duration for every arm. Invalid pairs remain invalid; unresolved
+uncertainty requires a longer predeclared experiment. This exploratory adaptation
+does not by itself establish a statistically confirmed gain. Existing report
+fields remain available, with raw constituent samples retained in aggregate
+artifacts. The Cross-frozen benchmark job is unchanged.
+
+See the [harness phases and paired procedure](../tests/performance/multi_protocol/README.md#phases-and-observed-concurrency-tracker-5588-section-1)
+for definitions and caveats. TCP/TLS now uses bounded full-duplex echoes instead
+of its former unbounded writer pipeline, identically for all gateways; its older
+rates are therefore not a workload-matched reference. The historical runs in this
+audit are not retroactively repaired by the harness change. A short hosted smoke
+run verifies artifact plumbing, not a revision performance improvement; production
+optimization experiments and the rest of #5588 remain open.
 
 **Completed current-main comparison.** Run 35195212169 has the same 141 groups,
 359 samples, three iterations, 15-second duration, and scaled concurrency as
