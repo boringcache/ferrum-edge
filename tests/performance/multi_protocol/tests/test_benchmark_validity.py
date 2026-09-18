@@ -16,13 +16,26 @@ class BenchmarkValidityTests(unittest.TestCase):
     def test_startup_failure_still_has_expected_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            self.assertEqual(expected_rows(path), [])
+            self.assertIsNone(expected_rows(path))
             (path / "manifest.json").write_text(json.dumps({
                 "gateways": ["ferrum", "envoy"], "payload_sizes": [10240, 5242880]}))
             self.assertEqual(expected_rows(path), [
                 ("ferrum", 10240), ("ferrum", 5242880),
                 ("envoy", 10240), ("envoy", 5242880)])
             self.assertTrue(bucket_issues([], 3))
+
+    def test_malformed_manifest_does_not_look_like_an_empty_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            malformed = (
+                "{",
+                json.dumps({"gateways": ["ferrum"]}),
+                json.dumps({"gateways": "ferrum", "payload_sizes": [1024]}),
+                json.dumps({"gateways": ["ferrum"], "payload_sizes": [True]}),
+            )
+            for contents in malformed:
+                (path / "manifest.json").write_text(contents)
+                self.assertIsNone(expected_rows(path))
 
     def test_all_iterations_must_be_clean(self):
         self.assertEqual(bucket_issues([clean()] * 3, 3), [])
