@@ -3498,8 +3498,14 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("request_transform"), "got: {err}");
-        assert!(err.contains("add/update/remove"), "got: {err}");
+        let expected = concat!(
+            "`mesh_route_dispatch.rules[0].request_transform[0].operation` ",
+            "must be one of `add`/`update`/`remove`"
+        );
+        assert!(err.starts_with(expected), "got: {err}");
+        let rendered = crate::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+        assert!(rendered.starts_with(expected), "got: {rendered}");
+        assert!(!rendered.contains("rename"), "got: {rendered}");
     }
 
     // ── MethodMatchOp (exact / prefix / regex) ────────────────────────────

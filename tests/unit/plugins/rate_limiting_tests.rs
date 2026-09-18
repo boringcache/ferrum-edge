@@ -2238,10 +2238,12 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
 fn traffic_root_unknown_keys_keep_fixed_context_and_suggestions_when_rendered() {
     // Keep the traffic callers of the shared unknown-key helper in one table.
     // The helper withholds the whole qualified key, including its root path.
+    // Typos must not be substrings of the retained schema suggestions: the
+    // negative canaries below must distinguish supplied keys from suggestions.
     for (plugin, typo, suggestion) in [
         ("compression", "gzip_leveel", "gzip_level"),
-        ("graphql", "max_dept", "max_depth"),
-        ("grpc_method_router", "allow_method", "allow_methods"),
+        ("graphql", "max_deptz", "max_depth"),
+        ("grpc_method_router", "allow_methodz", "allow_methods"),
         ("grpc_web", "expose_headerz", "expose_headers"),
         ("load_testing", "request_timeot_ms", "request_timeout_ms"),
         ("rate_limiting", "expose_headerz", "expose_headers"),
@@ -2256,7 +2258,7 @@ fn traffic_root_unknown_keys_keep_fixed_context_and_suggestions_when_rendered() 
             "max_frame_bytez",
             "max_frame_bytes",
         ),
-        ("ws_rate_limiting", "frames_per_secon", "frames_per_second"),
+        ("ws_rate_limiting", "frames_per_seconz", "frames_per_second"),
     ] {
         let hostile_key = "'\"\\\n`ROOT_QUOTE_CANARY";
         let config = json!({

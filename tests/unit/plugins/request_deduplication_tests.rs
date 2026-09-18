@@ -6817,8 +6817,17 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({"on_redis_unavailable": token}),
+            "`config.on_redis_unavailable`",
+            "require `sync_mode=redis` (did you mean to set `sync_mode`?)",
+        ),
+        (
+            json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://redis.example.test:6379/0",
+                "on_redis_unavailable": token
+            }),
             "`on_redis_unavailable`",
-            "must be exactly",
+            "must be exactly `fail_closed` or `local_only`",
         ),
         (
             json!({"ttl_seconds": false}),

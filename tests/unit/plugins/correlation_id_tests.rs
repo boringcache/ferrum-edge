@@ -45,7 +45,7 @@ fn test_constructor_rejects_one_and_multiple_unknown_fields_deterministically() 
         .expect("unknown field must be rejected");
     assert_eq!(
         one,
-        "correlation_id: unknown config field(s): echo_downsteam"
+        "correlation_id: unknown config field(s): \"echo_downsteam\""
     );
 
     let multiple = CorrelationId::new(&json!({
@@ -57,7 +57,7 @@ fn test_constructor_rejects_one_and_multiple_unknown_fields_deterministically() 
     .expect("multiple unknown fields must be rejected");
     assert_eq!(
         multiple,
-        "correlation_id: unknown config field(s): a_unknown, z_unknown"
+        "correlation_id: unknown config field(s): \"a_unknown, z_unknown\""
     );
 }
 

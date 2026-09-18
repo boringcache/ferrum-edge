@@ -129,7 +129,7 @@ fn test_reject_unknown_top_level_field() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("unknown config field"));
+    assert_eq!(err, "fault_injection: unknown `config` field \"deplay\"");
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn test_reject_unknown_abort_field() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("unknown abort field"));
+    assert_eq!(err, "fault_injection: unknown `abort` field \"why\"");
 }
 
 #[test]
@@ -209,7 +209,10 @@ fn test_reject_duration_ms_above_cap() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("duration_ms must be <="));
+    assert_eq!(
+        err,
+        "fault_injection: `delay.duration_ms` must be <= 60000, got \"60001\""
+    );
 }
 
 #[test]
@@ -292,7 +295,7 @@ fn test_reject_abort_body_not_string() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("body must be a string"));
+    assert_eq!(err, "fault_injection: `abort.body` must be a string");
 }
 
 #[test]
@@ -1717,11 +1720,23 @@ mod udp_datagram_faults {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
     for (config, field, reason) in [
+        (json!({token: true}), "`config`", "unknown"),
         (json!({"abort": {token: true}}), "`abort`", "unknown"),
+        (json!({"delay": {token: true}}), "`delay`", "unknown"),
+        (
+            json!({"abort": {"status_code": 503, "percentage": 50.0, "body": {token: true}}}),
+            "`abort.body`",
+            "must be a string",
+        ),
         (
             json!({"abort": {"status_code": 918273641}}),
             "`abort.status_code`",
             "must be 200-599",
+        ),
+        (
+            json!({"delay": {"duration_ms": 918273641, "percentage": 50.0}}),
+            "`delay.duration_ms`",
+            "must be <= 60000",
         ),
         (
             json!({"delay": {"duration_ms": 1, "percentage": 918273641}}),

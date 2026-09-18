@@ -102,7 +102,7 @@ fn test_creation_empty_rules() {
 #[test]
 fn test_creation_rejects_non_object_rule() {
     let err = ResponseMock::new(&json!({ "rules": [42] })).err().unwrap();
-    assert!(err.contains("rule[0] must be an object"));
+    assert_eq!(err, "response_mock: `rule[0]` must be an object");
 }
 
 #[test]
@@ -1234,6 +1234,7 @@ async fn prefix_trailing_slash_preserves_rule_path_coordinates() {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
     for (config, field, reason) in [
+        (json!({"rules": [token]}), "`rule[0]`", "must be an object"),
         (
             json!({"rules": [{"path": "/", "headers": {token: true}}]}),
             "`rule[0]`",
