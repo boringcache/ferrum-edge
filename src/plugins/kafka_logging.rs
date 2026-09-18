@@ -2499,9 +2499,9 @@ fn admit_producer_config(
                     .to_string(),
             );
         }
-        let prop = value
-            .as_str()
-            .ok_or_else(|| format!("kafka_logging: `producer_config` key {key:?} must be a string"))?;
+        let prop = value.as_str().ok_or_else(|| {
+            format!("kafka_logging: `producer_config` key {key:?} must be a string")
+        })?;
         if prop.trim().is_empty() {
             return Err(format!(
                 "kafka_logging: `producer_config` key {key:?} must not be empty"

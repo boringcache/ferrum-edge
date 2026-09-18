@@ -436,11 +436,13 @@ pub fn parse_custom_headers(
         .as_object()
         .ok_or_else(|| format!("{plugin_name}: `custom_headers` must be an object"))?;
     for (key, value) in map {
-        let value = value
-            .as_str()
-            .ok_or_else(|| format!("{plugin_name}: `custom_headers` key {key:?} must be a string"))?;
+        let value = value.as_str().ok_or_else(|| {
+            format!("{plugin_name}: `custom_headers` key {key:?} must be a string")
+        })?;
         let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
-            format!("{plugin_name}: invalid `custom_headers` name {key:?}: invalid HTTP header name")
+            format!(
+                "{plugin_name}: invalid `custom_headers` name {key:?}: invalid HTTP header name"
+            )
         })?;
         let header_value = HeaderValue::from_str(value).map_err(|_| {
             format!("{plugin_name}: invalid `custom_headers` value for key {key:?}: invalid HTTP header value")
