@@ -211,7 +211,10 @@ fn test_unknown_derived_field_entry_key_rejected_with_path() {
     }))
     .expect_err("unknown derived-field keys must be rejected");
     assert!(err.contains("entry \"audit\""), "got: {err}");
-    assert!(err.contains("\"from\" at `derived_fields[0]`"), "got: {err}");
+    assert!(
+        err.contains("\"from\" at `derived_fields[0]`"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -365,7 +368,10 @@ fn test_unknown_metadata_mode_still_names_the_mode() {
     // Option validation must not steal the diagnostic from an unknown mode.
     let err = validate_schema(json!({ "metadata": { "mode": "nope", "prefix": 3 } }))
         .expect_err("unknown mode rejected");
-    assert_contains(&err, "must be `nested`, `omit`, or `flatten` (got \"nope\")");
+    assert_contains(
+        &err,
+        "must be `nested`, `omit`, or `flatten` (got \"nope\")",
+    );
 }
 
 // ── Native gRPC message counters are projectable ────────────────────
