@@ -550,17 +550,10 @@ pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String
             root
         ));
     }
-    let metadata = std::fs::metadata(root).map_err(|error| {
-        format!(
-            "--host-proc-root {:?} is not readable: {error}",
-            root
-        )
-    })?;
+    let metadata = std::fs::metadata(root)
+        .map_err(|error| format!("--host-proc-root {:?} is not readable: {error}", root))?;
     if !metadata.is_dir() {
-        return Err(format!(
-            "--host-proc-root {:?} is not a directory",
-            root
-        ));
+        return Err(format!("--host-proc-root {:?} is not a directory", root));
     }
     // `self/ns/net` exists in every procfs instance, including one bind-mounted
     // from another PID namespace, so it distinguishes a real procfs from an

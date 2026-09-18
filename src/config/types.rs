@@ -4100,7 +4100,7 @@ impl GatewayConfig {
             if let Some(pattern) = path.strip_prefix('~') {
                 if pattern.is_empty() {
                     errors.push(format!(
-                        "Proxy {:?}: regex listen_path '~' has empty pattern",
+                        "Proxy {:?}: regex listen_path `~` has empty pattern",
                         proxy.id
                     ));
                     continue;
@@ -5118,13 +5118,13 @@ impl GatewayConfig {
             if plugin.plugin_name == "transaction_log_schema" && plugin.scope != PluginScope::Global
             {
                 errors.push(format!(
-                    "PluginConfig {:?} (transaction_log_schema) must have scope 'global'",
+                    "PluginConfig {:?} (transaction_log_schema) must have scope `global`",
                     plugin.id
                 ));
             }
             if plugin.plugin_name == "prometheus_metrics" && plugin.scope != PluginScope::Global {
                 errors.push(format!(
-                    "PluginConfig {:?} (prometheus_metrics) must have scope 'global'",
+                    "PluginConfig {:?} (prometheus_metrics) must have scope `global`",
                     plugin.id
                 ));
             }
@@ -5141,7 +5141,7 @@ impl GatewayConfig {
                 PluginScope::Global => {
                     if plugin.proxy_id.is_some() {
                         errors.push(format!(
-                            "PluginConfig {:?} with scope 'global' must not have proxy_id",
+                            "PluginConfig {:?} with scope `global` must not have proxy_id",
                             plugin.id
                         ));
                     }
@@ -5156,14 +5156,14 @@ impl GatewayConfig {
                         }
                     }
                     None => errors.push(format!(
-                        "PluginConfig {:?} with scope 'proxy' must have proxy_id",
+                        "PluginConfig {:?} with scope `proxy` must have proxy_id",
                         plugin.id
                     )),
                 },
                 PluginScope::ProxyGroup => {
                     if plugin.proxy_id.is_some() {
                         errors.push(format!(
-                            "PluginConfig {:?} with scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)",
+                            "PluginConfig {:?} with scope `proxy_group` must not have proxy_id (associations are managed via proxy.plugins)",
                             plugin.id
                         ));
                     }
@@ -5187,7 +5187,7 @@ impl GatewayConfig {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
-                                "Proxy {:?} references plugin_config {:?} with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
+                                "Proxy {:?} references plugin_config {:?} with scope `global` — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
                                 proxy.id, plugin.id,
                             ));
                         }
@@ -5728,7 +5728,7 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     }
     if host.contains("://") {
         return Err(format!(
-            "host {:?} must not contain a scheme (e.g., 'http://')",
+            "host {:?} must not contain a scheme (e.g., `http://`)",
             host
         ));
     }
@@ -5747,14 +5747,14 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if let Some(wildcard_suffix) = host.strip_prefix("*.") {
         if !WILDCARD_HOST_REGEX.is_match(host) {
             return Err(format!(
-                "wildcard host {:?} is invalid: must be '*.domain.tld' format",
+                "wildcard host {:?} is invalid: must be `*.domain.tld` format",
                 host
             ));
         }
         validate_hostname_labels(wildcard_suffix, host)?;
     } else if host.contains('*') {
         return Err(format!(
-            "host {:?} has invalid wildcard: '*' is only allowed as prefix '*.domain'",
+            "host {:?} has invalid wildcard: `*` is only allowed as prefix `*.domain`",
             host
         ));
     } else if !HOST_REGEX.is_match(host) {
@@ -7863,6 +7863,8 @@ impl Proxy {
             return;
         }
         tracing::warn!(
+            proxy = %crate::startup::sanitize_startup_scalar(&self.id),
+            namespace = %crate::startup::sanitize_startup_scalar(&self.namespace),
             "{}",
             crate::startup::sanitize_startup_cause(
                 format!(
@@ -8043,7 +8045,7 @@ impl Proxy {
                         );
                     } else if let Some(pattern) = path.strip_prefix('~') {
                         if pattern.is_empty() {
-                            errors.push("regex listen_path '~' has empty pattern".to_string());
+                            errors.push("regex listen_path `~` has empty pattern".to_string());
                         }
                     } else if let Some(exact) = path.strip_prefix('=') {
                         if !exact.starts_with('/') {
@@ -8076,7 +8078,7 @@ impl Proxy {
             errors.push(e);
         }
         if self.backend_host.contains("://") {
-            errors.push("backend_host must not contain a scheme (e.g., 'http://')".to_string());
+            errors.push("backend_host must not contain a scheme (e.g., `http://`)".to_string());
         }
         if self.upstream_id.is_none() && self.backend_host.is_empty() {
             errors.push("backend_host must be non-empty (or set upstream_id)".to_string());
@@ -9971,16 +9973,16 @@ impl PluginConfig {
                         errors.push(format!("proxy_id {}", e));
                     }
                 }
-                None => errors.push("scope 'proxy' requires proxy_id".to_string()),
+                None => errors.push("scope `proxy` requires proxy_id".to_string()),
             },
             PluginScope::Global => {
                 if self.proxy_id.is_some() {
-                    errors.push("scope 'global' must not have proxy_id".to_string());
+                    errors.push("scope `global` must not have proxy_id".to_string());
                 }
             }
             PluginScope::ProxyGroup => {
                 if self.proxy_id.is_some() {
-                    errors.push("scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)".to_string());
+                    errors.push("scope `proxy_group` must not have proxy_id (associations are managed via proxy.plugins)".to_string());
                 }
             }
         }
@@ -9996,13 +9998,13 @@ impl PluginConfig {
         // `db_available=false` and wedges the whole admin API read-only).
         if self.plugin_name == "transaction_log_schema" && self.scope != PluginScope::Global {
             errors.push(
-                "transaction_log_schema must have scope 'global' (it registers process-global named schemas)"
+                "transaction_log_schema must have scope `global` (it registers process-global named schemas)"
                     .to_string(),
             );
         }
         if self.plugin_name == "prometheus_metrics" && self.scope != PluginScope::Global {
             errors.push(
-                "prometheus_metrics must have scope 'global' (it owns one process-wide registry)"
+                "prometheus_metrics must have scope `global` (it owns one process-wide registry)"
                     .to_string(),
             );
         }

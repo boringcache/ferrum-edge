@@ -306,7 +306,7 @@ impl<'a> ExpressionParser<'a> {
                 // Field labels end with "filter"; do not append another "filter"
                 // before "filters" or the diagnostic becomes "...filter filters...".
                 return Err(format!(
-                    "Telemetry access log response.duration filters only support '>' and '>=' \
+                    "Telemetry access log response.duration filters only support `>` and `>=` \
                      (got {other:?})"
                 ));
             }

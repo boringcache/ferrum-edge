@@ -649,7 +649,7 @@ impl CorsPlugin {
             .ok_or_else(|| "cors: configuration must be a JSON object".to_string())?;
         for (key, value) in object {
             if !CORS_CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!("cors: unknown configuration key `{key}`"));
+                return Err(format!("cors: unknown configuration key {key:?}"));
             }
             if value.is_null() {
                 return Err(format!(

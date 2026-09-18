@@ -709,9 +709,9 @@ impl MeshRevisionGate {
         let applied_revision = state.applied.as_ref().map(sanitized_revision);
         drop(state);
         tracing::error!(
-            candidate_revision = ?revision.map(sanitized_revision),
-            ?accepted_revision,
-            ?applied_revision,
+            candidate_revision = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", revision.map(sanitized_revision))),
+            accepted_revision = %crate::startup::sanitize_startup_scalar(format_args!("{accepted_revision:?}")),
+            applied_revision = %crate::startup::sanitize_startup_scalar(format_args!("{applied_revision:?}")),
             "Mesh revision commit has no apply token; retaining the last committed baseline"
         );
         crate::plugins::mesh::prometheus_helpers::increment_mesh_config_revision_rejection(
@@ -810,10 +810,10 @@ impl MeshRevisionGate {
         drop(state);
 
         tracing::warn!(
-            rejected_authority = %rejected_authority,
-            rejected_sequence,
-            restored_authority = %restored_authority,
-            restored_sequence,
+            rejected_authority = %crate::startup::sanitize_startup_scalar(&rejected_authority),
+            rejected_sequence = %crate::startup::sanitize_startup_scalar(rejected_sequence),
+            restored_authority = %crate::startup::sanitize_startup_scalar(&restored_authority),
+            restored_sequence = %crate::startup::sanitize_startup_scalar(restored_sequence),
             "Mesh proxy runtime refused a received slice; rolled the accepted config revision \
              back to the last applied generation so valid intermediate revisions stay eligible"
         );
@@ -931,8 +931,8 @@ impl MeshRevisionGate {
                 state.foreign_watch = None;
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_config_revision_adoption();
                 tracing::warn!(
-                    authority = %diagnostic_value(&candidate.authority),
-                    sequence = candidate.sequence,
+                    authority = %crate::startup::sanitize_startup_scalar(&candidate.authority),
+                    sequence = %crate::startup::sanitize_startup_scalar(candidate.sequence),
                     observed_secs,
                     "Adopting foreign mesh config authority after the configured grace period; \
                      mesh config ordering restarts from this revision"
@@ -1010,14 +1010,10 @@ impl MeshRevisionGate {
         );
         tracing::warn!(
             reason = reason.as_metric_label(),
-            candidate_authority = %authority,
-            candidate_sequence = %crate::startup::sanitize_startup_cause(
-                format!("\"{sequence}\""), &[]
-            ),
-            accepted_authority = %accepted_authority,
-            accepted_sequence = %crate::startup::sanitize_startup_cause(
-                format!("\"{accepted_sequence}\""), &[]
-            ),
+            candidate_authority = %crate::startup::sanitize_startup_scalar(&authority),
+            candidate_sequence = %crate::startup::sanitize_startup_scalar(sequence),
+            accepted_authority = %crate::startup::sanitize_startup_scalar(&accepted_authority),
+            accepted_sequence = %crate::startup::sanitize_startup_scalar(accepted_sequence),
             consecutive,
             "Quarantined a mesh slice that is not newer than — or does not carry the same \
              content as — the accepted config revision; keeping the last-good slice"
@@ -1025,10 +1021,9 @@ impl MeshRevisionGate {
         Err(MeshRevisionRejection { reason, detail })
     }
 
-    /// RAW accepted revision, for ordering comparisons only. Anything that
-    /// logs it or returns it to a caller must render it through
-    /// [`Self::diagnostics`] (or [`Self::reset`]) instead, which sanitizes the
-    /// CP-supplied authority.
+    /// RAW accepted revision, for ordering comparisons only. Return bounded
+    /// values through [`Self::diagnostics`] (or [`Self::reset`]); tracing must
+    /// additionally withhold supplied authority/sequence values at emission.
     pub fn accepted(&self) -> Option<MeshConfigRevision> {
         self.lock_state().accepted.clone()
     }
@@ -1067,12 +1062,13 @@ impl MeshRevisionGate {
     }
 }
 
-/// Copy of a revision whose CP-supplied authority is safe to log or return.
+/// Copy of a revision with a bounded CP-supplied authority for admin diagnostics.
 ///
 /// The sequence is a `u64` and needs no bounding; only the authority string
 /// does. The gate keeps the raw value internally so ordering comparisons stay
 /// exact — sanitizing in place would make two distinct authorities that share
-/// a 64-character prefix compare equal.
+/// a 64-character prefix compare equal. Tracing must additionally withhold the
+/// authority and sequence; bounding alone does not redact supplied values.
 fn sanitized_revision(revision: &MeshConfigRevision) -> MeshConfigRevision {
     MeshConfigRevision {
         authority: diagnostic_value(&revision.authority),
@@ -1080,7 +1076,7 @@ fn sanitized_revision(revision: &MeshConfigRevision) -> MeshConfigRevision {
     }
 }
 
-/// Render a control-plane-supplied value for a log line or admin surface:
+/// Render a control-plane-supplied value for the bounded diagnostic API:
 /// control characters stripped (no log-line forgery) and truncated.
 fn diagnostic_value(value: &str) -> String {
     const MAX_CHARS: usize = 64;
@@ -1097,4 +1093,80 @@ fn diagnostic_value(value: &str) -> String {
         rendered.push_str("(truncated)");
     }
     rendered
+}
+
+#[cfg(test)]
+mod emission_tests {
+    use super::*;
+
+    #[test]
+    fn revision_events_withhold_values_without_changing_gate_diagnostics() {
+        let gate = MeshRevisionGate::new();
+        gate.set_policy(MeshRevisionPolicy {
+            foreign_authority_adopt_secs: 1,
+        });
+        let accepted = MeshConfigRevision {
+            authority: "'UNREGISTERED_accepted\"\\authority".to_string(),
+            sequence: 918273,
+        };
+        let newer = MeshConfigRevision {
+            sequence: 918274,
+            ..accepted.clone()
+        };
+        let older = MeshConfigRevision {
+            sequence: 918272,
+            ..accepted.clone()
+        };
+        let foreign = MeshConfigRevision {
+            authority: "'UNREGISTERED_foreign\"\\authority".to_string(),
+            sequence: 817263,
+        };
+        let content = MeshRevisionContentIdentity::from_digest([1; 32]);
+        let now = Utc::now();
+        let instant = Instant::now();
+        let ((), logs) = crate::modes::tests::capture_logs(|| {
+            gate.admit(Some(&accepted), content, now).unwrap();
+            let token = gate.begin_apply(Some(&accepted), content).unwrap();
+            assert!(gate.commit_applied(Some(&accepted), content, token));
+            gate.admit(Some(&newer), content, now).unwrap();
+            gate.reject_missing_apply_token(Some(&newer));
+            assert!(gate.rollback_rejected(Some(&newer), content));
+            assert_eq!(gate.accepted(), Some(accepted.clone()));
+
+            let rejection = gate.admit(Some(&older), content, now).unwrap_err();
+            assert_eq!(rejection.reason, MeshRevisionRejectReason::StaleRevision);
+            assert!(rejection.detail.contains("UNREGISTERED_accepted"));
+            assert_eq!(gate.diagnostics().accepted, Some(accepted.clone()));
+            assert_eq!(
+                gate.diagnostics().quarantined.unwrap().sequence,
+                older.sequence
+            );
+
+            gate.admit_at(Some(&foreign), content, now, instant)
+                .unwrap_err();
+            gate.admit_at(
+                Some(&foreign),
+                content,
+                now,
+                instant + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(gate.accepted(), Some(foreign.clone()));
+            assert_eq!(gate.diagnostics().accepted, Some(foreign));
+        });
+        for event in [
+            "commit has no apply token",
+            "rolled the accepted config revision",
+            "stale_revision",
+            "incomparable_authority",
+            "Adopting foreign mesh config authority",
+            "consecutive=1",
+            "observed_secs=1",
+        ] {
+            assert!(logs.contains(event), "{logs}");
+        }
+        for value in ["UNREGISTERED", "918273", "918274", "918272", "817263"] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+    }
 }

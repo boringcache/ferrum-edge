@@ -1004,9 +1004,8 @@ fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
 }
 
 pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value, String> {
-    let review: AdmissionReview =
-        crate::util::deserialization::from_json_slice(body)
-            .map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
+    let review: AdmissionReview = crate::util::deserialization::from_json_slice(body)
+        .map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
     let api_version = review
         .api_version
         .unwrap_or_else(|| "admission.k8s.io/v1".to_string());
@@ -2290,7 +2289,7 @@ fn resolve_named_container_port(
     let unresolved = || {
         format!(
             "container {container_name:?} {probe_field} names port {port_name:?} \
-which is not declared in that container's ports; refusing injection so the \
+which is not declared in the container ports; refusing injection so the \
 kubelet probe is not captured by inbound mesh redirect"
         )
     };
@@ -3594,7 +3593,7 @@ mod tests {
             .expect_err("mixed wildcard annotation rejected");
 
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
-        assert!(err.contains("wildcard '*' must be the only includeOutboundPorts token"));
+        assert!(err.contains("wildcard `*` must be the only includeOutboundPorts token"));
     }
 
     #[test]
@@ -5122,7 +5121,7 @@ mod tests {
 
         assert!(err.contains("ferrum.io/includeOutboundPorts"));
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
-        assert!(err.contains("cannot be combined with wildcard '*'"));
+        assert!(err.contains("cannot be combined with wildcard `*`"));
     }
 
     // Deduplication on the exclude-CIDR path: a CIDR repeated across env and

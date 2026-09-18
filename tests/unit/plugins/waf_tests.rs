@@ -4,6 +4,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginResult, RequestContext, ResponseTrailerPolicy,
     plugin_failure_policy,
 };
+use ferrum_edge::startup::render_startup_error;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -1970,7 +1971,7 @@ fn unknown_keys_are_rejected_before_defaults_weaken_policy() {
             json!({
                 "rule_overrides": { "FE-SQLI-001": { "severty": "critical" } }
             }),
-            "config.rule_overrides['FE-SQLI-001'].severty",
+            r#"config.rule_overrides[\"FE-SQLI-001\"].severty"#,
             Some("severity"),
         ),
     ];
@@ -2003,6 +2004,182 @@ fn unknown_keys_are_rejected_before_defaults_weaken_policy() {
         plugin_failure_policy("waf"),
         Some(PluginFailurePolicy::FailClosed)
     );
+}
+
+#[test]
+fn rendered_unknown_waf_keys_keep_fixed_paths_and_nonzero_ordinals() {
+    let rule = |id| {
+        json!({
+            "id": id,
+            "name": "WAF_RULE_NAME",
+            "category": "WAF_CATEGORY",
+            "target": {"type": "header_values", "names": ["WAF_HEADER_NAME"]},
+            "pattern": "WAF_PATTERN",
+            "conditions": {}
+        })
+    };
+    let config = json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "scoring": {},
+        "global_exemptions": {},
+        "custom_rules": [rule("WAF_FIRST_RULE"), rule("WAF_SECOND_RULE")],
+        "stream": {"signatures": [
+            {"id": "WAF_FIRST_SIGNATURE", "pattern": "first"},
+            {"id": "WAF_SECOND_SIGNATURE", "pattern": "WAF_PATTERN"}
+        ]}
+    });
+    Waf::new(&config).expect("preceding entries and unmodified config must be valid");
+
+    for (pointer, path, typo, suggestion) in [
+        ("", "config", "modde", "mode"),
+        (
+            "/scoring",
+            "config.scoring",
+            "block_threshhold",
+            "block_threshold",
+        ),
+        (
+            "/global_exemptions",
+            "config.global_exemptions",
+            "header_presnt",
+            "header_present",
+        ),
+        (
+            "/stream",
+            "config.stream",
+            "tcp_require_tsl",
+            "tcp_require_tls",
+        ),
+        (
+            "/stream/signatures/1",
+            "config.stream.signatures[1]",
+            "patern",
+            "pattern",
+        ),
+        (
+            "/custom_rules/1",
+            "config.custom_rules[1]",
+            "actoin",
+            "action",
+        ),
+        (
+            "/custom_rules/1/target",
+            "config.custom_rules[1].target",
+            "typee",
+            "type",
+        ),
+        (
+            "/custom_rules/1/conditions",
+            "config.custom_rules[1].conditions",
+            "methdos",
+            "methods",
+        ),
+    ] {
+        for supplied in [
+            "WAF_UNKNOWN_KEY",
+            "876543210",
+            "config.custom_rules[876543210].target",
+            "'WAF_UNKNOWN_KEY\"\\\n`config`",
+        ] {
+            let mut invalid = config.clone();
+            let object = invalid.pointer_mut(pointer).unwrap();
+            // Required fields such as pattern/type are absent when the typo
+            // is inserted, so the real caller must still reach key rejection.
+            object.as_object_mut().unwrap().remove(suggestion);
+            add_unknown_waf_keys(object, supplied, typo);
+            assert_rendered_waf_unknown_keys(&invalid, path, suggestion, &[supplied, typo]);
+        }
+    }
+}
+
+#[test]
+fn rendered_override_keys_never_become_visible_schema_context() {
+    for supplied in [
+        "WAF_OVERRIDE_ID",
+        "876543210",
+        "config.custom_rules[876543210].conditions",
+        "'WAF_OVERRIDE_ID\"\\\n`config`",
+    ] {
+        let config = json!({
+            "mode": "monitor",
+            "include_default_rules": false,
+            "custom_rules": [{
+                "id": supplied,
+                "category": "WAF_CATEGORY",
+                "target": "query_values",
+                "pattern": "WAF_PATTERN"
+            }],
+            "rule_overrides": {(supplied): {"conditions": {}}}
+        });
+        Waf::new(&config).expect("supplied id must name a valid custom rule");
+        for (conditions, path, typo, suggestion) in [
+            (false, "config.rule_overrides", "severty", "severity"),
+            (
+                true,
+                "config.rule_overrides.conditions",
+                "methdos",
+                "methods",
+            ),
+        ] {
+            let mut invalid = config.clone();
+            let object = &mut invalid["rule_overrides"][supplied];
+            let object = if conditions {
+                &mut object["conditions"]
+            } else {
+                object
+            };
+            add_unknown_waf_keys(object, "'WAF_UNKNOWN_KEY\"\\\n`config`", typo);
+            assert_rendered_waf_unknown_keys(&invalid, path, suggestion, &[supplied, typo]);
+        }
+    }
+}
+
+fn add_unknown_waf_keys(object: &mut serde_json::Value, supplied: &str, typo: &str) {
+    object[typo] = json!("'WAF_SCALAR_VALUE\"\\\n`config`");
+    object[supplied] = json!({"WAF_PAYLOAD_KEY": "WAF_PAYLOAD_VALUE"});
+    object["WAF_ARRAY_KEY"] = json!([{"WAF_NESTED_KEY": "WAF_NESTED_VALUE"}, 765432109]);
+}
+
+fn assert_rendered_waf_unknown_keys(
+    config: &serde_json::Value,
+    path: &str,
+    suggestion: &str,
+    withheld: &[&str],
+) {
+    let error = Waf::new(config).expect_err("unknown keys must reject construction");
+    let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains(&format!("waf: `{path}`:")), "{rendered}");
+    assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("did you mean `{suggestion}`?")),
+        "{rendered}"
+    );
+    for marker in [
+        "WAF_UNKNOWN_KEY",
+        "WAF_OVERRIDE_ID",
+        "WAF_FIRST_RULE",
+        "WAF_SECOND_RULE",
+        "WAF_RULE_NAME",
+        "WAF_CATEGORY",
+        "WAF_HEADER_NAME",
+        "WAF_PATTERN",
+        "WAF_FIRST_SIGNATURE",
+        "WAF_SECOND_SIGNATURE",
+        "WAF_SCALAR_VALUE",
+        "WAF_PAYLOAD_KEY",
+        "WAF_PAYLOAD_VALUE",
+        "WAF_ARRAY_KEY",
+        "WAF_NESTED_KEY",
+        "WAF_NESTED_VALUE",
+        "876543210",
+        "765432109",
+    ]
+    .into_iter()
+    .chain(withheld.iter().copied())
+    {
+        assert!(!rendered.contains(marker), "{marker} leaked: {rendered}");
+    }
 }
 
 #[test]

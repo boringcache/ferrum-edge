@@ -1027,6 +1027,28 @@ fn startup_diagnostics_withhold_channel_keys_types_and_webhook_headers() {
         assert!(!rendered.contains("true"), "{rendered}");
     }
 
+    for kind in ["slack", "teams", "discord", "webhook", "email"] {
+        let config = json!({"CHANNEL_CANARY": {
+            "type": kind, "typee": true, secret: "VALUE_CANARY"
+        }});
+        let error = parse_channels(&config).expect_err("unknown keys must fail admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("`channels`: unknown configuration key"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("did you mean `type`"), "{rendered}");
+        for withheld in [
+            "CHANNEL_CANARY",
+            "VALUE_CANARY",
+            "diagnostic-secret-5594",
+            "true",
+            "typee",
+        ] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+
     let error = parse_channels(&json!({"ops": {"typee": "slack"}})).unwrap_err();
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
     assert!(rendered.contains("`type` is required"), "{rendered}");

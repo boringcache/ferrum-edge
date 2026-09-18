@@ -2,6 +2,10 @@
 //!
 //! Mesh mode identifies HBONE in the main proxy path, then delegates the
 //! backend connection, circuit-breaker accounting, relay task, and logging here.
+//! Termination is not restricted to Inbound listeners: a matching authenticated
+//! CONNECT on an Outbound listener also reaches this handler. Inner reuse is
+//! classified with that CONNECT's listener facts and records them for sweeps;
+//! registry reuse is advertised only for CONNECTs the registry did not decide.
 
 use std::collections::HashMap;
 use std::io;
@@ -35,7 +39,9 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
 use crate::modes::mesh::MESH_INGRESS_HBONE_RELAY_PROXY_ID;
 use crate::modes::mesh::config::MeshConfig;
-use crate::plugins::{Direction, DisconnectCause, Plugin, RequestContext, TransactionSummary};
+use crate::plugins::{
+    Direction, DisconnectCause, HboneReuseContext, Plugin, RequestContext, TransactionSummary,
+};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
 
@@ -598,11 +604,12 @@ pub(super) struct HboneAdmissionView {
 ///    admission snapshot as `advertised_inner_reuse`; the response reads that
 ///    field back rather than re-folding, so the header the source receives and
 ///    the obligation the fence takes on are the same value.
+///    `HboneReuseContext` records this CONNECT's listener direction and port.
 /// 2. every fence sweep folds the same view key, re-resolved from whatever
 ///    generation is then current (route overrides never move a request's
 ///    `namespace|id`, so the key is stable), for every tunnel whose snapshot
-///    recorded the advertisement. A chain that has stopped permitting reuse
-///    revokes those tunnels
+///    recorded the advertisement, using the SAME recorded listener facts.
+///    A chain that has stopped permitting reuse revokes those tunnels
 ///    ([`crate::proxy::hbone_admission_fence::HboneRevocationReason::ReuseWithdrawn`]),
 ///    which is what restores per-operation admission: the source's next
 ///    operation performs a fresh CONNECT under the new chain.
@@ -616,10 +623,13 @@ pub(super) struct HboneAdmissionView {
 /// Fail-closed and allocation-free: one boolean fold over a short slice, with
 /// an empty chain — nothing decided anything — reusable. No plugin hook runs, so
 /// a sweep calling it charges nothing and asks no external service.
-pub(super) fn admitting_chain_allows_inner_reuse(plugins: &[Arc<dyn Plugin>]) -> bool {
+pub(super) fn admitting_chain_allows_inner_reuse(
+    plugins: &[Arc<dyn Plugin>],
+    admission: &HboneReuseContext,
+) -> bool {
     plugins
         .iter()
-        .all(|plugin| plugin.allows_hbone_inner_reuse())
+        .all(|plugin| plugin.allows_hbone_inner_reuse_for(admission))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1139,7 +1149,8 @@ pub(super) async fn handle_hbone_request(
     // evaluation of the fold on this path: the CONNECT response reads the
     // recorded value back rather than re-folding, so the header the source
     // receives and the obligation the fence takes on cannot disagree.
-    let chain_allows_inner_reuse = admitting_chain_allows_inner_reuse(plugins);
+    let reuse_context = HboneReuseContext::from(&*ctx);
+    let chain_allows_inner_reuse = admitting_chain_allows_inner_reuse(plugins, &reuse_context);
     // Register the admitted tunnel with the receiver-side admission fence
     // (issue #5042 step 1). The snapshot is what the gates above judged; a
     // later policy generation that would refuse this CONNECT revokes the
@@ -1183,6 +1194,7 @@ pub(super) async fn handle_hbone_request(
         // would otherwise have decided, so the eligibility itself has to be
         // re-decided for the tunnel's whole life, not only at admission.
         advertised_inner_reuse: chain_allows_inner_reuse,
+        reuse_context,
     });
     // Advertise the receiver-side admission fence on the CONNECT `200` (issue
     // #5042 step 2) only when BOTH halves hold.
@@ -1974,6 +1986,7 @@ pub(super) async fn handle_hbone_udp_request(
         // there — the capability does not exist on this surface, whatever its
         // admitting chain would have classified.
         advertised_inner_reuse: false,
+        reuse_context: HboneReuseContext::from(&*ctx),
     });
     let relay_proxy = proxy.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();

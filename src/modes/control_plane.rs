@@ -129,12 +129,12 @@ async fn reconcile_plugin_migrations_after_cp_reconnect(
             *needs_reconcile = false;
             true
         }
-        Err(error) => {
+        Err(_error) => {
             db_available.store(false, Ordering::Relaxed);
             warn!(
-                "Control-plane custom-plugin migration reconciliation failed after {}: {}. \
+                "Control-plane custom-plugin migration reconciliation failed after {}. \
                  Admin writes and recovered configuration publication remain blocked.",
-                context, error
+                context
             );
             false
         }
@@ -490,6 +490,40 @@ async fn run_cp_grpc_tls_accept_loop(
     }
 }
 
+// Keep these events in this module so CP tracing targets remain unchanged.
+// The database-mode capture regression exercises both modes' emitters.
+pub(super) fn log_database_dns_change(hostname: &str, previous: &[IpAddr], current: &[IpAddr]) {
+    info!(
+        "Database DNS changed for {}: {} -> {}, reconnecting pool",
+        sanitize_startup_scalar(hostname),
+        sanitize_startup_scalar(format!("{previous:?}")),
+        sanitize_startup_scalar(format!("{current:?}"))
+    );
+}
+
+pub(super) fn log_database_dns_reconnect_failure(hostname: &str, _error: &anyhow::Error) {
+    error!(
+        "Failed to reconnect database pool after DNS change for {}: database reconnect failed",
+        sanitize_startup_scalar(hostname)
+    );
+}
+
+// CpScope::describe includes bare namespace values for Set; retain the scope
+// labels and observed count without treating that description as a safe cause.
+fn cp_scope_for_log(scope: &CpScope) -> String {
+    match scope {
+        CpScope::Single(namespace) => {
+            format!("single namespace {}", sanitize_startup_scalar(namespace))
+        }
+        CpScope::Set(namespaces) => format!(
+            "{} namespaces: [{}]",
+            namespaces.len(),
+            sanitize_startup_scalar(format!("{namespaces:?}"))
+        ),
+        CpScope::All => "ALL namespaces (cluster-wide)".to_string(),
+    }
+}
+
 /// Resolve which namespaces the CP polling loop should load on each tick.
 ///
 /// `Single(ns)` / `Set({ns, ...})` return the explicit list directly; `All`
@@ -510,22 +544,21 @@ async fn resolve_polled_namespaces(
     // CpScope::All — discover dynamically.
     match db.list_namespaces_authoritative().await {
         Ok(ns) => merge_discovered_namespaces(ns, retain_on_success, fallback),
-        Err(e) => {
+        Err(_error) => {
             let retained = previous_on_error.unwrap_or(retain_on_success);
             let ns = normalize_namespace_list(retained);
             if !ns.is_empty() {
                 warn!(
-                    "CP scope=All: authoritative namespace discovery failed ({}); keeping previous {} namespace(s): [{}]",
-                    e,
+                    "CP scope=All: authoritative namespace discovery failed; keeping previous {} namespace(s): [{}]",
                     ns.len(),
-                    ns.join(", ")
+                    sanitize_startup_scalar(ns.join(", "))
                 );
                 ns
             } else {
                 warn!(
-                    "CP scope=All: authoritative namespace discovery failed ({}); falling back to \
-                     FERRUM_NAMESPACE={:?}",
-                    e, fallback
+                    "CP scope=All: authoritative namespace discovery failed; falling back to \
+                     FERRUM_NAMESPACE={}",
+                    sanitize_startup_scalar(fallback)
                 );
                 vec![fallback.to_string()]
             }
@@ -667,8 +700,8 @@ async fn load_incremental_config_multi(
                     return Err(error);
                 }
                 error!(
-                    namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
-                    error = %sanitize_startup_cause(&error, &[]),
+                    namespace = %sanitize_startup_scalar(ns),
+                    error = "database incremental load failed",
                     "CP incremental load failed for namespace; keeping last-known-good cursor and continuing other namespaces"
                 );
                 load_failures.push((ns.clone(), error.to_string()));
@@ -751,7 +784,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
                 }
                 Err(error) => {
                     error!(
-                        namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                        namespace = %sanitize_startup_scalar(ns),
                         error = %sanitize_startup_cause(&error, &[]),
                         "CP full config rejected for namespace; retaining last-known-good resources"
                     );
@@ -761,15 +794,15 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
             Err(error) => {
                 if crate::modes::is_poll_validation_rejection(&error) {
                     error!(
-                        namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                        namespace = %sanitize_startup_scalar(ns),
                         error = %sanitize_startup_cause(&error, &[]),
                         "CP full config load rejected for namespace; retaining last-known-good resources"
                     );
                     acc.apply_rejected(previous, ns, error.to_string());
                 } else {
                     error!(
-                        namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
-                        error = %sanitize_startup_cause(&error, &[]),
+                        namespace = %sanitize_startup_scalar(ns),
+                        error = "database full config load failed",
                         "CP full config load failed for namespace; retaining last-known-good resources"
                     );
                     acc.apply_failed(previous, ns);
@@ -1042,10 +1075,10 @@ async fn load_full_config_multi_with_sequence(
             Ok(sequence) => {
                 sequences.insert(ns.clone(), sequence);
             }
-            Err(error) => {
+            Err(_error) => {
                 error!(
-                    namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
-                    error = %sanitize_startup_cause(&error, &[]),
+                    namespace = %sanitize_startup_scalar(ns),
+                    error = "database change-sequence lookup failed",
                     "CP could not capture the change-sequence boundary for namespace before a \
                      full reload; retaining last-known-good resources, leaving its cursor \
                      unchanged, and skipping its resource load and broadcast"
@@ -1270,7 +1303,7 @@ pub(crate) fn compose_incremental_partitions(
         } else {
             for message in &errors {
                 error!(
-                    namespace = %sanitize_startup_cause(format!("{:?}", ns.to_string()), &[]),
+                    namespace = %sanitize_startup_scalar(ns),
                     "CP incremental config rejected for namespace: {}",
                     sanitize_startup_cause(message, &[])
                 );
@@ -1408,7 +1441,7 @@ async fn settle_full_reload_rejection_state(
     if !failed_namespaces.is_empty() {
         warn!(
             context,
-            failed_namespaces = %failed_namespaces.join(","),
+            failed_namespaces = %sanitize_startup_scalar(failed_namespaces.join(",")),
             "CP full reload could not refresh every namespace; serving last-known-good for the \
              remainder and leaving any standing config-rejection signal in place"
         );
@@ -2008,12 +2041,10 @@ pub async fn run(
                         info!("Read replica configured but suppressed until primary failback")
                     }
                     Ok(()) => info!("Read replica connected for admin reads"),
-                    Err(e) => {
-                        let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
+                    Err(_error) => {
                         warn!(
-                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds: {}",
-                            db_backend::redact_url(replica_url),
-                            safe_error
+                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds",
+                            sanitize_startup_scalar(replica_url)
                         );
                     }
                 }
@@ -2036,7 +2067,7 @@ pub async fn run(
     )
     .await?;
 
-    info!("CP mode: serving {}", cp_scope.describe());
+    info!("CP mode: serving {}", cp_scope_for_log(&cp_scope));
     if cp_scope.namespace_claim_required(env_config.cp_require_namespace_claim) {
         info!(
             "CP namespace authorization requires JWT `ns` claims for ConfigSync, MeshConfigSync, and xDS streams"
@@ -2065,7 +2096,7 @@ pub async fn run(
         info!(
             "CP scope=All: discovered {} namespace(s) at startup: [{}]",
             polled_namespaces.len(),
-            polled_namespaces.join(", ")
+            sanitize_startup_scalar(polled_namespaces.join(", "))
         );
     }
 
@@ -2181,7 +2212,7 @@ pub async fn run(
                          namespace(s): [{}]. Data planes in those namespaces cannot subscribe \
                          until a credential is bound to them.",
                         unreachable.len(),
-                        sanitize_startup_cause(format!("{unreachable:?}"), &[])
+                        sanitize_startup_scalar(unreachable.join(", "))
                     );
                 }
             }
@@ -2300,13 +2331,13 @@ pub async fn run(
     }
     if unbounded_stream_scopes.is_empty() {
         info!(
-            max_total_streams = stream_admission_limits.max_total_streams,
-            max_streams_per_namespace = stream_admission_limits.max_streams_per_namespace,
-            max_streams_per_principal = stream_admission_limits.max_streams_per_principal,
-            max_streams_per_node = stream_admission_limits.max_streams_per_node,
-            max_active_nodes = stream_admission_limits.max_active_nodes,
-            max_node_id_bytes = stream_admission_limits.max_node_id_bytes,
-            first_request_timeout_seconds = stream_admission_limits.first_request_timeout.as_secs(),
+            max_total_streams = %sanitize_startup_scalar(stream_admission_limits.max_total_streams),
+            max_streams_per_namespace = %sanitize_startup_scalar(stream_admission_limits.max_streams_per_namespace),
+            max_streams_per_principal = %sanitize_startup_scalar(stream_admission_limits.max_streams_per_principal),
+            max_streams_per_node = %sanitize_startup_scalar(stream_admission_limits.max_streams_per_node),
+            max_active_nodes = %sanitize_startup_scalar(stream_admission_limits.max_active_nodes),
+            max_node_id_bytes = %sanitize_startup_scalar(stream_admission_limits.max_node_id_bytes),
+            first_request_timeout_seconds = %sanitize_startup_scalar(stream_admission_limits.first_request_timeout.as_secs()),
             "Shared CP gRPC configuration-stream admission budgets active"
         );
     } else {
@@ -2351,7 +2382,7 @@ pub async fn run(
             .build();
     match env_config.mesh_cluster_audience.as_deref() {
         Some(audience) => info!(
-            cluster_audience = %audience,
+            cluster_audience = %sanitize_startup_scalar(audience),
             "Cross-cluster mesh remote discovery enabled: MeshSubscribe remote-discovery \
              subscriptions must present a JWT bound to this cluster's audience"
         ),
@@ -2569,8 +2600,7 @@ pub async fn run(
             }
             Err(e) => {
                 error!(
-                    "Failed to load admin TLS configuration: {}",
-                    crate::startup::sanitize_startup_cause(&e, &[])
+                    "Failed to load admin TLS configuration: certificate, key, or client trust material could not be loaded"
                 );
                 return Err(e);
             }
@@ -2684,8 +2714,8 @@ pub async fn run(
             );
         } else {
             info!(
-                max_connections = env_config.cp_grpc_max_connections,
-                max_connections_per_ip = env_config.cp_grpc_max_connections_per_ip,
+                max_connections = %sanitize_startup_scalar(env_config.cp_grpc_max_connections),
+                max_connections_per_ip = %sanitize_startup_scalar(env_config.cp_grpc_max_connections_per_ip),
                 "CP gRPC pre-authentication connection admission enabled"
             );
         }
@@ -2886,8 +2916,8 @@ pub async fn run(
             match cp_scope.explicit_namespaces() {
                 Some(namespaces) => {
                     info!(
-                        scope = cp_scope.describe(),
-                        namespaces = ?namespaces,
+                        scope = cp_scope_for_log(&cp_scope),
+                        namespaces = %sanitize_startup_scalar(namespaces.join(", ")),
                         "FERRUM_K8S_WATCH_NAMESPACES unset — deriving watch scope from CP scope"
                     );
                     namespaces
@@ -2957,8 +2987,8 @@ pub async fn run(
                 info!("Kubernetes CRD controller started");
                 Some(handle)
             }
-            Err(e) => {
-                error!("Failed to start K8s controller: {}", e);
+            Err(_error) => {
+                error!("Failed to start K8s controller: Kubernetes client initialization failed");
                 warn!(
                     "Continuing without K8s CRD watching — DB-sourced config still active. \
                      Check FERRUM_K8S_KUBECONFIG_PATH or in-cluster configuration."
@@ -3093,9 +3123,10 @@ pub async fn run(
                             None => false,
                         };
                         if needs_reconnect {
-                            info!(
-                                "Database DNS changed for {:?}: {:?} -> {:?}, reconnecting pool",
-                                hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
+                            log_database_dns_change(
+                                hostname,
+                                last_db_ips.as_deref().unwrap_or(&[]),
+                                &ips,
                             );
                             match db_poll.reconnect(&db_url_for_reconnect).await {
                                 Ok(_) => {
@@ -3104,12 +3135,8 @@ pub async fn run(
                                     plugin_migrations_need_reconcile = true;
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to reconnect database pool after DNS change for \
-                                         {:?}: {}",
-                                        hostname, e
-                                    );
+                                Err(error) => {
+                                    log_database_dns_reconnect_failure(hostname, &error);
                                 }
                             }
                         } else {
@@ -3269,8 +3296,7 @@ pub async fn run(
                                     );
                                 } else {
                                     error!(
-                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
-                                        e
+                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
                                     );
                                     database_delta_poll_metrics_for_poll
                                         .record_config_source_unavailable(
@@ -3323,11 +3349,11 @@ pub async fn run(
                                 // on every poll tick.
                                 if !load_failures.is_empty() {
                                     warn!(
-                                        failed_namespaces = %load_failures
+                                        failed_namespaces = %sanitize_startup_scalar(load_failures
                                             .iter()
                                             .map(|(ns, _)| ns.as_str())
                                             .collect::<Vec<_>>()
-                                            .join(","),
+                                            .join(",")),
                                         "CP incremental poll skipped namespace(s) after a load \
                                          failure; their cursors are unchanged and the remaining \
                                          namespaces continue"
@@ -3566,8 +3592,7 @@ pub async fn run(
                                                     );
                                                 } else {
                                                     warn!(
-                                                        "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config: {}",
-                                                        error
+                                                        "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config"
                                                     );
                                                 }
                                             }
@@ -3593,7 +3618,7 @@ pub async fn run(
                                 info!(
                                     "Incremental config update validated and pushed to {} namespace(s) (version={})",
                                     compose.accepted.len(),
-                                    version
+                                    sanitize_startup_scalar(&version)
                                 );
                                 // Advance the cursor for accepted namespaces and
                                 // for namespaces that loaded with no changes at
@@ -3630,13 +3655,11 @@ pub async fn run(
                             Err(e) => {
                                 if db_backend::is_incremental_full_reload_required(&e) {
                                     info!(
-                                        "Consumer change detected; using authoritative full reload for credential rehydration: {}",
-                                        e
+                                        "Consumer change detected; using authoritative full reload for credential rehydration"
                                     );
                                 } else {
                                     warn!(
-                                        "Authoritative primary incremental poll failed, falling back to full reload: {}",
-                                        e
+                                        "Authoritative primary incremental poll failed, falling back to full reload"
                                     );
                                 }
                                 // Fallback to full config load + full snapshot broadcast
@@ -3824,8 +3847,7 @@ pub async fn run(
                                                                     crate::modes::database::DatabasePollFailureReason::Connectivity,
                                                                 );
                                                             warn!(
-                                                                "Authoritative primary failover reload also failed (serving cached): {}",
-                                                                e3
+                                                                "Authoritative primary failover reload also failed (serving cached)"
                                                             );
                                                         }
                                                     }
@@ -3837,8 +3859,7 @@ pub async fn run(
                                                         crate::modes::database::DatabasePollFailureReason::Connectivity,
                                                     );
                                                 warn!(
-                                                    "Authoritative primary full config reload also failed (serving cached): {}",
-                                                    e2
+                                                    "Authoritative primary full config reload also failed (serving cached)"
                                                 );
                                             }
                                         }
@@ -4243,33 +4264,19 @@ fn classify_cp_listener_exit(
         )),
         Ok(Err(err)) => {
             error!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!("CP listener task `{name}` failed: {err:#}"),
-                    &[]
-                )
+                "CP listener task `{}` failed: {}",
+                name,
+                crate::modes::file::listener_failure_for_log(&err)
             );
             Some(err.context(format!("{name} failed")))
         }
         #[cfg(panic = "unwind")]
         Err(err) if err.is_panic() => {
-            error!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!("CP listener task `{name}` failed: {err}"),
-                    &[]
-                )
-            );
+            error!("CP listener task `{}` panicked", name);
             Some(anyhow::anyhow!("{name} panicked: {err}"))
         }
         Err(err) => {
-            error!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!("CP listener task `{name}` failed: {err}"),
-                    &[]
-                )
-            );
+            error!("CP listener task `{}` failed to join", name);
             Some(anyhow::anyhow!("{name} failed to join: {err}"))
         }
     }
@@ -4295,6 +4302,75 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Instant;
+
+    #[test]
+    fn namespace_discovery_failure_withholds_retained_and_fallback_values() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_, logs) = crate::modes::database::tests::capture_logs(|| {
+            runtime.block_on(async {
+                let store = DatabaseStore::connect_offline_with_pool_config(
+                    "sqlite",
+                    "sqlite::memory:",
+                    &[],
+                    DbPoolConfig::default(),
+                )
+                .unwrap();
+                // Closed pools fail immediately, with no live database or DNS.
+                store.pool().close().await;
+                let fallback = "'fallback-canary\"\\\n";
+                let retained = vec!["'retained-canary\"\\\nvalue".to_string()];
+                assert_eq!(
+                    resolve_polled_namespaces(&store, &CpScope::All, fallback, &[], None).await,
+                    vec![fallback.to_string()]
+                );
+                assert_eq!(
+                    resolve_polled_namespaces(
+                        &store,
+                        &CpScope::All,
+                        fallback,
+                        &[],
+                        Some(&retained),
+                    )
+                    .await,
+                    retained
+                );
+            });
+        });
+
+        assert_eq!(
+            logs.matches("authoritative namespace discovery failed")
+                .count(),
+            2
+        );
+        assert!(logs.contains("scope=All"), "{logs}");
+        assert!(logs.contains("FERRUM_NAMESPACE="), "{logs}");
+        assert!(logs.contains("keeping previous 1 namespace(s)"), "{logs}");
+        assert!(!logs.contains("fallback-canary"), "{logs}");
+        assert!(!logs.contains("retained-canary"), "{logs}");
+    }
+
+    #[test]
+    fn rejected_snapshot_emits_field_and_reason_without_resource_values() {
+        let mut proxy = make_proxy("'proxy-canary");
+        proxy.upstream_id = Some("'upstream-canary".to_string());
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+        let (result, logs) = crate::modes::database::tests::capture_logs(|| {
+            reject_invalid_cp_full_snapshot(&config)
+        });
+
+        let error = result.unwrap_err();
+        assert!(crate::modes::is_poll_validation_rejection(&error));
+        assert!(logs.contains("CP full config rejected"), "{logs}");
+        assert!(logs.contains("upstream"), "{logs}");
+        assert!(!logs.contains("proxy-canary"), "{logs}");
+        assert!(!logs.contains("upstream-canary"), "{logs}");
+    }
 
     fn empty_incremental() -> IncrementalResult {
         IncrementalResult {

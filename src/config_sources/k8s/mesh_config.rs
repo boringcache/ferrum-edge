@@ -459,7 +459,7 @@ fn envoy_ext_authz_http_provider(
         Some(_) => {
             return Err(format!(
                 "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp scheme must be \
-                 'http' or 'https'"
+                 `http` or `https`"
             ));
         }
     };
@@ -478,7 +478,7 @@ fn envoy_ext_authz_http_provider(
         Some(_) => {
             return Err(format!(
                 "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp pathPrefix must \
-                 start with '/'"
+                 start with `/`"
             ));
         }
         None => None,
@@ -624,7 +624,7 @@ fn parse_ext_authz_timeout_ms(display: &str, value: &Value) -> Result<u64, Strin
     let invalid = || {
         format!(
             "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp timeout must be a \
-             duration such as '0.5s', '250ms', or a number of seconds"
+             duration such as `0.5s`, `250ms`, or a number of seconds"
         )
     };
     if let Some(seconds) = value.as_f64() {
@@ -762,10 +762,12 @@ fn ext_authz_body_check(
                  includeRequestBodyInCheck.maxRequestBytes must be an integer"
             )
         })?,
-        None => return Err(format!(
-            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+        None => {
+            return Err(format!(
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
              includeRequestBodyInCheck requires maxRequestBytes"
-        )),
+            ));
+        }
     };
     if max_request_bytes == 0 || max_request_bytes > MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES as u64 {
         return Err(format!(
@@ -1023,7 +1025,7 @@ extensionProviders:
         let dup_count = parsed
             .warnings
             .iter()
-            .filter(|warning| warning.contains("duplicate tracing provider 'zipkin-prod'"))
+            .filter(|warning| warning.contains("duplicate tracing provider \"zipkin-prod\""))
             .count();
         assert_eq!(
             dup_count, 1,

@@ -251,27 +251,27 @@ fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String>
     let path = format!("channels.{name}");
     match kind {
         "slack" => {
-            reject_unknown_keys(obj, &path, SLACK_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, SLACK_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Slack(SlackChannel::new(name, def)?))
         }
         "teams" => {
-            reject_unknown_keys(obj, &path, TEAMS_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, TEAMS_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Teams(TeamsChannel::new(name, def)?))
         }
         "discord" => {
-            reject_unknown_keys(obj, &path, DISCORD_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, DISCORD_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Discord(DiscordChannel::new(
                 name, def,
             )?))
         }
         "webhook" => {
-            reject_unknown_keys(obj, &path, WEBHOOK_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, WEBHOOK_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Webhook(WebhookChannel::new(
                 name, def,
             )?))
         }
         "email" => {
-            reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Email(Box::new(EmailChannel::new(
                 name, def,
             )?)))

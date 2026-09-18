@@ -299,7 +299,7 @@ pub fn parse_app_probes(raw: &str) -> Result<BTreeMap<String, AppProbeSpec>, Str
         spec.validate(key)?;
         let Some((container, probe_field)) = key.split_once('/') else {
             return Err(format!(
-                "app probe key {key:?} must be '<container>/<probeField>'"
+                "app probe key {key:?} must be `<container>/<probeField>`"
             ));
         };
         validate_probe_container_name(container)?;

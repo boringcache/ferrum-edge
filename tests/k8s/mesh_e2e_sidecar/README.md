@@ -89,6 +89,15 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.config.native_subscribe_jwt_rejected` | dedicated probe DP completes mTLS then presents an invalid JWT; no slice accepted |
 | `sidecar.config.native_subscribe_tls_rotation_reconnects` | projected Secret generation swap of CP/DP gRPC TLS material reconnects the native stream without a pod restart; after the pre-swap baseline the production `capp` DP must publish a successful `surface=dp_grpc` TLS reload and then emit a Connected-to-CP for that exact pod/node identity, and the CP must publish a successful `surface=cp_grpc` TLS reload and then emit a `Tenant subscription accepted` audit for that same identity, strictly newer than the pre-swap baseline and ordered after those reload anchors (reload logs are not proof by themselves); an over-the-wire mTLS handshake to the running CP (Service DNS SAN, gen2 server CA, gen2 DP client cert) observes the replacement leaf serial, and a gen-1 client is then rejected |
 
+The rotation probe fetches the original `capp` pod's current `ferrum-edge`
+container logs with `kubectl logs --prefix=true --tail=-1`. The application
+continues withholding its configured `node_id`; the classifier binds redacted
+connection events to the exact `[pod/<name>/ferrum-edge]` source prefix instead.
+Another pod or container, an unbound placeholder, or a conflicting visible
+node ID cannot supply client evidence. The CP must still accept that exact
+node ID after its own TLS reload, and both event histories must retain the
+pre-swap baseline.
+
 Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
 allow/deny, RequestAuthentication JWT, DR namespace visibility/lookup precedence, DR connectTimeout, DR maxConnections,

@@ -7993,7 +7993,10 @@ impl EnvConfig {
                 "Invalid FERRUM_TRUSTED_PROXIES {}: {e}. Every entry must be a valid IP or CIDR \
                  and empty comma segments are rejected — a partially parsed forwarding trust \
                  boundary would silently change which peers may assert a client identity.",
-                crate::startup::quoted_config_value("FERRUM_TRUSTED_PROXIES", &self.trusted_proxies)
+                crate::startup::quoted_config_value(
+                    "FERRUM_TRUSTED_PROXIES",
+                    &self.trusted_proxies
+                )
             )
         })?;
         Ok(())

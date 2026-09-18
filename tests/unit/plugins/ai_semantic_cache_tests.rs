@@ -3565,11 +3565,11 @@ fn unknown_retention_multimodal_isolation_size_semantic_and_redis_typos_are_reje
             .err()
             .unwrap_or_else(|| panic!("unknown key {typo} must fail closed"));
         assert!(
-            err.contains(&format!("'config.{typo}'")),
+            err.contains(&format!("\"config.{typo}\"")),
             "path-qualified diagnostic missing for {typo}: {err}"
         );
         assert!(
-            err.contains(&format!("did you mean '{suggestion}'?")),
+            err.contains(&format!("did you mean `{suggestion}`?")),
             "spelling suggestion missing for {typo}: {err}"
         );
         assert!(
@@ -3594,9 +3594,9 @@ fn multiple_unknown_keys_are_reported_deterministically_with_suggestions() {
     assert_eq!(
         err,
         "ai_semantic_cache: unknown configuration key(s): \
-         'config.cache_multimoda' (did you mean 'cache_multimodal'?), \
-         'config.sync_mod' (did you mean 'sync_mode'?), \
-         'config.ttl_second' (did you mean 'ttl_seconds'?)"
+         \"config.cache_multimoda\" (did you mean `cache_multimodal`?), \
+         \"config.sync_mod\" (did you mean `sync_mode`?), \
+         \"config.ttl_second\" (did you mean `ttl_seconds`?)"
     );
 }
 
@@ -3658,11 +3658,11 @@ fn shared_admission_rejects_unknown_keys_with_keep_last_known_good_policy() {
     )
     .expect_err("shared admission must reject multimodal typos");
     assert!(
-        err.contains("'config.cache_multimoda'"),
+        err.contains("\"config.cache_multimoda\""),
         "unexpected admission error: {err}"
     );
     assert!(
-        err.contains("did you mean 'cache_multimodal'?"),
+        err.contains("did you mean `cache_multimodal`?"),
         "unexpected admission error: {err}"
     );
 }

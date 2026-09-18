@@ -272,7 +272,8 @@ impl EmailChannel {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("channel {name:?} (email): `smtp_host` is required"))?;
         let socket_host =
-            parse_socket_host(&format!("channel {name:?} (email)"), "smtp_host", raw_host)?;
+            parse_socket_host(&format!("channel {name:?} (email)"), "smtp_host", raw_host)
+                .map_err(|error| format!("`channels` (email): {error}"))?;
 
         let tls_mode = match value.get("tls_mode") {
             Some(v) => {

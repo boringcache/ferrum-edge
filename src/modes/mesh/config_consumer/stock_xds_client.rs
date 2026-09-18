@@ -211,7 +211,12 @@ pub async fn load_stock_policy_baseline_off_thread(
     tokio::task::spawn_blocking(move || load_stock_policy_baseline(&path))
         .await
         .map_err(|error| {
-            anyhow::anyhow!("Stock xDS mesh policy validation worker failed: {error}")
+            let reason = if error.is_cancelled() {
+                "cancelled"
+            } else {
+                "panicked"
+            };
+            anyhow::anyhow!("Stock xDS mesh policy validation worker failed: {reason}")
         })?
 }
 
@@ -828,7 +833,7 @@ pub async fn start_stock_xds_client_with_shutdown(
         cluster = %sanitize_startup_scalar(config.cluster.as_str()),
         xds_urls = xds_urls.len(),
         authorization = config.credential.is_configured(),
-        liveness_bound_secs = config.timings.liveness_bound_seconds(),
+        liveness_bound_secs = %sanitize_startup_scalar(config.timings.liveness_bound_seconds()),
         "Stock xDS mesh client starting (third-party control plane; discovery only)"
     );
 
@@ -1277,10 +1282,12 @@ async fn connect_stock_ads(
         endpoint_index,
         transport = transport.as_label(),
         authorization = credential.is_some(),
-        authorization_lifetime_secs = credential
-            .as_ref()
-            .map(|credential| credential.lifetime().as_secs())
-            .unwrap_or(0),
+        authorization_lifetime_secs = %sanitize_startup_scalar(
+            credential
+                .as_ref()
+                .map(|credential| credential.lifetime().as_secs())
+                .unwrap_or(0)
+        ),
         authorization_deadline_basis = credential
             .as_ref()
             .map(|credential| credential.deadline_basis().as_metric_label())
