@@ -3457,7 +3457,7 @@ async fn test_admin_create_rejects_invalid_ai_stream_router_policy_config() {
                 "fallback": {"max_attempts": 3}
             }),
             &[
-                "unsupported field 'fallback'",
+                "unsupported field `fallback`",
                 "provider fallback is not implemented",
             ][..],
         ),

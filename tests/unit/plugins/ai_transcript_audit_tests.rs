@@ -7299,6 +7299,12 @@ async fn metadata_only_empty_redaction_patterns_rejected() {
     .expect("metadata_only with an empty pattern set must be rejected");
     assert!(err.contains("metadata_only"), "got: {err}");
     assert!(err.contains("full_body"), "got: {err}");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+    assert!(rendered.contains("`mode` <redacted scalar>"), "{rendered}");
+    assert!(rendered.contains("`redaction.builtins: []`"), "{rendered}");
+    assert!(rendered.contains("unredacted request-derived data"), "{rendered}");
+    assert!(rendered.contains("`full_body`"), "{rendered}");
+    assert!(!rendered.contains("metadata_only"), "{rendered}");
 
     let hash_only = json!({
         "mode": "hash_only",

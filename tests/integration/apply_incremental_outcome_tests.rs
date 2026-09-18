@@ -1625,7 +1625,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
                 "fallback": {"on_connect_error": true}
             }),
             &[
-                "unsupported field 'fallback'",
+                "unsupported field `fallback`",
                 "provider fallback is not implemented",
             ][..],
         ),

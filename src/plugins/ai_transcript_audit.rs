@@ -1979,7 +1979,7 @@ impl AiTranscriptAudit {
             // `hash_only` exports no request-derived strings (envelope +
             // keyed hashes only), so it is exempt.
             return Err(format!(
-                "ai_transcript_audit: mode `{}` with `redaction.builtins: []` and no \
+                "ai_transcript_audit: `mode` {:?} with `redaction.builtins: []` and no \
                  `redaction.custom_patterns` would export unredacted request-derived data; \
                  configure at least one pattern, or use mode `full_body` with \
                  `allow_full_body: true` for deliberate raw capture",

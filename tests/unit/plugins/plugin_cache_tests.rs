@@ -5744,7 +5744,7 @@ fn test_apply_delta_rejects_invalid_ai_stream_router_config_and_keeps_last_known
                 "fallback": {"on_connect_error": true}
             }),
             &[
-                "unsupported field 'fallback'",
+                "unsupported field `fallback`",
                 "provider fallback is not implemented",
             ][..],
         ),
