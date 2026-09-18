@@ -20943,8 +20943,8 @@ pub fn validate_ingress_capture_addr(addr: SocketAddr) -> Result<(), String> {
     if !addr.ip().is_unspecified() {
         return Err(format!(
             "FERRUM_MESH_INBOUND_LISTEN_ADDR must be a wildcard address (0.0.0.0 or [::]) when \
-             the NodeWaypoint eBPF ingress redirect is enabled, got {addr}. The redirect resolves \
-             the capture listener with a wildcard socket lookup because the captured packet still \
+             the NodeWaypoint eBPF ingress redirect is enabled, got \"{addr}\". The redirect \
+             resolves the capture listener with a wildcard socket lookup because the packet still \
              carries the workload's own address; a specific-IP bind is invisible to it and every \
              captured connection would be dropped"
         ));
@@ -21132,8 +21132,8 @@ fn parse_stock_xds_credential_policy() -> Result<StockCredentialLifetimePolicy, 
     };
     if refresh_skew_secs >= max_stream_lifetime_secs {
         return Err(format!(
-            "{SKEW_KEY} ({refresh_skew_secs}s) must be smaller than {MAX_LIFETIME_KEY} \
-             ({max_stream_lifetime_secs}s)"
+            "{SKEW_KEY} (\"{refresh_skew_secs}\"s) must be smaller than {MAX_LIFETIME_KEY} \
+             (\"{max_stream_lifetime_secs}\"s)"
         ));
     }
 
@@ -21144,7 +21144,7 @@ fn parse_stock_xds_credential_policy() -> Result<StockCredentialLifetimePolicy, 
     };
     if watch_interval_secs == 0 || watch_interval_secs > 300 {
         return Err(format!(
-            "{WATCH_KEY} must be between 1 and 300 seconds (got {watch_interval_secs}); 0 \
+            "{WATCH_KEY} must be between 1 and 300 seconds (got \"{watch_interval_secs}\"); 0 \
              would disable rotation detection entirely"
         ));
     }

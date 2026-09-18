@@ -55,9 +55,12 @@ enum TokenLookup {
 
 impl JwtAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let config_obj = config
-            .as_object()
-            .ok_or_else(|| format!("jwt_auth: config must be an object, got: {config}"))?;
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "jwt_auth: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         reject_unknown_keys(config_obj)?;
         let token_lookup = parse_token_lookup(config_obj.get("token_lookup"))?;
         let consumer_claim_field = parse_non_empty_string(

@@ -194,9 +194,12 @@ impl RateLimiting {
         namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
-        let object = config
-            .as_object()
-            .ok_or_else(|| format!("rate_limiting: config must be an object, got: {config}"))?;
+        let object = config.as_object().ok_or_else(|| {
+            format!(
+                "rate_limiting: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         // Legacy root window fields get their own actionable diagnostic before
         // the closed-key sweep would report them as merely "unknown".
         reject_legacy_window_fields(object)?;

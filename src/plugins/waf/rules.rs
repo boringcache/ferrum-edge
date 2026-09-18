@@ -502,7 +502,7 @@ pub(super) fn compile_rules(
     for (mut rule, is_default) in rules.drain(..) {
         validate_rule(&rule)?;
         if !seen.insert(rule.id.clone()) {
-            return Err(format!("waf: duplicate rule id '{}'", rule.id));
+            return Err(format!("waf: duplicate rule id {:?}", rule.id));
         }
         if is_default {
             seen_default.insert(rule.id.clone());
@@ -560,7 +560,7 @@ pub(super) fn compile_rules(
         let cidr = if rule.match_kind == MatchKind::Cidr {
             Some(IpCidr::parse(&rule.pattern).ok_or_else(|| {
                 format!(
-                    "waf: rule '{}' has invalid CIDR '{}'",
+                    "waf: rule {:?} has invalid CIDR {:?}",
                     rule.id, rule.pattern
                 )
             })?)
@@ -573,7 +573,7 @@ pub(super) fn compile_rules(
             .as_ref()
             .map(CompiledConditions::compile)
             .transpose()
-            .map_err(|e| format!("waf: rule '{}': {e}", rule.id))?;
+            .map_err(|e| format!("waf: rule {:?}: {e}", rule.id))?;
 
         let rule_index = compiled_rules.len();
         let compiled = CompiledRule {
@@ -600,7 +600,7 @@ pub(super) fn compile_rules(
     if !unknown_disabled.is_empty() {
         unknown_disabled.sort_unstable();
         return Err(format!(
-            "waf: 'disabled_default_rules' references unknown default rule id(s): {}",
+            "waf: `disabled_default_rules` references unknown default rule id(s): {:?}",
             unknown_disabled.join(", ")
         ));
     }
@@ -616,7 +616,7 @@ pub(super) fn compile_rules(
     if !unknown.is_empty() {
         unknown.sort_unstable();
         return Err(format!(
-            "waf: 'rule_modes' references unknown rule id(s): {}",
+            "waf: `rule_modes` references unknown rule id(s): {:?}",
             unknown.join(", ")
         ));
     }
@@ -631,7 +631,7 @@ pub(super) fn compile_rules(
     if !unknown_overrides.is_empty() {
         unknown_overrides.sort_unstable();
         return Err(format!(
-            "waf: 'rule_overrides' references unknown rule id(s): {}",
+            "waf: `rule_overrides` references unknown rule id(s): {:?}",
             unknown_overrides.join(", ")
         ));
     }
@@ -654,19 +654,19 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
     }
     if rule.category.trim().is_empty() {
         return Err(format!(
-            "waf: rule '{}' category must be non-empty",
+            "waf: rule {:?} category must be non-empty",
             rule.id
         ));
     }
     if !(1..=4).contains(&rule.paranoia_min) {
         return Err(format!(
-            "waf: rule '{}' paranoia_min must be from 1 to 4",
+            "waf: rule {:?} paranoia_min must be from 1 to 4",
             rule.id
         ));
     }
     if !matches!(rule.match_kind, MatchKind::Luhn) && rule.pattern.is_empty() {
         return Err(format!(
-            "waf: rule '{}' pattern must be non-empty unless match_kind is luhn",
+            "waf: rule {:?} pattern must be non-empty unless match_kind is luhn",
             rule.id
         ));
     }
@@ -675,7 +675,7 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
         && !rule.target.is_response_body()
     {
         return Err(format!(
-            "waf: rule '{}' match_kind luhn is only supported for body targets",
+            "waf: rule {:?} match_kind luhn is only supported for body targets",
             rule.id
         ));
     }
@@ -683,7 +683,7 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
         && !matches!(rule.target, RuleTarget::FullUrl)
     {
         return Err(format!(
-            "waf: rule '{}' canonical query-value mirror is only valid for full_url targets",
+            "waf: rule {:?} canonical query-value mirror is only valid for full_url targets",
             rule.id
         ));
     }
@@ -694,9 +694,9 @@ fn compile_fp_filters(rule: &WafRule) -> Result<Option<RegexSet>, String> {
     if rule.fp_filters.is_empty() {
         return Ok(None);
     }
-    RegexSet::new(&rule.fp_filters).map(Some).map_err(|e| {
+    RegexSet::new(&rule.fp_filters).map(Some).map_err(|_| {
         format!(
-            "waf: failed to compile fp_filters for rule '{}': {e}",
+            "waf: `fp_filters` for rule {:?} is invalid or too complex",
             rule.id
         )
     })
@@ -923,7 +923,7 @@ fn compile_json_path(path: &str, rule_id: &str) -> Result<Vec<JsonPathSegment>, 
     for segment in path.split('.') {
         if segment.is_empty() {
             return Err(format!(
-                "waf: rule '{rule_id}' body_json_path contains an empty segment"
+                "waf: rule {rule_id:?} body_json_path contains an empty segment"
             ));
         }
         if let Ok(index) = segment.parse::<usize>() {
@@ -934,7 +934,7 @@ fn compile_json_path(path: &str, rule_id: &str) -> Result<Vec<JsonPathSegment>, 
     }
     if segments.is_empty() {
         return Err(format!(
-            "waf: rule '{rule_id}' body_json_path must not be empty"
+            "waf: rule {rule_id:?} body_json_path must not be empty"
         ));
     }
     Ok(segments)
@@ -1038,7 +1038,7 @@ pub(super) fn parse_custom_rule(
     let target = parse_target(
         object
             .get("target")
-            .ok_or_else(|| format!("waf: custom rule '{id}' requires 'target'"))?,
+            .ok_or_else(|| format!("waf: custom rule {id:?} requires `target`"))?,
         &format!("{path}.target"),
     )?;
     let match_kind = parse_match_kind(

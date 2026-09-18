@@ -61,9 +61,12 @@ pub struct AccessControl {
 
 impl AccessControl {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let object = config
-            .as_object()
-            .ok_or_else(|| format!("access_control: config must be an object, got: {config}"))?;
+        let object = config.as_object().ok_or_else(|| {
+            format!(
+                "access_control: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
 
         reject_removed_ip_keys(object)?;
         reject_unknown_keys(object)?;

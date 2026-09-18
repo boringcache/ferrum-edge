@@ -129,7 +129,10 @@ impl GrpcMethodRouter {
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config.as_object().ok_or_else(|| {
-            format!("grpc_method_router: config must be an object, got: {config}")
+            format!(
+                "grpc_method_router: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
         })?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.

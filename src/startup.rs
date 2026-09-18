@@ -7,7 +7,29 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-/// Render only the ordered startup cause chain, then apply credential redaction.
+/// Sanitize one original diagnostic before it is joined or emitted.
+///
+/// Match complete configured URLs and registered secrets before removing quoted
+/// spans: a quote inside a credential must not truncate it before matching.
+pub fn sanitize_startup_cause(cause: impl Display, database_urls: &[&str]) -> String {
+    let original = cause.to_string();
+    let rendered = crate::config::db_backend::redact_error_text(&original, database_urls);
+    let rendered = crate::secrets::redact_external_secret_values(&rendered);
+    // A registered secret may itself be a quote or contain a closing delimiter.
+    // If scrubbing changes the quote/escape syntax, scanning the rewritten text
+    // could expose another supplied value. Withhold this cause in full instead.
+    let quote_syntax = |ch: &char| matches!(ch, '\'' | '"' | '\\');
+    if !original
+        .chars()
+        .filter(quote_syntax)
+        .eq(rendered.chars().filter(quote_syntax))
+    {
+        return "<redacted diagnostic>".to_string();
+    }
+    crate::util::deserialization::sanitize_custom_message(&rendered)
+}
+
+/// Render only the ordered, independently sanitized startup cause chain.
 ///
 /// Withhold quoted spans in EACH cause before joining: an unterminated quote in
 /// one cause must not consume the next cause's field path or rejection reason.
@@ -17,13 +39,11 @@ use tokio::sync::oneshot;
 /// TLS/provider loaders remain responsible for withholding key material and source
 /// references at their typed boundaries; arbitrary secret text cannot be inferred here.
 pub fn render_startup_error(error: anyhow::Error, database_urls: &[&str]) -> String {
-    let rendered = error
+    error
         .chain()
-        .map(|cause| crate::util::deserialization::sanitize_custom_message(&cause.to_string()))
+        .map(|cause| sanitize_startup_cause(cause, database_urls))
         .collect::<Vec<_>>()
-        .join(": ");
-    let rendered = crate::config::db_backend::redact_error_text(rendered, database_urls);
-    crate::secrets::redact_external_secret_values(&rendered)
+        .join(": ")
 }
 
 /// Publish stream settings from the executable's accepted startup configuration.

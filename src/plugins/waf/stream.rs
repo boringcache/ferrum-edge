@@ -188,10 +188,10 @@ fn compile_stream_signatures(
             let id = optional_string(obj, "id")?
                 .ok_or_else(|| format!("waf: 'stream.signatures[{idx}]' requires 'id'"))?;
             if !seen_ids.insert(id.clone()) {
-                return Err(format!("waf: duplicate stream signature id '{id}'"));
+                return Err(format!("waf: duplicate stream signature id {id:?}"));
             }
             let pattern = optional_string(obj, "pattern")?
-                .ok_or_else(|| format!("waf: stream signature '{id}' requires 'pattern'"))?;
+                .ok_or_else(|| format!("waf: stream signature {id:?} requires `pattern`"))?;
             // Compile each pattern individually first so the error names the
             // offending signature rather than a combined-set position.
             regex::bytes::Regex::new(&pattern).map_err(|_| {
@@ -202,7 +202,7 @@ fn compile_stream_signatures(
             })?;
             let severity = match optional_string(obj, "severity")? {
                 Some(s) => parse_severity(&s).ok_or_else(|| {
-                    format!("waf: stream signature '{id}' has invalid severity '{s}'")
+                    format!("waf: stream signature {id:?} has invalid `severity` {s:?}")
                 })?,
                 None => Severity::Medium,
             };
@@ -227,8 +227,9 @@ fn compile_stream_signatures(
 
     // `RegexSet::new` over an empty pattern list yields a set that matches
     // nothing, which is exactly what we want when only `tcp_require_tls` is set.
-    let set = BytesRegexSet::new(&patterns)
-        .map_err(|e| format!("waf: failed to build stream signature set: {e}"))?;
+    let set = BytesRegexSet::new(&patterns).map_err(|_| {
+        "waf: `stream.signatures` pattern set is invalid or too complex".to_string()
+    })?;
 
     Ok(CompiledStreamSignatures { set, meta })
 }

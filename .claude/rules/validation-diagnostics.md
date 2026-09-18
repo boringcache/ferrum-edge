@@ -8,9 +8,15 @@ paths:
 
 - Two layers: serde families are sanitized structurally at the document boundary;
   `startup::render_startup_error` sanitizes EVERY rendered cause independently
-  with `sanitize_custom_message`, then joins with `: `. Both `run` and `validate`
-  use it. Never sanitize only the joined chain: an unterminated quote in one
-  cause must not swallow the next cause's field/index or reason.
+  with `sanitize_startup_cause`, then joins with `: `. For each ORIGINAL cause,
+  redact configured database URLs and registered external secrets FIRST, then
+  withhold quoted spans with `sanitize_custom_message`. A quote inside a URL or
+  secret must not truncate the value before the credential scrubbers match it.
+  If credential scrubbing changes quote/escape syntax, withhold that cause in
+  full as `<redacted diagnostic>`: a secret can itself be a delimiter.
+  Both `run` and `validate` use it. Never sanitize only the joined chain: an
+  unterminated quote in one cause must not swallow the next cause's field/index
+  or reason.
 - Validation diagnostics: schema names in backticks; document values omitted or
   strings in double quotes with Debug escaping (`{value:?}`). This convention
   makes semantic validators safe by construction at rendering. BARE document
@@ -31,10 +37,13 @@ paths:
   path or context chain for a family. Do not retain raw errors below safe wrappers.
   Exception: the exact leading `duplicate entry with key "` family from the
   bare YAML Value parser preserves its document key as `duplicate field` metadata.
-- Warnings bypassing the final renderer must withhold at emission (as the
-  validation pipeline does) or omit values. Migration/backup version diagnostics
-  omit values even before rendering. Regex-library errors can reproduce patterns
-  bare: replace them with the field/index and a fixed rejection reason.
+- Warnings/errors bypassing the final renderer must emit through
+  `startup::sanitize_startup_cause` (with known URLs where available) or omit
+  values. Quoting alone does NOT sanitize a tracing event. This includes backup,
+  SQL/Mongo quarantine/rejection, validation-pipeline and unknown-plugin logs.
+  Migration/backup version diagnostics omit values even before rendering.
+  Regex-library errors can reproduce patterns bare: replace them with the
+  field/index and a fixed rejection reason.
 - Known converted sites: mesh config validators (services/cluster IPs, workload
   identities, hosts, policy/targetRefs names, CIDRs, ext-authz and JWT headers,
   trust bundles, remote clusters/gateways); CORS origin/method/header checks;
@@ -52,3 +61,8 @@ paths:
   and revision identities. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
+- The constructor audit includes root/nested JSON object guards, file-mode
+  plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
+  regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
+  and Kubernetes port/weight/concurrency/sampling diagnostics. JSON Display
+  strings must be Debug-escaped even when a sibling guard already does so.

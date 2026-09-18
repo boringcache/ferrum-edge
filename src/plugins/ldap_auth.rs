@@ -1500,7 +1500,10 @@ fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<St
     arr.iter()
         .map(|item| {
             let raw = item.as_str().ok_or_else(|| {
-                format!("ldap_auth: '{field}' entries must be strings, got: {item}")
+                format!(
+                    "ldap_auth: `{field}` entries must be strings, got: {item:?}",
+                    item = item.to_string()
+                )
             })?;
             let value = raw.trim();
             if value.is_empty() {

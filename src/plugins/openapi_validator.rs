@@ -1990,7 +1990,7 @@ fn parse_encoding_map(
         normalized == "application/x-www-form-urlencoded" || normalized == "multipart/form-data";
     if !supports_style {
         return Err(format!(
-            "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type})"
+            "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type:?})"
         ));
     }
     let mut out = AHashMap::new();
@@ -2152,7 +2152,7 @@ fn parse_property_encoding(
         "deepObject" => EncodingStyle::DeepObject,
         other => {
             return Err(format!(
-                "encoding['{property}'].style '{other}' is unsupported for request bodies (supported: form, spaceDelimited, pipeDelimited, deepObject)"
+                "encoding['{property}'].style {other:?} is unsupported for request bodies (supported: form, spaceDelimited, pipeDelimited, deepObject)"
             ));
         }
     };

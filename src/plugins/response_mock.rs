@@ -278,7 +278,7 @@ impl ResponseMock {
             let delay_ms = optional_u64(rule_obj, "delay_ms", i)?.unwrap_or(0);
             if delay_ms > MAX_DELAY_MS {
                 return Err(format!(
-                    "response_mock: rule[{i}] 'delay_ms' must be <= {MAX_DELAY_MS}, got {delay_ms}"
+                    "response_mock: rule[{i}] `delay_ms` must be <= {MAX_DELAY_MS}, got \"{delay_ms}\""
                 ));
             }
 

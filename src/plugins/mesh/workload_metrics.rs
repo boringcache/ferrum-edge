@@ -459,7 +459,7 @@ impl WorkloadMetrics {
                 };
                 if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
                     return Err(format!(
-                        "workload_metrics: sampling_percentage must be between 0.0 and 100.0 (got {percentage})"
+                        "workload_metrics: sampling_percentage must be between 0.0 and 100.0 (got \"{percentage}\")"
                     ));
                 }
                 Some(percentage)

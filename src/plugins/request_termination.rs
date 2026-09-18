@@ -147,7 +147,7 @@ fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
             if !(200..=599).contains(&code) {
                 return Err(format!(
                     "request_termination: 'status_code' must be a final response from 200 to 599 \
-                     (informational statuses including 101 are rejected), got {code}"
+                     (informational statuses including 101 are rejected), got \"{code}\""
                 ));
             }
             u16::try_from(code)

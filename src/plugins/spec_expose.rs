@@ -402,7 +402,7 @@ impl SpecExpose {
             let ca_material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(
                 |error| {
                     format!(
-                        "spec_expose: configured CA bundle '{source_id}' could not be loaded; refusing to widen trust: {error}"
+                        "spec_expose: configured CA bundle {source_id:?} could not be loaded; refusing to widen trust: {error}"
                     )
                 },
             )?;
@@ -410,14 +410,14 @@ impl SpecExpose {
                 reqwest::Certificate::from_pem_bundle(ca_material.bytes.expose_secret()).map_err(
                     |error| {
                         format!(
-                            "spec_expose: configured CA bundle '{}' is invalid; refusing to widen trust: {error}",
+                            "spec_expose: configured CA bundle {:?} is invalid; refusing to widen trust: {error}",
                             ca_material.display_source_id
                         )
                     },
                 )?;
             if certificates.is_empty() {
                 return Err(format!(
-                    "spec_expose: configured CA bundle '{}' contains no certificates; refusing to widen trust",
+                    "spec_expose: configured CA bundle {:?} contains no certificates; refusing to widen trust",
                     ca_material.display_source_id
                 ));
             }

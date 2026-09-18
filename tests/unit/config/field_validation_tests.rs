@@ -3481,3 +3481,28 @@ fn test_proxy_effective_websocket_idle_timeout_resolution() {
     assert_eq!(proxy.effective_websocket_idle_timeout_seconds(300), 45);
     assert_eq!(proxy.effective_websocket_idle_timeout_seconds(0), 45);
 }
+
+#[test]
+fn malformed_credentials_keep_schema_names_when_rendered() {
+    for (kind, fields) in [
+        ("mtls_auth", vec!["identity"]),
+        ("hmac_auth", vec!["secret"]),
+        ("jwt", vec!["secret"]),
+        ("basicauth", vec!["password", "password_hash"]),
+    ] {
+        let mut consumer = make_consumer("schema-fixture", "schema-fixture");
+        consumer
+            .credentials
+            .insert(kind.into(), serde_json::json!([{}]));
+        let errors = consumer.validate_fields().unwrap_err();
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+        assert!(
+            rendered.contains(&format!("credentials.{kind}[0]")),
+            "{rendered}"
+        );
+        for field in fields {
+            assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+        }
+    }
+}

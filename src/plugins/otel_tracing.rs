@@ -3087,7 +3087,7 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
             })?;
             if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
                 return Err(format!(
-                    "otel_tracing: 'root_sampling_ratio' must be between 0.0 and 1.0, got: {ratio}"
+                    "otel_tracing: `root_sampling_ratio` must be between 0.0 and 1.0, got: \"{ratio}\""
                 ));
             }
             Some(ratio)
@@ -3129,7 +3129,7 @@ fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "{provider_name}: 'endpoint' scheme must be http or https, got: {scheme}"
+                "{provider_name}: `endpoint` scheme must be http or https, got: {scheme:?}"
             ));
         }
     }
@@ -3154,7 +3154,7 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "Datadog: 'agent_url' scheme must be http or https, got: {scheme}"
+                "Datadog: `agent_url` scheme must be http or https, got: {scheme:?}"
             ));
         }
     }

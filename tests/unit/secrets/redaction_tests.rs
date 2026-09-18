@@ -34,6 +34,9 @@ const CASE_VALUE: &str = "lowercase-method-sentinel";
 const QUOTED_KEY: &str = "FERRUM_REDACTION_FIXTURE_QUOTED";
 const QUOTED_VALUE: &str = r#"quoted"secret\sentinel"#;
 
+const APOSTROPHE_KEY: &str = "FERRUM_REDACTION_FIXTURE_APOSTROPHE";
+const APOSTROPHE_VALUE: &str = "apostrophe-secret-sentinel'with-tail";
+
 /// A one-character secret. A resolved value has deliberately no minimum length,
 /// so this is a legitimate secret — and it is also the JSON string delimiter,
 /// which is what makes a flat text pass over a serialized record unsafe.
@@ -240,7 +243,7 @@ const FIXTURES: [(&str, &str); 26] = [
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
     (QUOTED_KEY, QUOTED_VALUE),
-    (QUOTE_KEY, QUOTE_VALUE),
+    (APOSTROPHE_KEY, APOSTROPHE_VALUE),
     (DELIMITER_KEY, DELIMITER_VALUE),
     (FIELD_NAME_KEY, FIELD_NAME_VALUE),
     (MESSAGE_NAME_KEY, MESSAGE_NAME_VALUE),
@@ -293,7 +296,13 @@ fn arm_redaction() {
             // fixture-only and no real setting uses this prefix.
             unsafe { std::env::set_var(key, value) };
         }
-        record_external_secret_keys(FIXTURES.iter().map(|(key, _)| key.to_string()));
+        let mut keys: Vec<String> = FIXTURES.iter().map(|(key, _)| key.to_string()).collect();
+        if std::env::var_os("FERRUM_REDACTION_QUOTE_TEST_CHILD").is_some() {
+            // SAFETY: the same ENV_LOCK protects this fixture-only mutation.
+            unsafe { std::env::set_var(QUOTE_KEY, QUOTE_VALUE) };
+            keys.push(QUOTE_KEY.to_string());
+        }
+        record_external_secret_keys(keys);
         // Force the lazily built candidate plan while the lock is still held,
         // so its env read-back cannot race a concurrent mutation.
         let _ = redact_external_secret_values("");
@@ -772,6 +781,22 @@ fn parse_record(line: &str) -> serde_json::Value {
 /// structural quote with the placeholder and emits a line nothing can parse.
 #[test]
 fn one_character_quote_secret_does_not_corrupt_the_record() {
+    // Registering a quote is deliberately process-wide. Isolate this fixture
+    // from semantic-rendering tests, which use quotes as diagnostic syntax.
+    if std::env::var_os("FERRUM_REDACTION_QUOTE_TEST_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unit::secrets::redaction_tests::one_character_quote_secret_does_not_corrupt_the_record",
+                "--nocapture",
+            ])
+            .env("FERRUM_REDACTION_QUOTE_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
     let line = through_sink(|sink| {
         emit_tracing(
             sink,
@@ -790,6 +815,15 @@ fn one_character_quote_secret_does_not_corrupt_the_record() {
         "the resolved quote must not survive: {message}"
     );
     assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+
+    let error = anyhow::anyhow!("`next.field`: invalid configuration")
+        .context("validator rejected \"UNREGISTERED_QUOTE_TOKEN_5589\"");
+    let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+    assert_eq!(
+        rendered,
+        "<redacted diagnostic>: `next.field`: invalid configuration"
+    );
+    assert!(!rendered.contains("UNREGISTERED_QUOTE_TOKEN_5589"));
 }
 
 /// Same class, via a delimiter: the object must keep exactly its three fields
@@ -1685,4 +1719,18 @@ fn the_withheld_notice_keeps_its_own_envelope_keys() {
             "the withheld notice must keep its own `{key}` envelope key: {withheld}"
         );
     }
+}
+
+#[test]
+fn startup_redacts_apostrophe_secret_before_withholding_spans() {
+    arm_redaction();
+    let error = anyhow::anyhow!("`next.field`: invalid configuration")
+        .context(format!("validator rejected {APOSTROPHE_VALUE}"));
+    let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+    assert_eq!(
+        rendered,
+        "<redacted diagnostic>: `next.field`: invalid configuration"
+    );
+    assert!(!rendered.contains("apostrophe-secret-sentinel"), "{rendered}");
+    assert!(!rendered.contains("with-tail"), "{rendered}");
 }

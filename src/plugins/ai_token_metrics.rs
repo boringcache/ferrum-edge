@@ -105,7 +105,7 @@ impl AiTokenMetrics {
         };
         if provider != "auto" && parse_ai_provider(&provider).is_none() {
             return Err(format!(
-                "ai_token_metrics: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
+                "ai_token_metrics: unknown `provider` value {:?} (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
                 provider
             ));
         }
@@ -142,14 +142,14 @@ impl AiTokenMetrics {
             && (rate < 0.0 || !rate.is_finite() || rate > MAX_COST_RATE)
         {
             return Err(format!(
-                "ai_token_metrics: 'cost_per_prompt_token' must be a non-negative finite number no greater than {MAX_COST_RATE}, got {rate}"
+                "ai_token_metrics: `cost_per_prompt_token` must be a non-negative finite number no greater than {MAX_COST_RATE}, got \"{rate}\""
             ));
         }
         if let Some(rate) = cost_per_completion_token
             && (rate < 0.0 || !rate.is_finite() || rate > MAX_COST_RATE)
         {
             return Err(format!(
-                "ai_token_metrics: 'cost_per_completion_token' must be a non-negative finite number no greater than {MAX_COST_RATE}, got {rate}"
+                "ai_token_metrics: `cost_per_completion_token` must be a non-negative finite number no greater than {MAX_COST_RATE}, got \"{rate}\""
             ));
         }
 
@@ -663,7 +663,7 @@ impl Plugin for AiTokenMetrics {
                 Some(p) => p,
                 None => {
                     debug!(
-                        "ai_token_metrics: unknown configured provider '{}'",
+                        "ai_token_metrics: unknown configured provider {:?}",
                         self.provider
                     );
                     return PluginResult::Continue;

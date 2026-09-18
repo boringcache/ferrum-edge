@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secret values. The URL inventory reads only raw settings, without fetching
   dormant database TLS sources or creating PEM files. Owning loaders remain
   responsible for derived URLs and other provider/driver error payloads.
+  Credential scrubbers now run on each original cause before quoted-span
+  withholding, including URLs and registered secrets containing quotes. If the
+  scrubbers change quote/escape syntax, the affected cause is withheld in full
+  without consuming the next cause. Backup,
+  SQL/Mongo validation and unknown-plugin warnings sanitize before emission.
+  WAF stream/rule IDs, exemption regexes, Basic-auth consumer IDs, gRPC-Web
+  header elements and remaining constructor scalar/type diagnostics follow the
+  same withholding convention. Version and credential schema names remain
+  visible in backticks. Real-binary regressions inspect both output streams.
 
 ### Security
 

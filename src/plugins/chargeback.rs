@@ -401,14 +401,14 @@ pub mod pricing {
 
                 if !(100..=599).contains(&code_u64) {
                     return Err(format!(
-                        "{plugin_name}: pricing_tiers[{i}].status_codes contains invalid HTTP status code {code_u64}"
+                        "{plugin_name}: pricing_tiers[{i}].status_codes contains invalid HTTP status code \"{code_u64}\""
                     ));
                 }
                 let code = code_u64 as u16;
 
                 if price_by_status.contains_key(&code) {
                     return Err(format!(
-                        "{plugin_name}: status code {code} appears in multiple pricing tiers"
+                        "{plugin_name}: status code \"{code}\" appears in multiple pricing tiers"
                     ));
                 }
 

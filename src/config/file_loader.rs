@@ -228,7 +228,7 @@ pub fn load_config_from_file(
                     serde_json::Value::String(_) => "string",
                 };
                 anyhow::bail!(
-                    "field 'version' must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
+                    "field `version` must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
                 );
             }
         }
@@ -287,7 +287,7 @@ pub fn load_config_from_file(
         ))
         .run()?;
 
-    let plaintext_basic_auth_consumers: Vec<&str> = config
+    let plaintext_basic_auth_consumers: Vec<String> = config
         .consumers
         .iter()
         .filter(|consumer| {
@@ -297,12 +297,12 @@ pub fn load_config_from_file(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
         })
-        .map(|consumer| consumer.id.as_str())
+        .map(|consumer| format!("{:?}", consumer.id))
         .collect();
     if !plaintext_basic_auth_consumers.is_empty() {
         anyhow::bail!(
             "Configuration validation failed: file-mode Basic-auth credentials must use \
-             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             `password_hash`; plaintext `password` is accepted only by Admin API writes \
              (consumer IDs: {})",
             plaintext_basic_auth_consumers.join(", ")
         );
@@ -521,7 +521,7 @@ pub fn decode_and_validate_config_document(
                     serde_json::Value::String(_) => "string",
                 };
                 anyhow::bail!(
-                    "field 'version' must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
+                    "field `version` must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
                 );
             }
         }
@@ -570,7 +570,7 @@ pub fn decode_and_validate_config_document(
         ))
         .run()?;
 
-    let plaintext_basic_auth_consumers: Vec<&str> = config
+    let plaintext_basic_auth_consumers: Vec<String> = config
         .consumers
         .iter()
         .filter(|consumer| {
@@ -580,12 +580,12 @@ pub fn decode_and_validate_config_document(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
         })
-        .map(|consumer| consumer.id.as_str())
+        .map(|consumer| format!("{:?}", consumer.id))
         .collect();
     if !plaintext_basic_auth_consumers.is_empty() {
         anyhow::bail!(
             "Configuration validation failed: file-mode Basic-auth credentials must use \
-             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             `password_hash`; plaintext `password` is accepted only by Admin API writes \
              (consumer IDs: {})",
             plaintext_basic_auth_consumers.join(", ")
         );

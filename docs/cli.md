@@ -281,14 +281,18 @@ separate and only the bare inner diagnostic's exact leading family is classified
 Diagnostics keep field paths, available line/column positions, expected types,
 and missing/unknown/duplicate field names. Paths and unknown-field messages echo
 document **keys**; they are diagnostic context, not confidential value storage.
-The second layer is render-time withholding: **each cause** in both `run` and
-`validate` passes through the custom quoted-span sanitizer before the causes are
-joined. Every double- or single-quoted span is withheld, through the end of that
-cause if unterminated; backticks remain. An unmatched quote cannot consume the
-next cause's field path or reason. Validation-pipeline log records use the same
-pass before emission. Validators must use backticks for schema names and
-Debug-escaped double quotes (`{value:?}` for strings) for document values, or
-omit the values. A validator following this convention is safe by construction
+The second layer is render-time withholding: **each original cause** in both
+`run` and `validate` first passes through the configured-URL and registered-secret
+scrubbers, then the custom quoted-span sanitizer, before the causes are joined.
+If credential scrubbing changes quote or escape syntax, that cause is withheld
+in full as `<redacted diagnostic>` so removing a secret delimiter cannot expose
+another value. Every double- or single-quoted span is withheld, through the end
+of that cause if unterminated; backticks remain. An unmatched quote cannot consume
+the next cause's field path or reason. Backup, validation-pipeline, SQL/Mongo rejection
+and unknown-plugin log records use the same sanitizer before emission.
+Validators must use backticks for schema names and Debug-escaped double quotes
+(`{value:?}` for strings) for document values, or omit the values. A validator
+following this convention is safe by construction
 at rendering; interpolating a document scalar bare is a defect, not an exception
 to the convention. Parser errors use custom sanitization; the exact bare YAML
 `duplicate entry with key` family preserves its key as a backticked duplicate

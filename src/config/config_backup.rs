@@ -64,7 +64,7 @@ pub fn load_config_backup(
     // serving namespace.
     if namespace.is_empty() {
         anyhow::bail!(
-            "Config backup at {path} cannot be loaded without a serving namespace; \
+            "Config backup at {path:?} cannot be loaded without a serving namespace; \
              set FERRUM_NAMESPACE"
         );
     }
@@ -78,18 +78,24 @@ pub fn load_config_backup(
     ) {
         Ok(content) => content,
         Err(StableFileError::NotFound) => {
-            warn!("No config backup file found at {}", path);
+            warn!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!("No config backup file found at {path:?}"),
+                    &[]
+                )
+            );
             return Ok(None);
         }
         Err(error) => {
             return Err(anyhow::anyhow!(
-                "Failed to read config backup at {path}: {error}"
+                "Failed to read config backup at {path:?}: {error}"
             ));
         }
     };
 
     let mut value: serde_json::Value = config_decode::from_json_str(&content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config backup at {path}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse config backup at {path:?}: {e}"))?;
 
     // GET /backup wraps the runtime resources in administrative metadata.
     // Remove only its known envelope fields: unknown runtime fields must still
@@ -111,24 +117,24 @@ pub fn load_config_backup(
 
     normalize_backup_version_field(&mut value)?;
     ConfigMigrator::migrate_in_memory(&mut value)
-        .map_err(|e| anyhow::anyhow!("Config backup at {path} failed version migration: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Config backup at {path:?} failed version migration: {e}"))?;
 
     let backup_version = value
         .get("version")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!("Config backup at {path} is missing required `version` field")
+            anyhow::anyhow!("Config backup at {path:?} is missing required `version` field")
         })?;
     if backup_version != CURRENT_CONFIG_VERSION {
         anyhow::bail!(
-            "Config backup at {path} has unsupported version (<redacted scalar>) \
+            "Config backup at {path:?} has unsupported version (<redacted scalar>) \
              (current is {CURRENT_CONFIG_VERSION}); migrate supported older backups \
              or export a current-version snapshot"
         );
     }
 
     let mut config: GatewayConfig = config_decode::from_json_value(value)
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize config backup at {path}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize config backup at {path:?}: {e}"))?;
 
     // Preserve the same normalize → TLS resolution order used by database
     // full loads before the rejecting runtime contract runs.
@@ -149,7 +155,7 @@ pub fn load_config_backup(
     // before quarantine can hide two different records for the same ID.
     if let Err(errors) = config.validate_unique_resource_ids() {
         anyhow::bail!(
-            "Config backup at {path} failed runtime validation ({} duplicate resource ID(s))",
+            "Config backup at {path:?} failed runtime validation ({} duplicate resource ID(s))",
             errors.len()
         );
     }
@@ -178,14 +184,14 @@ pub fn load_config_backup(
     for consumer in &config.consumers {
         if let Err(errors) = consumer.validate_fields() {
             anyhow::bail!(
-                "Config backup at {path} failed consumer validation ({} error(s)); repair the consumer fields or credentials",
+                "Config backup at {path:?} failed consumer validation ({} error(s)); repair the consumer fields or credentials",
                 errors.len()
             );
         }
     }
     if let Err(errors) = config.validate_unique_consumer_credentials() {
         anyhow::bail!(
-            "Config backup at {path} failed consumer validation ({} duplicate credential(s))",
+            "Config backup at {path:?} failed consumer validation ({} duplicate credential(s))",
             errors.len()
         );
     }
@@ -199,10 +205,13 @@ pub fn load_config_backup(
     }
     if !validation_errors.is_empty() {
         for message in &validation_errors {
-            error!("Config backup rejected — {}", message);
+            error!(
+                "Config backup rejected — {}",
+                crate::startup::sanitize_startup_cause(message, &[])
+            );
         }
         anyhow::bail!(
-            "Config backup at {path} failed runtime validation ({} rejecting error(s)): {}",
+            "Config backup at {path:?} failed runtime validation ({} rejecting error(s)): {}",
             validation_errors.len(),
             validation_errors.join("; ")
         );
@@ -248,7 +257,7 @@ fn normalize_backup_version_field(value: &mut serde_json::Value) -> Result<(), a
                     serde_json::Value::String(_) => "string",
                 };
                 anyhow::bail!(
-                    "Config backup field 'version' must be a string or non-negative integer \
+                    "Config backup field `version` must be a string or non-negative integer \
                      (got {value_type}); use version: \"{CURRENT_CONFIG_VERSION}\" or \
                      version: {CURRENT_CONFIG_VERSION}"
                 );

@@ -53,7 +53,10 @@ impl CompiledExemptions {
             RegexSetBuilder::new(paths.into_iter().map(exemption_path_pattern))
                 .build()
                 .map(Some)
-                .map_err(|e| format!("waf: failed to compile global_exemptions.paths: {e}"))?
+                .map_err(|_| {
+                    "waf: `global_exemptions.paths` pattern set is invalid or too complex"
+                        .to_string()
+                })?
         };
 
         let methods = optional_string_vec(object, "methods")?
@@ -70,7 +73,7 @@ impl CompiledExemptions {
             .into_iter()
             .map(|raw| {
                 IpCidr::parse(&raw).ok_or_else(|| {
-                    format!("waf: global_exemptions.ips contains invalid IP/CIDR '{raw}'")
+                    format!("waf: `global_exemptions.ips` contains invalid IP/CIDR {raw:?}")
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -79,8 +82,9 @@ impl CompiledExemptions {
         let fp_capture_filters = if fp_filters.is_empty() {
             None
         } else {
-            RegexSet::new(fp_filters).map(Some).map_err(|e| {
-                format!("waf: failed to compile global_exemptions.fp_capture_filters: {e}")
+            RegexSet::new(fp_filters).map(Some).map_err(|_| {
+                "waf: `global_exemptions.fp_capture_filters` pattern set is invalid or too complex"
+                    .to_string()
             })?
         };
 

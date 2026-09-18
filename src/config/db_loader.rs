@@ -2114,7 +2114,7 @@ impl DatabaseStore {
         ) {
             Ok(snapshot) => snapshot.pin(options),
             Err(error) => {
-                let safe_error = crate::config::db_backend::redact_error_text(&error, &[db_url]);
+                let safe_error = crate::startup::sanitize_startup_cause(&error, &[db_url]);
                 warn!(
                     "Database TLS material could not be snapshotted for the backup-bootstrap pool; starting from the unmodified URL and retrying on reconnect: {safe_error}"
                 );
@@ -2701,7 +2701,7 @@ impl DatabaseStore {
         let quarantined = config.quarantine_colliding_consumer_identities();
         if !quarantined.is_empty() {
             for message in &quarantined {
-                error!("{}", message);
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
             }
             error!(
                 "Quarantined {} consumer(s) with colliding identities during full config load",
@@ -2717,7 +2717,7 @@ impl DatabaseStore {
         let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
         if !hmac_quarantined.is_empty() {
             for message in &hmac_quarantined {
-                error!("{}", message);
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
             }
             error!(
                 "Quarantined {} hmac_auth credential(s) during full config load",
@@ -2751,7 +2751,7 @@ impl DatabaseStore {
             for message in &quarantined {
                 error!(
                     "Database config: quarantined unconstructible plugin config — {}",
-                    message
+                    crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
             if !quarantined.is_empty() {
@@ -2768,7 +2768,10 @@ impl DatabaseStore {
         let validation_errors = collect_rejecting_runtime_config_errors(&config);
         if !validation_errors.is_empty() {
             for message in &validation_errors {
-                tracing::error!("Database config rejected — {}", message);
+                tracing::error!(
+                    "Database config rejected — {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
             }
             // Typed, downcast-discoverable rejection (parity with the Mongo
             // loader) so the database-mode poll loop classifies this as a

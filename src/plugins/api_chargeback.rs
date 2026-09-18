@@ -752,7 +752,7 @@ pub fn validate_composition(
             let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
             errors.push(format!(
                 "api_chargeback permits at most one effective instance per proxy \
-                 (shared /charges registry is exactly-once); proxy '{}' has: {}",
+                 (shared /charges registry is exactly-once); proxy {:?} has: {:?}",
                 proxy.id,
                 ids.join(", ")
             ));
@@ -764,7 +764,7 @@ pub fn validate_composition(
             let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
             errors.push(format!(
                 "api_chargeback_sink permits at most one effective instance per proxy \
-                 (independent event_id dedup keys duplicate durable rows); proxy '{}' has: {}",
+                 (independent event_id dedup keys duplicate durable rows); proxy {:?} has: {:?}",
                 proxy.id,
                 ids.join(", ")
             ));

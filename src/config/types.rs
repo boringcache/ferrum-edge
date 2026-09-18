@@ -287,7 +287,7 @@ fn basic_auth_credential_error(
     credential: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'static str> {
     if credential.len() != 1 {
-        return Some("must contain exactly one of 'password' or 'password_hash'");
+        return Some("must contain exactly one of `password` or `password_hash`");
     }
 
     if let Some(password) = credential.get("password") {
@@ -320,7 +320,7 @@ fn basic_auth_credential_error(
         );
     }
 
-    Some("must contain exactly one of 'password' or 'password_hash'")
+    Some("must contain exactly one of `password` or `password_hash`")
 }
 /// Maximum number of ACL groups per consumer.
 pub const MAX_ACL_GROUPS_PER_CONSUMER: usize = 500;
@@ -7845,13 +7845,16 @@ impl Proxy {
             return;
         }
         tracing::warn!(
-            proxy = %self.id,
-            namespace = %self.namespace,
-            "Proxy {:?} `allowed_ws_origins` contains '*' or a non-origin entry; {}; \
-             existing config is still loaded. Admin API writes and `ferrum-edge validate` \
-             reject this value.",
-            self.id,
-            ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "Proxy {:?} `allowed_ws_origins` contains `*` or a non-origin entry; {}; \
+                     existing config is still loaded. Admin API writes and `ferrum-edge validate` \
+                     reject this value.",
+                    self.id, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ),
+                &[]
+            )
         );
     }
 
@@ -8710,7 +8713,7 @@ impl Consumer {
                 if cred_type == "mtls_auth" {
                     if obj.len() != 1 || !obj.contains_key("identity") {
                         errors.push(format!(
-                            "{} must contain exactly one field named 'identity'",
+                            "{} must contain exactly one field named `identity`",
                             prefix
                         ));
                     }
@@ -8727,7 +8730,7 @@ impl Consumer {
                 if cred_type == "hmac_auth" {
                     if obj.len() != 1 || !obj.contains_key("secret") {
                         errors.push(format!(
-                            "{} must contain exactly one field named 'secret'",
+                            "{} must contain exactly one field named `secret`",
                             prefix
                         ));
                     }
@@ -8753,7 +8756,7 @@ impl Consumer {
                 if cred_type == "jwt" {
                     if obj.len() != 1 || !obj.contains_key("secret") {
                         errors.push(format!(
-                            "{} must contain exactly one field named 'secret'",
+                            "{} must contain exactly one field named `secret`",
                             prefix
                         ));
                     }

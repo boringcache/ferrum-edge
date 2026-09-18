@@ -4390,3 +4390,165 @@ async fn functional_cli_health_uses_secret_endpoint_for_tls_gateway() {
         cli_contract_diagnostic(&output)
     );
 }
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_plugin_diagnostics_withhold_all_supplied_values() {
+    let token = "'UNREGISTERED_REVIEW_TOKEN_5589";
+    let cases = [
+        (token, serde_json::json!({}), "Unknown plugin"),
+        (
+            "waf",
+            serde_json::json!({"stream": {"signatures": [{"id": token}]}}),
+            "requires `pattern`",
+        ),
+        (
+            "waf",
+            serde_json::json!({"stream": {"signatures": [
+                {"id": token, "pattern": "ok"}, {"id": token, "pattern": "ok"}
+            ]}}),
+            "duplicate stream signature id",
+        ),
+        (
+            "waf",
+            serde_json::json!({"stream": {"signatures": [
+                {"id": token, "pattern": "ok", "severity": token}
+            ]}}),
+            "invalid `severity`",
+        ),
+        (
+            "waf",
+            serde_json::json!({"global_exemptions": {"fp_capture_filters": [format!("{token}[")]}}),
+            "`global_exemptions.fp_capture_filters` pattern set is invalid",
+        ),
+        (
+            "waf",
+            serde_json::json!({"global_exemptions": {"paths": [format!("~{token}[")]}}),
+            "`global_exemptions.paths` pattern set is invalid",
+        ),
+        (
+            "bot_detection",
+            serde_json::json!({"custom_response_code": 918273641}),
+            "`custom_response_code` must be from 400 to 599",
+        ),
+        (
+            "grpc_web",
+            serde_json::json!({"expose_headers": [918273641]}),
+            "`expose_headers[0]` must be a string",
+        ),
+        (
+            "grpc_web",
+            serde_json::json!({"expose_headers": [{"nested": [token, 918273641]}]}),
+            "`expose_headers[0]` must be a string",
+        ),
+    ];
+    for (plugin, config, reason) in cases {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("plugin.json");
+        let document = serde_json::json!({
+            "version": "1", "proxies": [], "plugin_configs": [{
+                "id": "diagnostic-fixture", "plugin_name": plugin,
+                "scope": "global", "config": config
+            }]
+        });
+        std::fs::write(&path, document.to_string()).unwrap();
+        for subcommand in ["run", "validate"] {
+            let command = installed_cli_command(
+                &directory,
+                &[subcommand, "-m", "file", "-c", path.to_str().unwrap()],
+            );
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+            assert!(diagnostic.contains(reason), "{reason}: {diagnostic}");
+            for withheld in ["UNREGISTERED_REVIEW_TOKEN_5589", "918273641"] {
+                assert!(!diagnostic.contains(withheld), "{diagnostic}");
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_plaintext_basic_auth_withholds_consumer_ids() {
+    for token in [
+        "UNREGISTERED_CONSUMER_5589",
+        "'UNREGISTERED_CONSUMER_5589\"tail",
+    ] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("consumer.json");
+        let document = serde_json::json!({
+            "version": "1", "proxies": [], "plugin_configs": [], "consumers": [{
+                "id": token, "username": "fixture",
+                "credentials": {"basicauth": [{"password": "synthetic-password"}]}
+            }]
+        });
+        std::fs::write(&path, document.to_string()).unwrap();
+        for subcommand in ["run", "validate"] {
+            let command = installed_cli_command(
+                &directory,
+                &[subcommand, "-m", "file", "-c", path.to_str().unwrap()],
+            );
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+            assert!(
+                diagnostic.contains("file-mode Basic-auth credentials"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("`password_hash`"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("consumer IDs: <redacted scalar>"),
+                "{diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("UNREGISTERED_CONSUMER_5589"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("synthetic-password"), "{diagnostic}");
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_backup_validation_sanitizes_early_emissions() {
+    let directory = TempDir::new().unwrap();
+    let refused = crate::scaffolding::ports::reserve_refused_tcp_port().unwrap();
+    let path = directory.path().join("backup.json");
+    let token = "UNREGISTERED_UPSTREAM_5589";
+    let document = serde_json::json!({
+        "version": "1", "plugin_configs": [], "proxies": [{
+            "id": "fixture", "listen_path": "/", "backend_scheme": "http",
+            "backend_host": "localhost", "backend_port": 8080, "upstream_id": token
+        }]
+    });
+    std::fs::write(&path, document.to_string()).unwrap();
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "database"]);
+        command
+            .env("FERRUM_DB_TYPE", "postgres")
+            .env(
+                "FERRUM_DB_URL",
+                format!("postgres://fixture@127.0.0.1:{}/fixture", refused.port),
+            )
+            .env("FERRUM_DB_CONFIG_BACKUP_PATH", &path)
+            .env("FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS", "1")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "1")
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-for-backup-test-5589",
+            )
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+        assert!(diagnostic.contains("Config backup rejected"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("references non-existent upstream"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains(token), "{diagnostic}");
+    }
+}

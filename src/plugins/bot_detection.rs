@@ -219,7 +219,7 @@ fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
             };
             if !(400..=599).contains(&code) {
                 return Err(format!(
-                    "bot_detection: 'custom_response_code' must be from 400 to 599, got {code}"
+                    "bot_detection: `custom_response_code` must be from 400 to 599, got \"{code}\""
                 ));
             }
             u16::try_from(code)

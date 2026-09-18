@@ -84,3 +84,24 @@ fn startup_chain_includes_typed_sources_and_single_errors() {
         "invalid port"
     );
 }
+
+#[test]
+fn startup_redacts_quote_bearing_database_urls_before_withholding_spans() {
+    for query in [
+        "fixture-token'with-tail",
+        "fixture-token\"with-tail",
+        "fixture-token'\"tail",
+    ] {
+        let url = format!("postgres://fixture-user:fixture-password@localhost/db?token={query}");
+        let error = anyhow::anyhow!("`next.field`: invalid configuration")
+            .context(format!("driver rejected {url}"));
+        let rendered = render_startup_error(error, &[&url]);
+        for credential in ["fixture-user", "fixture-password", "fixture-token", "with-tail"] {
+            assert!(!rendered.contains(credential), "{rendered}");
+        }
+        assert_eq!(
+            rendered,
+            "<redacted diagnostic>: `next.field`: invalid configuration"
+        );
+    }
+}

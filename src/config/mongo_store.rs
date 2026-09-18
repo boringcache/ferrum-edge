@@ -8183,7 +8183,10 @@ mod inner {
                 .collect();
             if !trust_errors.is_empty() {
                 for message in &trust_errors {
-                    error!("MongoDB gateway trust bundle rejected — {}", message);
+                    error!(
+                        "MongoDB gateway trust bundle rejected — {}",
+                        crate::startup::sanitize_startup_cause(message, &[])
+                    );
                 }
                 crate::config::gateway_trust::record_trust_load_rejection(
                     crate::config::gateway_trust::GatewayTrustFailureReason::InvalidMaterial,
@@ -8207,7 +8210,10 @@ mod inner {
             // `consumer_identity_index` collection prevents NEW collisions
             // from being committed, this guard covers pre-existing rows.
             for message in config.quarantine_colliding_consumer_identities() {
-                error!("MongoDB config: {}", message);
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
             }
 
             // Fail-closed hmac_auth secret policy: strip pre-existing or
@@ -8216,7 +8222,10 @@ mod inner {
             // write-time validation rejects new violations; this guard covers
             // stored rows.
             for message in config.quarantine_invalid_hmac_credentials() {
-                error!("MongoDB config: {}", message);
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
             }
 
             // Serving-mode repairability (issue #4526), parity with the SQL
@@ -8232,7 +8241,7 @@ mod inner {
                 for message in &quarantined {
                     error!(
                         "MongoDB config: quarantined unconstructible plugin config — {}",
-                        message
+                        crate::startup::sanitize_startup_cause(message, &[])
                     );
                 }
                 if !quarantined.is_empty() {
@@ -8255,7 +8264,10 @@ mod inner {
             let validation_errors = collect_rejecting_runtime_config_errors(&config);
             if !validation_errors.is_empty() {
                 for msg in &validation_errors {
-                    error!("MongoDB config rejected — {}", msg);
+                    error!(
+                        "MongoDB config rejected — {}",
+                        crate::startup::sanitize_startup_cause(msg, &[])
+                    );
                 }
                 // Return a typed, downcast-discoverable rejection (not a bare
                 // `bail!`) so the database-mode poll loop can tell this apart

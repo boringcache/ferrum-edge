@@ -106,7 +106,8 @@ pub fn parse_claim_headers(
         )?;
         let raw_header = header_value.as_str().ok_or_else(|| {
             format!(
-                "{plugin}: '{field}.{claim_path}' must be a header name string, got: {header_value}"
+                "{plugin}: `{field}.{claim_path}` must be a header name string, got: {header_value:?}",
+                header_value = header_value.to_string()
             )
         })?;
         let header_name = normalize_allowed_header(raw_header, plugin, field)?;

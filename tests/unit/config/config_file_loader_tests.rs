@@ -3118,3 +3118,37 @@ fn unknown_extension_loader_rejects_alias_before_later_malformation() {
     assert!(!rendered.contains("private-version"));
     assert!(!rendered.contains("loader-secret"));
 }
+
+#[test]
+fn file_wrong_type_version_keeps_schema_name_when_rendered() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    for extension in [".json", ".yaml"] {
+        let content = if extension == ".json" {
+            "{\"version\":false}"
+        } else {
+            "version: false\n"
+        };
+        let mut file = NamedTempFile::with_suffix(extension).unwrap();
+        write!(file, "{content}").unwrap();
+        let path = file.path().to_str().unwrap();
+        let error = load_config_from_file(path, 30, &policy, "ferrum").unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+        assert!(rendered.contains("field `version` must be a string or non-negative integer"));
+        assert!(rendered.contains("got boolean"), "{rendered}");
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+#[test]
+fn memory_wrong_type_version_keeps_schema_name_when_rendered() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    for content in ["{\"version\":false}", "version: false\n"] {
+        let error = ferrum_edge::config::file_loader::decode_and_validate_config_document(
+            content, 30, &policy,
+        )
+        .unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+        assert!(rendered.contains("field `version` must be a string or non-negative integer"));
+        assert!(rendered.contains("got boolean"), "{rendered}");
+    }
+}

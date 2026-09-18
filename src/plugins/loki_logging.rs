@@ -871,7 +871,7 @@ fn validate_minimum_entry_budget(
         })?;
     if minimum_retained_bytes > max_entry_bytes {
         return Err(format!(
-            "loki_logging: 'max_entry_bytes' must fit a minimum serialized HTTP and stream entry plus configured, reserved, and worst-case dynamic label values (requires at least {minimum_retained_bytes} bytes, configured {max_entry_bytes})"
+            "loki_logging: `max_entry_bytes` must fit a minimum serialized HTTP and stream entry plus configured, reserved, and worst-case dynamic label values (requires at least {minimum_retained_bytes} bytes, configured \"{max_entry_bytes}\")"
         ));
     }
     Ok(())

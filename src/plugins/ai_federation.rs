@@ -1753,7 +1753,7 @@ fn optional_status_code_set(
         })?;
         if !(100..=599).contains(&status) {
             return Err(format!(
-                "ai_federation: '{field}' contains invalid HTTP status code {status}"
+                "ai_federation: `{field}` contains invalid HTTP status code \"{status}\""
             ));
         }
         if (200..300).contains(&status) {

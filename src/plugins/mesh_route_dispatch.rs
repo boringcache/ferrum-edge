@@ -348,7 +348,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         if delay.duration_ms > MAX_FAULT_DELAY_MS {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be \
-                 <= {MAX_FAULT_DELAY_MS} (1 minute), got {}",
+                 <= {MAX_FAULT_DELAY_MS} (1 minute), got \"{}\"",
                 delay.duration_ms
             ));
         }
@@ -358,7 +358,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         if !(200..=599).contains(&abort.status_code) {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.abort.status_code must be \
-                 200-599, got {}",
+                 200-599, got \"{}\"",
                 abort.status_code
             ));
         }
@@ -368,7 +368,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.abort.grpc_status must be \
-                 0-16, got {code}"
+                 0-16, got \"{code}\""
             ));
         }
     }
@@ -388,7 +388,7 @@ fn validate_fault_percentage(
     if !(0.0..=100.0).contains(&percentage) {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be in [0.0, 100.0], \
-             got {percentage}"
+             got \"{percentage}\""
         ));
     }
     if percentage == 0.0 {
@@ -471,7 +471,7 @@ fn validate_and_normalize_redirect(
 ) -> Result<(), String> {
     if !(300..=399).contains(&redirect.redirect_code) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got {}",
+            "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got \"{}\"",
             redirect.redirect_code
         ));
     }

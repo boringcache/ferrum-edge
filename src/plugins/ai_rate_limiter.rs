@@ -507,7 +507,7 @@ impl AiRateLimiter {
                 Some(parsed) => Some(parsed),
                 None => {
                     return Err(format!(
-                        "ai_rate_limiter: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
+                        "ai_rate_limiter: unknown `provider` value {:?} (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
                         provider
                     ));
                 }

@@ -400,9 +400,12 @@ impl JwksAuth {
         http_client: PluginHttpClient,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
-        let config_obj = config
-            .as_object()
-            .ok_or_else(|| format!("jwks_auth: config must be an object, got: {config}"))?;
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "jwks_auth: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         reject_unknown_fields(config_obj, &root_config_fields(), "config")?;
 
         // A blank id would collapse every jwks_auth config in a namespace onto
@@ -522,7 +525,10 @@ impl JwksAuth {
 
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
-                format!("jwks_auth: provider[{idx}] must be an object, got: {prov_cfg}")
+                format!(
+                    "jwks_auth: provider[{idx}] must be an object, got: {prov_cfg:?}",
+                    prov_cfg = prov_cfg.to_string()
+                )
             })?;
             reject_removed_provider_fields(prov_obj, idx)?;
             reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
@@ -2236,7 +2242,7 @@ fn parse_url_field(
         }
         scheme => {
             return Err(format!(
-                "jwks_auth: 'provider[{provider_idx}].{field}' must use http or https, got: {scheme}"
+                "jwks_auth: `provider[{provider_idx}].{field}` must use http or https, got: {scheme:?}"
             ));
         }
     }
@@ -2553,7 +2559,8 @@ fn parse_token_locations(
         for (idx, header) in headers.iter().enumerate() {
             let object = header.as_object().ok_or_else(|| {
                 format!(
-                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}]' must be an object, got: {header}"
+                    "jwks_auth: `provider[{provider_idx}].from_headers[{idx}]` must be an object, got: {header:?}",
+                    header = header.to_string()
                 )
             })?;
             reject_unknown_fields(
@@ -2568,7 +2575,8 @@ fn parse_token_locations(
             })?;
             let raw_name = name_value.as_str().ok_or_else(|| {
                 format!(
-                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' must be a string, got: {name_value}"
+                    "jwks_auth: `provider[{provider_idx}].from_headers[{idx}].name` must be a string, got: {name_value:?}",
+                    name_value = name_value.to_string()
                 )
             })?;
             let name = raw_name.trim().to_ascii_lowercase();

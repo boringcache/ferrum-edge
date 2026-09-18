@@ -3501,12 +3501,12 @@ pub fn validate_ws_frame_rate_params(
     }
     if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
-            "ws_rate_limiting: 'frames_per_second' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {frames_per_second}"
+            "ws_rate_limiting: `frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{frames_per_second}\""
         ));
     }
     if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
-            "ws_rate_limiting: 'burst_size' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {burst_size}"
+            "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
         ));
     }
     if burst_size < frames_per_second {

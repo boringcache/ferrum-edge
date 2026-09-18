@@ -2244,7 +2244,7 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
                     "critical" => 4,
                     other => {
                         return Err(format!(
-                            "waf: 'scoring.weights' has unknown severity '{other}'"
+                            "waf: `scoring.weights` has unknown severity {other:?}"
                         ));
                     }
                 };

@@ -901,9 +901,12 @@ impl HmacAuth {
         http_client: Option<&PluginHttpClient>,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
-        let config_obj = config
-            .as_object()
-            .ok_or_else(|| format!("hmac_auth: config must be an object, got: {config}"))?;
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "hmac_auth: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         if config_obj.get("require_digest").is_some() {
             return Err(
                 "hmac_auth: 'require_digest' was removed; request digests are always required"

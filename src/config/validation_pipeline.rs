@@ -1,6 +1,6 @@
 use crate::config::BackendEgressPolicy;
 use crate::config::types::{CountryMmdbValidationGeneration, GatewayConfig};
-use crate::util::deserialization::sanitize_custom_message;
+use crate::startup::sanitize_startup_cause;
 use tracing::{error, warn};
 
 pub(crate) enum ValidationAction<'a> {
@@ -647,7 +647,7 @@ impl<'a> ValidationPipeline<'a> {
                                 {
                                     warn!(
                                         "Optional plugin config validation warning: {}",
-                                        sanitize_custom_message(&message)
+                                        sanitize_startup_cause(message, &[])
                                     );
                                 } else {
                                     errors.push(message);
@@ -673,7 +673,7 @@ impl<'a> ValidationPipeline<'a> {
                             {
                                 warn!(
                                     "Optional plugin config validation warning: {}",
-                                    sanitize_custom_message(&message)
+                                    sanitize_startup_cause(message, &[])
                                 );
                             } else {
                                 errors.push(message);
@@ -737,7 +737,7 @@ fn handle_validation_errors(
         }
         ValidationAction::Warn => {
             for message in &errors {
-                warn!("{}", sanitize_custom_message(message));
+                warn!("{}", sanitize_startup_cause(message, &[]));
             }
             Ok(())
         }
@@ -747,7 +747,7 @@ fn handle_validation_errors(
                 "FatalCount template must include a '{{}}' placeholder"
             );
             for message in &errors {
-                error!("{}", sanitize_custom_message(message));
+                error!("{}", sanitize_startup_cause(message, &[]));
             }
             let summary = template.replacen("{}", &errors.len().to_string(), 1);
             anyhow::bail!(summary);

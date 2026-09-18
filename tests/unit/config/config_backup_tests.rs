@@ -908,3 +908,12 @@ fn backup_bootstrap_projects_the_namespace_before_it_validates() {
         "the backup loader must require a serving namespace argument"
     );
 }
+
+#[test]
+fn backup_wrong_type_version_keeps_the_schema_name_when_rendered() {
+    let (_tmp, path) = write_tmp_file(&json!({"version": false}).to_string());
+    let error = load_config_backup(&path, "ferrum").unwrap_err();
+    let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+    assert!(rendered.contains("field `version` must be a string or non-negative integer"));
+    assert!(rendered.contains("got boolean"), "{rendered}");
+}

@@ -772,7 +772,7 @@ fn explicit_provider_requires_the_documented_lowercase_enum_spelling() {
         let err = AiTokenMetrics::new(&json!({"provider": provider}))
             .err()
             .expect("non-canonical provider spelling must be rejected");
-        assert!(err.contains("unknown 'provider' value"), "got: {err}");
+        assert!(err.contains("unknown `provider` value"), "got: {err}");
     }
 }
 

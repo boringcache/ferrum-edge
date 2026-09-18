@@ -171,7 +171,7 @@ impl OutboundRegistry {
         .0;
         if !(400..=599).contains(&parsed.reject_status) {
             return Err(format!(
-                "mesh_outbound_registry: reject_status must be 4xx/5xx (got {})",
+                "mesh_outbound_registry: reject_status must be 4xx/5xx (got \"{}\")",
                 parsed.reject_status
             ));
         }

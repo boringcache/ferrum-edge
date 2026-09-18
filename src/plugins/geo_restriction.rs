@@ -404,9 +404,12 @@ impl GeoRestriction {
 }
 
 fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
-    let object = config
-        .as_object()
-        .ok_or_else(|| format!("geo_restriction: config must be an object, got: {config}"))?;
+    let object = config.as_object().ok_or_else(|| {
+        format!(
+            "geo_restriction: config must be an object, got: {config:?}",
+            config = config.to_string()
+        )
+    })?;
     if let Some(unknown) = object
         .keys()
         .find(|key| !CONFIG_KEYS.contains(&key.as_str()))

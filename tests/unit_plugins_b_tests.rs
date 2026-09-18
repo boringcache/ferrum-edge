@@ -99,6 +99,7 @@ mod unit {
         mod tcp_logging_tests;
         mod transaction_debugger_tests;
         mod transaction_log_schema_tests;
+        mod validation_diagnostics_tests;
         mod transaction_summary_tests;
         mod udp_endpoint_tests;
         mod udp_logging_tests;

@@ -390,7 +390,7 @@ impl std::fmt::Display for K8sTranslateError {
         match self {
             Self::Unsupported(resource) => write!(
                 f,
-                "unsupported Kubernetes resource {}/{} {}: {}",
+                "unsupported Kubernetes resource {:?}/{:?} {:?}: {}",
                 resource.namespace, resource.name, resource.kind, resource.reason
             ),
             Self::InvalidResource {
@@ -400,7 +400,7 @@ impl std::fmt::Display for K8sTranslateError {
                 message,
             } => write!(
                 f,
-                "invalid Kubernetes resource {}/{} {}: {}",
+                "invalid Kubernetes resource {:?}/{:?} {:?}: {}",
                 namespace, name, kind, message
             ),
         }
@@ -2474,7 +2474,7 @@ pub(crate) fn port_from_u64(
     if raw == 0 || raw > u16::MAX as u64 {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 1 and 65535 (got {raw})"),
+            format!("{field} must be between 1 and 65535"),
         ));
     }
     Ok(raw as u16)
@@ -2511,13 +2511,13 @@ pub(crate) fn target_weight_from_value(
     let Some(weight) = value.as_u64() else {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT} (got {value})"),
+            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT}"),
         ));
     };
     if weight > u64::from(MAX_TARGET_WEIGHT) {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"),
+            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT}"),
         ));
     }
     Ok(weight as u32)

@@ -72,7 +72,7 @@ impl GrpcDeadline {
             && default_ms > max_ms
         {
             return Err(format!(
-                "grpc_deadline: 'default_deadline_ms' ({default_ms}) cannot exceed 'max_deadline_ms' ({max_ms})"
+                "grpc_deadline: `default_deadline_ms` (\"{default_ms}\") cannot exceed `max_deadline_ms` (\"{max_ms}\")"
             ));
         }
 

@@ -211,9 +211,12 @@ struct IssuerFilter {
 
 impl IssuerFilter {
     fn from_json(val: &Value, context: &str) -> Result<Self, String> {
-        let obj = val
-            .as_object()
-            .ok_or_else(|| format!("mtls_auth: '{context}' entries must be objects, got: {val}"))?;
+        let obj = val.as_object().ok_or_else(|| {
+            format!(
+                "mtls_auth: `{context}` entries must be objects, got: {val:?}",
+                val = val.to_string()
+            )
+        })?;
         for key in obj.keys() {
             if !matches!(key.as_str(), "cn" | "o" | "ou" | "ca_certificate_pem") {
                 return Err(format!(

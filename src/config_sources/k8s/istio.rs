@@ -1631,7 +1631,7 @@ fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K
     let parsed = raw.parse::<u64>().map_err(|_| {
         invalid_resource(
             object,
-            format!("{field} must be a numeric port between 1 and 65535 (got {raw})"),
+            format!("{field} must be a numeric port between 1 and 65535"),
         )
     })?;
     port_from_u64(object, parsed, field)
@@ -1892,13 +1892,13 @@ fn translate_tcp_max_connections(
     if raw <= 0 {
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.tcp.maxConnections must be positive, got {raw}"),
+            "trafficPolicy.connectionPool.tcp.maxConnections must be positive".to_string(),
         ));
     }
     if raw > i64::from(u32::MAX) {
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.tcp.maxConnections ({raw}) exceeds u32::MAX"),
+            format!("trafficPolicy.connectionPool.tcp.maxConnections (\"{raw}\") exceeds u32::MAX"),
         ));
     }
     Ok(Some(raw as u32))
@@ -1941,7 +1941,7 @@ fn translate_tcp_keepalive(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes ({raw}) exceeds u32::MAX"
+                        "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes (\"{raw}\") exceeds u32::MAX"
                     ),
                 ));
             }
@@ -3081,7 +3081,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
             if raw > u64::from(MAX_TARGET_WEIGHT) {
                 return Err(invalid_resource(
                     object,
-                    format!("WorkloadEntry.weight must be 0..={MAX_TARGET_WEIGHT} (got {raw})"),
+                    format!("WorkloadEntry.weight must be 0..={MAX_TARGET_WEIGHT}"),
                 ));
             }
             Ok(raw as u32)
@@ -5757,9 +5757,7 @@ fn route_redirect_value(
         if !(300..=399).contains(&code) {
             return Err(invalid_resource(
                 object,
-                format!(
-                    "VirtualService http[].redirect.redirectCode must be in the 300-399 range, got {code}"
-                ),
+                "VirtualService http[].redirect.redirectCode must be in the 300-399 range".to_string(),
             ));
         }
         out.insert("redirect_code".to_string(), serde_json::json!(code));
@@ -7319,9 +7317,7 @@ fn telemetry_sampling_percentage(
     if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
         return Err(invalid_resource(
             object,
-            format!(
-                "Telemetry tracing.randomSamplingPercentage must be between 0 and 100 (got {sampling})"
-            ),
+            "Telemetry tracing.randomSamplingPercentage must be between 0 and 100".to_string(),
         ));
     }
     Ok(Some(sampling))
@@ -7611,16 +7607,14 @@ fn proxy_config(
             let raw = value.as_u64().ok_or_else(|| {
                 invalid_resource(
                     object,
-                    format!(
-                        "ProxyConfig spec.concurrency must be a non-negative integer (got {value})"
-                    ),
+                    "ProxyConfig spec.concurrency must be a non-negative integer".to_string(),
                 )
             })?;
             Some(u32::try_from(raw).map_err(|_| {
                 invalid_resource(
                     object,
                     format!(
-                        "ProxyConfig spec.concurrency must fit in u32 (0..={}), got {raw}",
+                        "ProxyConfig spec.concurrency must fit in u32 (0..={})",
                         u32::MAX
                     ),
                 )
@@ -7668,19 +7662,13 @@ fn proxy_config(
             let sampling = value.as_f64().ok_or_else(|| {
                 invalid_resource(
                     object,
-                    format!(
-                        "ProxyConfig spec.tracing.sampling must be a number between 0 and 100 \
-                         (got {value})"
-                    ),
+                    "ProxyConfig spec.tracing.sampling must be a number between 0 and 100".to_string(),
                 )
             })?;
             if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
                 return Err(invalid_resource(
                     object,
-                    format!(
-                        "ProxyConfig spec.tracing.sampling must be between 0 and 100 \
-                         (got {sampling})"
-                    ),
+                    "ProxyConfig spec.tracing.sampling must be between 0 and 100".to_string(),
                 ));
             }
             Some(sampling)
