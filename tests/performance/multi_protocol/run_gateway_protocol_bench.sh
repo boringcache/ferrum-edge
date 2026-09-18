@@ -15,7 +15,12 @@
 #   --concurrency 100
 #   --output-dir /tmp/gateway-protocol-results
 #   --skip-build                (reuse existing proto_bench binaries + ferrum docker image)
-#   --skip-direct               (skip direct-backend baseline)
+#   --skip-direct               (accepted for frozen workflow; pairs always include direct)
+#   --pairs N                   (even integer 2..12, default 2)
+#   --baseline-image IMAGE      (optional pinned Ferrum reference image)
+#   --adaptive                  (opt in to one budget-gated extension)
+#   --wallclock-budget-seconds N (per invocation, default 4200)
+#   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -51,6 +56,14 @@ CONCURRENCY=100
 OUTPUT_DIR="/tmp/gateway-protocol-results"
 SKIP_BUILD=false
 SKIP_DIRECT=false
+PAIRS=2
+ADAPTIVE=false
+WALLCLOCK_BUDGET=4200
+PROCESS_USAGE=true
+BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
+PAIR=0
+ORDER_POSITION=0
+HOST_ID=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,15 +74,39 @@ while [[ $# -gt 0 ]]; do
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --skip-direct) SKIP_DIRECT=true; shift ;;
+        --pairs) PAIRS="$2"; shift 2 ;;
+        --baseline-image) BASELINE_IMAGE="$2"; shift 2 ;;
+        --adaptive) ADAPTIVE=true; shift ;;
+        --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
+        --no-process-usage) PROCESS_USAGE=false; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-# DURATION is used in Bash arithmetic below. Validate it before arithmetic
-# expansion so caller-controlled values cannot be evaluated as expressions.
+# DURATION and PAYLOAD_SIZES reach Bash arithmetic below. Validate first so
+# caller-controlled values cannot be evaluated as expressions.
 if [[ ! $DURATION =~ ^[0-9]+$ ]]; then
     echo "--duration must be a non-negative integer" >&2
     exit 2
+fi
+if [[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]; then
+    echo "--payload-sizes must be non-negative integers separated by single spaces" >&2
+    exit 2
+fi
+
+if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]]; then
+    echo "--pairs must be an EVEN integer from 2 through 12 for exact position balance" >&2
+    exit 2
+fi
+if [[ ! $WALLCLOCK_BUDGET =~ ^[1-9][0-9]{0,4}$ ]]; then
+    echo "--wallclock-budget-seconds must be a positive integer (at most 99999)" >&2
+    exit 2
+fi
+if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
+    PROCESS_USAGE=false
+fi
+if ! $PROCESS_USAGE; then
+    echo "[warn] process_usage unavailable; samples are diagnostic and invalid for paired comparisons" >&2
 fi
 
 # UDP protocols are fixed to 1 KB regardless of caller.
@@ -181,10 +218,15 @@ KRAKEND_IMAGE="krakend:2.13.2"
 BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
+sampler_pid=""
 CERT_DIR="$SCRIPT_DIR/certs"
 
 cleanup() {
     echo "[cleanup] stopping all processes..."
+    if [ -n "$sampler_pid" ]; then
+        kill -TERM "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" || true
+    fi
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
@@ -725,15 +767,43 @@ run_bench() {
     # timeouts, but this outer `timeout` is a belt-and-suspenders guard
     # against any future hang path (new protocol handler, dependency change,
     # etc.) that would otherwise let a single stuck bench eat the workflow's
-    # 75-minute step budget. DURATION seconds of actual work + 60s head-room
+    # 75-minute step budget. DURATION seconds of actual work + 120s head-room
     # for connect/handshake/teardown.
-    local bench_wallclock=$(( DURATION + 60 ))
+    local bench_wallclock=$(( DURATION + 120 + (payload + 131071) / 131072 ))
 
     # `|| rc=$?` captures the exit code without tripping `set -e`. Using an
     # `if !` branch here would clear $? inside the then-block (bash semantics
     # of the `!` negation), so we'd lose the ability to distinguish a 124
     # (timeout) from a generic non-zero exit.
     local rc=0
+    local diagnostics="$OUTPUT_DIR/diagnostics"
+    mkdir -p "$diagnostics"
+    local gateway_pids=""
+    if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
+        gateway_pids=$(docker top "$GATEWAY_CID" -eo pid | tail -n +2 | tr '\n' ' ' || true)
+    fi
+    local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
+    if $PROCESS_USAGE; then
+        : > "$usage"
+        python3 "$SCRIPT_DIR/process_usage.py" \
+            --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+            --output "$usage" --interval 0.5 &
+        sampler_pid=$!
+        # Wait for the first observation and installed signal handlers. Without
+        # readiness, an immediately failing client could leave SIGINT ignored.
+        local sampler_wait=0
+        while [ ! -s "$usage" ] && kill -0 "$sampler_pid" 2>/dev/null && [ "$sampler_wait" -lt 100 ]; do
+            sleep 0.05
+            sampler_wait=$(( sampler_wait + 1 ))
+        done
+        if [ ! -s "$usage" ]; then
+            kill -TERM "$sampler_pid" 2>/dev/null || true
+            wait "$sampler_pid" || true
+            sampler_pid=""
+        fi
+    else
+        echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
+    fi
     if [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "${bench_wallclock}s" \
             "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
@@ -751,6 +821,11 @@ run_bench() {
             --payload-size "$payload" \
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
+    fi
+    if [ -n "$sampler_pid" ]; then
+        kill -INT "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" || true
+        sampler_pid=""
     fi
     # Capture after the timed load, while the gateway still exists. Keep these
     # below a subdirectory so summary globs cannot mistake stats for samples.
@@ -776,24 +851,12 @@ run_bench() {
             echo "[bench] FAILED (rc=$rc): $gateway/$PROTOCOL payload=${payload}B — see ${out}.err"
             echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"effective_concurrency\":$effective_concurrency,\"error\":\"bench failed\",\"rps\":0}" > "$out"
         fi
-        return 0
     fi
 
     # Stamp metadata into JSON for aggregation.
-    python3 - "$out" "$gateway" "$payload" "$effective_concurrency" <<'PYEOF'
-import json, sys
-path, gateway, payload, concurrency = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-try:
-    with open(path) as f:
-        d = json.load(f)
-except Exception:
-    d = {"rps": 0, "error": "unparseable"}
-d["gateway"] = gateway
-d["payload_size"] = payload
-d["effective_concurrency"] = concurrency
-with open(path, "w") as f:
-    json.dump(d, f, indent=2)
-PYEOF
+    python3 "$SCRIPT_DIR/benchmark_plan.py" stamp \
+        "$out" "$gateway" "$payload" "$effective_concurrency" \
+        "$PAIR" "$ORDER_POSITION" "$HOST_ID" "$usage" "$GATEWAY_ORDER"
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
@@ -813,61 +876,122 @@ main() {
     mkdir -p "$OUTPUT_DIR"
     echo "[main] protocol=$PROTOCOL sizes=$PAYLOAD_SIZES gateways=$GATEWAYS"
 
-    # Persist the intended matrix before any build/startup can fail. Missing
-    # gateways must not disappear and leave the survivors with a false win.
-    local expected_gateways=""
+    # A paired suite is self-contained even when the frozen caller passes
+    # --skip-direct after iteration one. Every pair measures direct again.
+    if $SKIP_DIRECT; then
+        echo "[main] --skip-direct ignored: each pair requires its own direct baseline"
+    fi
+    local expected_gateways="direct"
     for gw in $GATEWAYS; do
         if supports "$gw" "$PROTOCOL"; then expected_gateways+=" $gw"; fi
     done
-    if ! $SKIP_DIRECT; then expected_gateways="direct $expected_gateways"; fi
-    python3 - "$OUTPUT_DIR/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" <<'PYEOF'
+    if [ -n "$BASELINE_IMAGE" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
+        expected_gateways+=" ferrum-baseline"
+    fi
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        HOST_ID=$(cat /proc/sys/kernel/random/boot_id)
+    else
+        HOST_ID="$(hostname)-$$"
+    fi
+    local root_output="$OUTPUT_DIR"
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
-               "payload_sizes": [int(size) for size in sys.argv[3].split()]}, manifest)
+               "payload_sizes": [int(size) for size in sys.argv[3].split()],
+               "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
+               "sample_schema": 2}, manifest)
 PYEOF
 
     build_binaries
-    start_backend
-
-    # Direct baseline first (no gateway interference)
-    if ! $SKIP_DIRECT; then
-        for size in $PAYLOAD_SIZES; do
-            run_bench "direct" "$size" "direct"
+    # Save immutable image IDs as well as operator-supplied tags for revision A/B.
+    docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
+        --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
+        > "$root_output/images.txt"
+    local requested_pairs="$PAIRS"
+    local final_pairs="$PAIRS"
+    local extended=false
+    local first_pair=1
+    local base_started=$SECONDS
+    while true; do
+        for PAIR in $(seq "$first_pair" "$final_pairs"); do
+            OUTPUT_DIR="$root_output/pairs/$(printf 'pair_%03d' "$PAIR")"
+            mkdir -p "$OUTPUT_DIR"
+            GATEWAY_ORDER=$(python3 "$SCRIPT_DIR/benchmark_plan.py" order "$PAIR" "$expected_gateways")
+            ORDER_POSITION=0
+            for gw in $GATEWAY_ORDER; do
+                ORDER_POSITION=$(( ORDER_POSITION + 1 ))
+                # Fresh backend for every arm, including direct: no lingering
+                # DTLS sessions or gateway-specific backend state crosses arms.
+                if [ -n "$BACKEND_PID" ]; then
+                    kill "$BACKEND_PID" 2>/dev/null || true
+                    wait "$BACKEND_PID" 2>/dev/null || true
+                fi
+                start_backend
+                case "$gw" in
+                    direct) ;;
+                    ferrum) start_ferrum ;;
+                    ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
+                    envoy) start_envoy ;;
+                    kong) start_kong ;;
+                    tyk) start_tyk ;;
+                    krakend) start_krakend ;;
+                esac || { echo "[main] $gw failed to start"; stop_gateway; continue; }
+                for size in $PAYLOAD_SIZES; do
+                    if [ "$gw" = direct ]; then
+                        run_bench "$gw" "$size" direct
+                    else
+                        run_bench "$gw" "$size" gateway
+                    fi
+                done
+                stop_gateway
+            done
         done
-        # Restart backend so gateways get a clean server with no leftover
-        # session state. DTLS in particular accumulates per-client state
-        # machines that linger for 60s after the direct test ends; those
-        # zombie sessions contend for CPU and cause ferrum's backend DTLS
-        # handshake to stall on the first gateway run.
-        echo "[main] restarting backend (clean slate for gateway tests)..."
-        [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-        sleep 1
-        start_backend
-    fi
-
-    for gw in $GATEWAYS; do
-        if ! supports "$gw" "$PROTOCOL"; then
-            echo "[main] skipping $gw: does not support $PROTOCOL"
-            continue
+        OUTPUT_DIR="$root_output"
+        local decision
+        decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" summarize "$OUTPUT_DIR" \
+            "$PROTOCOL" "$expected_gateways" "$PAYLOAD_SIZES" "$final_pairs")
+        if ! $extended; then
+            local pair_seconds=$(( (SECONDS - base_started + requested_pairs - 1) / requested_pairs ))
+            decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" extension \
+                "$OUTPUT_DIR/manifest.json" "$ADAPTIVE" "$decision" "$SECONDS" \
+                "$pair_seconds" "$requested_pairs" "$WALLCLOCK_BUDGET")
+            echo "[main] extension decision: $decision"
         fi
-        echo "[main] === $gw ==="
-        case "$gw" in
-            ferrum)  start_ferrum ;;
-            envoy)   start_envoy ;;
-            kong)    start_kong ;;
-            tyk)     start_tyk ;;
-            krakend) start_krakend ;;
-        esac || { echo "[main] $gw failed to start, skipping"; stop_gateway; continue; }
-
-        for size in $PAYLOAD_SIZES; do
-            run_bench "$gw" "$size" "gateway"
-        done
-        stop_gateway
+        if ! $extended && [ "$decision" = extend ]; then
+            # One bounded extension of the WHOLE matrix, never just the loser.
+            extended=true
+            first_pair=$(( final_pairs + 1 ))
+            final_pairs=$(( final_pairs + requested_pairs ))
+            DURATION=$(( DURATION * 2 ))
+            # Publish missing placeholders BEFORE extended work begins, so a
+            # killed extension cannot leave a deceptively complete first block.
+            python3 "$SCRIPT_DIR/benchmark_plan.py" summarize "$OUTPUT_DIR" \
+                "$PROTOCOL" "$expected_gateways" "$PAYLOAD_SIZES" "$final_pairs" >/dev/null
+            python3 - "$OUTPUT_DIR/manifest.json" "$final_pairs" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    plan = json.load(f)
+plan.update(pairs=int(sys.argv[2]), adaptive_extension=True)
+with open(path, "w") as f:
+    json.dump(plan, f, indent=2)
+PYEOF
+            echo "[main] uncertainty overlaps gain: adding $requested_pairs pairs at ${DURATION}s"
+        else
+            break
+        fi
     done
-
+    python3 - "$OUTPUT_DIR/manifest.json" "$final_pairs" "$extended" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    plan = json.load(f)
+plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
+with open(path, "w") as f:
+    json.dump(plan, f, indent=2)
+PYEOF
     echo "[main] done. results in $OUTPUT_DIR"
-    ls -la "$OUTPUT_DIR"
 }
 
 main

@@ -439,6 +439,13 @@ jobs:
           retention-days: 90
 
   aggregate:
+    # Maximum safe dispatch inputs (full http1-tls: 6 arms x 5 sizes; adaptive off).
+    # Planning envelope: iterations * pairs * 30 * (duration + 15) / 60 + 5 minutes.
+    # duration x iterations x pairs -> projected minutes (75-minute frozen step):
+    # 10 x 1 x 2 -> 30; 15 x 1 x 2 -> 35; 15 x 2 x 2 -> 65;
+    #  5 x 3 x 2 -> 65; 15 x 3 x 2 -> 95 (unsafe); 15 x 1 x 4 -> 65.
+    # Reserve >=10 minutes; 15s/call overhead is an estimate, not a timeout guarantee.
+    # The frozen dispatcher cannot set pairs/adaptive: defaults are 2/off.
     name: Aggregate Results
     runs-on: ubuntu-latest
     needs: benchmark
@@ -466,6 +473,7 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, "tests/performance/multi_protocol")
           from benchmark_validity import bucket_issues, expected_rows, throughput_value
+          from benchmark_plan import read_comparisons
 
           iterations = int(os.environ.get("ITERATIONS", "1"))
           root = Path("all-results")
@@ -511,6 +519,18 @@ jobs:
                       data.setdefault(protocol, {}).setdefault((gw, size), []).append(rps)
                       latest.setdefault(protocol, {})[(gw, size)] = d
 
+          # Preserve flattened per-sample evidence in the combined artifact.
+          records = [dict(child, matrix_protocol=proto, gateway=gw, payload_size=size)
+                     for proto, buckets in samples.items()
+                     for (gw, size), rows in buckets.items()
+                     for row in rows for child in row.get("samples", [row])]
+          (root / "observed-samples.json").write_text(json.dumps(records, indent=2) + "\n")
+          paired = []
+          for path in sorted(root.glob("*/run_*/paired_comparisons.json")):
+              for row in read_comparisons(path):
+                  paired.append(dict(row, run=str(path.parent.relative_to(root))))
+          (root / "paired-comparisons.json").write_text(json.dumps(paired, indent=2) + "\n")
+
           def fmt_rps(v): return f"{v:,.0f}" if v else "—"
           def fmt_bytes(b):
               if b >= 1_048_576: return f"{b/1_048_576:.1f}MB"
@@ -520,6 +540,30 @@ jobs:
           lines = []
           lines.append("# Gateways × Protocols Benchmark — Combined Results\n")
           lines.append(f"**Duration:** {os.environ['DURATION']}s  |  **Concurrency:** {os.environ['CONCURRENCY']}  |  **Iterations:** {iterations}\n")
+
+          lines.append(f"**Paired evidence:** {len(records)} raw samples retained in "
+                       "`observed-samples.json`; phase timing, observed workers/connections/streams, "
+                       "client admission queues, and per-process CPU/RSS are included.\n")
+          lines.append("### Same-host paired comparisons\n")
+          lines.append("| Run | Baseline → Candidate | Payload | Ratio (95% paired interval) |")
+          lines.append("|-----|----------------------|---------|----------------------------|")
+          for row in paired:
+              result = row.get("reason", "unavailable")
+              if row.get("accepted"):
+                  result = (f"{row['ratio']:.3f} ({row['ci95_low']:.3f}–{row['ci95_high']:.3f}); "
+                            + result)
+              lines.append(f"| {row['run']} | {row.get('baseline', '?')} → {row.get('candidate', '?')} | "
+                           f"{fmt_bytes(row.get('payload_size', 0))} | {result} |")
+          lines.append("")
+
+          lines.append("### Planned position balance\n")
+          lines.append("| Run | Arm | Positions | Mean position |")
+          lines.append("|-----|-----|-----------|---------------|")
+          for path in sorted(root.glob("*/run_*/position_balance.json")):
+              for row in read_comparisons(path):
+                  lines.append(f"| {path.parent.relative_to(root)} | {row.get('gateway', '?')} | "
+                               f"{row.get('positions', row.get('reason'))} | {row.get('mean_position', '?')} |")
+          lines.append("")
 
           # Rank only complete, error-free scenarios. One bad iteration
           # invalidates the scenario; never cherry-pick clean iterations.
@@ -534,7 +578,7 @@ jobs:
                   continue
               for s in sizes:
                   contenders = [(g, sum(buckets[(g, s)]) / len(buckets[(g, s)]))
-                                for g in ("ferrum", "envoy", "kong", "tyk", "krakend")
+                                for g in ("ferrum-baseline", "ferrum", "envoy", "kong", "tyk", "krakend")
                                 if (g, s) in buckets and buckets[(g, s)]]
                   expected_gateways = {g for g, size in buckets
                                        if g != "direct" and size == s}
@@ -581,7 +625,7 @@ jobs:
               buckets = data[proto]
               lines.append(f"\n## {proto}\n")
               sizes = sorted({s for (_, s) in buckets})
-              gateways = [g for g in ("direct", "ferrum", "envoy", "kong", "tyk", "krakend")
+              gateways = [g for g in ("direct", "ferrum-baseline", "ferrum", "envoy", "kong", "tyk", "krakend")
                           if any((g, s) in buckets for s in sizes)]
 
               lines.append("### Validity across all iterations\n")
@@ -589,7 +633,7 @@ jobs:
               lines.append("|---------|---------|----------|")
               for g in gateways:
                   for s in sizes:
-                      issues = bucket_issues(samples[proto].get((g, s), []), 1 if g == "direct" else iterations)
+                      issues = bucket_issues(samples[proto].get((g, s), []), iterations)
                       lines.append(f"| {g} | {fmt_bytes(s)} | " + ("; ".join(issues) if issues else "clean") + " |")
 
               # Throughput table
@@ -645,7 +689,7 @@ jobs:
           lines.append("\n---\n")
           lines.append("### Notes\n")
           lines.append("- Gateways that do not support a protocol are omitted from that protocol's tables.")
-          lines.append("- `direct` = bench against `proto_backend` directly (no gateway), as the baseline.")
+          lines.append("- `direct` is repeated in every pair. Ratios include client/backend cost on the shared runner; they are not isolated proxy CPU cost.")
           lines.append("- UDP and UDP+DTLS use a fixed 1KB payload; all other protocols sweep 10KB–5MB.")
           lines.append("- Every cell is protocol-uniform end-to-end: the same protocol on "
                        "client→gateway and gateway→backend. Gateways that could only do half a "
@@ -666,6 +710,7 @@ jobs:
           PYEOF
 
       - name: Upload combined artifact
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: gateways-protocol-bench-combined-${{ github.sha }}

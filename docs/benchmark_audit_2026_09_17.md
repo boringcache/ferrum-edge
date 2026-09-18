@@ -78,7 +78,8 @@ with errors. Re-rendering the artifacts with the revised validity rules
 excludes 16 of 31 opposed scenarios. The remaining 15 still include old H3
 measurements: passing validity checks does not prove configuration parity.
 
-The following limitations remain even after the reporting repair:
+The following limitations applied after the initial reporting repair (the
+section-1 harness follow-up below addresses timing, observations and pairing):
 
 - Client, backend, and gateway share a runner. Throughput includes their CPU,
   memory, scheduling, and TLS costs. Direct/gateway RPS differences are useful
@@ -96,6 +97,49 @@ The following limitations remain even after the reporting repair:
   `effective_concurrency` is a requested worker count, not observed active
   streams. Record worker loss and actual concurrency/queueing in a future
   harness revision; invalidate any failed sample rather than retrying it away.
+
+**Section 1 harness follow-up (#5588).** The new client establishes transports,
+warms each worker with one validated echo, waits at a common measurement barrier,
+and drains admitted exchanges separately. Only completions before the exclusive
+deadline enter throughput and latency; warmup and drain counts/times are retained.
+H3 endpoints explicitly close after drain. Sampled worker, physical client
+connection, locally admitted stream/exchange and client admission-queue gauges
+replace inference from requested `effective_concurrency`. Queue totals, barrier
+participation and worker retirement are recorded in every raw sample. Server
+stream admission and kernel/QUIC queue depths remain separate transport questions.
+
+The runner now defaults to two counterbalanced same-host pairs per
+invocation, repeats direct in every pair, and supports a separately provisioned
+`ferrum-baseline` image for revision comparisons. Per-PID gateway/client/backend
+CPU and RSS series include explicit measurement brackets and sampling slack.
+The shell retains the static `timeout`/`gtimeout` client invocation; a passive
+500 ms `/proc` sampler observes it and is signalled/reaped after the load.
+Client CPU now comes from its own `getrusage` snapshots at the measurement
+boundaries, with lifetime peak RSS recorded at the end; every required process
+role must have a complete bracket. Never-observed transient gateway PIDs are
+diagnostic. At least one gateway PID must be observed, and every observed gateway
+PID must span the measurement window; even a PID observed once that exits
+mid-window invalidates the sample. Only even pair counts are accepted, and the
+combined summary exposes position balance.
+Adaptive extension is opt-in and gated on measured per-pair cost and remaining
+wall-clock budget; the frozen job defaults to two pairs without extension.
+Use at least four predeclared pairs for a performance claim. Invalid pairs remain invalid; unresolved
+uncertainty requires a longer predeclared experiment. This exploratory adaptation
+does not by itself establish a statistically confirmed gain. Existing report
+fields remain available, with raw constituent samples retained in aggregate
+artifacts. The Cross-frozen benchmark job is unchanged.
+
+See the [harness phases and paired procedure](../tests/performance/multi_protocol/README.md#phases-and-observed-concurrency-tracker-5588-section-1)
+for definitions and caveats. TCP/TLS now uses bounded full-duplex echoes instead
+of its former unbounded writer pipeline, identically for all gateways; its older
+rates are therefore not a workload-matched reference. The explicit rolling-budget
+`workload_revision` is now `2026-09-18.phased-bounded-echo.v1`: the evaluator
+excludes old/unmarked points and restarts its window, preventing a deliberate
+workload/accounting change from alerting as a regression. Absolute budgets and
+the shared-harness historical H1 ratio reference remain unchanged. The historical runs in this
+audit are not retroactively repaired by the harness change. A short hosted smoke
+run verifies artifact plumbing, not a revision performance improvement; production
+optimization experiments and the rest of #5588 remain open.
 
 **Completed current-main comparison.** Run 35195212169 has the same 141 groups,
 359 samples, three iterations, 15-second duration, and scaled concurrency as

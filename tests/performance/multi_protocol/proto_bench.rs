@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -13,8 +13,10 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
 use bytes::Buf;
-use multi_protocol_perf::metrics::{BenchMetrics, collect_results};
+use multi_protocol_perf::metrics::BenchMetrics;
+use multi_protocol_perf::phases::{Connections, Phases};
 use multi_protocol_perf::tls_utils;
+use multi_protocol_perf::transport::{ObservedBody, ObservedChannel, echo_exchange, request_body};
 
 // ── gRPC proto ───────────────────────────────────────────────────────────────
 
@@ -265,7 +267,9 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         None
     };
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
     let protocol_label = if is_tls { "HTTP/1.1+TLS" } else { "HTTP/1.1" };
     let payload = Bytes::from(make_payload(args.payload_size));
 
@@ -275,51 +279,55 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         let authority = authority.clone();
         let tls_connector = tls_connector.clone();
         let payload = payload.clone();
+        let mut metrics = phases.worker();
+        let connections = connections.clone();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
-
             // Helper to create a connection (plain or TLS)
             async fn connect_h1(
                 addr: SocketAddr,
+                connections: &Connections,
                 tls: &Option<(
                     tokio_rustls::TlsConnector,
                     rustls::pki_types::ServerName<'static>,
                 )>,
-            ) -> anyhow::Result<hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>>
-            {
+            ) -> anyhow::Result<hyper::client::conn::http1::SendRequest<ObservedBody>> {
                 let tcp = tokio::net::TcpStream::connect(addr).await?;
                 let _ = tcp.set_nodelay(true);
                 if let Some((connector, server_name)) = tls {
                     let tls_stream = connector.connect(server_name.clone(), tcp).await?;
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
+                    let connection = connections.opened();
                     tokio::spawn(async move {
+                        let _connection = connection;
                         let _ = conn.await;
                     });
                     Ok(sr)
                 } else {
                     let io = hyper_util::rt::TokioIo::new(tcp);
                     let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
+                    let connection = connections.opened();
                     tokio::spawn(async move {
+                        let _connection = connection;
                         let _ = conn.await;
                     });
                     Ok(sr)
                 }
             }
 
-            let mut send_req = connect_h1(addr, &tls_connector).await?;
+            let mut send_req = connect_h1(addr, &connections, &tls_connector).await?;
             let mut reconnects: u64 = 0;
 
-            while Instant::now() < deadline {
+            while metrics.next_request().await {
                 // Reconnect if the connection was closed
                 if send_req.is_closed() {
                     reconnects += 1;
-                    send_req = connect_h1(addr, &tls_connector).await?;
+                    send_req = connect_h1(addr, &connections, &tls_connector).await?;
                 }
 
                 let req = hyper::Request::post(&path)
                     .header("host", &authority)
-                    .body(http_body_util::Full::new(payload.clone()))
+                    .body(request_body(payload.clone(), metrics.admission()))
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
@@ -366,11 +374,11 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                     metrics.total_requests
                 );
             }
-            Ok(metrics)
+            Ok(metrics.finish_worker())
         }));
     }
 
-    let combined = collect_results(handles).await;
+    let combined = phases.finish(handles).await;
     print_results(&combined, protocol_label, args);
     Ok(())
 }
@@ -403,7 +411,9 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         url.path()
     );
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
 
     let tls_cfg = if is_tls {
         // Force ALPN to h2-only on the client side. The shared
@@ -460,14 +470,18 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
             let tls_stream = connector.connect(server_name, tcp).await?;
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let (sr, conn) = make_h2_builder().handshake(io).await?;
+            let connection = connections.opened();
             tokio::spawn(async move {
+                let _connection = connection;
                 let _ = conn.await;
             });
             sr
         } else {
             let io = hyper_util::rt::TokioIo::new(tcp);
             let (sr, conn) = make_h2_builder().handshake(io).await?;
+            let connection = connections.opened();
             tokio::spawn(async move {
+                let _connection = connection;
                 let _ = conn.await;
             });
             sr
@@ -484,11 +498,11 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         let mut send_req = senders[i as usize % num_conns].clone();
         let uri = request_uri.clone();
         let payload = payload.clone();
+        let mut metrics = phases.worker();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
-            while Instant::now() < deadline {
+            while metrics.next_request().await {
                 let req = hyper::Request::post(&uri)
-                    .body(http_body_util::Full::new(payload.clone()))
+                    .body(request_body(payload.clone(), metrics.admission()))
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
@@ -519,11 +533,11 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ok::<_, anyhow::Error>(metrics)
+            Ok::<_, anyhow::Error>(metrics.finish_worker())
         }));
     }
 
-    let combined = collect_results(handles).await;
+    let combined = phases.finish(handles).await;
     print_results(&combined, "HTTP/2", args);
     Ok(())
 }
@@ -539,7 +553,9 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         .context("invalid address")?;
     let path = url.path().to_string();
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
     let client_cfg = tls_utils::make_h3_client_config_insecure();
 
     // HTTP/3 multiplexes streams over QUIC connections. Use a connection pool
@@ -558,6 +574,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     let mut senders: Vec<h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>> =
         Vec::with_capacity(num_conns);
 
+    let mut endpoints = Vec::with_capacity(num_conns);
     for _ in 0..num_conns {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
         endpoint.set_default_client_config(client_cfg.clone());
@@ -570,8 +587,11 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn))
             .await
             .map_err(|e| anyhow::anyhow!("h3 handshake: {e}"))?;
+        endpoints.push(endpoint);
+        let connection = connections.opened();
         // h3 driver must be polled concurrently to process connection frames
         tokio::spawn(async move {
+            let _connection = connection;
             let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
         senders.push(send_req);
@@ -585,9 +605,9 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         let mut send_req = senders[i as usize % num_conns].clone();
         let full_uri = full_uri.clone();
         let payload = payload.clone();
+        let mut metrics = phases.worker();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
-            while Instant::now() < deadline {
+            while metrics.next_request().await {
                 let req = http::Request::builder()
                     .method("POST")
                     .uri(&full_uri)
@@ -596,6 +616,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                 let start = Instant::now();
                 match send_req.send_request(req).await {
                     Ok(mut stream) => {
+                        metrics.admitted();
                         if let Err(e) = stream.send_data(payload.clone()).await {
                             eprintln!("  h3 send_data error: {e}");
                             metrics.record_error();
@@ -678,11 +699,29 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ok::<_, anyhow::Error>(metrics)
+            Ok::<_, anyhow::Error>(metrics.finish_worker())
         }));
     }
 
-    let combined = collect_results(handles).await;
+    let mut combined = phases.finish(handles).await;
+    let close_started = Instant::now();
+    for endpoint in &endpoints {
+        endpoint.close(0u32.into(), b"benchmark drained");
+    }
+    for endpoint in endpoints {
+        if tokio::time::timeout(Duration::from_secs(5), endpoint.wait_idle())
+            .await
+            .is_err()
+        {
+            eprintln!("H3 endpoint close timed out");
+            if let Some(phases) = &mut combined.phases {
+                phases.transport_close_timed_out = true;
+            }
+        }
+    }
+    if let Some(phases) = &mut combined.phases {
+        phases.transport_close_secs = close_started.elapsed().as_secs_f64();
+    }
     print_results(&combined, "HTTP/3", args);
     Ok(())
 }
@@ -694,7 +733,9 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
     use tokio_tungstenite::Connector;
     use tokio_tungstenite::tungstenite::Message;
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
     let mut handles = Vec::new();
     let payload = make_payload(args.payload_size);
 
@@ -724,9 +765,9 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
         let target = args.target.clone();
         let payload = payload.clone();
         let connector = connector.clone();
+        let mut metrics = phases.worker();
+        let connections = connections.clone();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
-
             // Count connect failures as errors in the JSON report rather than
             // propagating via `?`. Otherwise the task returns Err, collect_results
             // prints a stderr line, and the aggregated metrics show 0 errors /
@@ -741,13 +782,15 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
                 Err(e) => {
                     eprintln!("  task error: ws connect: {e}");
                     metrics.record_error();
-                    return Ok::<_, anyhow::Error>(metrics);
+                    return Ok::<_, anyhow::Error>(metrics.finish_worker());
                 }
             };
+            let _connection = connections.opened();
             let (mut write, mut read) = ws.split();
 
-            while Instant::now() < deadline {
+            while metrics.next_request().await {
                 let start = Instant::now();
+                metrics.admitted();
                 if write.send(Message::Binary(payload.clone())).await.is_err() {
                     metrics.record_error();
                     break;
@@ -809,11 +852,11 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ok::<_, anyhow::Error>(metrics)
+            Ok::<_, anyhow::Error>(metrics.finish_worker())
         }));
     }
 
-    let combined = collect_results(handles).await;
+    let combined = phases.finish(handles).await;
     print_results(&combined, "WebSocket", args);
     Ok(())
 }
@@ -824,7 +867,9 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     use bench_proto::EchoRequest;
     use bench_proto::bench_service_client::BenchServiceClient;
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
     let payload = make_payload(args.payload_size);
 
     // gRPC TLS requires explicit trust configuration — tonic 0.14 has no
@@ -878,7 +923,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
         }
 
         let channel = endpoint
-            .connect()
+            .connect_with_connector(connections.clone())
             .await
             .map_err(|e| anyhow::anyhow!("gRPC connect to {}: {e}", args.target))?;
         channels.push(channel);
@@ -888,18 +933,21 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     for i in 0..args.concurrency {
         let channel = channels[i as usize % num_conns].clone();
         let payload = payload.clone();
+        let mut metrics = phases.worker();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
             // tonic defaults to a 4 MiB cap on request + response message
             // size; the bench sweeps payloads up to 5 MiB. Without raising
             // both caps, every 5 MiB RPC fails with OutOfRange on the
             // encode side (client) or RESOURCE_EXHAUSTED on the decode
             // side (server). Must match proto_backend's cap.
-            let mut client = BenchServiceClient::new(channel)
-                .max_decoding_message_size(8 * 1024 * 1024)
-                .max_encoding_message_size(8 * 1024 * 1024);
-
-            while Instant::now() < deadline {
+            // Admission shares the worker's atomics; next_request refreshes it.
+            let mut client = BenchServiceClient::new(ObservedChannel {
+                inner: channel,
+                admission: metrics.admission(),
+            })
+            .max_decoding_message_size(8 * 1024 * 1024)
+            .max_encoding_message_size(8 * 1024 * 1024);
+            while metrics.next_request().await {
                 let req = tonic::Request::new(EchoRequest {
                     payload: payload.clone(),
                 });
@@ -918,258 +966,104 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ok::<_, anyhow::Error>(metrics)
+            Ok::<_, anyhow::Error>(metrics.finish_worker())
         }));
     }
 
-    let combined = collect_results(handles).await;
+    let combined = phases.finish(handles).await;
     print_results(&combined, "gRPC", args);
     Ok(())
 }
 
 // ── TCP ──────────────────────────────────────────────────────────────────────
 
-// A reader must only wait for a payload the writer has admitted. Independent
-// deadline loops can otherwise ask for one extra echo just as the writer sends
-// close_notify. Counters preserve the existing pipelined byte stream without an
-// unbounded per-request queue. Notify has a single reader and stores a permit.
-#[derive(Default)]
-struct TcpWriteProgress {
-    admitted: AtomicU64,
-    finished: AtomicBool,
-    changed: tokio::sync::Notify,
-}
+// TCP echoes are closed-loop like the other protocols: one payload per worker.
+// Read concurrently with chunked writes so large TLS echoes cannot deadlock on
+// full socket buffers. The yield releases the split TLS stream between chunks.
+async fn tcp_echo<S>(
+    stream: S,
+    payload: Vec<u8>,
+    mut metrics: BenchMetrics,
+    connections: Connections,
+    label: &str,
+) -> anyhow::Result<BenchMetrics>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
 
-impl TcpWriteProgress {
-    fn admit(&self) {
-        self.admitted.fetch_add(1, Ordering::Release);
-        self.changed.notify_one();
-    }
-
-    fn finish(&self) {
-        self.finished.store(true, Ordering::Release);
-        self.changed.notify_one();
-    }
-
-    async fn wait_for_request(&self, received: u64) -> bool {
-        loop {
-            if received < self.admitted.load(Ordering::Acquire) {
-                return true;
+    let _connection = connections.opened();
+    let (mut read, mut write) = tokio::io::split(stream);
+    let mut response = vec![0; payload.len()];
+    while metrics.next_request().await {
+        let start = Instant::now();
+        metrics.admitted();
+        let exchange = echo_exchange(&mut read, &mut write, &payload, &mut response);
+        match tokio::time::timeout(Duration::from_secs(15), exchange).await {
+            Ok(Ok(_)) => {
+                if !record_echo_result(
+                    &mut metrics,
+                    label,
+                    &response,
+                    &payload,
+                    start.elapsed().as_micros() as u64,
+                ) {
+                    break;
+                }
             }
-            if self.finished.load(Ordering::Acquire) {
-                // The first load can precede the final admission. Observing
-                // finished synchronizes with every admission before it.
-                return received < self.admitted.load(Ordering::Acquire);
+            error => {
+                eprintln!("{label} echo failed: {error:?}");
+                metrics.record_error();
+                break;
             }
-            self.changed.notified().await;
         }
     }
-}
-
-struct FinishTcpWrites(Arc<TcpWriteProgress>);
-
-impl Drop for FinishTcpWrites {
-    fn drop(&mut self) {
-        self.0.finish();
+    match tokio::time::timeout(Duration::from_secs(5), write.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("{label} shutdown failed: {error}"),
+        Err(_) => {
+            eprintln!("{label} shutdown timed out");
+            metrics.transport_close_timed_out = true;
+        }
     }
+    Ok(metrics.finish_worker())
 }
+
+#[cfg(test)]
+#[path = "tests/support/tcp_echo_tests.rs"]
+mod tcp_echo_tests;
 
 async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let addr: SocketAddr = args.target.parse().context("invalid TCP target address")?;
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let mut handles = Vec::new();
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
     let payload = make_payload(args.payload_size);
-    let use_tls = args.tls;
-
-    let tls_cfg = if use_tls {
-        Some(Arc::new(tls_utils::make_client_tls_config_insecure_raw()))
-    } else {
-        None
-    };
-
+    let tls_cfg = args
+        .tls
+        .then(|| Arc::new(tls_utils::make_client_tls_config_insecure_raw()));
+    let mut handles = Vec::new();
     for _ in 0..args.concurrency {
         let payload = payload.clone();
         let tls_cfg = tls_cfg.clone();
+        let metrics = phases.worker();
+        let connections = connections.clone();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
             let tcp = tokio::net::TcpStream::connect(addr).await?;
-            let _ = tcp.set_nodelay(true);
-
-            // Run write_all and read_exact CONCURRENTLY via split + try_join.
-            // The previous sequential `write_all(N); read_exact(N)` pattern
-            // symmetric-deadlocks when N exceeds the kernel socket buffers
-            // (~212 KB default) and both peers try to push at once: each
-            // side's SNDBUF fills before the other drains, neither can
-            // progress. Reproduced locally at payload=1 MiB / concurrency>=10
-            // against proto_backend's TCP+TLS echo — every task stalled
-            // indefinitely and ran out the workflow's 75-min step budget.
-            //
-            // With full-duplex I/O the writer pushes bytes while the reader
-            // simultaneously drains the echo, so 50 conns × 1 MiB completes
-            // well inside DURATION.
+            tcp.set_nodelay(true)?;
             if let Some(tls_cfg) = tls_cfg {
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);
-                let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
-                    .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
+                let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())?;
                 let stream = connector.connect(server_name, tcp).await?;
-                // Spawn writer and reader on SEPARATE tasks. A single-task
-                // `try_join!` over `tokio::io::split(tls_stream)` shares
-                // a BiLock between halves and still deadlocks the TLS
-                // case — confirmed locally at 1 MiB × 50 conns. With
-                // two tasks the reader half can run on a different worker
-                // while the writer is holding the BiLock between chunks.
-                let (mut rd, mut wr) = tokio::io::split(stream);
-                let payload_bytes = payload.clone();
-                let write_deadline = deadline;
-                let progress = Arc::new(TcpWriteProgress::default());
-                let write_progress = progress.clone();
-                let write_task = tokio::spawn(async move {
-                    let _finished = FinishTcpWrites(write_progress.clone());
-                    // Chunk the write + yield_now() between chunks.
-                    // tokio::io::split over tokio_rustls::TlsStream shares a
-                    // BiLock between the read and write halves. poll_write
-                    // on the TLS stream produces Ready synchronously as
-                    // long as the underlying TCP has buffer space — which
-                    // means a naive `wr.write_all(5 MiB)` can complete
-                    // without ever returning Pending, never releases the
-                    // BiLock, and the reader on the other half is starved.
-                    // Reproduced locally at 5 MiB × 25 conns: the writer
-                    // task ran hot while read_exact never got scheduled.
-                    //
-                    // Chunked writes with explicit yield_now() between
-                    // chunks force cooperative yielding so the reader
-                    // can acquire the BiLock and drain the echo stream.
-                    const CHUNK: usize = 65_536;
-                    while Instant::now() < write_deadline {
-                        // Publish before writing so large payloads retain
-                        // full-duplex progress even when socket buffers fill.
-                        write_progress.admit();
-                        let mut offset = 0;
-                        while offset < payload_bytes.len() {
-                            let end = (offset + CHUNK).min(payload_bytes.len());
-                            if wr.write_all(&payload_bytes[offset..end]).await.is_err() {
-                                return Err::<(), ()>(());
-                            }
-                            offset = end;
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                    // Shut down the write half cleanly so the peer sees EOF
-                    // and stops echoing. Without this, the writer task drops
-                    // `wr` at deadline in the middle of a repeated payload
-                    // cycle — the LAST payload is only partially sent, the
-                    // reader is mid-way through a `read_exact(payload.len())`
-                    // that will never complete (the remaining bytes will
-                    // never arrive because we're no longer writing), and the
-                    // TCP FIN is never issued because `rd` on the other task
-                    // still keeps the TlsStream alive. Reader hangs forever
-                    // until the process wallclock-kills. Reproduced locally
-                    // at 500 KiB × 100 conns: ~6/100 connections wedge in
-                    // ESTABLISHED with half-received payloads.
-                    wr.shutdown().await.map_err(|_| ())?;
-                    Ok(())
-                });
-
-                // Read with a per-attempt timeout so a stalled backend or
-                // partial echo cannot wedge the task indefinitely. 15s is
-                // generous — well above the observed CI-runner worst case
-                // (~5-8s under heavy scheduler contention at 200 concurrent
-                // TLS connections on shared runners). The previous 5s caused
-                // false-positive errors on every run.
-                let mut buf = vec![0u8; payload.len()];
-                let mut received = 0;
-                let mut read_failed = false;
-                while Instant::now() < deadline {
-                    let start = Instant::now();
-                    let read_timeout = Duration::from_secs(15);
-                    let response = async {
-                        if !progress.wait_for_request(received).await {
-                            return Ok(None);
-                        }
-                        rd.read_exact(&mut buf).await?;
-                        Ok::<_, std::io::Error>(Some(()))
-                    };
-                    match tokio::time::timeout(read_timeout, response).await {
-                        Ok(Ok(None)) => break,
-                        Ok(Ok(Some(()))) => {
-                            received += 1;
-                            let latency = start.elapsed().as_micros() as u64;
-                            if !record_echo_result(&mut metrics, "TCP+TLS", &buf, &payload, latency)
-                            {
-                                read_failed = true;
-                                break;
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!(
-                                "[tcp-tls] read error after {} requests: {e}",
-                                metrics.total_requests
-                            );
-                            metrics.record_error();
-                            read_failed = true;
-                            break;
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "[tcp-tls] read timeout (15s) after {} requests",
-                                metrics.total_requests
-                            );
-                            metrics.record_error();
-                            read_failed = true;
-                            break;
-                        }
-                    }
-                }
-                // Abort the writer in case the reader exited first (deadline
-                // or error) — otherwise it could keep writing into a dropped
-                // socket until the write fails.
-                write_task.abort();
-                match write_task.await {
-                    Ok(Err(())) if !read_failed => {
-                        eprintln!("[tcp-tls] writer failed before clean shutdown");
-                        metrics.record_error();
-                    }
-                    Err(error) if !error.is_cancelled() && !read_failed => {
-                        eprintln!("[tcp-tls] writer task failed: {error}");
-                        metrics.record_error();
-                    }
-                    _ => {}
-                }
+                tcp_echo(stream, payload, metrics, connections, "TCP+TLS").await
             } else {
-                let (mut rd, mut wr) = tcp.into_split();
-                let mut buf = vec![0u8; payload.len()];
-                while Instant::now() < deadline {
-                    let start = Instant::now();
-                    let res = tokio::try_join!(async { wr.write_all(&payload).await }, async {
-                        rd.read_exact(&mut buf).await.map(|_| ())
-                    },);
-                    match res {
-                        Ok(_) => {
-                            let latency = start.elapsed().as_micros() as u64;
-                            if !record_echo_result(&mut metrics, "TCP", &buf, &payload, latency) {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[tcp] i/o error after {} requests: {e}",
-                                metrics.total_requests
-                            );
-                            metrics.record_error();
-                            break;
-                        }
-                    }
-                }
+                tcp_echo(tcp, payload, metrics, connections, "TCP").await
             }
-            Ok::<_, anyhow::Error>(metrics)
         }));
     }
-
-    let combined = collect_results(handles).await;
-    let proto_name = if args.tls { "TCP+TLS" } else { "TCP" };
-    print_results(&combined, proto_name, args);
+    let combined = phases.finish(handles).await;
+    let label = if args.tls { "TCP+TLS" } else { "TCP" };
+    print_results(&combined, label, args);
     Ok(())
 }
 
@@ -1178,7 +1072,9 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
 #[allow(unused_assignments)] // next_timeout assignments are defensive — drain loop may not always produce Timeout
 async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid UDP target address")?;
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let mut phases =
+        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let connections = phases.connections();
     let mut handles = Vec::new();
     let payload = make_payload(args.payload_size);
     let use_dtls = args.tls;
@@ -1196,9 +1092,9 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     for _ in 0..args.concurrency {
         let payload = payload.clone();
         let shared_cert = shared_cert.clone();
+        let mut metrics = phases.worker();
+        let connections = connections.clone();
         handles.push(tokio::spawn(async move {
-            let mut metrics = BenchMetrics::new();
-
             if use_dtls {
                 use dimpl::{Config, Dtls, Output};
 
@@ -1273,9 +1169,11 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                 }
 
+                let _connection = connections.opened();
                 // Connected — run echo benchmark using Sans-IO loop
-                'benchmark: while Instant::now() < deadline {
+                'benchmark: while metrics.next_request().await {
                     let start = Instant::now();
+                    metrics.admitted();
                     dtls.send_application_data(&payload).map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
 
                     // Drain encrypted packets until Timeout
@@ -1340,6 +1238,7 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
             } else {
                 let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
                 sock.connect(addr).await?;
+                let _connection = connections.opened();
                 let mut buf = vec![0u8; 65535];
                 // UDP is lossy by nature, and a misconfigured gateway (e.g.
                 // stream proxy that accepts datagrams but never forwards a
@@ -1351,8 +1250,9 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                 // kill the task but a total backend silence still lets the
                 // deadline check terminate the loop.
                 let recv_timeout = Duration::from_secs(1);
-                while Instant::now() < deadline {
+                while metrics.next_request().await {
                     let start = Instant::now();
+                    metrics.admitted();
                     if sock.send(&payload).await.is_err() {
                         metrics.record_error();
                         break;
@@ -1382,11 +1282,11 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ok::<_, anyhow::Error>(metrics)
+            Ok::<_, anyhow::Error>(metrics.finish_worker())
         }));
     }
 
-    let combined = collect_results(handles).await;
+    let combined = phases.finish(handles).await;
     let proto_name = if args.tls { "UDP+DTLS" } else { "UDP" };
     print_results(&combined, proto_name, args);
     Ok(())
@@ -1915,61 +1815,4 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tcp_admission_tests {
-    use super::{FinishTcpWrites, TcpWriteProgress};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn completed_writer_does_not_admit_an_extra_eof_read() {
-        let progress = TcpWriteProgress::default();
-        progress.admit();
-        progress.finish();
-        assert!(progress.wait_for_request(0).await);
-        assert!(!progress.wait_for_request(1).await);
-    }
-
-    #[tokio::test]
-    async fn completion_before_wait_and_coalesced_notifications_keep_all_requests() {
-        let progress = Arc::new(TcpWriteProgress::default());
-        {
-            let _finished = FinishTcpWrites(progress.clone());
-            progress.admit();
-            progress.admit();
-        }
-        assert!(progress.wait_for_request(0).await);
-        assert!(progress.wait_for_request(1).await);
-        assert!(!progress.wait_for_request(2).await);
-    }
-
-    #[tokio::test]
-    async fn pending_reader_wakes_when_writer_finishes_without_a_request() {
-        let progress = TcpWriteProgress::default();
-        let reader = progress.wait_for_request(0);
-        tokio::pin!(reader);
-        assert!(futures_util::poll!(&mut reader).is_pending());
-        progress.finish();
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), reader)
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn admitted_partial_payload_is_still_an_io_failure() {
-        let progress = TcpWriteProgress::default();
-        let (mut reader, mut writer) = tokio::io::duplex(4);
-        progress.admit();
-        writer.write_all(b"ab").await.unwrap();
-        drop(writer);
-        progress.finish();
-        assert!(progress.wait_for_request(0).await);
-        let mut payload = [0; 4];
-        assert!(reader.read_exact(&mut payload).await.is_err());
-    }
 }

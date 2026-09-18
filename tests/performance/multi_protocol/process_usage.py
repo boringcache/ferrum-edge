@@ -1,0 +1,171 @@
+"""Linux /proc sampler for the hosted shared-runner benchmark.
+
+CPU is a per-PID delta, never host utilization. Raw time series retain phase
+boundaries; setup/warmup/drain costs remain visible beside measurement costs.
+"""
+
+import argparse
+import json
+import math
+import os
+import signal
+import time
+from pathlib import Path
+
+
+def parse_stat(contents, ticks, page_size):
+    # comm can contain spaces and parentheses; fields follow its LAST ')'.
+    fields = contents[contents.rfind(")") + 2:].split()
+    return {"start_ticks": int(fields[19]),
+            "cpu_seconds": (int(fields[11]) + int(fields[12])) / ticks,
+            "rss_bytes": int(fields[21]) * page_size}
+
+
+def capture(pid, ticks, page_size):
+    try:
+        return parse_stat(Path(f"/proc/{pid}/stat").read_text(), ticks, page_size)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def measurement_usage(usage, phases):
+    """Bracket the common measured interval; expose sampling uncertainty."""
+    start = phases.get("measurement_start_unix_secs")
+    duration = phases.get("measurement_secs")
+    if not isinstance(start, (int, float)) or not isinstance(duration, (int, float)):
+        return []
+    end = start + duration
+    by_process = {}
+    for snapshot in usage.get("timeline", []):
+        for process in snapshot["processes"]:
+            if process["role"] == "client":
+                continue  # the client's own boundary snapshots are authoritative
+            key = (process["pid"], process["start_ticks"])
+            by_process.setdefault(key, []).append((snapshot["unix_secs"], process))
+    result = []
+    for values in by_process.values():
+        before = [item for item in values if item[0] <= start]
+        after = [item for item in values if item[0] >= end]
+        within = [item for item in values if start <= item[0] <= end]
+        identity = values[0][1]
+        record = dict(pid=identity["pid"], role=identity["role"],
+                      complete_bracket=bool(before and after),
+                      peak_rss_bytes=max((item[1]["rss_bytes"] for item in within), default=None))
+        if before and after:
+            left, right = before[-1], after[0]
+            # Endpoints alone must not hide a vanished/reused process mid-window.
+            record["complete_bracket"] = all(any(
+                p["pid"] == identity["pid"] and p["start_ticks"] == identity["start_ticks"]
+                for p in snapshot["processes"])
+                for snapshot in usage.get("timeline", [])
+                if left[0] <= snapshot["unix_secs"] <= right[0])
+            record.update(cpu_seconds=right[1]["cpu_seconds"] - left[1]["cpu_seconds"],
+                          bracket_secs=right[0] - left[0],
+                          boundary_slack_secs=(start - left[0]) + (right[0] - end))
+        result.append(record)
+    client = phases.get("client_usage")
+    if isinstance(client, dict):
+        result.append(dict(client))
+    return result
+
+
+def client_pids(parent, proc_root=Path("/proc")):
+    """Find only the runner's direct client or the client below GNU timeout."""
+    result = []
+    pending = [parent]
+    while pending:
+        pid = pending.pop()
+        try:
+            children = (proc_root / str(pid) / "task" / str(pid) / "children").read_text()
+        except OSError:
+            continue
+        for child in children.split():
+            if not child.isdecimal():
+                continue
+            try:
+                argv0 = (proc_root / child / "cmdline").read_bytes().split(b"\0", 1)[0]
+            except OSError:
+                continue
+            name = argv0.rsplit(b"/", 1)[-1]
+            if name == b"proto_bench":
+                result.append(int(child))
+            elif pid == parent and name in (b"timeout", b"gtimeout"):
+                pending.append(int(child))
+    return result
+
+
+def sample_processes(backend, gateway_pids, output, interval):
+    """Observe processes until signalled; never launch or control the client."""
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("sampling interval must be positive and finite")
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    # Background jobs inherit ignored SIGINT from Bash. Override it explicitly
+    # before publishing readiness so the runner can always stop and reap us.
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    parent = os.getppid()
+    ticks = os.sysconf("SC_CLK_TCK")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    roles = {pid: "gateway" for pid in gateway_pids}
+    roles[backend] = "backend"
+    records = {}
+    timeline = []
+    started = time.monotonic()
+
+    def sample():
+        for pid in client_pids(parent):
+            roles[pid] = "client"
+        snapshot = {"unix_secs": time.time(), "processes": []}
+        for pid, role in roles.items():
+            state = capture(pid, ticks, page_size)
+            if state is None:
+                continue
+            key = (pid, state["start_ticks"])
+            record = records.setdefault(key, dict(pid=pid, role=role, samples=0,
+                                                 first_cpu_seconds=state["cpu_seconds"],
+                                                 cpu_seconds=0, peak_rss_bytes=0))
+            record["samples"] += 1
+            record["cpu_seconds"] = state["cpu_seconds"] - record["first_cpu_seconds"]
+            record["peak_rss_bytes"] = max(record["peak_rss_bytes"], state["rss_bytes"])
+            snapshot["processes"].append(dict(state, pid=pid, role=role))
+        timeline.append(snapshot)
+
+    try:
+        sample()
+        Path(output).write_text(json.dumps({"capture_complete": False}) + "\n")
+        while not stopping and os.getppid() == parent:
+            sample()
+            time.sleep(interval)
+        sample()
+        clients = [record for record in records.values() if record["role"] == "client"]
+        report = {
+            "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+            "interval_ms": interval * 1000,
+            "elapsed_secs": time.monotonic() - started,
+            "capture_complete": stopping,
+            "processes": list(records.values()),
+            "missing_pids": sorted(set(roles) - {key[0] for key in records}),
+            "client_accounting": "sampled /proc deltas; process endpoints may be missed",
+            "client_cpu_seconds": sum(record["cpu_seconds"] for record in clients) if clients else None,
+            "client_peak_rss_bytes": max((record["peak_rss_bytes"] for record in clients), default=None),
+            "timeline": timeline,
+        }
+        Path(output).write_text(json.dumps(report) + "\n")
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", type=int, required=True)
+    parser.add_argument("--gateway-pids", default="")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--interval", type=float, default=0.5)
+    args = parser.parse_args()
+    sample_processes(args.backend, [int(pid) for pid in args.gateway_pids.split()],
+                     args.output, args.interval)
