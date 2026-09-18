@@ -776,7 +776,7 @@ impl AiStreamRouter {
             config_object,
             "config",
             AI_STREAM_ROUTER_CONFIG_KEYS,
-            "ai_stream_router: ",
+            "ai_stream_router: `config`: ",
         )?;
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
@@ -811,7 +811,7 @@ impl AiStreamRouter {
                 provider_object,
                 &provider_path,
                 AI_STREAM_ROUTER_PROVIDER_KEYS,
-                "ai_stream_router: ",
+                &format!("ai_stream_router: `{provider_path}`: "),
             )?;
 
             let name = pv["name"]

@@ -12793,6 +12793,146 @@ async fn http_records_never_carry_a_grpc_status() {
     );
 }
 
+fn assert_rendered_unknown_transcript_config(
+    config: Value,
+    path: &str,
+    typo: &str,
+    suggestion: &str,
+) {
+    let error = AiTranscriptAudit::new_shape_only(&config, loopback_http_client())
+        .err()
+        .expect("unknown keys must reject shape admission");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(
+        rendered.contains(&format!("ai_transcript_audit: `{path}`:")),
+        "{rendered}"
+    );
+    assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("did you mean `{suggestion}`?")),
+        "{rendered}"
+    );
+    for supplied in ["918273", typo, "payloadKey", "payloadValue"] {
+        assert!(!rendered.contains(supplied), "{rendered}");
+    }
+}
+
+#[test]
+fn rendered_unknown_transcript_sections_retain_fixed_context_without_supplied_data() {
+    for (section, typo, suggestion) in [
+        ("", "modde", "mode"),
+        ("capture", "requestz", "request"),
+        ("sampling", "ratez", "rate"),
+        ("redaction", "builtinz", "builtins"),
+        ("limits", "max_request_bytez", "max_request_bytes"),
+        ("privacy", "path_modz", "path_mode"),
+        ("sink", "endpoint_urz", "endpoint_url"),
+        ("grpc", "methodz", "methods"),
+    ] {
+        for (key, payload) in [
+            ("suppliedKey918273", json!("payloadValue918273")),
+            ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+            ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+        ] {
+            let mut config = config_with_sink("https://audit.example.com/ingest", json!({}));
+            let path = match section {
+                "" => "config".to_string(),
+                "grpc" => "grpc".to_string(),
+                _ => format!("config.{section}"),
+            };
+            let object = if section.is_empty() {
+                &mut config
+            } else {
+                if config.get(section).is_none() {
+                    config[section] = json!({});
+                }
+                &mut config[section]
+            };
+            object[typo] = payload.clone();
+            object[key] = payload;
+            assert_rendered_unknown_transcript_config(config, &path, typo, suggestion);
+        }
+    }
+}
+
+#[test]
+fn rendered_unknown_custom_pattern_retains_second_index_without_name_or_payload() {
+    for name in [
+        "suppliedPattern918273",
+        "918273",
+        "'suppliedPattern918273\"\\\n`suppliedTail918273`",
+    ] {
+        let payload = json!({"payloadKey918273": ["payloadValue918273", 918273]});
+        let config = config_with_sink(
+            "https://audit.example.com/ingest",
+            json!({"redaction": {"custom_patterns": [
+                {"name": "valid-preceding-pattern", "regex": "prior"},
+                {"name": name, "regxe": payload, (name): payload}
+            ]}}),
+        );
+        assert_rendered_unknown_transcript_config(
+            config,
+            "config.redaction.custom_patterns[1]",
+            "regxe",
+            "regex",
+        );
+    }
+}
+
+#[test]
+fn rendered_unknown_grpc_method_config_retains_parent_without_supplied_method_or_keys() {
+    // Method names are validated before the shared unknown-key helper. Keep
+    // this key syntactically valid so every hostile leaf reaches that helper.
+    for key in [
+        "suppliedKey918273",
+        "918273",
+        "'suppliedKey918273\"\\\n`suppliedTail918273`",
+    ] {
+        let payload = json!({"payloadKey918273": ["payloadValue918273", 918273]});
+        let config = config_with_sink(
+            "https://audit.example.com/ingest",
+            json!({"grpc": {
+                "descriptor_path": "/suppliedDescriptor918273.pb",
+                "methods": {"/supplied.Service918273/Call918273": {
+                    "request_typz": payload,
+                    (key): payload
+                }}
+            }}),
+        );
+        assert_rendered_unknown_transcript_config(
+            config,
+            "grpc.methods",
+            "request_typz",
+            "request_type",
+        );
+    }
+}
+
+#[test]
+fn rendered_invalid_grpc_method_keys_preserve_the_earlier_typed_rejection() {
+    for method in [
+        "/918273/918273",
+        "/supplied.Service/'suppliedMethod918273\"\\\n`suppliedTail918273`",
+    ] {
+        let config = config_with_sink(
+            "https://audit.example.com/ingest",
+            json!({"grpc": {
+                "descriptor_path": "/suppliedDescriptor918273.pb",
+                "methods": {(method): {"request_type": "supplied.Request918273"}}
+            }}),
+        );
+        let error = AiTranscriptAudit::new_shape_only(&config, loopback_http_client())
+            .err()
+            .expect("invalid method keys must reject before method-config parsing");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("ai_transcript_audit:"), "{rendered}");
+        assert!(rendered.contains("`grpc.methods` key must be"), "{rendered}");
+        assert!(rendered.contains("`/package.Service/Method` path"), "{rendered}");
+        assert!(!rendered.contains("unknown configuration key"), "{rendered}");
+        assert!(!rendered.contains("918273"), "{rendered}");
+    }
+}
+
 #[test]
 fn transcript_config_header_diagnostics_withhold_keys_and_secret_references() {
     use ferrum_edge::startup::render_startup_error;

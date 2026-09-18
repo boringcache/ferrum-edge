@@ -452,7 +452,7 @@ impl AiRateLimiter {
             object,
             "config",
             AI_RATE_LIMITER_CONFIG_KEYS,
-            "ai_rate_limiter: ",
+            "ai_rate_limiter: `config`: ",
         )?;
 
         let token_limit = required_u64(config, "token_limit")?;
@@ -464,7 +464,8 @@ impl AiRateLimiter {
             "ai_rate_limiter",
             "window_seconds",
             optional_u64(config, "window_seconds")?.unwrap_or(60),
-        )?;
+        )
+        .map_err(|error| format!("ai_rate_limiter: {error}"))?;
 
         let count_mode = optional_string(config, "count_mode")?
             .unwrap_or("total_tokens")
@@ -581,7 +582,8 @@ impl AiRateLimiter {
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("ai_rate_limiter: {error}"))?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),

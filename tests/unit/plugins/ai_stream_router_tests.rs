@@ -365,6 +365,56 @@ fn valid_provider() -> Value {
 }
 
 #[test]
+fn rendered_unknown_config_retains_root_or_second_provider_context_without_supplied_data() {
+    for (key, payload) in [
+        ("suppliedKey918273", json!("payloadValue918273")),
+        ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+        ("'suppliedKey918273\"\\\n`suppliedTail918273`", json!([918273])),
+    ] {
+        for nested in [false, true] {
+            let mut config = openai_and_anthropic_config();
+            config["providers"][1]["name"] = json!(key);
+            let (object, path, typo, suggestion) = if nested {
+                (
+                    &mut config["providers"][1],
+                    "config.providers[1]",
+                    "model_patternz",
+                    "model_patterns",
+                )
+            } else {
+                (&mut config, "config", "enabeld", "enabled")
+            };
+            object[typo] = payload.clone();
+            object[key] = payload.clone();
+            let error = AiStreamRouter::new(&config, http_client())
+                .err()
+                .expect("unknown keys must reject admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(
+                rendered.contains(&format!("ai_stream_router: `{path}`:")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("did you mean `{suggestion}`?")),
+                "{rendered}"
+            );
+            for supplied in [
+                "918273",
+                typo,
+                "payloadKey",
+                "payloadValue",
+                "sk-openai-secret",
+                "sk-ant-secret",
+            ] {
+                assert!(!rendered.contains(supplied), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
 fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
     let mut cfg = json!({
         "enabeld": false,

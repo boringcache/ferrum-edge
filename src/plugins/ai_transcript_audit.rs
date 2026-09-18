@@ -1867,7 +1867,7 @@ impl AiTranscriptAudit {
             config_obj,
             "config",
             AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
-            ERROR_PREFIX,
+            "ai_transcript_audit: `config`: ",
         )?;
         let empty = Value::Object(serde_json::Map::new());
 
@@ -7612,6 +7612,7 @@ fn materialize_sink_headers(
 
 // ---- config parsing helpers ----
 
+// Callers supply only fixed schema paths; document keys must not enter the prefix.
 fn reject_nested_unknown_keys(
     parent: &Value,
     key: &str,
@@ -7619,7 +7620,7 @@ fn reject_nested_unknown_keys(
     allowed: &[&str],
 ) -> Result<(), String> {
     if let Some(Value::Object(map)) = parent.get(key) {
-        reject_unknown_keys(map, path, allowed, ERROR_PREFIX)?;
+        reject_unknown_keys(map, path, allowed, &format!("{ERROR_PREFIX}`{path}`: "))?;
     }
     Ok(())
 }
@@ -7656,7 +7657,7 @@ fn parse_custom_patterns(obj: &Value) -> Result<Vec<(String, String)>, String> {
             map,
             &path,
             AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS,
-            ERROR_PREFIX,
+            &format!("{ERROR_PREFIX}`{path}`: "),
         )?;
         let name = entry.get("name").and_then(|value| value.as_str()).ok_or_else(|| {
             format!("ai_transcript_audit: `redaction.custom_patterns[{index}]` requires a string `name`")
@@ -8357,7 +8358,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         grpc_obj,
         "grpc",
         AI_TRANSCRIPT_AUDIT_GRPC_CONFIG_KEYS,
-        ERROR_PREFIX,
+        "ai_transcript_audit: `grpc`: ",
     )?;
 
     let descriptor_path = cfg_str(grpc, "descriptor_path", "grpc")?
@@ -8412,7 +8413,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
             method_obj,
             "grpc.methods",
             AI_TRANSCRIPT_AUDIT_GRPC_METHOD_KEYS,
-            ERROR_PREFIX,
+            "ai_transcript_audit: `grpc.methods`: ",
         )?;
         let request_type = cfg_str(method_config, "request_type", "grpc.methods")?
             .map(str::trim)

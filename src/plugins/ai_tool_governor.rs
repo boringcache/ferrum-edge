@@ -7025,7 +7025,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         config,
         "config",
         AI_TOOL_GOVERNOR_CONFIG_KEYS,
-        "ai_tool_governor: ",
+        "ai_tool_governor: `config`: ",
     )?;
 
     if let Some(object) = config.get("inspect").and_then(Value::as_object) {
@@ -7033,7 +7033,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
             object,
             "config.inspect",
             AI_TOOL_GOVERNOR_INSPECT_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.inspect`: ",
         )?;
     }
 
@@ -7047,7 +7047,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 object,
                 &tool_path,
                 AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
-                "ai_tool_governor: ",
+                "ai_tool_governor: `config.tools`: ",
             )?;
             if let Some(patterns) = object.get("blocked_arg_patterns").and_then(Value::as_array) {
                 for (idx, entry) in patterns.iter().enumerate() {
@@ -7056,7 +7056,9 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                             entry_obj,
                             &format!("{tool_path}.blocked_arg_patterns[{idx}]"),
                             AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
-                            "ai_tool_governor: ",
+                            &format!(
+                                "ai_tool_governor: `config.tools.*.blocked_arg_patterns[{idx}]`: "
+                            ),
                         )?;
                     }
                 }
@@ -7070,7 +7072,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
             object,
             "config.approval",
             AI_TOOL_GOVERNOR_APPROVAL_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.approval`: ",
         )?;
     }
     if let Some(object) = config.get("response").and_then(Value::as_object) {
@@ -7078,7 +7080,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
             object,
             "config.response",
             AI_TOOL_GOVERNOR_RESPONSE_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.response`: ",
         )?;
     }
     if let Some(object) = config.get("observability").and_then(Value::as_object) {
@@ -7086,7 +7088,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
             object,
             "config.observability",
             AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.observability`: ",
         )?;
     }
 
@@ -7105,7 +7107,7 @@ fn parse_inspect(config: &Value) -> Result<InspectConfig, String> {
             object,
             "config.inspect",
             AI_TOOL_GOVERNOR_INSPECT_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.inspect`: ",
         )?;
     }
     let get = |key: &'static str, default: bool| -> Result<bool, String> {
@@ -7134,7 +7136,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         obj,
         &tool_path,
         AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
-        "ai_tool_governor: ",
+        "ai_tool_governor: `config.tools`: ",
     )?;
 
     // A present-but-non-string `action` is a wrong TYPE, not an omission
@@ -7245,7 +7247,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 entry_obj,
                 &format!("{tool_path}.blocked_arg_patterns[{idx}]"),
                 AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
-                "ai_tool_governor: ",
+                &format!("ai_tool_governor: `config.tools.*.blocked_arg_patterns[{idx}]`: "),
             )?;
             let pattern_name = entry_obj
                 .get("name")
@@ -7332,7 +7334,7 @@ fn parse_approval(
         obj,
         "config.approval",
         AI_TOOL_GOVERNOR_APPROVAL_KEYS,
-        "ai_tool_governor: ",
+        "ai_tool_governor: `config.approval`: ",
     )?;
 
     // As with `tools.<name>.action`, distinguish an absent key from a present
@@ -7453,7 +7455,7 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
             object,
             "config.response",
             AI_TOOL_GOVERNOR_RESPONSE_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.response`: ",
         )?;
     }
 
@@ -7514,7 +7516,7 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
             object,
             "config.observability",
             AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS,
-            "ai_tool_governor: ",
+            "ai_tool_governor: `config.observability`: ",
         )?;
     }
 

@@ -1120,7 +1120,7 @@ impl AiSemanticCache {
             object,
             "config",
             AI_SEMANTIC_CACHE_CONFIG_KEYS,
-            "ai_semantic_cache: ",
+            "ai_semantic_cache: `config`: ",
         )?;
 
         let ttl_seconds = optional_positive_u64(config, "ttl_seconds")?.unwrap_or(300);
