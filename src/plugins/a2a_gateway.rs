@@ -2116,7 +2116,8 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
         })?;
         if parsed.path() != "/" {
             return Err(
-                "a2a_gateway: `discovery.allowed_public_origins` must not contain paths".to_string(),
+                "a2a_gateway: `discovery.allowed_public_origins` must not contain paths"
+                    .to_string(),
             );
         }
         allowed_public_origins.insert(parsed.origin().ascii_serialization());
@@ -2235,7 +2236,9 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
             .ok_or_else(|| "a2a_gateway: `policy.methods` must be an object".to_string())?;
         for (method, value) in methods_object {
             let canonical_method = canonical_policy_method(method).ok_or_else(|| {
-                format!("a2a_gateway: `policy.methods` has unsupported policy method name {method:?}")
+                format!(
+                    "a2a_gateway: `policy.methods` has unsupported policy method name {method:?}"
+                )
             })?;
             let object = value.as_object().ok_or_else(|| {
                 format!("a2a_gateway: `policy.methods` entry {method:?} must be an object")
@@ -4403,7 +4406,8 @@ fn parse_public_base_url(value: &str) -> Result<Url, String> {
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(
-            "a2a_gateway: `discovery.public_base_url` must not contain query or fragment".to_string(),
+            "a2a_gateway: `discovery.public_base_url` must not contain query or fragment"
+                .to_string(),
         );
     }
     // Checked AFTER parsing so a wrong scheme or a missing host still names the

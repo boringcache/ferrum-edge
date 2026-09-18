@@ -1077,7 +1077,10 @@ fn unknown_key_diagnostics_omit_supplied_path_keys_and_keep_schema_context() {
     ] {
         let rendered = render_mcp_config_diagnostic(&schema_fixture(overrides));
         assert!(rendered.contains(field), "{rendered}");
-        assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
         for supplied in ["MCP_TOOL_SECRET", "MCP_SERVER_SECRET", "MCP_UNKNOWN_KEY"] {
             assert!(!rendered.contains(supplied), "{rendered}");
         }
@@ -1103,18 +1106,21 @@ fn composition_diagnostic_withholds_apostrophe_leading_resource_ids() {
     let mut proxy = super::plugin_utils::create_test_proxy();
     proxy.id = "'MCP_PROXY_SECRET\"\\\n`id`".to_string();
     proxy.plugins.clear();
-    let plugin_configs = ["'MCP_FIRST_SECRET\"\\\n`id`", "'MCP_SECOND_SECRET\"\\\n`id`"]
-        .into_iter()
-        .map(|id| {
-            serde_json::from_value::<PluginConfig>(json!({
-                "id": id,
-                "plugin_name": "mcp_gateway",
-                "scope": "global",
-                "config": {"endpoint": {"path": "/mcp"}}
-            }))
-            .expect("global MCP plugin fixture must deserialize")
-        })
-        .collect();
+    let plugin_configs = [
+        "'MCP_FIRST_SECRET\"\\\n`id`",
+        "'MCP_SECOND_SECRET\"\\\n`id`",
+    ]
+    .into_iter()
+    .map(|id| {
+        serde_json::from_value::<PluginConfig>(json!({
+            "id": id,
+            "plugin_name": "mcp_gateway",
+            "scope": "global",
+            "config": {"endpoint": {"path": "/mcp"}}
+        }))
+        .expect("global MCP plugin fixture must deserialize")
+    })
+    .collect();
     let config = GatewayConfig {
         proxies: vec![proxy],
         plugin_configs,

@@ -8095,11 +8095,7 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
             let object = tool_policy.as_object().ok_or_else(|| {
                 format!("mcp_gateway: `policy.tools` entry {tool_name:?} must be an object")
             })?;
-            reject_unknown_mcp_keys(
-                object,
-                "config.policy.tools.*",
-                MCP_POLICY_TOOL_KEYS,
-            )?;
+            reject_unknown_mcp_keys(object, "config.policy.tools.*", MCP_POLICY_TOOL_KEYS)?;
             let action = PolicyAction::parse(
                 optional_string(object, "action")?.ok_or_else(|| {
                     format!(

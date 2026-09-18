@@ -251,7 +251,10 @@ fn unknown_key_diagnostics_keep_independent_schema_context() {
             .expect("unknown configuration keys must be rejected");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(rendered.contains(field), "{rendered}");
-        assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("A2A_UNKNOWN_KEY"), "{rendered}");
         assert!(!rendered.contains("message/send"), "{rendered}");
     }
