@@ -10,6 +10,11 @@ preserve its error campaign. There are no new performance results here. The prio
 cutoff campaign demonstrated no gain; its failed 5 MiB observations remain valid
 failure evidence and are not replaced by this foundation.
 
+The feature introduces no dependency or crypto-provider edge. `fips,bench-h1-profile`
+is explicitly included in the FIPS optional-profile inventory, so the existing
+hosted resolved-graph audit and compile matrix cover that combination. This is
+functional build coverage, not a separate cryptographic certification claim.
+
 ## Allocator safety and publication contract
 
 `src/main.rs` wraps the existing `tikv_jemallocator::Jemalloc` on non-Windows
