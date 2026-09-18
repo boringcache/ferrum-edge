@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "name": "h2",
+  "version": "0.4.19",
+  "url": "https://static.crates.io/crates/h2/h2-0.4.19.crate",
+  "sha256": "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16",
+  "revision": "d57d1b852fec9dda6d42d3454502006d52104da8",
+  "patch_sha256": "c8d3546f497f4c1ffdc26467bbc339e670ab5b84f14fffcfbc3d8bbc4b8554ed",
+  "files": {
+    "src/proto/streams/counts.rs": {
+      "before": "aba319047c01074d9e97afde4999c28e14f0ef21d1d39b7d6c6db4aebc786b79",
+      "after": "58b38853d490ca75a172996b3f04650b392fc65af7e3f5a219154cf8c56c0d1f"
+    },
+    "src/proto/streams/mod.rs": {
+      "before": "3f7afa89a19943b1ac56052f64c4e220dbf0e951a4ac74405adbf83ea7050c27",
+      "after": "40c979a24ae59ef01a90d6b33ea88eef9d3a53fcbcdb049737269e03a345fd1e"
+    },
+    "src/proto/streams/recv.rs": {
+      "before": "49888eca03594469393d8b3bf328036007aff0e87df704f61a4556e4272386f8",
+      "after": "d4e470b7a43640da61be3886f358727ae0396677001a9c68200b5b5de2574092"
+    },
+    "src/proto/streams/streams.rs": {
+      "before": "d2f866b385ea8107ecb4a56e0089523abeabb6a5dc8e107c0a6c3eeb26955290",
+      "after": "9dc75f8d09c4af34084816dbe95b11aa5fa2a9557fdcfd06fda32a5419ab2246"
+    }
+  },
+  "assets": {
+    "observer.rs": "955bccb05d7d0c9e3963333bf8b6af95441c951b6d384a3e7af8779486ee5436",
+    "guard_tests.rs": "1ca3183096eeed0f6f361f3acb22c78624e74f98ac48e31e66411d26ac167d84"
+  }
+}
