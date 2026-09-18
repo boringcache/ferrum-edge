@@ -31743,8 +31743,14 @@ mod tests {
                     "secret-padding-for-32-char-min!!",
                 ),
                 ("FERRUM_MESH_TOPOLOGY", "sidecar"),
-                ("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "'UNREGISTERED_capture\"\\value"),
-                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "'UNREGISTERED_capture\"\\value"),
+                (
+                    "FERRUM_MESH_CAPTURE_IPV6_ENABLED",
+                    "'UNREGISTERED_capture\"\\value",
+                ),
+                (
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+                    "'UNREGISTERED_capture\"\\value",
+                ),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
@@ -31756,7 +31762,11 @@ mod tests {
                 });
                 assert!(log.contains("FERRUM_MESH_CAPTURE_IPV6_ENABLED"), "{log}");
                 assert!(log.contains("FERRUM_MESH_CAPTURE_UDP_ENABLED"), "{log}");
-                assert_eq!(log.matches("Expected true, false, 1, or 0").count(), 2, "{log}");
+                assert_eq!(
+                    log.matches("Expected true, false, 1, or 0").count(),
+                    2,
+                    "{log}"
+                );
                 assert!(!log.contains("UNREGISTERED_capture"), "{log}");
             },
         );

@@ -10688,10 +10688,8 @@ mod tests {
 
     #[test]
     fn startup_and_identity_logs_withhold_each_configured_scalar() {
-        let mut config = node_waypoint_redirect_config(
-            "/'UNREGISTERED_cgroup\"\\\npath".to_string(),
-            false,
-        );
+        let mut config =
+            node_waypoint_redirect_config("/'UNREGISTERED_cgroup\"\\\npath".to_string(), false);
         config.node_name = "'UNREGISTERED_node\"\\\nname".to_string();
         config.bpf_fs_path = "/'UNREGISTERED_bpffs\"\\\npath".to_string();
         config.capture_contract.outbound_capture_port = 49387;
