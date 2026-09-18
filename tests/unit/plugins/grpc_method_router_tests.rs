@@ -579,7 +579,7 @@ fn test_unknown_limit_by_rejected() {
         }),
     );
     let err = result.err().expect("unknown limit_by must be rejected");
-    assert!(err.contains("'limit_by' must be one of"), "got: {err}");
+    assert!(err.contains("`limit_by` must be one of"), "got: {err}");
 }
 
 #[test]
@@ -743,7 +743,7 @@ fn test_missing_max_requests_rejected() {
     let err = result
         .err()
         .expect("missing max_requests should be rejected, not silently dropped");
-    assert!(err.contains("'max_requests' is required"), "got: {err}");
+    assert!(err.contains("`max_requests` is required"), "got: {err}");
 }
 
 #[test]
@@ -759,7 +759,7 @@ fn test_missing_window_seconds_rejected() {
     let err = result
         .err()
         .expect("missing window_seconds should be rejected, not silently dropped");
-    assert!(err.contains("'window_seconds' is required"), "got: {err}");
+    assert!(err.contains("`window_seconds` is required"), "got: {err}");
 }
 
 #[test]
@@ -821,7 +821,7 @@ fn test_duplicate_rate_limit_key_rejected_after_normalization() {
         .err()
         .expect("duplicate normalized rate-limit key must be rejected");
     assert!(
-        err.contains("duplicate method_rate_limits entry"),
+        err.contains("duplicate `method_rate_limits` entry"),
         "got: {err}"
     );
 }
@@ -1047,4 +1047,35 @@ async fn test_allow_list_still_permits_listed_method_after_fail_closed_fix() {
 
     let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"method_rate_limits": {token: {}}}),
+            "`method_rate_limits`",
+            "`max_requests` is required",
+        ),
+        (
+            json!({"method_rate_limits": {token: true}}),
+            "`method_rate_limits`",
+            "must be an object",
+        ),
+        (
+            json!({"allow_methods": [918273641]}),
+            "`allow_methods[0]`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

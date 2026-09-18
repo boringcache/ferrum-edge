@@ -214,9 +214,9 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "request_transformer: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        "request_transformer: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
         unknown.join(", "),
-        allowed.join(", ")
+        allowed.join("`, `")
     ))
 }
 
@@ -226,11 +226,11 @@ fn reject_unknown_keys(
 fn validate_configured_header_value(value: &str, idx: usize) -> Result<(), String> {
     if contains_crlf(value) {
         return Err(format!(
-            "request_transformer: rule[{idx}]: header 'value' must not contain CR or LF"
+            "request_transformer: `rule[{idx}]`: header `value` must not contain CR or LF"
         ));
     }
     HeaderValue::from_str(value).map_err(|_| {
-        format!("request_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue")
+        format!("request_transformer: `rule[{idx}]`: header `value` must be a valid HTTP HeaderValue")
     })?;
     Ok(())
 }
@@ -242,7 +242,7 @@ fn validate_configured_query_string_field(
 ) -> Result<(), String> {
     if contains_crlf(value) {
         return Err(format!(
-            "request_transformer: rule[{idx}]: query '{field}' must not contain CR or LF"
+            "request_transformer: `rule[{idx}]`: query `{field}` must not contain CR or LF"
         ));
     }
     Ok(())
@@ -252,8 +252,8 @@ impl RequestTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
         let config_obj = config.as_object().ok_or_else(|| {
             format!(
-                "request_transformer: config must be an object; allowed keys: {}",
-                CONFIG_KEYS.join(", ")
+                "request_transformer: config must be an object; allowed keys: `{}`",
+                CONFIG_KEYS.join("`, `")
             )
         })?;
         reject_unknown_keys(config_obj, "config", CONFIG_KEYS)?;
@@ -264,10 +264,10 @@ impl RequestTransformer {
         if let Some(rules) = config.get("rules") {
             let arr = rules
                 .as_array()
-                .ok_or("request_transformer: 'rules' must be an array")?;
+                .ok_or("request_transformer: `rules` must be an array")?;
             for (idx, r) in arr.iter().enumerate() {
                 let rule_obj = r.as_object().ok_or_else(|| {
-                    format!("request_transformer: rule[{idx}]: rule must be an object")
+                    format!("request_transformer: `rule[{idx}]`: rule must be an object")
                 })?;
                 let rule_path = format!("config.rules[{idx}]");
                 reject_unknown_keys(rule_obj, &rule_path, RULE_KEYS)?;
@@ -276,12 +276,12 @@ impl RequestTransformer {
                     Some(Value::String(s)) => s.as_str(),
                     None => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'target' is required (expected header/query/body)"
+                            "request_transformer: `rule[{idx}]`: `target` is required (expected `header`/`query`/`body`)"
                         ));
                     }
                     Some(_) => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'target' must be a string (expected header/query/body)"
+                            "request_transformer: `rule[{idx}]`: `target` must be a string (expected `header`/`query`/`body`)"
                         ));
                     }
                 };
@@ -295,7 +295,7 @@ impl RequestTransformer {
 
                 if target != "header" && target != "query" {
                     return Err(format!(
-                        "request_transformer: rule[{idx}]: unknown target '{target}' (expected header/query/body)"
+                        "request_transformer: `rule[{idx}]`: unknown `target` {target:?} (expected `header`/`query`/`body`)"
                     ));
                 }
 
@@ -303,18 +303,18 @@ impl RequestTransformer {
                     Some(Value::String(s)) => s.as_str(),
                     None => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'operation' is required"
+                            "request_transformer: `rule[{idx}]`: `operation` is required"
                         ));
                     }
                     Some(_) => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'operation' must be a string"
+                            "request_transformer: `rule[{idx}]`: `operation` must be a string"
                         ));
                     }
                 };
                 let (hop, qop) = parse_op(op_str).ok_or_else(|| {
                     format!(
-                        "request_transformer: rule[{idx}]: unknown operation '{op_str}' (expected add/update/remove/rename)"
+                        "request_transformer: `rule[{idx}]`: unknown `operation` {op_str:?} (expected `add`/`update`/`remove`/`rename`)"
                     )
                 })?;
 
@@ -322,12 +322,12 @@ impl RequestTransformer {
                     Some(Value::String(s)) => s.clone(),
                     None => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'key' is required"
+                            "request_transformer: `rule[{idx}]`: `key` is required"
                         ));
                     }
                     Some(_) => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'key' must be a string"
+                            "request_transformer: `rule[{idx}]`: `key` must be a string"
                         ));
                     }
                 };
@@ -337,7 +337,7 @@ impl RequestTransformer {
                     Some(Value::Null) | None => None,
                     Some(_) => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'value' must be a string for header/query rules"
+                            "request_transformer: `rule[{idx}]`: `value` must be a string for header/query rules"
                         ));
                     }
                 };
@@ -347,7 +347,7 @@ impl RequestTransformer {
                     Some(Value::Null) | None => None,
                     Some(_) => {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: 'new_key' must be a string"
+                            "request_transformer: `rule[{idx}]`: `new_key` must be a string"
                         ));
                     }
                 };
@@ -360,36 +360,36 @@ impl RequestTransformer {
                     "add" | "update" => {
                         if value.is_none() {
                             return Err(format!(
-                                "request_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
+                                "request_transformer: `rule[{idx}]`: {op_str:?} operation requires a `value`"
                             ));
                         }
                         if new_key_present {
                             return Err(format!(
-                                "request_transformer: rule[{idx}]: 'new_key' must not be set for {target} '{op_str}' operation"
+                                "request_transformer: `rule[{idx}]`: `new_key` must not be set for {target:?} {op_str:?} operation"
                             ));
                         }
                     }
                     "rename" => {
                         if value_present {
                             return Err(format!(
-                                "request_transformer: rule[{idx}]: 'value' must not be set for {target} 'rename' operation"
+                                "request_transformer: `rule[{idx}]`: `value` must not be set for {target:?} `rename` operation"
                             ));
                         }
                         if raw_new_key.is_none() {
                             return Err(format!(
-                                "request_transformer: rule[{idx}]: 'rename' operation requires a 'new_key'"
+                                "request_transformer: `rule[{idx}]`: `rename` operation requires a `new_key`"
                             ));
                         }
                     }
                     "remove" => {
                         if value_present {
                             return Err(format!(
-                                "request_transformer: rule[{idx}]: 'value' must not be set for {target} 'remove' operation"
+                                "request_transformer: `rule[{idx}]`: `value` must not be set for {target:?} `remove` operation"
                             ));
                         }
                         if new_key_present {
                             return Err(format!(
-                                "request_transformer: rule[{idx}]: 'new_key' must not be set for {target} 'remove' operation"
+                                "request_transformer: `rule[{idx}]`: `new_key` must not be set for {target:?} `remove` operation"
                             ));
                         }
                     }
@@ -400,7 +400,7 @@ impl RequestTransformer {
                     let key = HeaderName::from_bytes(raw_key.as_bytes())
                         .map_err(|_| {
                             format!(
-                                "request_transformer: rule[{idx}]: 'key' must be a valid HTTP header name"
+                                "request_transformer: `rule[{idx}]`: `key` must be a valid HTTP header name"
                             )
                         })?
                         .to_string();
@@ -410,7 +410,7 @@ impl RequestTransformer {
                             HeaderName::from_bytes(key.as_bytes())
                                 .map_err(|_| {
                                     format!(
-                                        "request_transformer: rule[{idx}]: 'new_key' must be a valid HTTP header name"
+                                        "request_transformer: `rule[{idx}]`: `new_key` must be a valid HTTP header name"
                                     )
                                 })
                                 .map(|name| name.to_string())
@@ -433,8 +433,8 @@ impl RequestTransformer {
                             || dest == "host")
                     {
                         return Err(format!(
-                            "request_transformer: rule[{idx}]: header destination '{dest}' is \
-                             gateway-owned and cannot be configured; use preserve_host_header \
+                            "request_transformer: `rule[{idx}]`: header destination {dest:?} is \
+                             gateway-owned and cannot be configured; use `preserve_host_header` \
                              for Host or trusted-proxy configuration for forwarding identity"
                         ));
                     }
@@ -470,7 +470,7 @@ impl RequestTransformer {
             Some(Value::Null) | None => false,
             Some(_) => {
                 return Err(
-                    "request_transformer: 'apply_route_overrides' must be a boolean".to_string(),
+                    "request_transformer: `apply_route_overrides` must be a boolean".to_string(),
                 );
             }
         };
@@ -481,7 +481,7 @@ impl RequestTransformer {
             && !apply_route_overrides
         {
             return Err(
-                "request_transformer: no 'rules' configured — plugin will have no effect"
+                "request_transformer: no `rules` configured — plugin will have no effect"
                     .to_string(),
             );
         }
@@ -491,7 +491,7 @@ impl RequestTransformer {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
                     return Err(
-                        "request_transformer: runtime_overlay_scope must be a non-empty string"
+                        "request_transformer: `runtime_overlay_scope` must be a non-empty string"
                             .to_string(),
                     );
                 }
@@ -500,7 +500,7 @@ impl RequestTransformer {
             Some(Value::Null) | None => None,
             Some(_) => {
                 return Err(
-                    "request_transformer: runtime_overlay_scope must be a string".to_string(),
+                    "request_transformer: `runtime_overlay_scope` must be a string".to_string(),
                 );
             }
         };
@@ -509,7 +509,7 @@ impl RequestTransformer {
             Some(Value::Bool(b)) => *b,
             Some(Value::Null) | None => true,
             Some(_) => {
-                return Err("request_transformer: default_enabled must be a boolean".to_string());
+                return Err("request_transformer: `default_enabled` must be a boolean".to_string());
             }
         };
 
@@ -518,7 +518,7 @@ impl RequestTransformer {
             Some(Value::Null) | None => None,
             Some(_) => {
                 return Err(format!(
-                    "request_transformer: {} must be a boolean",
+                    "request_transformer: `{}` must be a boolean",
                     transformer_gate::RESOLVED_ENABLED_KEY
                 ));
             }

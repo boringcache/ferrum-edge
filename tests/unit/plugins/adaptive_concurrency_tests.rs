@@ -2472,3 +2472,34 @@ fn proxy_scope_cache_keeps_same_id_proxies_in_two_namespaces_independent() {
     drop(permit_a);
     drop(permit_b);
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({token: true}),
+            "allowed keys",
+            "unknown config key",
+        ),
+        (
+            json!({"key_by": token}),
+            "`key_by`",
+            "unsupported",
+        ),
+        (
+            json!({"min_limit": true}),
+            "`min_limit`",
+            "must be an integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("adaptive_concurrency", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

@@ -4934,3 +4934,34 @@ fn expose_headers_field_admission_matches_the_documented_contract() {
         );
     }
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"expose_headers": [token]}),
+            "`expose_headers[0]`",
+            "not a valid HTTP header name",
+        ),
+        (
+            json!({"expose_headers": [918273641]}),
+            "`expose_headers[0]`",
+            "must be a string",
+        ),
+        (
+            json!({"expose_headers": [true]}),
+            "`expose_headers[0]`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("grpc_web", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

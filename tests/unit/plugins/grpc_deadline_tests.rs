@@ -2791,19 +2791,19 @@ fn test_invalid_field_types_rejected() {
     for (config, expected) in [
         (
             json!({ "max_deadline_ms": "30000" }),
-            "'max_deadline_ms' must be an unsigned integer",
+            "`max_deadline_ms` must be an unsigned integer",
         ),
         (
             json!({ "default_deadline_ms": -1 }),
-            "'default_deadline_ms' must be an unsigned integer",
+            "`default_deadline_ms` must be an unsigned integer",
         ),
         (
             json!({ "subtract_gateway_processing": "true" }),
-            "'subtract_gateway_processing' must be a boolean",
+            "`subtract_gateway_processing` must be a boolean",
         ),
         (
             json!({ "reject_no_deadline": 1 }),
-            "'reject_no_deadline' must be a boolean",
+            "`reject_no_deadline` must be a boolean",
         ),
     ] {
         let err = create_plugin("grpc_deadline", &config)
@@ -2818,9 +2818,12 @@ fn test_unknown_and_null_fields_are_rejected() {
     for (config, expected) in [
         (
             json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
-            "config.reject_no_deadine",
+            "unknown configuration property in `config`: \"reject_no_deadine\"",
         ),
-        (json!({"MAX_DEADLINE_MS": 30000}), "config.MAX_DEADLINE_MS"),
+        (
+            json!({"MAX_DEADLINE_MS": 30000}),
+            "unknown configuration property in `config`: \"MAX_DEADLINE_MS\"",
+        ),
         (
             json!({"max_deadline_ms": null}),
             "must be an unsigned integer",
@@ -2828,7 +2831,7 @@ fn test_unknown_and_null_fields_are_rejected() {
         (json!({"reject_no_deadline": null}), "must be a boolean"),
         (
             json!({"max_deadline_ms": 30000, "unexpected": {"nested": true}}),
-            "config.unexpected",
+            "unknown configuration property in `config`: \"unexpected\"",
         ),
     ] {
         let error = create_plugin("grpc_deadline", &config)
@@ -4983,4 +4986,35 @@ async fn exact_value_telemetry_decorators_declare_only_what_they_write() {
         !limiter_hidden.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-limit"),
         "expose_headers=false writes nothing, so it owns nothing"
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({token: true}),
+            "`config`",
+            "unknown configuration property",
+        ),
+        (
+            json!({"default_deadline_ms": 918273641, "max_deadline_ms": 1}),
+            "`default_deadline_ms`",
+            "cannot exceed `max_deadline_ms`",
+        ),
+        (
+            json!({"max_deadline_ms": false}),
+            "`max_deadline_ms`",
+            "must be an unsigned integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("grpc_deadline", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

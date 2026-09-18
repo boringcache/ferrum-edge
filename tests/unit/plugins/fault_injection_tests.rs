@@ -102,7 +102,7 @@ fn test_valid_abort_with_grpc_status() {
 #[test]
 fn test_reject_no_abort_no_delay() {
     let err = FaultInjectionPlugin::new(&json!({})).err().unwrap();
-    assert!(err.contains("at least one of 'abort' or 'delay'"));
+    assert!(err.contains("at least one of `abort` or `delay`"));
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_reject_both_null() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("at least one of 'abort' or 'delay'"));
+    assert!(err.contains("at least one of `abort` or `delay`"));
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn test_reject_abort_not_object() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("'abort' must be an object"));
+    assert!(err.contains("`abort` must be an object"));
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn test_reject_delay_not_object() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("'delay' must be an object"));
+    assert!(err.contains("`delay` must be an object"));
 }
 
 #[test]
@@ -1710,5 +1710,36 @@ mod udp_datagram_faults {
             start.elapsed() < std::time::Duration::from_millis(500),
             "UDP stream connect must not park on delay"
         );
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"abort": {token: true}}),
+            "`abort`",
+            "unknown",
+        ),
+        (
+            json!({"abort": {"status_code": 918273641}}),
+            "`abort.status_code`",
+            "must be 200-599",
+        ),
+        (
+            json!({"delay": {"duration_ms": 1, "percentage": 918273641}}),
+            "`delay.percentage`",
+            "must be 0.0-100.0",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("fault_injection", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
     }
 }

@@ -2022,7 +2022,7 @@ fn test_constructor_rejects_uncompilable_regex_origin() {
 
 #[test]
 fn semantic_cors_diagnostics_withhold_unregistered_values() {
-    let token = "prefix'\"UNREGISTERED_CORS_TOKEN\\tail";
+    let token = "'\"UNREGISTERED_CORS_TOKEN\\tail";
     let regex_error = CorsPlugin::new(&json!({
         "allowed_origins": [{"exact": "https://example.com"}, {"regex": format!("{token}[")}]
     }))
@@ -2034,6 +2034,19 @@ fn semantic_cors_diagnostics_withhold_unregistered_values() {
         !regex_error.contains("UNREGISTERED_CORS_TOKEN"),
         "{regex_error}"
     );
+
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(regex_error), &[]);
+    assert!(rendered.contains("allowed_origins[1]"), "{rendered}");
+    assert!(rendered.contains("invalid or exceeds"), "{rendered}");
+    assert!(!rendered.contains("UNREGISTERED_CORS_TOKEN"), "{rendered}");
+
+    let url_error = CorsPlugin::new(&json!({"allowed_origins": [token]}))
+        .err()
+        .expect("invalid origin must still be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(url_error), &[]);
+    assert!(rendered.contains("`allowed_origins`"), "{rendered}");
+    assert!(rendered.contains("invalid origin URL"), "{rendered}");
+    assert!(!rendered.contains("UNREGISTERED_CORS_TOKEN"), "{rendered}");
 
     for field in ["allowed_methods", "allowed_headers", "exposed_headers"] {
         let mut config = json!({"allowed_origins": ["https://example.com"]});

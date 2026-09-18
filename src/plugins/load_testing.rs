@@ -463,11 +463,11 @@ impl LoadTesting {
         let key = optional_string(config, "key")?
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                "load_testing: 'key' is required and must be a non-empty string".to_string()
+                "load_testing: `key` is required and must be a non-empty string".to_string()
             })?;
         if key.chars().count() < MIN_TRIGGER_KEY_LEN {
             return Err(format!(
-                "load_testing: 'key' must be at least {MIN_TRIGGER_KEY_LEN} characters"
+                "load_testing: `key` must be at least {MIN_TRIGGER_KEY_LEN} characters"
             ));
         }
         if key.as_bytes().first() == Some(&b' ')
@@ -475,13 +475,13 @@ impl LoadTesting {
             || !key.bytes().all(|byte| (b' '..=b'~').contains(&byte))
         {
             return Err(
-                "load_testing: 'key' must contain only printable ASCII HTTP header-value characters and must not start or end with a space"
+                "load_testing: `key` must contain only printable ASCII HTTP header-value characters and must not start or end with a space"
                     .to_string(),
             );
         }
 
         let concurrent_clients = optional_u64(config, "concurrent_clients")?
-            .ok_or_else(|| "load_testing: 'concurrent_clients' is required".to_string())?;
+            .ok_or_else(|| "load_testing: `concurrent_clients` is required".to_string())?;
         if concurrent_clients == 0 || concurrent_clients > 10_000 {
             return Err(format!(
                 "load_testing: `concurrent_clients` must be 1–10000 (got \"{}\")",
@@ -490,7 +490,7 @@ impl LoadTesting {
         }
 
         let duration_seconds = optional_u64(config, "duration_seconds")?
-            .ok_or_else(|| "load_testing: 'duration_seconds' is required".to_string())?;
+            .ok_or_else(|| "load_testing: `duration_seconds` is required".to_string())?;
         if duration_seconds == 0 || duration_seconds > 3600 {
             return Err(format!(
                 "load_testing: `duration_seconds` must be 1–3600 (got \"{}\")",
@@ -502,7 +502,7 @@ impl LoadTesting {
 
         let request_timeout_ms = optional_u64(config, "request_timeout_ms")?.unwrap_or(30_000);
         if request_timeout_ms == 0 {
-            return Err("load_testing: 'request_timeout_ms' must be greater than 0".to_string());
+            return Err("load_testing: `request_timeout_ms` must be greater than 0".to_string());
         }
         if request_timeout_ms > MAX_REQUEST_TIMEOUT_MS {
             return Err(format!(
@@ -514,7 +514,7 @@ impl LoadTesting {
             optional_u64(config, "max_response_body_bytes")?.unwrap_or(1_048_576);
         if max_response_body_bytes == 0 {
             return Err(
-                "load_testing: 'max_response_body_bytes' must be greater than 0".to_string(),
+                "load_testing: `max_response_body_bytes` must be greater than 0".to_string(),
             );
         }
 
@@ -563,8 +563,8 @@ impl LoadTesting {
         if gateway_port == 0 {
             return Err(format!(
                 "load_testing: resolved gateway port is 0 because the selected {listener_name} \
-listener is disabled; set gateway_tls to select an enabled listener and/or set an explicit \
-gateway_port in 1–65535"
+listener is disabled; set `gateway_tls` to select an enabled listener and/or set an explicit \
+`gateway_port` in 1–65535"
             ));
         }
 
@@ -698,12 +698,12 @@ fn parse_gateway_addresses(
         Some(Value::Array(addresses)) => {
             if addresses.is_empty() {
                 return Err(
-                    "load_testing: 'gateway_addresses' must not be empty when provided".to_string(),
+                    "load_testing: `gateway_addresses` must not be empty when provided".to_string(),
                 );
             }
             if addresses.len() > MAX_GATEWAY_ADDRESSES {
                 return Err(format!(
-                    "load_testing: 'gateway_addresses' must have at most {MAX_GATEWAY_ADDRESSES} entries (got {})",
+                    "load_testing: `gateway_addresses` must have at most {MAX_GATEWAY_ADDRESSES} entries (got {})",
                     addresses.len()
                 ));
             }
@@ -714,11 +714,11 @@ fn parse_gateway_addresses(
             let mut seen = HashSet::new();
             for addr in addresses {
                 let url = addr.as_str().ok_or_else(|| {
-                    "load_testing: each 'gateway_addresses' entry must be a string".to_string()
+                    "load_testing: each `gateway_addresses` entry must be a string".to_string()
                 })?;
                 if url.is_empty() {
                     return Err(
-                        "load_testing: 'gateway_addresses' entries must not be empty".to_string(),
+                        "load_testing: `gateway_addresses` entries must not be empty".to_string(),
                     );
                 }
                 let parsed = validate_gateway_address(url)?;
@@ -732,7 +732,7 @@ fn parse_gateway_addresses(
                 let label = sanitize_gateway_label(&normalized);
                 if is_local_loopback_alias(&parsed, &local) {
                     return Err(format!(
-                        "load_testing: `gateway_addresses` must not include this node's local loopback target ({label:?})"
+                        "load_testing: `gateway_addresses` must not include the local loopback target of this node ({label:?})"
                     ));
                 }
                 if !seen.insert(label.clone()) {
@@ -745,7 +745,7 @@ fn parse_gateway_addresses(
             Ok(urls)
         }
         Some(Value::Null) | None => Ok(Vec::new()),
-        Some(_) => Err("load_testing: 'gateway_addresses' must be an array".to_string()),
+        Some(_) => Err("load_testing: `gateway_addresses` must be an array".to_string()),
     }
 }
 
@@ -828,7 +828,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("load_testing: '{key}' must be a boolean")),
+        Some(_) => Err(format!("load_testing: `{key}` must be a boolean")),
     }
 }
 
@@ -836,7 +836,7 @@ fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> 
     match config.get(key) {
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("load_testing: '{key}' must be a string")),
+        Some(_) => Err(format!("load_testing: `{key}` must be a string")),
     }
 }
 
@@ -845,9 +845,9 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(Value::Number(value)) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("load_testing: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("load_testing: `{key}` must be an unsigned integer")),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("load_testing: '{key}' must be an unsigned integer")),
+        Some(_) => Err(format!("load_testing: `{key}` must be an unsigned integer")),
     }
 }
 

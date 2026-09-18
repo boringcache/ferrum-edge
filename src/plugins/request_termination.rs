@@ -59,8 +59,8 @@ impl RequestTermination {
     pub fn new(config: &Value) -> Result<Self, String> {
         let config = config.as_object().ok_or_else(|| {
             format!(
-                "request_termination: config must be a JSON object; allowed keys: {}",
-                REQUEST_TERMINATION_CONFIG_KEYS.join(", ")
+                "request_termination: config must be a JSON object; allowed keys: `{}`",
+                REQUEST_TERMINATION_CONFIG_KEYS.join("`, `")
             )
         })?;
         reject_unknown_keys(
@@ -83,7 +83,7 @@ impl RequestTermination {
                 && !raw.is_empty()
             {
                 return Err(format!(
-                    "request_termination: status {status_code} cannot carry a response body; omit 'body' or set it to \"\""
+                    "request_termination: `status_code` \"{status_code}\" cannot carry a response body; omit `body` or set it to an empty string"
                 ));
             }
             String::new()
@@ -127,9 +127,9 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "{plugin}: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        "{plugin}: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
         unknown.join(", "),
-        allowed.join(", ")
+        allowed.join("`, `")
     ))
 }
 
@@ -146,12 +146,12 @@ fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
             };
             if !(200..=599).contains(&code) {
                 return Err(format!(
-                    "request_termination: 'status_code' must be a final response from 200 to 599 \
+                    "request_termination: `status_code` must be a final response from 200 to 599 \
                      (informational statuses including 101 are rejected), got \"{code}\""
                 ));
             }
             u16::try_from(code)
-                .map_err(|_| "request_termination: 'status_code' is too large".to_string())
+                .map_err(|_| "request_termination: `status_code` is too large".to_string())
         }
     }
 }
@@ -163,11 +163,11 @@ fn parse_content_type(config: &Map<String, Value>) -> Result<String, String> {
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 return Err(
-                    "request_termination: 'content_type' must be a non-empty string".to_string(),
+                    "request_termination: `content_type` must be a non-empty string".to_string(),
                 );
             }
             HeaderValue::from_str(trimmed).map_err(|_| {
-                "request_termination: 'content_type' contains characters not permitted in HTTP header values"
+                "request_termination: `content_type` contains characters not permitted in HTTP header values"
                     .to_string()
             })?;
             Ok(trimmed.to_string())
@@ -195,7 +195,7 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         return Ok(Trigger::Always);
     };
     let Value::Object(trigger) = trigger else {
-        return Err("request_termination: 'trigger' must be an object".to_string());
+        return Err("request_termination: `trigger` must be an object".to_string());
     };
     reject_unknown_keys(
         trigger,
@@ -209,14 +209,14 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
     let has_header_value = trigger.contains_key("header_value");
     if has_path && (has_header || has_header_value) {
         return Err(
-            "request_termination: 'trigger' must set only one of 'path_prefix' or 'header'; \
-             'header_value' is valid only with 'header'"
+            "request_termination: `trigger` must set only one of `path_prefix` or `header`; \
+             `header_value` is valid only with `header`"
                 .to_string(),
         );
     }
     if has_header_value && !has_header {
         return Err(
-            "request_termination: 'trigger.header_value' requires 'trigger.header'".to_string(),
+            "request_termination: `trigger.header_value` requires `trigger.header`".to_string(),
         );
     }
 
@@ -229,7 +229,7 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         })?;
         if path.is_empty() {
             return Err(
-                "request_termination: 'trigger.path_prefix' must be a non-empty string".to_string(),
+                "request_termination: `trigger.path_prefix` must be a non-empty string".to_string(),
             );
         }
         // The trigger matches against `ctx.path`, the parsed request target
@@ -245,13 +245,13 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         // contain those bytes.
         if path != "*" && !path.starts_with('/') {
             return Err(
-                "request_termination: 'trigger.path_prefix' must start with '/' or be \"*\" (asterisk-form OPTIONS target)"
+                "request_termination: `trigger.path_prefix` must start with `/` or be `*` (asterisk-form OPTIONS target)"
                     .to_string(),
             );
         }
         if path.chars().any(char::is_control) {
             return Err(
-                "request_termination: 'trigger.path_prefix' must not contain control characters"
+                "request_termination: `trigger.path_prefix` must not contain control characters"
                     .to_string(),
             );
         }
@@ -263,14 +263,14 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         // target has no escapes and passes through unchanged.
         if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(path) {
             return Err(format!(
-                "request_termination: 'trigger.path_prefix' must already be a canonical policy \
+                "request_termination: `trigger.path_prefix` must already be a canonical policy \
                  path ({reason}); request paths are canonicalized before plugins run, so a \
                  non-canonical prefix can never match"
             ));
         }
         if let Some(reason) = unreachable_parsed_path_prefix_reason(path) {
             return Err(format!(
-                "request_termination: 'trigger.path_prefix' {reason}"
+                "request_termination: `trigger.path_prefix` {reason}"
             ));
         }
         return Ok(Trigger::PathPrefix(path.to_string()));
@@ -286,12 +286,12 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         let header = header.trim();
         if header.is_empty() {
             return Err(
-                "request_termination: 'trigger.header' must be a non-empty string".to_string(),
+                "request_termination: `trigger.header` must be a non-empty string".to_string(),
             );
         }
         let header = HeaderName::from_bytes(header.as_bytes())
             .map_err(|_| {
-                "request_termination: 'trigger.header' contains an invalid HTTP header name"
+                "request_termination: `trigger.header` contains an invalid HTTP header name"
                     .to_string()
             })?
             .as_str()
@@ -309,7 +309,7 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
         return Ok(Trigger::HeaderMatch { header, value });
     }
 
-    Err("request_termination: 'trigger' must set 'path_prefix' or 'header'".to_string())
+    Err("request_termination: `trigger` must set `path_prefix` or `header`".to_string())
 }
 
 fn json_u64(value: &Value) -> Option<u64> {
@@ -440,8 +440,8 @@ fn is_xml_1_0_char(c: char) -> bool {
 fn validate_xml_1_0_message(message: &str) -> Result<(), String> {
     if let Some(bad) = message.chars().find(|c| !is_xml_1_0_char(*c)) {
         return Err(format!(
-            "request_termination: 'message' contains U+{:04X}, which is not a valid XML 1.0 character \
-             when content_type selects XML rendering",
+            "request_termination: `message` contains \"U+{:04X}\", which is not a valid XML 1.0 character \
+             when `content_type` selects XML rendering",
             bad as u32
         ));
     }

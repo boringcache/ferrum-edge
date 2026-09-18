@@ -648,3 +648,40 @@ async fn no_eligible_consumer_leaves_route_override_unused() {
     assert!(!headers.contains_key("x-tenant"));
     assert!(!headers.contains_key("x-disabled"));
 }
+
+#[test]
+fn route_transform_diagnostics_keep_indexes_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_ROUTE_TOKEN\\tail";
+    for (rule, field, reason) in [
+        (
+            json!({"target": token, "operation": "add", "key": "x-test", "value": "ok"}),
+            "target",
+            "must be `header`",
+        ),
+        (
+            json!({"target": "header", "operation": token, "key": "x-test"}),
+            "operation",
+            "must be one of",
+        ),
+        (
+            json!({"target": "header", "operation": "add", "key": token, "value": "ok"}),
+            "key",
+            "must be a valid HTTP header name",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config(
+            "mesh_route_dispatch",
+            &json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "backend"},
+                "request_transform": [rule]
+            }]}),
+        )
+        .expect_err("invalid route transform must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        let path = format!("`mesh_route_dispatch.rules[0].request_transform[0].{field}`");
+        assert!(rendered.contains(&path), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        assert!(!rendered.contains("UNREGISTERED_ROUTE_TOKEN"), "{rendered}");
+    }
+}

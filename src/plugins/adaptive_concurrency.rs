@@ -170,8 +170,8 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
         .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
     {
         return Err(format!(
-            "adaptive_concurrency: unknown config key '{unknown}'; allowed keys: {}",
-            ALLOWED_KEYS.join(", ")
+            "adaptive_concurrency: unknown config key {unknown:?}; allowed keys: `{}`",
+            ALLOWED_KEYS.join("`, `")
         ));
     }
 
@@ -192,41 +192,41 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
         .unwrap_or(AdaptiveConcurrencyKeyBy::Proxy);
 
     if min_limit == 0 {
-        return Err("adaptive_concurrency: 'min_limit' must be greater than 0".to_string());
+        return Err("adaptive_concurrency: `min_limit` must be greater than 0".to_string());
     }
     if max_limit < min_limit {
         return Err(
-            "adaptive_concurrency: 'max_limit' must be greater than or equal to 'min_limit'"
+            "adaptive_concurrency: `max_limit` must be greater than or equal to `min_limit`"
                 .to_string(),
         );
     }
     if initial_limit < min_limit || initial_limit > max_limit {
         return Err(
-            "adaptive_concurrency: 'initial_limit' must be between 'min_limit' and 'max_limit'"
+            "adaptive_concurrency: `initial_limit` must be between `min_limit` and `max_limit`"
                 .to_string(),
         );
     }
     if max_tracked_keys == 0 {
-        return Err("adaptive_concurrency: 'max_tracked_keys' must be greater than 0".to_string());
+        return Err("adaptive_concurrency: `max_tracked_keys` must be greater than 0".to_string());
     }
     let max_tracked_keys = usize::try_from(max_tracked_keys).map_err(|_| {
-        "adaptive_concurrency: 'max_tracked_keys' is too large for this platform".to_string()
+        "adaptive_concurrency: `max_tracked_keys` is too large for this platform".to_string()
     })?;
     if min_samples == 0 {
-        return Err("adaptive_concurrency: 'min_samples' must be greater than 0".to_string());
+        return Err("adaptive_concurrency: `min_samples` must be greater than 0".to_string());
     }
     if increase_step == 0 {
-        return Err("adaptive_concurrency: 'increase_step' must be greater than 0".to_string());
+        return Err("adaptive_concurrency: `increase_step` must be greater than 0".to_string());
     }
     if !target_latency_multiplier.is_finite() || target_latency_multiplier <= 1.0 {
         return Err(
-            "adaptive_concurrency: 'target_latency_multiplier' must be a finite number greater than 1.0"
+            "adaptive_concurrency: `target_latency_multiplier` must be a finite number greater than 1.0"
                 .to_string(),
         );
     }
     if !decrease_ratio.is_finite() || decrease_ratio <= 0.0 || decrease_ratio >= 1.0 {
         return Err(
-            "adaptive_concurrency: 'decrease_ratio' must be a finite number greater than 0 and less than 1"
+            "adaptive_concurrency: `decrease_ratio` must be a finite number greater than 0 and less than 1"
                 .to_string(),
         );
     }
@@ -252,7 +252,7 @@ fn parse_key_by(raw: &str) -> Result<AdaptiveConcurrencyKeyBy, String> {
         "upstream_target" => Ok(AdaptiveConcurrencyKeyBy::Upstream),
         "backend_target" => Ok(AdaptiveConcurrencyKeyBy::Backend),
         other => Err(format!(
-            "adaptive_concurrency: unsupported `key_by` {other:?} (expected proxy_target, upstream_target, or backend_target)"
+            "adaptive_concurrency: unsupported `key_by` {other:?} (expected `proxy_target`, `upstream_target`, or `backend_target`)"
         )),
     }
 }
@@ -263,7 +263,7 @@ fn optional_u64(object: &Map<String, Value>, field: &str) -> Result<Option<u64>,
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| format!("adaptive_concurrency: '{field}' must be an integer"))
+                .ok_or_else(|| format!("adaptive_concurrency: `{field}` must be an integer"))
         })
         .transpose()
 }
@@ -274,7 +274,7 @@ fn optional_f64(object: &Map<String, Value>, field: &str) -> Result<Option<f64>,
         .map(|value| {
             value
                 .as_f64()
-                .ok_or_else(|| format!("adaptive_concurrency: '{field}' must be a number"))
+                .ok_or_else(|| format!("adaptive_concurrency: `{field}` must be a number"))
         })
         .transpose()
 }
@@ -285,7 +285,7 @@ fn optional_bool(object: &Map<String, Value>, field: &str) -> Result<Option<bool
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("adaptive_concurrency: '{field}' must be a boolean"))
+                .ok_or_else(|| format!("adaptive_concurrency: `{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -299,7 +299,7 @@ fn optional_string<'a>(
         .map(|value| {
             value
                 .as_str()
-                .ok_or_else(|| format!("adaptive_concurrency: '{field}' must be a string"))
+                .ok_or_else(|| format!("adaptive_concurrency: `{field}` must be a string"))
         })
         .transpose()
 }

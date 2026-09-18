@@ -1588,15 +1588,15 @@ impl RequestMirror {
     ) -> Result<Self, String> {
         let config_obj = config.as_object().ok_or_else(|| {
             format!(
-                "request_mirror: config must be an object; allowed keys: {}",
-                REQUEST_MIRROR_CONFIG_KEYS.join(", ")
+                "request_mirror: config must be an object; allowed keys: `{}`",
+                REQUEST_MIRROR_CONFIG_KEYS.join("`, `")
             )
         })?;
         reject_unknown_request_mirror_keys(config_obj)?;
 
         let raw_mirror_host = optional_string(config, "mirror_host")?
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "request_mirror: 'mirror_host' is required".to_string())?
+            .ok_or_else(|| "request_mirror: `mirror_host` is required".to_string())?
             .to_ascii_lowercase();
         let (mirror_host, mirror_hostname) = parse_mirror_host(&raw_mirror_host)?;
 
@@ -1606,7 +1606,7 @@ impl RequestMirror {
 
         if mirror_protocol != "http" && mirror_protocol != "https" {
             return Err(format!(
-                "request_mirror: 'mirror_protocol' must be 'http' or 'https' (got '{}')",
+                "request_mirror: `mirror_protocol` must be `http` or `https` (got {:?})",
                 mirror_protocol
             ));
         }
@@ -1630,13 +1630,13 @@ impl RequestMirror {
         if let Some(path) = &mirror_path
             && !path.starts_with('/')
         {
-            return Err("request_mirror: 'mirror_path' must start with '/'".to_string());
+            return Err("request_mirror: `mirror_path` must start with `/`".to_string());
         }
         if let Some(path) = &mirror_path
             && (path.contains('?') || path.contains('#'))
         {
             return Err(
-                "request_mirror: 'mirror_path' must not contain a query or fragment".to_string(),
+                "request_mirror: `mirror_path` must not contain a query or fragment".to_string(),
             );
         }
 
@@ -1654,7 +1654,7 @@ impl RequestMirror {
         let max_in_flight = optional_u64(config, "max_in_flight")?
             .map(|v| {
                 if v == 0 {
-                    return Err("request_mirror: 'max_in_flight' must be >= 1".to_string());
+                    return Err("request_mirror: `max_in_flight` must be >= 1".to_string());
                 }
                 // Range-check against the deployment-safe hard cap before the
                 // value ever reaches `Semaphore::new`. A value above the cap
@@ -1662,7 +1662,7 @@ impl RequestMirror {
                 // otherwise panic construction; reject it as a config error.
                 let v = usize::try_from(v).map_err(|_| {
                     format!(
-                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS}"
+                        "request_mirror: `max_in_flight` must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS}"
                     )
                 })?;
                 if v > MAX_MAX_IN_FLIGHT_MIRRORS {
@@ -1681,7 +1681,7 @@ impl RequestMirror {
                 .map(|v| {
                     if v == 0 {
                         Err(
-                            "request_mirror: 'max_retained_request_body_bytes' must be >= 1"
+                            "request_mirror: `max_retained_request_body_bytes` must be >= 1"
                                 .to_string(),
                         )
                     } else {
@@ -1696,12 +1696,12 @@ impl RequestMirror {
                 .map(|v| {
                     if v == 0 {
                         Err(
-                            "request_mirror: 'max_mirrored_request_body_bytes' must be >= 1"
+                            "request_mirror: `max_mirrored_request_body_bytes` must be >= 1"
                                 .to_string(),
                         )
                     } else if usize::try_from(v).is_err() {
                         Err(
-                            "request_mirror: 'max_mirrored_request_body_bytes' is too large for this platform"
+                            "request_mirror: `max_mirrored_request_body_bytes` is too large for this platform"
                                 .to_string(),
                         )
                     } else {
@@ -2034,21 +2034,21 @@ fn reject_unknown_request_mirror_keys(object: &Map<String, Value>) -> Result<(),
     let details: Vec<String> = unknown
         .into_iter()
         .map(|key| match suggest_key(key, REQUEST_MIRROR_CONFIG_KEYS) {
-            Some(suggestion) => format!("'{key}' (did you mean '{suggestion}'?)"),
-            None => format!("'{key}'"),
+            Some(suggestion) => format!("{key:?} (did you mean `{suggestion}`?)"),
+            None => format!("{key:?}"),
         })
         .collect();
     Err(format!(
-        "request_mirror: unknown configuration key(s): {}; allowed keys: {}",
+        "request_mirror: unknown configuration key(s): {}; allowed keys: `{}`",
         details.join(", "),
-        REQUEST_MIRROR_CONFIG_KEYS.join(", ")
+        REQUEST_MIRROR_CONFIG_KEYS.join("`, `")
     ))
 }
 
 fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String> {
     let host = raw_host.trim();
     if host.is_empty() {
-        return Err("request_mirror: 'mirror_host' is required".to_string());
+        return Err("request_mirror: `mirror_host` is required".to_string());
     }
     if host
         .chars()
@@ -2057,7 +2057,7 @@ fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String>
         || host.contains(['/', '?', '#', '@'])
     {
         return Err(
-            "request_mirror: 'mirror_host' must be a hostname or IP address without scheme, path, query, fragment, or credentials"
+            "request_mirror: `mirror_host` must be a hostname or IP address without scheme, path, query, fragment, or credentials"
                 .to_string(),
         );
     }
@@ -2079,7 +2079,7 @@ fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String>
 
     if bracketed || host.contains(':') {
         return Err(
-            "request_mirror: 'mirror_host' must not include brackets or a port unless it is an IPv6 literal"
+            "request_mirror: `mirror_host` must not include brackets or a port unless it is an IPv6 literal"
                 .to_string(),
         );
     }
@@ -2090,7 +2090,7 @@ fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String>
             Ok((hostname.clone(), Some(hostname)))
         }
         _ => {
-            Err("request_mirror: 'mirror_host' must be a valid hostname or IP address".to_string())
+            Err("request_mirror: `mirror_host` must be a valid hostname or IP address".to_string())
         }
     }
 }
@@ -2105,25 +2105,25 @@ fn parse_sensitive_header_patterns(config: &Value) -> Result<Vec<String>, String
         Some(Value::Array(items)) => {
             if items.len() > MAX_SENSITIVE_HEADER_PATTERNS {
                 return Err(format!(
-                    "request_mirror: 'sensitive_header_patterns' must contain at most {MAX_SENSITIVE_HEADER_PATTERNS} entries"
+                    "request_mirror: `sensitive_header_patterns` must contain at most {MAX_SENSITIVE_HEADER_PATTERNS} entries"
                 ));
             }
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
                 let Some(pattern) = item.as_str() else {
                     return Err(format!(
-                        "request_mirror: 'sensitive_header_patterns[{idx}]' must be a string"
+                        "request_mirror: `sensitive_header_patterns[{idx}]` must be a string"
                     ));
                 };
                 let trimmed = pattern.trim();
                 if trimmed.is_empty() {
                     return Err(format!(
-                        "request_mirror: 'sensitive_header_patterns[{idx}]' must not be blank"
+                        "request_mirror: `sensitive_header_patterns[{idx}]` must not be blank"
                     ));
                 }
                 if trimmed.len() > MAX_SENSITIVE_HEADER_PATTERN_LEN {
                     return Err(format!(
-                        "request_mirror: 'sensitive_header_patterns[{idx}]' exceeds maximum length of {MAX_SENSITIVE_HEADER_PATTERN_LEN} bytes"
+                        "request_mirror: `sensitive_header_patterns[{idx}]` exceeds maximum length of {MAX_SENSITIVE_HEADER_PATTERN_LEN} bytes"
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
@@ -2134,7 +2134,7 @@ fn parse_sensitive_header_patterns(config: &Value) -> Result<Vec<String>, String
             Ok(out)
         }
         Some(_) => Err(
-            "request_mirror: 'sensitive_header_patterns' must be an array of strings".to_string(),
+            "request_mirror: `sensitive_header_patterns` must be an array of strings".to_string(),
         ),
     }
 }
@@ -2149,30 +2149,30 @@ fn parse_forward_sensitive_header_allowlist(
         Some(Value::Array(items)) => {
             if items.len() > MAX_FORWARD_SENSITIVE_ALLOWLIST {
                 return Err(format!(
-                    "request_mirror: 'forward_sensitive_header_allowlist' must contain at most {MAX_FORWARD_SENSITIVE_ALLOWLIST} entries"
+                    "request_mirror: `forward_sensitive_header_allowlist` must contain at most {MAX_FORWARD_SENSITIVE_ALLOWLIST} entries"
                 ));
             }
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
                 let Some(name) = item.as_str() else {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' must be a string"
+                        "request_mirror: `forward_sensitive_header_allowlist[{idx}]` must be a string"
                     ));
                 };
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' must not be blank"
+                        "request_mirror: `forward_sensitive_header_allowlist[{idx}]` must not be blank"
                     ));
                 }
                 if trimmed.len() > MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' exceeds maximum length of {MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN} bytes"
+                        "request_mirror: `forward_sensitive_header_allowlist[{idx}]` exceeds maximum length of {MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN} bytes"
                     ));
                 }
                 if http::HeaderName::from_bytes(trimmed.as_bytes()).is_err() {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' is not a valid HTTP header name"
+                        "request_mirror: `forward_sensitive_header_allowlist[{idx}]` is not a valid HTTP header name"
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
@@ -2184,7 +2184,7 @@ fn parse_forward_sensitive_header_allowlist(
                 // name that is not stripped could never be "forwarded" by it.
                 if !is_mirror_sensitive_header(&lower, operator_patterns) {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' ('{lower}') is not a recognized sensitive header (built-in credential or a configured sensitive_header_patterns match)"
+                        "request_mirror: `forward_sensitive_header_allowlist[{idx}]` ({lower:?}) is not a recognized sensitive header (built-in credential or a configured sensitive_header_patterns match)"
                     ));
                 }
                 if !out.iter().any(|existing| existing == &lower) {
@@ -2195,7 +2195,7 @@ fn parse_forward_sensitive_header_allowlist(
         }
         Some(_) => {
             return Err(
-                "request_mirror: 'forward_sensitive_header_allowlist' must be an array of strings"
+                "request_mirror: `forward_sensitive_header_allowlist` must be an array of strings"
                     .to_string(),
             );
         }
@@ -2204,7 +2204,7 @@ fn parse_forward_sensitive_header_allowlist(
     match (forward_sensitive_headers, raw.is_empty()) {
         (false, true) => Ok(raw),
         (false, false) => Err(
-            "request_mirror: 'forward_sensitive_header_allowlist' requires forward_sensitive_headers=true"
+            "request_mirror: `forward_sensitive_header_allowlist` requires `forward_sensitive_headers=true`"
                 .to_string(),
         ),
         (true, true) => Err(
@@ -2221,25 +2221,25 @@ fn parse_sensitive_query_patterns(config: &Value) -> Result<Vec<String>, String>
         Some(Value::Array(items)) => {
             if items.len() > MAX_SENSITIVE_QUERY_PATTERNS {
                 return Err(format!(
-                    "request_mirror: 'sensitive_query_patterns' must contain at most {MAX_SENSITIVE_QUERY_PATTERNS} entries"
+                    "request_mirror: `sensitive_query_patterns` must contain at most {MAX_SENSITIVE_QUERY_PATTERNS} entries"
                 ));
             }
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
                 let Some(pattern) = item.as_str() else {
                     return Err(format!(
-                        "request_mirror: 'sensitive_query_patterns[{idx}]' must be a string"
+                        "request_mirror: `sensitive_query_patterns[{idx}]` must be a string"
                     ));
                 };
                 let trimmed = pattern.trim();
                 if trimmed.is_empty() {
                     return Err(format!(
-                        "request_mirror: 'sensitive_query_patterns[{idx}]' must not be blank"
+                        "request_mirror: `sensitive_query_patterns[{idx}]` must not be blank"
                     ));
                 }
                 if trimmed.len() > MAX_SENSITIVE_QUERY_PATTERN_LEN {
                     return Err(format!(
-                        "request_mirror: 'sensitive_query_patterns[{idx}]' exceeds maximum length of {MAX_SENSITIVE_QUERY_PATTERN_LEN} bytes"
+                        "request_mirror: `sensitive_query_patterns[{idx}]` exceeds maximum length of {MAX_SENSITIVE_QUERY_PATTERN_LEN} bytes"
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
@@ -2250,7 +2250,7 @@ fn parse_sensitive_query_patterns(config: &Value) -> Result<Vec<String>, String>
             Ok(out)
         }
         Some(_) => Err(
-            "request_mirror: 'sensitive_query_patterns' must be an array of strings".to_string(),
+            "request_mirror: `sensitive_query_patterns` must be an array of strings".to_string(),
         ),
     }
 }
@@ -2265,25 +2265,25 @@ fn parse_forward_sensitive_query_allowlist(
         Some(Value::Array(items)) => {
             if items.len() > MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST {
                 return Err(format!(
-                    "request_mirror: 'forward_sensitive_query_allowlist' must contain at most {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST} entries"
+                    "request_mirror: `forward_sensitive_query_allowlist` must contain at most {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST} entries"
                 ));
             }
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
                 let Some(name) = item.as_str() else {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' must be a string"
+                        "request_mirror: `forward_sensitive_query_allowlist[{idx}]` must be a string"
                     ));
                 };
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' must not be blank"
+                        "request_mirror: `forward_sensitive_query_allowlist[{idx}]` must not be blank"
                     ));
                 }
                 if trimmed.len() > MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' exceeds maximum length of {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN} bytes"
+                        "request_mirror: `forward_sensitive_query_allowlist[{idx}]` exceeds maximum length of {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN} bytes"
                     ));
                 }
                 if trimmed
@@ -2293,13 +2293,13 @@ fn parse_forward_sensitive_query_allowlist(
                     || http::HeaderName::from_bytes(trimmed.as_bytes()).is_err()
                 {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' is not a valid query parameter name"
+                        "request_mirror: `forward_sensitive_query_allowlist[{idx}]` is not a valid query parameter name"
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
                 if !is_mirror_sensitive_query_name(&lower, operator_patterns) {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' is not a recognized sensitive query name (built-in credential or a configured sensitive_query_patterns match)"
+                        "request_mirror: `forward_sensitive_query_allowlist[{idx}]` is not a recognized sensitive query name (built-in credential or a configured sensitive_query_patterns match)"
                     ));
                 }
                 if !out.iter().any(|existing| existing == &lower) {
@@ -2310,7 +2310,7 @@ fn parse_forward_sensitive_query_allowlist(
         }
         Some(_) => {
             return Err(
-                "request_mirror: 'forward_sensitive_query_allowlist' must be an array of strings"
+                "request_mirror: `forward_sensitive_query_allowlist` must be an array of strings"
                     .to_string(),
             );
         }
@@ -2319,7 +2319,7 @@ fn parse_forward_sensitive_query_allowlist(
     match (forward_sensitive_query, raw.is_empty()) {
         (false, true) => Ok(raw),
         (false, false) => Err(
-            "request_mirror: 'forward_sensitive_query_allowlist' requires forward_sensitive_query=true"
+            "request_mirror: `forward_sensitive_query_allowlist` requires `forward_sensitive_query=true`"
                 .to_string(),
         ),
         (true, true) => Err(
@@ -2334,7 +2334,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("request_mirror: '{key}' must be a boolean")),
+        Some(_) => Err(format!("request_mirror: `{key}` must be a boolean")),
     }
 }
 
@@ -2343,9 +2343,9 @@ fn optional_f64(config: &Value, key: &str) -> Result<Option<f64>, String> {
         Some(Value::Number(value)) => value
             .as_f64()
             .map(Some)
-            .ok_or_else(|| format!("request_mirror: '{key}' must be a number")),
+            .ok_or_else(|| format!("request_mirror: `{key}` must be a number")),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("request_mirror: '{key}' must be a number")),
+        Some(_) => Err(format!("request_mirror: `{key}` must be a number")),
     }
 }
 
@@ -2353,7 +2353,7 @@ fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> 
     match config.get(key) {
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("request_mirror: '{key}' must be a string")),
+        Some(_) => Err(format!("request_mirror: `{key}` must be a string")),
     }
 }
 
@@ -2362,10 +2362,10 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(Value::Number(value)) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("request_mirror: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("request_mirror: `{key}` must be an unsigned integer")),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(format!(
-            "request_mirror: '{key}' must be an unsigned integer"
+            "request_mirror: `{key}` must be an unsigned integer"
         )),
     }
 }

@@ -2202,3 +2202,34 @@ async fn composed_admitted_limiters_publish_the_tightest_budget_in_either_order(
     );
     assert_eq!(meta(&reversed, "ratelimit_remaining"), Some("4"));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"limits": [{"scope": "default", token: true}]}),
+            "`limits[0]`",
+            "not valid inside `limits`",
+        ),
+        (
+            json!({"limits": [{"scope": token, "requests_per_second": 1}]}),
+            "`scope`",
+            "must be `default` or `consumers`",
+        ),
+        (
+            json!({"limits": [{"scope": "default", "requests_per_second": true}]}),
+            "`requests_per_second`",
+            "must be an integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("rate_limiting", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

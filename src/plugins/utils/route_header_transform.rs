@@ -168,7 +168,7 @@ pub fn parse_route_header_transforms(
     for (idx, rule) in raw.iter().enumerate() {
         if rule.target != "header" {
             return Err(format!(
-                "{context}[{idx}].target must be \"header\" for route-level transforms (got \"{}\")",
+                "`{context}[{idx}].target` must be `header` for route-level transforms (got {:?})",
                 rule.target
             ));
         }
@@ -178,31 +178,31 @@ pub fn parse_route_header_transforms(
             "remove" => RouteHeaderTransformOp::Remove,
             other => {
                 return Err(format!(
-                    "{context}[{idx}].operation must be one of add/update/remove (got {other:?})"
+                    "`{context}[{idx}].operation` must be one of `add`/`update`/`remove` (got {other:?})"
                 ));
             }
         };
         if rule.key.is_empty() {
-            return Err(format!("{context}[{idx}].key must not be empty"));
+            return Err(format!("`{context}[{idx}].key` must not be empty"));
         }
         let key = HeaderName::from_bytes(rule.key.as_bytes())
-            .map_err(|_| format!("{context}[{idx}].key must be a valid HTTP header name"))?
+            .map_err(|_| format!("`{context}[{idx}].key` must be a valid HTTP header name"))?
             .to_string();
         match op {
             RouteHeaderTransformOp::Add | RouteHeaderTransformOp::Update => {
                 let Some(value) = rule.value.as_ref() else {
                     return Err(format!(
-                        "{context}[{idx}].value is required for operation \"{}\"",
+                        "`{context}[{idx}].value` is required for operation {:?}",
                         rule.operation
                     ));
                 };
                 if value.bytes().any(|b| b == b'\r' || b == b'\n') {
-                    return Err(format!("{context}[{idx}].value must not contain CR or LF"));
+                    return Err(format!("`{context}[{idx}].value` must not contain CR or LF"));
                 }
                 // Same complete HeaderValue gate used by outbound Hyper / H3 /
                 // reqwest adapters so invalid controls fail at config load.
                 HeaderValue::from_str(value).map_err(|_| {
-                    format!("{context}[{idx}].value must be a valid HTTP HeaderValue")
+                    format!("`{context}[{idx}].value` must be a valid HTTP HeaderValue")
                 })?;
                 out.push(RouteHeaderTransformRule {
                     operation: op,
@@ -213,7 +213,7 @@ pub fn parse_route_header_transforms(
             RouteHeaderTransformOp::Remove => {
                 if rule.value.is_some() {
                     return Err(format!(
-                        "{context}[{idx}].value must not be set for operation \"remove\""
+                        "`{context}[{idx}].value` must not be set for operation `remove`"
                     ));
                 }
                 out.push(RouteHeaderTransformRule {

@@ -97,7 +97,7 @@ fn test_graphql_rejects_invalid_scalar_config_types() {
         .err()
         .expect("null sync_mode must be rejected");
     assert!(
-        sync_mode_error.starts_with("graphql: 'sync_mode' must be a string"),
+        sync_mode_error.starts_with("graphql: `sync_mode` must be a string"),
         "GraphQL must own the sync_mode admission error: {sync_mode_error}"
     );
 }
@@ -960,7 +960,7 @@ fn test_unknown_limit_by_rejected() {
     );
     let err = result.err().expect("unknown limit_by must be rejected");
     assert!(
-        err.contains("'limit_by' must be exactly 'ip' or 'consumer'"),
+        err.contains("`limit_by` must be exactly `ip` or `consumer`"),
         "got: {err}"
     );
 }
@@ -979,7 +979,7 @@ fn test_zero_window_seconds_in_type_limit_rejected() {
     );
     let err = result.err().expect("window_seconds=0 must be rejected");
     assert!(
-        err.contains("'window_seconds' must be greater than zero"),
+        err.contains("`window_seconds` must be greater than zero"),
         "got: {err}"
     );
 }
@@ -995,7 +995,7 @@ fn test_missing_max_requests_in_operation_limit_rejected() {
         }),
     );
     let err = result.err().expect("missing max_requests must be rejected");
-    assert!(err.contains("'max_requests' is required"), "got: {err}");
+    assert!(err.contains("`max_requests` is required"), "got: {err}");
 }
 
 #[test]
@@ -1011,7 +1011,7 @@ fn test_missing_window_seconds_in_type_limit_rejected() {
     let err = result
         .err()
         .expect("missing window_seconds must be rejected");
-    assert!(err.contains("'window_seconds' is required"), "got: {err}");
+    assert!(err.contains("`window_seconds` is required"), "got: {err}");
 }
 
 #[tokio::test]
@@ -2104,4 +2104,40 @@ async fn structural_policy_still_runs_over_an_already_charged_bucket() {
             .await,
         Some(400),
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"sync_mode": token}),
+            "`sync_mode`",
+            "must be exactly",
+        ),
+        (
+            json!({"operation_rate_limits": {"UNREGISTERED_TRAFFIC_TOKEN": {}}}),
+            "`operation_rate_limits`",
+            "`max_requests` is required",
+        ),
+        (
+            json!({"operation_rate_limits": {token: {}}}),
+            "`operation_rate_limits`",
+            "valid GraphQL operation name",
+        ),
+        (
+            json!({"max_depth": true}),
+            "`max_depth`",
+            "must be an integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("graphql", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

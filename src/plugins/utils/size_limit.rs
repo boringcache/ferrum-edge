@@ -30,7 +30,7 @@ pub fn required_positive_u64(
 
     if value == 0 {
         Err(format!(
-            "{plugin_name}: '{field}' is required and must be greater than zero"
+            "{plugin_name}: `{field}` is required and must be greater than zero"
         ))
     } else {
         Ok(value)
@@ -46,7 +46,7 @@ pub fn required_positive_usize(
 
     if value == 0 {
         Err(format!(
-            "{plugin_name}: '{field}' is required and must be greater than zero"
+            "{plugin_name}: `{field}` is required and must be greater than zero"
         ))
     } else {
         Ok(value)

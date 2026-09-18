@@ -90,7 +90,7 @@ fn test_creation_rejects_non_object_config() {
 #[test]
 fn test_creation_missing_rules() {
     let err = ResponseMock::new(&json!({})).err().unwrap();
-    assert!(err.contains("'rules' must be a JSON array"));
+    assert!(err.contains("`rules` must be a JSON array"));
 }
 
 #[test]
@@ -112,7 +112,7 @@ fn test_creation_rule_missing_path() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("missing 'path'"));
+    assert!(err.contains("missing `path`"));
 }
 
 #[test]
@@ -133,39 +133,39 @@ fn test_creation_rejects_invalid_field_shapes() {
                 "rules": [{ "path": "/test" }],
                 "passthrough_on_no_match": "yes"
             }),
-            "'passthrough_on_no_match' must be a boolean",
+            "`passthrough_on_no_match` must be a boolean",
         ),
         (
             json!({ "rules": [{ "path": "/test", "method": 42 }] }),
-            "'method' must be a string",
+            "`method` must be a string",
         ),
         (
             json!({ "rules": [{ "path": "/test", "method": "GET /admin" }] }),
-            "'method' must be a valid HTTP method token",
+            "`method` must be a valid HTTP method token",
         ),
         (
             json!({ "rules": [{ "path": "/test", "method": "GET\r\nX-Injected: yes" }] }),
-            "'method' must be a valid HTTP method token",
+            "`method` must be a valid HTTP method token",
         ),
         (
             json!({ "rules": [{ "path": "", "body": "test" }] }),
-            "'path' must not be empty",
+            "`path` must not be empty",
         ),
         (
             json!({ "rules": [{ "path": "/test", "headers": [] }] }),
-            "'headers' must be an object",
+            "`headers` must be an object",
         ),
         (
             json!({ "rules": [{ "path": "/test", "headers": { "x-test": 42 } }] }),
-            "header 'x-test' value must be a string",
+            "header \"x-test\" value must be a string",
         ),
         (
             json!({ "rules": [{ "path": "/test", "body": 42 }] }),
-            "'body' must be a string",
+            "`body` must be a string",
         ),
         (
             json!({ "rules": [{ "path": "/test", "delay_ms": "50" }] }),
-            "'delay_ms' must be an unsigned integer",
+            "`delay_ms` must be an unsigned integer",
         ),
     ] {
         let err = ResponseMock::new(&config).err().unwrap();
@@ -204,7 +204,7 @@ fn test_creation_rejects_unknown_top_level_key() {
     .err()
     .expect("misspelled top-level key must be rejected");
     assert!(
-        err.contains("unknown config key(s) under 'config'"),
+        err.contains("unknown config key(s) under `config`"),
         "got: {err}"
     );
     assert!(err.contains("passthrough_on_no_mach"), "got: {err}");
@@ -226,7 +226,7 @@ fn test_creation_rejects_unknown_rule_key() {
     .err()
     .expect("misspelled rule key must be rejected");
     assert!(
-        err.contains("unknown config key(s) under 'config.rules[0]'"),
+        err.contains("unknown config key(s) under `config.rules[0]`"),
         "got: {err}"
     );
     assert!(err.contains("status_cod"), "got: {err}");
@@ -296,7 +296,7 @@ fn test_creation_rejects_status_code_below_range() {
     }))
     .err()
     .unwrap();
-    assert!(err.contains("'status_code' must be in range 100-599"));
+    assert!(err.contains("`status_code` must be in range 100-599"));
 }
 
 // === Path stripping — mock rules are relative to proxy listen_path ===
@@ -821,7 +821,7 @@ fn test_invalid_status_code_rejects() {
     .err()
     .unwrap();
 
-    assert!(err.contains("'status_code' must be in range 100-599"));
+    assert!(err.contains("`status_code` must be in range 100-599"));
 }
 
 // === Delay ===
@@ -1227,5 +1227,41 @@ async fn prefix_trailing_slash_preserves_rule_path_coordinates() {
         assert_eq!(status_code, 200);
         assert_eq!(body, expected);
         assert_eq!(ctx.path, path);
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"rules": [{"path": "/", "headers": {token: true}}]}),
+            "`rule[0]`",
+            "not a valid name",
+        ),
+        (
+            json!({"rules": [{token: true}]}),
+            "`config.rules[0]`",
+            "unknown config key",
+        ),
+        (
+            json!({"rules": [{"path": "/", "status_code": 103}]}),
+            "`status_code`",
+            "unsupported",
+        ),
+        (
+            json!({"rules": [{"path": format!("~{token}[")}]}),
+            "`rule[0].path`",
+            "invalid regex",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("response_mock", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "103", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
     }
 }

@@ -137,13 +137,13 @@ const PROVIDER_STRING_CONFIG_FIELDS: &[&str] = &[
 /// [`CredentialAdmission::Required`] raises them; CP/admin candidate admission
 /// defers availability to the data plane (issue #5179).
 const AWS_REGION_REQUIRED: &str =
-    "'aws_region' is required for aws_lambda (or set AWS_DEFAULT_REGION / AWS_REGION env var)";
+    "`aws_region` is required for aws_lambda (or set AWS_DEFAULT_REGION / AWS_REGION env var)";
 const AWS_ACCESS_KEY_ID_REQUIRED: &str =
-    "'aws_access_key_id' is required for aws_lambda (or set AWS_ACCESS_KEY_ID env var)";
+    "`aws_access_key_id` is required for aws_lambda (or set AWS_ACCESS_KEY_ID env var)";
 const AWS_SECRET_ACCESS_KEY_REQUIRED: &str =
-    "'aws_secret_access_key' is required for aws_lambda (or set AWS_SECRET_ACCESS_KEY env var)";
+    "`aws_secret_access_key` is required for aws_lambda (or set AWS_SECRET_ACCESS_KEY env var)";
 const AWS_FUNCTION_NAME_REQUIRED: &str =
-    "'aws_function_name' is required for aws_lambda (or set AWS_LAMBDA_FUNCTION_NAME env var)";
+    "`aws_function_name` is required for aws_lambda (or set AWS_LAMBDA_FUNCTION_NAME env var)";
 
 const DEFAULT_INSTANCE_ID: &str = "standalone";
 
@@ -307,11 +307,11 @@ fn parse_invocation_mode(config: &Value) -> Result<InvocationMode, String> {
             "pre_proxy" => Ok(InvocationMode::PreProxy),
             "terminate" => Ok(InvocationMode::Terminate),
             other => Err(format!(
-                "serverless_function: unknown mode {other:?} (expected `pre_proxy` or `terminate`)"
+                "serverless_function: unknown `mode` {other:?} (expected `pre_proxy` or `terminate`)"
             )),
         },
         None => Ok(InvocationMode::PreProxy),
-        Some(_) => Err("serverless_function: 'mode' must be a string".to_string()),
+        Some(_) => Err("serverless_function: `mode` must be a string".to_string()),
     }
 }
 
@@ -481,7 +481,7 @@ impl ServerlessFunction {
         unknown_fields.sort_unstable();
         if !unknown_fields.is_empty() {
             return Err(format!(
-                "serverless_function: unknown configuration field(s): {}",
+                "serverless_function: unknown configuration field(s): {:?}",
                 unknown_fields.join(", ")
             ));
         }
@@ -497,7 +497,7 @@ impl ServerlessFunction {
             } else {
                 "must not be null; omit the field instead"
             };
-            return Err(format!("serverless_function: '{key}' {detail}"));
+            return Err(format!("serverless_function: `config` field {key:?} {detail}"));
         }
 
         let provider = match config.get("provider").and_then(Value::as_str) {
@@ -506,15 +506,15 @@ impl ServerlessFunction {
             Some("gcp_cloud_functions") => Provider::GcpCloudFunctions,
             Some(other) => {
                 return Err(format!(
-                    "serverless_function: unknown provider '{}' — must be 'aws_lambda', \
-                     'azure_functions', or 'gcp_cloud_functions'",
+                    "serverless_function: unknown `provider` {:?} — must be `aws_lambda`, \
+                     `azure_functions`, or `gcp_cloud_functions`",
                     other
                 ));
             }
             None => {
                 return Err(
-                    "serverless_function: 'provider' is required — must be 'aws_lambda', \
-                     'azure_functions', or 'gcp_cloud_functions'"
+                    "serverless_function: `provider` is required — must be `aws_lambda`, \
+                     `azure_functions`, or `gcp_cloud_functions`"
                         .to_string(),
                 );
             }
@@ -540,7 +540,7 @@ impl ServerlessFunction {
 
         let timeout_ms = optional_u64(config, "timeout_ms")?.unwrap_or(5000);
         if timeout_ms == 0 {
-            return Err("serverless_function: timeout_ms must be > 0".to_string());
+            return Err("serverless_function: `timeout_ms` must be > 0".to_string());
         }
 
         let max_response_body_bytes = parse_max_response_body_bytes(
@@ -565,14 +565,14 @@ impl ServerlessFunction {
             },
             None => ErrorAction::Reject,
             Some(_) => {
-                return Err("serverless_function: 'on_error' must be a string".to_string());
+                return Err("serverless_function: `on_error` must be a string".to_string());
             }
         };
 
         let raw_status = optional_u64(config, "error_status_code")?.unwrap_or(502);
         if !(400..=599).contains(&raw_status) {
             return Err(format!(
-                "serverless_function: error_status_code must be in range 400-599 (got \"{raw_status}\")"
+                "serverless_function: `error_status_code` must be in range 400-599 (got \"{raw_status}\")"
             ));
         }
         let error_status_code = raw_status as u16;
@@ -588,7 +588,7 @@ impl ServerlessFunction {
             }
             None => None,
             Some(_) => {
-                return Err("serverless_function: 'function_url' must be a string".to_string());
+                return Err("serverless_function: `function_url` must be a string".to_string());
             }
         };
 
@@ -714,7 +714,7 @@ impl ServerlessFunction {
                 }
                 Provider::AzureFunctions => {
                     let url = configured_function_url.ok_or_else(|| {
-                        "serverless_function: 'function_url' is required for azure_functions"
+                        "serverless_function: `function_url` is required for azure_functions"
                             .to_string()
                     })?;
 
@@ -739,7 +739,7 @@ impl ServerlessFunction {
                 }
                 Provider::GcpCloudFunctions => {
                     let url = configured_function_url.ok_or_else(|| {
-                        "serverless_function: 'function_url' is required for gcp_cloud_functions"
+                        "serverless_function: `function_url` is required for gcp_cloud_functions"
                             .to_string()
                     })?;
 
@@ -1105,7 +1105,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         None => Ok(None),
-        Some(_) => Err(format!("serverless_function: '{key}' must be a boolean")),
+        Some(_) => Err(format!("serverless_function: `{key}` must be a boolean")),
     }
 }
 
@@ -1114,10 +1114,10 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(Value::Number(value)) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("serverless_function: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("serverless_function: `{key}` must be an unsigned integer")),
         None => Ok(None),
         Some(_) => Err(format!(
-            "serverless_function: '{key}' must be an unsigned integer"
+            "serverless_function: `{key}` must be an unsigned integer"
         )),
     }
 }
@@ -1126,7 +1126,7 @@ fn optional_config_string(config: &Value, key: &str) -> Result<Option<String>, S
     match config.get(key) {
         Some(Value::String(value)) => Ok((!value.is_empty()).then(|| value.clone())),
         None => Ok(None),
-        Some(_) => Err(format!("serverless_function: '{key}' must be a string")),
+        Some(_) => Err(format!("serverless_function: `{key}` must be a string")),
     }
 }
 
@@ -1140,16 +1140,16 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
     };
 
     let Value::Array(headers) = value else {
-        return Err("serverless_function: 'forward_headers' must be an array".to_string());
+        return Err("serverless_function: `forward_headers` must be an array".to_string());
     };
 
     let mut parsed = Vec::with_capacity(headers.len());
     for (idx, header) in headers.iter().enumerate() {
         let name = header.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
-            format!("serverless_function: forward_headers[{idx}] must be a non-empty string")
+            format!("serverless_function: `forward_headers[{idx}]` must be a non-empty string")
         })?;
         HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            format!("serverless_function: forward_headers[{idx}] is not a valid HTTP header name")
+            format!("serverless_function: `forward_headers[{idx}]` is not a valid HTTP header name")
         })?;
         parsed.push(name.to_ascii_lowercase());
     }
@@ -1199,7 +1199,7 @@ fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
         if let Some(value) = config.get(*field)
             && !value.is_string()
         {
-            return Err(format!("serverless_function: '{field}' must be a string"));
+            return Err(format!("serverless_function: `{field}` must be a string"));
         }
     }
     if let Some(endpoint) = optional_config_string(config, "aws_endpoint_url")? {
@@ -1230,13 +1230,13 @@ fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
 fn validate_aws_function_name(function_name: &str) -> Result<(), String> {
     if function_name.chars().count() > MAX_AWS_FUNCTION_NAME_CHARS {
         return Err(format!(
-            "serverless_function: 'aws_function_name' must be at most \
+            "serverless_function: `aws_function_name` must be at most \
              {MAX_AWS_FUNCTION_NAME_CHARS} characters"
         ));
     }
     if !AWS_FUNCTION_NAME_REGEX.is_match(function_name) {
         return Err(
-            "serverless_function: 'aws_function_name' is not a valid Lambda function name, \
+            "serverless_function: `aws_function_name` is not a valid Lambda function name, \
              partial ARN, or full ARN"
                 .to_string(),
         );
@@ -1248,13 +1248,13 @@ fn validate_aws_function_name(function_name: &str) -> Result<(), String> {
 fn validate_aws_qualifier(qualifier: &str) -> Result<(), String> {
     if qualifier.chars().count() > MAX_AWS_QUALIFIER_CHARS {
         return Err(format!(
-            "serverless_function: 'aws_qualifier' must be at most \
+            "serverless_function: `aws_qualifier` must be at most \
              {MAX_AWS_QUALIFIER_CHARS} characters"
         ));
     }
     if !AWS_QUALIFIER_REGEX.is_match(qualifier) {
         return Err(
-            "serverless_function: 'aws_qualifier' is not a valid Lambda version or alias \
+            "serverless_function: `aws_qualifier` is not a valid Lambda version or alias \
              qualifier"
                 .to_string(),
         );
@@ -1273,7 +1273,7 @@ fn validate_aws_qualifier(qualifier: &str) -> Result<(), String> {
 /// anywhere a header map is rendered.
 fn credential_header_value(field: &str, value: &str) -> Result<HeaderValue, String> {
     let mut header = HeaderValue::from_str(value)
-        .map_err(|_| format!("serverless_function: '{field}' is not a valid HTTP header value"))?;
+        .map_err(|_| format!("serverless_function: `{field}` is not a valid HTTP header value"))?;
     header.set_sensitive(true);
     Ok(header)
 }
@@ -1325,36 +1325,36 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
         .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         return Err(format!(
-            "serverless_function: {field} must not contain ASCII whitespace or control characters"
+            "serverless_function: `{field}` must not contain ASCII whitespace or control characters"
         ));
     }
 
-    let parsed = Url::parse(url).map_err(|_| format!("serverless_function: invalid {field}"))?;
+    let parsed = Url::parse(url).map_err(|_| format!("serverless_function: invalid `{field}`"))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
         _ => {
             return Err(format!(
-                "serverless_function: {field} must use http:// or https://"
+                "serverless_function: `{field}` must use http:// or https://"
             ));
         }
     }
 
     if !has_non_empty_authority(url) {
         return Err(format!(
-            "serverless_function: {field} must include a hostname or IP address"
+            "serverless_function: `{field}` must include a hostname or IP address"
         ));
     }
     http_url_hostname(&parsed, field)?;
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
-            "serverless_function: {field} must not contain URL userinfo; use the provider credential fields"
+            "serverless_function: `{field}` must not contain URL userinfo; use the provider credential fields"
         ));
     }
     if parsed.fragment().is_some() {
         return Err(format!(
-            "serverless_function: {field} must not contain a URL fragment"
+            "serverless_function: `{field}` must not contain a URL fragment"
         ));
     }
 
@@ -1364,10 +1364,10 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
 fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "aws_endpoint_url")?;
     let parsed =
-        Url::parse(url).map_err(|_| "serverless_function: invalid aws_endpoint_url".to_string())?;
+        Url::parse(url).map_err(|_| "serverless_function: invalid `aws_endpoint_url`".to_string())?;
     if parsed.path() != "/" || parsed.query().is_some() {
         return Err(
-            "serverless_function: aws_endpoint_url must be an HTTP(S) origin without a path, query, or fragment"
+            "serverless_function: `aws_endpoint_url` must be an HTTP(S) origin without a path, query, or fragment"
                 .to_string(),
         );
     }
@@ -2291,7 +2291,7 @@ fn is_protocol_managed_or_unsafe_response_header(name: &str) -> bool {
 
 fn http_url_hostname(parsed: &Url, field: &str) -> Result<String, String> {
     let host = parsed.host().ok_or_else(|| {
-        format!("serverless_function: {field} must include a hostname or IP address")
+        format!("serverless_function: `{field}` must include a hostname or IP address")
     })?;
 
     Ok(match host {

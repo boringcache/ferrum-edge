@@ -60,7 +60,7 @@ impl WsMessageSizeLimiting {
         };
         if max_message_bytes < max_frame_bytes {
             return Err(
-                "ws_message_size_limiting: 'max_message_bytes' must be greater than or equal to 'max_frame_bytes'"
+                "ws_message_size_limiting: `max_message_bytes` must be greater than or equal to `max_frame_bytes`"
                     .to_string(),
             );
         }
@@ -71,7 +71,7 @@ impl WsMessageSizeLimiting {
         if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
             warn!(
                 max_bytes = Self::MAX_CLOSE_REASON_BYTES,
-                "ws_message_size_limiting: 'close_reason' exceeds WebSocket limit — truncating"
+                "ws_message_size_limiting: `close_reason` exceeds WebSocket limit — truncating"
             );
             close_reason.truncate(Self::truncate_utf8_boundary(
                 &close_reason,
@@ -102,7 +102,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ws_message_size_limiting: '{field}' must be a string"))
+        .ok_or_else(|| format!("ws_message_size_limiting: `{field}` must be a string"))
 }
 
 impl Plugin for WsMessageSizeLimiting {

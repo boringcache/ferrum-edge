@@ -9102,3 +9102,38 @@ async fn test_bypassed_response_is_not_rewritten_with_a_vary_contract() {
     plugin.after_proxy(&mut ctx, 200, &mut resp).await;
     assert!(!resp.contains_key("vary"));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [
+        (
+            json!({"cacheable_methods": ["'UNREGISTERED_TRAFFIC_TOKEN"]}),
+            "`cacheable_methods[0]`",
+            "not a bodyless retrieval",
+        ),
+        (
+            json!({"cacheable_status_codes": [103]}),
+            "`cacheable_status_codes[0]`",
+            "caching semantics",
+        ),
+        (
+            json!({"cacheable_methods": [918273641]}),
+            "`cacheable_methods[0]`",
+            "must be a string",
+        ),
+        (
+            json!({"vary_by_headers": [true]}),
+            "`vary_by_headers[0]`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("response_caching", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "103", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

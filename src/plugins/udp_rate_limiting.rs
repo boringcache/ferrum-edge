@@ -143,7 +143,7 @@ impl UdpRateLimiting {
 
         if datagrams_per_second.is_none() && bytes_per_second.is_none() {
             return Err(
-                "udp_rate_limiting: at least one of 'datagrams_per_second' or 'bytes_per_second' must be set"
+                "udp_rate_limiting: at least one of `datagrams_per_second` or `bytes_per_second` must be set"
                     .to_string(),
             );
         }
@@ -540,12 +540,12 @@ fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "udp_rate_limiting: '{field}' must be an integer greater than zero"
+            "udp_rate_limiting: `{field}` must be an integer greater than zero"
         ));
     };
     if value == 0 {
         return Err(format!(
-            "udp_rate_limiting: '{field}' must be greater than zero"
+            "udp_rate_limiting: `{field}` must be greater than zero"
         ));
     }
     Ok(Some(value))

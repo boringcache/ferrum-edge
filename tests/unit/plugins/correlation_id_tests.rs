@@ -1153,3 +1153,44 @@ async fn public_metadata_cannot_mark_a_client_value_as_generated() {
         "client-fixed-1"
     ));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({token: true}),
+            "correlation_id",
+            "unknown config field",
+        ),
+        (
+            json!({"header_name": 918273641}),
+            "`header_name`",
+            "must be a string",
+        ),
+        (
+            json!({"header_name": true}),
+            "`header_name`",
+            "must be a string",
+        ),
+        (
+            json!({"header_name": {token: 918273641}}),
+            "`header_name`",
+            "must be a string",
+        ),
+        (
+            json!({"echo_downstream": token}),
+            "`echo_downstream`",
+            "must be a boolean",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("correlation_id", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

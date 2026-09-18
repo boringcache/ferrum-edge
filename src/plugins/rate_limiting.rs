@@ -223,7 +223,7 @@ impl RateLimiting {
         let parsed_limits = parse_limits(object)?;
         if !parsed_limits.consumer_overrides.is_empty() && limit_by != LimitBy::Consumer {
             return Err(
-                "rate_limiting: consumer-scoped limits can only be used with limit_by='consumer'"
+                "rate_limiting: consumer-scoped limits can only be used with `limit_by=consumer`"
                     .to_string(),
             );
         }
@@ -976,7 +976,7 @@ fn parse_optional_bool(
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("rate_limiting: '{field}' must be a boolean"))
+                .ok_or_else(|| format!("rate_limiting: `{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -990,7 +990,7 @@ fn parse_optional_u64(
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| format!("rate_limiting: '{field}' must be an integer"))
+                .ok_or_else(|| format!("rate_limiting: `{field}` must be an integer"))
         })
         .transpose()
 }
@@ -1009,14 +1009,14 @@ fn parse_window_specs(
     let has_custom = object.contains_key("window_seconds") || object.contains_key("max_requests");
     if has_preset && has_custom {
         return Err(format!(
-            "{label}: cannot combine 'window_seconds'/'max_requests' with 'requests_per_second'/'requests_per_minute'/'requests_per_hour' in the same rule"
+            "{label}: cannot combine `window_seconds`/`max_requests` with `requests_per_second`/`requests_per_minute`/`requests_per_hour` in the same rule"
         ));
     }
 
     if let Some(window_seconds) = parse_optional_u64(object, "window_seconds")? {
         let window_seconds = validate_window_seconds(label, "window_seconds", window_seconds)?;
         let max_requests = parse_optional_u64(object, "max_requests")?.ok_or_else(|| {
-            format!("{label}: 'max_requests' is required when 'window_seconds' is set")
+            format!("{label}: `max_requests` is required when `window_seconds` is set")
         })?;
         let max_requests = validate_max_requests(label, "max_requests", max_requests)?;
         return Ok(vec![RateLimitWindowSpec {
@@ -1026,7 +1026,7 @@ fn parse_window_specs(
     }
 
     if object.contains_key("max_requests") {
-        return Err(format!("{label}: 'max_requests' requires 'window_seconds'"));
+        return Err(format!("{label}: `max_requests` requires `window_seconds`"));
     }
 
     let mut specs = Vec::new();
@@ -1068,17 +1068,17 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
 
     let limits = object
         .get("limits")
-        .ok_or_else(|| "rate_limiting: 'limits' is required".to_string())?
+        .ok_or_else(|| "rate_limiting: `limits` is required".to_string())?
         .as_array()
-        .ok_or_else(|| "rate_limiting: 'limits' must be an array".to_string())?;
+        .ok_or_else(|| "rate_limiting: `limits` must be an array".to_string())?;
     if limits.is_empty() {
-        return Err("rate_limiting: 'limits' must contain at least one rule".to_string());
+        return Err("rate_limiting: `limits` must contain at least one rule".to_string());
     }
 
     let mut default_limit = None;
     let mut consumer_overrides = HashMap::new();
     for (idx, raw_rule) in limits.iter().enumerate() {
-        let label = format!("rate_limiting: limits[{idx}]");
+        let label = format!("rate_limiting: `limits[{idx}]`");
         let rule = raw_rule
             .as_object()
             .ok_or_else(|| format!("{label} must be an object"))?;
@@ -1087,7 +1087,7 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
         let specs = parse_window_specs(&label, rule)?;
         if specs.is_empty() {
             return Err(format!(
-                "{label}: no rate limit windows configured — set 'window_seconds'+'max_requests', or 'requests_per_second'/'requests_per_minute'/'requests_per_hour'"
+                "{label}: no rate limit windows configured — set `window_seconds`+`max_requests`, or `requests_per_second`/`requests_per_minute`/`requests_per_hour`"
             ));
         }
         let limit = DynamicRateLimitOp::new(specs);
@@ -1096,7 +1096,7 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
             LimitScope::Default => {
                 if let Some((first_idx, _)) = default_limit.replace((idx, limit)) {
                     return Err(format!(
-                        "rate_limiting: limits[{idx}] is a second 'scope: default' rule; limits[{first_idx}] already defines the default rule"
+                        "rate_limiting: `limits[{idx}]` is a second `scope: default` rule; `limits[{first_idx}]` already defines the default rule"
                     ));
                 }
             }
@@ -1111,7 +1111,7 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
                         std::collections::hash_map::Entry::Occupied(entry) => {
                             let first_idx = entry.get().0;
                             return Err(format!(
-                                "rate_limiting: limits[{idx}] duplicates consumer-specific limit for {:?}; first defined in limits[{first_idx}]",
+                                "rate_limiting: `limits[{idx}]` duplicates consumer-specific limit for {:?}; first defined in `limits[{first_idx}]`",
                                 entry.key()
                             ));
                         }
@@ -1123,7 +1123,7 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
 
     let Some((_, default_limit)) = default_limit else {
         return Err(
-            "rate_limiting: 'limits' must include one rule with scope='default'".to_string(),
+            "rate_limiting: `limits` must include one rule with `scope=default`".to_string(),
         );
     };
 
@@ -1148,14 +1148,14 @@ fn parse_limit_scope(
     let scope = object
         .get("scope")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("{label}: 'scope' is required and must be a string"))?;
+        .ok_or_else(|| format!("{label}: `scope` is required and must be a string"))?;
     let scope = scope.to_ascii_lowercase();
 
     match scope.as_str() {
         "default" => {
             if object.contains_key("consumers") {
                 return Err(format!(
-                    "{label}: 'consumers' is only valid when scope='consumers'"
+                    "{label}: `consumers` is only valid when `scope=consumers`"
                 ));
             }
             Ok(LimitScope::Default)
@@ -1163,12 +1163,12 @@ fn parse_limit_scope(
         "consumers" => {
             let consumers = object
                 .get("consumers")
-                .ok_or_else(|| format!("{label}: 'consumers' is required"))?
+                .ok_or_else(|| format!("{label}: `consumers` is required"))?
                 .as_array()
-                .ok_or_else(|| format!("{label}: 'consumers' must be an array"))?;
+                .ok_or_else(|| format!("{label}: `consumers` must be an array"))?;
             if consumers.is_empty() {
                 return Err(format!(
-                    "{label}: 'consumers' must contain at least one identity"
+                    "{label}: `consumers` must contain at least one identity"
                 ));
             }
             let mut parsed = Vec::with_capacity(consumers.len());
@@ -1176,15 +1176,15 @@ fn parse_limit_scope(
             for (idx, raw_consumer) in consumers.iter().enumerate() {
                 let consumer = raw_consumer
                     .as_str()
-                    .ok_or_else(|| format!("{label}: 'consumers[{idx}]' must be a string"))?;
+                    .ok_or_else(|| format!("{label}: `consumers[{idx}]` must be a string"))?;
                 if consumer.is_empty() {
                     return Err(format!(
-                        "{label}: 'consumers[{idx}]' must be a non-empty string"
+                        "{label}: `consumers[{idx}]` must be a non-empty string"
                     ));
                 }
                 if !seen.insert(consumer) {
                     return Err(format!(
-                        "{label}: 'consumers[{idx}]' duplicates consumer identity {consumer:?} in the same rule"
+                        "{label}: `consumers[{idx}]` duplicates consumer identity {consumer:?} in the same rule"
                     ));
                 }
                 parsed.push(consumer.to_string());
@@ -1210,7 +1210,7 @@ fn reject_legacy_window_fields(object: &serde_json::Map<String, Value>) -> Resul
     for field in LEGACY_FIELDS {
         if object.contains_key(*field) {
             return Err(format!(
-                "rate_limiting: '{field}' must be configured inside 'limits' rules"
+                "rate_limiting: `{field}` must be configured inside `limits` rules"
             ));
         }
     }
@@ -1235,12 +1235,12 @@ fn validate_limit_rule_fields(
     for key in object.keys() {
         if key == "sync_mode" || key.starts_with("redis_") {
             return Err(format!(
-                "{label}: '{key}' is not valid inside 'limits'; configure counter storage once at the rate_limiting plugin level"
+                "{label}: {key:?} is not valid inside `limits`; configure counter storage once at the rate_limiting plugin level"
             ));
         }
         if !ALLOWED_FIELDS.contains(&key.as_str()) {
             return Err(format!(
-                "{label}: '{key}' is not valid inside 'limits'; allowed fields are scope, consumers, requests_per_second, requests_per_minute, requests_per_hour, window_seconds, max_requests"
+                "{label}: {key:?} is not valid inside `limits`; allowed fields are `scope`, `consumers`, `requests_per_second`, `requests_per_minute`, `requests_per_hour`, `window_seconds`, `max_requests`"
             ));
         }
     }

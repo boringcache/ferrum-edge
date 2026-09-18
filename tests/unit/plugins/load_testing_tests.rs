@@ -464,7 +464,7 @@ fn test_missing_key_is_error() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("'key' is required"), "got: {err}");
+    assert!(err.contains("`key` is required"), "got: {err}");
 }
 
 #[test]
@@ -477,7 +477,7 @@ fn test_empty_key_is_error() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("'key' is required"), "got: {err}");
+    assert!(err.contains("`key` is required"), "got: {err}");
 }
 
 #[test]
@@ -599,7 +599,7 @@ fn test_gateway_addresses_shape_validation() {
         .err()
         .expect("non-string gateway address must fail");
     assert!(
-        err.contains("each 'gateway_addresses' entry must be a string"),
+        err.contains("each `gateway_addresses` entry must be a string"),
         "got: {err}"
     );
 
@@ -626,7 +626,7 @@ fn test_gateway_addresses_shape_validation() {
         .err()
         .expect("non-array gateway_addresses must fail");
     assert!(
-        err.contains("'gateway_addresses' must be an array"),
+        err.contains("`gateway_addresses` must be an array"),
         "got: {err}"
     );
 }
@@ -2492,4 +2492,30 @@ fn schema_case_config_without_port(extra: &serde_json::Value) -> serde_json::Val
         config[name.as_str()] = value.clone();
     }
     config
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"key": true}),
+            "`key`",
+            "must be a string",
+        ),
+        (
+            json!({"key": token, "concurrent_clients": 918273641}),
+            "`concurrent_clients`",
+            "must be 1–10000",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("load_testing", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

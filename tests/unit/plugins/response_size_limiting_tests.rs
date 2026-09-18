@@ -89,7 +89,7 @@ fn test_explicit_null_require_buffered_check_rejected() {
     .err()
     .expect("explicit null must be rejected");
     assert!(
-        err.contains("'require_buffered_check' must be a boolean"),
+        err.contains("`require_buffered_check` must be a boolean"),
         "{err}"
     );
     assert!(
@@ -700,5 +700,30 @@ async fn test_final_response_body_over_limit_still_rejects_after_transforms() {
     {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
         other => panic!("Expected 502 Reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [
+        (
+            json!({"max_bytes": false}),
+            "`max_bytes`",
+            "must be greater than zero",
+        ),
+        (
+            json!({"max_bytes": 1, "require_buffered_check": 918273641}),
+            "`require_buffered_check`",
+            "must be a boolean",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("response_size_limiting", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
     }
 }
