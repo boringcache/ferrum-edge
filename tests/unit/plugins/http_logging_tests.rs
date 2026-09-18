@@ -1040,8 +1040,14 @@ fn startup_diagnostics_preserve_observability_root_context_and_suggestions() {
                 .expect_err("unknown observability keys must fail admission");
             let rendered =
                 ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
-            assert!(rendered.contains(&format!("{plugin}: `config`:")), "{rendered}");
-            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("{plugin}: `config`:")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("unknown configuration key(s)"),
+                "{rendered}"
+            );
             assert!(
                 rendered.contains(&format!("did you mean `{suggestion}`?")),
                 "{rendered}"

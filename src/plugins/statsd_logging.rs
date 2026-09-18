@@ -454,9 +454,9 @@ fn build_global_tags(
                     "statsd_logging: duplicate global_tags key {validated:?} after normalization"
                 ));
             }
-            let value = value
-                .as_str()
-                .ok_or_else(|| format!("statsd_logging: `global_tags` key {key:?} must be a string"))?;
+            let value = value.as_str().ok_or_else(|| {
+                format!("statsd_logging: `global_tags` key {key:?} must be a string")
+            })?;
             pairs.push(format!("{validated}:{}", sanitize_tag_value(value)));
         }
     }

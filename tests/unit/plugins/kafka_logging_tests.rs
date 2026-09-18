@@ -2032,7 +2032,10 @@ fn startup_diagnostics_withhold_kafka_enums_and_producer_keys() {
         ("key_field", json!(secret)),
         ("compression", json!(secret)),
         ("acks", json!(secret)),
-        ("producer_config", json!({"'diagnostic-secret-5594": 987654321})),
+        (
+            "producer_config",
+            json!({"'diagnostic-secret-5594": 987654321}),
+        ),
     ] {
         let mut config = json!({"broker_list": "localhost:9092", "topic": "logs"});
         config[field] = value;
