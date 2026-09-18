@@ -59,7 +59,10 @@ fn shared_rate_limit_bounds_keep_schema_fields_and_withhold_values_and_labels() 
             "<redacted scalar>: `max_requests` must be greater than zero".to_string(),
         ),
     ] {
-        assert_eq!(render_startup_error(anyhow::Error::msg(error), &[]), expected);
+        assert_eq!(
+            render_startup_error(anyhow::Error::msg(error), &[]),
+            expected
+        );
     }
 }
 
@@ -107,11 +110,9 @@ fn shared_redis_failure_policy_diagnostics_keep_fixed_choices_without_values() {
         } else {
             "must be a string (`fail_closed` or `local_fallback`)"
         };
-        let error = parse_redis_failure_policy(
-            "rate_limiting",
-            &json!({"redis_failure_policy": supplied}),
-        )
-        .unwrap_err();
+        let error =
+            parse_redis_failure_policy("rate_limiting", &json!({"redis_failure_policy": supplied}))
+                .unwrap_err();
         assert_eq!(
             render_startup_error(anyhow::Error::msg(error), &[]),
             format!("rate limiting: `redis_failure_policy` {reason}")
@@ -137,7 +138,10 @@ fn shared_redis_identity_diagnostics_withhold_invalid_names_and_ids() {
         .expect("invalid identities must fail before Redis construction");
         let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains(reason), "{rendered}");
-        assert!(rendered.contains("must start with an alphanumeric"), "{rendered}");
+        assert!(
+            rendered.contains("must start with an alphanumeric"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("UNREGISTERED_ID"), "{rendered}");
     }
 }
@@ -166,7 +170,11 @@ fn shared_ws_rate_diagnostics_keep_bounds_and_relations_without_supplied_numbers
                 "`burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: <redacted scalar>"
             ),
         ),
-        (57, 19, "`burst_size` must be >= `frames_per_second`".to_string()),
+        (
+            57,
+            19,
+            "`burst_size` must be >= `frames_per_second`".to_string(),
+        ),
         (
             13,
             27,
