@@ -109,8 +109,7 @@ fn redis_ca_load_diagnostic_omits_hostile_source_and_provider_details() {
             false,
             Some(&source),
         )
-        .err()
-        .expect("unloadable exclusive CA must refuse construction");
+        .expect_err("unloadable exclusive CA must refuse construction");
         assert!(!error.contains("REDIS_CA_SOURCE_MARKER"), "{error}");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(
