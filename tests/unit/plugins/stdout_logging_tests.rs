@@ -437,6 +437,16 @@ fn test_stdout_logging_rejects_unknown_errors_only_expression_fields() {
 #[test]
 fn startup_diagnostics_withhold_expression_scalars_and_unknown_keys() {
     let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (config, path) in [
+        (json!({(secret): true}), "`stdout_logging`"),
+        (json!({"filter": {(secret): false}}), "`stdout_logging.filter`"),
+    ] {
+        let error = StdoutLogging::new(&config).err().expect("unknown key rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(path), "{rendered}");
+        assert!(rendered.contains("unknown configuration key"), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+    }
     for expression in [
         json!({"op": secret}),
         json!({"op": "status_code_min", "value": 987654321}),

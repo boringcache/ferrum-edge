@@ -337,7 +337,7 @@ impl SummarySchema {
         for (name, kind) in &derived_fields {
             if !caps.family.supports_derived(*kind) {
                 return Err(format!(
-                    "{plugin_name}: schema derived field {name:?} uses kind `{}`, which is not \
+                    "{plugin_name}: schema `derived_fields.kind` for field {name:?} uses kind {:?}, which is not \
                      representable from a {} (no source field); remove it or pick a supported kind",
                     kind.label(),
                     caps.family.label()

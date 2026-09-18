@@ -270,7 +270,7 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "stdout_logging: unknown configuration key(s): {}",
+        "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
         unknown.join(", ")
     ))
 }
