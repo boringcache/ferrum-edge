@@ -514,20 +514,20 @@ async fn rejects_multiple_unknown_root_keys_sorted_with_suggestions() {
         .expect("unknown root keys must fail closed");
     assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(
-        err.contains("'config.aaa_unknown'")
-            && err.contains("'config.allow_full_bod'")
-            && err.contains("'config.zzz_unknown'"),
+        err.contains("\"config.aaa_unknown\"")
+            && err.contains("\"config.allow_full_bod\"")
+            && err.contains("\"config.zzz_unknown\""),
         "got: {err}"
     );
-    let aaa = err.find("'config.aaa_unknown'").expect("aaa path");
-    let allow = err.find("'config.allow_full_bod'").expect("allow path");
-    let zzz = err.find("'config.zzz_unknown'").expect("zzz path");
+    let aaa = err.find("\"config.aaa_unknown\"").expect("aaa path");
+    let allow = err.find("\"config.allow_full_bod\"").expect("allow path");
+    let zzz = err.find("\"config.zzz_unknown\"").expect("zzz path");
     assert!(
         aaa < allow && allow < zzz,
         "unknown keys must be sorted: {err}"
     );
     assert!(
-        err.contains("did you mean 'allow_full_body'"),
+        err.contains("did you mean `allow_full_body`"),
         "typo should suggest allow_full_body: {err}"
     );
 }
@@ -609,12 +609,12 @@ async fn rejects_privacy_capture_sampling_redaction_limits_and_fail_posture_typo
             "missing unknown-key wording for {needle}: {err}"
         );
         assert!(
-            err.contains(&format!("'{needle}'")),
+            err.contains(&format!("{needle:?}")),
             "error did not identify {needle}: {err}"
         );
         if let Some(suggestion) = suggestion {
             assert!(
-                err.contains(&format!("did you mean '{suggestion}'")),
+                err.contains(&format!("did you mean `{suggestion}`")),
                 "expected suggestion {suggestion} for {needle}: {err}"
             );
         }

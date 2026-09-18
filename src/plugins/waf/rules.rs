@@ -981,7 +981,12 @@ pub(super) fn parse_rule_overrides(
                     .as_object()
                     .ok_or_else(|| format!("waf: rule_overrides[{id:?}] must be an object"))?;
                 let path = format!("config.rule_overrides[{id:?}]");
-                reject_unknown_keys(object, &path, RULE_OVERRIDE_KEYS, "waf: ")?;
+                reject_unknown_keys(
+                    object,
+                    &path,
+                    RULE_OVERRIDE_KEYS,
+                    "waf: `config.rule_overrides`: ",
+                )?;
                 let action = optional_string(object, "action")?
                     .map(|raw| parse_rule_action(&raw, "rule_overrides.action"))
                     .transpose()?;
@@ -999,7 +1004,13 @@ pub(super) fn parse_rule_overrides(
                 let fp_filters = optional_string_vec(object, "fp_filters")?;
                 let conditions = object
                     .get("conditions")
-                    .map(|value| parse_conditions(value, &format!("{path}.conditions")))
+                    .map(|value| {
+                        // The override path contains a supplied rule id; only
+                        // the fixed schema context may survive rendering.
+                        parse_conditions(value, &format!("{path}.conditions")).map_err(|error| {
+                            format!("waf: `config.rule_overrides.conditions`: {error}")
+                        })
+                    })
                     .transpose()?;
                 let score = optional_u32(object, "score")?;
                 out.insert(
@@ -1031,7 +1042,7 @@ pub(super) fn parse_custom_rule(
     let object = value
         .as_object()
         .ok_or_else(|| "waf: custom_rules entries must be objects".to_string())?;
-    reject_unknown_keys(object, path, CUSTOM_RULE_KEYS, "waf: ")?;
+    reject_unknown_keys(object, path, CUSTOM_RULE_KEYS, &format!("waf: `{path}`: "))?;
     let id = required_string(object, "id")?;
     let name = optional_string(object, "name")?.unwrap_or_else(|| id.clone());
     let category = required_string(object, "category")?;
@@ -1061,7 +1072,11 @@ pub(super) fn parse_custom_rule(
     let score = optional_u32(object, "score")?;
     let conditions = object
         .get("conditions")
-        .map(|value| parse_conditions(value, &format!("{path}.conditions")))
+        .map(|value| {
+            // Custom-rule paths contain only the schema and array ordinal.
+            parse_conditions(value, &format!("{path}.conditions"))
+                .map_err(|error| format!("waf: `{path}.conditions`: {error}"))
+        })
         .transpose()?;
 
     Ok(WafRule {
@@ -1116,7 +1131,7 @@ fn parse_target(value: &Value, path: &str) -> Result<RuleTarget, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "waf: rule target must be a string or object".to_string())?;
-    reject_unknown_keys(object, path, TARGET_OBJECT_KEYS, "waf: ")?;
+    reject_unknown_keys(object, path, TARGET_OBJECT_KEYS, &format!("waf: `{path}`: "))?;
     let raw = required_string(object, "type")?;
     let names = optional_string_vec(object, "names")?;
     let path_field = optional_string(object, "path")?;

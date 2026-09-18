@@ -13,6 +13,7 @@ use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
+use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
     MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseReassembler, SseText, SseTextKind,
     parse_sse_data_frames_checked,
@@ -21,8 +22,140 @@ use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
     extract_from_location,
 };
+use ferrum_edge::startup::render_startup_error;
+use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+
+#[test]
+fn unknown_key_diagnostics_keep_sorted_suggestions_when_rendered() {
+    let config = json!({"z_unknown": false, "typee": true, "expose_headerz": 987654321});
+    let error = reject_unknown_keys(
+        config.as_object().unwrap(),
+        "config",
+        &["type", "expose_headers"],
+        "test_plugin: ",
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "test_plugin: unknown configuration key(s): \
+         \"config.expose_headerz\" (did you mean `expose_headers`?), \
+         \"config.typee\" (did you mean `type`?), \"config.z_unknown\""
+    );
+    assert_eq!(
+        render_startup_error(anyhow::Error::msg(error), &[]),
+        "test_plugin: unknown configuration key(s): \
+         <redacted scalar> (did you mean `expose_headers`?), \
+         <redacted scalar> (did you mean `type`?), <redacted scalar>"
+    );
+}
+
+#[test]
+fn unknown_key_diagnostics_withhold_document_keys_and_entire_untrusted_paths() {
+    // Caller paths can contain document map keys, even when those keys look
+    // like schema identifiers, array indexes, or boolean values.
+    for supplied in [
+        "'UNREGISTERED_KEY\"\\\n`config`",
+        "UNREGISTERED_KEY",
+        "987654321",
+        "false",
+    ] {
+        let config = json!({(supplied): "UNREGISTERED_VALUE", "actoin": true});
+        for path in [
+            format!("config.tools.{supplied}"),
+            format!("config.method_rate_limits[{supplied}]"),
+            format!("config.rule_overrides[{supplied:?}]"),
+        ] {
+            let error = reject_unknown_keys(
+                config.as_object().unwrap(),
+                &path,
+                &["action"],
+                "test_plugin: ",
+            )
+            .unwrap_err();
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            assert!(rendered.contains("did you mean `action`?"), "{rendered}");
+            for withheld in [
+                supplied,
+                "UNREGISTERED_KEY",
+                "UNREGISTERED_VALUE",
+                "actoin",
+                "true",
+                path.as_str(),
+            ] {
+                assert!(!rendered.contains(withheld), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_key_suggestion_ties_keep_allowed_order_and_known_keys_stay_admitted() {
+    let config = json!({"cot": false});
+    let object = config.as_object().unwrap();
+    let error = reject_unknown_keys(object, "config", &["cat", "cut"], "").unwrap_err();
+    assert_eq!(
+        render_startup_error(anyhow::Error::msg(error), &[]),
+        "unknown configuration key(s): <redacted scalar> (did you mean `cat`?)"
+    );
+
+    let config = json!({"cat": "'UNREGISTERED_VALUE", "cut": false});
+    let object = config.as_object().unwrap();
+    assert!(reject_unknown_keys(object, "config", &["cat", "cut"], "").is_ok());
+}
+
+#[test]
+fn socket_host_diagnostics_keep_fields_and_reasons_without_supplied_hosts() {
+    for (host, reason) in [
+        ("", "must not be empty"),
+        (
+            "http://'UNREGISTERED_HOST\"\\\n`host`",
+            "without scheme, path, query, fragment, or credentials",
+        ),
+        (
+            "['UNREGISTERED_HOST]",
+            "must not include brackets or a port unless it is an IPv6 literal",
+        ),
+        (
+            "'UNREGISTERED_HOST%FF",
+            "must be a valid hostname or IP address",
+        ),
+    ] {
+        for label in ["tcp_logging", "channel ''UNREGISTERED_CHANNEL\"\\\n`host`' (email)"] {
+            let error = parse_socket_host(label, "host", host).unwrap_err();
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains("<redacted scalar>: `host`"), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            assert!(!rendered.contains("UNREGISTERED_HOST"), "{rendered}");
+            assert!(!rendered.contains("UNREGISTERED_CHANNEL"), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn socket_egress_diagnostics_keep_policy_reason_without_supplied_addresses() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+
+    let policy = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both);
+    for host in ["169.254.169.254", "ff02::1", "0.0.0.0"] {
+        let socket_host = parse_socket_host("udp_logging", "host", host).unwrap();
+        let error = socket_host
+            .screen_egress_ip("udp_logging", "host", &policy)
+            .unwrap_err();
+        assert!(!error.contains(host), "{error}");
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        for expected in [
+            "udp_logging: `host` address is blocked by the backend egress policy",
+            "cloud-metadata/link-local/multicast/unspecified range blocked by default",
+            "`FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_ALLOW_CIDRS`",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        assert!(!rendered.contains(host), "{rendered}");
+    }
+}
 
 #[test]
 fn json_escape_escapes_backslash_and_quote() {
