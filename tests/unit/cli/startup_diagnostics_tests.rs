@@ -145,7 +145,10 @@ fn destination_rule_port_level_diagnostics_withhold_supplied_numbers() {
         );
         let error = translate_k8s_objects(&[object], options).unwrap_err();
         let rendered = render_startup_error(error.into(), &[]);
-        assert!(rendered.contains("trafficPolicy.portLevelSettings"), "{rendered}");
+        assert!(
+            rendered.contains("trafficPolicy.portLevelSettings"),
+            "{rendered}"
+        );
         assert!(rendered.contains(reason), "{rendered}");
         assert!(!rendered.contains(token), "{rendered}");
     }
@@ -190,7 +193,10 @@ fn destination_rule_translation_warning_withholds_document_fields_at_emission() 
     );
     translate_k8s_objects(&[object], options).unwrap();
     let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    assert!(output.contains("failoverPriority contains a duplicate"), "{output}");
+    assert!(
+        output.contains("failoverPriority contains a duplicate"),
+        "{output}"
+    );
     assert!(output.contains("index=1"), "{output}");
     assert!(!output.contains(token), "{output}");
 }

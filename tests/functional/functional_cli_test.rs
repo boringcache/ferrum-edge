@@ -4649,8 +4649,14 @@ async fn functional_cli_sql_row_rejection_withholds_every_resource_id() {
     let output = cli_contract_output(command).await;
     let diagnostic = cli_contract_diagnostic(&output);
     assert_eq!(output.status.code(), Some(1), "{diagnostic}");
-    assert!(diagnostic.contains("SQL row decode rejected"), "{diagnostic}");
-    assert!(diagnostic.contains("failed to parse hosts JSON"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("SQL row decode rejected"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("failed to parse hosts JSON"),
+        "{diagnostic}"
+    );
     assert!(!diagnostic.contains(token), "{diagnostic}");
 }
 

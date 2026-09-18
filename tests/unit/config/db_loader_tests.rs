@@ -4145,7 +4145,10 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
         let error = store.load_full_config("ferrum").await.unwrap_err();
         assert!(ferrum_edge::_test_support::is_row_decode_rejection(&error));
         let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
-        assert!(rendered.contains("SQL row decode rejected"), "{table}: {rendered}");
+        assert!(
+            rendered.contains("SQL row decode rejected"),
+            "{table}: {rendered}"
+        );
         assert!(rendered.contains(column), "{table}: {rendered}");
         assert!(!rendered.contains(token), "{table}: {rendered}");
     }

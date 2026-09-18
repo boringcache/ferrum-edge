@@ -11893,12 +11893,9 @@ mod tests {
             "name-only reference should be skipped when extensionProviders lookup misses"
         );
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| {
-                    warning.contains("unknown meshConfig extensionProvider \"zipkin\"")
-                }),
+            result.warnings.iter().any(|warning| {
+                warning.contains("unknown meshConfig extensionProvider \"zipkin\"")
+            }),
             "unknown name-only provider should produce an operator-visible warning"
         );
     }

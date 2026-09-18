@@ -1008,9 +1008,7 @@ fn bounded_rejection_errors_for_log(errors: &[String]) -> Vec<String> {
     errors
         .iter()
         .take(3)
-        .map(|error| {
-            truncate_for_log(&crate::startup::sanitize_startup_cause(error, &[]), 256)
-        })
+        .map(|error| truncate_for_log(&crate::startup::sanitize_startup_cause(error, &[]), 256))
         .collect()
 }
 

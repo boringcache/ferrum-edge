@@ -12391,7 +12391,11 @@ fn row_to_proxy_inner(
         circuit_breaker: match optional_utf8_text_column(row, "circuit_breaker")? {
             Some(s) => Some(
                 config_decode::from_json_str::<CircuitBreakerConfig>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {:?}: failed to parse circuit_breaker JSON: {}", pid, e)
+                    anyhow::anyhow!(
+                        "Proxy {:?}: failed to parse circuit_breaker JSON: {}",
+                        pid,
+                        e
+                    )
                 })?,
             ),
             None => None,
@@ -12496,7 +12500,11 @@ fn row_to_proxy_inner(
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
             Some(s) => Some(
                 config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {:?}: failed to parse allowed_methods JSON: {}", pid, e)
+                    anyhow::anyhow!(
+                        "Proxy {:?}: failed to parse allowed_methods JSON: {}",
+                        pid,
+                        e
+                    )
                 })?,
             ),
             None => None,
