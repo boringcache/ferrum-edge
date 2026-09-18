@@ -26,6 +26,7 @@ use crate::modes::mesh::config::{
 use crate::modes::mesh::revision::MeshRevisionRejection;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, XdsConvergenceSnapshot};
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
+use crate::startup::sanitize_startup_scalar;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::runtime_proto;
@@ -704,9 +705,9 @@ pub async fn start_xds_client_with_shutdown(
     state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
-        cluster = %config.cluster,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
+        cluster = %sanitize_startup_scalar(config.cluster.as_str()),
         cp_urls = cp_urls.len(),
         liveness_bound_secs = timings.liveness_bound_seconds(),
         "xDS mesh client starting"
@@ -961,9 +962,9 @@ async fn connect_ads(
     let consumer = XdsConfigConsumer::new(config.clone(), state);
 
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
-        cluster = %config.cluster,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
+        cluster = %sanitize_startup_scalar(config.cluster.as_str()),
         cp_url = %cp_url,
         "Connected to CP, subscribing for xDS ADS config"
     );
@@ -1298,9 +1299,9 @@ async fn handle_ads_response(
     }
 
     debug!(
-        node_id = %config.node_id,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         type_url = %type_url,
-        version = %response.version_info,
+        version = %sanitize_startup_scalar(response.version_info.to_string()),
         nonce = %response.nonce,
         resources = response.resources.len(),
         "Received xDS ADS response"
@@ -1315,7 +1316,7 @@ async fn handle_ads_response(
         subscriptions.record_response(&type_url, &response.version_info, &response.nonce)
     {
         debug!(
-            node_id = %config.node_id,
+            node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = %type_url,
             nonce = %nonce,
             "Ignoring stale/duplicate xDS ADS response (nonce already processed)"
@@ -1346,7 +1347,7 @@ async fn handle_ads_response(
             subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
             debug!(
-                node_id = %config.node_id,
+                node_id = %sanitize_startup_scalar(config.node_id.as_str()),
                 type_url = %type_url,
                 "ACKed xDS ADS response while waiting for remaining resource types"
             );
@@ -1457,9 +1458,9 @@ fn apply_pending_xds_slice(
         );
     }
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
-        version = %version,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
+        version = %sanitize_startup_scalar(version.to_string()),
         type_url = %pending.type_url,
         all_types_ready = pending.all_types_ready,
         version_skew = version_skew,
@@ -1597,10 +1598,10 @@ fn reverse_translate(
             // to an unknown cluster is ACKed, not NACKed) and never wedges
             // slice application for unrelated updates.
             debug!(
-                node_id = %config.node_id,
-                resource_name = %resource.name,
-                namespace = %parsed.namespace,
-                service = %parsed.service,
+                node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+                resource_name = %sanitize_startup_scalar(resource.name.to_string()),
+                namespace = %sanitize_startup_scalar(parsed.namespace.to_string()),
+                service = %sanitize_startup_scalar(parsed.service.to_string()),
                 "Skipping xDS route referencing a service not yet present in CDS/EDS/LDS (resource warming)"
             );
             continue;
@@ -1664,16 +1665,16 @@ fn reverse_translate(
                     )?;
                 } else if dr.namespace != config.namespace {
                     debug!(
-                        name = %dr.name,
-                        namespace = %dr.namespace,
-                        workload_namespace = %config.namespace,
+                        name = %sanitize_startup_scalar(dr.name.to_string()),
+                        namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+                        workload_namespace = %sanitize_startup_scalar(config.namespace.as_str()),
                         "Skipping xDS ECDS DR-carrier outside workload namespace"
                     );
                     continue;
                 }
                 debug!(
-                    name = %dr.name,
-                    namespace = %dr.namespace,
+                    name = %sanitize_startup_scalar(dr.name.to_string()),
+                    namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
                     "Recovered MeshDestinationRule from xDS ECDS carrier"
                 );
                 destination_rules.push(dr);
@@ -2456,7 +2457,7 @@ fn reserved_destination_rule_carrier_name(name: &str) -> Result<Option<(&str, &s
         return Err(format!(
             "xDS ECDS resource <redacted scalar> uses reserved Ferrum DestinationRule carrier \
              name but must be named \
-             '{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{{namespace}}/{{name}}'"
+             `{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{{namespace}}/{{name}}`"
         ));
     }
     Ok(Some((parts[0], parts[1])))
@@ -2679,25 +2680,25 @@ fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> 
     match type_url {
         CDS_TYPE_URL => proto::Cluster::decode(value)
             .map(|resource| resource.name)
-            .map_err(|e| format!("failed to decode Cluster resource: {e}")),
+            .map_err(|_| "failed to decode Cluster resource".to_string()),
         EDS_TYPE_URL => proto::ClusterLoadAssignment::decode(value)
             .map(|resource| resource.cluster_name)
-            .map_err(|e| format!("failed to decode ClusterLoadAssignment resource: {e}")),
+            .map_err(|_| "failed to decode ClusterLoadAssignment resource".to_string()),
         LDS_TYPE_URL => proto::Listener::decode(value)
             .map(|resource| resource.name)
-            .map_err(|e| format!("failed to decode Listener resource: {e}")),
+            .map_err(|_| "failed to decode Listener resource".to_string()),
         RDS_TYPE_URL => proto::RouteConfiguration::decode(value)
             .map(|resource| resource.name)
-            .map_err(|e| format!("failed to decode RouteConfiguration resource: {e}")),
+            .map_err(|_| "failed to decode RouteConfiguration resource".to_string()),
         SDS_TYPE_URL => proto::Secret::decode(value)
             .map(|resource| resource.name)
-            .map_err(|e| format!("failed to decode Secret resource: {e}")),
+            .map_err(|_| "failed to decode Secret resource".to_string()),
         ECDS_TYPE_URL => proto::TypedExtensionConfig::decode(value)
             .map(|resource| resource.name)
-            .map_err(|e| format!("failed to decode TypedExtensionConfig resource: {e}")),
+            .map_err(|_| "failed to decode TypedExtensionConfig resource".to_string()),
         RTDS_TYPE_URL => runtime_proto::Runtime::decode(value)
             .map(|resource| resource.name)
-            .map_err(|e| format!("failed to decode Runtime resource: {e}")),
+            .map_err(|_| "failed to decode Runtime resource".to_string()),
         _ => Err("unknown xDS type_url <redacted scalar>".to_string()),
     }
 }
@@ -2734,7 +2735,7 @@ fn parse_service_port_resource_name(
     if parts.len() != 4 || parts[0] != expected_prefix {
         return Err(format!(
             "resource name <redacted scalar> must use \
-             '{expected_prefix}/{{namespace}}/{{service}}/{{port}}'"
+             `{expected_prefix}/{{namespace}}/{{service}}/{{port}}`"
         ));
     }
     let namespace = parts[1];

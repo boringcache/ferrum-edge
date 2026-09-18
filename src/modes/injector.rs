@@ -753,14 +753,14 @@ pub async fn run(
     let listener = TcpListener::bind(config.listen_addr).await?;
     if tls_acceptor.is_none() {
         warn!(
-            listen_addr = %config.listen_addr,
+            listen_addr = %crate::startup::sanitize_startup_scalar(config.listen_addr),
             "Ferrum injector serving PLAINTEXT HTTP (FERRUM_INJECTOR_ALLOW_PLAINTEXT=true). \
              Kubernetes requires HTTPS for admission webhooks; this is for local development only"
         );
     }
     info!(
-        listen_addr = %config.listen_addr,
-        namespace = %config.namespace,
+        listen_addr = %crate::startup::sanitize_startup_scalar(config.listen_addr),
+        namespace = %crate::startup::sanitize_startup_scalar(config.namespace.as_str()),
         tls = tls_acceptor.is_some(),
         "Ferrum injector admission webhook listening"
     );
@@ -1005,7 +1005,8 @@ fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
 
 pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value, String> {
     let review: AdmissionReview =
-        serde_json::from_slice(body).map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
+        crate::util::deserialization::from_json_slice(body)
+            .map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
     let api_version = review
         .api_version
         .unwrap_or_else(|| "admission.k8s.io/v1".to_string());

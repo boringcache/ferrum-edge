@@ -62,6 +62,7 @@ use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{ConfigApplyOutcome, GatewayTrustCommit, ProxyState};
+use crate::startup::sanitize_startup_cause;
 use crate::tls::multi_cert::{
     GatewayCertificateInput, load_gateway_multi_cert_tls_config_with_handshake_scope,
 };
@@ -1031,27 +1032,11 @@ pub async fn start_dp_client_with_stream_timings(
     let node_id = uuid::Uuid::new_v4().to_string();
     let cp_count = cp_urls.len();
 
-    if cp_count > 1 {
-        info!(
-            "DP client starting with {} CP URLs (failover enabled): {}",
-            cp_count,
-            cp_urls
-                .iter()
-                .enumerate()
-                .map(|(i, u)| if i == 0 {
-                    format!("{} (primary)", u)
-                } else {
-                    u.to_string()
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    } else {
-        info!(
-            "DP client starting, connecting to CP at {}",
-            cp_urls.first().map(|s| s.as_str()).unwrap_or("(none)")
-        );
-    }
+    info!(
+        cp_count,
+        cp_urls = %sanitize_startup_cause(format!("{cp_urls:?}"), &[]),
+        "DP client starting (first CP is primary)"
+    );
 
     let mut backoff = MultiCpBackoffState::new();
     let mut last_tls_revision = tls_reload
@@ -1104,7 +1089,7 @@ pub async fn start_dp_client_with_stream_timings(
                     Err(error) => {
                         warn!(
                             revision,
-                            error = %error,
+                            error = %sanitize_startup_cause(error, &[]),
                             "{} gRPC TLS source revision changed but rebuild failed; keeping previous TLS material",
                             reload.label
                         );
@@ -1122,10 +1107,13 @@ pub async fn start_dp_client_with_stream_timings(
                 "Connecting to fallback CP [{}/{}] at {}",
                 backoff.current_cp_index + 1,
                 cp_count,
-                cp_url
+                sanitize_startup_cause(format!("{cp_url:?}"), &[])
             );
         } else if cp_count > 1 {
-            info!("Connecting to primary CP at {}", cp_url);
+            info!(
+                "Connecting to primary CP at {}",
+                sanitize_startup_cause(format!("{cp_url:?}"), &[])
+            );
         }
 
         let result = connect_and_subscribe_with_startup_ready_inner(
@@ -1189,7 +1177,7 @@ pub async fn start_dp_client_with_stream_timings(
                     "CP [{}/{}] connection stream ended ({}), will reconnect...",
                     backoff.current_cp_index + 1,
                     cp_count,
-                    cp_url
+                    sanitize_startup_cause(format!("{cp_url:?}"), &[])
                 );
                 // A stream that delivered config was authoritative until it
                 // closed; a stream that never did is authority loss.
@@ -1215,7 +1203,7 @@ pub async fn start_dp_client_with_stream_timings(
                      applying so a stale fallback cache cannot roll config back",
                     backoff.current_cp_index + 1,
                     cp_count,
-                    cp_url
+                    sanitize_startup_cause(format!("{cp_url:?}"), &[])
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::StaleSnapshotFenced
@@ -1233,7 +1221,7 @@ pub async fn start_dp_client_with_stream_timings(
                      without applying while keeping last-known-good config",
                     backoff.current_cp_index + 1,
                     cp_count,
-                    cp_url
+                    sanitize_startup_cause(format!("{cp_url:?}"), &[])
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::InvalidDeltaFreshness
@@ -1247,7 +1235,7 @@ pub async fn start_dp_client_with_stream_timings(
                      FULL_SNAPSHOT base; failing over without applying",
                     backoff.current_cp_index + 1,
                     cp_count,
-                    cp_url
+                    sanitize_startup_cause(format!("{cp_url:?}"), &[])
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::InvalidSubscriptionBase
@@ -1262,7 +1250,7 @@ pub async fn start_dp_client_with_stream_timings(
                      FULL_SNAPSHOT resync; reconnecting while keeping last-known-good config",
                     backoff.current_cp_index + 1,
                     cp_count,
-                    cp_url
+                    sanitize_startup_cause(format!("{cp_url:?}"), &[])
                 );
                 // The source just supplied a payload that could not become
                 // authoritative. Treat that refusal as authority loss even
@@ -1294,10 +1282,10 @@ pub async fn start_dp_client_with_stream_timings(
                     // detail, and the stale fence latches on a control plane
                     // that is demonstrably alive.
                     error!(
-                        cp_url = %cp_url,
+                        cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
                         cp_index = backoff.current_cp_index + 1,
                         cp_count,
-                        status = %status.message(),
+                        status = %sanitize_startup_cause(status.message(), &[]),
                         "CP [{}/{}] REFUSED the ConfigSync subscription for capacity/tenancy \
                          reasons ({}): the control plane is reachable and answering, but a CP \
                          gRPC stream admission budget is saturated. Raise the budget named in \
@@ -1306,7 +1294,7 @@ pub async fn start_dp_client_with_stream_timings(
                          serving and this DP keeps retrying",
                         backoff.current_cp_index + 1,
                         cp_count,
-                        cp_url
+                        sanitize_startup_cause(format!("{cp_url:?}"), &[])
                     );
                     crate::dp_config_freshness::record_cp_admission_refused();
                     // `authority_retained = true` routes to
@@ -1327,8 +1315,8 @@ pub async fn start_dp_client_with_stream_timings(
                         "CP [{}/{}] connection error ({}): {}",
                         backoff.current_cp_index + 1,
                         cp_count,
-                        cp_url,
-                        e
+                        sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                        sanitize_startup_cause(&e, &[cp_url.as_str()])
                     );
                     // A failed connect/subscribe attempt is the authority-loss
                     // signal the bound latches on.
@@ -2241,18 +2229,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         .mint_async(node_id, Some(namespace), None)
         .await?;
     if jwt_secret.uses_external_token() {
-        info!(
-            "Presenting externally issued CP/DP token from FERRUM_DP_CP_GRPC_TOKEN_FILE \
-             (iss='{}') for CP authentication",
-            jwt_secret.issuer(),
-        );
+        info!("Presenting externally issued CP/DP token for CP authentication");
     } else {
-        info!(
-            "Generated fresh DP JWT (TTL={}s, iss='{}', ns='{}') for CP authentication",
-            DP_JWT_TTL_SECONDS,
-            jwt_secret.issuer(),
-            namespace,
-        );
+        info!("Generated fresh DP JWT for CP authentication");
     }
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
@@ -2364,7 +2343,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     }
                     Err(e) => {
                         error!(
-                            error = %e,
+                            error = %sanitize_startup_cause(e, &[]),
                             received_config,
                             "ConfigSync stream RPC error; reconnecting"
                         );
@@ -2389,7 +2368,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         // peer. Otherwise an incompatible or malformed-version CP could keep a
         // stream alive indefinitely while bypassing the config-update gate.
         if let Err(err) = check_cp_version_compatibility(&update.ferrum_version) {
-            error!("{}", err);
+            error!("{}", sanitize_startup_cause(err, &[]));
             return Ok(DpStreamEnd::TransportFailure { received_config });
         }
 
@@ -2403,14 +2382,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 warn!(
                     base_applied = subscription.base_applied,
                     heartbeats_negotiated,
-                    cp_url,
+                    cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
                     "Refusing ConfigSync heartbeat before an accepted, negotiated \
                      FULL_SNAPSHOT base; terminating stream"
                 );
                 return Ok(refuse_unusable_snapshot(subscription.base_applied));
             }
             debug!(
-                version = %update.version,
+                version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
                 "Received ConfigSync heartbeat"
             );
             continue;
@@ -2421,8 +2400,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         // changing lifecycle policy before establishing an authoritative base.
         if update.heartbeat_negotiated && update.update_type != 0 {
             warn!(
-                update_type = update.update_type,
-                cp_url, "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
+                update_type = %sanitize_startup_cause(format!("\"{}\"", update.update_type), &[]),
+                cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
             );
             return Ok(refuse_unusable_snapshot(subscription.base_applied));
         }
@@ -2436,7 +2416,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
 
         info!(
             "Received config update (type={}, version={}, cp_version={})",
-            update.update_type, update.version, update.ferrum_version
+            sanitize_startup_cause(format!("\"{}\"", update.update_type), &[]),
+            sanitize_startup_cause(format!("{:?}", update.version), &[]),
+            sanitize_startup_cause(format!("{:?}", update.ferrum_version), &[])
         );
 
         match update.update_type {
@@ -2452,7 +2434,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     match config_decode::from_json_str::<GatewayConfig>(&update.config_json) {
                         Ok(config) => config,
                         Err(e) => {
-                            error!("Failed to parse full config update: {}", e);
+                            error!(
+                                "Failed to parse full config update: {}",
+                                sanitize_startup_cause(e, &[])
+                            );
                             return Ok(refuse_unusable_snapshot(subscription.base_applied));
                         }
                     };
@@ -2460,7 +2445,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
                         Ok(update) => update,
                         Err(msg) => {
-                            error!("CP config rejected — {}", msg);
+                            error!(
+                                "CP config rejected — {}",
+                                sanitize_startup_cause(msg, &[])
+                            );
                             error!("Ignoring config update with invalid gateway trust bundles");
                             return Ok(refuse_unusable_snapshot(subscription.base_applied));
                         }
@@ -2479,9 +2467,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 let filtered = filter_config_to_namespace(&mut config, namespace);
                 if filtered > 0 {
                     warn!(
-                        "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
+                        "DP namespace filter {} excluded {} cross-namespace resources from CP \
+                         snapshot — \
                          the CP should have filtered these (verify CP namespace matches DP)",
-                        namespace, filtered
+                        sanitize_startup_cause(format!("{namespace:?}"), &[]), filtered
                     );
                 }
                 if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
@@ -2496,56 +2485,80 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     &proxy_state.env_config.backend_allow_ips,
                 ) {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with invalid field values");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_hosts() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with invalid hosts");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_regex_listen_paths() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with invalid regex listen_paths");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_listen_path_encodings() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with encoded-slash listen_paths");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_unique_listen_paths() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with conflicting listen paths");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_stream_proxies() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with invalid stream proxy config");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_upstream_references() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with invalid upstream references");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_plugin_references() {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!("Ignoring config update with invalid plugin references");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
@@ -2554,7 +2567,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
                 {
                     for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(msg, &[])
+                        );
                     }
                     error!(
                         "Ignoring config update with invalid mesh_route_dispatch upstream references"
@@ -2572,9 +2588,12 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         record_fenced_full_snapshot(divergence_metrics);
                         warn!(
                             ?reason,
-                            cp_url,
-                            version = %update.version,
-                            loaded_at = %config.loaded_at,
+                            cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                            version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
+                            loaded_at = %sanitize_startup_cause(
+                                format!("{:?}", config.loaded_at.to_string()),
+                                &[]
+                            ),
                             "Refusing FULL_SNAPSHOT with inconsistent or unorderable version \
                              and terminating this ConfigSync stream"
                         );
@@ -2592,9 +2611,12 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     record_fenced_full_snapshot(divergence_metrics);
                     warn!(
                         ?reason,
-                        cp_url,
-                        version = %update.version,
-                        loaded_at = %config.loaded_at,
+                        cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                        version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
+                        loaded_at = %sanitize_startup_cause(
+                            format!("{:?}", config.loaded_at.to_string()),
+                            &[]
+                        ),
                         "Refusing FULL_SNAPSHOT with an implausibly-future committed timestamp \
                          (CP clock skew beyond tolerance) and terminating this ConfigSync stream \
                          so a skewed clock cannot poison the freshness watermark"
@@ -2647,8 +2669,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         record_fenced_full_snapshot(divergence_metrics);
                         warn!(
                             ?reason,
-                            cp_url,
-                            version = %update.version,
+                            cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                            version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
                             "Refusing stale cross-source FULL_SNAPSHOT and terminating this \
                              ConfigSync stream so no later delta from it can apply against newer \
                              config; keeping applied config and failing over"
@@ -2671,7 +2693,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 ) {
                     Ok(update) => update,
                     Err(error) => {
-                        error!("CP config rejected — {}", error);
+                        error!(
+                            "CP config rejected — {}",
+                            sanitize_startup_cause(error, &[])
+                        );
                         error!("Ignoring config update with unusable frontend TLS material");
                         return Ok(refuse_unusable_snapshot(subscription.base_applied));
                     }
@@ -2739,7 +2764,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 .await
                             {
                                 warn!(
-                                    error = %error,
+                                    error = %sanitize_startup_cause(error, &[]),
                                     "Stream listener startup wait timed out after CP snapshot; continuing (bind failures are non-fatal in DP mode)"
                                 );
                             }
@@ -2780,9 +2805,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         // error, and those messages arrive here. Without them
                         // the operator sees a frozen fleet and no cause.
                         error!(
-                            cp_url,
-                            version = %update.version,
-                            validation_errors = ?errors,
+                            cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                            version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
+                            validation_errors = %sanitize_startup_cause(errors.join("; "), &[]),
                             "Full configuration snapshot rejected during apply; keeping previous \
                              config — this data plane is now frozen on its last-known-good \
                              generation until the offending resource is repaired at the CP"
@@ -2808,7 +2833,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 {
                     warn!(
                         ?reason,
-                        cp_url,
+                        cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
                         "Refusing DELTA before a valid FULL_SNAPSHOT base on this \
                          subscription; terminating stream without applying"
                     );
@@ -2823,7 +2848,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
                                 Ok(update) => update,
                                 Err(msg) => {
-                                    error!("CP delta rejected — {}", msg);
+                                    error!(
+                                        "CP delta rejected — {}",
+                                        sanitize_startup_cause(msg, &[])
+                                    );
                                     error!(
                                         "Terminating ConfigSync stream after invalid gateway trust \
                                          side-channel so later resource deltas cannot apply"
@@ -2862,8 +2890,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         let filtered = filter_incremental_to_namespace(&mut result, namespace);
                         if filtered > 0 {
                             warn!(
-                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP delta",
-                                namespace, filtered
+                                "DP namespace filter {} excluded {} cross-namespace resources \
+                                 from CP delta",
+                                sanitize_startup_cause(format!("{namespace:?}"), &[]), filtered
                             );
                         }
 
@@ -2885,9 +2914,18 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 Err(reason) => {
                                     warn!(
                                         ?reason,
-                                        cp_url,
-                                        version = %update.version,
-                                        poll_timestamp = %poll_timestamp,
+                                        cp_url = %sanitize_startup_cause(
+                                            format!("{cp_url:?}"),
+                                            &[]
+                                        ),
+                                        version = %sanitize_startup_cause(
+                                            format!("{:?}", update.version),
+                                            &[]
+                                        ),
+                                        poll_timestamp = %sanitize_startup_cause(
+                                            format!("{:?}", poll_timestamp.to_string()),
+                                            &[]
+                                        ),
                                         "Refusing DELTA with inconsistent or unorderable freshness"
                                     );
                                     // Freshness accounting is independent of
@@ -2911,9 +2949,15 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         {
                             warn!(
                                 ?reason,
-                                cp_url,
-                                version = %update.version,
-                                poll_timestamp = %poll_timestamp,
+                                cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                                version = %sanitize_startup_cause(
+                                    format!("{:?}", update.version),
+                                    &[]
+                                ),
+                                poll_timestamp = %sanitize_startup_cause(
+                                    format!("{:?}", poll_timestamp.to_string()),
+                                    &[]
+                                ),
                                 "Refusing DELTA with an implausibly-future committed timestamp \
                                  before it can poison the freshness watermark"
                             );
@@ -2928,9 +2972,15 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         {
                             warn!(
                                 ?reason,
-                                cp_url,
-                                version = %update.version,
-                                poll_timestamp = %poll_timestamp,
+                                cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                                version = %sanitize_startup_cause(
+                                    format!("{:?}", update.version),
+                                    &[]
+                                ),
+                                poll_timestamp = %sanitize_startup_cause(
+                                    format!("{:?}", poll_timestamp.to_string()),
+                                    &[]
+                                ),
                                 "Refusing DELTA older than the applied authority watermark"
                             );
                             crate::dp_config_freshness::record_snapshot_rejected();
@@ -3068,8 +3118,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         DeltaRejectionKind::NonEmptyApplyRejected,
                                     );
                                     error!(
-                                        cp_version = %cp_version,
-                                        update_version = update_version,
+                                        cp_version = %sanitize_startup_cause(
+                                            format!("{cp_version:?}"),
+                                            &[]
+                                        ),
+                                        update_version = %sanitize_startup_cause(
+                                            format!("{update_version:?}"),
+                                            &[]
+                                        ),
                                         added_proxies = added_proxy_count,
                                         removed_proxies = removed_proxy_count,
                                         added_upstreams = added_upstream_count,
@@ -3078,7 +3134,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         removed_consumers = removed_consumer_count,
                                         added_plugin_configs = added_plugin_config_count,
                                         removed_plugin_configs = removed_plugin_config_count,
-                                        validation_errors = ?errors,
+                                        validation_errors = %sanitize_startup_cause(
+                                            errors.join("; "),
+                                            &[]
+                                        ),
                                         "DP rejected CP-pushed delta — terminating stream for \
                                          authoritative FULL_SNAPSHOT resync; last-known-good \
                                          config kept serving"
@@ -3094,7 +3153,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     }
                     Err(e) => {
                         // Parse failure is unclassifiable — fail closed (issue #2394).
-                        error!("Failed to parse delta update: {}", e);
+                        error!(
+                            "Failed to parse delta update: {}",
+                            sanitize_startup_cause(e, &[])
+                        );
                         let _ =
                             delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
                         crate::dp_config_freshness::record_snapshot_rejected();
@@ -3105,8 +3167,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
             }
             other => {
                 warn!(
-                    update_type = other,
-                    cp_url,
+                    update_type = %sanitize_startup_cause(format!("\"{other}\""), &[]),
+                    cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
                     base_applied = subscription.base_applied,
                     "Refusing unknown ConfigSync update type; terminating stream so an \
                      unrecognized authoritative message cannot be skipped before later deltas"

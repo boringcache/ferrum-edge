@@ -951,7 +951,7 @@ pub(super) fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, St
         "monitor" | "log" | "warn" => Ok(RuleAction::Monitor),
         "disabled" | "disable" | "off" => Ok(RuleAction::Disabled),
         other => Err(format!(
-            "waf: '{field}' must be one of enforce, monitor, disabled; got {other:?}"
+            "waf: `{field}` must be one of enforce, monitor, disabled; got {other:?}"
         )),
     }
 }
@@ -979,8 +979,8 @@ pub(super) fn parse_rule_overrides(
             for (id, raw) in map {
                 let object = raw
                     .as_object()
-                    .ok_or_else(|| format!("waf: rule_overrides['{id}'] must be an object"))?;
-                let path = format!("config.rule_overrides['{id}']");
+                    .ok_or_else(|| format!("waf: rule_overrides[{id:?}] must be an object"))?;
+                let path = format!("config.rule_overrides[{id:?}]");
                 reject_unknown_keys(object, &path, RULE_OVERRIDE_KEYS, "waf: ")?;
                 let action = optional_string(object, "action")?
                     .map(|raw| parse_rule_action(&raw, "rule_overrides.action"))
@@ -990,7 +990,7 @@ pub(super) fn parse_rule_overrides(
                     && !(1..=4).contains(&p)
                 {
                     return Err(format!(
-                        "waf: rule_overrides['{id}'].paranoia_min must be from 1 to 4"
+                        "waf: rule_overrides[{id:?}].paranoia_min must be from 1 to 4"
                     ));
                 }
                 let severity = optional_string(object, "severity")?
@@ -1203,7 +1203,7 @@ fn parse_conditions(value: &Value, path: &str) -> Result<Conditions, String> {
 }
 
 fn required_string(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
-    optional_string(object, key)?.ok_or_else(|| format!("waf: missing required string '{key}'"))
+    optional_string(object, key)?.ok_or_else(|| format!("waf: missing required string `{key}`"))
 }
 
 fn optional_string(
@@ -1213,7 +1213,7 @@ fn optional_string(
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
-        Some(Value::String(_)) => Err(format!("waf: '{key}' must be non-empty")),
+        Some(Value::String(_)) => Err(format!("waf: `{key}` must be non-empty")),
         Some(other) => Err(format!(
             "waf: `{key}` must be a string, got {other:?}",
             other = other.to_string()
@@ -1228,7 +1228,7 @@ fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Opt
             .as_u64()
             .and_then(|v| u8::try_from(v).ok())
             .map(Some)
-            .ok_or_else(|| format!("waf: '{key}' must be an integer from 0 to 255")),
+            .ok_or_else(|| format!("waf: `{key}` must be an integer from 0 to 255")),
         Some(other) => Err(format!(
             "waf: `{key}` must be an integer, got {other:?}",
             other = other.to_string()
@@ -1243,7 +1243,7 @@ fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .map(Some)
-            .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
+            .ok_or_else(|| format!("waf: `{key}` must be a non-negative integer")),
         Some(other) => Err(format!(
             "waf: `{key}` must be an integer, got {other:?}",
             other = other.to_string()
@@ -1261,10 +1261,10 @@ fn optional_string_vec(
             let mut parsed = Vec::with_capacity(values.len());
             for value in values {
                 let Some(raw) = value.as_str() else {
-                    return Err(format!("waf: '{key}' entries must be strings"));
+                    return Err(format!("waf: `{key}` entries must be strings"));
                 };
                 if raw.is_empty() {
-                    return Err(format!("waf: '{key}' entries must be non-empty"));
+                    return Err(format!("waf: `{key}` entries must be non-empty"));
                 }
                 parsed.push(raw.to_string());
             }

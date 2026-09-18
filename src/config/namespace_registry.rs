@@ -956,7 +956,7 @@ impl NamespaceRegistryPhase {
             );
         }
         anyhow::anyhow!(
-            "injected namespace registry fault at phase '{}'",
+            "injected namespace registry fault at phase `{}`",
             self.as_str()
         )
     }

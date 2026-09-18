@@ -53,7 +53,7 @@ use crate::k8s_controller::{
 use crate::modes::file::ListenerJoinHandle;
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::startup_security;
-use crate::startup::{sanitize_startup_cause, wait_for_start_signals};
+use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar, wait_for_start_signals};
 use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 use crate::xds::XdsAdsServer;
 
@@ -2495,11 +2495,11 @@ pub async fn run(
         Some(tokio::spawn(async move {
             info!(
                 "Starting Admin HTTP listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
-                    &admin_http_addr.to_string()
-                )
+                    &admin_http_addr.to_string(),
+                ))
             );
             match admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
@@ -2603,11 +2603,11 @@ pub async fn run(
         Some(tokio::spawn(async move {
             info!(
                 "Starting Admin HTTPS listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTPS_PORT",
-                    &admin_https_addr.to_string()
-                )
+                    &admin_https_addr.to_string(),
+                ))
             );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(
@@ -2732,10 +2732,10 @@ pub async fn run(
             // means either a loopback bind or an explicit operator opt-in. Either
             // way, surface a high-severity warning — DP JWTs and the full gateway
             // config travel unencrypted.
-            let grpc_addr_shown = crate::secrets::report_env_field(
+            let grpc_addr_shown = sanitize_startup_scalar(crate::secrets::report_env_field(
                 "FERRUM_CP_GRPC_LISTEN_ADDR",
                 &grpc_addr.to_string(),
-            );
+            ));
             if grpc_addr.ip().is_loopback() {
                 warn!(
                     "SECURITY: CP gRPC config sync is running in PLAINTEXT on loopback {grpc_addr_shown} \
@@ -2758,7 +2758,10 @@ pub async fn run(
         let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
         info!(
             "CP gRPC server listening on {}",
-            crate::secrets::report_env_field("FERRUM_CP_GRPC_LISTEN_ADDR", &grpc_addr.to_string())
+            sanitize_startup_scalar(crate::secrets::report_env_field(
+                "FERRUM_CP_GRPC_LISTEN_ADDR",
+                &grpc_addr.to_string(),
+            ))
         );
         let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
         let grpc_http2_max_pending_accept_reset_streams =
@@ -4239,16 +4242,34 @@ fn classify_cp_listener_exit(
             "{name} exited unexpectedly without a shutdown request"
         )),
         Ok(Err(err)) => {
-            error!("CP listener task '{name}' failed: {err:#}");
+            error!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!("CP listener task `{name}` failed: {err:#}"),
+                    &[]
+                )
+            );
             Some(err.context(format!("{name} failed")))
         }
         #[cfg(panic = "unwind")]
         Err(err) if err.is_panic() => {
-            error!("CP listener task '{name}' failed: {err}");
+            error!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!("CP listener task `{name}` failed: {err}"),
+                    &[]
+                )
+            );
             Some(anyhow::anyhow!("{name} panicked: {err}"))
         }
         Err(err) => {
-            error!("CP listener task '{name}' failed: {err}");
+            error!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!("CP listener task `{name}` failed: {err}"),
+                    &[]
+                )
+            );
             Some(anyhow::anyhow!("{name} failed to join: {err}"))
         }
     }

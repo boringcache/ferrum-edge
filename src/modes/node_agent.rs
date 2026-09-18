@@ -1059,13 +1059,23 @@ pub async fn run(
         start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready.clone()).await?;
 
     info!(
-        node_name = %config.node_name,
+        node_name = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.node_name), &[]
+        ),
         capture_mode = ?config.capture_config.mode,
         proxy_mode = %config.capture_contract.proxy_mode,
-        outbound_capture_port = config.capture_contract.outbound_capture_port,
-        hbone_redirect_port = config.capture_contract.hbone_redirect_port,
-        cgroup_root = %config.cgroup_root,
-        bpf_fs_path = %config.bpf_fs_path,
+        outbound_capture_port = %crate::startup::sanitize_startup_cause(
+            format!("\"{}\"", config.capture_contract.outbound_capture_port), &[]
+        ),
+        hbone_redirect_port = %crate::startup::sanitize_startup_cause(
+            format!("\"{}\"", config.capture_contract.hbone_redirect_port), &[]
+        ),
+        cgroup_root = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.cgroup_root), &[]
+        ),
+        bpf_fs_path = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.bpf_fs_path), &[]
+        ),
         fallback_mode = ?config.fallback_mode,
         "Starting node agent"
     );
@@ -1552,7 +1562,7 @@ fn decide_admin_bind_address(
     let configured_ip: std::net::IpAddr = configured_bind.parse().map_err(|_| {
         anyhow::anyhow!(
             "Invalid FERRUM_ADMIN_BIND_ADDRESS {} (expected a valid IP address)",
-            crate::secrets::quoted_env_value("FERRUM_ADMIN_BIND_ADDRESS", configured_bind)
+            crate::startup::quoted_config_value("FERRUM_ADMIN_BIND_ADDRESS", configured_bind)
         )
     })?;
 
@@ -9956,7 +9966,9 @@ fn initialize_backend_after_load(
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
             error!(
-                cgroup_root = %config.cgroup_root,
+                cgroup_root = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", config.cgroup_root), &[]
+        ),
                 error = %e,
                 "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
                  cookie bridge is not running, so per-pod source-identity resolution would \

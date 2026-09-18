@@ -242,11 +242,11 @@ fn mesh_ports_reject_zero_on_core_resources() {
         "expected mesh service port error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("protocol_overrides[0]")),
+        errors.iter().any(|e| e.contains("protocol_overrides[\"0\"]")),
         "expected protocol override port error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("port_overrides[0]")),
+        errors.iter().any(|e| e.contains("port_overrides[\"0\"]")),
         "expected peer auth port override error, got: {errors:?}"
     );
     assert!(
@@ -1007,7 +1007,7 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("port_overrides[15006]")
+            .any(|e| e.contains("port_overrides[\"15006\"]")
                 && e.contains("invalid for server-side policy")),
         "expected invalid port override mtls_mode error, got: {:?}",
         errors

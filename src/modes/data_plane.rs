@@ -23,7 +23,7 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::startup_security;
 use crate::modes::tls_reload;
 use crate::proxy::{self, ProxyState};
-use crate::startup::wait_for_start_signals;
+use crate::startup::{sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls;
 
 pub async fn run(
@@ -544,11 +544,11 @@ pub async fn run(
         let http_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_PROXY_BIND_ADDRESS",
                     "FERRUM_PROXY_HTTP_PORT",
-                    &http_addr.to_string()
-                )
+                    &http_addr.to_string(),
+                ))
             );
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
@@ -590,11 +590,11 @@ pub async fn run(
         let https_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTPS proxy listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_PROXY_BIND_ADDRESS",
                     "FERRUM_PROXY_HTTPS_PORT",
-                    &https_addr.to_string()
-                )
+                    &https_addr.to_string(),
+                ))
             );
             if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
                 https_addr,
@@ -678,7 +678,13 @@ pub async fn run(
         let manager = gateway_listeners.clone();
         listener_handles.push(tokio::spawn(async move {
             if let Err(e) = manager.run(sh).await {
-                tracing::warn!("Gateway API listener supervisor failed: {e:#}");
+                tracing::warn!(
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!("Gateway API listener supervisor failed: {e:#}"),
+                        &[]
+                    )
+                );
             }
         }));
     }
@@ -722,11 +728,11 @@ pub async fn run(
             let h3_handle = tokio::spawn(async move {
                 info!(
                     "Starting HTTP/3 (QUIC) proxy listener on {}",
-                    crate::secrets::report_listener_addr(
+                    sanitize_startup_scalar(crate::secrets::report_listener_addr(
                         "FERRUM_PROXY_BIND_ADDRESS",
                         "FERRUM_PROXY_HTTPS_PORT",
-                        &h3_addr.to_string()
-                    )
+                        &h3_addr.to_string(),
+                    ))
                 );
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,
@@ -845,11 +851,11 @@ pub async fn run(
         let admin_http_handle = tokio::spawn(async move {
             info!(
                 "Starting Admin HTTP listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
-                    &admin_http_addr.to_string()
-                )
+                    &admin_http_addr.to_string(),
+                ))
             );
             // The admin listener is one of the DP's own operational inputs (its
             // port comes from env, not CP-pushed config), so a bind failure is
@@ -951,11 +957,11 @@ pub async fn run(
         let admin_https_handle = tokio::spawn(async move {
             info!(
                 "Starting Admin HTTPS listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTPS_PORT",
-                    &admin_https_addr.to_string()
-                )
+                    &admin_https_addr.to_string(),
+                ))
             );
             // Bind failure is fatal at startup (start signal); a post-startup
             // serve error flips readiness to not-ready. Same rationale as the

@@ -234,7 +234,10 @@ fn real_json_yaml_and_value_boundaries_withhold_scalars_and_raw_causes() {
 #[test]
 fn cidr_document_errors_keep_field_paths_and_reasons_without_values() {
     for (cidr, reason) in [
-        ("10.0.0.0/40", "prefix length 40 out of range in CIDR"),
+        (
+            "10.0.0.0/40",
+            "prefix length <redacted scalar> out of range (maximum 32) in CIDR",
+        ),
         ("not-a-cidr", "invalid IP in CIDR"),
     ] {
         let document = serde_json::json!({"ip_blocks": [cidr]});

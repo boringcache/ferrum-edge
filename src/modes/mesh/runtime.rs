@@ -121,7 +121,7 @@ impl MeshEgressScopeState {
                 Ok(registry) => Some(Arc::new(registry)),
                 Err(err) => {
                     warn!(
-                        error = %err,
+                        error = %crate::startup::sanitize_startup_cause(err, &[]),
                         "Failed to rebuild mesh egress-scope test registry from accepted slice"
                     );
                     None

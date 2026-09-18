@@ -10,6 +10,7 @@ use crate::common::GatewayChildGuard;
 use crate::scaffolding::harness::wait_for_spawned_gateway;
 use crate::scaffolding::port_registry::TestSocket;
 
+use ferrum_edge::grpc::proto::ConfigUpdate;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -3580,6 +3581,134 @@ fn cli_contract_diagnostic(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[derive(Clone)]
+struct RejectedSnapshotCp {
+    update: ferrum_edge::grpc::proto::ConfigUpdate,
+}
+
+#[tonic::async_trait]
+impl ferrum_edge::grpc::proto::config_sync_server::ConfigSync for RejectedSnapshotCp {
+    type SubscribeStream = futures::stream::BoxStream<'static, Result<ConfigUpdate, tonic::Status>>;
+
+    async fn subscribe(
+        &self,
+        _request: tonic::Request<ferrum_edge::grpc::proto::SubscribeRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeStream>, tonic::Status> {
+        use futures::StreamExt;
+
+        // Hold the stream open after delivery. Reconnection must be the DP's
+        // explicit snapshot refusal, never a fixture-induced EOF.
+        let update = self.update.clone();
+        let stream =
+            futures::stream::once(async move { Ok(update) }).chain(futures::stream::pending());
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+
+    async fn get_full_config(
+        &self,
+        _request: tonic::Request<ferrum_edge::grpc::proto::FullConfigRequest>,
+    ) -> Result<tonic::Response<ferrum_edge::grpc::proto::FullConfigResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture uses Subscribe"))
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_dp_initial_snapshot_rejection_withholds_document_values() {
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSyncServer;
+
+    let directory = TempDir::new().unwrap();
+    let proxy_token = "UNREGISTERED_PROXY5591";
+    let upstream_token = "UNREGISTERED_UPSTREAM5591";
+    let proxy = serde_json::from_value(serde_json::json!({
+        "id": proxy_token, "namespace": "ferrum", "listen_path": "/",
+        "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080,
+        "upstream_id": upstream_token
+    }))
+    .unwrap();
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    let cp = RejectedSnapshotCp {
+        update: ferrum_edge::grpc::proto::ConfigUpdate {
+            update_type: 0,
+            config_json: serde_json::to_string(&config).unwrap(),
+            version: config.loaded_at.to_rfc3339(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            ..Default::default()
+        },
+    };
+    let reservation = reserve_port().await.unwrap();
+    let address = format!("http://127.0.0.1:{}", reservation.port);
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(reservation.into_listener());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(ConfigSyncServer::new(cp))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let stdout = directory.path().join("stdout");
+    let stderr = directory.path().join("stderr");
+    let mut command = installed_cli_command(&directory, &["run", "-m", "dp"]);
+    command
+        .env("FERRUM_NAMESPACE", "ferrum")
+        .env("FERRUM_DP_CP_GRPC_URLS", address)
+        .env(
+            "FERRUM_CP_DP_GRPC_JWT_SECRET",
+            "synthetic-dp-secret-at-least-32-characters",
+        )
+        .env("FERRUM_PROXY_HTTP_PORT", "0")
+        .env("FERRUM_PROXY_HTTPS_PORT", "0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    let mut gateway = GatewayChildGuard::new(command.spawn().unwrap());
+    let combined = || {
+        format!(
+            "{}{}",
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let output = combined();
+            assert!(
+                !gateway.has_exited(),
+                "DP exited before snapshot refusal: {output}"
+            );
+            if output.contains("Ignoring config update with invalid upstream references") {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("DP did not refuse the delivered snapshot: {}", combined()));
+    gateway.shutdown();
+    let output = combined();
+    assert!(output.contains("references non-existent upstream"), "{output}");
+    assert!(
+        !output.contains("Full configuration snapshot accepted"),
+        "{output}"
+    );
+    for token in [proxy_token, upstream_token] {
+        assert!(!output.contains(token), "{output}");
+    }
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[ignore]

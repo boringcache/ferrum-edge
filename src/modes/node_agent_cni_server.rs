@@ -40,6 +40,7 @@ use tracing::warn;
 
 use crate::cni::rpc::{CniRpcRequest, CniRpcResponse};
 use crate::ebpf::NodeAgentMetrics;
+use crate::startup::sanitize_startup_cause;
 
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
@@ -135,8 +136,8 @@ pub fn spawn_cni_listener(
     tokio::spawn(async move {
         if let Err(err) = prepare_socket_parent(&socket_path).await {
             error!(
-                socket_path = %socket_path,
-                error = %err,
+                socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                error = %sanitize_startup_cause(err, &[]),
                 reason = "ownership_io_error",
                 "Failed to prepare node-agent CNI socket parent; CNI plugin path will fall back to kube-rs watcher"
             );
@@ -156,8 +157,11 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
                 );
                 error!(
-                    socket_path = %socket_path,
-                    lock_path = %socket_ownership_lock_path(&socket_path).display(),
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    lock_path = %sanitize_startup_cause(
+                        format!("{:?}", socket_ownership_lock_path(&socket_path)),
+                        &[]
+                    ),
                     reason = "ownership_conflict",
                     "Another live node-agent owns the CNI socket; refusing to replace it and falling back to the kube-rs watcher"
                 );
@@ -168,9 +172,12 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
                 );
                 error!(
-                    socket_path = %socket_path,
-                    lock_path = %socket_ownership_lock_path(&socket_path).display(),
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    lock_path = %sanitize_startup_cause(
+                        format!("{:?}", socket_ownership_lock_path(&socket_path)),
+                        &[]
+                    ),
+                    error = %sanitize_startup_cause(err, &[]),
                     reason = "ownership_io_error",
                     "Failed to acquire node-agent CNI socket ownership; falling back to the kube-rs watcher"
                 );
@@ -185,7 +192,7 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
                 );
                 error!(
-                    socket_path = %socket_path,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                     reason = "ownership_conflict",
                     "A live pre-lock node-agent still owns the CNI socket; refusing to evict it and falling back to the kube-rs watcher"
                 );
@@ -193,8 +200,8 @@ pub fn spawn_cni_listener(
             }
             Err(err) => {
                 error!(
-                    socket_path = %socket_path,
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    error = %sanitize_startup_cause(err, &[]),
                     reason = "stale_socket_cleanup_error",
                     "Failed to classify or remove stale node-agent CNI socket after acquiring ownership; CNI plugin path will fall back to kube-rs watcher"
                 );
@@ -217,8 +224,8 @@ pub fn spawn_cni_listener(
             Ok(stage) => stage,
             Err(err) => {
                 error!(
-                    socket_path = %socket_path,
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    error = %sanitize_startup_cause(err, &[]),
                     "Failed to create private staging directory for node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
                 );
                 return;
@@ -228,8 +235,8 @@ pub fn spawn_cni_listener(
             Ok(listener) => listener,
             Err(err) => {
                 error!(
-                    socket_path = %socket_path,
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    error = %sanitize_startup_cause(err, &[]),
                     "Failed to bind node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
                 );
                 cleanup_private_socket_stage(&stage);
@@ -240,8 +247,8 @@ pub fn spawn_cni_listener(
         // fails, abort rather than publish a world-reachable socket.
         if let Err(err) = set_socket_perms(&stage.socket_path) {
             error!(
-                socket_path = %socket_path,
-                error = %err,
+                socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                error = %sanitize_startup_cause(err, &[]),
                 "Failed to chmod node-agent CNI socket to 0660 before publish; aborting CNI listener (falling back to kube-rs watcher)"
             );
             cleanup_private_socket_stage(&stage);
@@ -254,8 +261,8 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::HandoffIdentityError,
                 );
                 error!(
-                    socket_path = %socket_path,
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    error = %sanitize_startup_cause(err, &[]),
                     reason = "handoff_identity_error",
                     "Failed to identify staged node-agent CNI socket; refusing publication"
                 );
@@ -268,8 +275,8 @@ pub fn spawn_cni_listener(
                 crate::ebpf::CniSocketLifecycleReason::HandoffPublicationError,
             );
             error!(
-                socket_path = %socket_path,
-                error = %err,
+                socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                error = %sanitize_startup_cause(err, &[]),
                 reason = "handoff_publication_error",
                 "Failed to publish node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
             );
@@ -284,7 +291,7 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::HandoffIdentityError,
                 );
                 error!(
-                    socket_path = %socket_path,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                     expected_device = published_identity.device,
                     expected_inode = published_identity.inode,
                     actual_device = current.device,
@@ -299,8 +306,8 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::HandoffIdentityError,
                 );
                 error!(
-                    socket_path = %socket_path,
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    error = %sanitize_startup_cause(err, &[]),
                     reason = "handoff_identity_error",
                     "Published CNI socket could not be verified; dropping the listener"
                 );
@@ -308,7 +315,7 @@ pub fn spawn_cni_listener(
             }
         }
         info!(
-            socket_path = %socket_path,
+            socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
             "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK/STATUS/GC calls"
         );
 
@@ -347,7 +354,11 @@ pub fn spawn_cni_listener(
                             if let Some(suppressed) =
                                 accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
                             {
-                                warn!(error = %err, suppressed, "Node-agent CNI listener accept failed");
+                                warn!(
+                                    error = %sanitize_startup_cause(&err, &[]),
+                                    suppressed,
+                                    "Node-agent CNI listener accept failed"
+                                );
                             }
                             if let Some(delay) = accept_backoff.on_error(err.kind()) {
                                 tokio::time::sleep(delay).await;
@@ -359,14 +370,14 @@ pub fn spawn_cni_listener(
         }
 
         info!(
-            socket_path = %socket_path,
+            socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
             "Node-agent CNI listener shutting down; checking socket ownership before cleanup"
         );
         match remove_published_socket_if_owned(&socket_path, published_identity).await {
             Ok(OwnedSocketCleanup::Removed | OwnedSocketCleanup::AlreadyMissing) => {}
             Ok(OwnedSocketCleanup::ReplacementPreserved { current }) => {
                 info!(
-                    socket_path = %socket_path,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                     owned_device = published_identity.device,
                     owned_inode = published_identity.inode,
                     current_device = current.device,
@@ -380,8 +391,8 @@ pub fn spawn_cni_listener(
                     crate::ebpf::CniSocketLifecycleReason::ShutdownCleanupError,
                 );
                 warn!(
-                    socket_path = %socket_path,
-                    error = %err,
+                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                    error = %sanitize_startup_cause(err, &[]),
                     reason = "shutdown_cleanup_error",
                     "Failed to remove owned CNI socket file on shutdown"
                 );
@@ -404,7 +415,7 @@ pub fn spawn_cni_listener(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         warn!(
-            socket_path = %socket_path,
+            socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
             "Node-agent CNI listener requested on non-Unix target; listener disabled"
         );
     })
@@ -645,8 +656,8 @@ fn create_private_socket_stage(socket_path: &str) -> std::io::Result<PrivateSock
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
                     debug!(
-                        stage_parent = %stage_parent.display(),
-                        error = %err,
+                        stage_parent = %sanitize_startup_cause(format!("{stage_parent:?}"), &[]),
+                        error = %sanitize_startup_cause(&err, &[]),
                         "Failed to create candidate private CNI socket staging directory"
                     );
                     last_create_error = Some(err);
@@ -741,7 +752,7 @@ async fn handle_one_connection(
     let request = match timeout(REQUEST_READ_TIMEOUT, read_request_frame(&mut stream)).await {
         Ok(Ok(req)) => req,
         Ok(Err(err)) => {
-            debug!(error = %err, "Rejected malformed CNI RPC request");
+            debug!(error = %sanitize_startup_cause(err, &[]), "Rejected malformed CNI RPC request");
             // We cannot attribute to a specific verb because parsing failed;
             // bump the "error" outcome on each verb? Instead, log only —
             // bad framing means a misconfigured client, not a node-agent
@@ -775,7 +786,7 @@ async fn handle_one_connection(
     if let Err(err) = work_sender.try_send(work) {
         warn!(
             verb = ?verb,
-            error = %err,
+            error = %sanitize_startup_cause(err, &[]),
             "Failed to enqueue CNI work; main loop may be saturated or shutting down"
         );
         metrics.record_cni_call(metric_verb, CniCallOutcome::Error);
@@ -816,7 +827,7 @@ async fn handle_one_connection(
         "Served CNI RPC"
     );
     if let Err(err) = write_response_frame(&mut stream, &response).await {
-        warn!(error = %err, "Failed to write CNI RPC response");
+        warn!(error = %sanitize_startup_cause(err, &[]), "Failed to write CNI RPC response");
     }
 }
 

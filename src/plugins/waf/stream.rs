@@ -182,11 +182,11 @@ fn compile_stream_signatures(
         for (idx, entry) in array.iter().enumerate() {
             let obj = entry
                 .as_object()
-                .ok_or_else(|| format!("waf: 'stream.signatures[{idx}]' must be an object"))?;
+                .ok_or_else(|| format!("waf: `stream.signatures[{idx}]` must be an object"))?;
             let path = format!("config.stream.signatures[{idx}]");
             reject_unknown_keys(obj, &path, STREAM_SIGNATURE_KEYS, "waf: ")?;
             let id = optional_string(obj, "id")?
-                .ok_or_else(|| format!("waf: 'stream.signatures[{idx}]' requires 'id'"))?;
+                .ok_or_else(|| format!("waf: `stream.signatures[{idx}]` requires `id`"))?;
             if !seen_ids.insert(id.clone()) {
                 return Err(format!("waf: duplicate stream signature id {id:?}"));
             }

@@ -29,6 +29,29 @@ pub fn sanitize_startup_cause(cause: impl Display, database_urls: &[&str]) -> St
     crate::util::deserialization::sanitize_custom_message(&rendered)
 }
 
+/// Quote a configuration scalar after key-aware credential redaction.
+///
+/// The diagnostic renderer can withhold this span even when an unregistered
+/// value starts with an apostrophe, contains quotes, or was parsed as a number.
+pub fn quoted_config_value(env_key: &str, rendered: &str) -> String {
+    if crate::secrets::is_external_secret_key(env_key) {
+        crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string()
+    } else {
+        format!("{:?}", crate::secrets::redact_external_secret_values(rendered))
+    }
+}
+
+/// Withhold one scalar at an early log boundary, preserving key-aware redaction.
+///
+/// Unlike a cause, a scalar contains no schema path or rejection reason to keep.
+pub fn sanitize_startup_scalar(value: impl Display) -> String {
+    let rendered = value.to_string();
+    if rendered == crate::secrets::EXTERNAL_SECRET_PLACEHOLDER {
+        return rendered;
+    }
+    sanitize_startup_cause(format!("{rendered:?}"), &[])
+}
+
 /// Render only the ordered, independently sanitized startup cause chain.
 ///
 /// Withhold quoted spans in EACH cause before joining: an unterminated quote in
@@ -202,7 +225,7 @@ pub fn flip_ready_off_on_listener_failure<E: Display>(
     startup_ready.store(false, Ordering::Release);
     tracing::error!(
         listener = listener,
-        error = %err,
+        error = %sanitize_startup_cause(err, &[]),
         "Serving listener task exited with an error; marked serving degraded and flipped readiness to not-ready"
     );
 }

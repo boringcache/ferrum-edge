@@ -76,7 +76,15 @@ impl<S> Drop for TrackedMeshStream<S> {
                 Utc::now(),
             );
         }
-        info!("Mesh node '{}' disconnected (stream dropped)", self.node_id);
+        info!(
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "Mesh node {:?} disconnected (stream dropped)", self.node_id
+                ),
+                &[]
+            )
+        );
     }
 }
 
@@ -374,7 +382,7 @@ impl MeshGrpcServer {
                 && status.code() == tonic::Code::FailedPrecondition
             {
                 return Status::failed_precondition(format!(
-                    "Mesh namespace '{}' does not match CP namespace '{}'. \
+                    "Mesh namespace {:?} does not match CP namespace {:?}. \
                      A single CP serves a single namespace; deploy a separate CP \
                      instance per namespace.",
                     mesh_namespace, self.namespace
@@ -477,7 +485,15 @@ impl MeshGrpcServer {
                 |revision| (revision.authority.clone(), revision.sequence),
             );
         let mesh_slice_json = serde_json::to_string(&slice).map_err(|e| {
-            error!("Failed to serialize mesh slice: {}", e);
+            error!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!(
+                        "Failed to serialize mesh slice: {}", e
+                    ),
+                    &[]
+                )
+            );
             Status::internal("Failed to serialize mesh slice")
         })?;
         Ok(MeshConfigUpdate {
@@ -777,8 +793,14 @@ impl MeshConfigSync for MeshGrpcServer {
         );
 
         info!(
-            "Mesh node '{}' (v{}) subscribed for mesh config (namespace='{}')",
-            node_id, inner.ferrum_version, inner.namespace
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "Mesh node {:?} (v{:?}) subscribed for mesh config (namespace={:?})",
+                    node_id, inner.ferrum_version, inner.namespace
+                ),
+                &[]
+            )
         );
 
         let waypoint_name = if inner.waypoint_name.trim().is_empty() {
@@ -933,8 +955,11 @@ impl MeshConfigSync for MeshGrpcServer {
                         }
                         Err(e) => {
                             warn!(
-                                version = %version,
-                                error = %e,
+                                version = %crate::startup::sanitize_startup_cause(
+                                    format!("{version:?}"),
+                                    &[]
+                                ),
+                                error = %crate::startup::sanitize_startup_cause(&e, &[]),
                                 "Failed to build mesh delta update"
                             );
                             Some(Err(e))

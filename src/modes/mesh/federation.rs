@@ -1166,9 +1166,9 @@ fn sanitize_endpoint_for_logging(endpoint: &str) -> String {
 /// become active for inbound SPIFFE verification. Accepting unauthenticated
 /// HTTP would let an on-path attacker replace a remote trust root.
 pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String> {
-    let url = reqwest::Url::parse(endpoint).map_err(|e| {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| {
         format!(
-            "federation_endpoint {:?} is not a valid URL: {e}",
+            "federation_endpoint {:?} is not a valid URL",
             sanitize_endpoint_for_logging(endpoint)
         )
     })?;
@@ -1204,19 +1204,20 @@ fn reject_unsafe_ipv4(ip: &std::net::Ipv4Addr) -> Result<(), String> {
     }
     if ip.is_link_local() {
         return Err(format!(
-            "federation_endpoint refuses link-local host {ip} (defends against cloud metadata SSRF)"
+            "federation_endpoint refuses link-local host \"{ip}\" (defends against cloud \
+             metadata SSRF)"
         ));
     }
     // 169.254.169.254 is link-local already, but call it out explicitly for
     // the operator-readable error message.
     if ip.octets() == [169, 254, 169, 254] {
         return Err(format!(
-            "federation_endpoint refuses cloud metadata IP {ip}"
+            "federation_endpoint refuses cloud metadata IP \"{ip}\""
         ));
     }
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
         return Err(format!(
-            "federation_endpoint refuses non-unicast IPv4 host {ip}"
+            "federation_endpoint refuses non-unicast IPv4 host \"{ip}\""
         ));
     }
     Ok(())
@@ -1228,14 +1229,14 @@ fn reject_unsafe_ipv6(ip: &std::net::Ipv6Addr) -> Result<(), String> {
     }
     if ip.is_unspecified() || ip.is_multicast() {
         return Err(format!(
-            "federation_endpoint refuses non-unicast IPv6 host {ip}"
+            "federation_endpoint refuses non-unicast IPv6 host \"{ip}\""
         ));
     }
     // RFC 4291 link-local fe80::/10
     let segs = ip.segments();
     if segs[0] & 0xffc0 == 0xfe80 {
         return Err(format!(
-            "federation_endpoint refuses link-local IPv6 host {ip}"
+            "federation_endpoint refuses link-local IPv6 host \"{ip}\""
         ));
     }
     Ok(())

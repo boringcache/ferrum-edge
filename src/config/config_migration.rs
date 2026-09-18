@@ -101,7 +101,7 @@ impl ConfigMigrator {
     pub fn migrate_file(path: &str) -> Result<ConfigMigrateResult, anyhow::Error> {
         let file_path = Path::new(path);
         if !file_path.exists() {
-            anyhow::bail!("Configuration file not found: {}", path);
+            anyhow::bail!("Configuration file not found: {:?}", path);
         }
 
         let content = read_config_migration_file(file_path)?;
@@ -153,7 +153,10 @@ impl ConfigMigrator {
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
         let backup_path = format!("{}.backup.{}", path, timestamp);
         std::fs::copy(file_path, &backup_path)?;
-        info!("Created config backup at {}", backup_path);
+        info!(
+            "Created config backup at {}",
+            crate::startup::sanitize_startup_cause(format!("{backup_path:?}"), &[])
+        );
 
         // Write migrated content back in the original format
         let migrated_content = match ext.as_str() {
@@ -183,7 +186,7 @@ impl ConfigMigrator {
     pub fn detect_version(path: &str) -> Result<String, anyhow::Error> {
         let file_path = Path::new(path);
         if !file_path.exists() {
-            anyhow::bail!("Configuration file not found: {}", path);
+            anyhow::bail!("Configuration file not found: {:?}", path);
         }
 
         let content = read_config_migration_file(file_path)?;

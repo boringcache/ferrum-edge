@@ -137,7 +137,7 @@ pub fn read_mesh_config_document(
 /// file source would later refuse (size, regularity, UTF-8, settle contract).
 fn read_mesh_file_bytes(path: &Path) -> Result<String, anyhow::Error> {
     if !path.exists() {
-        anyhow::bail!("mesh configuration file not found: {}", path.display());
+        anyhow::bail!("mesh configuration file not found: {:?}", path.display());
     }
 
     // Mirror file mode's credential-hygiene warning: mesh documents can carry

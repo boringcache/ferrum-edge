@@ -67,9 +67,19 @@ paths:
   and Kubernetes port/weight/concurrency/sampling diagnostics. JSON Display
   strings must be Debug-escaped even when a sibling guard already does so.
 
-- Scope of #5591: plugin diagnostics are converted per family under #5594; the
-  renderer withholds their single-quoted spans fail-closed in the meantime; the
-  known disclosure classes there are apostrophe-leading `'{value}'`
-  interpolations and retained regex-library errors. This PR finishes WAF,
-  CP trust-bundle and SQL row diagnostics, stream-port/other early emissions,
-  and the Istio port-level rejection; other plugin families stay under #5594.
+- Scope of #5591: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
+  `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, and `src/plugins/waf`.
+  Other plugin families remain under #5594. Withholding is conditional on safe
+  producer interpolation: apostrophe-leading single-quoted values, bare values,
+  and retained third-party parser text can still expose supplied data. Do not
+  describe the renderer alone as fail-closed for arbitrary diagnostic text.
+- The mechanical producer/emitter contract is
+  `tests/unit/cli/diagnostic_source_guard_tests.rs` (registered in `cli/mod.rs`).
+  It scans every Rust file in the above roots, including multiline/nested macros
+  and raw strings, for single-quoted interpolation in diagnostic macros and for
+  named error/message captures in `warn!`/`error!` without a sanitizer call in
+  that statement. Its exact, commented exception list contains SQL query syntax,
+  not document-value diagnostics. Keep schema names in backticks. The guard
+  prevents those syntax regressions in scope; it cannot infer whether arbitrary
+  bare arguments are document values or prove third-party errors safe. Retain
+  rendered-output/captured-log regressions for semantic and emission coverage.

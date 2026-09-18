@@ -6012,11 +6012,11 @@ fn validate_hash_on_field(field_name: &str, value: &str, errors: &mut Vec<String
 
     if name.is_empty() {
         errors.push(format!(
-            "{field_name} '{kind}:' requires a non-empty {kind} name"
+            "{field_name} `{kind}:` requires a non-empty {kind} name"
         ));
     } else if !is_valid_http_token(name) {
         errors.push(format!(
-            "{field_name} '{kind}:' name must contain only ASCII HTTP token characters"
+            "{field_name} `{kind}:` name must contain only ASCII HTTP token characters"
         ));
     }
 }
@@ -7264,15 +7264,15 @@ fn load_validated_country_mmdb_inner(
     #[cfg(not(unix))]
     verify_country_mmdb_path_digest(path, &file_version, &digest)?;
 
-    let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
+    let reader = maxminddb::Reader::from_source(bytes).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file {path:?} is not a valid readable .mmdb: {e}"
+            "MaxMind database file {path:?} is not a valid readable .mmdb"
         ))
     })?;
 
-    reader.verify().map_err(|e| {
+    reader.verify().map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file {path:?} failed comprehensive verification: {e}"
+            "MaxMind database file {path:?} failed comprehensive verification"
         ))
     })?;
 
@@ -7285,30 +7285,30 @@ fn load_validated_country_mmdb_inner(
     }
 
     let mut found_country_code = false;
-    let networks = reader.networks(Default::default()).map_err(|e| {
+    let networks = reader.networks(Default::default()).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file {path:?} cannot enumerate country records: {e}"
+            "MaxMind database file {path:?} cannot enumerate country records"
         ))
     })?;
     for network in networks {
-        let lookup = network.map_err(|e| {
+        let lookup = network.map_err(|_| {
             CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database file {path:?} contains an invalid network record: {e}"
+                "MaxMind database file {path:?} contains an invalid network record"
             ))
         })?;
         let country: Option<&str> = lookup
             .decode_path(&maxminddb::path!["country", "iso_code"])
-            .map_err(|e| {
+            .map_err(|_| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file {path:?} has an incompatible country record: {e}"
+                    "MaxMind database file {path:?} has an incompatible country record"
                 ))
             })?;
         let registered_country: Option<&str> = lookup
             .decode_path(&maxminddb::path!["registered_country", "iso_code"])
-            .map_err(|e| {
+            .map_err(|_| {
                 CountryMmdbLoadError::Invalid(format!(
                     "MaxMind database file {path:?} has an incompatible registered-country \
-                     record: {e}"
+                     record"
                 ))
             })?;
 

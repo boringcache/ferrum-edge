@@ -100,7 +100,10 @@ impl ConfFile {
         let options = StableFileReadOptions::new(MAX_FERRUM_CONF_BYTES, "ferrum.conf");
         match read_stable_file(path, options) {
             Ok(contents) => {
-                info!("Loading configuration from {}", path.display());
+                info!(
+                    "Loading configuration from {}",
+                    crate::startup::sanitize_startup_cause(format!("{path:?}"), &[])
+                );
                 Self::parse(&contents)
             }
             Err(StableFileError::NotFound) if absent_ok => Ok(Self::default()),

@@ -2162,10 +2162,10 @@ impl TrustBundleKeyDocument {
                     ));
                 }
             };
-            let decoding_key = parsed.map_err(|e| {
+            let decoding_key = parsed.map_err(|_| {
                 format!(
                     "CP/DP trust bundle {origin:?}: key {kid:?} public key is not valid PEM for \
-                     \"{algorithm:?}\": {e}"
+                     \"{algorithm:?}\""
                 )
             })?;
             let identity_material = canonical_public_key_identity_material(bytes);

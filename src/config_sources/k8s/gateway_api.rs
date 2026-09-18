@@ -541,8 +541,8 @@ pub(super) fn collect_backend_lb_policy(
             }
             Some((true, old)) => {
                 acc.warnings.push(format!(
-                    "{} {}/{} replaces older backend session policy {}/{} \
-                     for Service {}/{}",
+                    "{} {:?}/{:?} replaces older backend session policy {:?}/{:?} \
+                     for Service {:?}/{:?}",
                     object.kind,
                     object.metadata.namespace,
                     object.metadata.name,
@@ -556,7 +556,7 @@ pub(super) fn collect_backend_lb_policy(
             }
             Some((false, old)) => {
                 acc.warnings.push(format!(
-                    "{} {}/{} ignored for Service {}/{}; older policy {}/{} wins",
+                    "{} {:?}/{:?} ignored for Service {:?}/{:?}; older policy {:?}/{:?} wins",
                     object.kind,
                     object.metadata.namespace,
                     object.metadata.name,
@@ -613,7 +613,7 @@ pub(super) fn finalize_backend_lb_policies(acc: &mut K8sAccumulator) {
         .retain(|_, policy| !withdrawn.contains(&policy.resource));
     for resource in withdrawn {
         acc.warnings.push(format!(
-            "{} {}/{} lost at least one targeted Service under BackendLB/XBackendTraffic \
+            "{} {:?}/{:?} lost at least one targeted Service under BackendLB/XBackendTraffic \
              oldest-wins precedence; its session persistence is withdrawn from every \
              targeted Service to match the atomic Accepted=False/Conflicted status",
             resource.kind, resource.namespace, resource.name
@@ -907,7 +907,7 @@ fn resolve_rule_session_persistence(
                             format!(
                                 "backendRefs target Services with conflicting \
                                  BackendLB/XBackendTraffic sessionPersistence \
-                                 (Service {}/{} vs Service {}/{})",
+                                 (Service {:?}/{:?} vs Service {:?}/{:?})",
                                 prior_key.0, prior_key.1, key.0, key.1
                             ),
                         ));
@@ -921,8 +921,8 @@ fn resolve_rule_session_persistence(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "backend Service {}/{} has rejected session policy \
-                         {}/{}: {message}",
+                        "backend Service {:?}/{:?} has rejected session policy \
+                         {:?}/{:?}: {message}",
                         key.0, key.1, policy.resource.namespace, policy.resource.name
                     ),
                 ));
@@ -1554,7 +1554,7 @@ pub(super) fn collect_gateway_listener_policy(
             Ok(namespaces) => (namespaces, None),
             Err(error) => {
                 acc.warnings.push(format!(
-                    "Gateway API Gateway {}/{} listener {} rejected: {}",
+                    "Gateway API Gateway {:?}/{:?} listener {:?} rejected: {}",
                     object.metadata.namespace, object.metadata.name, listener_name, error
                 ));
                 (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
@@ -1562,7 +1562,8 @@ pub(super) fn collect_gateway_listener_policy(
         };
         if !listener_protocol_mode_is_supported(listener) {
             acc.warnings.push(format!(
-                "Gateway API Gateway {}/{} listener {} rejected: spec.listeners[].tls.mode must be Passthrough for protocol TLS",
+                "Gateway API Gateway {:?}/{:?} listener {:?} rejected: spec.listeners[].tls.mode \
+                 must be Passthrough for protocol TLS",
                 object.metadata.namespace, object.metadata.name, listener_name
             ));
         }
@@ -1827,7 +1828,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                         .cloned()
                         .collect::<Vec<_>>(),
                     format!(
-                        "Port {port} is claimed by both plaintext and an effective TLS-serving \
+                        "Port \"{port}\" is claimed by both plaintext and an effective TLS-serving \
                          frontend shape, so every conflicting claim on this port is refused \
                          (Conflicted)."
                     ),
@@ -1837,7 +1838,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                     "HostnameConflict",
                     claims.effective_tls,
                     format!(
-                        "Port {port} has incompatible effective TLS credential sets across \
+                        "Port \"{port}\" has incompatible effective TLS credential sets across \
                          namespaces, so every conflicting claim on this port is refused \
                          (Conflicted)."
                     ),
@@ -1936,14 +1937,19 @@ pub(crate) fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8
         };
         let Some(certificates) = listener_frontend_tls_sources(acc, object, listener) else {
             warnings.push(format!(
-                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs has at least one reference that is not an authorized, valid kubernetes.io/tls Secret; leaving this listener's frontend TLS unmaterialized",
+                "Gateway API {} {:?}/{:?} listener {:?} field \
+                 spec.listeners[].tls.certificateRefs has at least one reference that is not an \
+                 authorized, valid kubernetes.io/tls Secret; leaving this listener's frontend \
+                 TLS unmaterialized",
                 object.kind, object.metadata.namespace, object.metadata.name, listener_name
             ));
             continue;
         };
         if certificates.is_empty() {
             warnings.push(format!(
-                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs is empty on a Terminate-mode listener; leaving this listener's frontend TLS unmaterialized",
+                "Gateway API {} {:?}/{:?} listener {:?} field \
+                 spec.listeners[].tls.certificateRefs is empty on a Terminate-mode listener; \
+                 leaving this listener's frontend TLS unmaterialized",
                 object.kind, object.metadata.namespace, object.metadata.name, listener_name
             ));
             continue;
@@ -2013,7 +2019,9 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
                 .and_then(|listener| listener.hostname.as_deref())
                 .unwrap_or("");
             acc.warnings.push(format!(
-                "Gateway API {} {}/{} listener {} field spec.listeners[].hostname '{}' is already served with a different certificate by {} {}/{} listener {}; reporting the conflict and leaving route traffic on this listener unmaterialized",
+                "Gateway API {} {:?}/{:?} listener {:?} field spec.listeners[].hostname {:?} is \
+                 already served with a different certificate by {} {:?}/{:?} listener {:?}; \
+                 reporting the conflict and leaving route traffic on this listener unmaterialized",
                 key.parent_kind.as_str(),
                 key.namespace,
                 key.gateway,
@@ -2033,7 +2041,10 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
             }
         } else if admission.certificate_cap_losers.contains(key) {
             acc.warnings.push(format!(
-                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for its serving namespace; leaving this listener's certificate set and route traffic unmaterialized",
+                "Gateway API {} {:?}/{:?} listener {:?} field \
+                 spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS \
+                 certificate limit for its serving namespace; leaving this listener's \
+                 certificate set and route traffic unmaterialized",
                 key.parent_kind.as_str(),
                 key.namespace,
                 key.gateway,
@@ -3302,7 +3313,7 @@ fn upsert_http_route_resources(
         if let Some(proxy_id) = plugin.proxy_id.clone() {
             let Some(key) = namespaced_resource_key(&plugin.namespace, &proxy_id) else {
                 acc.warnings.push(format!(
-                    "route plugin '{}/{}' with empty namespace or proxy_id was ignored",
+                    "route plugin {:?}/{:?} with empty namespace or proxy_id was ignored",
                     plugin.namespace, plugin.id
                 ));
                 continue;
@@ -3331,7 +3342,8 @@ fn upsert_http_route_resources(
         // translator happened to observe first.
         if acc.gateway_api_refused_route_slots.contains(&slot) {
             acc.warnings.push(format!(
-                "Gateway API route proxy '{}/{}' is refused: its host+path claim on this listener \
+                "Gateway API route proxy {:?}/{:?} is refused: its host+path claim on this \
+                 listener \
                  port was already refused because two different Gateway API listeners claim it",
                 proxy.namespace, proxy.id
             ));
@@ -3355,7 +3367,7 @@ fn upsert_http_route_resources(
             // cannot serve two contradictory contracts on the same host+path.
             // Refuse both sides rather than letting observation order decide.
             acc.warnings.push(format!(
-                "Gateway API route proxies '{}/{}' and '{}/{}' claim the same host+path on \
+                "Gateway API route proxies {:?}/{:?} and {:?}/{:?} claim the same host+path on \
                  listener port {:?} from different Gateway API listeners; the claim is \
                  physically ambiguous, so both are refused (Conflicted)",
                 conflict.0, conflict.1, proxy.namespace, proxy.id, proxy.listen_port
@@ -4190,8 +4202,8 @@ fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> 
                     // Compile exactly the way `mesh_route_dispatch` will, so an
                     // unusable pattern is refused during translation rather
                     // than failing the plugin build on the data plane.
-                    compile_grpc_uri_regex(&pattern).map_err(|error| {
-                        format!("matches[].method.method is not usable as a URI predicate: {error}")
+                    compile_grpc_uri_regex(&pattern).map_err(|_| {
+                        "matches[].method.method is not usable as a URI predicate".to_string()
                     })?;
                     Ok(GrpcRouteMatchPlan::UriRegex { pattern })
                 }
@@ -4738,7 +4750,8 @@ fn mesh_services_from_gateway(
             }
             if !listener_protocol_mode_is_supported(listener) {
                 acc.warnings.push(format!(
-                    "Gateway API Gateway {}/{} listener {} uses unsupported protocol TLS with a non-Passthrough mode and will not be exposed",
+                    "Gateway API Gateway {:?}/{:?} listener {:?} uses unsupported protocol TLS \
+                     with a non-Passthrough mode and will not be exposed",
                     object.metadata.namespace,
                     object.metadata.name,
                     listener_name
@@ -4751,7 +4764,8 @@ fn mesh_services_from_gateway(
             // raw certificate resolution would re-admit a withdrawn listener.
             if !materializable {
                 acc.warnings.push(format!(
-                    "Gateway API Gateway {}/{} listener {} is not materializable and will not be exposed",
+                    "Gateway API Gateway {:?}/{:?} listener {:?} is not materializable and will \
+                     not be exposed",
                     object.metadata.namespace,
                     object.metadata.name,
                     listener_name
@@ -4760,7 +4774,8 @@ fn mesh_services_from_gateway(
             }
             if requires_frontend_tls && !routes_materializable {
                 acc.warnings.push(format!(
-                    "Gateway API Gateway {}/{} listener {} has no admitted frontend TLS source and will not be exposed",
+                    "Gateway API Gateway {:?}/{:?} listener {:?} has no admitted frontend TLS \
+                     source and will not be exposed",
                     object.metadata.namespace,
                     object.metadata.name,
                     listener_name
@@ -4892,7 +4907,7 @@ fn route_parent_ref_disallow_error(
         return Some(invalid_resource(
             object,
             format!(
-                "{} parentRef does not match any known {parent_kind} listener in namespace '{}'",
+                "{} parentRef does not match any known {parent_kind} listener in namespace {:?}",
                 object.kind, parent_namespace
             ),
         ));
@@ -4901,7 +4916,7 @@ fn route_parent_ref_disallow_error(
         return Some(invalid_resource(
             object,
             format!(
-                "{} parentRef does not match any known {parent_kind} listener in namespace '{}'",
+                "{} parentRef does not match any known {parent_kind} listener in namespace {:?}",
                 object.kind, parent_namespace
             ),
         ));
@@ -4910,7 +4925,7 @@ fn route_parent_ref_disallow_error(
         return Some(invalid_resource(
             object,
             format!(
-                "{} parentRef.namespace '{}' is not permitted by the target {parent_kind} listener",
+                "{} parentRef.namespace {:?} is not permitted by the target {parent_kind} listener",
                 object.kind, parent_namespace
             ),
         ));
@@ -5488,7 +5503,7 @@ fn warn_unrepresentable_grpc_route_matches(object: &K8sObject, acc: &mut K8sAccu
         };
         let Some(matches) = matches_value.as_array() else {
             acc.warnings.push(format!(
-                "GRPCRoute {}/{} rules[{rule_index}].matches dropped fail-closed: matches must \
+                "GRPCRoute {:?}/{:?} rules[{rule_index}].matches dropped fail-closed: matches must \
                  be an array",
                 object.metadata.namespace, object.metadata.name
             ));
@@ -5497,7 +5512,7 @@ fn warn_unrepresentable_grpc_route_matches(object: &K8sObject, acc: &mut K8sAccu
         for (match_index, entry) in matches.iter().enumerate() {
             if let Err(reason) = grpc_route_match(entry) {
                 acc.warnings.push(format!(
-                    "GRPCRoute {}/{} rules[{rule_index}].matches[{match_index}] dropped \
+                    "GRPCRoute {:?}/{:?} rules[{rule_index}].matches[{match_index}] dropped \
                      fail-closed: {reason}",
                     object.metadata.namespace, object.metadata.name
                 ));
@@ -7021,7 +7036,7 @@ fn route_backends(
     }
     if fault_reason.is_some_and(|reason| reason != BackendRefFaultReason::NoServiceableBackend) {
         acc.warnings.push(format!(
-            "{} {}/{} has unresolved backendRef(s); materializing fail-closed route action",
+            "{} {:?}/{:?} has unresolved backendRef(s); materializing fail-closed route action",
             object.kind, object.metadata.namespace, object.metadata.name
         ));
     }
@@ -7233,18 +7248,19 @@ fn l4_route_proxies_for_namespace(
                 .contains_key(&K8sResourceKey::from_object(object))
         {
             acc.warnings.push(format!(
-                "{} {}/{} lost every claimed UDP listener to an older competing UDPRoute; \
+                "{} {:?}/{:?} lost every claimed UDP listener to an older competing UDPRoute; \
                  no listener was opened",
                 object.kind, object.metadata.namespace, object.metadata.name
             ));
         } else if scheme.is_udp() && !route_declares_gateway_parent_ref(object) {
             acc.warnings.push(format!(
-                "{} {}/{} has no valid attached Gateway listener; no listener was opened",
+                "{} {:?}/{:?} has no valid attached Gateway listener; no listener was opened",
                 object.kind, object.metadata.namespace, object.metadata.name
             ));
         } else {
             acc.warnings.push(format!(
-                "{} {}/{} declares parentRefs but none resolved to a materializable Gateway listener; \
+                "{} {:?}/{:?} declares parentRefs but none resolved to a materializable Gateway \
+                 listener; \
                  no listener was opened",
                 object.kind, object.metadata.namespace, object.metadata.name
             ));
@@ -7559,7 +7575,7 @@ fn ensure_udp_route_rule_shape(
         return Err(invalid_resource(
             object,
             format!(
-                "{} spec.rules supports at most {MAX_UDP_ROUTE_RULES} entries (got {})",
+                "{} spec.rules supports at most {MAX_UDP_ROUTE_RULES} entries (got \"{}\")",
                 object.kind,
                 rules.len()
             ),
@@ -7714,7 +7730,7 @@ fn udp_rule_backends(
         return Err(invalid_resource(
             object,
             format!(
-                "{} backendRefs supports at most {MAX_UDP_ROUTE_BACKEND_REFS} entries (got {})",
+                "{} backendRefs supports at most {MAX_UDP_ROUTE_BACKEND_REFS} entries (got \"{}\")",
                 object.kind,
                 backend_refs.len()
             ),
@@ -7812,7 +7828,7 @@ fn udp_rule_backends(
     }
     if unserviceable > 0 {
         acc.warnings.push(format!(
-            "{} {}/{} has {} unresolved backendRef(s); their declared weight is dropped fail \
+            "{} {:?}/{:?} has {} unresolved backendRef(s); their declared weight is dropped fail \
              closed and is not redistributed to the resolvable backends",
             object.kind, object.metadata.namespace, object.metadata.name, unserviceable
         ));

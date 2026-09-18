@@ -501,10 +501,13 @@ fn mesh_authz_rejects_invalid_direct_source_ip_block() {
     };
 
     assert!(
-        err.contains("prefix length 40 out of range in CIDR <redacted scalar>"),
-        "error should retain the prefix length and reason: {err}"
+        err.contains(
+            "prefix length <redacted scalar> out of range (maximum 32) in CIDR <redacted scalar>"
+        ),
+        "error should withhold the prefix and retain the reason: {err}"
     );
     assert!(!err.contains("10.0.0.0/40"), "CIDR must be withheld: {err}");
+    assert!(!err.contains("40"), "prefix must be withheld: {err}");
 }
 
 #[test]

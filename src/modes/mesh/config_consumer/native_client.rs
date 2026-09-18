@@ -33,6 +33,7 @@ use crate::modes::mesh::runtime::{
     MeshRuntimeState, MeshSliceInstall, MeshSliceRuntimeOutcome, MeshSliceRuntimeRejectReason,
 };
 use crate::modes::mesh::slice::MeshSlice;
+use crate::startup::sanitize_startup_scalar;
 
 /// Wire category for a proxy-runtime refusal (issue #4812).
 ///
@@ -170,8 +171,8 @@ pub async fn start_native_mesh_client_with_shutdown(
     state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         cp_urls = cp_urls.len(),
         liveness_bound_secs = config.timings.liveness_bound_seconds(),
         "Native mesh client starting"
@@ -302,7 +303,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                             &[]
                         ),
                         outcome = MeshStreamAttempt::AdmissionRefused.as_metric_label(),
-                        status = %status.message(),
+                        status = %crate::startup::sanitize_startup_cause(status.message(), &[]),
                         "Control plane REFUSED the native MeshSubscribe stream for \
                          capacity/tenancy reasons: it is reachable and answering, but a CP gRPC \
                          stream admission budget is saturated. Raise the budget named in the \
@@ -472,8 +473,8 @@ async fn connect_mesh_subscribe(
     let mut status_client = client.clone();
 
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         cp_url = %cp_url,
         "Connected to CP, subscribing for native mesh config"
     );
@@ -659,7 +660,7 @@ async fn connect_mesh_subscribe(
                     pending_status_report = Some((retry_report, attempts_left));
                 }
                 tracing::debug!(
-                    version = %version,
+                    version = %sanitize_startup_scalar(version.to_string()),
                     code = ?err.code(),
                     retrying = pending_status_report.is_some(),
                     "Mesh slice status retry did not reach the control plane"
@@ -686,9 +687,9 @@ async fn connect_mesh_subscribe(
                 tracker.record_usable_state();
                 state.set_config_stream_status(tracker.status(state.has_first_slice()));
                 info!(
-                    node_id = %slice.node_id,
-                    namespace = %slice.namespace,
-                    version = %slice.version,
+                    node_id = %sanitize_startup_scalar(slice.node_id.to_string()),
+                    namespace = %sanitize_startup_scalar(slice.namespace.to_string()),
+                    version = %sanitize_startup_scalar(slice.version.to_string()),
                     "Applied native MeshSubscribe update"
                 );
                 // Issue #4812: this is the INSTALL-time verdict only — the

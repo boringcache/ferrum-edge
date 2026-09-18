@@ -1,7 +1,7 @@
 // Included at the binary root; shared gateway modules are imported from the library.
 use clap::Parser;
 use config::{AdminHttpExposure, EnvConfig, OperatingMode};
-use startup::render_startup_error;
+use startup::{render_startup_error, sanitize_startup_scalar};
 use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
@@ -410,7 +410,10 @@ fn init_logging() -> Result<LoggingGuards, String> {
             // the raw numbers when the variable was externally resolved.
             warn!(
                 variable = resolved.name,
-                supplied_value = %secrets::report_env_field(resolved.name, &supplied.to_string()),
+                supplied_value = %sanitize_startup_scalar(secrets::report_env_field(
+                    resolved.name,
+                    &supplied.to_string(),
+                )),
                 applied_value =
                     %secrets::report_env_field(resolved.name, &resolved.applied.to_string()),
                 "logging configuration value was clamped"
@@ -441,7 +444,7 @@ where
 {
     fn reload(&self, directive: &str) -> Result<(), String> {
         let filter = EnvFilter::try_new(directive)
-            .map_err(|e| format!("invalid filter directive '{directive}': {e}"))?;
+            .map_err(|_| format!("invalid filter directive {directive:?}"))?;
         self.handle
             .reload(filter)
             .map_err(|e| format!("tracing reload failed: {e}"))
@@ -838,12 +841,21 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // the placeholder, so the rendering is formatted first and printed as `{}`.
     info!(
         "Operating mode: {}",
-        secrets::report_env_field("FERRUM_MODE", &format!("{:?}", env_config.mode))
+        sanitize_startup_scalar(secrets::report_env_field(
+            "FERRUM_MODE",
+            &format!("{:?}", env_config.mode),
+        ))
     );
     info!(
         "Proxy bind address: {}, Admin bind address: {}",
-        secrets::report_env_field("FERRUM_PROXY_BIND_ADDRESS", &env_config.proxy_bind_address),
-        secrets::report_env_field("FERRUM_ADMIN_BIND_ADDRESS", &env_config.admin_bind_address)
+        sanitize_startup_scalar(secrets::report_env_field(
+            "FERRUM_PROXY_BIND_ADDRESS",
+            &env_config.proxy_bind_address,
+        )),
+        sanitize_startup_scalar(secrets::report_env_field(
+            "FERRUM_ADMIN_BIND_ADDRESS",
+            &env_config.admin_bind_address,
+        ))
     );
     // Surface the plaintext admin HTTP listener's network exposure. The
     // unsafe writable-mode case (database/cp, public, no allowlist, no opt-in)
@@ -859,14 +871,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                  IPs may connect, but operator bearer tokens still traverse cleartext on this \
                  port. Prefer admin over TLS (FERRUM_ADMIN_TLS_CERT_PATH / \
                  FERRUM_ADMIN_TLS_KEY_PATH) and disable plaintext with FERRUM_ADMIN_HTTP_PORT=0.",
-                secrets::report_env_field(
+                sanitize_startup_scalar(secrets::report_env_field(
                     "FERRUM_ADMIN_HTTP_PORT",
-                    &env_config.admin_http_port.to_string()
-                ),
-                secrets::report_env_field(
+                    &env_config.admin_http_port.to_string(),
+                )),
+                sanitize_startup_scalar(secrets::report_env_field(
                     "FERRUM_ADMIN_BIND_ADDRESS",
-                    &env_config.admin_bind_address
-                )
+                    &env_config.admin_bind_address,
+                ))
             );
         }
         AdminHttpExposure::ReachableUnrestricted => {
@@ -879,10 +891,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                      bound to {} with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist — the admin API and \
                      operator bearer tokens are exposed in cleartext on every matching interface. \
                      Development only; never use this in production.",
-                    secrets::report_env_field(
+                    sanitize_startup_scalar(secrets::report_env_field(
                         "FERRUM_ADMIN_BIND_ADDRESS",
-                        &env_config.admin_bind_address
-                    )
+                        &env_config.admin_bind_address,
+                    ))
                 );
             } else {
                 warn!(
@@ -890,10 +902,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                      FERRUM_ADMIN_ALLOWED_CIDRS allowlist; ensure it is not publicly reachable. \
                      Prefer FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1, an allowlist, or admin TLS with \
                      FERRUM_ADMIN_HTTP_PORT=0.",
-                    secrets::report_env_field(
+                    sanitize_startup_scalar(secrets::report_env_field(
                         "FERRUM_ADMIN_BIND_ADDRESS",
-                        &env_config.admin_bind_address
-                    )
+                        &env_config.admin_bind_address,
+                    ))
                 );
             }
         }
@@ -929,14 +941,20 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     if let Some(workers) = env_config.worker_threads {
         info!(
             "Tokio worker threads: {}",
-            secrets::report_env_field("FERRUM_WORKER_THREADS", &workers.to_string())
+            sanitize_startup_scalar(secrets::report_env_field(
+                "FERRUM_WORKER_THREADS",
+                &workers.to_string(),
+            ))
         );
         rt_builder.worker_threads(workers);
     }
     if let Some(blocking) = env_config.blocking_threads {
         info!(
             "Tokio max blocking threads: {}",
-            secrets::report_env_field("FERRUM_BLOCKING_THREADS", &blocking.to_string())
+            sanitize_startup_scalar(secrets::report_env_field(
+                "FERRUM_BLOCKING_THREADS",
+                &blocking.to_string(),
+            ))
         );
         rt_builder.max_blocking_threads(blocking);
     }

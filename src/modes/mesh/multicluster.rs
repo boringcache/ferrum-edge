@@ -1477,7 +1477,7 @@ pub(crate) fn parse_remote_discovery_credentials(
             return Err(format!(
                 "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference {} secret must be at \
                  least {} characters (matching FERRUM_CP_DP_GRPC_JWT_SECRET); got {}",
-                crate::secrets::quoted_env_value(
+                crate::startup::quoted_config_value(
                     "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS",
                     reference.trim()
                 ),
@@ -1606,7 +1606,7 @@ pub(crate) fn validate_control_plane_url_with_posture(
     // Normalise before parsing so the scheme check is on the canonical form.
     let normalized = normalize_control_plane_url(url);
     let parsed =
-        reqwest::Url::parse(&normalized).map_err(|e| format!("invalid control_plane_url: {e}"))?;
+        reqwest::Url::parse(&normalized).map_err(|_| "invalid control_plane_url".to_string())?;
     match parsed.scheme() {
         "http" | "https" => {}
         _ => {
@@ -1634,12 +1634,13 @@ pub(crate) fn validate_control_plane_url_with_posture(
             }
             if ip.is_link_local() || ip.octets() == [169, 254, 169, 254] {
                 return Err(format!(
-                    "control_plane_url refuses link-local / cloud-metadata host {ip} (SSRF defense)"
+                    "control_plane_url refuses link-local / cloud-metadata host \"{ip}\" (SSRF \
+                     defense)"
                 ));
             }
             if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
                 return Err(format!(
-                    "control_plane_url refuses non-unicast IPv4 host {ip}"
+                    "control_plane_url refuses non-unicast IPv4 host \"{ip}\""
                 ));
             }
         }
@@ -1649,12 +1650,12 @@ pub(crate) fn validate_control_plane_url_with_posture(
             }
             if ip.is_unspecified() || ip.is_multicast() {
                 return Err(format!(
-                    "control_plane_url refuses non-unicast IPv6 host {ip}"
+                    "control_plane_url refuses non-unicast IPv6 host \"{ip}\""
                 ));
             }
             if ip.segments()[0] & 0xffc0 == 0xfe80 {
                 return Err(format!(
-                    "control_plane_url refuses link-local IPv6 host {ip}"
+                    "control_plane_url refuses link-local IPv6 host \"{ip}\""
                 ));
             }
         }
@@ -2194,7 +2195,7 @@ async fn fetch_remote_slice(
 
     let attempt = async {
         let mut endpoint = Channel::from_shared(control_plane_url.to_string())
-            .map_err(|e| format!("invalid control_plane_url: {e}"))?
+            .map_err(|_| "invalid control_plane_url".to_string())?
             .connect_timeout(Duration::from_secs(10));
         if let Some(tls) = tls_config {
             let mut client_tls = tonic_tls_config(tls);

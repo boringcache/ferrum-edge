@@ -44,7 +44,7 @@ use crate::modes::file::{
 };
 use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
-use crate::startup::wait_for_start_signals;
+use crate::startup::{sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls;
 
 async fn shutdown_database_runtime_tasks(
@@ -1790,11 +1790,11 @@ pub async fn run(
         let http_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_PROXY_BIND_ADDRESS",
                     "FERRUM_PROXY_HTTP_PORT",
-                    &http_addr.to_string()
-                )
+                    &http_addr.to_string(),
+                ))
             );
             proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
@@ -1833,11 +1833,11 @@ pub async fn run(
             let https_handle = tokio::spawn(async move {
                 info!(
                     "Starting HTTPS proxy listener on {}",
-                    crate::secrets::report_listener_addr(
+                    sanitize_startup_scalar(crate::secrets::report_listener_addr(
                         "FERRUM_PROXY_BIND_ADDRESS",
                         "FERRUM_PROXY_HTTPS_PORT",
-                        &https_addr.to_string()
-                    )
+                        &https_addr.to_string(),
+                    ))
                 );
                 let result = if let Some(slot) = reload_slot {
                     proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -1953,11 +1953,11 @@ pub async fn run(
                 let h3_handle = tokio::spawn(async move {
                     info!(
                         "Starting HTTP/3 (QUIC) proxy listener on {}",
-                        crate::secrets::report_listener_addr(
+                        sanitize_startup_scalar(crate::secrets::report_listener_addr(
                             "FERRUM_PROXY_BIND_ADDRESS",
                             "FERRUM_PROXY_HTTPS_PORT",
-                            &h3_addr.to_string()
-                        )
+                            &h3_addr.to_string(),
+                        ))
                     );
                     crate::http3::server::start_http3_listener_with_signal(
                         h3_addr,
@@ -2137,11 +2137,11 @@ pub async fn run(
         let admin_http_handle = tokio::spawn(async move {
             info!(
                 "Starting Admin HTTP listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
-                    &admin_http_addr.to_string()
-                )
+                    &admin_http_addr.to_string(),
+                ))
             );
             admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
@@ -2243,11 +2243,11 @@ pub async fn run(
         let admin_https_handle = tokio::spawn(async move {
             info!(
                 "Starting Admin HTTPS listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTPS_PORT",
-                    &admin_https_addr.to_string()
-                )
+                    &admin_https_addr.to_string(),
+                ))
             );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(

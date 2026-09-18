@@ -546,20 +546,20 @@ pub struct AmbientUdpPreflightArgs {
 pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String> {
     if !root.is_absolute() {
         return Err(format!(
-            "--host-proc-root must be an absolute path, got {}",
-            root.display()
+            "--host-proc-root must be an absolute path, got {:?}",
+            root
         ));
     }
     let metadata = std::fs::metadata(root).map_err(|error| {
         format!(
-            "--host-proc-root {} is not readable: {error}",
-            root.display()
+            "--host-proc-root {:?} is not readable: {error}",
+            root
         )
     })?;
     if !metadata.is_dir() {
         return Err(format!(
-            "--host-proc-root {} is not a directory",
-            root.display()
+            "--host-proc-root {:?} is not a directory",
+            root
         ));
     }
     // `self/ns/net` exists in every procfs instance, including one bind-mounted
@@ -567,8 +567,8 @@ pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String
     // empty mount point that would resolve nothing.
     if cfg!(target_os = "linux") && !root.join("self").join("ns").join("net").exists() {
         return Err(format!(
-            "--host-proc-root {} does not look like a mounted procfs (no self/ns/net)",
-            root.display()
+            "--host-proc-root {:?} does not look like a mounted procfs (no self/ns/net)",
+            root
         ));
     }
     Ok(root.to_path_buf())
@@ -708,7 +708,7 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
             Ok(()) => {}
             Err(error) if error.is_deadline_elapsed() => {
                 if let Some(reason) = error.deadline_operator_reason() {
-                    tracing::warn!("{reason}");
+                    tracing::warn!("{}", crate::startup::sanitize_startup_cause(reason, &[]));
                 }
                 return Ok(
                     crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
@@ -1226,8 +1226,8 @@ impl ValidateNamespaceFilter {
             self.document_namespaces.join(", ")
         };
         format!(
-            "namespace filter mismatch: active namespace '{}' left 0 surviving resources \
-             ({counts}); document namespaces: {namespaces}",
+            "namespace filter mismatch: active namespace {:?} left 0 surviving resources \
+             ({counts}); document namespaces: {namespaces:?}",
             report_field("FERRUM_NAMESPACE", &self.active_namespace)
         )
     }
@@ -1242,7 +1242,10 @@ fn report_empty_namespace_filter(
     }
     let diagnostic = report.diagnostic();
     if allow_empty {
-        println!("WARNING: {diagnostic}");
+        println!(
+            "WARNING: {}",
+            crate::startup::sanitize_startup_cause(diagnostic, &[])
+        );
         println!("  Continuing because --allow-empty-namespace was set.");
         Ok(())
     } else {

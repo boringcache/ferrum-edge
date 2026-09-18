@@ -2252,7 +2252,7 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
                     .as_u64()
                     .and_then(|v| u32::try_from(v).ok())
                     .ok_or_else(|| {
-                        format!("waf: 'scoring.weights.{key}' must be a non-negative integer")
+                        format!("waf: `scoring.weights.{key}` must be a non-negative integer")
                     })?;
             }
         }
@@ -2329,7 +2329,7 @@ fn optional_string(
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
-        Some(Value::String(_)) => Err(format!("waf: '{key}' must be non-empty")),
+        Some(Value::String(_)) => Err(format!("waf: `{key}` must be non-empty")),
         Some(other) => Err(format!(
             "waf: `{key}` must be a string, got {other:?}",
             other = other.to_string()
@@ -2347,10 +2347,10 @@ fn optional_string_vec(
             let mut parsed = Vec::with_capacity(values.len());
             for value in values {
                 let Some(raw) = value.as_str() else {
-                    return Err(format!("waf: '{key}' entries must be strings"));
+                    return Err(format!("waf: `{key}` entries must be strings"));
                 };
                 if raw.is_empty() {
-                    return Err(format!("waf: '{key}' entries must be non-empty"));
+                    return Err(format!("waf: `{key}` entries must be non-empty"));
                 }
                 parsed.push(raw.to_string());
             }
@@ -2365,13 +2365,13 @@ fn optional_string_vec(
 
 fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u8>, String> {
     optional_u64(object, key)?
-        .map(|value| u8::try_from(value).map_err(|_| format!("waf: '{key}' is too large")))
+        .map(|value| u8::try_from(value).map_err(|_| format!("waf: `{key}` is too large")))
         .transpose()
 }
 
 fn optional_u16(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u16>, String> {
     optional_u64(object, key)?
-        .map(|value| u16::try_from(value).map_err(|_| format!("waf: '{key}' is too large")))
+        .map(|value| u16::try_from(value).map_err(|_| format!("waf: `{key}` is too large")))
         .transpose()
 }
 
@@ -2380,7 +2380,7 @@ fn optional_usize(
     key: &str,
 ) -> Result<Option<usize>, String> {
     optional_u64(object, key)?
-        .map(|value| usize::try_from(value).map_err(|_| format!("waf: '{key}' is too large")))
+        .map(|value| usize::try_from(value).map_err(|_| format!("waf: `{key}` is too large")))
         .transpose()
 }
 
@@ -2390,7 +2390,7 @@ fn optional_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
         Some(Value::Number(value)) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
+            .ok_or_else(|| format!("waf: `{key}` must be a non-negative integer")),
         Some(other) => Err(format!(
             "waf: `{key}` must be an integer, got {other:?}",
             other = other.to_string()

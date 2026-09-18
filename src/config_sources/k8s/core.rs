@@ -1134,7 +1134,7 @@ fn workload_from_pod(
 ) -> Result<Workload, K8sTranslateError> {
     let path = format!("ns/{}/sa/{}", pod.namespace, pod.service_account);
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
-        .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
+        .map_err(|_| invalid_resource_for_core_pod(pod, "invalid pod SPIFFE ID".to_string()))?;
     let mut addresses = if endpoint.addresses.is_empty() {
         pod.addresses.clone()
     } else {
@@ -1178,7 +1178,7 @@ fn identity_only_workload_from_pod(
 ) -> Result<Workload, K8sTranslateError> {
     let path = format!("ns/{}/sa/{}", pod.namespace, pod.service_account);
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
-        .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
+        .map_err(|_| invalid_resource_for_core_pod(pod, "invalid pod SPIFFE ID".to_string()))?;
     let node_name = nonempty_node_name(pod.node_name.as_deref());
     let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
     // Only ambient-enrolled pods are fronted by a NodeWaypoint. Merely sharing

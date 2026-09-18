@@ -120,7 +120,7 @@ pub(crate) fn collect(
 ) -> Result<(), K8sTranslateError> {
     let Some(raw_mesh_config) = mesh_config_yaml(object) else {
         acc.warnings.push(format!(
-            "Ignoring ConfigMap {}/{} as meshConfig source because data.mesh is missing",
+            "Ignoring ConfigMap {:?}/{:?} as meshConfig source because data.mesh is missing",
             object.metadata.namespace, object.metadata.name
         ));
         return Ok(());
@@ -180,7 +180,8 @@ fn collect_extension_providers(value: &Value, parsed: &mut ParsedMeshConfig) -> 
                     .is_some()
                 {
                     parsed.warnings.push(format!(
-                        "meshConfig.extensionProviders duplicate tracing provider '{name}' replaced by later definition"
+                        "meshConfig.extensionProviders duplicate tracing provider {name:?} \
+                         replaced by later definition"
                     ));
                 }
             }
@@ -208,7 +209,8 @@ fn collect_extension_providers(value: &Value, parsed: &mut ParsedMeshConfig) -> 
                     && existing != provider.as_ref()
                 {
                     return Err(format!(
-                        "meshConfig.extensionProviders declares external authorization provider '{}' more than once with different configuration",
+                        "meshConfig.extensionProviders declares external authorization provider \
+                         {:?} more than once with different configuration",
                         sanitize_mesh_ext_authz_diagnostic(&name)
                     ));
                 }
@@ -350,7 +352,8 @@ fn validate_ext_authz_provider_entry_shape(
     for key in object.keys() {
         if key != "name" && key != selected_variant {
             return Err(format!(
-                "meshConfig.extensionProviders '{}' {selected_variant} entry does not support sibling field '{}'; extension provider variants are mutually exclusive",
+                "meshConfig.extensionProviders {:?} {selected_variant} entry does not support \
+                 sibling field {:?}; extension provider variants are mutually exclusive",
                 sanitize_mesh_ext_authz_diagnostic(name),
                 sanitize_mesh_ext_authz_diagnostic(key)
             ));
@@ -392,7 +395,7 @@ fn lightstep_provider(name: &str, config: &Value) -> Result<TracingProvider, Str
         trimmed_string_aliased(config, "accessTokenEnv", &["access_token_env"])
     else {
         return Err(format!(
-            "meshConfig.extensionProviders '{name}' lightstep provider requires accessTokenEnv"
+            "meshConfig.extensionProviders {name:?} lightstep provider requires accessTokenEnv"
         ));
     };
     Ok(TracingProvider::Lightstep {
@@ -442,12 +445,12 @@ fn envoy_ext_authz_http_provider(
 
     let Some(service) = optional_ext_authz_string(&display, config, "service")? else {
         return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp requires service"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp requires service"
         ));
     };
     let Some(port) = optional_u16(config, "port")? else {
         return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp requires port"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp requires port"
         ));
     };
     let tls = match optional_ext_authz_string(&display, config, "scheme")?.as_deref() {
@@ -455,7 +458,8 @@ fn envoy_ext_authz_http_provider(
         Some("https") => true,
         Some(_) => {
             return Err(format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp scheme must be 'http' or 'https'"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp scheme must be \
+                 'http' or 'https'"
             ));
         }
     };
@@ -465,14 +469,16 @@ fn envoy_ext_authz_http_provider(
     };
     if timeout_ms == 0 || timeout_ms > MESH_EXT_AUTHZ_MAX_TIMEOUT_MS {
         return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp timeout must be between 1ms and {MESH_EXT_AUTHZ_MAX_TIMEOUT_MS}ms"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp timeout must be between \
+             1ms and {MESH_EXT_AUTHZ_MAX_TIMEOUT_MS}ms"
         ));
     }
     let path_prefix = match optional_ext_authz_string(&display, config, "pathPrefix")? {
         Some(prefix) if prefix.starts_with('/') => Some(prefix),
         Some(_) => {
             return Err(format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp pathPrefix must start with '/'"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp pathPrefix must \
+                 start with '/'"
             ));
         }
         None => None,
@@ -551,7 +557,7 @@ fn optional_ext_authz_string(
             Ok((!value.is_empty()).then(|| value.to_string()))
         }
         Some(_) => Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} must be a string"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp {field} must be a string"
         )),
     }
 }
@@ -568,7 +574,8 @@ fn reject_unknown_provider_keys(
     for key in object.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(format!(
-                "meshConfig.extensionProviders '{display}' {block} does not support field '{}'; Ferrum refuses unmodelled ext-authz fields rather than silently ignoring them",
+                "meshConfig.extensionProviders {display:?} {block} does not support field {:?}; \
+                 Ferrum refuses unmodelled ext-authz fields rather than silently ignoring them",
                 sanitize_mesh_ext_authz_diagnostic(key)
             ));
         }
@@ -591,7 +598,9 @@ fn reject_unknown_provider_keys(
 fn parse_ext_authz_status_on_error(display: &str, config: &Value) -> Result<u16, String> {
     let invalid = || {
         format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp statusOnError must be a 4xx or 5xx HTTP status, written as a decimal string such as \"403\" (an integer is also accepted)"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp statusOnError must be a \
+             4xx or 5xx HTTP status, written as a decimal string such as \"403\" (an integer is \
+             also accepted)"
         )
     };
     let status = match config.get("statusOnError") {
@@ -614,7 +623,8 @@ fn parse_ext_authz_status_on_error(display: &str, config: &Value) -> Result<u16,
 fn parse_ext_authz_timeout_ms(display: &str, value: &Value) -> Result<u64, String> {
     let invalid = || {
         format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp timeout must be a duration such as '0.5s', '250ms', or a number of seconds"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp timeout must be a \
+             duration such as '0.5s', '250ms', or a number of seconds"
         )
     };
     if let Some(seconds) = value.as_f64() {
@@ -655,14 +665,15 @@ fn ext_authz_header_list(
     };
     let entries = value.as_array().ok_or_else(|| {
         format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} must be an array"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp {field} must be an array"
         )
     })?;
     let mut names = Vec::with_capacity(entries.len());
     for entry in entries {
         let raw = entry.as_str().ok_or_else(|| {
             format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} entries must be strings"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp {field} entries \
+                 must be strings"
             )
         })?;
         // Istio permits `*`-suffixed prefix matches here. Ferrum refuses them:
@@ -671,11 +682,12 @@ fn ext_authz_header_list(
         // would silently widen what a provider may read or rewrite.
         if raw.contains('*') {
             return Err(format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} does not support wildcard entries; list exact header names"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp {field} does not \
+                 support wildcard entries; list exact header names"
             ));
         }
         let normalized = validator(raw).map_err(|error| {
-            format!("meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} {error}")
+            format!("meshConfig.extensionProviders {display:?} envoyExtAuthzHttp {field} {error}")
         })?;
         if !names.contains(&normalized) {
             names.push(normalized);
@@ -693,19 +705,22 @@ fn ext_authz_additional_headers(
     };
     let object = value.as_object().ok_or_else(|| {
         format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeAdditionalHeadersInCheck must be a map"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+             includeAdditionalHeadersInCheck must be a map"
         )
     })?;
     let mut headers = Vec::with_capacity(object.len());
     for (key, raw) in object {
         let name = validate_mesh_ext_authz_forwarded_header(key).map_err(|error| {
             format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeAdditionalHeadersInCheck {error}"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+                 includeAdditionalHeadersInCheck {error}"
             )
         })?;
         let header_value = raw.as_str().ok_or_else(|| {
             format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeAdditionalHeadersInCheck values must be strings"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+                 includeAdditionalHeadersInCheck values must be strings"
             )
         })?;
         headers.push(MeshExtAuthzHeader {
@@ -735,22 +750,28 @@ fn ext_authz_body_check(
         // API only. Ferrum performs an HTTP check, so honouring the flag is
         // impossible and ignoring it would change what the provider inspects.
         return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck.packAsBytes is only meaningful for the gRPC check API and is not supported"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+             includeRequestBodyInCheck.packAsBytes is only meaningful for the gRPC check API and \
+             is not supported"
         ));
     }
     let max_request_bytes = match value.get("maxRequestBytes") {
         Some(raw) => raw.as_u64().ok_or_else(|| {
             format!(
-                "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck.maxRequestBytes must be an integer"
+                "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+                 includeRequestBodyInCheck.maxRequestBytes must be an integer"
             )
         })?,
         None => return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck requires maxRequestBytes"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+             includeRequestBodyInCheck requires maxRequestBytes"
         )),
     };
     if max_request_bytes == 0 || max_request_bytes > MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES as u64 {
         return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck.maxRequestBytes must be between 1 and {MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES}"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+             includeRequestBodyInCheck.maxRequestBytes must be between 1 and \
+             {MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES}"
         ));
     }
     // Deliberate, documented narrowing (see `MeshExtAuthzProvider::validate`):
@@ -760,7 +781,10 @@ fn ext_authz_body_check(
     // accepted-but-unreachable flag would be worse than this refusal.
     if optional_bool(value, "allowPartialMessage")?.unwrap_or(false) {
         return Err(format!(
-            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the complete buffered body and returns 413 at maxRequestBytes instead of checking a truncated prefix"
+            "meshConfig.extensionProviders {display:?} envoyExtAuthzHttp \
+             includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the \
+             complete buffered body and returns 413 at maxRequestBytes instead of checking a \
+             truncated prefix"
         ));
     }
     Ok(Some(MeshExtAuthzBodyCheck {
@@ -804,7 +828,8 @@ fn service_endpoint_with_default_scheme(
 ) -> Result<String, String> {
     let Some(service) = trimmed_string(config, "service") else {
         return Err(format!(
-            "meshConfig.extensionProviders '{provider_name}' {provider_kind} provider requires service or an explicit endpoint URL"
+            "meshConfig.extensionProviders {provider_name:?} {provider_kind} provider requires \
+             service or an explicit endpoint URL"
         ));
     };
     let port = optional_u16(config, "port")?.unwrap_or(default_port);

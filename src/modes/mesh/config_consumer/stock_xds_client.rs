@@ -112,6 +112,7 @@ use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload};
 use crate::modes::mesh::config::MeshConfig;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, XdsConvergenceSnapshot};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::startup::sanitize_startup_scalar;
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::runtime_proto;
@@ -822,9 +823,9 @@ pub async fn start_stock_xds_client_with_shutdown(
     state.set_config_stream_status(tracker.status(state.has_first_slice()));
 
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
-        cluster = %config.cluster,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
+        cluster = %sanitize_startup_scalar(config.cluster.as_str()),
         xds_urls = xds_urls.len(),
         authorization = config.credential.is_configured(),
         liveness_bound_secs = config.timings.liveness_bound_seconds(),
@@ -1271,8 +1272,8 @@ async fn connect_stock_ads(
     }
 
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         endpoint_index,
         transport = transport.as_label(),
         authorization = credential.is_some(),
@@ -1665,8 +1666,8 @@ async fn run_stock_ads_stream(
                 };
                 baseline = next_baseline;
                 info!(
-                    node_id = %config.node_id,
-                    namespace = %config.namespace,
+                    node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+                    namespace = %sanitize_startup_scalar(config.namespace.as_str()),
                     "Stock xDS mesh policy document reloaded; rebuilding slice from current discovery"
                 );
                 if accumulator.ready() {
@@ -1857,7 +1858,7 @@ async fn handle_stock_response(
     }
 
     debug!(
-        node_id = %config.node_id,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         type_url = type_label,
         resources = response.resources.len(),
         "Received stock xDS ADS response"
@@ -1872,7 +1873,7 @@ async fn handle_stock_response(
         NonceOutcome::StaleDuplicate
     ) {
         debug!(
-            node_id = %config.node_id,
+            node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = type_label,
             "Ignoring stale/duplicate stock xDS response (nonce already processed)"
         );
@@ -1962,7 +1963,7 @@ async fn handle_stock_response(
     {
         let names = stream_state.subscriptions.resource_names(EDS_TYPE_URL);
         debug!(
-            node_id = %config.node_id,
+            node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = "eds",
             resources = names.len(),
             "Updating dependency-ordered EDS subscription after CDS update"
@@ -1982,7 +1983,7 @@ async fn handle_stock_response(
     {
         let names = stream_state.subscriptions.resource_names(RDS_TYPE_URL);
         debug!(
-            node_id = %config.node_id,
+            node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = "rds",
             resources = names.len(),
             "Updating dependency-ordered RDS subscription after LDS update"
@@ -1998,7 +1999,7 @@ async fn handle_stock_response(
 
     if !accumulator.ready() {
         debug!(
-            node_id = %config.node_id,
+            node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = type_label,
             pending = ?accumulator.pending_types(),
             "ACKed stock xDS response while waiting for the remaining gating types"
@@ -2106,8 +2107,8 @@ fn apply_pending(
     }
     log_refusals(config, &refusals, last_logged_refusals);
     info!(
-        node_id = %config.node_id,
-        namespace = %config.namespace,
+        node_id = %sanitize_startup_scalar(config.node_id.as_str()),
+        namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         type_url = stock_log_type_label(&type_url),
         services,
         workloads,
@@ -2653,7 +2654,7 @@ pub async fn start_stock_policy_watcher_with_shutdown(
     #[cfg(not(unix))]
     {
         info!(
-            file_path = %path,
+            file_path = %crate::startup::sanitize_startup_cause(format!("{path:?}"), &[]),
             "Stock xDS mesh policy document loaded; live reload is Unix-only (SIGHUP)"
         );
         let _ = &policy_tx;

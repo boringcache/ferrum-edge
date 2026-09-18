@@ -1314,7 +1314,7 @@ impl K8sAccumulator {
 
     fn note_unresolved_gateway_class(&mut self, class_name: &str) {
         let warning = format!(
-            "GatewayClass '{class_name}' is not present in the current snapshot; \
+            "GatewayClass {class_name:?} is not present in the current snapshot; \
              Gateways that reference it are not Ferrum-managed until an owned GatewayClass is observed"
         );
         if !self.warnings.iter().any(|existing| existing == &warning) {
@@ -1385,7 +1385,7 @@ impl K8sAccumulator {
     pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) {
         let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
             self.warnings.push(format!(
-                "proxy with empty namespace or id was ignored (namespace='{}', id='{}')",
+                "proxy with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 proxy.namespace, proxy.id
             ));
             return;
@@ -1400,7 +1400,7 @@ impl K8sAccumulator {
 
             if gateway_loses {
                 self.warnings.push(format!(
-                    "Gateway API proxy '{}/{}' ignored because Istio resource has precedence",
+                    "Gateway API proxy {:?}/{:?} ignored because Istio resource has precedence",
                     proxy.namespace, proxy.id
                 ));
                 return;
@@ -1452,7 +1452,7 @@ impl K8sAccumulator {
     pub(crate) fn upsert_upstream(&mut self, upstream: Upstream) {
         if namespaced_resource_key(&upstream.namespace, &upstream.id).is_none() {
             self.warnings.push(format!(
-                "upstream with empty namespace or id was ignored (namespace='{}', id='{}')",
+                "upstream with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 upstream.namespace, upstream.id
             ));
             return;
@@ -1975,7 +1975,8 @@ where
              merging HTTPRoute and GRPCRoute rules on a shared listener"
         };
         acc.warnings.push(format!(
-            "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and {}; winner is {}/{}",
+            "Gateway API {} {:?}/{:?} conflicted on parent={:?} host={:?} path={:?} match={:?} \
+             and {}; winner is {:?}/{:?}",
             conflict.loser.kind,
             conflict.loser.namespace,
             conflict.loser.name,
@@ -2040,7 +2041,7 @@ where
         }
 
         acc.warnings.push(format!(
-            "Ignoring unsupported Kubernetes resource kind '{}' in {}/{}",
+            "Ignoring unsupported Kubernetes resource kind {:?} in {:?}/{:?}",
             object.kind, object.metadata.namespace, object.metadata.name
         ));
     }
@@ -2330,9 +2331,10 @@ pub(crate) fn resolve_workload_entry_service_attachment(
         return Err(invalid_resource(
             object,
             format!(
-                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
-                 (cross-namespace); a ReferenceGrant in namespace '{}' must permit from \
-                 WorkloadEntry in '{}' to Service '{}'",
+                "WorkloadEntry.service {service_raw:?} references Service {:?}/{:?} across \
+                 namespaces \
+                 (cross-namespace); a ReferenceGrant in namespace {:?} must permit from \
+                 WorkloadEntry in {:?} to Service {:?}",
                 key.namespace, key.name, key.namespace, object.metadata.namespace, key.name
             ),
         ));
@@ -2342,7 +2344,8 @@ pub(crate) fn resolve_workload_entry_service_attachment(
         return Err(invalid_resource(
             object,
             format!(
-                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
+                "WorkloadEntry.service {service_raw:?} references Service {:?}/{:?} across \
+                 namespaces \
                  (cross-namespace) but that Service is not present in the translated inventory; \
                  cross-namespace WorkloadEntry attachments require an authoritative target Service",
                 key.namespace, key.name

@@ -1274,7 +1274,9 @@ impl ParsedCidr {
             Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR {s:?}"))?;
         let max = if network.is_ipv4() { 32 } else { 128 };
         if prefix > max {
-            return Err(format!("prefix length {prefix} out of range in CIDR {s:?}"));
+            return Err(format!(
+                "prefix length \"{prefix}\" out of range (maximum {max}) in CIDR {s:?}"
+            ));
         }
         Ok(Self { network, prefix })
     }
@@ -1310,7 +1312,7 @@ impl ParsedCidr {
                         Some(p) if p >= 96 => p - 96,
                         Some(p) => {
                             return Err(format!(
-                                "IPv4-mapped IPv6 CIDR prefix {p} must be at least 96"
+                                "IPv4-mapped IPv6 CIDR prefix \"{p}\" must be at least 96"
                             ));
                         }
                         None => 32,
@@ -1946,7 +1948,8 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
                 IpAddr::V6(v6) => {
                     if v6.to_ipv4_mapped().is_some() && prefix < 96 {
                         return Err(format!(
-                            "IPv4-mapped IPv6 CIDR prefix {prefix} must be at least 96 in CIDR {cidr:?}"
+                            "IPv4-mapped IPv6 CIDR prefix \"{prefix}\" must be at least 96 in \
+                             CIDR {cidr:?}"
                         ));
                     }
                     128
@@ -1954,7 +1957,7 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
             };
             if prefix > max {
                 return Err(format!(
-                    "prefix length {prefix} out of range in CIDR {cidr:?}"
+                    "prefix length \"{prefix}\" out of range (maximum {max}) in CIDR {cidr:?}"
                 ));
             }
             Ok(())
@@ -2551,9 +2554,9 @@ where
         return Ok(Vec::new());
     }
     if value.is_array() {
-        serde_json::from_value(value).map_err(serde::de::Error::custom)
+        crate::util::deserialization::from_json_value(value).map_err(serde::de::Error::custom)
     } else {
-        serde_json::from_value(value)
+        crate::util::deserialization::from_json_value(value)
             .map(|provider| vec![provider])
             .map_err(serde::de::Error::custom)
     }
@@ -3058,7 +3061,7 @@ impl TrustBundle {
             .map(|(i, s)| {
                 engine
                     .decode(s.as_bytes())
-                    .map_err(|e| format!("x509_authorities[{}]: invalid base64: {}", i, e))
+                    .map_err(|_| format!("x509_authorities[{}]: invalid base64", i))
             })
             .collect()
     }
@@ -6965,7 +6968,7 @@ fn validate_mesh_config_internal(
         }
         for port in svc.protocol_overrides.keys() {
             validate_non_zero_port(
-                format!("MeshService {:?}.protocol_overrides[{}]", svc.name, port),
+                format!("MeshService {:?}.protocol_overrides[\"{}\"]", svc.name, port),
                 *port,
                 &mut errors,
             );
@@ -7016,30 +7019,30 @@ fn validate_mesh_config_internal(
                     ));
                 }
                 if let Some(pat) = principal.spiffe_id_pattern.as_ref()
-                    && let Err(e) = glob::Pattern::new(pat)
+                    && glob::Pattern::new(pat).is_err()
                 {
                     errors.push(format!(
                         "MeshPolicy {:?}.rules[{}].from[{}].spiffe_id_pattern \
-                         {:?} is not a valid glob: {}",
-                        policy.name, i, j, pat, e
+                         {:?} is not a valid glob",
+                        policy.name, i, j, pat
                     ));
                 }
                 if let Some(pat) = principal.namespace_pattern.as_ref()
-                    && let Err(e) = glob::Pattern::new(pat)
+                    && glob::Pattern::new(pat).is_err()
                 {
                     errors.push(format!(
                         "MeshPolicy {:?}.rules[{}].from[{}].namespace_pattern \
-                         {:?} is not a valid glob: {}",
-                        policy.name, i, j, pat, e
+                         {:?} is not a valid glob",
+                        policy.name, i, j, pat
                     ));
                 }
                 if let Some(pat) = principal.trust_domain_pattern.as_ref()
-                    && let Err(e) = glob::Pattern::new(pat)
+                    && glob::Pattern::new(pat).is_err()
                 {
                     errors.push(format!(
                         "MeshPolicy {:?}.rules[{}].from[{}].trust_domain_pattern \
-                         {:?} is not a valid glob: {}",
-                        policy.name, i, j, pat, e
+                         {:?} is not a valid glob",
+                        policy.name, i, j, pat
                     ));
                 }
             }
@@ -7149,21 +7152,22 @@ fn validate_mesh_config_internal(
         }
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
-                format!("PeerAuthentication {:?}.port_overrides[{}]", pa.name, port),
+                format!("PeerAuthentication {:?}.port_overrides[\"{}\"]", pa.name, port),
                 *port,
                 &mut errors,
             );
         }
         if !pa.mtls_mode.is_peer_auth_mode() {
             errors.push(format!(
-                "PeerAuthentication {:?}: mtls_mode '{:?}' is invalid for server-side policy",
+                "PeerAuthentication {:?}: mtls_mode `{:?}` is invalid for server-side policy",
                 pa.name, pa.mtls_mode
             ));
         }
         for (port, mode) in &pa.port_overrides {
             if !mode.is_peer_auth_mode() {
                 errors.push(format!(
-                    "PeerAuthentication {:?}: port_overrides[{port}] mode '{mode:?}' is invalid for server-side policy",
+                    "PeerAuthentication {:?}: port_overrides[\"{port}\"] mode `{mode:?}` is \
+                     invalid for server-side policy",
                     pa.name
                 ));
             }

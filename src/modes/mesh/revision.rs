@@ -1005,15 +1005,19 @@ impl MeshRevisionGate {
             reason.as_metric_label(),
         );
         let detail = format!(
-            "candidate revision {authority:?}/{sequence} refused against accepted revision \
-             {accepted_authority:?}/{accepted_sequence}"
+            "candidate revision {authority:?}/\"{sequence}\" refused against accepted revision \
+             {accepted_authority:?}/\"{accepted_sequence}\""
         );
         tracing::warn!(
             reason = reason.as_metric_label(),
             candidate_authority = %authority,
-            candidate_sequence = sequence,
+            candidate_sequence = %crate::startup::sanitize_startup_cause(
+                format!("\"{sequence}\""), &[]
+            ),
             accepted_authority = %accepted_authority,
-            accepted_sequence,
+            accepted_sequence = %crate::startup::sanitize_startup_cause(
+                format!("\"{accepted_sequence}\""), &[]
+            ),
             consecutive,
             "Quarantined a mesh slice that is not newer than — or does not carry the same \
              content as — the accepted config revision; keeping the last-good slice"

@@ -112,8 +112,9 @@ fn validate_resource_counts(
         return Ok(());
     }
     anyhow::bail!(
-        "resource_counts mismatch: declared proxies={}, consumers={}, plugin_configs={}, \
-         upstreams={} but file contains proxies={}, consumers={}, plugin_configs={}, \
+        "resource_counts mismatch: declared proxies=\"{}\", consumers=\"{}\", \
+         plugin_configs=\"{}\", \
+         upstreams=\"{}\" but file contains proxies={}, consumers={}, plugin_configs={}, \
          upstreams={}. A torn or truncated trailing section (commonly plugin_configs) \
          can parse as valid YAML while silently dropping resources; refuse the candidate.",
         expected.proxies,
@@ -141,7 +142,7 @@ pub fn load_config_from_file(
 ) -> Result<GatewayConfig, anyhow::Error> {
     let file_path = Path::new(path);
     if !file_path.exists() {
-        anyhow::bail!("Configuration file not found: {}", file_path.display());
+        anyhow::bail!("Configuration file not found: {:?}", file_path.display());
     }
 
     // Warn if the config file is world-readable (may contain credentials)
@@ -166,9 +167,15 @@ pub fn load_config_from_file(
     let is_yaml = detect_json_or_yaml_extension(file_path);
 
     if is_yaml {
-        info!("Loading YAML configuration from {}", file_path.display());
+        info!(
+            "Loading YAML configuration from {}",
+            crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[])
+        );
     } else {
-        info!("Loading JSON configuration from {}", file_path.display());
+        info!(
+            "Loading JSON configuration from {}",
+            crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[])
+        );
     }
 
     // For version detection and migration, parse to serde_json::Value. Retain
@@ -392,8 +399,14 @@ pub fn load_config_from_file(
         - config.upstreams.len();
     if filtered_out > 0 {
         info!(
-            "Namespace filter {:?}: excluded {} resources from other namespaces",
-            namespace, filtered_out
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "Namespace filter {:?}: excluded {} resources from other namespaces",
+                    namespace, filtered_out
+                ),
+                &[]
+            )
         );
     }
 
@@ -453,11 +466,17 @@ pub fn load_config_from_file(
         .run()?;
 
     info!(
-        "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
-        config.version,
-        config.proxies.len(),
-        config.consumers.len(),
-        config.plugin_configs.len()
+        "{}",
+        crate::startup::sanitize_startup_cause(
+            format!(
+                "Configuration loaded (version {:?}): {} proxies, {} consumers, {} plugin configs",
+                config.version,
+                config.proxies.len(),
+                config.consumers.len(),
+                config.plugin_configs.len()
+            ),
+            &[]
+        )
     );
 
     Ok(config)
@@ -667,7 +686,10 @@ pub fn reload_config_from_file(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
     namespace: &str,
 ) -> Result<GatewayConfig, anyhow::Error> {
-    info!("Reloading configuration from file: {}", path);
+    info!(
+        "Reloading configuration from file: {}",
+        crate::startup::sanitize_startup_cause(format!("{path:?}"), &[])
+    );
     load_config_from_file(path, cert_expiry_warning_days, backend_allow_ips, namespace)
 }
 

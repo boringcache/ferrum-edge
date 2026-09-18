@@ -1273,12 +1273,16 @@ mod inner {
                     "MongoDB TLS enabled (ca={}, client_cert={}, insecure={})",
                     tls_ca_cert_path
                         .map(|value| {
-                            CertSource::parse(value, MaterialKind::CaBundle).redacted_source_id()
+                            crate::startup::sanitize_startup_scalar(
+                                CertSource::parse(value, MaterialKind::CaBundle).redacted_source_id(),
+                            )
                         })
                         .unwrap_or_else(|| "system-roots".to_string()),
                     tls_client_cert_path
                         .map(|value| {
-                            CertSource::parse(value, MaterialKind::Cert).redacted_source_id()
+                            crate::startup::sanitize_startup_scalar(
+                                CertSource::parse(value, MaterialKind::Cert).redacted_source_id(),
+                            )
                         })
                         .unwrap_or_else(|| "none".to_string()),
                     tls_insecure
@@ -1309,9 +1313,11 @@ mod inner {
             })?;
 
             info!(
-                "MongoDB connected (database={:?}, url={}, replica_set={})",
-                settings.database_name,
-                crate::config::db_backend::redact_url(mongo_url),
+                "MongoDB connected (database={}, url={}, replica_set={})",
+                crate::startup::sanitize_startup_scalar(&settings.database_name),
+                crate::startup::sanitize_startup_scalar(
+                    crate::config::db_backend::redact_url(mongo_url)
+                ),
                 replica_set_configured
             );
 
@@ -2292,8 +2298,14 @@ mod inner {
         async fn release_mtls_dns_admission_leases_after_commit(leases: &mut Vec<MongoLockGuard>) {
             if let Err(error) = Self::release_mtls_dns_admission_leases(leases).await {
                 error!(
-                    "MongoDB mTLS DNS admission lease cleanup failed after a committed write; \
-                     the durable result stands and is reported as success: {error}"
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!(
+                            "MongoDB mTLS DNS admission lease cleanup failed after a committed \
+                             write; the durable result stands and is reported as success: {error}"
+                        ),
+                        &[]
+                    )
                 );
             }
         }
@@ -2704,10 +2716,16 @@ mod inner {
                             && is_pipeline_update_unsupported(&error) =>
                     {
                         warn!(
-                            "MongoDB rejected the aggregation-pipeline {}-lease update \
-                             (AWS DocumentDB-compatible backend); falling back to the classic \
-                             client-time lease for this operation: {error}",
-                            label
+                            "{}",
+                            crate::startup::sanitize_startup_cause(
+                                format!(
+                                    "MongoDB rejected the aggregation-pipeline {}-lease update \
+                                     (AWS DocumentDB-compatible backend); falling back to the classic \
+                                     client-time lease for this operation: {error}",
+                                    label
+                                ),
+                                &[]
+                            )
                         );
                         mode = RenewableLeaseMode::ClientTimeClassic;
                         continue;
@@ -3583,7 +3601,17 @@ mod inner {
                     .await;
                 if let Err(error) = result {
                     warn!(
-                        "standalone plugin-config write failed after attaching the proxy association and the compensating detach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxy_id={attach}): {error}; repair the proxy's `plugins` array by hand"
+                        "{}",
+                        crate::startup::sanitize_startup_cause(
+                            format!(
+                                "standalone plugin-config write failed after attaching the proxy \
+                                 association and the compensating detach also failed \
+                                 (namespace={namespace:?} plugin_config_id={plugin_config_id:?} \
+                                 proxy_id={attach:?}): {error}; repair the proxy's `plugins` array \
+                                 by hand"
+                            ),
+                            &[]
+                        )
                     );
                 }
             }
@@ -3603,8 +3631,17 @@ mod inner {
                     .await;
                 if let Err(error) = result {
                     warn!(
-                        "standalone plugin-config write failed after detaching proxy associations and the compensating re-attach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxies={:?}): {error}; repair those proxies' `plugins` arrays by hand",
-                        plan.detach
+                        "{}",
+                        crate::startup::sanitize_startup_cause(
+                            format!(
+                                "standalone plugin-config write failed after detaching proxy \
+                                 associations and the compensating re-attach also failed \
+                                 (namespace={namespace:?} plugin_config_id={plugin_config_id:?} \
+                                 proxies={:?}): {error}; repair those proxies' `plugins` arrays by hand",
+                                plan.detach
+                            ),
+                            &[]
+                        )
                     );
                 }
             }

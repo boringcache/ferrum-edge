@@ -520,7 +520,7 @@ pub async fn warn_stale_mysql_identity_collations(connection: &mut AnyConnection
         Ok(findings) => emit_stale_collation_warning(&findings),
         Err(error) => {
             warn!(
-                error = %error,
+                error = %crate::startup::sanitize_startup_cause(error, &[]),
                 "Could not inspect MySQL identity-column collations after migrations; \
                  if this deployment was upgraded from a pre-utf8mb4_0900_bin schema, \
                  verify information_schema.COLUMNS and run \
