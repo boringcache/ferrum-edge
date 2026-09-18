@@ -409,8 +409,7 @@ async fn mesh_outbound_registry_direction_gate_precedes_registry_and_metrics() {
         // registry membership nor the missing-header rejection may run.
         for port in [Some(15008), Some(15006), None] {
             for host in [Some("unknown.example:8080"), None] {
-                let mut ctx =
-                    RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
+                let mut ctx = RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
                 ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
                 ctx.frontend_listen_port = port;
                 if let Some(host) = host {
@@ -433,11 +432,11 @@ async fn mesh_outbound_registry_direction_gate_precedes_registry_and_metrics() {
         // unscoped Host allowlist enforces even without a known frontend port.
         for direction in [Some(MeshTrafficDirection::Outbound), None] {
             for port in [Some(15008), Some(15006), None] {
-                let mut ctx =
-                    RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
+                let mut ctx = RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
                 ctx.mesh_direction = direction;
                 ctx.frontend_listen_port = port;
-                ctx.headers.insert("host".into(), "unknown.example:8080".into());
+                ctx.headers
+                    .insert("host".into(), "unknown.example:8080".into());
                 let result = plugin.on_request_received(&mut ctx).await;
                 if !scoped || port == Some(15008) {
                     assert!(
