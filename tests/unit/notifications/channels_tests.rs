@@ -1021,7 +1021,9 @@ fn startup_diagnostics_withhold_channel_keys_types_and_webhook_headers() {
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains(context), "{rendered}");
         assert!(
-            !rendered.to_ascii_lowercase().contains("diagnostic-secret-5594"),
+            !rendered
+                .to_ascii_lowercase()
+                .contains("diagnostic-secret-5594"),
             "{rendered}"
         );
         assert!(!rendered.contains("true"), "{rendered}");
