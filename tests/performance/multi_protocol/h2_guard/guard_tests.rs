@@ -53,8 +53,32 @@ fn noop_waker() -> Waker {
     Waker::from(Arc::new(NoopWake))
 }
 
-fn connection() -> Streams<Bytes, client::Peer> {
-    Streams::new(Config {
+struct ConnectionFixture(Streams<Bytes, client::Peer>);
+
+impl std::ops::Deref for ConnectionFixture {
+    type Target = Streams<Bytes, client::Peer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ConnectionFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ConnectionFixture {
+    fn drop(&mut self) {
+        // Match the real Connection::drop: retire live streams and reset queues
+        // before Counts checks its lifetime invariant, including during unwind.
+        let _ = self.0.recv_eof(true);
+    }
+}
+
+fn connection() -> ConnectionFixture {
+    ConnectionFixture(Streams::new(Config {
         initial_max_send_streams: 1000,
         local_max_buffer_size: 1024 * 1024,
         local_next_stream_id: 1.into(),
@@ -67,7 +91,7 @@ fn connection() -> Streams<Bytes, client::Peer> {
         remote_max_initiated: Some(1000),
         local_max_error_reset_streams: Some(1000),
         data_frame_budget: 32767,
-    })
+    }))
 }
 
 fn response(s: &mut Streams<Bytes, client::Peer>) -> StreamRef<Bytes> {
