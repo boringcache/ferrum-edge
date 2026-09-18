@@ -1,3 +1,4 @@
+pub mod h1_profile;
 pub mod metrics;
 pub mod phases;
 pub mod process_usage;

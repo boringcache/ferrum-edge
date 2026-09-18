@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::h1_profile;
 use crate::metrics::{BenchMetrics, collect_results};
 use crate::process_usage::{ClientUsage, Snapshot};
 
@@ -248,6 +249,7 @@ pub struct PhaseReport {
     pub measurement_elapsed_secs: f64,
     pub measurement_start_unix_secs: Option<f64>,
     pub client_usage: Option<ClientUsage>,
+    pub h1_profile: Option<h1_profile::Snapshot>,
     pub drain_secs: f64,
     pub transport_close_secs: f64,
     pub transport_close_timed_out: bool,
@@ -293,6 +295,7 @@ pub struct Phases {
     phase: watch::Sender<Phase>,
     slots: Vec<Arc<Slot>>,
     connections: Connections,
+    h1_counters: Vec<Arc<h1_profile::Counters>>,
 }
 
 impl Phases {
@@ -306,6 +309,7 @@ impl Phases {
             phase,
             slots: Vec::new(),
             connections: Connections(Arc::new(AtomicUsize::new(0))),
+            h1_counters: Vec::new(),
         }
     }
 
@@ -321,6 +325,12 @@ impl Phases {
     pub fn with_observation_settle(mut self, duration: Duration) -> Self {
         self.observation_settle = duration;
         self
+    }
+
+    pub fn h1_counters(&mut self) -> Arc<h1_profile::Counters> {
+        let counters = Arc::new(h1_profile::Counters::default());
+        self.h1_counters.push(counters.clone());
+        counters
     }
 
     /// Register before spawning, so even a setup panic releases the barrier.
@@ -411,6 +421,7 @@ impl Phases {
                 .ok()
                 .map(|elapsed| elapsed.as_secs_f64());
             let client_start = Snapshot::capture();
+            let h1_start = h1_profile::Snapshot::capture(&self.h1_counters);
             self.phase.send_replace(Phase::Measure { start, end });
             // Sample independently of worker joins, including after worker loss.
             while Instant::now() < end {
@@ -436,6 +447,10 @@ impl Phases {
                 .await;
             }
             let client_end = Snapshot::capture();
+            if !self.h1_counters.is_empty() {
+                phases.h1_profile =
+                    Some(h1_profile::Snapshot::capture(&self.h1_counters).delta(&h1_start));
+            }
             phases.measurement_elapsed_secs =
                 self.duration.as_secs_f64() + end.elapsed().as_secs_f64();
             match (client_start, client_end) {

@@ -23,11 +23,30 @@ def parse_stat(contents, ticks, page_size):
             "rss_bytes": int(fields[21]) * page_size}
 
 
+IO_FIELDS = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes",
+             "cancelled_write_bytes")
+
+
+def parse_io(contents):
+    values = dict(line.split(":", 1) for line in contents.splitlines())
+    result = {key: int(values[key].strip()) for key in IO_FIELDS}
+    if any(value < 0 for value in result.values()):
+        raise ValueError("negative process I/O counter")
+    return result
+
+
 def capture(pid, ticks, page_size):
     try:
-        return parse_stat(Path(f"/proc/{pid}/stat").read_text(), ticks, page_size)
+        state = parse_stat(Path(f"/proc/{pid}/stat").read_text(), ticks, page_size)
     except (OSError, ValueError, IndexError):
         return None
+    try:
+        state["io"] = parse_io(Path(f"/proc/{pid}/io").read_text())
+    except (OSError, ValueError, KeyError) as error:
+        # /proc/io has stricter access rules than stat. Never invent zero I/O
+        # when ptrace permissions deny a container PID owned by another UID.
+        state["io_error"] = str(error)
+    return state
 
 
 def measurement_usage(usage, phases):
@@ -64,6 +83,17 @@ def measurement_usage(usage, phases):
             record.update(cpu_seconds=right[1]["cpu_seconds"] - left[1]["cpu_seconds"],
                           bracket_secs=right[0] - left[0],
                           boundary_slack_secs=(start - left[0]) + (right[0] - end))
+            bracket = [item[1] for item in values if left[0] <= item[0] <= right[0]]
+            if all(isinstance(item.get("io"), dict) for item in bracket):
+                monotonic = all(b["io"][key] >= a["io"][key]
+                                for a, b in zip(bracket, bracket[1:]) for key in IO_FIELDS)
+                if monotonic and record["complete_bracket"]:
+                    record["io"] = {key: right[1]["io"][key] - left[1]["io"][key]
+                                    for key in IO_FIELDS}
+                else:
+                    record["io_error"] = "counter decreased or process bracket incomplete"
+            else:
+                record["io_error"] = "I/O unavailable at one or more bracket samples"
         result.append(record)
     client = phases.get("client_usage")
     if isinstance(client, dict):
@@ -96,7 +126,8 @@ def client_pids(parent, proc_root=Path("/proc")):
     return result
 
 
-def sample_processes(backend, gateway_pids, output, interval, http3=False, envoy=False):
+def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, stop_file=None,
+                     *, http3=False, envoy=False):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("sampling interval must be positive and finite")
@@ -109,7 +140,7 @@ def sample_processes(backend, gateway_pids, output, interval, http3=False, envoy
     # Background jobs inherit ignored SIGINT from Bash. Override it explicitly
     # before publishing readiness so the runner can always stop and reap us.
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
-    parent = os.getppid()
+    parent = os.getppid() if parent_pid is None else parent_pid
     ticks = os.sysconf("SC_CLK_TCK")
     page_size = os.sysconf("SC_PAGE_SIZE")
     roles = {pid: "gateway" for pid in gateway_pids}
@@ -144,7 +175,13 @@ def sample_processes(backend, gateway_pids, output, interval, http3=False, envoy
     try:
         sample()
         Path(output).write_text(json.dumps({"capture_complete": False}) + "\n")
-        while not stopping and os.getppid() == parent:
+        while not stopping:
+            if stop_file is not None and Path(stop_file).exists():
+                stopping = True
+                break
+            if (parent_pid is None and os.getppid() != parent) or (
+                    parent_pid is not None and not Path(f"/proc/{parent}").exists()):
+                break
             sample()
             time.sleep(interval)
         sample()
@@ -175,6 +212,9 @@ if __name__ == "__main__":
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--http3", action="store_true")
     parser.add_argument("--envoy", action="store_true")
+    parser.add_argument("--parent-pid", type=int)
+    parser.add_argument("--stop-file")
     args = parser.parse_args()
     sample_processes(args.backend, [int(pid) for pid in args.gateway_pids.split()],
-                     args.output, args.interval, args.http3, args.envoy)
+                     args.output, args.interval, parent_pid=args.parent_pid,
+                     stop_file=args.stop_file, http3=args.http3, envoy=args.envoy)

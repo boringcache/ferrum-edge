@@ -1,0 +1,5465 @@
+{
+  "description": "Section 4 cutoff 0/1 hosted A/B. All 30 child sample objects and all 15 hosted paired comparisons retained; invalid observations are not removed.",
+  "workflow_run": "https://github.com/ferrum-edge/ferrum-edge/actions/runs/35345033478",
+  "measured_revision": "86724a319273e08277b82a83fc35d4bc22182561",
+  "base_revision": "d44ca81545e9f96bd76c46db543d307a0422bf60",
+  "source_artifact": {
+    "id": 10549857170,
+    "node_id": "MDg6QXJ0aWZhY3QxMDU0OTg1NzE3MA==",
+    "name": "gateways-protocol-bench-combined-86724a319273e08277b82a83fc35d4bc22182561",
+    "size_in_bytes": 294650,
+    "url": "https://api.github.com/repos/ferrum-edge/ferrum-edge/actions/artifacts/10549857170",
+    "archive_download_url": "https://api.github.com/repos/ferrum-edge/ferrum-edge/actions/artifacts/10549857170/zip",
+    "expired": false,
+    "digest": "sha256:5ffe9dd128b69ae004d2bc2be91cab5cbec3a700c699c5ceff98074754928ead",
+    "created_at": "2026-09-18T13:27:02Z",
+    "updated_at": "2026-09-18T13:27:02Z",
+    "expires_at": "2026-10-18T12:30:34Z",
+    "workflow_run": {
+      "id": 35345033478,
+      "repository_id": 1175627632,
+      "head_repository_id": 1175627632,
+      "head_branch": "worker/20260918-edge-5588-h1-framing-ab",
+      "head_sha": "86724a319273e08277b82a83fc35d4bc22182561"
+    }
+  },
+  "extraction": {
+    "sample_source": "run_1/<gateway>_http1-tls_<payload>.json: samples",
+    "paired_source": "run_1/paired_comparisons.json",
+    "aggregate_summary_limitation": "Single-protocol download was flat. Top-level observed-samples.json and paired-comparisons.json were empty, but run_1 contained the full raw observations and hosted-calculated intervals.",
+    "omitted": "Full 500ms process series and repeated backend startup logs remain in the original artifact. No project code, build, test, or script was executed locally."
+  },
+  "host": {
+    "boot_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+    "cpu": "AMD EPYC 7763",
+    "logical_cpus": 4,
+    "hypervisor": "Microsoft",
+    "ram_gib_reported": 15,
+    "swap_gib_reported": 3,
+    "startup_steal_percent": 0
+  },
+  "image": {
+    "tag": "ferrum-edge:bench",
+    "id": "sha256:32d582ff627463224a83d55ab1850a17fb49141bf1d07ef0d4e14a5cc8c23b9b",
+    "revision_label": null,
+    "arms": [
+      "ferrum",
+      "ferrum-exp-cutoff-one"
+    ]
+  },
+  "dispatch": {
+    "duration": 30,
+    "concurrency": 200,
+    "iterations": 1,
+    "skip_protocols": "http2 http3 grpcs wss tcp-tls udp udp-dtls",
+    "skip_gateways": "envoy kong tyk krakend",
+    "skip_payload_sizes": "",
+    "pairs": 2,
+    "adaptive": false
+  },
+  "config": "tests/performance/multi_protocol/configs/http1_tls_e2e_perf.yaml",
+  "manifest": {
+    "gateways": [
+      "direct",
+      "ferrum",
+      "ferrum-exp-cutoff-one"
+    ],
+    "payload_sizes": [
+      10240,
+      71680,
+      512000,
+      1048576,
+      5242880
+    ],
+    "pairs": 2,
+    "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+    "sample_schema": 2,
+    "extend": false,
+    "extension_skipped": "disabled",
+    "projected_wallclock_secs": 4663,
+    "wallclock_budget_secs": 4200,
+    "adaptive_extension": false
+  },
+  "experiment": {
+    "enabled": true,
+    "name": "5588-h1-cutoff-zero-versus-one",
+    "protocol": "http1-tls",
+    "arms": [
+      {
+        "gateway": "ferrum",
+        "FERRUM_EXTRA_ENV": "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0"
+      },
+      {
+        "gateway": "ferrum-exp-cutoff-one",
+        "FERRUM_EXTRA_ENV": "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1"
+      }
+    ]
+  },
+  "diagnostics": {
+    "stderr_nonempty": [
+      {
+        "pair": 1,
+        "gateway": "ferrum",
+        "payload_size": 5242880,
+        "stderr": "  join error: task 8 was cancelled\n"
+      },
+      {
+        "pair": 1,
+        "gateway": "ferrum-exp-cutoff-one",
+        "payload_size": 5242880,
+        "stderr": "  join error: task 67 was cancelled\n"
+      },
+      {
+        "pair": 2,
+        "gateway": "ferrum-exp-cutoff-one",
+        "payload_size": 5242880,
+        "stderr": "  join error: task 44 was cancelled\n"
+      }
+    ],
+    "other_client_stderr": "Empty",
+    "gateway_logs": "All 20 empty",
+    "backend_logs": "All 30 contain only startup banners/listener addresses"
+  },
+  "hosted_paired_comparisons": [
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.215734489922457,
+      "ci95_low": 0.1299773169060964,
+      "ci95_high": 0.35807301804611835,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum",
+      "payload_size": 10240
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.2539340089390018,
+      "ci95_low": 0.252184283666246,
+      "ci95_high": 0.25569587429632434,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum",
+      "payload_size": 71680
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.2548479272169987,
+      "ci95_low": 0.22295453641058535,
+      "ci95_high": 0.29130363101110296,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum",
+      "payload_size": 512000
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.2736782072162745,
+      "ci95_low": 0.26434215004247524,
+      "ci95_high": 0.28334399600320637,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum",
+      "payload_size": 1048576
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": false,
+      "reason": "invalid pair",
+      "baseline": "direct",
+      "candidate": "ferrum",
+      "payload_size": 5242880
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.22009591236523943,
+      "ci95_low": 0.2058179628003944,
+      "ci95_high": 0.23536434809077958,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 10240
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.2509938197126456,
+      "ci95_low": 0.23908832005670708,
+      "ci95_high": 0.26349215854209096,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 71680
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.24925346526249384,
+      "ci95_low": 0.2109460152774904,
+      "ci95_high": 0.29451748526102967,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 512000
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.2670057968640002,
+      "ci95_low": 0.23902230645112965,
+      "ci95_high": 0.29826544901806507,
+      "needs_more_measurement": false,
+      "reason": "paired interval",
+      "baseline": "direct",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 1048576
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": false,
+      "reason": "invalid pair",
+      "baseline": "direct",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 5242880
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 1.0202166211084285,
+      "ci95_low": 0.6573082478402938,
+      "ci95_high": 1.5834913944953146,
+      "needs_more_measurement": true,
+      "reason": "uncertainty overlaps no gain",
+      "baseline": "ferrum",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 10240
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.9884214436709717,
+      "ci95_low": 0.9350495807360159,
+      "ci95_high": 1.0448397287549067,
+      "needs_more_measurement": true,
+      "reason": "uncertainty overlaps no gain",
+      "baseline": "ferrum",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 71680
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.9780478420382002,
+      "ci95_low": 0.9461391486963026,
+      "ci95_high": 1.0110326611404472,
+      "needs_more_measurement": true,
+      "reason": "uncertainty overlaps no gain",
+      "baseline": "ferrum",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 512000
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": true,
+      "ratio": 0.9756195043071099,
+      "ci95_low": 0.904215640270471,
+      "ci95_high": 1.0526619699917337,
+      "needs_more_measurement": true,
+      "reason": "uncertainty overlaps no gain",
+      "baseline": "ferrum",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 1048576
+    },
+    {
+      "expected_pairs": 2,
+      "accepted": false,
+      "reason": "invalid pair",
+      "baseline": "ferrum",
+      "candidate": "ferrum-exp-cutoff-one",
+      "payload_size": 5242880
+    }
+  ],
+  "samples": [
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 1450704,
+      "total_errors": 0,
+      "rps": 48356.8,
+      "latency_avg_us": 4131,
+      "latency_stdev_us": 1744,
+      "latency_max_us": 21503,
+      "p50_us": 3927,
+      "p75_us": 5115,
+      "p90_us": 6395,
+      "p95_us": 7295,
+      "p99_us": 9287,
+      "total_bytes": 14855208960,
+      "throughput_mbps": 3961.389056,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 2048000,
+      "phases": {
+        "setup_secs": 0.039436183,
+        "warmup_secs": 0.011411494,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.003259019,
+        "measurement_start_unix_secs": 1789736737.973555,
+        "client_usage": {
+          "pid": 17301,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 60.601309,
+          "peak_rss_bytes": 59604992,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.003259019,
+          "boundary_slack_secs": 0.003259019000001473
+        },
+        "h1_profile": {
+          "tls_records": 1450786,
+          "tls_record_bytes": 15002578026,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1450786,
+          "body_data_bytes": 14856048640,
+          "chunked_responses": 0,
+          "content_length_responses": 1450786
+        },
+        "drain_secs": 0.009905829,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2606,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.72333077513406
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 3,
+          "mean": 0.1957022256331546
+        },
+        "queue_time_ns": 6920509644,
+        "admissions": 1450904,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 10240,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.162337164999826,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "samples": 62,
+            "first_cpu_seconds": 0.04,
+            "cpu_seconds": 55.03,
+            "peak_rss_bytes": 28536832
+          },
+          {
+            "pid": 17301,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 60.601309,
+            "peak_rss_bytes": 59604992,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.003259019,
+            "boundary_slack_secs": 0.003259019000001473
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 60.601309,
+        "client_peak_rss_bytes": 59604992,
+        "measurement": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 28536832,
+            "cpu_seconds": 55.03,
+            "bracket_secs": 30.161365270614624,
+            "boundary_slack_secs": 0.16136527061462402,
+            "io": {
+              "rchar": 1,
+              "wchar": 15006109328,
+              "syscr": 1,
+              "syscw": 1455626,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17301,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 60.601309,
+            "peak_rss_bytes": 59604992,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.003259019,
+            "boundary_slack_secs": 0.003259019000001473
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 1426832,
+      "total_errors": 0,
+      "rps": 47561.066666666666,
+      "latency_avg_us": 4200,
+      "latency_stdev_us": 1791,
+      "latency_max_us": 20351,
+      "p50_us": 3985,
+      "p75_us": 5207,
+      "p90_us": 6531,
+      "p95_us": 7463,
+      "p99_us": 9503,
+      "total_bytes": 14610759680,
+      "throughput_mbps": 3896.2025813333335,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 2048000,
+      "phases": {
+        "setup_secs": 0.040317657,
+        "warmup_secs": 0.011574256,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.00305546,
+        "measurement_start_unix_secs": 1789737844.1272774,
+        "client_usage": {
+          "pid": 19651,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 61.364483,
+          "peak_rss_bytes": 61497344,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.00305546,
+          "boundary_slack_secs": 0.0030554599999987886
+        },
+        "h1_profile": {
+          "tls_records": 1426908,
+          "tls_record_bytes": 14755655628,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1426906,
+          "body_data_bytes": 14611517440,
+          "chunked_responses": 0,
+          "content_length_responses": 1426906
+        },
+        "drain_secs": 0.008000829,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2590,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.74903474903476
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 2,
+          "mean": 0.16872586872586912
+        },
+        "queue_time_ns": 6536633179,
+        "admissions": 1427032,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 10240,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.15730184699987,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "samples": 62,
+            "first_cpu_seconds": 0.04,
+            "cpu_seconds": 54.76,
+            "peak_rss_bytes": 29368320
+          },
+          {
+            "pid": 19651,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.364483,
+            "peak_rss_bytes": 61497344,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.00305546,
+            "boundary_slack_secs": 0.0030554599999987886
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 61.364483,
+        "client_peak_rss_bytes": 61497344,
+        "measurement": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 29368320,
+            "cpu_seconds": 54.76,
+            "bracket_secs": 30.15634775161743,
+            "boundary_slack_secs": 0.15634775161743164,
+            "io": {
+              "rchar": 1,
+              "wchar": 14759261626,
+              "syscr": 1,
+              "syscw": 1431778,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19651,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.364483,
+            "peak_rss_bytes": 61497344,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.00305546,
+            "boundary_slack_secs": 0.0030554599999987886
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 370601,
+      "total_errors": 0,
+      "rps": 12353.366666666667,
+      "latency_avg_us": 16174,
+      "latency_stdev_us": 6467,
+      "latency_max_us": 56063,
+      "p50_us": 15455,
+      "p75_us": 20095,
+      "p90_us": 24767,
+      "p95_us": 27967,
+      "p99_us": 34239,
+      "total_bytes": 26564679680,
+      "throughput_mbps": 7083.914581333333,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 14336000,
+      "phases": {
+        "setup_secs": 0.036739951,
+        "warmup_secs": 0.026063988,
+        "barrier_secs": 1.6e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001941709,
+        "measurement_start_unix_secs": 1789736768.2694988,
+        "client_usage": {
+          "pid": 17323,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 61.265853,
+          "peak_rss_bytes": 91168768,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001941709,
+          "boundary_slack_secs": 0.0019417090000004578
+        },
+        "h1_profile": {
+          "tls_records": 1853366,
+          "tls_record_bytes": 26640503581,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1853363,
+          "body_data_bytes": 26570393892,
+          "chunked_responses": 0,
+          "content_length_responses": 370715
+        },
+        "drain_secs": 0.013609218,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2528,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.8184335443041
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 2,
+          "mean": 0.10007911392405061
+        },
+        "queue_time_ns": 3600573865,
+        "admissions": 370801,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 71680,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.15725617399994,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "samples": 62,
+            "first_cpu_seconds": 55.07,
+            "cpu_seconds": 56.949999999999996,
+            "peak_rss_bytes": 57163776
+          },
+          {
+            "pid": 17323,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.265853,
+            "peak_rss_bytes": 91168768,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001941709,
+            "boundary_slack_secs": 0.0019417090000004578
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 61.265853,
+        "client_peak_rss_bytes": 91168768,
+        "measurement": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 57163776,
+            "cpu_seconds": 56.949999999999996,
+            "bracket_secs": 30.15632939338684,
+            "boundary_slack_secs": 0.15632939338684082,
+            "io": {
+              "rchar": 0,
+              "wchar": 26663669954,
+              "syscr": 0,
+              "syscw": 745195,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17323,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.265853,
+            "peak_rss_bytes": 91168768,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001941709,
+            "boundary_slack_secs": 0.0019417090000004578
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 371111,
+      "total_errors": 0,
+      "rps": 12370.366666666667,
+      "latency_avg_us": 16152,
+      "latency_stdev_us": 6533,
+      "latency_max_us": 61759,
+      "p50_us": 15375,
+      "p75_us": 20127,
+      "p90_us": 24927,
+      "p95_us": 28175,
+      "p99_us": 34335,
+      "total_bytes": 26601236480,
+      "throughput_mbps": 7093.663061333334,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 14336000,
+      "phases": {
+        "setup_secs": 0.035590168,
+        "warmup_secs": 0.025057859,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.004690558,
+        "measurement_start_unix_secs": 1789737874.4172761,
+        "client_usage": {
+          "pid": 19675,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 61.648722,
+          "peak_rss_bytes": 92127232,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.004690558,
+          "boundary_slack_secs": 0.004690558000000067
+        },
+        "h1_profile": {
+          "tls_records": 1856053,
+          "tls_record_bytes": 26678957309,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1856053,
+          "body_data_bytes": 26608796657,
+          "chunked_responses": 0,
+          "content_length_responses": 371234
+        },
+        "drain_secs": 0.01105837,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2531,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.81667325167922
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 2,
+          "mean": 0.10351639668115369
+        },
+        "queue_time_ns": 3505464465,
+        "admissions": 371311,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 71680,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.147151959999974,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "samples": 62,
+            "first_cpu_seconds": 54.8,
+            "cpu_seconds": 56.510000000000005,
+            "peak_rss_bytes": 60203008
+          },
+          {
+            "pid": 19675,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.648722,
+            "peak_rss_bytes": 92127232,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.004690558,
+            "boundary_slack_secs": 0.004690558000000067
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 61.648722,
+        "client_peak_rss_bytes": 92127232,
+        "measurement": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 60203008,
+            "cpu_seconds": 56.510000000000005,
+            "bracket_secs": 30.1461923122406,
+            "boundary_slack_secs": 0.14619231224060059,
+            "io": {
+              "rchar": 0,
+              "wchar": 26700329114,
+              "syscr": 0,
+              "syscw": 746188,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19675,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.648722,
+            "peak_rss_bytes": 92127232,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.004690558,
+            "boundary_slack_secs": 0.004690558000000067
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 63861,
+      "total_errors": 0,
+      "rps": 2128.7,
+      "latency_avg_us": 93602,
+      "latency_stdev_us": 40700,
+      "latency_max_us": 925695,
+      "p50_us": 87551,
+      "p75_us": 117439,
+      "p90_us": 150143,
+      "p95_us": 169471,
+      "p99_us": 207231,
+      "total_bytes": 32696832000,
+      "throughput_mbps": 8719.1552,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 102400000,
+      "phases": {
+        "setup_secs": 0.039280186,
+        "warmup_secs": 0.130528213,
+        "barrier_secs": 1.6e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.002138124,
+        "measurement_start_unix_secs": 1789736798.6574202,
+        "client_usage": {
+          "pid": 17349,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 58.218309999999995,
+          "peak_rss_bytes": 294076416,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.002138124,
+          "boundary_slack_secs": 0.0021381239999982427
+        },
+        "h1_profile": {
+          "tls_records": 2045043,
+          "tls_record_bytes": 32771348162,
+          "tls_parse_errors": 0,
+          "body_data_frames": 2045043,
+          "body_data_bytes": 32721240256,
+          "chunked_responses": 0,
+          "content_length_responses": 63962
+        },
+        "drain_secs": 0.047088968,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 34,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2504,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 193.65375399361002
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 41,
+          "mean": 6.262380191693302
+        },
+        "queue_time_ns": 192979545419,
+        "admissions": 64061,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 512000,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.673069093999857,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 112.02,
+            "cpu_seconds": 61.019999999999996,
+            "peak_rss_bytes": 263438336
+          },
+          {
+            "pid": 17349,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 58.218309999999995,
+            "peak_rss_bytes": 294076416,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.002138124,
+            "boundary_slack_secs": 0.0021381239999982427
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 58.218309999999995,
+        "client_peak_rss_bytes": 294076416,
+        "measurement": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 263438336,
+            "cpu_seconds": 61.019999999999996,
+            "bracket_secs": 30.67213249206543,
+            "boundary_slack_secs": 0.6721324920654297,
+            "io": {
+              "rchar": 0,
+              "wchar": 32952187659,
+              "syscr": 0,
+              "syscw": 515558,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17349,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 58.218309999999995,
+            "peak_rss_bytes": 294076416,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.002138124,
+            "boundary_slack_secs": 0.0021381239999982427
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 64898,
+      "total_errors": 0,
+      "rps": 2163.266666666667,
+      "latency_avg_us": 92244,
+      "latency_stdev_us": 40015,
+      "latency_max_us": 902143,
+      "p50_us": 87487,
+      "p75_us": 115903,
+      "p90_us": 145279,
+      "p95_us": 165503,
+      "p99_us": 208767,
+      "total_bytes": 33227776000,
+      "throughput_mbps": 8860.740266666666,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 102400000,
+      "phases": {
+        "setup_secs": 0.038232997,
+        "warmup_secs": 0.129688904,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.002297351,
+        "measurement_start_unix_secs": 1789737904.7973816,
+        "client_usage": {
+          "pid": 19701,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 59.743042,
+          "peak_rss_bytes": 305561600,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.002297351,
+          "boundary_slack_secs": 0.0022973509999992814
+        },
+        "h1_profile": {
+          "tls_records": 2077153,
+          "tls_record_bytes": 33285375254,
+          "tls_parse_errors": 0,
+          "body_data_frames": 2077152,
+          "body_data_bytes": 33234468464,
+          "chunked_responses": 0,
+          "content_length_responses": 64913
+        },
+        "drain_secs": 0.06645732,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 34,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2502,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 192.95203836930472
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 48,
+          "mean": 6.949640287769786
+        },
+        "queue_time_ns": 218486844275,
+        "admissions": 65098,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 512000,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.670305800999813,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 111.31,
+            "cpu_seconds": 59.609999999999985,
+            "peak_rss_bytes": 260968448
+          },
+          {
+            "pid": 19701,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 59.743042,
+            "peak_rss_bytes": 305561600,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.002297351,
+            "boundary_slack_secs": 0.0022973509999992814
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 59.743042,
+        "client_peak_rss_bytes": 305561600,
+        "measurement": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 260968448,
+            "cpu_seconds": 59.609999999999985,
+            "bracket_secs": 30.669317483901978,
+            "boundary_slack_secs": 0.6693174839019775,
+            "io": {
+              "rchar": 0,
+              "wchar": 33483951327,
+              "syscr": 0,
+              "syscw": 524105,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19701,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 59.743042,
+            "peak_rss_bytes": 305561600,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.002297351,
+            "boundary_slack_secs": 0.0022973509999992814
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 100,
+      "total_requests": 31666,
+      "total_errors": 0,
+      "rps": 1055.5333333333333,
+      "latency_avg_us": 94487,
+      "latency_stdev_us": 40093,
+      "latency_max_us": 324863,
+      "p50_us": 90431,
+      "p75_us": 118719,
+      "p90_us": 148095,
+      "p95_us": 166143,
+      "p99_us": 209023,
+      "total_bytes": 33204207616,
+      "throughput_mbps": 8854.455364266667,
+      "warmup_requests": 100,
+      "drain_requests": 100,
+      "drain_bytes": 104857600,
+      "phases": {
+        "setup_secs": 0.020625897,
+        "warmup_secs": 0.11869608,
+        "barrier_secs": 1.4e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.00088095,
+        "measurement_start_unix_secs": 1789736829.4233816,
+        "client_usage": {
+          "pid": 17372,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 61.226677,
+          "peak_rss_bytes": 314044416,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.00088095,
+          "boundary_slack_secs": 0.0008809499999991033
+        },
+        "h1_profile": {
+          "tls_records": 2059012,
+          "tls_record_bytes": 33263883771,
+          "tls_parse_errors": 0,
+          "body_data_frames": 2059010,
+          "body_data_bytes": 33216001909,
+          "chunked_responses": 0,
+          "content_length_responses": 31693
+        },
+        "drain_secs": 0.05643375,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 38,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2487,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_connections": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 100,
+          "mean": 99.84881383192601
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 3,
+          "mean": 0.10414153598713323
+        },
+        "queue_time_ns": 3026171770,
+        "admissions": 31766,
+        "workers_at_barrier": 100,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 1048576,
+      "effective_concurrency": 100,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.672430520000034,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 173.04,
+            "cpu_seconds": 58.06,
+            "peak_rss_bytes": 281993216
+          },
+          {
+            "pid": 17372,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.226677,
+            "peak_rss_bytes": 314044416,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.00088095,
+            "boundary_slack_secs": 0.0008809499999991033
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 61.226677,
+        "client_peak_rss_bytes": 314044416,
+        "measurement": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 281993216,
+            "cpu_seconds": 57.99000000000001,
+            "bracket_secs": 30.17068839073181,
+            "boundary_slack_secs": 0.17068839073181152,
+            "io": {
+              "rchar": 0,
+              "wchar": 33403902430,
+              "syscr": 0,
+              "syscw": 543144,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17372,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.226677,
+            "peak_rss_bytes": 314044416,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.00088095,
+            "boundary_slack_secs": 0.0008809499999991033
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 100,
+      "total_requests": 32030,
+      "total_errors": 0,
+      "rps": 1067.6666666666667,
+      "latency_avg_us": 93344,
+      "latency_stdev_us": 41879,
+      "latency_max_us": 965631,
+      "p50_us": 87615,
+      "p75_us": 117759,
+      "p90_us": 148735,
+      "p95_us": 167423,
+      "p99_us": 212223,
+      "total_bytes": 33585889280,
+      "throughput_mbps": 8956.237141333333,
+      "warmup_requests": 100,
+      "drain_requests": 100,
+      "drain_bytes": 104857600,
+      "phases": {
+        "setup_secs": 0.021088954,
+        "warmup_secs": 0.107374934,
+        "barrier_secs": 1e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.002138288,
+        "measurement_start_unix_secs": 1789737935.5512805,
+        "client_usage": {
+          "pid": 19723,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 60.709346000000004,
+          "peak_rss_bytes": 309608448,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.002138288,
+          "boundary_slack_secs": 0.002138288000001154
+        },
+        "h1_profile": {
+          "tls_records": 2083055,
+          "tls_record_bytes": 33652317422,
+          "tls_parse_errors": 0,
+          "body_data_frames": 2083051,
+          "body_data_bytes": 33603892947,
+          "chunked_responses": 0,
+          "content_length_responses": 32061
+        },
+        "drain_secs": 0.052968346,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 38,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2499,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_connections": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 100,
+          "mean": 99.89475790316145
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 5,
+          "mean": 0.06522609043617433
+        },
+        "queue_time_ns": 2099641996,
+        "admissions": 32130,
+        "workers_at_barrier": 100,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 1048576,
+      "effective_concurrency": 100,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.66671965400019,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 170.92,
+            "cpu_seconds": 58.56,
+            "peak_rss_bytes": 259375104
+          },
+          {
+            "pid": 19723,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 60.709346000000004,
+            "peak_rss_bytes": 309608448,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.002138288,
+            "boundary_slack_secs": 0.002138288000001154
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 60.709346000000004,
+        "client_peak_rss_bytes": 309608448,
+        "measurement": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 259375104,
+            "cpu_seconds": 58.5,
+            "bracket_secs": 30.164965629577637,
+            "boundary_slack_secs": 0.16496562957763672,
+            "io": {
+              "rchar": 0,
+              "wchar": 33796912190,
+              "syscr": 0,
+              "syscw": 549470,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19723,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 60.709346000000004,
+            "peak_rss_bytes": 309608448,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.002138288,
+            "boundary_slack_secs": 0.002138288000001154
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 50,
+      "total_requests": 6553,
+      "total_errors": 0,
+      "rps": 218.43333333333334,
+      "latency_avg_us": 226590,
+      "latency_stdev_us": 91938,
+      "latency_max_us": 699391,
+      "p50_us": 219135,
+      "p75_us": 283903,
+      "p90_us": 349439,
+      "p95_us": 391679,
+      "p99_us": 471807,
+      "total_bytes": 34356592640,
+      "throughput_mbps": 9161.758037333333,
+      "warmup_requests": 50,
+      "drain_requests": 50,
+      "drain_bytes": 262144000,
+      "phases": {
+        "setup_secs": 0.012941747,
+        "warmup_secs": 0.291296817,
+        "barrier_secs": 8e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001513426,
+        "measurement_start_unix_secs": 1789736860.3831718,
+        "client_usage": {
+          "pid": 17396,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 60.58867,
+          "peak_rss_bytes": 668672000,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001513426,
+          "boundary_slack_secs": 0.0015134259999989297
+        },
+        "h1_profile": {
+          "tls_records": 2107192,
+          "tls_record_bytes": 34463748523,
+          "tls_parse_errors": 0,
+          "body_data_frames": 2107192,
+          "body_data_bytes": 34416857319,
+          "chunked_responses": 0,
+          "content_length_responses": 6580
+        },
+        "drain_secs": 0.10374368,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 70,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2474,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_connections": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 50,
+          "mean": 49.964025869038046
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 2,
+          "mean": 0.015763945028294306
+        },
+        "queue_time_ns": 442978034,
+        "admissions": 6603,
+        "workers_at_barrier": 50,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 5242880,
+      "effective_concurrency": 50,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.683900536999772,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 231.1,
+            "cpu_seconds": 59.190000000000026,
+            "peak_rss_bytes": 677367808
+          },
+          {
+            "pid": 17396,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 60.58867,
+            "peak_rss_bytes": 668672000,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001513426,
+            "boundary_slack_secs": 0.0015134259999989297
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 60.58867,
+        "client_peak_rss_bytes": 668672000,
+        "measurement": [
+          {
+            "pid": 17283,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 677367808,
+            "cpu_seconds": 59.190000000000026,
+            "bracket_secs": 30.682882070541382,
+            "boundary_slack_secs": 0.6828820705413818,
+            "io": {
+              "rchar": 0,
+              "wchar": 34928480743,
+              "syscr": 0,
+              "syscw": 547991,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17396,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 60.58867,
+            "peak_rss_bytes": 668672000,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001513426,
+            "boundary_slack_secs": 0.0015134259999989297
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:3447/echo",
+      "duration_secs": 30,
+      "concurrency": 50,
+      "total_requests": 6668,
+      "total_errors": 0,
+      "rps": 222.26666666666668,
+      "latency_avg_us": 223277,
+      "latency_stdev_us": 82964,
+      "latency_max_us": 658431,
+      "p50_us": 217215,
+      "p75_us": 275455,
+      "p90_us": 338431,
+      "p95_us": 370943,
+      "p99_us": 430079,
+      "total_bytes": 34959523840,
+      "throughput_mbps": 9322.539690666667,
+      "warmup_requests": 50,
+      "drain_requests": 50,
+      "drain_bytes": 262144000,
+      "phases": {
+        "setup_secs": 0.013309646,
+        "warmup_secs": 0.294477063,
+        "barrier_secs": 7e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001216535,
+        "measurement_start_unix_secs": 1789737966.5232825,
+        "client_usage": {
+          "pid": 19748,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 61.021476,
+          "peak_rss_bytes": 643362816,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001216535,
+          "boundary_slack_secs": 0.0012165350000010733
+        },
+        "h1_profile": {
+          "tls_records": 2144180,
+          "tls_record_bytes": 35068683268,
+          "tls_parse_errors": 0,
+          "body_data_frames": 2144178,
+          "body_data_bytes": 35020936407,
+          "chunked_responses": 0,
+          "content_length_responses": 6693
+        },
+        "drain_secs": 0.105527183,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 70,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2474,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_connections": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 50,
+          "mean": 49.96564268391263
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.013338722716249021
+        },
+        "queue_time_ns": 365932798,
+        "admissions": 6718,
+        "workers_at_barrier": 50,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "direct",
+      "payload_size": 5242880,
+      "effective_concurrency": 50,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.682621657000254,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 229.48,
+            "cpu_seconds": 58.75000000000003,
+            "peak_rss_bytes": 558743552
+          },
+          {
+            "pid": 19748,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.021476,
+            "peak_rss_bytes": 643362816,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001216535,
+            "boundary_slack_secs": 0.0012165350000010733
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 61.021476,
+        "client_peak_rss_bytes": 643362816,
+        "measurement": [
+          {
+            "pid": 19633,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 558743552,
+            "cpu_seconds": 58.75000000000003,
+            "bracket_secs": 30.681698083877563,
+            "boundary_slack_secs": 0.6816980838775635,
+            "io": {
+              "rchar": 0,
+              "wchar": 35532228613,
+              "syscr": 0,
+              "syscw": 556630,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19748,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 61.021476,
+            "peak_rss_bytes": 643362816,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001216535,
+            "boundary_slack_secs": 0.0012165350000010733
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 300732,
+      "total_errors": 0,
+      "rps": 10024.4,
+      "latency_avg_us": 19939,
+      "latency_stdev_us": 8264,
+      "latency_max_us": 393727,
+      "p50_us": 19199,
+      "p75_us": 24879,
+      "p90_us": 30303,
+      "p95_us": 33855,
+      "p99_us": 41599,
+      "total_bytes": 3079495680,
+      "throughput_mbps": 821.198848,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 2048000,
+      "phases": {
+        "setup_secs": 0.041366712,
+        "warmup_secs": 0.073163382,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.00108124,
+        "measurement_start_unix_secs": 1789736894.7707436,
+        "client_usage": {
+          "pid": 17529,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 26.59912,
+          "peak_rss_bytes": 58052608,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.00108124,
+          "boundary_slack_secs": 0.0010812400000013156
+        },
+        "h1_profile": {
+          "tls_records": 300755,
+          "tls_record_bytes": 3115335077,
+          "tls_parse_errors": 0,
+          "body_data_frames": 300751,
+          "body_data_bytes": 3079546880,
+          "chunked_responses": 300737,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.019636846,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2718,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 199.64201618837365
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 67,
+          "mean": 0.28366445916114796
+        },
+        "queue_time_ns": 13632784184,
+        "admissions": 300932,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 10240,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.605989491999935,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 0.1,
+            "cpu_seconds": 63.86,
+            "peak_rss_bytes": 143343616
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 0.03,
+            "cpu_seconds": 23.529999999999998,
+            "peak_rss_bytes": 24256512
+          },
+          {
+            "pid": 17529,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 26.59912,
+            "peak_rss_bytes": 58052608,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.00108124,
+            "boundary_slack_secs": 0.0010812400000013156
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 26.59912,
+        "client_peak_rss_bytes": 58052608,
+        "measurement": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 143343616,
+            "cpu_seconds": 63.86,
+            "bracket_secs": 30.604792594909668,
+            "boundary_slack_secs": 0.604792594909668,
+            "io": {
+              "rchar": 42042,
+              "wchar": 6270187144,
+              "syscr": 254,
+              "syscw": 603676,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 24256512,
+            "cpu_seconds": 23.529999999999998,
+            "bracket_secs": 30.604792594909668,
+            "boundary_slack_secs": 0.604792594909668,
+            "io": {
+              "rchar": 1,
+              "wchar": 3114622026,
+              "syscr": 1,
+              "syscw": 350393,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17529,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 26.59912,
+            "peak_rss_bytes": 58052608,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.00108124,
+            "boundary_slack_secs": 0.0010812400000013156
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 320340,
+      "total_errors": 0,
+      "rps": 10678,
+      "latency_avg_us": 18718,
+      "latency_stdev_us": 7017,
+      "latency_max_us": 63711,
+      "p50_us": 18271,
+      "p75_us": 23423,
+      "p90_us": 28143,
+      "p95_us": 30959,
+      "p99_us": 36191,
+      "total_bytes": 3280281600,
+      "throughput_mbps": 874.74176,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 2048000,
+      "phases": {
+        "setup_secs": 0.057272395,
+        "warmup_secs": 0.074293255,
+        "barrier_secs": 2.41e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001025081,
+        "measurement_start_unix_secs": 1789737687.7534223,
+        "client_usage": {
+          "pid": 19265,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 27.915744,
+          "peak_rss_bytes": 58896384,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001025081,
+          "boundary_slack_secs": 0.0010250810000016486
+        },
+        "h1_profile": {
+          "tls_records": 320381,
+          "tls_record_bytes": 3318485854,
+          "tls_parse_errors": 0,
+          "body_data_frames": 320375,
+          "body_data_bytes": 3280353280,
+          "chunked_responses": 320347,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.020686944,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2713,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 199.53225211942555
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 95,
+          "mean": 0.3925543678584594
+        },
+        "queue_time_ns": 19244926063,
+        "admissions": 320540,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 10240,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.615838293999786,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 0.09,
+            "cpu_seconds": 66.61999999999999,
+            "peak_rss_bytes": 145305600
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 0.04,
+            "cpu_seconds": 24.8,
+            "peak_rss_bytes": 23527424
+          },
+          {
+            "pid": 19265,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 27.915744,
+            "peak_rss_bytes": 58896384,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001025081,
+            "boundary_slack_secs": 0.0010250810000016486
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 27.915744,
+        "client_peak_rss_bytes": 58896384,
+        "measurement": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 145305600,
+            "cpu_seconds": 66.61999999999999,
+            "bracket_secs": 30.61469554901123,
+            "boundary_slack_secs": 0.6146955490112305,
+            "io": {
+              "rchar": 43694,
+              "wchar": 6678453319,
+              "syscr": 262,
+              "syscw": 642925,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 23527424,
+            "cpu_seconds": 24.8,
+            "bracket_secs": 30.61469554901123,
+            "boundary_slack_secs": 0.6146955490112305,
+            "io": {
+              "rchar": 1,
+              "wchar": 3317418827,
+              "syscr": 1,
+              "syscw": 372485,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19265,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 27.915744,
+            "peak_rss_bytes": 58896384,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001025081,
+            "boundary_slack_secs": 0.0010250810000016486
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 94057,
+      "total_errors": 0,
+      "rps": 3135.233333333333,
+      "latency_avg_us": 63706,
+      "latency_stdev_us": 26792,
+      "latency_max_us": 172927,
+      "p50_us": 61727,
+      "p75_us": 82879,
+      "p90_us": 100351,
+      "p95_us": 110335,
+      "p99_us": 126783,
+      "total_bytes": 6742005760,
+      "throughput_mbps": 1797.8682026666668,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 14336000,
+      "phases": {
+        "setup_secs": 0.034524045,
+        "warmup_secs": 0.060356367,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000746703,
+        "measurement_start_unix_secs": 1789736925.524501,
+        "client_usage": {
+          "pid": 17597,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.326940999999998,
+          "peak_rss_bytes": 100122624,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000746703,
+          "boundary_slack_secs": 0.0007467030000007924
+        },
+        "h1_profile": {
+          "tls_records": 846951,
+          "tls_record_bytes": 6776368429,
+          "tls_parse_errors": 0,
+          "body_data_frames": 846951,
+          "body_data_bytes": 6745595175,
+          "chunked_responses": 94119,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.038801531,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2710,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.73357933579325
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 25,
+          "mean": 0.19298892988929894
+        },
+        "queue_time_ns": 11756555313,
+        "admissions": 94257,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 71680,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.612673880999864,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 63.96,
+            "cpu_seconds": 58.62,
+            "peak_rss_bytes": 168906752
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 23.56,
+            "cpu_seconds": 29.220000000000002,
+            "peak_rss_bytes": 55128064
+          },
+          {
+            "pid": 17597,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.326940999999998,
+            "peak_rss_bytes": 100122624,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000746703,
+            "boundary_slack_secs": 0.0007467030000007924
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 31.326940999999998,
+        "client_peak_rss_bytes": 100122624,
+        "measurement": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 168906752,
+            "cpu_seconds": 58.62,
+            "bracket_secs": 30.611510753631592,
+            "boundary_slack_secs": 0.6115107536315918,
+            "io": {
+              "rchar": 41536,
+              "wchar": 13603777181,
+              "syscr": 247,
+              "syscw": 945237,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 55128064,
+            "cpu_seconds": 29.220000000000002,
+            "bracket_secs": 30.611510753631592,
+            "boundary_slack_secs": 0.6115107536315918,
+            "io": {
+              "rchar": 0,
+              "wchar": 6788993221,
+              "syscr": 0,
+              "syscw": 246800,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17597,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.326940999999998,
+            "peak_rss_bytes": 100122624,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000746703,
+            "boundary_slack_secs": 0.0007467030000007924
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 94289,
+      "total_errors": 0,
+      "rps": 3142.9666666666667,
+      "latency_avg_us": 63553,
+      "latency_stdev_us": 27051,
+      "latency_max_us": 161535,
+      "p50_us": 61439,
+      "p75_us": 82751,
+      "p90_us": 100799,
+      "p95_us": 111039,
+      "p99_us": 128063,
+      "total_bytes": 6758635520,
+      "throughput_mbps": 1802.3028053333333,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 14336000,
+      "phases": {
+        "setup_secs": 0.035990464,
+        "warmup_secs": 0.061418739,
+        "barrier_secs": 2.41e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000260067,
+        "measurement_start_unix_secs": 1789737718.4965007,
+        "client_usage": {
+          "pid": 19334,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.227268,
+          "peak_rss_bytes": 97746944,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000260067,
+          "boundary_slack_secs": 0.0002600669999992533
+        },
+        "h1_profile": {
+          "tls_records": 848805,
+          "tls_record_bytes": 6791144675,
+          "tls_parse_errors": 0,
+          "body_data_frames": 848805,
+          "body_data_bytes": 6760303844,
+          "chunked_responses": 94325,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.037914201,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2710,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 199.70516605166037
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 38,
+          "mean": 0.22140221402214044
+        },
+        "queue_time_ns": 12229394164,
+        "admissions": 94489,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 71680,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.61006958100006,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 66.71,
+            "cpu_seconds": 58.82000000000001,
+            "peak_rss_bytes": 175316992
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 24.84,
+            "cpu_seconds": 29.459999999999997,
+            "peak_rss_bytes": 55459840
+          },
+          {
+            "pid": 19334,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.227268,
+            "peak_rss_bytes": 97746944,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000260067,
+            "boundary_slack_secs": 0.0002600669999992533
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 31.227268,
+        "client_peak_rss_bytes": 97746944,
+        "measurement": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 175316992,
+            "cpu_seconds": 58.82000000000001,
+            "bracket_secs": 30.608978271484375,
+            "boundary_slack_secs": 0.608978271484375,
+            "io": {
+              "rchar": 41788,
+              "wchar": 13637158607,
+              "syscr": 247,
+              "syscw": 947505,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 55459840,
+            "cpu_seconds": 29.459999999999997,
+            "bracket_secs": 30.608978271484375,
+            "boundary_slack_secs": 0.608978271484375,
+            "io": {
+              "rchar": 0,
+              "wchar": 6805674981,
+              "syscr": 0,
+              "syscw": 248283,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19334,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.227268,
+            "peak_rss_bytes": 97746944,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000260067,
+            "boundary_slack_secs": 0.0002600669999992533
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 16447,
+      "total_errors": 0,
+      "rps": 548.2333333333333,
+      "latency_avg_us": 362026,
+      "latency_stdev_us": 110291,
+      "latency_max_us": 1370111,
+      "p50_us": 361727,
+      "p75_us": 437759,
+      "p90_us": 503039,
+      "p95_us": 543231,
+      "p99_us": 617983,
+      "total_bytes": 8420864000,
+      "throughput_mbps": 2245.5637333333334,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 102400000,
+      "phases": {
+        "setup_secs": 0.032900849,
+        "warmup_secs": 0.333070225,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000668072,
+        "measurement_start_unix_secs": 1789736956.5737176,
+        "client_usage": {
+          "pid": 17726,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 32.750474,
+          "peak_rss_bytes": 213135360,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000668072,
+          "boundary_slack_secs": 0.000668071999999853
+        },
+        "h1_profile": {
+          "tls_records": 1038747,
+          "tls_record_bytes": 8470585801,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1038746,
+          "body_data_bytes": 8442042586,
+          "chunked_responses": 16521,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.188647333,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 34,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2721,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 2,
+          "max": 200,
+          "mean": 199.88423373759622
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 6,
+          "mean": 0.02278574053656743
+        },
+        "queue_time_ns": 961903633,
+        "admissions": 16647,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 512000,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.601318399999855,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 122.58,
+            "cpu_seconds": 57.60000000000001,
+            "peak_rss_bytes": 163528704
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 52.78,
+            "cpu_seconds": 30.439999999999998,
+            "peak_rss_bytes": 163315712
+          },
+          {
+            "pid": 17726,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.750474,
+            "peak_rss_bytes": 213135360,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000668072,
+            "boundary_slack_secs": 0.000668071999999853
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 32.750474,
+        "client_peak_rss_bytes": 213135360,
+        "measurement": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 163528704,
+            "cpu_seconds": 57.60000000000001,
+            "bracket_secs": 30.600250244140625,
+            "boundary_slack_secs": 0.600250244140625,
+            "io": {
+              "rchar": 43020,
+              "wchar": 17296276027,
+              "syscr": 255,
+              "syscw": 1078835,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 163315712,
+            "cpu_seconds": 30.439999999999998,
+            "bracket_secs": 30.600250244140625,
+            "boundary_slack_secs": 0.600250244140625,
+            "io": {
+              "rchar": 0,
+              "wchar": 8639479784,
+              "syscr": 0,
+              "syscw": 210743,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17726,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.750474,
+            "peak_rss_bytes": 213135360,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000668072,
+            "boundary_slack_secs": 0.000668071999999853
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 16366,
+      "total_errors": 0,
+      "rps": 545.5333333333333,
+      "latency_avg_us": 363702,
+      "latency_stdev_us": 132772,
+      "latency_max_us": 887807,
+      "p50_us": 359935,
+      "p75_us": 450815,
+      "p90_us": 538111,
+      "p95_us": 594431,
+      "p99_us": 694783,
+      "total_bytes": 8379392000,
+      "throughput_mbps": 2234.5045333333333,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 102400000,
+      "phases": {
+        "setup_secs": 0.036403798,
+        "warmup_secs": 0.275772391,
+        "barrier_secs": 1.71e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000634018,
+        "measurement_start_unix_secs": 1789737749.4875317,
+        "client_usage": {
+          "pid": 19401,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 32.739856,
+          "peak_rss_bytes": 205996032,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000634018,
+          "boundary_slack_secs": 0.0006340179999995144
+        },
+        "h1_profile": {
+          "tls_records": 1033832,
+          "tls_record_bytes": 8430518598,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1033830,
+          "body_data_bytes": 8402093824,
+          "chunked_responses": 16446,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.176736633,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 34,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2720,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 199.8944852941175
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 3,
+          "mean": 0.011764705882352951
+        },
+        "queue_time_ns": 643298108,
+        "admissions": 16566,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 512000,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.600821018999795,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 125.53,
+            "cpu_seconds": 57.370000000000005,
+            "peak_rss_bytes": 166498304
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 54.3,
+            "cpu_seconds": 30.430000000000007,
+            "peak_rss_bytes": 144277504
+          },
+          {
+            "pid": 19401,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.739856,
+            "peak_rss_bytes": 205996032,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000634018,
+            "boundary_slack_secs": 0.0006340179999995144
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 32.739856,
+        "client_peak_rss_bytes": 205996032,
+        "measurement": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 166498304,
+            "cpu_seconds": 57.370000000000005,
+            "bracket_secs": 30.599671840667725,
+            "boundary_slack_secs": 0.5996718406677246,
+            "io": {
+              "rchar": 43163,
+              "wchar": 17213098926,
+              "syscr": 255,
+              "syscw": 1073701,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 144277504,
+            "cpu_seconds": 30.430000000000007,
+            "bracket_secs": 30.599671840667725,
+            "boundary_slack_secs": 0.5996718406677246,
+            "io": {
+              "rchar": 0,
+              "wchar": 8597935512,
+              "syscr": 0,
+              "syscw": 208999,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19401,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.739856,
+            "peak_rss_bytes": 205996032,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000634018,
+            "boundary_slack_secs": 0.0006340179999995144
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 100,
+      "total_requests": 8690,
+      "total_errors": 0,
+      "rps": 289.6666666666667,
+      "latency_avg_us": 342624,
+      "latency_stdev_us": 217061,
+      "latency_max_us": 13729791,
+      "p50_us": 343807,
+      "p75_us": 406015,
+      "p90_us": 460799,
+      "p95_us": 492543,
+      "p99_us": 552447,
+      "total_bytes": 9112125440,
+      "throughput_mbps": 2429.900117333333,
+      "warmup_requests": 100,
+      "drain_requests": 100,
+      "drain_bytes": 104857600,
+      "phases": {
+        "setup_secs": 0.020470314,
+        "warmup_secs": 0.23017632,
+        "barrier_secs": 9.1e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001031575,
+        "measurement_start_unix_secs": 1789736987.2257128,
+        "client_usage": {
+          "pid": 17796,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 33.672540000000005,
+          "peak_rss_bytes": 211439616,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001031575,
+          "boundary_slack_secs": 0.001031574999998952
+        },
+        "h1_profile": {
+          "tls_records": 1123441,
+          "tls_record_bytes": 9162032440,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1123441,
+          "body_data_bytes": 9132029489,
+          "chunked_responses": 8722,
+          "content_length_responses": 0
+        },
+        "drain_secs": 10.075854306,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 38,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2717,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_connections": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 100,
+          "mean": 99.95583364004412
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 3,
+          "mean": 0.007361059992638955
+        },
+        "queue_time_ns": 345118359,
+        "admissions": 8790,
+        "workers_at_barrier": 100,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 1048576,
+      "effective_concurrency": 100,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 40.626490655,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "samples": 83,
+            "first_cpu_seconds": 180.18,
+            "cpu_seconds": 55.609999999999985,
+            "peak_rss_bytes": 155516928
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "samples": 83,
+            "first_cpu_seconds": 83.22,
+            "cpu_seconds": 31.090000000000003,
+            "peak_rss_bytes": 178061312
+          },
+          {
+            "pid": 17796,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.672540000000005,
+            "peak_rss_bytes": 211439616,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001031575,
+            "boundary_slack_secs": 0.001031574999998952
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 33.672540000000005,
+        "client_peak_rss_bytes": 211439616,
+        "measurement": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 154005504,
+            "cpu_seconds": 55.59,
+            "bracket_secs": 30.604158639907837,
+            "boundary_slack_secs": 0.6041586399078369,
+            "io": {
+              "rchar": 41691,
+              "wchar": 18688317443,
+              "syscr": 247,
+              "syscw": 1155981,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 178061312,
+            "cpu_seconds": 31.090000000000003,
+            "bracket_secs": 30.604158639907837,
+            "boundary_slack_secs": 0.6041586399078369,
+            "io": {
+              "rchar": 0,
+              "wchar": 9335905046,
+              "syscr": 0,
+              "syscw": 230082,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17796,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.672540000000005,
+            "peak_rss_bytes": 211439616,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001031575,
+            "boundary_slack_secs": 0.001031574999998952
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 100,
+      "total_requests": 8742,
+      "total_errors": 0,
+      "rps": 291.4,
+      "latency_avg_us": 341192,
+      "latency_stdev_us": 95276,
+      "latency_max_us": 1319935,
+      "p50_us": 345343,
+      "p75_us": 407295,
+      "p90_us": 459263,
+      "p95_us": 487935,
+      "p99_us": 542719,
+      "total_bytes": 9166651392,
+      "throughput_mbps": 2444.4403712,
+      "warmup_requests": 100,
+      "drain_requests": 100,
+      "drain_bytes": 104857600,
+      "phases": {
+        "setup_secs": 0.020210105,
+        "warmup_secs": 0.267720223,
+        "barrier_secs": 1.1e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000626915,
+        "measurement_start_unix_secs": 1789737780.2274907,
+        "client_usage": {
+          "pid": 19470,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 33.413918,
+          "peak_rss_bytes": 188575744,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000626915,
+          "boundary_slack_secs": 0.00062691500000156
+        },
+        "h1_profile": {
+          "tls_records": 1129579,
+          "tls_record_bytes": 9212053269,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1129577,
+          "body_data_bytes": 9181869698,
+          "chunked_responses": 8773,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.172699877,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 38,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2712,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_connections": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 100,
+          "mean": 99.93915929203558
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 2,
+          "mean": 0.010324483775811202
+        },
+        "queue_time_ns": 426589268,
+        "admissions": 8842,
+        "workers_at_barrier": 100,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 1048576,
+      "effective_concurrency": 100,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.604197518000092,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 182.9,
+            "cpu_seconds": 56.09,
+            "peak_rss_bytes": 162873344
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 84.73,
+            "cpu_seconds": 31,
+            "peak_rss_bytes": 164085760
+          },
+          {
+            "pid": 19470,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.413918,
+            "peak_rss_bytes": 188575744,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000626915,
+            "boundary_slack_secs": 0.00062691500000156
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 33.413918,
+        "client_peak_rss_bytes": 188575744,
+        "measurement": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 159862784,
+            "cpu_seconds": 56.09,
+            "bracket_secs": 30.60309338569641,
+            "boundary_slack_secs": 0.6030933856964111,
+            "io": {
+              "rchar": 43165,
+              "wchar": 18798417504,
+              "syscr": 255,
+              "syscw": 1162804,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 164085760,
+            "cpu_seconds": 31,
+            "bracket_secs": 30.60309338569641,
+            "boundary_slack_secs": 0.6030933856964111,
+            "io": {
+              "rchar": 0,
+              "wchar": 9390497970,
+              "syscr": 0,
+              "syscw": 229516,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19470,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.413918,
+            "peak_rss_bytes": 188575744,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000626915,
+            "boundary_slack_secs": 0.00062691500000156
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 50,
+      "total_requests": 1881,
+      "total_errors": 1,
+      "rps": 62.7,
+      "latency_avg_us": 768799,
+      "latency_stdev_us": 203505,
+      "latency_max_us": 1410047,
+      "p50_us": 789503,
+      "p75_us": 908287,
+      "p90_us": 1011199,
+      "p95_us": 1068031,
+      "p99_us": 1206271,
+      "total_bytes": 9861857280,
+      "throughput_mbps": 2629.828608,
+      "warmup_requests": 49,
+      "drain_requests": 49,
+      "drain_bytes": 256901120,
+      "phases": {
+        "setup_secs": 0.012098381,
+        "warmup_secs": 66.857191534,
+        "barrier_secs": 7e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000348952,
+        "measurement_start_unix_secs": 1789737094.6386714,
+        "client_usage": {
+          "pid": 17888,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 34.901447,
+          "peak_rss_bytes": 524201984,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000348952,
+          "boundary_slack_secs": 0.0003489519999995139
+        },
+        "h1_profile": {
+          "tls_records": 1210007,
+          "tls_record_bytes": 9944355330,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1210009,
+          "body_data_bytes": 9912710915,
+          "chunked_responses": 1900,
+          "content_length_responses": 0
+        },
+        "drain_secs": 30.004449256,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 70,
+        "stalled_workers": [],
+        "timed_out": true
+      },
+      "observed": {
+        "samples": 2716,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_connections": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 50,
+          "mean": 49.96723122238575
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.00257731958762887
+        },
+        "queue_time_ns": 68338764,
+        "admissions": 1931,
+        "workers_at_barrier": 50,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 5242880,
+      "effective_concurrency": 50,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 127.28985950700007,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "samples": 256,
+            "first_cpu_seconds": 235.79,
+            "cpu_seconds": 54.31000000000003,
+            "peak_rss_bytes": 137789440
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "samples": 256,
+            "first_cpu_seconds": 114.31,
+            "cpu_seconds": 32.99000000000001,
+            "peak_rss_bytes": 427503616
+          },
+          {
+            "pid": 17888,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.901447,
+            "peak_rss_bytes": 524201984,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000348952,
+            "boundary_slack_secs": 0.0003489519999995139
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 34.901447,
+        "client_peak_rss_bytes": 524201984,
+        "measurement": [
+          {
+            "pid": 17467,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 130134016,
+            "cpu_seconds": 53.059999999999974,
+            "bracket_secs": 30.605716228485107,
+            "boundary_slack_secs": 0.6057162284851074,
+            "io": {
+              "rchar": 43069,
+              "wchar": 20227575806,
+              "syscr": 255,
+              "syscw": 1235662,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17411,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 423329792,
+            "cpu_seconds": 32.33,
+            "bracket_secs": 30.605716228485107,
+            "boundary_slack_secs": 0.6057162284851074,
+            "io": {
+              "rchar": 0,
+              "wchar": 10112969853,
+              "syscr": 0,
+              "syscw": 240353,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 17888,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.901447,
+            "peak_rss_bytes": 524201984,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000348952,
+            "boundary_slack_secs": 0.0003489519999995139
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 50,
+      "total_requests": 1878,
+      "total_errors": 0,
+      "rps": 62.6,
+      "latency_avg_us": 786336,
+      "latency_stdev_us": 224979,
+      "latency_max_us": 1423359,
+      "p50_us": 813055,
+      "p75_us": 937983,
+      "p90_us": 1057791,
+      "p95_us": 1105919,
+      "p99_us": 1255423,
+      "total_bytes": 9846128640,
+      "throughput_mbps": 2625.634304,
+      "warmup_requests": 50,
+      "drain_requests": 50,
+      "drain_bytes": 262144000,
+      "phases": {
+        "setup_secs": 0.012076647,
+        "warmup_secs": 0.566967335,
+        "barrier_secs": 8e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000536075,
+        "measurement_start_unix_secs": 1789737811.285779,
+        "client_usage": {
+          "pid": 19535,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 34.900484999999996,
+          "peak_rss_bytes": 415059968,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000536075,
+          "boundary_slack_secs": 0.0005360749999994141
+        },
+        "h1_profile": {
+          "tls_records": 1205044,
+          "tls_record_bytes": 9904889041,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1205128,
+          "body_data_bytes": 9873373763,
+          "chunked_responses": 1893,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.467047162,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 70,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2711,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_connections": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 50,
+          "mean": 49.97823681298415
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.003319808188860204
+        },
+        "queue_time_ns": 83265532,
+        "admissions": 1928,
+        "workers_at_barrier": 50,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum",
+      "payload_size": 5242880,
+      "effective_concurrency": 50,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 2,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 31.121058644000186,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "samples": 64,
+            "first_cpu_seconds": 238.99,
+            "cpu_seconds": 54.349999999999966,
+            "peak_rss_bytes": 154722304
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "samples": 64,
+            "first_cpu_seconds": 115.73,
+            "cpu_seconds": 32.89999999999999,
+            "peak_rss_bytes": 439959552
+          },
+          {
+            "pid": 19535,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.900484999999996,
+            "peak_rss_bytes": 415059968,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000536075,
+            "boundary_slack_secs": 0.0005360749999994141
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 34.900484999999996,
+        "client_peak_rss_bytes": 415059968,
+        "measurement": [
+          {
+            "pid": 19211,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 152842240,
+            "cpu_seconds": 52.67999999999998,
+            "bracket_secs": 30.106308460235596,
+            "boundary_slack_secs": 0.1063084602355957,
+            "io": {
+              "rchar": 41787,
+              "wchar": 20011132727,
+              "syscr": 247,
+              "syscw": 1222071,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19156,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 439959552,
+            "cpu_seconds": 31.960000000000008,
+            "bracket_secs": 30.106308460235596,
+            "boundary_slack_secs": 0.1063084602355957,
+            "io": {
+              "rchar": 0,
+              "wchar": 9945918441,
+              "syscr": 0,
+              "syscw": 236412,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19535,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.900484999999996,
+            "peak_rss_bytes": 415059968,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000536075,
+            "boundary_slack_secs": 0.0005360749999994141
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 317613,
+      "total_errors": 0,
+      "rps": 10587.1,
+      "latency_avg_us": 18879,
+      "latency_stdev_us": 7121,
+      "latency_max_us": 62399,
+      "p50_us": 18383,
+      "p75_us": 23631,
+      "p90_us": 28495,
+      "p95_us": 31391,
+      "p99_us": 36703,
+      "total_bytes": 3252357120,
+      "throughput_mbps": 867.295232,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 2048000,
+      "phases": {
+        "setup_secs": 0.045792415,
+        "warmup_secs": 0.072560455,
+        "barrier_secs": 2.4e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000330975,
+        "measurement_start_unix_secs": 1789737159.1291282,
+        "client_usage": {
+          "pid": 18148,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 27.583441999999998,
+          "peak_rss_bytes": 58728448,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000330975,
+          "boundary_slack_secs": 0.00033097500000067726
+        },
+        "h1_profile": {
+          "tls_records": 317643,
+          "tls_record_bytes": 3290164246,
+          "tls_parse_errors": 0,
+          "body_data_frames": 317640,
+          "body_data_bytes": 3252367360,
+          "chunked_responses": 317614,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.021268112,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2716,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.55780559646544
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 66,
+          "mean": 0.36745213549337274
+        },
+        "queue_time_ns": 16756388595,
+        "admissions": 317813,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 10240,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.598412524000196,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 0.1,
+            "cpu_seconds": 67.14,
+            "peak_rss_bytes": 144375808
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 0.04,
+            "cpu_seconds": 24.51,
+            "peak_rss_bytes": 23232512
+          },
+          {
+            "pid": 18148,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 27.583441999999998,
+            "peak_rss_bytes": 58728448,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000330975,
+            "boundary_slack_secs": 0.00033097500000067726
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 27.583441999999998,
+        "client_peak_rss_bytes": 58728448,
+        "measurement": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 144375808,
+            "cpu_seconds": 67.14,
+            "bracket_secs": 30.597296237945557,
+            "boundary_slack_secs": 0.5972962379455566,
+            "io": {
+              "rchar": 43601,
+              "wchar": 6621680474,
+              "syscr": 262,
+              "syscw": 637464,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 23232512,
+            "cpu_seconds": 24.51,
+            "bracket_secs": 30.597296237945557,
+            "boundary_slack_secs": 0.5972962379455566,
+            "io": {
+              "rchar": 1,
+              "wchar": 3289197188,
+              "syscr": 1,
+              "syscw": 369306,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18148,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 27.583441999999998,
+            "peak_rss_bytes": 58728448,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000330975,
+            "boundary_slack_secs": 0.00033097500000067726
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 315702,
+      "total_errors": 0,
+      "rps": 10523.4,
+      "latency_avg_us": 18994,
+      "latency_stdev_us": 7253,
+      "latency_max_us": 66687,
+      "p50_us": 18511,
+      "p75_us": 23871,
+      "p90_us": 28735,
+      "p95_us": 31663,
+      "p99_us": 37087,
+      "total_bytes": 3232788480,
+      "throughput_mbps": 862.076928,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 2048000,
+      "phases": {
+        "setup_secs": 0.046684926,
+        "warmup_secs": 0.066105716,
+        "barrier_secs": 1.7e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001057845,
+        "measurement_start_unix_secs": 1789737423.4435196,
+        "client_usage": {
+          "pid": 18710,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 27.830389,
+          "peak_rss_bytes": 58286080,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001057845,
+          "boundary_slack_secs": 0.0010578449999982809
+        },
+        "h1_profile": {
+          "tls_records": 315740,
+          "tls_record_bytes": 3270492382,
+          "tls_parse_errors": 0,
+          "body_data_frames": 315735,
+          "body_data_bytes": 3232911360,
+          "chunked_responses": 315714,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.021269498,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2718,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.66004415011042
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 73,
+          "mean": 0.264900662251655
+        },
+        "queue_time_ns": 13942519363,
+        "admissions": 315902,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 10240,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.59583550699972,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 0.09,
+            "cpu_seconds": 66.74,
+            "peak_rss_bytes": 143073280
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 0.04,
+            "cpu_seconds": 24.7,
+            "peak_rss_bytes": 23560192
+          },
+          {
+            "pid": 18710,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 27.830389,
+            "peak_rss_bytes": 58286080,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001057845,
+            "boundary_slack_secs": 0.0010578449999982809
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 27.830389,
+        "client_peak_rss_bytes": 58286080,
+        "measurement": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 143073280,
+            "cpu_seconds": 66.74,
+            "bracket_secs": 30.59471321105957,
+            "boundary_slack_secs": 0.5947132110595703,
+            "io": {
+              "rchar": 43654,
+              "wchar": 6581879069,
+              "syscr": 262,
+              "syscw": 633662,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 23560192,
+            "cpu_seconds": 24.7,
+            "bracket_secs": 30.59471321105957,
+            "boundary_slack_secs": 0.5947132110595703,
+            "io": {
+              "rchar": 1,
+              "wchar": 3269452779,
+              "syscr": 1,
+              "syscw": 368565,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18710,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 27.830389,
+            "peak_rss_bytes": 58286080,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001057845,
+            "boundary_slack_secs": 0.0010578449999982809
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 93375,
+      "total_errors": 0,
+      "rps": 3112.5,
+      "latency_avg_us": 64170,
+      "latency_stdev_us": 27085,
+      "latency_max_us": 174079,
+      "p50_us": 62527,
+      "p75_us": 83391,
+      "p90_us": 101055,
+      "p95_us": 110783,
+      "p99_us": 129151,
+      "total_bytes": 6693120000,
+      "throughput_mbps": 1784.832,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 14336000,
+      "phases": {
+        "setup_secs": 0.035973502,
+        "warmup_secs": 0.060129798,
+        "barrier_secs": 1.6e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000486226,
+        "measurement_start_unix_secs": 1789737189.8685791,
+        "client_usage": {
+          "pid": 18218,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.317238999999997,
+          "peak_rss_bytes": 97792000,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000486226,
+          "boundary_slack_secs": 0.00048622599999958993
+        },
+        "h1_profile": {
+          "tls_records": 840755,
+          "tls_record_bytes": 6726776820,
+          "tls_parse_errors": 0,
+          "body_data_frames": 840755,
+          "body_data_bytes": 6696227351,
+          "chunked_responses": 93446,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.03786763,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2711,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 199.77130210254518
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 42,
+          "mean": 0.15529324972334924
+        },
+        "queue_time_ns": 10872242111,
+        "admissions": 93575,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 71680,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.60133609200011,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 67.24,
+            "cpu_seconds": 58.870000000000005,
+            "peak_rss_bytes": 176480256
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 24.55,
+            "cpu_seconds": 29.37,
+            "peak_rss_bytes": 53858304
+          },
+          {
+            "pid": 18218,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.317238999999997,
+            "peak_rss_bytes": 97792000,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000486226,
+            "boundary_slack_secs": 0.00048622599999958993
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 31.317238999999997,
+        "client_peak_rss_bytes": 97792000,
+        "measurement": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 176480256,
+            "cpu_seconds": 58.870000000000005,
+            "bracket_secs": 30.600193977355957,
+            "boundary_slack_secs": 0.600193977355957,
+            "io": {
+              "rchar": 41697,
+              "wchar": 13505555257,
+              "syscr": 247,
+              "syscw": 938374,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 53858304,
+            "cpu_seconds": 29.37,
+            "bracket_secs": 30.600193977355957,
+            "boundary_slack_secs": 0.600193977355957,
+            "io": {
+              "rchar": 0,
+              "wchar": 6739981675,
+              "syscr": 0,
+              "syscw": 245825,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18218,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.317238999999997,
+            "peak_rss_bytes": 97792000,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000486226,
+            "boundary_slack_secs": 0.00048622599999958993
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 92791,
+      "total_errors": 0,
+      "rps": 3093.0333333333333,
+      "latency_avg_us": 64569,
+      "latency_stdev_us": 28364,
+      "latency_max_us": 168191,
+      "p50_us": 62111,
+      "p75_us": 84543,
+      "p90_us": 104447,
+      "p95_us": 115519,
+      "p99_us": 133247,
+      "total_bytes": 6651258880,
+      "throughput_mbps": 1773.6690346666667,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 14336000,
+      "phases": {
+        "setup_secs": 0.033394674,
+        "warmup_secs": 0.062241311,
+        "barrier_secs": 1.8e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.001105082,
+        "measurement_start_unix_secs": 1789737454.1861572,
+        "client_usage": {
+          "pid": 18778,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.363913,
+          "peak_rss_bytes": 97865728,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.001105082,
+          "boundary_slack_secs": 0.0011050819999987027
+        },
+        "h1_profile": {
+          "tls_records": 835497,
+          "tls_record_bytes": 6684696519,
+          "tls_parse_errors": 0,
+          "body_data_frames": 835497,
+          "body_data_bytes": 6654339060,
+          "chunked_responses": 92849,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.039954064,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 31,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2713,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.7640987836344
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 29,
+          "mean": 0.16218208625138264
+        },
+        "queue_time_ns": 10661521659,
+        "admissions": 92991,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 71680,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.61287405899975,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 66.83,
+            "cpu_seconds": 58.91,
+            "peak_rss_bytes": 171991040
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 24.74,
+            "cpu_seconds": 29.330000000000002,
+            "peak_rss_bytes": 55693312
+          },
+          {
+            "pid": 18778,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.363913,
+            "peak_rss_bytes": 97865728,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001105082,
+            "boundary_slack_secs": 0.0011050819999987027
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 31.363913,
+        "client_peak_rss_bytes": 97865728,
+        "measurement": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 171991040,
+            "cpu_seconds": 58.91,
+            "bracket_secs": 30.61172890663147,
+            "boundary_slack_secs": 0.6117289066314697,
+            "io": {
+              "rchar": 41753,
+              "wchar": 13421444205,
+              "syscr": 247,
+              "syscw": 932536,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 55693312,
+            "cpu_seconds": 29.330000000000002,
+            "bracket_secs": 30.61172890663147,
+            "boundary_slack_secs": 0.6117289066314697,
+            "io": {
+              "rchar": 0,
+              "wchar": 6698011003,
+              "syscr": 0,
+              "syscw": 244760,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18778,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 31.363913,
+            "peak_rss_bytes": 97865728,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.001105082,
+            "boundary_slack_secs": 0.0011050819999987027
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 16128,
+      "total_errors": 0,
+      "rps": 537.6,
+      "latency_avg_us": 369554,
+      "latency_stdev_us": 122728,
+      "latency_max_us": 810495,
+      "p50_us": 365567,
+      "p75_us": 452863,
+      "p90_us": 533503,
+      "p95_us": 580607,
+      "p99_us": 669183,
+      "total_bytes": 8257536000,
+      "throughput_mbps": 2202.0096,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 102400000,
+      "phases": {
+        "setup_secs": 0.036879593,
+        "warmup_secs": 0.285916269,
+        "barrier_secs": 1.71e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000887851,
+        "measurement_start_unix_secs": 1789737220.8628674,
+        "client_usage": {
+          "pid": 18285,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 32.71798,
+          "peak_rss_bytes": 209408000,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000887851,
+          "boundary_slack_secs": 0.0008878510000016604
+        },
+        "h1_profile": {
+          "tls_records": 1018152,
+          "tls_record_bytes": 8302612984,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1018152,
+          "body_data_bytes": 8274636256,
+          "chunked_responses": 16186,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.213060267,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 34,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2722,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 41,
+          "max": 200,
+          "mean": 199.92285084496658
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 5,
+          "mean": 0.009184423218221882
+        },
+        "queue_time_ns": 701297499,
+        "admissions": 16328,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 512000,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.599184461000277,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 126.11,
+            "cpu_seconds": 57.55,
+            "peak_rss_bytes": 176103424
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 53.92,
+            "cpu_seconds": 30.36,
+            "peak_rss_bytes": 141217792
+          },
+          {
+            "pid": 18285,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.71798,
+            "peak_rss_bytes": 209408000,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000887851,
+            "boundary_slack_secs": 0.0008878510000016604
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 32.71798,
+        "client_peak_rss_bytes": 209408000,
+        "measurement": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 172957696,
+            "cpu_seconds": 57.55,
+            "bracket_secs": 30.59806752204895,
+            "boundary_slack_secs": 0.5980675220489502,
+            "io": {
+              "rchar": 43083,
+              "wchar": 16968766848,
+              "syscr": 255,
+              "syscw": 1058432,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 141217792,
+            "cpu_seconds": 30.36,
+            "bracket_secs": 30.59806752204895,
+            "boundary_slack_secs": 0.5980675220489502,
+            "io": {
+              "rchar": 0,
+              "wchar": 8475893760,
+              "syscr": 0,
+              "syscw": 207200,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18285,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.71798,
+            "peak_rss_bytes": 209408000,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000887851,
+            "boundary_slack_secs": 0.0008878510000016604
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 200,
+      "total_requests": 15965,
+      "total_errors": 0,
+      "rps": 532.1666666666666,
+      "latency_avg_us": 372985,
+      "latency_stdev_us": 111050,
+      "latency_max_us": 809471,
+      "p50_us": 371711,
+      "p75_us": 450047,
+      "p90_us": 516607,
+      "p95_us": 559103,
+      "p99_us": 635391,
+      "total_bytes": 8174080000,
+      "throughput_mbps": 2179.7546666666667,
+      "warmup_requests": 200,
+      "drain_requests": 200,
+      "drain_bytes": 102400000,
+      "phases": {
+        "setup_secs": 0.036676076,
+        "warmup_secs": 0.312605376,
+        "barrier_secs": 2.6e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000287001,
+        "measurement_start_unix_secs": 1789737485.2197535,
+        "client_usage": {
+          "pid": 18848,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 32.482697,
+          "peak_rss_bytes": 230719488,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000287001,
+          "boundary_slack_secs": 0.000287001000000231
+        },
+        "h1_profile": {
+          "tls_records": 1007957,
+          "tls_record_bytes": 8219482987,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1007955,
+          "body_data_bytes": 8191769600,
+          "chunked_responses": 16029,
+          "content_length_responses": 0
+        },
+        "drain_secs": 0.199869259,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 34,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2720,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_connections": {
+          "min": 200,
+          "max": 200,
+          "mean": 200
+        },
+        "active_streams": {
+          "min": 1,
+          "max": 200,
+          "mean": 199.87647058823558
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 5,
+          "mean": 0.012132352941176462
+        },
+        "queue_time_ns": 733075484,
+        "admissions": 16165,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 512000,
+      "effective_concurrency": 200,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 30.59322933300018,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "samples": 63,
+            "first_cpu_seconds": 125.74,
+            "cpu_seconds": 57.88000000000001,
+            "peak_rss_bytes": 167391232
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "samples": 63,
+            "first_cpu_seconds": 54.07,
+            "cpu_seconds": 30.270000000000003,
+            "peak_rss_bytes": 145084416
+          },
+          {
+            "pid": 18848,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.482697,
+            "peak_rss_bytes": 230719488,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000287001,
+            "boundary_slack_secs": 0.000287001000000231
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 32.482697,
+        "client_peak_rss_bytes": 230719488,
+        "measurement": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 167391232,
+            "cpu_seconds": 57.88000000000001,
+            "bracket_secs": 30.592097520828247,
+            "boundary_slack_secs": 0.5920975208282471,
+            "io": {
+              "rchar": 43126,
+              "wchar": 16801423902,
+              "syscr": 255,
+              "syscw": 1047992,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 145084416,
+            "cpu_seconds": 30.270000000000003,
+            "bracket_secs": 30.592097520828247,
+            "boundary_slack_secs": 0.5920975208282471,
+            "io": {
+              "rchar": 0,
+              "wchar": 8392310568,
+              "syscr": 0,
+              "syscw": 205971,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18848,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 32.482697,
+            "peak_rss_bytes": 230719488,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000287001,
+            "boundary_slack_secs": 0.000287001000000231
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 100,
+      "total_requests": 8529,
+      "total_errors": 0,
+      "rps": 284.3,
+      "latency_avg_us": 349135,
+      "latency_stdev_us": 214256,
+      "latency_max_us": 13639679,
+      "p50_us": 352255,
+      "p75_us": 409855,
+      "p90_us": 459007,
+      "p95_us": 483839,
+      "p99_us": 536575,
+      "total_bytes": 8943304704,
+      "throughput_mbps": 2384.8812544,
+      "warmup_requests": 100,
+      "drain_requests": 100,
+      "drain_bytes": 104857600,
+      "phases": {
+        "setup_secs": 0.019473,
+        "warmup_secs": 0.304627676,
+        "barrier_secs": 9e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000483244,
+        "measurement_start_unix_secs": 1789737251.6278062,
+        "client_usage": {
+          "pid": 18353,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 33.3865,
+          "peak_rss_bytes": 202514432,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000483244,
+          "boundary_slack_secs": 0.0004832440000015481
+        },
+        "h1_profile": {
+          "tls_records": 1102053,
+          "tls_record_bytes": 8987578209,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1102051,
+          "body_data_bytes": 8958129956,
+          "chunked_responses": 8557,
+          "content_length_responses": 0
+        },
+        "drain_secs": 10.050080405,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 38,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2718,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_connections": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 100,
+          "mean": 99.92678440029445
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.008830022075055169
+        },
+        "queue_time_ns": 344897908,
+        "admissions": 8629,
+        "workers_at_barrier": 100,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 1048576,
+      "effective_concurrency": 100,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 40.61696019100009,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "samples": 83,
+            "first_cpu_seconds": 183.66,
+            "cpu_seconds": 56.390000000000015,
+            "peak_rss_bytes": 157085696
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "samples": 83,
+            "first_cpu_seconds": 84.28,
+            "cpu_seconds": 30.939999999999998,
+            "peak_rss_bytes": 154255360
+          },
+          {
+            "pid": 18353,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.3865,
+            "peak_rss_bytes": 202514432,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000483244,
+            "boundary_slack_secs": 0.0004832440000015481
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 33.3865,
+        "client_peak_rss_bytes": 202514432,
+        "measurement": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 156381184,
+            "cpu_seconds": 56.370000000000005,
+            "bracket_secs": 30.595823287963867,
+            "boundary_slack_secs": 0.5958232879638672,
+            "io": {
+              "rchar": 43123,
+              "wchar": 18349832324,
+              "syscr": 255,
+              "syscw": 1135028,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 154255360,
+            "cpu_seconds": 30.939999999999998,
+            "bracket_secs": 30.595823287963867,
+            "boundary_slack_secs": 0.5958232879638672,
+            "io": {
+              "rchar": 0,
+              "wchar": 9166835735,
+              "syscr": 0,
+              "syscw": 226682,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18353,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.3865,
+            "peak_rss_bytes": 202514432,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000483244,
+            "boundary_slack_secs": 0.0004832440000015481
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 100,
+      "total_requests": 8478,
+      "total_errors": 0,
+      "rps": 282.6,
+      "latency_avg_us": 350980,
+      "latency_stdev_us": 220744,
+      "latency_max_us": 13819903,
+      "p50_us": 353279,
+      "p75_us": 418303,
+      "p90_us": 475903,
+      "p95_us": 509183,
+      "p99_us": 572415,
+      "total_bytes": 8889827328,
+      "throughput_mbps": 2370.6206208,
+      "warmup_requests": 100,
+      "drain_requests": 100,
+      "drain_bytes": 104857600,
+      "phases": {
+        "setup_secs": 0.019329293,
+        "warmup_secs": 0.250446299,
+        "barrier_secs": 1e-7,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000817906,
+        "measurement_start_unix_secs": 1789737515.8992667,
+        "client_usage": {
+          "pid": 18918,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 33.490003,
+          "peak_rss_bytes": 189972480,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000817906,
+          "boundary_slack_secs": 0.0008179060000017557
+        },
+        "h1_profile": {
+          "tls_records": 1096288,
+          "tls_record_bytes": 8940614629,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1096287,
+          "body_data_bytes": 8911336193,
+          "chunked_responses": 8519,
+          "content_length_responses": 0
+        },
+        "drain_secs": 9.866903134,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 38,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "observed": {
+        "samples": 2720,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_connections": {
+          "min": 100,
+          "max": 100,
+          "mean": 100
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 100,
+          "mean": 99.954044117647
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.006249999999999985
+        },
+        "queue_time_ns": 328549861,
+        "admissions": 8578,
+        "workers_at_barrier": 100,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 1048576,
+      "effective_concurrency": 100,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 40.61951795499999,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "samples": 83,
+            "first_cpu_seconds": 183.62,
+            "cpu_seconds": 56.00999999999999,
+            "peak_rss_bytes": 147886080
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "samples": 83,
+            "first_cpu_seconds": 84.34,
+            "cpu_seconds": 31.039999999999992,
+            "peak_rss_bytes": 188678144
+          },
+          {
+            "pid": 18918,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.490003,
+            "peak_rss_bytes": 189972480,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000817906,
+            "boundary_slack_secs": 0.0008179060000017557
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 33.490003,
+        "client_peak_rss_bytes": 189972480,
+        "measurement": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 145076224,
+            "cpu_seconds": 55.99000000000001,
+            "bracket_secs": 30.599634885787964,
+            "boundary_slack_secs": 0.5996348857879639,
+            "io": {
+              "rchar": 43129,
+              "wchar": 18242648870,
+              "syscr": 255,
+              "syscw": 1128524,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 188678144,
+            "cpu_seconds": 31.039999999999992,
+            "bracket_secs": 30.599634885787964,
+            "boundary_slack_secs": 0.5996348857879639,
+            "io": {
+              "rchar": 0,
+              "wchar": 9113282218,
+              "syscr": 0,
+              "syscw": 225930,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18918,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 33.490003,
+            "peak_rss_bytes": 189972480,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000817906,
+            "boundary_slack_secs": 0.0008179060000017557
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 50,
+      "total_requests": 1840,
+      "total_errors": 1,
+      "rps": 61.333333333333336,
+      "latency_avg_us": 787218,
+      "latency_stdev_us": 198514,
+      "latency_max_us": 1542143,
+      "p50_us": 808447,
+      "p75_us": 922623,
+      "p90_us": 1026559,
+      "p95_us": 1071103,
+      "p99_us": 1169407,
+      "total_bytes": 9646899200,
+      "throughput_mbps": 2572.5064533333334,
+      "warmup_requests": 49,
+      "drain_requests": 49,
+      "drain_bytes": 256901120,
+      "phases": {
+        "setup_secs": 0.012312083,
+        "warmup_secs": 66.917435269,
+        "barrier_secs": 7e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000895248,
+        "measurement_start_unix_secs": 1789737359.016746,
+        "client_usage": {
+          "pid": 18442,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 34.563756,
+          "peak_rss_bytes": 480235520,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000895248,
+          "boundary_slack_secs": 0.0008952479999990715
+        },
+        "h1_profile": {
+          "tls_records": 1181223,
+          "tls_record_bytes": 9710911311,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1181227,
+          "body_data_bytes": 9680001649,
+          "chunked_responses": 1856,
+          "content_length_responses": 0
+        },
+        "drain_secs": 30.002194186,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 70,
+        "stalled_workers": [],
+        "timed_out": true
+      },
+      "observed": {
+        "samples": 2716,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_connections": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 50,
+          "mean": 49.97938144329899
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.002209131075110464
+        },
+        "queue_time_ns": 82487642,
+        "admissions": 1890,
+        "workers_at_barrier": 50,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 5242880,
+      "effective_concurrency": 50,
+      "sample_schema": 2,
+      "pair": 1,
+      "order_position": 3,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-cutoff-one"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 127.27969682999992,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "samples": 256,
+            "first_cpu_seconds": 240.05,
+            "cpu_seconds": 55.110000000000014,
+            "peak_rss_bytes": 136118272
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "samples": 256,
+            "first_cpu_seconds": 115.22,
+            "cpu_seconds": 32.81,
+            "peak_rss_bytes": 431681536
+          },
+          {
+            "pid": 18442,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.563756,
+            "peak_rss_bytes": 480235520,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000895248,
+            "boundary_slack_secs": 0.0008952479999990715
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 34.563756,
+        "client_peak_rss_bytes": 480235520,
+        "measurement": [
+          {
+            "pid": 18094,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 123334656,
+            "cpu_seconds": 53.40999999999997,
+            "bracket_secs": 30.595705032348633,
+            "boundary_slack_secs": 0.5957050323486328,
+            "io": {
+              "rchar": 43133,
+              "wchar": 19727796327,
+              "syscr": 255,
+              "syscw": 1205168,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18037,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 431681536,
+            "cpu_seconds": 31.989999999999995,
+            "bracket_secs": 30.595705032348633,
+            "boundary_slack_secs": 0.5957050323486328,
+            "io": {
+              "rchar": 0,
+              "wchar": 9832274723,
+              "syscr": 0,
+              "syscw": 233256,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18442,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.563756,
+            "peak_rss_bytes": 480235520,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000895248,
+            "boundary_slack_secs": 0.0008952479999990715
+          }
+        ]
+      }
+    },
+    {
+      "protocol": "HTTP/1.1+TLS",
+      "target": "https://127.0.0.1:8443/echo",
+      "duration_secs": 30,
+      "concurrency": 50,
+      "total_requests": 1835,
+      "total_errors": 1,
+      "rps": 61.166666666666664,
+      "latency_avg_us": 788809,
+      "latency_stdev_us": 189119,
+      "latency_max_us": 1282047,
+      "p50_us": 809983,
+      "p75_us": 914943,
+      "p90_us": 1008127,
+      "p95_us": 1060863,
+      "p99_us": 1147903,
+      "total_bytes": 9620684800,
+      "throughput_mbps": 2565.515946666667,
+      "warmup_requests": 49,
+      "drain_requests": 49,
+      "drain_bytes": 256901120,
+      "phases": {
+        "setup_secs": 0.012203843,
+        "warmup_secs": 66.855950161,
+        "barrier_secs": 8e-8,
+        "measurement_secs": 30,
+        "measurement_elapsed_secs": 30.000457395,
+        "measurement_start_unix_secs": 1789737623.2795951,
+        "client_usage": {
+          "pid": 19007,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 34.744126,
+          "peak_rss_bytes": 450101248,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 30.000457395,
+          "boundary_slack_secs": 0.0004573950000015259
+        },
+        "h1_profile": {
+          "tls_records": 1178605,
+          "tls_record_bytes": 9686402681,
+          "tls_parse_errors": 0,
+          "body_data_frames": 1178605,
+          "body_data_bytes": 9655579527,
+          "chunked_responses": 1850,
+          "content_length_responses": 0
+        },
+        "drain_secs": 30.002068732,
+        "transport_close_secs": 0,
+        "transport_close_timed_out": false,
+        "preflight_bound_secs": 70,
+        "stalled_workers": [],
+        "timed_out": true
+      },
+      "observed": {
+        "samples": 2714,
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_connections": {
+          "min": 50,
+          "max": 50,
+          "mean": 50
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 50,
+          "mean": 49.97789240972737
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 1,
+          "mean": 0.0036845983787767247
+        },
+        "queue_time_ns": 87196725,
+        "admissions": 1885,
+        "workers_at_barrier": 50,
+        "workers_retired_before_deadline": 0
+      },
+      "gateway": "ferrum-exp-cutoff-one",
+      "payload_size": 5242880,
+      "effective_concurrency": 50,
+      "sample_schema": 2,
+      "pair": 2,
+      "order_position": 1,
+      "host_id": "1d9861a4-9ea3-4816-8319-a3bb5c028236",
+      "gateway_order": [
+        "ferrum-exp-cutoff-one",
+        "ferrum",
+        "direct"
+      ],
+      "process_usage": {
+        "scope": "sampler lifetime bracketing client setup, warmup, measurement and drain",
+        "interval_ms": 500,
+        "elapsed_secs": 127.28129495799976,
+        "capture_complete": true,
+        "processes": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "samples": 256,
+            "first_cpu_seconds": 239.63,
+            "cpu_seconds": 54.70999999999998,
+            "peak_rss_bytes": 126701568
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "samples": 256,
+            "first_cpu_seconds": 115.38,
+            "cpu_seconds": 32.83000000000001,
+            "peak_rss_bytes": 448733184
+          },
+          {
+            "pid": 19007,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.744126,
+            "peak_rss_bytes": 450101248,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000457395,
+            "boundary_slack_secs": 0.0004573950000015259
+          }
+        ],
+        "missing_pids": [],
+        "client_accounting": "getrusage(RUSAGE_SELF) at measurement boundaries",
+        "client_cpu_seconds": 34.744126,
+        "client_peak_rss_bytes": 450101248,
+        "measurement": [
+          {
+            "pid": 18655,
+            "role": "gateway",
+            "complete_bracket": true,
+            "peak_rss_bytes": 117211136,
+            "cpu_seconds": 53.25999999999996,
+            "bracket_secs": 30.602721691131592,
+            "boundary_slack_secs": 0.6027216911315918,
+            "io": {
+              "rchar": 43150,
+              "wchar": 19726112007,
+              "syscr": 255,
+              "syscw": 1205018,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 18599,
+            "role": "backend",
+            "complete_bracket": true,
+            "peak_rss_bytes": 448733184,
+            "cpu_seconds": 32.219999999999985,
+            "bracket_secs": 30.602721691131592,
+            "boundary_slack_secs": 0.6027216911315918,
+            "io": {
+              "rchar": 0,
+              "wchar": 9851332215,
+              "syscr": 0,
+              "syscw": 237582,
+              "read_bytes": 0,
+              "write_bytes": 0,
+              "cancelled_write_bytes": 0
+            }
+          },
+          {
+            "pid": 19007,
+            "role": "client",
+            "complete_bracket": true,
+            "cpu_seconds": 34.744126,
+            "peak_rss_bytes": 450101248,
+            "rss_scope": "process lifetime high-water mark at measurement end",
+            "bracket_secs": 30.000457395,
+            "boundary_slack_secs": 0.0004573950000015259
+          }
+        ]
+      }
+    }
+  ]
+}

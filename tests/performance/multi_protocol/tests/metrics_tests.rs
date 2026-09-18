@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 #[path = "../proto_bench.rs"]
 mod proto_bench;
 
+#[path = "support/h1_profile_tests.rs"]
+mod h1_profile_tests;
+
 #[test]
 fn worker_transport_close_timeouts_are_ored_without_counting_errors() {
     let mut combined = BenchMetrics::new();

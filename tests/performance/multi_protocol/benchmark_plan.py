@@ -10,6 +10,33 @@ from process_usage import measurement_usage
 from transport_diagnostics import annotate_experiment, measurement_threads, summarize_transport
 
 
+def ordered_gateways(gateways):
+    """Keep familiar table ordering without hiding branch-declared arms."""
+    gateways = set(gateways)
+    preferred = ("direct", "ferrum-baseline", "ferrum", "envoy", "kong", "tyk", "krakend")
+    return [gateway for gateway in preferred if gateway in gateways] + sorted(
+        gateways.difference(preferred))
+
+
+def normalize_artifact_layout(root, protocols, revision):
+    """download-artifact v8 extracts a single match directly into its root."""
+    root = Path(root)
+    flat_runs = sorted(path for path in root.glob("run_*") if path.is_dir())
+    if not flat_runs:
+        return
+    supported = {"http1-tls", "http2", "http3", "grpcs", "wss", "tcp-tls", "udp", "udp-dtls"}
+    if len(protocols) != 1 or protocols[0] not in supported:
+        raise ValueError("flat artifact layout requires exactly one selected protocol")
+    if not isinstance(revision, str) or len(revision) != 40 or any(
+            char not in "0123456789abcdef" for char in revision):
+        raise ValueError("invalid artifact revision")
+    destination = root / f"gateways-protocol-bench-{protocols[0]}-{revision}"
+    # Never merge/overwrite observations from two downloads with the same name.
+    destination.mkdir()
+    for path in flat_runs:
+        path.rename(destination / path.name)
+
+
 def stamp_sample(path, gateway, payload, concurrency, pair, position, host, usage_path, order):
     """Attach metadata and passive process observations after the client exits."""
     path = Path(path)

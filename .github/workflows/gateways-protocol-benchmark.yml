@@ -467,13 +467,14 @@ jobs:
           DURATION: ${{ inputs.duration }}
           CONCURRENCY: ${{ inputs.concurrency }}
           ITERATIONS: ${{ inputs.iterations }}
+          SKIP_PROTOCOLS: ${{ inputs.skip_protocols }}
         run: |
           python3 - <<'PYEOF'
           import os, json, glob, math, sys
           from pathlib import Path
           sys.path.insert(0, "tests/performance/multi_protocol")
           from benchmark_validity import bucket_issues, expected_rows, throughput_value
-          from benchmark_plan import protocol_runs, read_comparisons
+          from benchmark_plan import normalize_artifact_layout, ordered_gateways, protocol_runs, read_comparisons
 
           iterations = int(os.environ.get("ITERATIONS", "1"))
           root = Path("all-results")
@@ -481,6 +482,11 @@ jobs:
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                   f.write("# Gateways × Protocols Benchmark\n\n_No results collected._\n")
               raise SystemExit(0)
+
+          selected_protocols = [proto for proto in
+                                ("http1-tls", "http2", "http3", "grpcs", "wss", "tcp-tls", "udp", "udp-dtls")
+                                if proto not in os.environ["SKIP_PROTOCOLS"].split()]
+          normalize_artifact_layout(root, selected_protocols, os.environ["GITHUB_SHA"])
 
           # {protocol: {(gateway, size): [rps...]}}
           data = {}
@@ -570,9 +576,6 @@ jobs:
               if proto in unknown_plan_protocols:
                   continue
               for s in sizes:
-                  contenders = [(g, sum(buckets[(g, s)]) / len(buckets[(g, s)]))
-                                for g in ("ferrum-baseline", "ferrum", "envoy", "kong", "tyk", "krakend")
-                                if (g, s) in buckets and buckets[(g, s)]]
                   expected_gateways = {g for g, size in buckets
                                        if g != "direct" and size == s}
                   if len(expected_gateways) < 2:
@@ -583,6 +586,8 @@ jobs:
                          for g in expected_gateways):
                       invalid += 1
                       continue
+                  contenders = [(g, sum(buckets[(g, s)]) / len(buckets[(g, s)]))
+                                for g in ordered_gateways(expected_gateways)]
                   winner_gw, winner_rps = max(contenders, key=lambda x: x[1])
                   if sum(rps == winner_rps for _, rps in contenders) > 1:
                       tied += 1
@@ -618,8 +623,7 @@ jobs:
               buckets = data[proto]
               lines.append(f"\n## {proto}\n")
               sizes = sorted({s for (_, s) in buckets})
-              gateways = [g for g in ("direct", "ferrum-baseline", "ferrum", "envoy", "kong", "tyk", "krakend")
-                          if any((g, s) in buckets for s in sizes)]
+              gateways = ordered_gateways(g for g, size in buckets)
 
               lines.append("### Validity across all iterations\n")
               lines.append("| Gateway | Payload | Validity |")
