@@ -389,6 +389,76 @@ fn mesh_outbound_registry_metric_contract_matches_docs_and_help() {
 }
 
 #[tokio::test]
+async fn mesh_outbound_registry_direction_gate_precedes_registry_and_metrics() {
+    for ports in [vec![15008], vec![]] {
+        let scoped = !ports.is_empty();
+        let namespace = format!("registry-direction-gate-scoped-{scoped}");
+        let plugin = create_plugin(
+            "mesh_outbound_registry",
+            &json!({
+                "registry": [],
+                "outbound_listen_ports": ports,
+                "namespace": namespace,
+            }),
+        )
+        .expect("valid empty registry")
+        .expect("registered plugin");
+        assert_eq!(plugin.allows_hbone_inner_reuse(), scoped);
+
+        // Inbound bypasses even a matching scope and a missing Host. Neither
+        // registry membership nor the missing-header rejection may run.
+        for port in [Some(15008), Some(15006), None] {
+            for host in [Some("unknown.example:8080"), None] {
+                let mut ctx =
+                    RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
+                ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+                ctx.frontend_listen_port = port;
+                if let Some(host) = host {
+                    ctx.headers.insert("host".into(), host.into());
+                }
+                assert!(matches!(
+                    plugin.on_request_received(&mut ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+        }
+        let rendered =
+            ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+        assert!(
+            !rendered.contains(&format!("mesh_namespace=\"{namespace}\"")),
+            "skipped inbound requests must not record any registry decision"
+        );
+
+        // Outbound and non-mesh listeners retain the existing port gate. An
+        // unscoped Host allowlist enforces even without a known frontend port.
+        for direction in [Some(MeshTrafficDirection::Outbound), None] {
+            for port in [Some(15008), Some(15006), None] {
+                let mut ctx =
+                    RequestContext::new("127.0.0.1".into(), "CONNECT".into(), "/".into());
+                ctx.mesh_direction = direction;
+                ctx.frontend_listen_port = port;
+                ctx.headers.insert("host".into(), "unknown.example:8080".into());
+                let result = plugin.on_request_received(&mut ctx).await;
+                if !scoped || port == Some(15008) {
+                    assert!(
+                        matches!(
+                            result,
+                            PluginResult::Reject {
+                                status_code: 502,
+                                ..
+                            }
+                        ),
+                        "scope {ports:?}, direction {direction:?}, port {port:?}: {result:?}"
+                    );
+                } else {
+                    assert!(matches!(result, PluginResult::Continue));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn mesh_outbound_registry_metrics_classify_only_applicable_entries() {
     let cases = [
         (["api.example.com", "*.example.com:443"], true, false),

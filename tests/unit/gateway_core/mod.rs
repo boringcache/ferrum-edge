@@ -107,6 +107,7 @@ mod mesh_bpf_metrics_contract_tests;
 mod mesh_dual_stack_capture_tests;
 mod mesh_host_udp_capture_plan_tests;
 mod mesh_injector_ca_crd_helm_tests;
+mod mesh_listener_direction_ports_tests;
 mod mesh_pool_shared_creation_tests;
 mod mesh_revision_gate_tests;
 mod mesh_startup_rollback_tests;

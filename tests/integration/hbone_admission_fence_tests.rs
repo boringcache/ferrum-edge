@@ -3499,7 +3499,7 @@ fn assert_registry_only_gate_is_injected(config: &GatewayConfig) {
         row.config["outbound_listen_ports"],
         json!([REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT]),
         "the injected gate must be scoped to the OUTBOUND capture port; an unscoped instance \
-         would decide on the inbound HBONE listener too, and would then be right to refuse reuse"
+         keeps the fail-closed reuse classification because it enforces on non-mesh listeners"
     );
     assert_eq!(
         row.config["registry"],
@@ -3509,19 +3509,22 @@ fn assert_registry_only_gate_is_injected(config: &GatewayConfig) {
     );
 }
 
-/// Publishing `REGISTRY_ONLY` withdraws reuse even when its injected numeric
-/// port scope does not match this inbound listener.
+/// `REGISTRY_ONLY` must neither withhold inbound reuse nor revoke the tunnels
+/// that already have it.
 ///
-/// The scope cannot prove that another valid deployment will not use the same
-/// numeric port for inbound HBONE and outbound capture on different bind
-/// addresses. The registry membership decision is not re-issued by the fence,
-/// so the plugin must classify every instance fail-closed. The CONNECT remains
-/// admitted here because the gate does not apply on this listener, but it may
-/// not carry the reuse capability.
+/// The Global registry row enters the inbound admitting chain, but its first
+/// hook statement skips the Inbound direction before any registry lookup.
+/// A blanket `false` would withhold reuse and revoke live advertised tunnels
+/// even on disjoint ports. Both halves run through the production dispatcher:
+/// the live tunnel survives publication carrying bytes, and a fresh CONNECT is
+/// admitted AND advertised. The next test covers a colliding numeric scope.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_registry_only_publication_withdraws_inbound_reuse_fail_closed() {
+async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
     let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+
+    // ALLOW_ANY start, on the SAME runtime the publication uses, so the only
+    // delta between the two generations is the outbound traffic policy.
     let state = build_state(prepared_config_from_mesh_with_runtime(
         Some(backend_addr.port()),
         None,
@@ -3534,6 +3537,7 @@ async fn a_registry_only_publication_withdraws_inbound_reuse_fail_closed() {
     ));
     let (gateway_addr, shutdown_tx) =
         start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    assert_ne!(gateway_addr.port(), REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT);
     let (mut sender, conn_task) =
         connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
@@ -3541,7 +3545,8 @@ async fn a_registry_only_publication_withdraws_inbound_reuse_fail_closed() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         tunnel_reuse_advertisement(&response).as_deref(),
-        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED)
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "the ALLOW_ANY chain is the ordinary reusable one, or this test proves nothing"
     );
     let mut tunnel = Tunnel {
         request_body,
@@ -3562,25 +3567,112 @@ async fn a_registry_only_publication_withdraws_inbound_reuse_fail_closed() {
         ConfigApplyOutcome::Applied
     );
 
-    assert_tunnel_closed(&mut tunnel.response_body).await;
-    wait_for_no_live_tunnels(&state).await;
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        1,
+        "arming REGISTRY_ONLY must not revoke an inbound tunnel: the gate it installs answers \
+         `Continue` on the listener that terminated this CONNECT"
+    );
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0, 0, 0, 1, 0],
-        "the registry classification must withdraw reuse without treating the CONNECT as denied"
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "no reuse_withdrawn, and no refusal either"
     );
+    // Still carrying bytes, not merely still registered.
+    echo_round_trip(&mut tunnel, b"after-registry-only").await;
 
+    // And the capability survives into the new generation. The empty registry
+    // would refuse every destination if this gate decided inbound at all, so a
+    // 200 here is itself the proof that it did not.
     let (response, _request_body) = send_connect(&mut sender, None).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "the outbound-only gate must still leave this inbound CONNECT admitted"
+        "an outbound egress policy must not refuse an inbound CONNECT"
     );
     assert_eq!(
-        tunnel_reuse_advertisement(&response),
-        None,
-        "a scoped registry must fail closed because numeric scope cannot prove listener identity"
+        tunnel_reuse_advertisement(&response).as_deref(),
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+        "and it must not cost the new tunnel its capability either"
     );
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// A numeric scope that CONTAINS the actual HBONE listener port must still
+/// leave inbound CONNECTs admitted and reusable. No second socket is needed:
+/// the production gate sees exactly the colliding scope and stamped direction
+/// that same-port binds on distinct addresses used to produce. Startup now
+/// rejects that listener plan; this independently proves the request boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_colliding_registry_scope_skips_inbound_connects_and_advertises_reuse() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let mut runtime = registry_only_runtime();
+    runtime.outbound_listen_addr.set_port(gateway_addr.port());
+    let registry_only = prepared_config_from_mesh_with_runtime(
+        Some(backend_addr.port()),
+        None,
+        registry_only_mesh(),
+        Vec::new(),
+        runtime,
+    );
+    let row = registry_only
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_outbound_registry")
+        .expect("a nonzero outbound scope must inject the registry");
+    assert!(row.enabled);
+    assert_eq!(row.scope, PluginScope::Global);
+    assert_eq!(
+        row.config["outbound_listen_ports"],
+        json!([gateway_addr.port()])
+    );
+    assert_eq!(row.config["registry"], json!([]));
+
+    // Re-publish the same collision as an operator-managed global as well.
+    // This proves the boundary does not depend on an auto-injected row id.
+    let mut operator_row = row.clone();
+    operator_row.id = "operator-colliding-outbound-registry".to_string();
+    let operator_config = prepared_config_with(
+        Some(backend_addr.port()),
+        None,
+        vec![allow_client()],
+        vec![operator_row],
+    );
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+    for config in [registry_only, operator_config] {
+        assert_eq!(state.update_config(config), ConfigApplyOutcome::Applied);
+        wait_for_settled_sweeps(&state).await;
+        let (response, request_body) = send_connect(&mut sender, None).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an empty registry would reject this CONNECT if the matching port armed enforcement"
+        );
+        assert_eq!(
+            tunnel_reuse_advertisement(&response).as_deref(),
+            Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
+            "the Inbound direction gate makes a colliding scoped instance reusable"
+        );
+        let mut tunnel = Tunnel {
+            request_body,
+            response_body: response.into_body(),
+        };
+        echo_round_trip(&mut tunnel, b"inbound-with-colliding-registry-port").await;
+        assert_eq!(revocation_counts(&state), [0; 9]);
+    }
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
