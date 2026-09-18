@@ -8451,7 +8451,9 @@ enum CopyReadOutcome {
 /// the sentinel keeps that explicit instead of resting on the caller's
 /// history.
 fn begin_half_close(state: &mut CopyDirectionState, write_watermark: Option<&AtomicU64>) {
-    if !state.needs_flush && let Some(wm) = write_watermark {
+    if !state.needs_flush
+        && let Some(wm) = write_watermark
+    {
         wm.store(u64::MAX, Ordering::Relaxed);
     }
     state.phase = CopyPhase::ShuttingDown;
