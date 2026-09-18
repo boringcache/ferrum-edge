@@ -420,8 +420,9 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
 
 ### H2/gRPC transport observation campaign (#5588, section 3)
 
-This is a **planned diagnostic experiment, with no new measured results**. The
-adaptive-window explanation remains a hypothesis. Hosted run
+The [completed four-pair campaign](../../../docs/benchmark_h2_grpc_2026_09_18.md)
+reproduces adaptive H2 and gRPC failures; the exact triggering counter and a
+production repair remain unproved. Earlier hosted run
 [35348523042](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35348523042)
 measured `cdac4e06b09416f531935d429c1ccfeec2dad39f`, including #5598 and #5599,
 with an unconditional `FERRUM_LOG_LEVEL=warn` overlay. Three H2/70 KiB samples
@@ -434,8 +435,9 @@ historical 10/70 KiB failures. The later `d302bfb05` refusal-body snippet and
 overlay and its duplicate parser are removed; its artifact provenance remains
 part of this history.
 
-`experiment.json` enables this campaign for the pending hosted investigation.
-Disable it after preserving the results. Use the existing
+`experiment.json` is disabled after preserving the campaign results. To
+reproduce the controlled observation on a diagnostic branch, explicitly enable
+that manifest and use the existing
 `gateways-protocol-benchmark.yml` dispatch inputs:
 
 | Input | Exact value |
@@ -537,8 +539,11 @@ capture, client/backend event-log truncation, captured client/backend transport
 errors or an incomplete H2 driver observation. Inspect every repetition, including
 warmup/drain failures and clean controls; bounded logs or zero observed events
 are not proof of zero transport faults. Do not average surviving workers into a
-performance win. The next investigation is to compare failure incidence/reasons
-and observed occupancy between the two effective settings. GOAWAY debug subtype,
+performance win. The [recorded hosted campaign](../../../docs/benchmark_h2_grpc_2026_09_18.md)
+reproduces adaptive H2 and gRPC failures and rejects a throughput-win claim.
+The manifest is disabled after that campaign. Further diagnosis must compare
+failure reasons and observed occupancy between the two effective settings.
+The H2 backend log identifies `too_many_data_frames`; the gRPC debug subtype,
 DATA-length/END_STREAM distributions, per-backend active streams, tonic backend
 driver results and exact cross-hop identity remain gaps. Add narrower observation
 only if the captured reasons require it; no production fix is justified here.

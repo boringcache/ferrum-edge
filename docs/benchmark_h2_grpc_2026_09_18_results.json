@@ -1,0 +1,6481 @@
+{
+  "run_id": 35393243172,
+  "commit": "d4d7b7c7110c48cf3945837cb0762e489f52a8f4",
+  "run_url": "https://github.com/ferrum-edge/ferrum-edge/actions/runs/35393243172",
+  "duration_secs": 15,
+  "offered_workers": 200,
+  "canonical_samples": "run_1/pairs/pair_*/*.json; root run_1 sample files are duplicate final-pair copies",
+  "protocols": {
+    "http2": {
+      "manifest": {
+        "gateways": [
+          "direct",
+          "ferrum",
+          "ferrum-exp-fixed"
+        ],
+        "payload_sizes": [
+          71680
+        ],
+        "pairs": 4,
+        "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+        "h2_observation_enabled": true,
+        "sample_schema": 2,
+        "effective_h2_arms": {
+          "ferrum": {
+            "protocol": "http2",
+            "environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "true",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000"
+            },
+            "settings": {
+              "adaptive_window": true,
+              "configured_stream_window": 8388608,
+              "configured_connection_window": 33554432,
+              "builder_initial_stream_window": 65535,
+              "builder_initial_connection_window": 65535,
+              "max_frame_size": 1048576,
+              "max_concurrent_streams": 1000,
+              "configured_pool_shards": 16,
+              "provenance": "verified route plus pinned Hyper builder semantics; not negotiated observations"
+            },
+            "route_sha256": "e276a5912c87dbfab9460b6ae7029672de27869d68a04a6c3ff379a15f9866a0",
+            "route_config": "ferrum_config.yaml",
+            "verified_container_environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "true",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000",
+              "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST": "16",
+              "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE": "8388608",
+              "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE": "33554432",
+              "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE": "1048576",
+              "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES": "0"
+            },
+            "image_id": "sha256:a3eeee033d464190ff08182c267aa2203b97e2977273bb8c53f6ccaa354767fb"
+          },
+          "ferrum-exp-fixed": {
+            "protocol": "http2",
+            "environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "false",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000"
+            },
+            "settings": {
+              "adaptive_window": false,
+              "configured_stream_window": 8388608,
+              "configured_connection_window": 33554432,
+              "builder_initial_stream_window": 8388608,
+              "builder_initial_connection_window": 33554432,
+              "max_frame_size": 1048576,
+              "max_concurrent_streams": 1000,
+              "configured_pool_shards": 16,
+              "provenance": "verified route plus pinned Hyper builder semantics; not negotiated observations"
+            },
+            "route_sha256": "11317c938790e9ac60d12587dabeed32c6fb9ee8b5001205c4a26a7e1704e41e",
+            "route_config": "ferrum-exp-fixed_config.yaml",
+            "verified_container_environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "false",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000",
+              "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST": "16",
+              "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE": "8388608",
+              "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE": "33554432",
+              "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE": "1048576",
+              "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES": "0"
+            },
+            "image_id": "sha256:a3eeee033d464190ff08182c267aa2203b97e2977273bb8c53f6ccaa354767fb"
+          }
+        },
+        "extend": false,
+        "extension_skipped": "disabled",
+        "projected_wallclock_secs": 1045.0,
+        "wallclock_budget_secs": 4200,
+        "adaptive_extension": false
+      },
+      "position_balance": [
+        {
+          "gateway": "direct",
+          "positions": [
+            1,
+            3,
+            3,
+            1
+          ],
+          "mean_position": 2
+        },
+        {
+          "gateway": "ferrum",
+          "positions": [
+            2,
+            2,
+            1,
+            3
+          ],
+          "mean_position": 2
+        },
+        {
+          "gateway": "ferrum-exp-fixed",
+          "positions": [
+            3,
+            1,
+            2,
+            2
+          ],
+          "mean_position": 2
+        }
+      ],
+      "paired_comparisons": [
+        {
+          "expected_pairs": 4,
+          "accepted": false,
+          "reason": "invalid pair",
+          "baseline": "direct",
+          "candidate": "ferrum",
+          "payload_size": 71680
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": false,
+          "reason": "invalid pair",
+          "baseline": "direct",
+          "candidate": "ferrum-exp-fixed",
+          "payload_size": 71680
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": false,
+          "reason": "invalid pair",
+          "baseline": "ferrum",
+          "candidate": "ferrum-exp-fixed",
+          "payload_size": 71680
+        }
+      ],
+      "hosted_job_id": 105756162818,
+      "hardware": {
+        "visible_cpus": 4,
+        "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+        "hypervisor": "Microsoft",
+        "reported_memory": "15Gi",
+        "runner_image": "ubuntu24",
+        "runner_image_version": "20260907.300.1",
+        "initial_cpu_steal_percent": 0.0
+      }
+    },
+    "grpcs": {
+      "manifest": {
+        "gateways": [
+          "direct",
+          "ferrum",
+          "ferrum-exp-fixed"
+        ],
+        "payload_sizes": [
+          10240,
+          71680
+        ],
+        "pairs": 4,
+        "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+        "h2_observation_enabled": true,
+        "sample_schema": 2,
+        "effective_h2_arms": {
+          "ferrum": {
+            "protocol": "grpcs",
+            "environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "true",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000"
+            },
+            "settings": {
+              "adaptive_window": true,
+              "configured_stream_window": 8388608,
+              "configured_connection_window": 33554432,
+              "builder_initial_stream_window": 65535,
+              "builder_initial_connection_window": 65535,
+              "max_frame_size": 1048576,
+              "max_concurrent_streams": 1000,
+              "configured_pool_shards": 16,
+              "provenance": "verified route plus pinned Hyper builder semantics; not negotiated observations"
+            },
+            "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc",
+            "route_config": "ferrum_config.yaml",
+            "verified_container_environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "true",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000",
+              "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST": "16",
+              "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE": "8388608",
+              "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE": "33554432",
+              "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE": "1048576",
+              "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES": "0"
+            },
+            "image_id": "sha256:748ade80e0fa2b064b2eedfc99b89f05fcbb4d5a2100dd13087ba3dd4a64b205"
+          },
+          "ferrum-exp-fixed": {
+            "protocol": "grpcs",
+            "environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "false",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000"
+            },
+            "settings": {
+              "adaptive_window": false,
+              "configured_stream_window": 8388608,
+              "configured_connection_window": 33554432,
+              "builder_initial_stream_window": 8388608,
+              "builder_initial_connection_window": 33554432,
+              "max_frame_size": 1048576,
+              "max_concurrent_streams": 1000,
+              "configured_pool_shards": 16,
+              "provenance": "verified route plus pinned Hyper builder semantics; not negotiated observations"
+            },
+            "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982",
+            "route_config": "ferrum-exp-fixed_config.yaml",
+            "verified_container_environment": {
+              "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW": "false",
+              "FERRUM_LOG_LEVEL": "warn,ferrum_h2_observe=debug",
+              "FERRUM_METRICS_ALLOWED_CIDRS": "127.0.0.1/32",
+              "FERRUM_ADMIN_HTTP_PORT": "9000",
+              "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST": "16",
+              "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE": "8388608",
+              "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE": "33554432",
+              "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE": "1048576",
+              "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS": "1000",
+              "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES": "0"
+            },
+            "image_id": "sha256:748ade80e0fa2b064b2eedfc99b89f05fcbb4d5a2100dd13087ba3dd4a64b205"
+          }
+        },
+        "extend": false,
+        "extension_skipped": "disabled",
+        "projected_wallclock_secs": 1724.0,
+        "wallclock_budget_secs": 4200,
+        "adaptive_extension": false
+      },
+      "position_balance": [
+        {
+          "gateway": "direct",
+          "positions": [
+            1,
+            3,
+            3,
+            1
+          ],
+          "mean_position": 2
+        },
+        {
+          "gateway": "ferrum",
+          "positions": [
+            2,
+            2,
+            1,
+            3
+          ],
+          "mean_position": 2
+        },
+        {
+          "gateway": "ferrum-exp-fixed",
+          "positions": [
+            3,
+            1,
+            2,
+            2
+          ],
+          "mean_position": 2
+        }
+      ],
+      "paired_comparisons": [
+        {
+          "expected_pairs": 4,
+          "accepted": true,
+          "ratio": 0.3520648486114064,
+          "ci95_low": 0.3068850230735141,
+          "ci95_high": 0.4038960793406997,
+          "needs_more_measurement": false,
+          "reason": "paired interval",
+          "baseline": "direct",
+          "candidate": "ferrum",
+          "payload_size": 10240
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": false,
+          "reason": "invalid pair",
+          "baseline": "direct",
+          "candidate": "ferrum",
+          "payload_size": 71680
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": true,
+          "ratio": 0.36306828826681276,
+          "ci95_low": 0.3444761692948197,
+          "ci95_high": 0.38266386384532913,
+          "needs_more_measurement": false,
+          "reason": "paired interval",
+          "baseline": "direct",
+          "candidate": "ferrum-exp-fixed",
+          "payload_size": 10240
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": true,
+          "ratio": 0.4671838210281067,
+          "ci95_low": 0.44458282381548725,
+          "ci95_high": 0.49093377192863746,
+          "needs_more_measurement": false,
+          "reason": "paired interval",
+          "baseline": "direct",
+          "candidate": "ferrum-exp-fixed",
+          "payload_size": 71680
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": true,
+          "ratio": 1.031254013852293,
+          "ci95_low": 0.9267367124750517,
+          "ci95_high": 1.147558769141883,
+          "needs_more_measurement": true,
+          "reason": "uncertainty overlaps no gain",
+          "baseline": "ferrum",
+          "candidate": "ferrum-exp-fixed",
+          "payload_size": 10240
+        },
+        {
+          "expected_pairs": 4,
+          "accepted": false,
+          "reason": "invalid pair",
+          "baseline": "ferrum",
+          "candidate": "ferrum-exp-fixed",
+          "payload_size": 71680
+        }
+      ],
+      "hosted_job_id": 105756162959,
+      "hardware": {
+        "visible_cpus": 4,
+        "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+        "hypervisor": "Microsoft",
+        "reported_memory": "15Gi",
+        "runner_image": "ubuntu24",
+        "runner_image_version": "20260907.300.1",
+        "initial_cpu_steal_percent": 0.0
+      }
+    }
+  },
+  "rows": [
+    {
+      "protocol": "HTTP/2",
+      "gateway": "direct",
+      "pair": 1,
+      "payload_size": 71680,
+      "total_requests": 203405,
+      "total_errors": 0,
+      "total_bytes": 14580070400,
+      "rps": 13560.333333333334,
+      "p50_us": 13407,
+      "p99_us": 45183,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_001/direct_http2_71680.json",
+      "sample_sha256": "c713bf0bad8169c76eefb02acec4529f730657e37da58c031db5521e4938d257",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 199,
+          "mean": 170.02166934189395
+        },
+        "queued_requests": {
+          "min": 1,
+          "max": 103,
+          "mean": 29.817014446227923
+        },
+        "queue_time_ns": 437689841479,
+        "admissions": 203605,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766497.7969902,
+        "warmup_start_monotonic_secs": 0.029300043,
+        "measurement_start_monotonic_secs": 0.057976535,
+        "drain_start_monotonic_secs": 15.059162345,
+        "transport_close_start_monotonic_secs": 15.072308873,
+        "setup_secs": 0.029300434,
+        "warmup_secs": 0.027592895,
+        "barrier_secs": 0.001083126,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001177407,
+        "measurement_start_unix_secs": 1789766497.8549666,
+        "drain_secs": 0.013129993,
+        "transport_close_secs": 0.000890485,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17322,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 26288128,
+          "cpu_seconds": 27.080000000000002,
+          "bracket_secs": 15.572100400924683,
+          "boundary_slack_secs": 0.5721004009246826,
+          "io": {
+            "rchar": 1,
+            "wchar": 14637949313,
+            "syscr": 1,
+            "syscw": 430371,
+            "read_bytes": 0,
+            "write_bytes": 8192,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17341,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 30.918966,
+          "peak_rss_bytes": 56774656,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001177407,
+          "boundary_slack_secs": 0.0011774070000001302
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "setup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 1,
+      "payload_size": 71680,
+      "total_requests": 61519,
+      "total_errors": 0,
+      "total_bytes": 4409681920,
+      "rps": 4101.266666666666,
+      "p50_us": 48415,
+      "p99_us": 72319,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_001/ferrum-exp-fixed_http2_71680.json",
+      "sample_sha256": "ffab5f80f0fa3460dd6127f2a234b00ca3ce1ae14a3174c1ca573830c2a10cb4",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 197.93995381062336
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 22,
+          "mean": 1.9083910700538884
+        },
+        "queue_time_ns": 35412641609,
+        "admissions": 61719,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766537.2615795,
+        "warmup_start_monotonic_secs": 0.031480302,
+        "measurement_start_monotonic_secs": 0.1194117,
+        "drain_start_monotonic_secs": 15.121480556,
+        "transport_close_start_monotonic_secs": 15.138911195,
+        "setup_secs": 0.031480592,
+        "warmup_secs": 0.08684088,
+        "barrier_secs": 0.001090247,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.002058972,
+        "measurement_start_unix_secs": 1789766537.3809912,
+        "drain_secs": 0.017413042,
+        "transport_close_secs": 0.000863374,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17633,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 172630016,
+          "cpu_seconds": 24.13,
+          "bracket_secs": 15.187287092208862,
+          "boundary_slack_secs": 0.1872870922088623,
+          "io": {
+            "rchar": 20894,
+            "wchar": 8906276506,
+            "syscr": 127,
+            "syscw": 516187,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17577,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 38248448,
+          "cpu_seconds": 12.56,
+          "bracket_secs": 15.187287092208862,
+          "boundary_slack_secs": 0.1872870922088623,
+          "io": {
+            "rchar": 1,
+            "wchar": 4447320193,
+            "syscr": 1,
+            "syscw": 174597,
+            "read_bytes": 0,
+            "write_bytes": 12288,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17709,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.846227,
+          "peak_rss_bytes": 49311744,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.002058972,
+          "boundary_slack_secs": 0.002058972000000381
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 22
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 19
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "11317c938790e9ac60d12587dabeed32c6fb9ee8b5001205c4a26a7e1704e41e"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum",
+      "pair": 1,
+      "payload_size": 71680,
+      "total_requests": 57600,
+      "total_errors": 361,
+      "total_bytes": 4128768000,
+      "rps": 3840.0,
+      "p50_us": 36543,
+      "p99_us": 67839,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_001/ferrum_http2_71680.json",
+      "sample_sha256": "2771f40836bb43a858f223bcc9ca21eb754127e2291eea908212bdfc22b85f22",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 149,
+          "max": 200,
+          "mean": 149.54816513761466
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 148.31498470948
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 34,
+          "mean": 1.0818042813455646
+        },
+        "queue_time_ns": 24298691869,
+        "admissions": 58110,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 51
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766517.4004648,
+        "warmup_start_monotonic_secs": 0.030947284,
+        "measurement_start_monotonic_secs": 0.133579634,
+        "drain_start_monotonic_secs": 15.135667334,
+        "transport_close_start_monotonic_secs": 15.157884879,
+        "setup_secs": 0.030947624,
+        "warmup_secs": 0.101531718,
+        "barrier_secs": 0.001100211,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.002077044,
+        "measurement_start_unix_secs": 1789766517.5340443,
+        "drain_secs": 0.022194641,
+        "transport_close_secs": 0.001073652,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 404,
+        "transport_errors_total": 310,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17412,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 148828160,
+          "cpu_seconds": 23.54,
+          "bracket_secs": 15.180736303329468,
+          "boundary_slack_secs": 0.18073630332946777,
+          "io": {
+            "rchar": 20875,
+            "wchar": 8361081111,
+            "syscr": 127,
+            "syscw": 476994,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17356,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 33054720,
+          "cpu_seconds": 11.9,
+          "bracket_secs": 15.180736303329468,
+          "boundary_slack_secs": 0.18073630332946777,
+          "io": {
+            "rchar": 1,
+            "wchar": 4162854231,
+            "syscr": 1,
+            "syscw": 159765,
+            "read_bytes": 0,
+            "write_bytes": 53248,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17494,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.176081,
+          "peak_rss_bytes": 43974656,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.002077044,
+          "boundary_slack_secs": 0.0020770439999999724
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "measurement",
+            "client_h2",
+            "response_body_error",
+            11,
+            "reset",
+            "remote"
+          ],
+          "count": 310
+        },
+        {
+          "key": [
+            "measurement",
+            "client_h2",
+            "response_validation_failed",
+            null,
+            null,
+            null
+          ],
+          "count": 51
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 45
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 44
+        },
+        {
+          "key": [
+            "measurement",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 45
+        },
+        {
+          "key": [
+            "measurement",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 46
+        },
+        {
+          "key": [
+            "measurement",
+            "driver_terminated",
+            11,
+            "goaway",
+            "remote"
+          ],
+          "count": 1
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 85
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 20
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "unclassified",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 1
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "e276a5912c87dbfab9460b6ae7029672de27869d68a04a6c3ff379a15f9866a0"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "direct",
+      "pair": 2,
+      "payload_size": 71680,
+      "total_requests": 212909,
+      "total_errors": 0,
+      "total_bytes": 15261317120,
+      "rps": 14193.933333333332,
+      "p50_us": 13023,
+      "p99_us": 38559,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_002/direct_http2_71680.json",
+      "sample_sha256": "ae345e12bb211b6dbffabe072a3f39c891d8106f194673333dbcda1c70b59d95",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 170.96437054631798
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 113,
+          "mean": 28.874901029295305
+        },
+        "queue_time_ns": 417284071411,
+        "admissions": 213109,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766594.4257185,
+        "warmup_start_monotonic_secs": 0.031543494,
+        "measurement_start_monotonic_secs": 0.059580681,
+        "drain_start_monotonic_secs": 15.061545481,
+        "transport_close_start_monotonic_secs": 15.071546098,
+        "setup_secs": 0.031543985,
+        "warmup_secs": 0.026951628,
+        "barrier_secs": 0.001085079,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001956467,
+        "measurement_start_unix_secs": 1789766594.485299,
+        "drain_secs": 0.009981648,
+        "transport_close_secs": 0.000830599,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18212,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 24121344,
+          "cpu_seconds": 28.34,
+          "bracket_secs": 15.57279658317566,
+          "boundary_slack_secs": 0.5727965831756592,
+          "io": {
+            "rchar": 1,
+            "wchar": 15320515529,
+            "syscr": 1,
+            "syscw": 449779,
+            "read_bytes": 0,
+            "write_bytes": 8192,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18231,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 30.720436,
+          "peak_rss_bytes": 56647680,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001956467,
+          "boundary_slack_secs": 0.0019564669999994067
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "setup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 1
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 2,
+      "payload_size": 71680,
+      "total_requests": 64081,
+      "total_errors": 0,
+      "total_bytes": 4593326080,
+      "rps": 4272.066666666667,
+      "p50_us": 46463,
+      "p99_us": 68095,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_002/ferrum-exp-fixed_http2_71680.json",
+      "sample_sha256": "e6fbd408a1eea693f88580041b81e70ef3cca7678acfe9e25fab5e50e4f245c0",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 197.3405740884407
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 56,
+          "mean": 2.5058184639255194
+        },
+        "queue_time_ns": 44647516399,
+        "admissions": 64281,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766556.6376505,
+        "warmup_start_monotonic_secs": 0.031866023,
+        "measurement_start_monotonic_secs": 0.128228588,
+        "drain_start_monotonic_secs": 15.130492009,
+        "transport_close_start_monotonic_secs": 15.160226046,
+        "setup_secs": 0.031866283,
+        "warmup_secs": 0.095269024,
+        "barrier_secs": 0.00109297,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.002253716,
+        "measurement_start_unix_secs": 1789766556.7658792,
+        "drain_secs": 0.029715219,
+        "transport_close_secs": 0.000905758,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17850,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 178364416,
+          "cpu_seconds": 24.259999999999998,
+          "bracket_secs": 15.155457496643066,
+          "boundary_slack_secs": 0.1554574966430664,
+          "io": {
+            "rchar": 20893,
+            "wchar": 9257233213,
+            "syscr": 127,
+            "syscw": 520927,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17792,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 38203392,
+          "cpu_seconds": 12.33,
+          "bracket_secs": 15.155457496643066,
+          "boundary_slack_secs": 0.1554574966430664,
+          "io": {
+            "rchar": 1,
+            "wchar": 4617888367,
+            "syscr": 1,
+            "syscw": 180658,
+            "read_bytes": 0,
+            "write_bytes": 32768,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17926,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.949623,
+          "peak_rss_bytes": 49815552,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.002253716,
+          "boundary_slack_secs": 0.0022537160000002388
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 55
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 54
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 54
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "11317c938790e9ac60d12587dabeed32c6fb9ee8b5001205c4a26a7e1704e41e"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum",
+      "pair": 2,
+      "payload_size": 71680,
+      "total_requests": 62031,
+      "total_errors": 0,
+      "total_bytes": 4446382080,
+      "rps": 4135.4,
+      "p50_us": 48287,
+      "p99_us": 71551,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_002/ferrum_http2_71680.json",
+      "sample_sha256": "d472dce8968e531f6d8f9a1869386cce412dc2d5482f19cd1b3c951f11467c15",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 198.10999999999993
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 34,
+          "mean": 1.7369230769230775
+        },
+        "queue_time_ns": 33588697424,
+        "admissions": 62231,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766576.4075437,
+        "warmup_start_monotonic_secs": 0.031660773,
+        "measurement_start_monotonic_secs": 0.14201338,
+        "drain_start_monotonic_secs": 15.144611459,
+        "transport_close_start_monotonic_secs": 15.169396305,
+        "setup_secs": 0.031661224,
+        "warmup_secs": 0.109257152,
+        "barrier_secs": 0.001094934,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.00259171,
+        "measurement_start_unix_secs": 1789766576.549557,
+        "drain_secs": 0.024767128,
+        "transport_close_secs": 0.001051107,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18060,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 163147776,
+          "cpu_seconds": 24.24,
+          "bracket_secs": 15.672849893569946,
+          "boundary_slack_secs": 0.6728498935699463,
+          "io": {
+            "rchar": 22248,
+            "wchar": 8980383158,
+            "syscr": 135,
+            "syscw": 525052,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18004,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 40321024,
+          "cpu_seconds": 13.110000000000001,
+          "bracket_secs": 15.672849893569946,
+          "boundary_slack_secs": 0.6728498935699463,
+          "io": {
+            "rchar": 1,
+            "wchar": 4484221833,
+            "syscr": 1,
+            "syscw": 175570,
+            "read_bytes": 0,
+            "write_bytes": 32768,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18134,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.984252999999999,
+          "peak_rss_bytes": 48381952,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.00259171,
+          "boundary_slack_secs": 0.002591710000000802
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 55
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 54
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 53
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "e276a5912c87dbfab9460b6ae7029672de27869d68a04a6c3ff379a15f9866a0"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "direct",
+      "pair": 3,
+      "payload_size": 71680,
+      "total_requests": 193008,
+      "total_errors": 0,
+      "total_bytes": 13834813440,
+      "rps": 12867.2,
+      "p50_us": 14687,
+      "p99_us": 35711,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_003/direct_http2_71680.json",
+      "sample_sha256": "41f9daa0961cb9541122477d2007f39419c9d36a24ac4c385a5de7b1de980ffa",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 173.07228915662665
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 108,
+          "mean": 26.76947791164658
+        },
+        "queue_time_ns": 391127708703,
+        "admissions": 193208,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766651.9343793,
+        "warmup_start_monotonic_secs": 0.030610543,
+        "measurement_start_monotonic_secs": 0.061540879,
+        "drain_start_monotonic_secs": 15.064168311,
+        "transport_close_start_monotonic_secs": 15.073145131,
+        "setup_secs": 0.030610604,
+        "warmup_secs": 0.02984734,
+        "barrier_secs": 0.001082745,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.002618939,
+        "measurement_start_unix_secs": 1789766651.9959202,
+        "drain_secs": 0.008952032,
+        "transport_close_secs": 0.00055944,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18676,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 23654400,
+          "cpu_seconds": 27.44,
+          "bracket_secs": 15.575976133346558,
+          "boundary_slack_secs": 0.5759761333465576,
+          "io": {
+            "rchar": 1,
+            "wchar": 13890949548,
+            "syscr": 1,
+            "syscw": 403217,
+            "read_bytes": 0,
+            "write_bytes": 8192,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18695,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.022265,
+          "peak_rss_bytes": 56954880,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.002618939,
+          "boundary_slack_secs": 0.0026189389999995427
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "setup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 3,
+      "payload_size": 71680,
+      "total_requests": 55592,
+      "total_errors": 0,
+      "total_bytes": 3984834560,
+      "rps": 3706.133333333333,
+      "p50_us": 53087,
+      "p99_us": 73983,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_003/ferrum-exp-fixed_http2_71680.json",
+      "sample_sha256": "4bc2f0d101a85703e12846d904f751a793a91eacfd89602929adf4b46e896a5c",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 199.07212622088676
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 32,
+          "mean": 0.7783621337340337
+        },
+        "queue_time_ns": 18156492354,
+        "admissions": 55792,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766633.8950748,
+        "warmup_start_monotonic_secs": 0.031502902,
+        "measurement_start_monotonic_secs": 0.122751717,
+        "drain_start_monotonic_secs": 15.123665401,
+        "transport_close_start_monotonic_secs": 15.163571064,
+        "setup_secs": 0.031503283,
+        "warmup_secs": 0.090151988,
+        "barrier_secs": 0.001096336,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.000903479,
+        "measurement_start_unix_secs": 1789766634.0178266,
+        "drain_secs": 0.039879293,
+        "transport_close_secs": 0.00116522,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18521,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 173629440,
+          "cpu_seconds": 24.66,
+          "bracket_secs": 15.152219295501709,
+          "boundary_slack_secs": 0.15221929550170898,
+          "io": {
+            "rchar": 20904,
+            "wchar": 8035863137,
+            "syscr": 127,
+            "syscw": 478370,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18461,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 52752384,
+          "cpu_seconds": 12.58,
+          "bracket_secs": 15.152219295501709,
+          "boundary_slack_secs": 0.15221929550170898,
+          "io": {
+            "rchar": 1,
+            "wchar": 4009747978,
+            "syscr": 1,
+            "syscw": 168968,
+            "read_bytes": 0,
+            "write_bytes": 24576,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18593,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.34751,
+          "peak_rss_bytes": 48345088,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.000903479,
+          "boundary_slack_secs": 0.0009034789999997628
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 43
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 42
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 41
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "11317c938790e9ac60d12587dabeed32c6fb9ee8b5001205c4a26a7e1704e41e"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum",
+      "pair": 3,
+      "payload_size": 71680,
+      "total_requests": 61197,
+      "total_errors": 0,
+      "total_bytes": 4386600960,
+      "rps": 4079.8,
+      "p50_us": 48351,
+      "p99_us": 76863,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_003/ferrum_http2_71680.json",
+      "sample_sha256": "52deeab2c22e6ab9cae656707666f4393f012531be2e8e14535bb1e8a4c0ad18",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 197.92455735180917
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 27,
+          "mean": 1.921478060046188
+        },
+        "queue_time_ns": 37236028236,
+        "admissions": 61397,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766614.083611,
+        "warmup_start_monotonic_secs": 0.028739448,
+        "measurement_start_monotonic_secs": 0.147913427,
+        "drain_start_monotonic_secs": 15.150286631,
+        "transport_close_start_monotonic_secs": 15.175042772,
+        "setup_secs": 0.028739718,
+        "warmup_secs": 0.118090764,
+        "barrier_secs": 0.001082886,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.00236396,
+        "measurement_start_unix_secs": 1789766614.2315245,
+        "drain_secs": 0.024737824,
+        "transport_close_secs": 0.000727679,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18306,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 166776832,
+          "cpu_seconds": 23.349999999999998,
+          "bracket_secs": 15.175069332122803,
+          "boundary_slack_secs": 0.17506933212280273,
+          "io": {
+            "rchar": 20895,
+            "wchar": 8842366851,
+            "syscr": 127,
+            "syscw": 512456,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18249,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 43597824,
+          "cpu_seconds": 12.870000000000001,
+          "bracket_secs": 15.175069332122803,
+          "boundary_slack_secs": 0.17506933212280273,
+          "io": {
+            "rchar": 1,
+            "wchar": 4412955351,
+            "syscr": 1,
+            "syscw": 177793,
+            "read_bytes": 0,
+            "write_bytes": 49152,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18383,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.433538,
+          "peak_rss_bytes": 48623616,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.00236396,
+          "boundary_slack_secs": 0.002363960000000276
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 89
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 88
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 84
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "e276a5912c87dbfab9460b6ae7029672de27869d68a04a6c3ff379a15f9866a0"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "direct",
+      "pair": 4,
+      "payload_size": 71680,
+      "total_requests": 193128,
+      "total_errors": 0,
+      "total_bytes": 13843415040,
+      "rps": 12875.2,
+      "p50_us": 14823,
+      "p99_us": 34751,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_004/direct_http2_71680.json",
+      "sample_sha256": "bfc9c69649e04dd8143df6fb37c4913627999e283e081929543b21c2ec12725a",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 172.3008849557518
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 125,
+          "mean": 27.54062751407882
+        },
+        "queue_time_ns": 408796604079,
+        "admissions": 193328,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 5e-08,
+        "setup_start_unix_secs": 1789766669.8563108,
+        "warmup_start_monotonic_secs": 0.030297964,
+        "measurement_start_monotonic_secs": 0.060037565,
+        "drain_start_monotonic_secs": 15.061438979,
+        "transport_close_start_monotonic_secs": 15.071237609,
+        "setup_secs": 0.030298285,
+        "warmup_secs": 0.028652539,
+        "barrier_secs": 0.001086732,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001393882,
+        "measurement_start_unix_secs": 1789766669.9163485,
+        "drain_secs": 0.009777058,
+        "transport_close_secs": 0.000440055,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18714,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 26103808,
+          "cpu_seconds": 27.5,
+          "bracket_secs": 15.570188045501709,
+          "boundary_slack_secs": 0.570188045501709,
+          "io": {
+            "rchar": 1,
+            "wchar": 13899532932,
+            "syscr": 1,
+            "syscw": 400581,
+            "read_bytes": 0,
+            "write_bytes": 8192,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18733,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.231373,
+          "peak_rss_bytes": 58900480,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001393882,
+          "boundary_slack_secs": 0.001393882000000346
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "setup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 4,
+      "payload_size": 71680,
+      "total_requests": 56274,
+      "total_errors": 0,
+      "total_bytes": 4033720320,
+      "rps": 3751.6,
+      "p50_us": 51743,
+      "p99_us": 74303,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_004/ferrum-exp-fixed_http2_71680.json",
+      "sample_sha256": "c8b884df734f77be3d21a9c8366addd5b33e97b9298c34047bd72896525c3e93",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 198.63712757830396
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 26,
+          "mean": 1.2131398013750951
+        },
+        "queue_time_ns": 25112697224,
+        "admissions": 56474,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766689.481977,
+        "warmup_start_monotonic_secs": 0.030934525,
+        "measurement_start_monotonic_secs": 0.129282587,
+        "drain_start_monotonic_secs": 15.130319374,
+        "transport_close_start_monotonic_secs": 15.163434014,
+        "setup_secs": 0.030935006,
+        "warmup_secs": 0.09725487,
+        "barrier_secs": 0.001093001,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.00102558,
+        "measurement_start_unix_secs": 1789766689.6112595,
+        "drain_secs": 0.033091285,
+        "transport_close_secs": 0.001136307,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18805,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 172957696,
+          "cpu_seconds": 24.38,
+          "bracket_secs": 15.158040523529053,
+          "boundary_slack_secs": 0.15804052352905273,
+          "io": {
+            "rchar": 20993,
+            "wchar": 8135501503,
+            "syscr": 127,
+            "syscw": 460896,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18747,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 36384768,
+          "cpu_seconds": 12.610000000000001,
+          "bracket_secs": 15.158040523529053,
+          "boundary_slack_secs": 0.15804052352905273,
+          "io": {
+            "rchar": 1,
+            "wchar": 4058852517,
+            "syscr": 1,
+            "syscw": 158765,
+            "read_bytes": 0,
+            "write_bytes": 49152,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18879,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 12.424358,
+          "peak_rss_bytes": 47575040,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.00102558,
+          "boundary_slack_secs": 0.0010255800000003035
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 85
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 84
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 79
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "11317c938790e9ac60d12587dabeed32c6fb9ee8b5001205c4a26a7e1704e41e"
+    },
+    {
+      "protocol": "HTTP/2",
+      "gateway": "ferrum",
+      "pair": 4,
+      "payload_size": 71680,
+      "total_requests": 55866,
+      "total_errors": 0,
+      "total_bytes": 4004474880,
+      "rps": 3724.4,
+      "p50_us": 51775,
+      "p99_us": 100735,
+      "host_id": "9975e30b-371c-4ccb-8f8a-bf6b5d6e9dbf",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_004/ferrum_http2_71680.json",
+      "sample_sha256": "ce57dc2d23d66c66a15a3464df5c15aeb83eb4336fa1d885ee8ecbc574481404",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 198.55204317656097
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 18,
+          "mean": 1.294525828835775
+        },
+        "queue_time_ns": 24584539370,
+        "admissions": 56066,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766709.2743957,
+        "warmup_start_monotonic_secs": 0.031506556,
+        "measurement_start_monotonic_secs": 0.17442844,
+        "drain_start_monotonic_secs": 15.175601727,
+        "transport_close_start_monotonic_secs": 15.212250085,
+        "setup_secs": 0.031506856,
+        "warmup_secs": 0.141835654,
+        "barrier_secs": 0.00108606,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.00103634,
+        "measurement_start_unix_secs": 1789766709.4488242,
+        "drain_secs": 0.036623651,
+        "transport_close_secs": 0.00102595,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 43,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 19017,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 163233792,
+          "cpu_seconds": 24.709999999999997,
+          "bracket_secs": 15.6712806224823,
+          "boundary_slack_secs": 0.6712806224822998,
+          "io": {
+            "rchar": 22362,
+            "wchar": 8094478504,
+            "syscr": 135,
+            "syscw": 499892,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18960,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 37593088,
+          "cpu_seconds": 12.23,
+          "bracket_secs": 15.6712806224823,
+          "boundary_slack_secs": 0.6712806224822998,
+          "io": {
+            "rchar": 1,
+            "wchar": 4041836335,
+            "syscr": 1,
+            "syscw": 164898,
+            "read_bytes": 0,
+            "write_bytes": 40960,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 19093,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 13.033645,
+          "peak_rss_bytes": 48586752,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.00103634,
+          "boundary_slack_secs": 0.001036340000000635
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_h2",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "senders_dropped",
+            null,
+            null,
+            null
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "transport_close",
+            "client_h2",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [
+        {
+          "key": [
+            "warmup",
+            "connection_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 74
+        },
+        {
+          "key": [
+            "warmup",
+            "driver_terminated",
+            null,
+            null,
+            null
+          ],
+          "count": 73
+        }
+      ],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 72
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 20
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "unclassified",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 1
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "e276a5912c87dbfab9460b6ae7029672de27869d68a04a6c3ff379a15f9866a0"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 1,
+      "payload_size": 10240,
+      "total_requests": 493340,
+      "total_errors": 0,
+      "total_bytes": 5051801600,
+      "rps": 32889.333333333336,
+      "p50_us": 5723,
+      "p99_us": 14071,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_001/direct_grpcs_10240.json",
+      "sample_sha256": "a874a4c856f2580c315713731b6ee3f38f872e1c7ed5794f72e3e641d5f21982",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 150.58762117822488
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 141,
+          "mean": 49.264727815063445
+        },
+        "queue_time_ns": 719932388151,
+        "admissions": 493540,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766339.6389637,
+        "warmup_start_monotonic_secs": 0.031356622,
+        "measurement_start_monotonic_secs": 0.043053784,
+        "drain_start_monotonic_secs": 15.044120487,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.031356872,
+        "warmup_secs": 0.010615388,
+        "barrier_secs": 0.001081623,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.00105812,
+        "measurement_start_unix_secs": 1789766339.6820173,
+        "drain_secs": 0.009976839,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17047,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 21843968,
+          "cpu_seconds": 27.83,
+          "bracket_secs": 15.063700199127197,
+          "boundary_slack_secs": 0.06370019912719727,
+          "io": {
+            "rchar": 1,
+            "wchar": 5100408506,
+            "syscr": 1,
+            "syscw": 944734,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17065,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 30.078122,
+          "peak_rss_bytes": 53989376,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.00105812,
+          "boundary_slack_secs": 0.0010581199999997182
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 1,
+      "payload_size": 71680,
+      "total_requests": 136665,
+      "total_errors": 0,
+      "total_bytes": 9796147200,
+      "rps": 9111.0,
+      "p50_us": 20287,
+      "p99_us": 48799,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_001/direct_grpcs_71680.json",
+      "sample_sha256": "2377ac3124f92283cb333a4128e635fbae67359fdaf69276b4c1ce35c660f514",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 156.9275362318843
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 140,
+          "mean": 42.91143317230279
+        },
+        "queue_time_ns": 639466179699,
+        "admissions": 136865,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766355.4020143,
+        "warmup_start_monotonic_secs": 0.037531647,
+        "measurement_start_monotonic_secs": 0.067216253,
+        "drain_start_monotonic_secs": 15.068396055,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.037531758,
+        "warmup_secs": 0.028604054,
+        "barrier_secs": 0.001080462,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001168625,
+        "measurement_start_unix_secs": 1789766355.4692307,
+        "drain_secs": 0.014974201,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17047,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 35241984,
+          "cpu_seconds": 27.32,
+          "bracket_secs": 15.564522743225098,
+          "boundary_slack_secs": 0.5645227432250977,
+          "io": {
+            "rchar": 0,
+            "wchar": 9866381543,
+            "syscr": 0,
+            "syscw": 809639,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17087,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.791294,
+          "peak_rss_bytes": 84234240,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001168625,
+          "boundary_slack_secs": 0.0011686250000000342
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 1,
+      "payload_size": 10240,
+      "total_requests": 179262,
+      "total_errors": 0,
+      "total_bytes": 1835642880,
+      "rps": 11950.8,
+      "p50_us": 16007,
+      "p99_us": 34463,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_001/ferrum-exp-fixed_grpcs_10240.json",
+      "sample_sha256": "2aa031a53d7aebc10f9f8f08f0c1a63d8d8de5dfa5712d02337ed470b093a851",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 191.33053435114502
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 114,
+          "mean": 8.51679389312978
+        },
+        "queue_time_ns": 138936292495,
+        "admissions": 179462,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766409.969672,
+        "warmup_start_monotonic_secs": 0.030668995,
+        "measurement_start_monotonic_secs": 0.05449415,
+        "drain_start_monotonic_secs": 15.055140157,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.030669356,
+        "warmup_secs": 0.022740557,
+        "barrier_secs": 0.001084137,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.000636632,
+        "measurement_start_unix_secs": 1789766410.024166,
+        "drain_secs": 0.014161935,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17430,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 137375744,
+          "cpu_seconds": 27.860000000000003,
+          "bracket_secs": 15.25955843925476,
+          "boundary_slack_secs": 0.25955843925476074,
+          "io": {
+            "rchar": 21171,
+            "wchar": 3719938995,
+            "syscr": 127,
+            "syscw": 707027,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17373,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 23740416,
+          "cpu_seconds": 15.08,
+          "bracket_secs": 15.25955843925476,
+          "boundary_slack_secs": 0.25955843925476074,
+          "io": {
+            "rchar": 1,
+            "wchar": 1856024501,
+            "syscr": 1,
+            "syscw": 355113,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17505,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.108166,
+          "peak_rss_bytes": 51531776,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.000636632,
+          "boundary_slack_secs": 0.0006366320000008585
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 19
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "unclassified",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 2
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 1,
+      "payload_size": 71680,
+      "total_requests": 65186,
+      "total_errors": 0,
+      "total_bytes": 4672532480,
+      "rps": 4345.733333333334,
+      "p50_us": 42911,
+      "p99_us": 102975,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_001/ferrum-exp-fixed_grpcs_71680.json",
+      "sample_sha256": "a61ff4ba8b107dd190bdb5f9558ce1fe5e62d4ad493ea4b2caf9ae4ea77f767b",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 191.25982357658393
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 102,
+          "mean": 8.582197273456302
+        },
+        "queue_time_ns": 151038645369,
+        "admissions": 65386,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766425.4843903,
+        "warmup_start_monotonic_secs": 0.035975265,
+        "measurement_start_monotonic_secs": 0.085394094,
+        "drain_start_monotonic_secs": 15.090413239,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.035975615,
+        "warmup_secs": 0.048335524,
+        "barrier_secs": 0.001083205,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.005011423,
+        "measurement_start_unix_secs": 1789766425.5697842,
+        "drain_secs": 0.021334136,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17430,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 160014336,
+          "cpu_seconds": 27.3,
+          "bracket_secs": 15.360649108886719,
+          "boundary_slack_secs": 0.36064910888671875,
+          "io": {
+            "rchar": 21207,
+            "wchar": 9446691366,
+            "syscr": 127,
+            "syscw": 786176,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17373,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 39276544,
+          "cpu_seconds": 15.18,
+          "bracket_secs": 15.360649108886719,
+          "boundary_slack_secs": 0.36064910888671875,
+          "io": {
+            "rchar": 0,
+            "wchar": 4713055874,
+            "syscr": 0,
+            "syscw": 202810,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17575,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 17.093204,
+          "peak_rss_bytes": 79028224,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.005011423,
+          "boundary_slack_secs": 0.005011422999999127
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 19
+        },
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "unclassified",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 2
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 1,
+      "payload_size": 10240,
+      "total_requests": 158776,
+      "total_errors": 0,
+      "total_bytes": 1625866240,
+      "rps": 10585.066666666668,
+      "p50_us": 17759,
+      "p99_us": 42111,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_001/ferrum_grpcs_10240.json",
+      "sample_sha256": "d5a36a5c530efb4d14459495ade1fad92b7e1884f802abf6ec325c51326851b2",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 193.42996987951813
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 85,
+          "mean": 6.417921686746995
+        },
+        "queue_time_ns": 103912606162,
+        "admissions": 158976,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766375.0556402,
+        "warmup_start_monotonic_secs": 0.03006101,
+        "measurement_start_monotonic_secs": 0.059518728,
+        "drain_start_monotonic_secs": 15.059721999,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.030061381,
+        "warmup_secs": 0.028375624,
+        "barrier_secs": 0.001081713,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.000191062,
+        "measurement_start_unix_secs": 1789766375.1151588,
+        "drain_secs": 0.015282578,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17160,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 133939200,
+          "cpu_seconds": 25.540000000000003,
+          "bracket_secs": 15.2757248878479,
+          "boundary_slack_secs": 0.2757248878479004,
+          "io": {
+            "rchar": 21693,
+            "wchar": 3296309803,
+            "syscr": 134,
+            "syscw": 624920,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17102,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 22908928,
+          "cpu_seconds": 14.4,
+          "bracket_secs": 15.2757248878479,
+          "boundary_slack_secs": 0.2757248878479004,
+          "io": {
+            "rchar": 1,
+            "wchar": 1644479808,
+            "syscr": 1,
+            "syscw": 320290,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17242,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 15.352159,
+          "peak_rss_bytes": 51261440,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.000191062,
+          "boundary_slack_secs": 0.00019106200000074125
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 1,
+      "payload_size": 71680,
+      "total_requests": 62323,
+      "total_errors": 0,
+      "total_bytes": 4467312640,
+      "rps": 4154.866666666667,
+      "p50_us": 39935,
+      "p99_us": 203903,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum",
+        "ferrum-exp-fixed"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_001/ferrum_grpcs_71680.json",
+      "sample_sha256": "9a78de360b8c09a396c30c1bda5d31ff7ea88d073c0cb62f8e6e9d3f6566a90f",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 188.74654752233948
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 104,
+          "mean": 11.09017059301382
+        },
+        "queue_time_ns": 185415173471,
+        "admissions": 62523,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766390.5867894,
+        "warmup_start_monotonic_secs": 0.038351175,
+        "measurement_start_monotonic_secs": 0.093729467,
+        "drain_start_monotonic_secs": 15.095129758,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.038351376,
+        "warmup_secs": 0.054296698,
+        "barrier_secs": 0.001081433,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001391167,
+        "measurement_start_unix_secs": 1789766390.6805189,
+        "drain_secs": 0.025811464,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17160,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 149479424,
+          "cpu_seconds": 27.59,
+          "bracket_secs": 15.336799383163452,
+          "boundary_slack_secs": 0.33679938316345215,
+          "io": {
+            "rchar": 22538,
+            "wchar": 9036688472,
+            "syscr": 135,
+            "syscw": 826630,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17102,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 40726528,
+          "cpu_seconds": 15.23,
+          "bracket_secs": 15.336799383163452,
+          "boundary_slack_secs": 0.33679938316345215,
+          "io": {
+            "rchar": 0,
+            "wchar": 4508423711,
+            "syscr": 0,
+            "syscw": 224253,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17312,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.726967000000002,
+          "peak_rss_bytes": 81547264,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001391167,
+          "boundary_slack_secs": 0.0013911669999995269
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 2,
+      "payload_size": 10240,
+      "total_requests": 487663,
+      "total_errors": 0,
+      "total_bytes": 4993669120,
+      "rps": 32510.866666666665,
+      "p50_us": 5835,
+      "p99_us": 13927,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_002/direct_grpcs_10240.json",
+      "sample_sha256": "f5e8b8b6fe3653f95e6218651fb151549cb840e83b852069360f82632b2ef9cf",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 152.04244229337283
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 126,
+          "mean": 47.80714817572601
+        },
+        "queue_time_ns": 711606138928,
+        "admissions": 487863,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766513.6950905,
+        "warmup_start_monotonic_secs": 0.032783382,
+        "measurement_start_monotonic_secs": 0.044411745,
+        "drain_start_monotonic_secs": 15.045297348,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.032783823,
+        "warmup_secs": 0.010543986,
+        "barrier_secs": 0.001083716,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.000876629,
+        "measurement_start_unix_secs": 1789766513.7395024,
+        "drain_secs": 0.009427824,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18158,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 21536768,
+          "cpu_seconds": 28.38,
+          "bracket_secs": 15.053440809249878,
+          "boundary_slack_secs": 0.05344080924987793,
+          "io": {
+            "rchar": 1,
+            "wchar": 5041750928,
+            "syscr": 1,
+            "syscw": 933132,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18176,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 30.430899999999998,
+          "peak_rss_bytes": 54370304,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.000876629,
+          "boundary_slack_secs": 0.0008766290000004062
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 2,
+      "payload_size": 71680,
+      "total_requests": 138408,
+      "total_errors": 0,
+      "total_bytes": 9921085440,
+      "rps": 9227.2,
+      "p50_us": 20143,
+      "p99_us": 46687,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_002/direct_grpcs_71680.json",
+      "sample_sha256": "deaebe59def2e61f34cdf1726e548e53a92be01aa2eeb01350ea0438263d65a8",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 157.23790322580638
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 132,
+          "mean": 42.59758064516129
+        },
+        "queue_time_ns": 634843339253,
+        "admissions": 138608,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766529.5005558,
+        "warmup_start_monotonic_secs": 0.038655714,
+        "measurement_start_monotonic_secs": 0.066769818,
+        "drain_start_monotonic_secs": 15.070959641,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.038655985,
+        "warmup_secs": 0.02703239,
+        "barrier_secs": 0.001081372,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.0041805,
+        "measurement_start_unix_secs": 1789766529.5673254,
+        "drain_secs": 0.013053589,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18158,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 36950016,
+          "cpu_seconds": 27.2,
+          "bracket_secs": 15.563786268234253,
+          "boundary_slack_secs": 0.5637862682342529,
+          "io": {
+            "rchar": 0,
+            "wchar": 9991862302,
+            "syscr": 0,
+            "syscw": 820559,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18199,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.956264,
+          "peak_rss_bytes": 84537344,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.0041805,
+          "boundary_slack_secs": 0.0041805000000003645
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 2,
+      "payload_size": 10240,
+      "total_requests": 173949,
+      "total_errors": 0,
+      "total_bytes": 1781237760,
+      "rps": 11596.6,
+      "p50_us": 16559,
+      "p99_us": 35423,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_002/ferrum-exp-fixed_grpcs_10240.json",
+      "sample_sha256": "265b45b794ac9a60ad7e35b3ae58b5296fb59988cbbcdeaf5493ecac756573b6",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 191.73856707317083
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 97,
+          "mean": 8.108231707317081
+        },
+        "queue_time_ns": 133635846515,
+        "admissions": 174149,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766445.2508123,
+        "warmup_start_monotonic_secs": 0.030132876,
+        "measurement_start_monotonic_secs": 0.053861402,
+        "drain_start_monotonic_secs": 15.05667653,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.030133237,
+        "warmup_secs": 0.022639511,
+        "barrier_secs": 0.001088694,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.002803741,
+        "measurement_start_unix_secs": 1789766445.3046737,
+        "drain_secs": 0.007427808,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17691,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 137285632,
+          "cpu_seconds": 27.87,
+          "bracket_secs": 15.266307353973389,
+          "boundary_slack_secs": 0.26630735397338867,
+          "io": {
+            "rchar": 21236,
+            "wchar": 3609914755,
+            "syscr": 127,
+            "syscw": 682322,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17634,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 24072192,
+          "cpu_seconds": 15.23,
+          "bracket_secs": 15.266307353973389,
+          "boundary_slack_secs": 0.26630735397338867,
+          "io": {
+            "rchar": 1,
+            "wchar": 1801160341,
+            "syscr": 1,
+            "syscw": 345669,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17765,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.034583,
+          "peak_rss_bytes": 52027392,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.002803741,
+          "boundary_slack_secs": 0.002803740999999249
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 2,
+      "payload_size": 71680,
+      "total_requests": 65130,
+      "total_errors": 0,
+      "total_bytes": 4668518400,
+      "rps": 4342.0,
+      "p50_us": 43679,
+      "p99_us": 100991,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_002/ferrum-exp-fixed_grpcs_71680.json",
+      "sample_sha256": "4b07ab97a656b5c6bff8be4211881ae19e162ff80bdb571d725758d7e65b0f18",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 188.27377049180336
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 112,
+          "mean": 11.561475409836058
+        },
+        "queue_time_ns": 197088543218,
+        "admissions": 65330,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766460.7751427,
+        "warmup_start_monotonic_secs": 0.036993438,
+        "measurement_start_monotonic_secs": 0.085895719,
+        "drain_start_monotonic_secs": 15.08755894,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.036993688,
+        "warmup_secs": 0.047821249,
+        "barrier_secs": 0.001080772,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001651162,
+        "measurement_start_unix_secs": 1789766460.8610384,
+        "drain_secs": 0.027178114,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17691,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 156639232,
+          "cpu_seconds": 27.51,
+          "bracket_secs": 15.35956859588623,
+          "boundary_slack_secs": 0.35956859588623047,
+          "io": {
+            "rchar": 21258,
+            "wchar": 9438709378,
+            "syscr": 127,
+            "syscw": 789274,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17634,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 35323904,
+          "cpu_seconds": 15.069999999999999,
+          "bracket_secs": 15.35956859588623,
+          "boundary_slack_secs": 0.35956859588623047,
+          "io": {
+            "rchar": 0,
+            "wchar": 4709015981,
+            "syscr": 0,
+            "syscw": 200903,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17838,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 17.02229,
+          "peak_rss_bytes": 79757312,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001651162,
+          "boundary_slack_secs": 0.0016511619999999283
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 2,
+      "payload_size": 10240,
+      "total_requests": 172341,
+      "total_errors": 0,
+      "total_bytes": 1764771840,
+      "rps": 11489.4,
+      "p50_us": 16703,
+      "p99_us": 36031,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_002/ferrum_grpcs_10240.json",
+      "sample_sha256": "4ca34e187791d345f40faab1a78ead13a7e66d08042b5052edcd230565000a86",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 191.64057750759878
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 89,
+          "mean": 8.20592705167173
+        },
+        "queue_time_ns": 132445563278,
+        "admissions": 172541,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766480.5918171,
+        "warmup_start_monotonic_secs": 0.03158477,
+        "measurement_start_monotonic_secs": 0.057608558,
+        "drain_start_monotonic_secs": 15.058707971,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.03158483,
+        "warmup_secs": 0.025969906,
+        "barrier_secs": 5.3931e-05,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001089969,
+        "measurement_start_unix_secs": 1789766480.6494257,
+        "drain_secs": 0.012184145,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17957,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 136302592,
+          "cpu_seconds": 27.92,
+          "bracket_secs": 15.30974555015564,
+          "boundary_slack_secs": 0.30974555015563965,
+          "io": {
+            "rchar": 21254,
+            "wchar": 3577526059,
+            "syscr": 127,
+            "syscw": 694477,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17899,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 23519232,
+          "cpu_seconds": 15.270000000000001,
+          "bracket_secs": 15.30974555015564,
+          "boundary_slack_secs": 0.30974555015563965,
+          "io": {
+            "rchar": 1,
+            "wchar": 1784675700,
+            "syscr": 1,
+            "syscw": 347758,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18030,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.003510000000002,
+          "peak_rss_bytes": 51990528,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001089969,
+          "boundary_slack_secs": 0.001089969000000579
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 2,
+      "payload_size": 71680,
+      "total_requests": 57797,
+      "total_errors": 0,
+      "total_bytes": 4142888960,
+      "rps": 3853.133333333333,
+      "p50_us": 31583,
+      "p99_us": 251519,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum-exp-fixed",
+        "ferrum",
+        "direct"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_002/ferrum_grpcs_71680.json",
+      "sample_sha256": "1252ad072be05c003b876380c82f5886bbc59ea09e7242fd33ae818cef9a01dc",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 193.36863057324845
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 103,
+          "mean": 6.474522292993626
+        },
+        "queue_time_ns": 112424895330,
+        "admissions": 57997,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766496.1550236,
+        "warmup_start_monotonic_secs": 0.036369972,
+        "measurement_start_monotonic_secs": 0.092168697,
+        "drain_start_monotonic_secs": 15.095603928,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.036370583,
+        "warmup_secs": 0.054716501,
+        "barrier_secs": 0.001082084,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.003396513,
+        "measurement_start_unix_secs": 1789766496.2471921,
+        "drain_secs": 0.023840459,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 17957,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 138878976,
+          "cpu_seconds": 27.409999999999997,
+          "bracket_secs": 15.286401748657227,
+          "boundary_slack_secs": 0.28640174865722656,
+          "io": {
+            "rchar": 21254,
+            "wchar": 8386283281,
+            "syscr": 127,
+            "syscw": 822943,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 17899,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 45363200,
+          "cpu_seconds": 15.329999999999998,
+          "bracket_secs": 15.286401748657227,
+          "boundary_slack_secs": 0.28640174865722656,
+          "io": {
+            "rchar": 0,
+            "wchar": 4183745528,
+            "syscr": 0,
+            "syscw": 228448,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18099,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.819869999999998,
+          "peak_rss_bytes": 79437824,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.003396513,
+          "boundary_slack_secs": 0.003396513000000212
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 3,
+      "payload_size": 10240,
+      "total_requests": 484161,
+      "total_errors": 0,
+      "total_bytes": 4957808640,
+      "rps": 32277.4,
+      "p50_us": 5875,
+      "p99_us": 13951,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_003/direct_grpcs_10240.json",
+      "sample_sha256": "368b17d6384739f7fbf9efafdf911ca5ec0399d793226230347be6f09b9bd966",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 151.77191679049045
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 153,
+          "mean": 48.074294205052
+        },
+        "queue_time_ns": 707035515473,
+        "admissions": 484361,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766619.8454604,
+        "warmup_start_monotonic_secs": 0.031977535,
+        "measurement_start_monotonic_secs": 0.045169486,
+        "drain_start_monotonic_secs": 15.047155458,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.031977865,
+        "warmup_secs": 0.012109788,
+        "barrier_secs": 0.001081904,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001974715,
+        "measurement_start_unix_secs": 1789766619.8906298,
+        "drain_secs": 0.007884321,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18740,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 21127168,
+          "cpu_seconds": 28.419999999999998,
+          "bracket_secs": 15.05972146987915,
+          "boundary_slack_secs": 0.05972146987915039,
+          "io": {
+            "rchar": 1,
+            "wchar": 5005560464,
+            "syscr": 1,
+            "syscw": 925767,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18758,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 30.467247999999998,
+          "peak_rss_bytes": 53698560,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001974715,
+          "boundary_slack_secs": 0.0019747149999993496
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 3,
+      "payload_size": 71680,
+      "total_requests": 137289,
+      "total_errors": 0,
+      "total_bytes": 9840875520,
+      "rps": 9152.6,
+      "p50_us": 19247,
+      "p99_us": 47551,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_003/direct_grpcs_71680.json",
+      "sample_sha256": "76779748b463ea28200e4a888cac00022c6ced7038b2f9e9cee6b3ba6542eece",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 161.69359999999992
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 130,
+          "mean": 38.14560000000001
+        },
+        "queue_time_ns": 574924498868,
+        "admissions": 137489,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766635.6104157,
+        "warmup_start_monotonic_secs": 0.039095127,
+        "measurement_start_monotonic_secs": 0.065878087,
+        "drain_start_monotonic_secs": 15.068751233,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.039095508,
+        "warmup_secs": 0.02569815,
+        "barrier_secs": 0.00108462,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.002863642,
+        "measurement_start_unix_secs": 1789766635.6762936,
+        "drain_secs": 2.235395993,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18740,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 35389440,
+          "cpu_seconds": 27.73,
+          "bracket_secs": 15.560699701309204,
+          "boundary_slack_secs": 0.5606997013092041,
+          "io": {
+            "rchar": 0,
+            "wchar": 9910723546,
+            "syscr": 0,
+            "syscw": 813282,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18782,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.372244,
+          "peak_rss_bytes": 83779584,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.002863642,
+          "boundary_slack_secs": 0.0028636419999994445
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 3,
+      "payload_size": 10240,
+      "total_requests": 184055,
+      "total_errors": 0,
+      "total_bytes": 1884723200,
+      "rps": 12270.333333333334,
+      "p50_us": 15663,
+      "p99_us": 33407,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_003/ferrum-exp-fixed_grpcs_10240.json",
+      "sample_sha256": "c4705f2e7cce247341c8321ad66a89a603e055f4ecb558f4131fe814898bda2f",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 189.18524212144493
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 123,
+          "mean": 10.661798616448893
+        },
+        "queue_time_ns": 166886575543,
+        "admissions": 184255,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766584.4650693,
+        "warmup_start_monotonic_secs": 0.02937674,
+        "measurement_start_monotonic_secs": 0.05285452,
+        "drain_start_monotonic_secs": 15.054633951,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.02937684,
+        "warmup_secs": 0.022392151,
+        "barrier_secs": 0.001085499,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001769236,
+        "measurement_start_unix_secs": 1789766584.5179238,
+        "drain_secs": 0.012357392,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18543,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 138866688,
+          "cpu_seconds": 28.26,
+          "bracket_secs": 15.258122682571411,
+          "boundary_slack_secs": 0.25812268257141113,
+          "io": {
+            "rchar": 21829,
+            "wchar": 3818178739,
+            "syscr": 134,
+            "syscw": 683429,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18484,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 23224320,
+          "cpu_seconds": 14.510000000000002,
+          "bracket_secs": 15.258122682571411,
+          "boundary_slack_secs": 0.25812268257141113,
+          "io": {
+            "rchar": 1,
+            "wchar": 1904704269,
+            "syscr": 1,
+            "syscw": 325252,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18616,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.077513999999997,
+          "peak_rss_bytes": 52527104,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001769236,
+          "boundary_slack_secs": 0.0017692359999994522
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 3,
+      "payload_size": 71680,
+      "total_requests": 65302,
+      "total_errors": 0,
+      "total_bytes": 4680847360,
+      "rps": 4353.466666666666,
+      "p50_us": 38591,
+      "p99_us": 117311,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_003/ferrum-exp-fixed_grpcs_71680.json",
+      "sample_sha256": "8f398e91c842651c00455e6a5c4f030b32e3b64e3dadc32b64d6a4b65c80d673",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 189.82003257329004
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 118,
+          "mean": 10.021172638436495
+        },
+        "queue_time_ns": 172124816800,
+        "admissions": 65502,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766599.982486,
+        "warmup_start_monotonic_secs": 0.036121044,
+        "measurement_start_monotonic_secs": 0.087592724,
+        "drain_start_monotonic_secs": 15.088429575,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.036121144,
+        "warmup_secs": 0.050388555,
+        "barrier_secs": 0.001083165,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.000825944,
+        "measurement_start_unix_secs": 1789766600.0700788,
+        "drain_secs": 2.052389407,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18543,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 153812992,
+          "cpu_seconds": 27.490000000000002,
+          "bracket_secs": 15.364997625350952,
+          "boundary_slack_secs": 0.36499762535095215,
+          "io": {
+            "rchar": 21327,
+            "wchar": 9462493330,
+            "syscr": 127,
+            "syscw": 797594,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18484,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 45191168,
+          "cpu_seconds": 14.41,
+          "bracket_secs": 15.364997625350952,
+          "boundary_slack_secs": 0.36499762535095215,
+          "io": {
+            "rchar": 0,
+            "wchar": 4720360530,
+            "syscr": 0,
+            "syscw": 180390,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18684,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 17.466411,
+          "peak_rss_bytes": 88252416,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.000825944,
+          "boundary_slack_secs": 0.000825944000000689
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 3,
+      "payload_size": 10240,
+      "total_requests": 191373,
+      "total_errors": 0,
+      "total_bytes": 1959659520,
+      "rps": 12758.2,
+      "p50_us": 15415,
+      "p99_us": 31343,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_003/ferrum_grpcs_10240.json",
+      "sample_sha256": "97bc90bbad96a6263226fca8593ab7e4f6c9dab6d418abadf7bbf609007006c2",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 187.31898539584947
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 120,
+          "mean": 12.52113758647194
+        },
+        "queue_time_ns": 191167481852,
+        "admissions": 191573,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3.1e-08,
+        "setup_start_unix_secs": 1789766549.244171,
+        "warmup_start_monotonic_secs": 0.032843529,
+        "measurement_start_monotonic_secs": 0.061721439,
+        "drain_start_monotonic_secs": 15.062935695,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.032843959,
+        "warmup_secs": 0.027795496,
+        "barrier_secs": 0.001081603,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001206474,
+        "measurement_start_unix_secs": 1789766549.3058922,
+        "drain_secs": 0.013707867,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18275,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 140443648,
+          "cpu_seconds": 28.52,
+          "bracket_secs": 15.257477283477783,
+          "boundary_slack_secs": 0.2574772834777832,
+          "io": {
+            "rchar": 21258,
+            "wchar": 3969349764,
+            "syscr": 127,
+            "syscw": 692571,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18217,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 27607040,
+          "cpu_seconds": 13.26,
+          "bracket_secs": 15.257477283477783,
+          "boundary_slack_secs": 0.2574772834777832,
+          "io": {
+            "rchar": 1,
+            "wchar": 1979120304,
+            "syscr": 1,
+            "syscw": 281516,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18349,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.198236,
+          "peak_rss_bytes": 54878208,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001206474,
+          "boundary_slack_secs": 0.0012064739999999574
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 3,
+      "payload_size": 71680,
+      "total_requests": 54437,
+      "total_errors": 156,
+      "total_bytes": 3902044160,
+      "rps": 3629.133333333333,
+      "p50_us": 12687,
+      "p99_us": 69183,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "ferrum",
+        "ferrum-exp-fixed",
+        "direct"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_003/ferrum_grpcs_71680.json",
+      "sample_sha256": "49ad1fe028ae46aa23b5b52da02eb40e240bc7b0bdb0e620bb825d7e22984a38",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 44,
+          "max": 200,
+          "mean": 52.307576894223494
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 50.828957239309815
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 77,
+          "mean": 1.3300825206301572
+        },
+        "queue_time_ns": 25114297748,
+        "admissions": 54637,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 156
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766564.8532648,
+        "warmup_start_monotonic_secs": 0.038905512,
+        "measurement_start_monotonic_secs": 0.093520924,
+        "drain_start_monotonic_secs": 15.094805337,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.038905853,
+        "warmup_secs": 0.053518456,
+        "barrier_secs": 0.001096756,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001271624,
+        "measurement_start_unix_secs": 1789766564.9467857,
+        "drain_secs": 0.005008332,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 177,
+        "transport_errors_total": 156,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18275,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 142798848,
+          "cpu_seconds": 25.450000000000003,
+          "bracket_secs": 15.180811166763306,
+          "boundary_slack_secs": 0.18081116676330566,
+          "io": {
+            "rchar": 21266,
+            "wchar": 7892554308,
+            "syscr": 127,
+            "syscw": 823345,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18217,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 38862848,
+          "cpu_seconds": 12.760000000000002,
+          "bracket_secs": 15.180811166763306,
+          "boundary_slack_secs": 0.18081116676330566,
+          "io": {
+            "rchar": 0,
+            "wchar": 3932051431,
+            "syscr": 0,
+            "syscw": 200894,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18419,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 15.774206999999999,
+          "peak_rss_bytes": 74850304,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001271624,
+          "boundary_slack_secs": 0.0012716239999992496
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "measurement",
+            "client_grpc",
+            "unary_echo_error",
+            11,
+            "reset",
+            "remote"
+          ],
+          "count": 152
+        },
+        {
+          "key": [
+            "measurement",
+            "client_grpc",
+            "unary_echo_error",
+            null,
+            null,
+            null
+          ],
+          "count": 4
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "measurement",
+            "backend_grpc_tls",
+            "goaway",
+            "ENHANCE_YOUR_CALM",
+            "local_library"
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [
+        {
+          "timestamp": "2026-09-18T21:22:45.791196Z",
+          "level": "DEBUG",
+          "fields": {
+            "message": "H2 driver terminated",
+            "hop": "backend_grpc_tls",
+            "connection_id": 23,
+            "sequence": 22,
+            "monotonic_ns": 18162202931,
+            "lifetime_ns": 16512236661,
+            "kind": "goaway",
+            "reason": "ENHANCE_YOUR_CALM",
+            "initiator": "local_library",
+            "limit_reached": false
+          },
+          "target": "ferrum_h2_observe"
+        }
+      ],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 4,
+      "payload_size": 10240,
+      "total_requests": 481832,
+      "total_errors": 0,
+      "total_bytes": 4933959680,
+      "rps": 32122.133333333335,
+      "p50_us": 5923,
+      "p99_us": 14039,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_004/direct_grpcs_10240.json",
+      "sample_sha256": "dfdc472356885cd87caa825931ad901e4a26ebaafe5c6266ccbe2447f04f5c1a",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 150.43633655994043
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 126,
+          "mean": 49.41474311243484
+        },
+        "queue_time_ns": 713801981317,
+        "admissions": 482032,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766655.4536583,
+        "warmup_start_monotonic_secs": 0.032810711,
+        "measurement_start_monotonic_secs": 0.045763429,
+        "drain_start_monotonic_secs": 15.04735087,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.03281101,
+        "warmup_secs": 0.011871733,
+        "barrier_secs": 0.001080824,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001576704,
+        "measurement_start_unix_secs": 1789766655.4994218,
+        "drain_secs": 0.009069338,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18799,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 21827584,
+          "cpu_seconds": 28.32,
+          "bracket_secs": 15.057705879211426,
+          "boundary_slack_secs": 0.05770587921142578,
+          "io": {
+            "rchar": 1,
+            "wchar": 4981506993,
+            "syscr": 1,
+            "syscw": 921612,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18817,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 30.554477,
+          "peak_rss_bytes": 53334016,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001576704,
+          "boundary_slack_secs": 0.0015767039999996513
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "direct",
+      "pair": 4,
+      "payload_size": 71680,
+      "total_requests": 139870,
+      "total_errors": 0,
+      "total_bytes": 10025881600,
+      "rps": 9324.666666666666,
+      "p50_us": 18847,
+      "p99_us": 44991,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 1,
+      "artifact_path": "pairs/pair_004/direct_grpcs_71680.json",
+      "sample_sha256": "b37ef6c0812d4c164482cdafeb8ee4eeeb22f0499771c5aac0d5f1fc8d780869",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 160.50726978998418
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 133,
+          "mean": 39.32956381260095
+        },
+        "queue_time_ns": 585872928942,
+        "admissions": 140070,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766671.2140596,
+        "warmup_start_monotonic_secs": 0.040253345,
+        "measurement_start_monotonic_secs": 0.06772536,
+        "drain_start_monotonic_secs": 15.071395209,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.040253645,
+        "warmup_secs": 0.026430721,
+        "barrier_secs": 0.001041134,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.003660545,
+        "measurement_start_unix_secs": 1789766671.281785,
+        "drain_secs": 9.140959025,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18799,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 35573760,
+          "cpu_seconds": 27.36,
+          "bracket_secs": 15.072866678237915,
+          "boundary_slack_secs": 0.07286667823791504,
+          "io": {
+            "rchar": 0,
+            "wchar": 10090910793,
+            "syscr": 0,
+            "syscw": 827964,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18840,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 31.727666,
+          "peak_rss_bytes": 85532672,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.003660545,
+          "boundary_slack_secs": 0.003660545000000681
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": null,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": null,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [],
+      "gateway_events_during_measurement": []
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 4,
+      "payload_size": 10240,
+      "total_requests": 169921,
+      "total_errors": 0,
+      "total_bytes": 1739991040,
+      "rps": 11328.066666666668,
+      "p50_us": 16975,
+      "p99_us": 35839,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_004/ferrum-exp-fixed_grpcs_10240.json",
+      "sample_sha256": "3eee86229019e51ce952096dd9989641cb1ed641235c61a4e053d5b7278983ef",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 191.538753799392
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 97,
+          "mean": 8.310030395136769
+        },
+        "queue_time_ns": 125594527386,
+        "admissions": 170121,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 7e-08,
+        "setup_start_unix_secs": 1789766699.9357889,
+        "warmup_start_monotonic_secs": 0.03038948,
+        "measurement_start_monotonic_secs": 0.055559366,
+        "drain_start_monotonic_secs": 15.056726664,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.030389841,
+        "warmup_secs": 0.02408667,
+        "barrier_secs": 0.001082906,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001156852,
+        "measurement_start_unix_secs": 1789766699.9913483,
+        "drain_secs": 0.014267049,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18914,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 140046336,
+          "cpu_seconds": 27.8,
+          "bracket_secs": 15.280465126037598,
+          "boundary_slack_secs": 0.28046512603759766,
+          "io": {
+            "rchar": 21881,
+            "wchar": 3526488287,
+            "syscr": 134,
+            "syscw": 662983,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18854,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 24186880,
+          "cpu_seconds": 15.23,
+          "bracket_secs": 15.280465126037598,
+          "boundary_slack_secs": 0.28046512603759766,
+          "io": {
+            "rchar": 1,
+            "wchar": 1759538849,
+            "syscr": 1,
+            "syscw": 337691,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18990,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.104907,
+          "peak_rss_bytes": 51257344,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001156852,
+          "boundary_slack_secs": 0.0011568519999993754
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum-exp-fixed",
+      "pair": 4,
+      "payload_size": 71680,
+      "total_requests": 62412,
+      "total_errors": 0,
+      "total_bytes": 4473692160,
+      "rps": 4160.8,
+      "p50_us": 44639,
+      "p99_us": 109503,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 2,
+      "artifact_path": "pairs/pair_004/ferrum-exp-fixed_grpcs_71680.json",
+      "sample_sha256": "cc0d1a003e55569a91bd72bd197d67f202f41c0f64b8a0f99bd8d20d723c2dd8",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 191.4654895666131
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 138,
+          "mean": 8.373996789727137
+        },
+        "queue_time_ns": 146380704024,
+        "admissions": 62612,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 3e-08,
+        "setup_start_unix_secs": 1789766715.4719095,
+        "warmup_start_monotonic_secs": 0.038882379,
+        "measurement_start_monotonic_secs": 0.089258952,
+        "drain_start_monotonic_secs": 15.090368142,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.03888269,
+        "warmup_secs": 0.049290982,
+        "barrier_secs": 0.00108549,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001100046,
+        "measurement_start_unix_secs": 1789766715.5611684,
+        "drain_secs": 0.029770019,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 18914,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 162246656,
+          "cpu_seconds": 27.42,
+          "bracket_secs": 15.365487337112427,
+          "boundary_slack_secs": 0.36548733711242676,
+          "io": {
+            "rchar": 21348,
+            "wchar": 9047186888,
+            "syscr": 127,
+            "syscw": 750849,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 18854,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 37515264,
+          "cpu_seconds": 15.3,
+          "bracket_secs": 15.365487337112427,
+          "boundary_slack_secs": 0.36548733711242676,
+          "io": {
+            "rchar": 0,
+            "wchar": 4513721946,
+            "syscr": 0,
+            "syscw": 194593,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 19062,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.890323,
+          "peak_rss_bytes": 80982016,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001100046,
+          "boundary_slack_secs": 0.001100045999999466
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "dd3e363e4bcd58b7a703e2d308dafc7fef97368d060544eb1bd718566208d982"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 4,
+      "payload_size": 10240,
+      "total_requests": 164660,
+      "total_errors": 0,
+      "total_bytes": 1686118400,
+      "rps": 10977.333333333334,
+      "p50_us": 17455,
+      "p99_us": 37631,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_004/ferrum_grpcs_10240.json",
+      "sample_sha256": "93d525c429c832cf8b1ba3cab4e1ec5863039b5b5eba2f2bad5ead3693a73de6",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 192.64334600760455
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 107,
+          "mean": 7.204562737642566
+        },
+        "queue_time_ns": 112152970306,
+        "admissions": 164860,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766734.8927464,
+        "warmup_start_monotonic_secs": 0.03082177,
+        "measurement_start_monotonic_secs": 0.06049243,
+        "drain_start_monotonic_secs": 15.060674636,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.030822029,
+        "warmup_secs": 0.028583527,
+        "barrier_secs": 0.001086832,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.00017186,
+        "measurement_start_unix_secs": 1789766734.953239,
+        "drain_secs": 0.014232614,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 19179,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 135733248,
+          "cpu_seconds": 27.69,
+          "bracket_secs": 15.283050060272217,
+          "boundary_slack_secs": 0.2830500602722168,
+          "io": {
+            "rchar": 21876,
+            "wchar": 3418602491,
+            "syscr": 134,
+            "syscw": 662762,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 19120,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 23994368,
+          "cpu_seconds": 15.38,
+          "bracket_secs": 15.283050060272217,
+          "boundary_slack_secs": 0.2830500602722168,
+          "io": {
+            "rchar": 1,
+            "wchar": 1705594000,
+            "syscr": 1,
+            "syscw": 342434,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 19255,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.154607,
+          "peak_rss_bytes": 51810304,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.00017186,
+          "boundary_slack_secs": 0.00017186000000002366
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    },
+    {
+      "protocol": "gRPC",
+      "gateway": "ferrum",
+      "pair": 4,
+      "payload_size": 71680,
+      "total_requests": 60358,
+      "total_errors": 0,
+      "total_bytes": 4326461440,
+      "rps": 4023.866666666667,
+      "p50_us": 14351,
+      "p99_us": 413695,
+      "host_id": "7047265a-1835-4102-846f-b7b5197f092c",
+      "gateway_order": [
+        "direct",
+        "ferrum-exp-fixed",
+        "ferrum"
+      ],
+      "order_position": 3,
+      "artifact_path": "pairs/pair_004/ferrum_grpcs_71680.json",
+      "sample_sha256": "1804f00e573c001ed895d7e01df40579f35e8fe1b9c7f1b14648bbcc993c1c87",
+      "exact_successful_bytes": true,
+      "observed": {
+        "sampling_interval_ms": 10,
+        "active_workers": {
+          "min": 200,
+          "max": 200,
+          "mean": 200.0
+        },
+        "active_connections": {
+          "min": 21,
+          "max": 21,
+          "mean": 21.0
+        },
+        "active_streams": {
+          "min": 0,
+          "max": 200,
+          "mean": 195.69291964996015
+        },
+        "queued_requests": {
+          "min": 0,
+          "max": 60,
+          "mean": 4.148766905330152
+        },
+        "queue_time_ns": 71218277494,
+        "admissions": 60558,
+        "workers_at_barrier": 200,
+        "workers_retired_before_deadline": 0
+      },
+      "phase_bounds": {
+        "setup_start_monotonic_secs": 4e-08,
+        "setup_start_unix_secs": 1789766750.4398704,
+        "warmup_start_monotonic_secs": 0.03802382,
+        "measurement_start_monotonic_secs": 0.090781211,
+        "drain_start_monotonic_secs": 15.092407109,
+        "transport_close_start_monotonic_secs": null,
+        "setup_secs": 0.038024441,
+        "warmup_secs": 0.051681005,
+        "barrier_secs": 0.001076196,
+        "measurement_secs": 15.0,
+        "measurement_elapsed_secs": 15.001616103,
+        "measurement_start_unix_secs": 1789766750.5306516,
+        "drain_secs": 0.028019652,
+        "transport_close_secs": 0.0,
+        "transport_close_timed_out": false,
+        "transport_close_start_unix_secs": null,
+        "transport_events_total": 21,
+        "transport_errors_total": 0,
+        "transport_events_suppressed": 0,
+        "observation_hold_secs": 0.0,
+        "preflight_bound_secs": 31.0,
+        "stalled_workers": [],
+        "timed_out": false
+      },
+      "process_measurement": [
+        {
+          "pid": 19179,
+          "role": "gateway",
+          "complete_bracket": true,
+          "peak_rss_bytes": 129617920,
+          "cpu_seconds": 28.0,
+          "bracket_secs": 15.261655807495117,
+          "boundary_slack_secs": 0.2616558074951172,
+          "io": {
+            "rchar": 21348,
+            "wchar": 8756156829,
+            "syscr": 127,
+            "syscw": 894860,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 19120,
+          "role": "backend",
+          "complete_bracket": true,
+          "peak_rss_bytes": 49205248,
+          "cpu_seconds": 14.59,
+          "bracket_secs": 15.261655807495117,
+          "boundary_slack_secs": 0.2616558074951172,
+          "io": {
+            "rchar": 0,
+            "wchar": 4367414453,
+            "syscr": 0,
+            "syscw": 221946,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          }
+        },
+        {
+          "pid": 19325,
+          "role": "client",
+          "complete_bracket": true,
+          "cpu_seconds": 16.680203000000002,
+          "peak_rss_bytes": 76865536,
+          "rss_scope": "process lifetime high-water mark at measurement end",
+          "bracket_secs": 15.001616103,
+          "boundary_slack_secs": 0.0016161029999999244
+        }
+      ],
+      "client_event_groups": [
+        {
+          "key": [
+            "setup",
+            "client_grpc",
+            "socket_opened",
+            null,
+            null,
+            null
+          ],
+          "count": 21
+        }
+      ],
+      "backend_event_groups": [],
+      "h2_observation": {
+        "configured_pool_shards": 16,
+        "capture_errors": [],
+        "backend_phase_clock": "cross_process_unix; clock skew not measured",
+        "pool_gauge_scope": "resident cached transports, not busy streams or configured shards",
+        "tonic_driver_result_available": false,
+        "gauges_available": true,
+        "backend_errors_observed": 0
+      },
+      "gateway_event_groups": [
+        {
+          "key": [
+            "before_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        },
+        {
+          "key": [
+            "after_sample_measurement",
+            "frontend_auto_tls",
+            "ok",
+            "unavailable",
+            "unknown"
+          ],
+          "count": 21
+        }
+      ],
+      "gateway_events_during_measurement": [],
+      "route_sha256": "360859d773087aa10f57cf7d0870c486a5cce0992033778a7561ffe2da9102bc"
+    }
+  ]
+}
