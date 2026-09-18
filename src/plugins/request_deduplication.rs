@@ -1124,7 +1124,7 @@ impl RequestDeduplication {
             object,
             "config",
             REQUEST_DEDUPLICATION_CONFIG_KEYS,
-            "request_deduplication: ",
+            "request_deduplication: `config`: ",
         )?;
 
         // Redis-only fields outside Redis mode are a configuration error rather

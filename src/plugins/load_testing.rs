@@ -457,7 +457,7 @@ impl LoadTesting {
             config_obj,
             "config",
             LOAD_TESTING_CONFIG_KEYS,
-            "load_testing: ",
+            "load_testing: `config`: ",
         )?;
 
         let key = optional_string(config, "key")?

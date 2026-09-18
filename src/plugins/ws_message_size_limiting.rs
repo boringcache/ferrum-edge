@@ -47,7 +47,7 @@ impl WsMessageSizeLimiting {
             config_obj,
             "config",
             WS_MESSAGE_SIZE_LIMITING_CONFIG_KEYS,
-            "ws_message_size_limiting: ",
+            "ws_message_size_limiting: `config`: ",
         )?;
 
         let max_frame_bytes =

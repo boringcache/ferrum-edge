@@ -2233,3 +2233,219 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn traffic_root_unknown_keys_keep_fixed_context_and_suggestions_when_rendered() {
+    // Keep the traffic callers of the shared unknown-key helper in one table.
+    // The helper withholds the whole qualified key, including its root path.
+    for (plugin, typo, suggestion) in [
+        ("compression", "gzip_leveel", "gzip_level"),
+        ("graphql", "max_dept", "max_depth"),
+        ("grpc_method_router", "allow_method", "allow_methods"),
+        ("grpc_web", "expose_headerz", "expose_headers"),
+        ("load_testing", "request_timeot_ms", "request_timeout_ms"),
+        ("rate_limiting", "expose_headerz", "expose_headers"),
+        ("request_deduplication", "ttl_secondz", "ttl_seconds"),
+        ("request_size_limiting", "max_bytez", "max_bytes"),
+        ("response_caching", "ttl_secondz", "ttl_seconds"),
+        ("response_size_limiting", "max_bytez", "max_bytes"),
+        ("sse", "retry_mz", "retry_ms"),
+        ("udp_rate_limiting", "window_secondz", "window_seconds"),
+        ("ws_message_size_limiting", "max_frame_bytez", "max_frame_bytes"),
+        ("ws_rate_limiting", "frames_per_secon", "frames_per_second"),
+    ] {
+        let hostile_key = "'\"\\\n`ROOT_QUOTE_CANARY";
+        let config = json!({
+            typo: "ROOT_SCALAR_CANARY",
+            "ROOT_IDENTIFIER_CANARY": {"ROOT_PAYLOAD_KEY": "ROOT_OBJECT_CANARY"},
+            "918273641": [{"ROOT_ARRAY_KEY": "ROOT_ARRAY_CANARY"}],
+            hostile_key: "ROOT_HOSTILE_VALUE"
+        });
+        let error = ferrum_edge::plugins::validate_plugin_config(plugin, &config)
+            .expect_err("unknown root keys must still fail admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.starts_with(&format!("{plugin}: `config`: unknown configuration key(s):")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("did you mean `{suggestion}`?")),
+            "{rendered}"
+        );
+        for withheld in [
+            typo,
+            "ROOT_SCALAR_CANARY",
+            "ROOT_IDENTIFIER_CANARY",
+            "ROOT_PAYLOAD_KEY",
+            "ROOT_OBJECT_CANARY",
+            "918273641",
+            "ROOT_ARRAY_KEY",
+            "ROOT_ARRAY_CANARY",
+            "ROOT_QUOTE_CANARY",
+            "ROOT_HOSTILE_VALUE",
+        ] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn shared_rate_bounds_keep_the_nonzero_rule_index_when_rendered() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
+
+    for (field, maximum) in [
+        ("window_seconds", MAX_RATE_LIMIT_WINDOW_SECONDS),
+        ("max_requests", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_second", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_minute", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_hour", MAX_RATE_LIMIT_MAX_REQUESTS),
+    ] {
+        let mut rule = json!({"scope": "consumers", "consumers": ["HTTP_CONSUMER_CANARY"]});
+        if matches!(field, "window_seconds" | "max_requests") {
+            rule["window_seconds"] = json!(60);
+            rule["max_requests"] = json!(10);
+        }
+        rule[field] = json!(1);
+        let valid = json!({
+            "limit_by": "consumer",
+            "limits": [{"scope": "default", "requests_per_second": 10}, rule]
+        });
+        ferrum_edge::plugins::validate_plugin_config("rate_limiting", &valid)
+            .expect("both rules must be valid before changing the bound");
+
+        for value in [0, maximum + 1] {
+            let mut config = valid.clone();
+            config["limits"][1][field] = json!(value);
+            let error = RateLimiting::new(&config, PluginHttpClient::default())
+                .err()
+                .expect("the second rule must fail the shared bound");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains("rate_limiting: `limits[1]`"), "{rendered}");
+            assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+            if value == 0 {
+                assert!(rendered.contains("must be greater than zero"), "{rendered}");
+                assert!(!rendered.contains('0'), "{rendered}");
+            } else {
+                assert!(
+                    rendered.contains(&format!("must be <= {maximum}")),
+                    "{rendered}"
+                );
+                assert!(!rendered.contains(&value.to_string()), "{rendered}");
+            }
+            assert!(!rendered.contains("HTTP_CONSUMER_CANARY"), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn traffic_backend_errors_keep_plugin_context_and_withhold_policy_and_identity() {
+    use ferrum_edge::_test_support::create_rate_limit_plugin_with_config_id;
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::plugins::create_plugin_with_http_client_and_config_id;
+
+    // These are the five traffic entry points into the shared backend. Local
+    // mode still validates policy and identity, without contacting Redis.
+    for (plugin, valid) in [
+        (
+            "rate_limiting",
+            json!({"limits": [{"scope": "default", "requests_per_second": 10}]}),
+        ),
+        ("graphql", json!({"max_depth": 5})),
+        (
+            "grpc_method_router",
+            json!({"allow_methods": ["/pkg.Service/Method"]}),
+        ),
+        ("udp_rate_limiting", json!({"datagrams_per_second": 10})),
+        ("ws_rate_limiting", json!({"frames_per_second": 10})),
+    ] {
+        create_rate_limit_plugin_with_config_id(plugin, &valid, Some("valid-policy"))
+            .expect("the baseline must reach and pass backend construction");
+        for (policy, reason) in [
+            (json!("POLICY_IDENTIFIER_CANARY"), "must be exactly"),
+            (json!("918273641"), "must be exactly"),
+            (json!("'\"\\\n`POLICY_QUOTE_CANARY"), "must be exactly"),
+            (json!(918273641), "must be a string"),
+            (
+                json!({"POLICY_PAYLOAD_KEY": ["POLICY_VALUE_CANARY"]}),
+                "must be a string",
+            ),
+        ] {
+            let mut config = valid.clone();
+            config["redis_failure_policy"] = policy;
+            let error = create_rate_limit_plugin_with_config_id(plugin, &config, None)
+                .expect_err("invalid failure policy must fail backend construction");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.starts_with(&format!("{plugin}: ")), "{rendered}");
+            for retained in [
+                "`redis_failure_policy`",
+                reason,
+                "`fail_closed`",
+                "`local_fallback`",
+            ] {
+                assert!(rendered.contains(retained), "{retained}: {rendered}");
+            }
+            for withheld in [
+                "POLICY_IDENTIFIER_CANARY",
+                "918273641",
+                "POLICY_QUOTE_CANARY",
+                "POLICY_PAYLOAD_KEY",
+                "POLICY_VALUE_CANARY",
+            ] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+        }
+
+        for identity in [
+            "IDENTITY_CANARY:invalid",
+            "918273641:invalid",
+            "'\"\\\n`IDENTITY_QUOTE_CANARY",
+        ] {
+            let error = create_rate_limit_plugin_with_config_id(plugin, &valid, Some(identity))
+                .expect_err("malformed config id must fail backend construction");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.starts_with(&format!("{plugin}: ")), "{rendered}");
+            assert!(rendered.contains("invalid plugin config id"), "{rendered}");
+            assert!(rendered.contains("must start with"), "{rendered}");
+            for withheld in ["IDENTITY_CANARY", "918273641", "IDENTITY_QUOTE_CANARY"] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+
+            let http_client = PluginHttpClient::new(
+                &PoolConfig::default(),
+                DnsCache::new(DnsConfig::default()),
+                1000,
+                0,
+                100,
+                false,
+                None,
+                Arc::new(Vec::new()),
+                identity,
+                BackendEgressPolicy::unrestricted(),
+                Arc::new(Vec::new()),
+                0,
+            );
+            let error = create_plugin_with_http_client_and_config_id(
+                plugin,
+                &valid,
+                http_client,
+                Some("valid-policy"),
+            )
+            .err()
+            .expect("malformed client namespace must fail backend construction");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.starts_with(&format!("{plugin}: ")), "{rendered}");
+            assert!(rendered.contains("invalid Redis namespace"), "{rendered}");
+            assert!(rendered.contains("must start with"), "{rendered}");
+            for withheld in ["IDENTITY_CANARY", "918273641", "IDENTITY_QUOTE_CANARY"] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+        }
+    }
+}

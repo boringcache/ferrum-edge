@@ -201,7 +201,7 @@ impl GraphqlPlugin {
                 && GRAPHQL_CONFIG_KEYS.len()
                     == GRAPHQL_POLICY_CONFIG_KEYS.len() + RATE_LIMIT_REDIS_CONFIG_KEYS.len()
         );
-        reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: ")?;
+        reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: `config`: ")?;
 
         match config.get("sync_mode") {
             None => {}
@@ -296,7 +296,8 @@ impl GraphqlPlugin {
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("graphql: {error}"))?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
@@ -594,8 +595,10 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     // the shared production maxima. Local sliding-window memory itself is
     // bounded by a fixed aggregate-bucket ring, not by one timestamp per request.
     let label = format!("graphql: `{field}` entry {key:?}");
-    let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
-    let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)?;
+    let max_requests = validate_max_requests(&label, "max_requests", max_requests)
+        .map_err(|error| format!("graphql: `{field}`: {error}"))?;
+    let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)
+        .map_err(|error| format!("graphql: `{field}`: {error}"))?;
     let window = Duration::from_secs(window_seconds);
     Ok(RateSpec {
         max_requests,

@@ -1050,3 +1050,21 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn shared_window_bound_keeps_udp_plugin_and_field_when_rendered() {
+    use ferrum_edge::plugins::utils::rate_limit::MAX_RATE_LIMIT_WINDOW_SECONDS;
+
+    let value = MAX_RATE_LIMIT_WINDOW_SECONDS + 1;
+    let config = json!({"datagrams_per_second": 1, "window_seconds": value});
+    let error = ferrum_edge::plugins::validate_plugin_config("udp_rate_limiting", &config)
+        .expect_err("an excessive window must fail the shared bound");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.starts_with("udp_rate_limiting:"), "{rendered}");
+    assert!(rendered.contains("`window_seconds`"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds")),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(&value.to_string()), "{rendered}");
+}

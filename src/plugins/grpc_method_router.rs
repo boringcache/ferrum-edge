@@ -146,7 +146,7 @@ impl GrpcMethodRouter {
             object,
             "config",
             GRPC_METHOD_ROUTER_CONFIG_KEYS,
-            "grpc_method_router: ",
+            "grpc_method_router: `config`: ",
         )?;
 
         let allow_methods = parse_optional_method_set(config, "allow_methods")?;
@@ -211,9 +211,11 @@ impl GrpcMethodRouter {
                             "grpc_method_router: `method_rate_limits` entry {method:?}: `window_seconds` is required and must be a positive integer"
                         )
                     })?;
-                let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
+                let max_requests = validate_max_requests(&label, "max_requests", max_requests)
+                    .map_err(|error| format!("grpc_method_router: `method_rate_limits`: {error}"))?;
                 let window_seconds =
-                    validate_window_seconds(&label, "window_seconds", window_seconds)?;
+                    validate_window_seconds(&label, "window_seconds", window_seconds)
+                        .map_err(|error| format!("grpc_method_router: `method_rate_limits`: {error}"))?;
                 let normalized = normalize_config_method_path(method, "method_rate_limits")?;
                 let window = Duration::from_secs(window_seconds);
                 if method_rate_limits
@@ -274,7 +276,8 @@ impl GrpcMethodRouter {
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("grpc_method_router: {error}"))?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),

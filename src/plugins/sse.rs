@@ -181,7 +181,7 @@ impl SsePlugin {
                 value_kind(config)
             ));
         };
-        reject_unknown_keys(config_obj, "config", SSE_CONFIG_KEYS, "sse: ")?;
+        reject_unknown_keys(config_obj, "config", SSE_CONFIG_KEYS, "sse: `config`: ")?;
 
         let require_accept_header = bool_config(config_obj, "require_accept_header", true)?;
         let require_get_method = bool_config(config_obj, "require_get_method", true)?;

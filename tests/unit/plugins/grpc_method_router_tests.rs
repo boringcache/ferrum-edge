@@ -1079,3 +1079,108 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn shared_method_rate_bounds_keep_the_parent_without_promoting_supplied_keys() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
+
+    // Bounds are checked before method-path normalization, so even these bare
+    // numeric and hostile keys reach the shared validators through admission.
+    for key in [
+        "/pkg.Service/MethodIdentifierCanary",
+        "918273641",
+        "'\"\\\n`GRPC_METHOD_CANARY",
+    ] {
+        for (field, maximum) in [
+            ("max_requests", MAX_RATE_LIMIT_MAX_REQUESTS),
+            ("window_seconds", MAX_RATE_LIMIT_WINDOW_SECONDS),
+        ] {
+            for value in [0, maximum + 1] {
+                let mut spec = json!({"max_requests": 10, "window_seconds": 60});
+                spec[field] = json!(value);
+                let config = json!({"method_rate_limits": {key: spec}});
+                let error =
+                    ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config)
+                        .expect_err("invalid bound must be rejected before method normalization");
+                let rendered =
+                    ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+                assert!(
+                    rendered.contains("grpc_method_router: `method_rate_limits`"),
+                    "{rendered}"
+                );
+                assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+                if value == 0 {
+                    assert!(rendered.contains("must be greater than zero"), "{rendered}");
+                    assert!(!rendered.contains('0'), "{rendered}");
+                } else {
+                    assert!(
+                        rendered.contains(&format!("must be <= {maximum}")),
+                        "{rendered}"
+                    );
+                    assert!(!rendered.contains(&value.to_string()), "{rendered}");
+                }
+                for withheld in ["MethodIdentifierCanary", "918273641", "GRPC_METHOD_CANARY"] {
+                    assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn method_rate_shape_errors_keep_schema_and_suggestions_without_supplied_content() {
+    for key in [
+        "/pkg.Service/MethodIdentifierCanary",
+        "918273641",
+        "'\"\\\n`GRPC_METHOD_CANARY",
+    ] {
+        let hostile_key = "'\"\\\n`GRPC_KEY_CANARY";
+        for (spec, reason) in [
+            (
+                json!({
+                    "window_seconds": 60,
+                    "max_requets": {"GRPC_PAYLOAD_KEY": ["GRPC_VALUE_CANARY"]},
+                    hostile_key: "GRPC_SCALAR_CANARY",
+                    "918273642": ["GRPC_ARRAY_CANARY"]
+                }),
+                "did you mean `max_requests`?",
+            ),
+            (json!({"window_seconds": 60}), "`max_requests` is required"),
+            (
+                json!({
+                    "window_seconds": 60,
+                    "max_requests": {"GRPC_PAYLOAD_KEY": ["GRPC_VALUE_CANARY"]}
+                }),
+                "`max_requests` is required and must be a positive integer",
+            ),
+        ] {
+            let config = json!({"method_rate_limits": {key: spec}});
+            let error = ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config)
+                .expect_err("invalid rate spec must fail admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains("grpc_method_router:"), "{rendered}");
+            assert!(rendered.contains("`method_rate_limits`"), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            if config["method_rate_limits"][key].get("max_requets").is_some() {
+                assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            }
+            for withheld in [
+                "MethodIdentifierCanary",
+                "918273641",
+                "GRPC_METHOD_CANARY",
+                "max_requets",
+                "GRPC_KEY_CANARY",
+                "GRPC_PAYLOAD_KEY",
+                "GRPC_VALUE_CANARY",
+                "GRPC_SCALAR_CANARY",
+                "GRPC_ARRAY_CANARY",
+                "918273642",
+            ] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+        }
+    }
+}

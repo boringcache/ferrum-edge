@@ -2141,3 +2141,120 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn rate_map_bounds_keep_the_fixed_parent_and_withhold_operation_names() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
+
+    for (parent, key) in [
+        ("type_rate_limits", "query"),
+        ("operation_rate_limits", "OperationIdentifierCanary"),
+        // GraphQL names cannot start with a digit; this is the reachable shape.
+        ("operation_rate_limits", "_918273641"),
+    ] {
+        for (field, maximum) in [
+            ("max_requests", MAX_RATE_LIMIT_MAX_REQUESTS),
+            ("window_seconds", MAX_RATE_LIMIT_WINDOW_SECONDS),
+        ] {
+            let mut config = json!({parent: {key: {"max_requests": 10, "window_seconds": 60}}});
+            ferrum_edge::plugins::validate_plugin_config("graphql", &config)
+                .expect("the operation key and baseline rate spec must be accepted");
+            config[parent][key][field] = json!(maximum + 1);
+            let error = ferrum_edge::plugins::validate_plugin_config("graphql", &config)
+                .expect_err("an excessive rate bound must fail admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(
+                rendered.contains(&format!("graphql: `{parent}`")),
+                "{rendered}"
+            );
+            assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+            assert!(
+                rendered.contains(&format!("must be <= {maximum}")),
+                "{rendered}"
+            );
+            assert!(!rendered.contains(key), "{key}: {rendered}");
+            assert!(!rendered.contains(&(maximum + 1).to_string()), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn rate_map_shape_errors_keep_schema_and_suggestions_without_supplied_content() {
+    for (parent, key) in [
+        ("type_rate_limits", "query"),
+        ("operation_rate_limits", "OperationIdentifierCanary"),
+        ("operation_rate_limits", "_918273641"),
+    ] {
+        let hostile_key = "'\"\\\n`GRAPHQL_KEY_CANARY";
+        for (spec, reason) in [
+            (
+                json!({
+                    "window_seconds": 60,
+                    "max_requets": {"GRAPHQL_PAYLOAD_KEY": ["GRAPHQL_VALUE_CANARY"]},
+                    hostile_key: "GRAPHQL_SCALAR_CANARY",
+                    "918273642": ["GRAPHQL_ARRAY_CANARY"]
+                }),
+                "did you mean `max_requests`?",
+            ),
+            (json!({"window_seconds": 60}), "`max_requests` is required"),
+            (
+                json!({
+                    "window_seconds": 60,
+                    "max_requests": {"GRAPHQL_PAYLOAD_KEY": ["GRAPHQL_VALUE_CANARY"]}
+                }),
+                "`max_requests` is required and must be a positive integer",
+            ),
+        ] {
+            let config = json!({parent: {key: spec}});
+            let error = ferrum_edge::plugins::validate_plugin_config("graphql", &config)
+                .expect_err("invalid rate spec must fail admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains("graphql:"), "{rendered}");
+            assert!(rendered.contains(&format!("`{parent}`")), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            if config[parent][key].get("max_requets").is_some() {
+                assert!(rendered.contains("unknown configuration key(s)"), "{rendered}");
+            }
+            for withheld in [
+                key,
+                "max_requets",
+                "GRAPHQL_KEY_CANARY",
+                "GRAPHQL_PAYLOAD_KEY",
+                "GRAPHQL_VALUE_CANARY",
+                "GRAPHQL_SCALAR_CANARY",
+                "GRAPHQL_ARRAY_CANARY",
+                "918273642",
+            ] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+        }
+    }
+}
+
+#[test]
+fn unreachable_operation_key_shapes_are_rejected_before_shared_rate_bounds() {
+    for key in ["918273641", "'\"\\\n`GRAPHQL_OPERATION_CANARY"] {
+        let config = json!({"operation_rate_limits": {key: {
+            "max_requests": 918273642,
+            "window_seconds": 60
+        }}});
+        let error = ferrum_edge::plugins::validate_plugin_config("graphql", &config)
+            .expect_err("numeric and quote-bearing operation names are not GraphQL names");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("graphql: `operation_rate_limits`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("valid GraphQL operation name"),
+            "{rendered}"
+        );
+        for withheld in ["918273641", "918273642", "GRAPHQL_OPERATION_CANARY"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

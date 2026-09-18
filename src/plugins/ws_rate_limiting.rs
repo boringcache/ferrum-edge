@@ -121,7 +121,7 @@ impl WsRateLimiting {
             object,
             "config",
             WS_RATE_LIMITING_CONFIG_KEYS,
-            "ws_rate_limiting: ",
+            "ws_rate_limiting: `config`: ",
         )?;
 
         let frames_per_second = optional_positive_u64(config, "frames_per_second")?.unwrap_or(100);
@@ -170,7 +170,8 @@ impl WsRateLimiting {
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second as f64, burst_size as f64),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("ws_rate_limiting: {error}"))?,
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })

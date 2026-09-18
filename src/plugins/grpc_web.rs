@@ -954,7 +954,7 @@ impl GrpcWebPlugin {
         let object = config
             .as_object()
             .ok_or_else(|| "grpc_web: config must be an object".to_string())?;
-        reject_unknown_keys(object, "config", GRPC_WEB_CONFIG_KEYS, "grpc_web: ")?;
+        reject_unknown_keys(object, "config", GRPC_WEB_CONFIG_KEYS, "grpc_web: `config`: ")?;
 
         let mut expose_headers = BASE_EXPOSE_HEADERS
             .iter()

@@ -456,7 +456,7 @@ impl CompressionPlugin {
             config_object,
             "config",
             COMPRESSION_CONFIG_KEYS,
-            "compression: ",
+            "compression: `config`: ",
         )?;
 
         // Parse `algorithms` strictly. Unknown values are rejected (no silent

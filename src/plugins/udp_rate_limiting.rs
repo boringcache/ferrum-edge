@@ -135,7 +135,7 @@ impl UdpRateLimiting {
             object,
             "config",
             UDP_RATE_LIMITING_CONFIG_KEYS,
-            "udp_rate_limiting: ",
+            "udp_rate_limiting: `config`: ",
         )?;
 
         let datagrams_per_second = optional_positive_u64(config, "datagrams_per_second")?;
@@ -153,7 +153,8 @@ impl UdpRateLimiting {
         // zero and `window * 2` (activity retention) to zero — every increment
         // deleted its own counter, removing enforcement entirely.
         let window_seconds = match optional_positive_u64(config, "window_seconds")? {
-            Some(value) => validate_window_seconds("udp_rate_limiting", "window_seconds", value)?,
+            Some(value) => validate_window_seconds("udp_rate_limiting", "window_seconds", value)
+                .map_err(|error| format!("udp_rate_limiting: {error}"))?,
             None => 1,
         };
         let datagrams_per_window = per_window_limit(datagrams_per_second, window_seconds)?;
@@ -189,7 +190,8 @@ impl UdpRateLimiting {
                     epoch_base,
                 ),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("udp_rate_limiting: {error}"))?,
         })
     }
 

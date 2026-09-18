@@ -955,7 +955,7 @@ impl ResponseCachingConfig {
             object,
             "config",
             RESPONSE_CACHING_CONFIG_KEYS,
-            "response_caching: ",
+            "response_caching: `config`: ",
         )?;
 
         let cacheable_methods = parse_method_list(config, "cacheable_methods")?
