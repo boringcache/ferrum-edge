@@ -96,7 +96,12 @@ fn startup_redacts_quote_bearing_database_urls_before_withholding_spans() {
         let error = anyhow::anyhow!("`next.field`: invalid configuration")
             .context(format!("driver rejected {url}"));
         let rendered = render_startup_error(error, &[&url]);
-        for credential in ["fixture-user", "fixture-password", "fixture-token", "with-tail"] {
+        for credential in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-token",
+            "with-tail",
+        ] {
             assert!(!rendered.contains(credential), "{rendered}");
         }
         assert_eq!(

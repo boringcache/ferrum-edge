@@ -5757,7 +5757,8 @@ fn route_redirect_value(
         if !(300..=399).contains(&code) {
             return Err(invalid_resource(
                 object,
-                "VirtualService http[].redirect.redirectCode must be in the 300-399 range".to_string(),
+                "VirtualService http[].redirect.redirectCode must be in the 300-399 range"
+                    .to_string(),
             ));
         }
         out.insert("redirect_code".to_string(), serde_json::json!(code));
@@ -7662,7 +7663,8 @@ fn proxy_config(
             let sampling = value.as_f64().ok_or_else(|| {
                 invalid_resource(
                     object,
-                    "ProxyConfig spec.tracing.sampling must be a number between 0 and 100".to_string(),
+                    "ProxyConfig spec.tracing.sampling must be a number between 0 and 100"
+                        .to_string(),
                 )
             })?;
             if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {

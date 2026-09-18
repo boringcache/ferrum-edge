@@ -1731,6 +1731,9 @@ fn startup_redacts_apostrophe_secret_before_withholding_spans() {
         rendered,
         "<redacted diagnostic>: `next.field`: invalid configuration"
     );
-    assert!(!rendered.contains("apostrophe-secret-sentinel"), "{rendered}");
+    assert!(
+        !rendered.contains("apostrophe-secret-sentinel"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("with-tail"), "{rendered}");
 }

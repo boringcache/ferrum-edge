@@ -4544,7 +4544,10 @@ async fn functional_cli_backup_validation_sanitizes_early_emissions() {
         let output = cli_contract_output(command).await;
         let diagnostic = cli_contract_diagnostic(&output);
         assert_eq!(output.status.code(), Some(1), "{diagnostic}");
-        assert!(diagnostic.contains("Config backup rejected"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("Config backup rejected"),
+            "{diagnostic}"
+        );
         assert!(
             diagnostic.contains("references non-existent upstream"),
             "{diagnostic}"

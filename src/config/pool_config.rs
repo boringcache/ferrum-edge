@@ -362,9 +362,7 @@ impl PoolConfig {
         // Advisory only: any valid u64 is accepted. Sub-10s is unusually low
         // next to the HTTP read timeout, but it is a deliberate operator value.
         if config.http2_keep_alive_timeout_seconds < 10 {
-            tracing::warn!(
-                "HTTP/2 keep-alive timeout is below 10s, consider increasing to 30-45s"
-            );
+            tracing::warn!("HTTP/2 keep-alive timeout is below 10s, consider increasing to 30-45s");
         }
 
         Ok(config)
