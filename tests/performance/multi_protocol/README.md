@@ -187,8 +187,10 @@ errors, zero successful work, missing iterations, or inconsistent echo byte
 totals exclude a scenario from the scoreboard. Raw rates remain diagnostic.
 Each run records its expected matrix before startup (`manifest.json`) and saves
 backend/gateway logs plus Envoy counters under `diagnostics/` after the timed
-samples. A green workflow alone does not certify an error-free benchmark;
-inspect the validity tables.
+samples. If that manifest is missing or malformed, ranking is suppressed for
+the affected protocol while observed rows remain available for diagnosis. A
+green workflow alone does not certify an error-free benchmark; inspect the
+validity tables.
 
 The per-protocol summary rendered inside the matrix job still shows raw
 throughput only. `Trusted Cross Build Policy` freezes that job's bytes against
