@@ -980,3 +980,14 @@ The JSON output breaks connect failures into `refused / timeout / reset / tls_er
 - **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.
 - **Heartbeat is intentionally low-rate** (default 1 req/sec/conn). The point is to test connection capacity, not RPS — a high heartbeat rate would conflate the two and give a different (RPS-bound) breaking point.
 - **Connect attempts are spread over `--ramp-seconds`** so the *client* doesn't SYN-flood itself. With N=50K and ramp=30s that's ~1666 connects/sec, well within typical client capacity given proper ulimit.
+
+## UDP internal profile campaign
+
+The separate [UDP Internal Profile lane](../../../.github/workflows/udp-internal-profile.yml)
+uses default-off `bench-udp-profile`, four UDP1024 echo200 pairs, repeated direct
+controls, and same-revision observer calibration. See
+[coverage and limitations](../../../docs/udp_internal_profile.md) and the fixed
+`udp_profile_manifest.json` / `udp_profile_schema.json` contracts. Profiles and
+traffic validity are separate; unpublished tails and scrape failures cannot
+become zero-filled success. Controlled locality/burst/churn remain explicit
+hooks, and `experiment.json` remains disabled.

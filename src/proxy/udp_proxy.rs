@@ -23,6 +23,9 @@
 //! authenticated sequence (issue #3862), both refused at the same single
 //! receive boundary, before any session, hook, or backend effect.
 
+#[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+use crate::udp_profile::BatchField;
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::hash::{Hash, Hasher};
@@ -120,6 +123,7 @@ fn admit_udp_response(
     if crate::udp_amplification::factor_is_unlimited(factor) {
         return true;
     }
+    udp_count!(AmplificationChargeCalls, 1);
     if crate::udp_amplification::charge_response_budget(remaining, len) {
         crate::udp_amplification::record_response_allowed();
         true
@@ -138,10 +142,12 @@ fn admit_udp_response(
 }
 
 fn publish_session_request_budget(session: &UdpSession, request_size: u64) {
+    udp_count!(RequestSizeStores, 1);
     session
         .last_request_size
         .store(request_size, Ordering::Release);
     if let Some(factor) = session.amplification_factor {
+        udp_count!(RequestBudgetCalls, 1);
         crate::udp_amplification::publish_request_budget(
             &session.response_budget_remaining,
             request_size,
@@ -690,6 +696,7 @@ impl UdpSession {
         guard.take();
         // `notify_one` stores a permit if the worker is between its stop-flag
         // check and registering the hook-cancellation waiter.
+        udp_count!(HookNotifyCalls, 1);
         self.hook_ingress_stop_notify.notify_one();
         drop(guard);
         self.close_egress_writer();
@@ -733,6 +740,7 @@ pub(crate) fn signal_udp_reply_task_stop(
     stop_notify: &tokio::sync::Notify,
 ) {
     stop_flag.store(true, std::sync::atomic::Ordering::Release);
+    udp_count!(ReplyNotifyCalls, 1);
     stop_notify.notify_one();
 }
 
@@ -810,6 +818,7 @@ pub(crate) fn take_udp_last_client_if_live<T>(
     match last_client {
         Some((cached_addr, cached)) if cached_addr == client_addr => {
             if is_expired(cached.as_ref()) {
+                udp_count!(LastClientExpired, 1);
                 *last_client = None;
                 None
             } else {
@@ -1290,6 +1299,7 @@ enum UdpEgressAdmission {
 /// Emit a rate-limited warning for egress-writer drops (first drop, then every
 /// 100th). Omits client addresses so labels/log fields stay bounded.
 fn record_egress_queue_drop(metrics: &UdpProxyMetrics, proxy_id: &str, listen_port: u16) {
+    udp_count!(EgressDropped, 1);
     let n = metrics.egress_queue_drops.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n.is_multiple_of(100) {
         warn!(
@@ -1374,6 +1384,7 @@ fn enqueue_egress_datagram(
     client_addr: SocketAddr,
 ) -> UdpEgressAdmission {
     let len = data.len();
+    udp_count!(EgressInflightAdds, 1);
     let inflight_prev = session.egress_inflight.fetch_add(1, Ordering::AcqRel);
     if inflight_prev >= SESSION_EGRESS_MAX_QUEUED_DATAGRAMS {
         session.egress_inflight.fetch_sub(1, Ordering::AcqRel);
@@ -1382,6 +1393,7 @@ fn enqueue_egress_datagram(
     }
 
     let session_queued = &session.egress_queued_bytes;
+    udp_count!(EgressSessionByteAdds, 1);
     let session_prev = session_queued.fetch_add(len, Ordering::Relaxed);
     if session_prev.saturating_add(len) > SESSION_EGRESS_MAX_QUEUED_BYTES {
         rollback_egress_charge(session, metrics, len, true, false);
@@ -1390,6 +1402,7 @@ fn enqueue_egress_datagram(
     }
 
     let listener_queued = &metrics.egress_queued_bytes;
+    udp_count!(EgressListenerByteAdds, 1);
     let listener_prev = listener_queued.fetch_add(len, Ordering::Relaxed);
     if listener_prev.saturating_add(len) > LISTENER_EGRESS_MAX_QUEUED_BYTES {
         rollback_egress_charge(session, metrics, len, true, true);
@@ -1411,6 +1424,8 @@ fn enqueue_egress_datagram(
         return UdpEgressAdmission::Dropped;
     }
 
+    udp_count!(EgressQueued, 1);
+    udp_count!(EgressQueuedBytes, len);
     metrics.egress_handoffs.fetch_add(1, Ordering::Relaxed);
     UdpEgressAdmission::Queued
 }
@@ -1496,7 +1511,8 @@ fn spawn_session_egress_writer<F, Fut>(
     Fut: std::future::Future<Output = Result<usize, std::io::Error>> + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(queued) = rx.recv().await {
+        while let Some(queued) = udp_poll!(false, rx.recv()).await {
+            udp_count!(EgressDequeued, 1);
             let len = queued.data.len();
             // Charged at admission; released when this datagram leaves the
             // writer, whatever ends it.
@@ -1543,13 +1559,20 @@ fn spawn_session_egress_writer<F, Fut>(
             let publish = !queued.budget_published;
             let data = queued.data;
             let backend = send(Arc::clone(&session), data.clone());
-            let sent = forward_client_datagram_commit(&session, &data, backend, publish).await;
+            let sent = udp_poll!(
+                false,
+                forward_client_datagram_commit(&session, &data, backend, publish)
+            )
+            .await;
             match sent {
                 Ok(()) => {
+                    udp_count!(EgressSent, 1);
+                    udp_count!(EgressSentBytes, len);
                     metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
                     metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
+                    udp_count!(EgressSendError, 1);
                     metrics.egress_send_errors.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         proxy_id = %session.datagram_proxy_id,
@@ -1607,8 +1630,11 @@ impl PendingDatagramQueue {
         if self.datagrams.len() >= PENDING_SESSION_MAX_QUEUED_DATAGRAMS
             || self.queued_bytes.saturating_add(data.len()) > PENDING_SESSION_MAX_QUEUED_BYTES
         {
+            udp_count!(PendingTailDrop, 1);
             return false;
         }
+        udp_count!(PendingQueued, 1);
+        udp_count!(PendingQueuedBytes, data.len());
         self.queued_bytes += data.len();
         self.datagrams.push(PendingDatagram {
             data: data.to_vec(),
@@ -1637,7 +1663,14 @@ impl PendingSessionGate {
 impl Drop for PendingSessionGate {
     fn drop(&mut self) {
         if self.armed {
-            self.pending_sessions.remove(&self.session_key);
+            udp_count!(PendingAborted, 1);
+            let removed = self.pending_sessions.remove(&self.session_key);
+            #[cfg(feature = "bench-udp-profile")]
+            if let Some((_, queue)) = removed.as_ref() {
+                udp_count!(PendingAbortedDatagrams, queue.datagrams.len());
+                udp_count!(PendingAbortedBytes, queue.queued_bytes);
+            }
+            drop(removed);
         }
     }
 }
@@ -1846,14 +1879,22 @@ fn try_insert_pending_session_gate(
     forwarded_client: Option<SocketAddr>,
 ) -> Result<bool, anyhow::Error> {
     if pending_sessions.len() >= max_sessions {
+        #[cfg(feature = "bench-udp-profile")]
+        crate::udp_profile::operation_error(crate::udp_profile::Operation::PendingRaceGate);
         return Err(anyhow::anyhow!(
             "UDP pending session limit reached ({}), dropping datagram",
             max_sessions
         ));
     }
     match pending_sessions.entry(session_key.clone()) {
-        dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            #[cfg(feature = "bench-udp-profile")]
+            crate::udp_profile::lookup_outcome(crate::udp_profile::Operation::PendingRaceGate, true);
+            Ok(false)
+        }
         dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            #[cfg(feature = "bench-udp-profile")]
+            crate::udp_profile::lookup_outcome(crate::udp_profile::Operation::PendingRaceGate, false);
             vacant.insert(PendingDatagramQueue {
                 forwarded_client,
                 ..Default::default()
@@ -1916,10 +1957,13 @@ fn take_pending_datagrams(
     match pending_sessions.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             if occupied.get().datagrams.is_empty() {
+                udp_count!(PendingEmptyRemove, 1);
                 occupied.remove();
                 None
             } else {
                 let queue = occupied.get_mut();
+                udp_count!(PendingDrainDatagrams, queue.datagrams.len());
+                udp_count!(PendingDrainBytes, queue.queued_bytes);
                 queue.queued_bytes = 0;
                 Some(std::mem::take(&mut queue.datagrams))
             }
@@ -2627,22 +2671,35 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        return udp_frontend_send_until_expiry(authorization, frontend.send_to(data, client_addr))
-            .await;
+        return udp_frontend_send_until_expiry(
+            authorization,
+            udp_direct!(frontend.send_to(data, client_addr)),
+        )
+        .await;
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
         if let Some(termination) = udp_reply_expired_at_commit(authorization) {
             return UdpFrontendSendOutcome::AuthorizationExpired(termination);
         }
-        match crate::socket_opts::send_with_pktinfo(
+        let result = crate::socket_opts::send_with_pktinfo(
             frontend.as_raw_fd(),
             data,
             local,
             &dest,
             dest_len,
             None,
-        ) {
+        );
+        #[cfg(feature = "bench-udp-profile")]
+        {
+            crate::udp_profile::batch_count(
+                crate::udp_profile::Direction::Reply,
+                BatchField::DirectCalls,
+                1,
+            );
+            crate::udp_profile::direct_outcome(&result);
+        }
+        match result {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await {
                     UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
@@ -3579,6 +3636,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     // skip the per-datagram orig-dst cmsg scan (it would always yield `None`).
     #[cfg(target_os = "linux")]
     let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size, false);
+    #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+    recv_batch.profile_direction = crate::udp_profile::Direction::Ingress;
     #[cfg(not(target_os = "linux"))]
     let _ = recvmmsg_batch_size; // suppress unused variable warning
 
@@ -3608,10 +3667,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         tokio::select! {
             ready = frontend_socket.readable(), if pktinfo_primary => {
                 if let Err(e) = ready {
+                    udp_count!(ReadinessError, 1);
                     warn!(proxy_id = %proxy_id, "UDP readable error: {}", e);
                     continue;
                 }
 
+                udp_count!(ReadinessReady, 1);
                 #[cfg(target_os = "linux")]
                 {
                     let mut batch_dgrams_in: u64 = 0;
@@ -3630,9 +3691,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     'drain: while total_drained < batch_limit {
                         let max_this_call =
                             (batch_limit - total_drained).min(recv_batch.capacity());
-                        match frontend_socket.try_io(tokio::io::Interest::READABLE, || {
-                            recv_batch.recv(fd, max_this_call)
-                        }) {
+                        match udp_drain!(
+                            false,
+                            frontend_socket.try_io(tokio::io::Interest::READABLE, || {
+                                recv_batch.recv(fd, max_this_call)
+                            })
+                        ) {
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
@@ -3773,6 +3837,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                             &proxy_id,
                             batch_dgrams_in,
                         );
+                        udp_count!(ListenerCounterUpdates, 4);
                         metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
                         metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
                         metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
@@ -3882,9 +3947,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     'drain: while total_drained < batch_limit {
                         let max_this_call =
                             (batch_limit - total_drained).min(recv_batch.capacity());
-                        match frontend_socket.try_io(tokio::io::Interest::READABLE, || {
-                            recv_batch.recv(fd, max_this_call)
-                        }) {
+                        match udp_drain!(
+                            false,
+                            frontend_socket.try_io(tokio::io::Interest::READABLE, || {
+                                recv_batch.recv(fd, max_this_call)
+                            })
+                        ) {
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
@@ -4103,6 +4171,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 adaptive_buffer.record_batch_cycle(&proxy_namespace, &proxy_id, batch_dgrams_in);
 
                 // Flush batched metrics to atomics once.
+                udp_count!(ListenerCounterUpdates, 4);
                 metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
                 metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
                 metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
@@ -4179,7 +4248,7 @@ async fn process_datagram(
     // pass through exactly as before.
     let (data, identity) = match datagram_client_address {
         None => (data, DatagramClientIdentity::direct(client_addr)),
-        Some(gate) => match gate.decode(data, &client_addr) {
+        Some(gate) => match udp_timed!(MetadataDecode, gate.decode(data, &client_addr)) {
             Ok(decoded) => (
                 decoded.payload,
                 DatagramClientIdentity {
@@ -4207,12 +4276,15 @@ async fn process_datagram(
     // local destination is missing or is not an exact route on this listener is
     // dropped here: nothing is allocated for it and it never falls back to
     // another Service's route.
-    let Some((session_key, route)) = resolve_udp_session_route(
-        destinations,
-        proxy_id,
-        client_addr,
-        local_addr,
-        listener_generation,
+    let Some((session_key, route)) = udp_lookup!(
+        DestinationResolve,
+        resolve_udp_session_route(
+            destinations,
+            proxy_id,
+            client_addr,
+            local_addr,
+            listener_generation,
+        )
     ) else {
         return Ok(());
     };
@@ -4226,7 +4298,7 @@ async fn process_datagram(
         None => (proxy_namespace, proxy_id),
     };
 
-    if let Some(mut pending) = pending_sessions.get_mut(&session_key) {
+    if let Some(mut pending) = udp_lookup!(PendingLookup, pending_sessions.get_mut(&session_key)) {
         // A follow-up datagram must belong to the same client the in-flight
         // setup was started for. Queueing a different forwarded client here
         // would hand its payload to a session admitted under another identity.
@@ -4257,17 +4329,26 @@ async fn process_datagram(
     // the map but the recv-loop's `Arc` keeps it alive, so without clearing
     // we'd pin the backend socket/session on a quiet listener and keep
     // forwarding through a session the cleanup task already declared dead.
-    let existing_session =
+    let existing_session = udp_lookup!(
+        LastClientLookup,
         take_udp_last_client_if_live(last_client, &session_key, |cached_session| {
             cached_session
                 .expired
                 .load(std::sync::atomic::Ordering::Acquire)
         })
-        .or_else(|| {
-            sessions
-                .get(&session_key)
-                .map(|entry| entry.value().clone())
-        });
+    )
+    .or_else(|| {
+        udp_lookup!(
+            EstablishedLookup,
+            sessions.get(&session_key).map(|entry| {
+                #[cfg(feature = "bench-udp-profile")]
+                if entry.expired.load(Ordering::Acquire) {
+                    udp_count!(EstablishedExpired, 1);
+                }
+                entry.value().clone()
+            })
+        )
+    });
 
     let Some(session) = existing_session else {
         // Cheap flood shield: when the active-session cap is already full, drop a
@@ -4284,17 +4365,22 @@ async fn process_datagram(
                 max_sessions
             ));
         }
-        if !try_insert_pending_session_gate(
-            pending_sessions,
-            &session_key,
-            max_sessions,
-            identity.forwarded,
+        if !udp_timed!(
+            PendingRaceGate,
+            try_insert_pending_session_gate(
+                pending_sessions,
+                &session_key,
+                max_sessions,
+                identity.forwarded,
+            )
         )? {
             // Defensive: a gate appeared after the check at the top of this
             // function (not expected — the recv loop is a single task). Treat
             // this datagram as a follow-up for the in-flight setup, subject to
             // the same forwarded-client agreement as the ordinary queue path.
-            if let Some(mut pending) = pending_sessions.get_mut(&session_key) {
+            if let Some(mut pending) =
+                udp_lookup!(PendingRaceLookup, pending_sessions.get_mut(&session_key))
+            {
                 if pending.forwarded_client == identity.forwarded {
                     let _ = pending.push_bounded(data, local_addr.map(|local| local.ifindex));
                 } else {
@@ -5134,8 +5220,13 @@ fn forward_client_datagram_without_blocking(
     // conservative budget based on bytes accepted from the client.
     publish_session_request_budget(session, data.len() as u64);
 
-    match socket.try_send(data) {
-        Ok(_) => {
+    match udp_timed!(BorrowedSend, socket.try_send(data)) {
+        Ok(sent) => {
+            let _ = sent;
+            udp_count!(BorrowedSendSuccess, 1);
+            udp_count!(BorrowedSendBytes, sent);
+            udp_count!(FastActivityStores, 1);
+            udp_count!(FastByteAdds, 1);
             session
                 .last_activity
                 .store(coarse_epoch_millis(), Ordering::Relaxed);
@@ -5145,13 +5236,17 @@ fn forward_client_datagram_without_blocking(
             UdpEgressAdmission::Sent
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            udp_count!(BorrowedSendWouldBlock, 1);
             // The LOCAL socket buffer is full. Hand this datagram to the
             // session's writer instead of parking the shared receive loop on
             // writability; its response budget was already published above, so
             // the writer must not publish it again.
             enqueue_egress_datagram(session, data, true, metrics, client_addr)
         }
-        Err(e) => UdpEgressAdmission::Failed(anyhow::anyhow!("send to backend failed: {}", e)),
+        Err(e) => {
+            udp_count!(BorrowedSendIoError, 1);
+            UdpEgressAdmission::Failed(anyhow::anyhow!("send to backend failed: {}", e))
+        }
     }
 }
 
@@ -8665,10 +8760,14 @@ async fn create_session(
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
         let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
+        #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+        send_batch.profile_direction = crate::udp_profile::Direction::Reply;
         // Pre-allocate GSO batch buffer for concatenating same-size datagrams (Linux only).
         // GSO is preferred over sendmmsg when available — fewer syscalls for same-size bursts.
         #[cfg(target_os = "linux")]
         let mut gso_batch = super::udp_batch::GsoBatchBuf::new(65535);
+        #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+        gso_batch.profile_direction = crate::udp_profile::Direction::Reply;
         // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
@@ -8696,7 +8795,7 @@ async fn create_session(
                     reply_stop_notify.as_ref(),
                     reply_authorization_plan,
                     &mut reply_authorization_deadline,
-                    dtls.recv(),
+                    udp_poll!(true, dtls.recv()),
                     udp_reply_shutdown_cancel(
                         &mut reply_listener_shutdown,
                         &mut reply_global_shutdown,
@@ -8750,7 +8849,7 @@ async fn create_session(
                     reply_stop_notify.as_ref(),
                     reply_authorization_plan,
                     &mut reply_authorization_deadline,
-                    sock.recv(&mut buf),
+                    udp_poll!(true, sock.recv(&mut buf)),
                     udp_reply_shutdown_cancel(
                         &mut reply_listener_shutdown,
                         &mut reply_global_shutdown,
@@ -9016,7 +9115,7 @@ async fn create_session(
                 // pending `send_to`.
                 match udp_frontend_send_until_expiry(
                     reply_authorization_plan,
-                    frontend.send_to(send_data, client_addr),
+                    udp_direct!(frontend.send_to(send_data, client_addr)),
                 )
                 .await
                 {
@@ -9075,7 +9174,7 @@ async fn create_session(
                         }
                         break 'reply;
                     }
-                    match sock.try_recv(&mut buf) {
+                    match udp_drain!(true, sock.try_recv(&mut buf)) {
                         Ok(len2) => {
                             if let Some(source) = reply_session.node_waypoint_source.as_ref()
                                 && let Err(refusal) =
@@ -9243,7 +9342,7 @@ async fn create_session(
                             } else {
                                 match udp_frontend_send_until_expiry(
                                     reply_authorization_plan,
-                                    frontend.send_to(&buf[..len2], client_addr),
+                                    udp_direct!(frontend.send_to(&buf[..len2], client_addr)),
                                 )
                                 .await
                                 {
@@ -9452,6 +9551,7 @@ async fn create_session(
             }
 
             // Flush batched metrics.
+            udp_count!(ReplyCounterUpdates, 4);
             reply_session.last_activity.store(now, Ordering::Relaxed);
             reply_session
                 .bytes_received

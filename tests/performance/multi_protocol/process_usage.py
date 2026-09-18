@@ -127,7 +127,7 @@ def client_pids(parent, proc_root=Path("/proc")):
 
 
 def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, stop_file=None,
-                     *, http3=False, envoy=False, h2_gauges=False, h1_profile=False):
+                     *, http3=False, envoy=False, h2_gauges=False, h1_profile=False, udp_profile=False):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("sampling interval must be positive and finite")
@@ -176,6 +176,12 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
         if h1_profile:
             from h1_internal_profile import snapshot as h1_snapshot
             snapshot["h1_profile"] = h1_snapshot(len(timeline))
+        if udp_profile:
+            from udp_internal_profile import snapshot as udp_snapshot
+            snapshot["udp_profile"] = udp_snapshot(len(timeline), snapshot["processes"])
+            # Retain each raw scrape even if the sampler later exits abnormally.
+            with Path(str(output) + ".udp-profile.jsonl").open("a") as raw:
+                raw.write(json.dumps(snapshot) + "\n")
         timeline.append(snapshot)
 
     try:
@@ -220,10 +226,12 @@ if __name__ == "__main__":
     parser.add_argument("--envoy", action="store_true")
     parser.add_argument("--h2-gauges", action="store_true")
     parser.add_argument("--h1-profile", action="store_true")
+    parser.add_argument("--udp-profile", action="store_true")
     parser.add_argument("--parent-pid", type=int)
     parser.add_argument("--stop-file")
     args = parser.parse_args()
     sample_processes(args.backend, [int(pid) for pid in args.gateway_pids.split()],
                      args.output, args.interval, parent_pid=args.parent_pid,
                      stop_file=args.stop_file, http3=args.http3, envoy=args.envoy,
-                     h2_gauges=args.h2_gauges, h1_profile=args.h1_profile)
+                     h2_gauges=args.h2_gauges, h1_profile=args.h1_profile,
+                     udp_profile=args.udp_profile)

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "issue": 5588,
+  "parent": "d4b2ad9bd1fd64fb44e46afd94718fa5a7cef7fd",
+  "protocol": "udp",
+  "pairs": 4,
+  "duration": 15,
+  "offered_workers": 200,
+  "payload_sizes": [
+    1024
+  ],
+  "scenario": "existing_echo_200",
+  "campaigns": {
+    "calibration": {
+      "ferrum": "observer on",
+      "ferrum-baseline": "same revision observer off"
+    },
+    "profile": {
+      "ferrum": "observer on",
+      "kong": "kong/kong-gateway:3.10.0.0 unchanged baseline"
+    }
+  },
+  "direct": "repeated every pair",
+  "offered_work": "equal workers, payload and timed duration; closed-loop echo, not equal completed counts",
+  "observed_sockets": "existing active_connections client socket lifetime gauges",
+  "unimplemented_scenarios": {
+    "fixed_locality": "requires a predeclared per-socket schedule and equal offered packet count/rate across arms",
+    "seeded_bursts": "requires seed, burst/interleave schedule, loss and per-socket observations",
+    "setup_churn": "requires fixed socket creation/retirement schedule, cleanup proof and socket-lifetime accounting; existing echo does not exercise churn"
+  },
+  "coverage": "published UDP source-site counters; tails and tracing remain explicit",
+  "kong_provenance": {
+    "image": "kong/kong-gateway:3.10.0.0",
+    "vendor_correspondence": "unestablished; root investigation",
+    "changelog": "OpenResty connection pooling correction in 3.10.0.2; UDP impact unestablished; no causal attribution"
+  }
+}
