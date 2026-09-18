@@ -142,9 +142,9 @@ mod per_port_load_balancer_tests;
 mod policy_path_tests;
 mod pool_create_failure_classification_tests;
 mod pool_create_failure_fanout_tests;
+mod pool_key_tests;
 #[cfg(feature = "bench-pool-profile")]
 mod pool_profile_tests;
-mod pool_key_tests;
 mod pool_sharding_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;
