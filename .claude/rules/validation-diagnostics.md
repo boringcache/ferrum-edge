@@ -85,6 +85,15 @@ paths:
   are withheld. JSON Schema and regex admission retain fixed classifications.
   Registered constructor/rendered-output regressions cover these configuration
   paths independently of the scoped mechanical producer guard.
+- Shared TLS and plugin-client configuration diagnostics quote material paths,
+  source identifiers, cipher/group selections and opaque provider detail.
+  Fixed material labels, PEM/CRL record indexes and measured public-key strength
+  remain available. Custom I/O causes stay in typed fields but are omitted from
+  generic error-chain traversal; native OS causes remain chained. TLS constructor
+  logs sanitize source/proxy scalars at emission. Shared Redis/replay admission
+  preserves schema fields and fixed rejection reasons without supplied identities.
+  Registered loader, rendered-chain and captured-log regressions cover these
+  surfaces; source IDs retained for internal identity are not safe log labels.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,

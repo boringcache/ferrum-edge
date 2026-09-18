@@ -62,6 +62,115 @@ fn live(client: &PluginHttpClient) -> &reqwest::Client {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn ca_construction_logs_withhold_hostile_sources_and_malformed_material() {
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("'HTTP_CA_MISSING_MARKER.pem");
+    let malformed = dir.path().join("'HTTP_CA_FILENAME_MARKER.pem");
+    let pem = "-----BEGIN CERTIFICATE-----\n'HTTP_CA_CONTENT_MARKER\n-----END CERTIFICATE-----\n";
+    std::fs::write(&malformed, pem).unwrap();
+    let cases = [
+        (missing.to_str().unwrap(), "failed to load CA bundle (io)"),
+        (malformed.to_str().unwrap(), "malformed PEM CA bundle"),
+        (pem, "malformed PEM CA bundle"),
+        (
+            "file://operator:HTTP_CA_PROVIDER_MARKER@localhost/key.pem",
+            "failed to load CA bundle (invalid_source)",
+        ),
+    ];
+    for (source, reason) in cases {
+        let (logs, guard) = super::plugin_utils::capture_debug_logs();
+        let client = PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            Some(source),
+            Arc::new(Vec::new()),
+            ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            BackendEgressPolicy::unrestricted(),
+            Arc::new(Vec::new()),
+            0,
+        );
+        drop(guard);
+        let captured = logs.contents();
+        for expected in [
+            "Failed to load configured plugin HTTP CA bundle",
+            "Applying empty trust store for invalid plugin HTTP CA bundle",
+            "ca_bundle=",
+            "error=",
+            "`FERRUM_TLS_CA_BUNDLE_PATH`",
+            reason,
+        ] {
+            assert!(captured.contains(expected), "missing {expected:?}: {captured}");
+        }
+        for withheld in [
+            "HTTP_CA_MISSING_MARKER",
+            "HTTP_CA_FILENAME_MARKER",
+            "HTTP_CA_CONTENT_MARKER",
+            "HTTP_CA_PROVIDER_MARKER",
+            source,
+        ] {
+            assert!(!captured.contains(withheld), "leaked {withheld:?}: {captured}");
+        }
+        assert!(
+            client.get().is_ok(),
+            "the empty-trust client remains constructible"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_ca_der_constructor_logs_keep_fixed_failure_reason() {
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("'HTTP_CA_DER_FILENAME_MARKER.pem");
+    // Valid PEM framing reaches the actual reqwest builder; these bytes are
+    // the supplied scalar 927451, not an X.509 trust anchor.
+    std::fs::write(
+        &path,
+        "-----BEGIN CERTIFICATE-----\nOTI3NDUx\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let (logs, guard) = super::plugin_utils::capture_debug_logs();
+    let client = PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        path.to_str(),
+        Arc::new(Vec::new()),
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        BackendEgressPolicy::unrestricted(),
+        Arc::new(Vec::new()),
+        0,
+    );
+    drop(guard);
+    let captured = logs.contents();
+    for expected in [
+        "Failed to build fully-configured plugin HTTP client",
+        "Failed to build minimal DNS-cached fallback plugin client",
+        "error=plugin HTTP client construction failed",
+    ] {
+        assert!(captured.contains(expected), "missing {expected:?}: {captured}");
+    }
+    for withheld in ["HTTP_CA_DER_FILENAME_MARKER", "OTI3NDUx", "927451"] {
+        assert!(!captured.contains(withheld), "leaked {withheld:?}: {captured}");
+    }
+    assert!(client.get().is_ok(), "empty-trust fallback remains constructible");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn plugin_http_client_ignores_ambient_proxy_environment() {
     let proxy = MockServer::start().await;
     let client = {
