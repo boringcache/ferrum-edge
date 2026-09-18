@@ -821,7 +821,7 @@ impl OidcRelyingParty {
             .get("providers")
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                "oidc_relying_party: 'providers' must be a non-empty array".to_string()
+                "oidc_relying_party: `providers` must be a non-empty array".to_string()
             })?;
         if providers.len() != 1 {
             return Err(
@@ -831,19 +831,19 @@ impl OidcRelyingParty {
         }
         let provider_obj = providers[0]
             .as_object()
-            .ok_or_else(|| "oidc_relying_party: provider[0] must be an object".to_string())?;
+            .ok_or_else(|| "oidc_relying_party: `provider[0]` must be an object".to_string())?;
         reject_unknown_fields(provider_obj, PROVIDER_FIELDS, "provider[0]")?;
         let session_obj = config_obj
             .get("session")
             .and_then(Value::as_object)
-            .ok_or_else(|| "oidc_relying_party: 'session' object is required".to_string())?;
+            .ok_or_else(|| "oidc_relying_party: `session` object is required".to_string())?;
         reject_unknown_fields(session_obj, SESSION_FIELDS, "session")?;
         let behavior_obj = match config_obj.get("behavior") {
             Some(Value::Null) | None => None,
             Some(value) => Some(
                 value
                     .as_object()
-                    .ok_or_else(|| "oidc_relying_party: behavior must be an object".to_string())?,
+                    .ok_or_else(|| "oidc_relying_party: `behavior` must be an object".to_string())?,
             ),
         };
         if let Some(behavior_obj) = behavior_obj {
@@ -851,7 +851,7 @@ impl OidcRelyingParty {
         }
         if let Some(client_auth) = provider_obj.get("client_auth") {
             let client_auth = client_auth.as_object().ok_or_else(|| {
-                "oidc_relying_party: provider[0].client_auth must be an object".to_string()
+                "oidc_relying_party: `provider[0].client_auth` must be an object".to_string()
             })?;
             reject_unknown_fields(client_auth, CLIENT_AUTH_FIELDS, "provider[0].client_auth")?;
         }
@@ -872,7 +872,7 @@ impl OidcRelyingParty {
             authorization_endpoint.is_some() && token_endpoint.is_some() && jwks_uri.is_some();
         if discovery_url.is_none() && !explicit_complete {
             return Err(
-                "oidc_relying_party: provider[0] requires discovery_url or explicit authorization_endpoint, token_endpoint, and jwks_uri"
+                "oidc_relying_party: `provider[0]` requires `discovery_url` or explicit `authorization_endpoint`, `token_endpoint`, and `jwks_uri`"
                     .to_string(),
             );
         }
@@ -880,7 +880,7 @@ impl OidcRelyingParty {
             && (authorization_endpoint.is_some() || token_endpoint.is_some() || jwks_uri.is_some())
         {
             return Err(
-                "oidc_relying_party: provider[0] discovery_url conflicts with explicit endpoints"
+                "oidc_relying_party: `provider[0]` `discovery_url` conflicts with explicit endpoints"
                     .to_string(),
             );
         }
@@ -906,7 +906,7 @@ impl OidcRelyingParty {
         let client_id = required_string(provider_obj, "client_id", "provider[0]")?;
         let scopes = parse_string_array(provider_obj, "scopes", "provider[0]")?;
         if scopes.is_empty() || !scopes.iter().any(|scope| scope == "openid") {
-            return Err("oidc_relying_party: provider[0].scopes must include 'openid'".to_string());
+            return Err("oidc_relying_party: `provider[0].scopes` must include `openid`".to_string());
         }
         let redirect_uri = required_string(provider_obj, "redirect_uri", "provider[0]")?;
         validate_redirect_uri(&redirect_uri)?;
@@ -914,18 +914,18 @@ impl OidcRelyingParty {
             .ok()
             .and_then(|url| correlation_cookie_host_from_url(&url))
             .ok_or_else(|| {
-                "oidc_relying_party: redirect_uri must include a valid cookie host".to_string()
+                "oidc_relying_party: `redirect_uri` must include a valid cookie host".to_string()
             })?;
         let callback_path = optional_string(provider_obj, "callback_path", "provider[0]")?
             .unwrap_or_else(|| "/oauth/callback".to_string());
         validate_path_only(&callback_path, "callback_path")?;
         let redirect_path = Url::parse(&redirect_uri)
-            .map_err(|e| format!("oidc_relying_party: redirect_uri is invalid: {e}"))?
+            .map_err(|e| format!("oidc_relying_party: `redirect_uri` is invalid: {e}"))?
             .path()
             .to_string();
         if redirect_path != callback_path {
             return Err(
-                "oidc_relying_party: redirect_uri path must equal callback_path".to_string(),
+                "oidc_relying_party: `redirect_uri` path must equal `callback_path`".to_string(),
             );
         }
         let logout_path = optional_string(provider_obj, "logout_path", "provider[0]")?
@@ -938,7 +938,7 @@ impl OidcRelyingParty {
         // (issue #5030).
         if route_paths_collide(&logout_path, &callback_path) {
             return Err(
-                "oidc_relying_party: provider[0].logout_path must not resolve to the same path as callback_path"
+                "oidc_relying_party: `provider[0].logout_path` must not resolve to the same path as `callback_path`"
                     .to_string(),
             );
         }
@@ -950,7 +950,7 @@ impl OidcRelyingParty {
         )?;
         if id_token_clock_skew_secs > MAX_ID_TOKEN_CLOCK_SKEW_SECS {
             return Err(format!(
-                "oidc_relying_party: provider[0].id_token_clock_skew_secs must be <= {MAX_ID_TOKEN_CLOCK_SKEW_SECS}"
+                "oidc_relying_party: `provider[0].id_token_clock_skew_secs` must be <= {MAX_ID_TOKEN_CLOCK_SKEW_SECS}"
             ));
         }
 
@@ -1014,7 +1014,7 @@ impl OidcRelyingParty {
         let store = optional_string(session_obj, "store", "session")?
             .unwrap_or_else(|| "cookie".to_string());
         if store != "cookie" {
-            return Err("oidc_relying_party: session.store must be 'cookie'".to_string());
+            return Err("oidc_relying_party: `session.store` must be `cookie`".to_string());
         }
         let encryption_secret = required_string(session_obj, "encryption_secret", "session")?;
         let previous_secret =
@@ -1028,12 +1028,12 @@ impl OidcRelyingParty {
         for (field, value) in [("ttl_secs", ttl_secs), ("idle_ttl_secs", idle_ttl_secs)] {
             if value == 0 {
                 return Err(format!(
-                    "oidc_relying_party: session.{field} must be greater than zero"
+                    "oidc_relying_party: `session.{field}` must be greater than zero"
                 ));
             }
             if value > MAX_SESSION_TTL_SECS {
                 return Err(format!(
-                    "oidc_relying_party: session.{field} must be <= {MAX_SESSION_TTL_SECS}"
+                    "oidc_relying_party: `session.{field}` must be <= {MAX_SESSION_TTL_SECS}"
                 ));
             }
         }
@@ -1043,11 +1043,11 @@ impl OidcRelyingParty {
             DEFAULT_SESSION_MAX_COOKIE_BYTES,
         )?;
         if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
-            return Err("oidc_relying_party: session.max_cookie_bytes must be <= 8000".to_string());
+            return Err("oidc_relying_party: `session.max_cookie_bytes` must be <= 8000".to_string());
         }
         if max_cookie_bytes < MIN_SESSION_MAX_COOKIE_BYTES {
             return Err(format!(
-                "oidc_relying_party: session.max_cookie_bytes must be >= {MIN_SESSION_MAX_COOKIE_BYTES}"
+                "oidc_relying_party: `session.max_cookie_bytes` must be >= {MIN_SESSION_MAX_COOKIE_BYTES}"
             ));
         }
         let http_only = optional_bool(session_obj, "http_only")?.unwrap_or(true);
@@ -1056,7 +1056,7 @@ impl OidcRelyingParty {
             .to_ascii_lowercase();
         if !matches!(same_site.as_str(), "strict" | "lax" | "none") {
             return Err(
-                "oidc_relying_party: session.same_site must be strict, lax, or none".to_string(),
+                "oidc_relying_party: `session.same_site` must be strict, lax, or none".to_string(),
             );
         }
         if same_site == "none" && !secure {
@@ -1071,12 +1071,12 @@ impl OidcRelyingParty {
         )?);
         if state_ttl.is_zero() {
             return Err(
-                "oidc_relying_party: behavior.state_ttl_secs must be greater than zero".to_string(),
+                "oidc_relying_party: `behavior.state_ttl_secs` must be greater than zero".to_string(),
             );
         }
         if state_ttl.as_secs() > MAX_STATE_TTL_SECS {
             return Err(format!(
-                "oidc_relying_party: behavior.state_ttl_secs must be <= {MAX_STATE_TTL_SECS}"
+                "oidc_relying_party: `behavior.state_ttl_secs` must be <= {MAX_STATE_TTL_SECS}"
             ));
         }
         let state_cache_max_entries = behavior_usize(
@@ -1091,7 +1091,7 @@ impl OidcRelyingParty {
         )?;
         if state_cache_max_entries_per_source > state_cache_max_entries {
             return Err(
-                "oidc_relying_party: behavior.state_cache_max_entries_per_source must not exceed state_cache_max_entries"
+                "oidc_relying_party: `behavior.state_cache_max_entries_per_source` must not exceed `state_cache_max_entries`"
                     .to_string(),
             );
         }
@@ -1131,13 +1131,13 @@ impl OidcRelyingParty {
         let trusted_redirect_hosts =
             parse_behavior_string_array(behavior_obj, "trusted_redirect_hosts")?;
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
-            return Err("oidc_relying_party: behavior.trusted_redirect_hosts is required when post_login_redirect_param is set".to_string());
+            return Err("oidc_relying_party: `behavior.trusted_redirect_hosts` is required when `post_login_redirect_param` is set".to_string());
         }
         let refresh_skew_secs =
             optional_behavior_u64(behavior_obj, "refresh_skew_secs", DEFAULT_REFRESH_SKEW_SECS)?;
         if refresh_skew_secs > ttl_secs / 2 {
             return Err(
-                "oidc_relying_party: behavior.refresh_skew_secs must be <= session.ttl_secs / 2"
+                "oidc_relying_party: `behavior.refresh_skew_secs` must be <= `session.ttl_secs` / 2"
                     .to_string(),
             );
         }
@@ -3020,7 +3020,7 @@ fn parse_client_auth(
     let method = match auth.get("method") {
         Some(Value::Null) | None => "client_secret_basic",
         Some(value) => value.as_str().ok_or_else(|| {
-            "oidc_relying_party: provider[0].client_auth.method must be a string".to_string()
+            "oidc_relying_party: `provider[0].client_auth.method` must be a string".to_string()
         })?,
     };
     match method {
@@ -3043,16 +3043,20 @@ fn parse_client_auth(
                 "ES256" => Algorithm::ES256,
                 "ES384" => Algorithm::ES384,
                 "EdDSA" => Algorithm::EdDSA,
-                _ => return Err("oidc_relying_party: unsupported private_key_jwt_alg".to_string()),
+                _ => return Err("oidc_relying_party: unsupported `private_key_jwt_alg`".to_string()),
             };
             let encoding_key = match alg {
                 Algorithm::ES256 | Algorithm::ES384 => EncodingKey::from_ec_pem(pem.as_bytes())
-                    .map_err(|e| format!("oidc_relying_party: invalid EC private key PEM: {e}"))?,
-                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|e| {
-                    format!("oidc_relying_party: invalid EdDSA private key PEM: {e}")
+                    .map_err(|_| {
+                        "oidc_relying_party: `client_auth.private_key_pem` is invalid EC PEM"
+                            .to_string()
+                    })?,
+                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|_| {
+                    "oidc_relying_party: `client_auth.private_key_pem` is invalid EdDSA PEM".to_string()
                 })?,
-                _ => EncodingKey::from_rsa_pem(pem.as_bytes())
-                    .map_err(|e| format!("oidc_relying_party: invalid RSA private key PEM: {e}"))?,
+                _ => EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| {
+                    "oidc_relying_party: `client_auth.private_key_pem` is invalid RSA PEM".to_string()
+                })?,
             };
             // Parsing the PEM only proves it is a well-formed key of that
             // family, not that it supports the selected algorithm: an ES256
@@ -3064,7 +3068,7 @@ fn parse_client_auth(
             build_client_assertion("ferrum-edge", "ferrum-edge", &encoding_key, alg, &None)
                 .map_err(|_| {
                     format!(
-                        "oidc_relying_party: client_auth.private_key_pem cannot sign private_key_jwt_alg {alg_name}"
+                        "oidc_relying_party: `client_auth.private_key_pem` cannot sign `private_key_jwt_alg` {alg_name:?}"
                     )
                 })?;
             let kid = auth
@@ -3087,13 +3091,13 @@ fn parse_client_auth(
                     .is_none_or(|host| !is_local_auth_host(&host))
             }) {
                 return Err(
-                    "oidc_relying_party: client_auth.method='none' is only allowed for localhost or loopback token endpoints"
+                    "oidc_relying_party: `client_auth.method`=`none` is only allowed for localhost or loopback token endpoints"
                         .to_string(),
                 );
             }
             Ok(OidcClientAuth::None)
         }
-        _ => Err("oidc_relying_party: unsupported client_auth.method".to_string()),
+        _ => Err("oidc_relying_party: unsupported `client_auth.method`".to_string()),
     }
 }
 
@@ -3216,7 +3220,7 @@ fn reject_unknown_fields(
         .find(|field| !allowed.contains(&field.as_str()))
     {
         return Err(format!(
-            "oidc_relying_party: unknown field '{scope}.{field}'"
+            "oidc_relying_party: unknown field {field:?} in `{scope}`"
         ));
     }
     Ok(())
@@ -3424,10 +3428,10 @@ fn behavior_usize(
     let raw = optional_behavior_u64(config, field, default as u64)?;
     if raw == 0 {
         return Err(format!(
-            "oidc_relying_party: behavior.{field} must be greater than zero"
+            "oidc_relying_party: `behavior.{field}` must be greater than zero"
         ));
     }
-    usize::try_from(raw).map_err(|_| format!("oidc_relying_party: behavior.{field} is too large"))
+    usize::try_from(raw).map_err(|_| format!("oidc_relying_party: `behavior.{field}` is too large"))
 }
 
 fn required_string(
@@ -3436,7 +3440,7 @@ fn required_string(
     scope: &str,
 ) -> Result<String, String> {
     optional_string(config, field, scope)?
-        .ok_or_else(|| format!("oidc_relying_party: {scope}.{field} is required"))
+        .ok_or_else(|| format!("oidc_relying_party: `{scope}.{field}` is required"))
 }
 
 fn optional_string(
@@ -3452,11 +3456,11 @@ fn optional_string(
     }
     let raw = value
         .as_str()
-        .ok_or_else(|| format!("oidc_relying_party: {scope}.{field} must be a string"))?;
+        .ok_or_else(|| format!("oidc_relying_party: `{scope}.{field}` must be a string"))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "oidc_relying_party: {scope}.{field} must not be empty"
+            "oidc_relying_party: `{scope}.{field}` must not be empty"
         ));
     }
     Ok(Some(trimmed.to_string()))
@@ -3468,7 +3472,7 @@ fn optional_u64(config: &Map<String, Value>, field: &str, default: u64) -> Resul
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| format!("oidc_relying_party: {field} must be an unsigned integer"))
+                .ok_or_else(|| format!("oidc_relying_party: `{field}` must be an unsigned integer"))
         })
         .transpose()
         .map(|value| value.unwrap_or(default))
@@ -3480,7 +3484,7 @@ fn optional_bool(config: &Map<String, Value>, field: &str) -> Result<Option<bool
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("oidc_relying_party: {field} must be a boolean"))
+                .ok_or_else(|| format!("oidc_relying_party: `{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -3495,16 +3499,16 @@ fn parse_string_array(
     };
     let arr = value
         .as_array()
-        .ok_or_else(|| format!("oidc_relying_party: {scope}.{field} must be an array"))?;
+        .ok_or_else(|| format!("oidc_relying_party: `{scope}.{field}` must be an array"))?;
     let mut values = Vec::with_capacity(arr.len());
     for (idx, item) in arr.iter().enumerate() {
         let raw = item.as_str().ok_or_else(|| {
-            format!("oidc_relying_party: {scope}.{field}[{idx}] must be a string")
+            format!("oidc_relying_party: `{scope}.{field}[{idx}]` must be a string")
         })?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(format!(
-                "oidc_relying_party: {scope}.{field}[{idx}] must not be empty"
+                "oidc_relying_party: `{scope}.{field}[{idx}]` must not be empty"
             ));
         }
         values.push(trimmed.to_string());
@@ -3521,7 +3525,7 @@ fn optional_behavior_u64(
         .and_then(|cfg| cfg.get(field))
         .map(|value| {
             value.as_u64().ok_or_else(|| {
-                format!("oidc_relying_party: behavior.{field} must be an unsigned integer")
+                format!("oidc_relying_party: `behavior.{field}` must be an unsigned integer")
             })
         })
         .transpose()
@@ -3537,7 +3541,7 @@ fn optional_behavior_bool(
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("oidc_relying_party: behavior.{field} must be a boolean"))
+                .ok_or_else(|| format!("oidc_relying_party: `behavior.{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -3554,10 +3558,10 @@ fn optional_behavior_string(
     }
     let raw = value
         .as_str()
-        .ok_or_else(|| format!("oidc_relying_party: behavior.{field} must be a string"))?;
+        .ok_or_else(|| format!("oidc_relying_party: `behavior.{field}` must be a string"))?;
     if raw.trim().is_empty() {
         return Err(format!(
-            "oidc_relying_party: behavior.{field} must not be empty"
+            "oidc_relying_party: `behavior.{field}` must not be empty"
         ));
     }
     Ok(Some(raw.trim().to_string()))
@@ -3572,15 +3576,15 @@ fn parse_behavior_string_array(
     };
     let arr = value
         .as_array()
-        .ok_or_else(|| format!("oidc_relying_party: behavior.{field} must be an array"))?;
+        .ok_or_else(|| format!("oidc_relying_party: `behavior.{field}` must be an array"))?;
     let mut values = Vec::with_capacity(arr.len());
     for item in arr {
         let raw = item.as_str().ok_or_else(|| {
-            format!("oidc_relying_party: behavior.{field} entries must be strings")
+            format!("oidc_relying_party: `behavior.{field}` entries must be strings")
         })?;
         if raw.trim().is_empty() || !raw.is_ascii() {
             return Err(format!(
-                "oidc_relying_party: behavior.{field} entries must be non-empty ASCII"
+                "oidc_relying_party: `behavior.{field}` entries must be non-empty ASCII"
             ));
         }
         values.push(raw.trim().to_string());
@@ -3590,32 +3594,32 @@ fn parse_behavior_string_array(
 
 fn parse_status(value: u64, allowed: &[u16], field: &str) -> Result<u16, String> {
     let status = u16::try_from(value)
-        .map_err(|_| format!("oidc_relying_party: behavior.{field} is invalid"))?;
+        .map_err(|_| format!("oidc_relying_party: `behavior.{field}` is invalid"))?;
     if allowed.contains(&status) {
         Ok(status)
     } else {
-        Err(format!("oidc_relying_party: behavior.{field} is invalid"))
+        Err(format!("oidc_relying_party: `behavior.{field}` is invalid"))
     }
 }
 
 fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     let parsed =
-        Url::parse(uri).map_err(|e| format!("oidc_relying_party: redirect_uri invalid: {e}"))?;
+        Url::parse(uri).map_err(|e| format!("oidc_relying_party: `redirect_uri` invalid: {e}"))?;
     let host = parsed
         .host_str()
-        .ok_or_else(|| "oidc_relying_party: redirect_uri must include a hostname".to_string())?;
+        .ok_or_else(|| "oidc_relying_party: `redirect_uri` must include a hostname".to_string())?;
     match parsed.scheme() {
         "https" => {}
         "http" if is_local_auth_host(host) => {}
         "http" => {
             return Err(
-                "oidc_relying_party: redirect_uri must use https except for literal loopback or localhost"
+                "oidc_relying_party: `redirect_uri` must use https except for literal loopback or localhost"
                     .to_string(),
             );
         }
         scheme => {
             return Err(format!(
-                "oidc_relying_party: redirect_uri must use http or https, got {scheme:?}"
+                "oidc_relying_party: `redirect_uri` must use http or https, got {scheme:?}"
             ));
         }
     }
@@ -3625,7 +3629,7 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     // browser never transmits `state`/`code` and every callback fails
     // (issue #5031).
     if parsed.fragment().is_some() {
-        return Err("oidc_relying_party: redirect_uri must not contain a fragment".to_string());
+        return Err("oidc_relying_party: `redirect_uri` must not contain a fragment".to_string());
     }
     Ok(())
 }
@@ -3668,21 +3672,21 @@ fn correlation_cookie_host_from_request(ctx: &RequestContext) -> Option<Correlat
 
 fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
     let parsed =
-        Url::parse(raw).map_err(|e| format!("oidc_relying_party: {field} invalid: {e}"))?;
+        Url::parse(raw).map_err(|e| format!("oidc_relying_party: `{field}` invalid: {e}"))?;
     let host = parsed
         .host_str()
-        .ok_or_else(|| format!("oidc_relying_party: {field} must include a hostname"))?;
+        .ok_or_else(|| format!("oidc_relying_party: `{field}` must include a hostname"))?;
     match parsed.scheme() {
         "https" => {}
         "http" if is_local_auth_host(host) => {}
         "http" => {
             return Err(format!(
-                "oidc_relying_party: {field} must use https except for literal loopback or localhost"
+                "oidc_relying_party: `{field}` must use https except for literal loopback or localhost"
             ));
         }
         scheme => {
             return Err(format!(
-                "oidc_relying_party: {field} must use http or https, got {scheme:?}"
+                "oidc_relying_party: `{field}` must use http or https, got {scheme:?}"
             ));
         }
     }
@@ -3743,7 +3747,7 @@ fn is_local_auth_host(hostname: &str) -> bool {
 fn validate_path_only(path: &str, field: &str) -> Result<(), String> {
     if !path.starts_with('/') || path.contains('?') || path.contains('#') {
         return Err(format!(
-            "oidc_relying_party: provider[0].{field} must be a path-only value"
+            "oidc_relying_party: `provider[0].{field}` must be a path-only value"
         ));
     }
     // `callback_path` becomes the insecure-development correlation cookie's
@@ -3751,7 +3755,7 @@ fn validate_path_only(path: &str, field: &str) -> Result<(), String> {
     // carries the same delimiter and control-character rules.
     if !is_cookie_path_value(path) {
         return Err(format!(
-            "oidc_relying_party: provider[0].{field} must not contain control characters, spaces, commas, or ';'"
+            "oidc_relying_party: `provider[0].{field}` must not contain control characters, spaces, commas, or `;`"
         ));
     }
     Ok(())
@@ -3803,7 +3807,7 @@ fn is_cookie_token_char(c: char) -> bool {
 fn validate_cookie_name(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().all(is_cookie_token_char) {
         return Err(
-            "oidc_relying_party: session.cookie_name must be an RFC 6265 cookie-name token (ASCII, no control characters, spaces, or separators such as ';' '=' ',' '\"')"
+            "oidc_relying_party: `session.cookie_name` must be an RFC 6265 cookie-name token (ASCII, no control characters, spaces, or separators such as `;` `=` `,` `\"`)"
                 .to_string(),
         );
     }
@@ -3812,11 +3816,11 @@ fn validate_cookie_name(name: &str) -> Result<(), String> {
 
 fn validate_cookie_path(path: &str, field: &str) -> Result<(), String> {
     if !path.starts_with('/') {
-        return Err(format!("oidc_relying_party: {field} must start with '/'"));
+        return Err(format!("oidc_relying_party: `{field}` must start with `/`"));
     }
     if !is_cookie_path_value(path) {
         return Err(format!(
-            "oidc_relying_party: {field} must not contain control characters, spaces, commas, or ';'"
+            "oidc_relying_party: `{field}` must not contain control characters, spaces, commas, or `;`"
         ));
     }
     Ok(())
@@ -3845,7 +3849,7 @@ fn validate_cookie_domain(domain: &str) -> Result<(), String> {
         && candidate.split('.').all(is_cookie_domain_label);
     if !valid {
         return Err(
-            "oidc_relying_party: session.domain must be a bare DNS name (no scheme, port, path, or attribute delimiters)"
+            "oidc_relying_party: `session.domain` must be a bare DNS name (no scheme, port, path, or attribute delimiters)"
                 .to_string(),
         );
     }
@@ -3865,13 +3869,13 @@ fn validate_explicit_cookie_prefix(
     if name.starts_with("__Host-") {
         if !secure || domain.is_some() || path != "/" {
             return Err(
-                "oidc_relying_party: a __Host- session.cookie_name requires session.secure=true, no session.domain, and session.path='/'"
+                "oidc_relying_party: a __Host- `session.cookie_name` requires `session.secure`=true, no `session.domain`, and `session.path`=`/`"
                     .to_string(),
             );
         }
     } else if name.starts_with("__Secure-") && !secure {
         return Err(
-            "oidc_relying_party: a __Secure- session.cookie_name requires session.secure=true"
+            "oidc_relying_party: a __Secure- `session.cookie_name` requires `session.secure`=true"
                 .to_string(),
         );
     }

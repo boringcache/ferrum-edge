@@ -810,3 +810,37 @@ async fn test_basic_auth_removal_is_scheme_and_name_case_insensitive() {
         "mixed-case name and scheme must still be removed: {backend_headers:?}"
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"hide_credentials": canary}),
+            &["`hide_credentials`", "must be a boolean"],
+        ),
+        (
+            json!({"hide_credentials": 8675309}),
+            &["`hide_credentials`", "must be a boolean"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("basic_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

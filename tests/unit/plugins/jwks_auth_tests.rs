@@ -5523,3 +5523,69 @@ async fn insufficient_scope_body_is_valid_json_for_control_characters() {
     // produced.
     assert!(body.contains("\\u003ctag\\u003e"), "body: {body}");
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let header = "'security-diagnostic-canary";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"providers": [{(canary): true}]}),
+            &["`provider[0]`", "unknown field"],
+        ),
+        (
+            json!({"providers": [{"jwks": {"keys": []}, "audiences": [8675309]}]}),
+            &["`provider[0].audiences[0]`", "must be a string"],
+        ),
+        (
+            json!({"providers": [{"jwks": {"keys": true}}]}),
+            &["`provider[0].jwks`", "invalid JWKS JSON"],
+        ),
+        (
+            json!({"providers": [{
+                "jwks": {"keys": []},
+                "claim_headers": {"sub": header},
+                "output_claim_headers": [{"claim": "sub", "header": header}]
+            }]}),
+            &[
+                "`provider[0]`",
+                "`claim_headers`",
+                "`output_claim_headers`",
+                "exactly one",
+            ],
+        ),
+        (
+            json!({"providers": [{
+                "jwks": {"keys": []},
+                "output_claim_headers": [{"claim": "sub", "header": "x-sub", (canary): true}]
+            }]}),
+            &["`output_claim_headers[0]`", "does not support field"],
+        ),
+        (
+            json!({"providers": [{
+                "jwks": {"keys": []},
+                "claim_headers": {"sub": canary}
+            }]}),
+            &["`claim_headers[0].header`", "header name is invalid"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("jwks_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

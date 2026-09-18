@@ -927,3 +927,34 @@ async fn test_access_control_stream_connect_disallowed_group() {
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_reject(result, Some(403));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({"allowed_consumers": [8675309]}),
+            &["`allowed_consumers`", "must be strings"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("access_control", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

@@ -667,7 +667,7 @@ fn file_mode_config_requires_generated_operations_table() {
     .err()
     .expect("operations is required for direct/file-mode config");
     assert!(
-        err.contains("'operations' is required"),
+        err.contains("`operations` is required"),
         "expected operations requirement error, got: {err}"
     );
 }
@@ -4454,7 +4454,7 @@ fn encoding_wrapper_is_explicit_and_strict() {
         .err()
         .expect("ambiguous or malformed encoding wrapper must fail admission");
         assert!(
-            error.contains("media type object") || error.contains("encoding must be an object"),
+            error.contains("media type object") || error.contains("`encoding` must be an object"),
             "unexpected strict-wrapper error: {error}"
         );
     }
@@ -7602,7 +7602,7 @@ fn explicit_null_fixed_fields_are_rejected_instead_of_selecting_defaults() {
         }]
     }));
     assert!(
-        error.contains("contentType must be a string"),
+        error.contains("contentType` must be a string"),
         "explicit null Encoding Object fields must fail type admission: {error}"
     );
 }
@@ -9869,4 +9869,87 @@ async fn deeply_nested_xml_multipart_part_is_rejected() {
         "multipart XML part must be refused by the depth bound, got {:?}",
         request_error(&ctx)
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let header = "'security-diagnostic-canary";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": format!("{canary}[")
+            }]}),
+            &["`operations[0].path_regex`", "invalid or too complex"],
+        ),
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": "/",
+                "responses": {(canary): {}}
+            }]}),
+            &["`operations[0].responses`", "invalid status"],
+        ),
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": "/",
+                "request_body": {
+                    "content_type": "application/x-www-form-urlencoded",
+                    "schema": {"type": "object", "properties": {(header): {"type": "string"}}},
+                    "encoding": {(header): {"style": canary}}
+                }
+            }]}),
+            &[
+                "`operations[0].request_body`",
+                "encoding[",
+                "style`",
+                "unsupported for request bodies",
+            ],
+        ),
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": "/",
+                "request_body": {
+                    "content_type": "multipart/form-data",
+                    "schema": {"type": "object", "properties": {"payload": {"type": "string"}}},
+                    "encoding": {"payload": {"headers": {
+                        (header): {"content": {(header): {"schema": {"type": "string"}}}}
+                    }}}
+                }
+            }]}),
+            &[
+                "`operations[0].request_body`",
+                "encoding[",
+                "headers[",
+                "content[",
+                "must be a concrete media type",
+            ],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("openapi_validator", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
 }

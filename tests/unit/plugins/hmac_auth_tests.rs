@@ -3386,3 +3386,37 @@ async fn the_handshake_proof_never_overwrites_collected_body_hashes() {
 
     assert_eq!(ctx.request_body_sha256, Some(expected));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"sync_mode": canary}),
+            &["`sync_mode`", "`local`", "`redis`"],
+        ),
+        (
+            json!({"clock_skew_seconds": -8675309}),
+            &["`clock_skew_seconds`", "unsigned integer"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("hmac_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

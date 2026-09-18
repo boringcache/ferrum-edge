@@ -1405,3 +1405,37 @@ async fn true_ipv6_client_is_not_folded_onto_an_ipv4_country_decision() {
         Some("89.160.20.112".parse().unwrap())
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"db_path": "/unused.mmdb", "allow_countries": [canary]}),
+            &["`allow_countries`", "invalid ISO"],
+        ),
+        (
+            json!({"db_path": "/unused.mmdb", "allow_countries": [true]}),
+            &["`allow_countries`", "must be strings"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("geo_restriction", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

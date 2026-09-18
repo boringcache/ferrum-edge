@@ -6054,7 +6054,7 @@ fn invalid_replay_scope_value_is_rejected() {
     let err = SoapWsSecurity::new(&config)
         .err()
         .expect("an unknown replay scope must reject");
-    assert!(err.contains("'process' or 'shared'"), "{err}");
+    assert!(err.contains("`process` or `shared`"), "{err}");
     assert!(
         !err.contains("cluster"),
         "the rejected value must not be echoed: {err}"
@@ -9400,5 +9400,49 @@ fn openapi_soap_ws_security_component_matches_constructor_admission() {
              (constructor said {:?})",
             runtime.err()
         );
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"username_token": {"credentials": [{"username": canary, "password": true}]}}),
+            &[
+                "`config.username_token.credentials[0].password`",
+                "must be a string",
+            ],
+        ),
+        (
+            json!({"nonce": {"max_encoded_length": 54321, "max_total_cache_bytes": 1024}}),
+            &["`config.nonce.max_encoded_length`", "must be an integer"],
+        ),
+        (
+            json!({"x509_signature": {"trusted_certs": [canary]}}),
+            &[
+                "`config.x509_signature.trusted_certs[0]`",
+                "failed to load trusted cert",
+            ],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("soap_ws_security", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
     }
 }

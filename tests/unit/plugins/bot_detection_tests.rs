@@ -800,3 +800,41 @@ async fn test_native_grpc_rejection_is_normalized_without_json_body() {
         Some("8")
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({(canary): true}),
+            &["unknown config key", "`blocked_patterns`"],
+        ),
+        (
+            json!({"custom_response_code": 8675309}),
+            &["`custom_response_code`", "400 to 599"],
+        ),
+        (
+            json!({"blocked_patterns": [true]}),
+            &["`blocked_patterns`", "index 0", "must be a string"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("bot_detection", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

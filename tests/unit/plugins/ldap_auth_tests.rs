@@ -455,7 +455,7 @@ fn test_unknown_config_key_rejected() {
     .expect("misspelled authorization key must fail closed");
 
     assert!(
-        error.contains("unknown config key 'required_group'"),
+        error.contains("unknown config key \"required_group\""),
         "{error}"
     );
 }
@@ -2814,7 +2814,7 @@ fn test_unbalanced_search_filter_rejected_at_admission() {
         panic!("unbalanced search_filter must be rejected");
     };
     assert!(
-        error.contains("'search_filter'") && error.contains("RFC 4515"),
+        error.contains("`search_filter`") && error.contains("RFC 4515"),
         "unexpected error: {error}"
     );
 }
@@ -2825,7 +2825,7 @@ fn test_empty_filter_branch_in_search_filter_rejected_at_admission() {
     let Err(error) = LdapAuth::new(&config, http_client()) else {
         panic!("an empty filter branch must be rejected");
     };
-    assert!(error.contains("'search_filter'"), "unexpected: {error}");
+    assert!(error.contains("`search_filter`"), "unexpected: {error}");
 }
 
 #[test]
@@ -2845,7 +2845,7 @@ fn test_unbalanced_group_filter_rejected_at_admission() {
         panic!("unbalanced group_filter must be rejected");
     };
     assert!(
-        error.contains("'group_filter'") && error.contains("RFC 4515"),
+        error.contains("`group_filter`") && error.contains("RFC 4515"),
         "unexpected error: {error}"
     );
 }
@@ -2907,7 +2907,7 @@ fn test_max_cache_entries_upper_bound_enforced() {
     let Err(error) = LdapAuth::new(&config, http_client()) else {
         panic!("above the documented maximum must be rejected");
     };
-    assert!(error.contains("'max_cache_entries'"), "unexpected: {error}");
+    assert!(error.contains("`max_cache_entries`"), "unexpected: {error}");
 }
 
 // ─── hide_credentials (advisory GHSA-wprm-pc37-r867) ─────────────────────
@@ -3049,7 +3049,7 @@ fn test_empty_service_account_password_still_rejected() {
         panic!("an empty password must be rejected");
     };
     assert!(
-        error.contains("'service_account_password'"),
+        error.contains("`service_account_password`"),
         "unexpected: {error}"
     );
 }
@@ -3223,4 +3223,72 @@ async fn test_hex_escaped_rdn_value_is_decoded_before_matching() {
 #[tokio::test]
 async fn test_unparsable_group_dn_fails_closed() {
     assert_dn_fallback_group_result("not-a-distinguished-name", "admins", false).await;
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({"ldap_url": 8675309}),
+            &["`ldap_url`", "must be a string"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("ldap_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(rendered.contains(fragment), "missing {fragment:?}: {rendered}");
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ca_bundle_admission_diagnostics_withhold_source_and_parser_payloads() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("'LDAP_DIAGNOSTIC_CANARY-missing.pem");
+    let malformed = directory.path().join("'LDAP_DIAGNOSTIC_CANARY-malformed.pem");
+    std::fs::write(
+        &malformed,
+        b"-----BEGIN CERTIFICATE-----\nLDAP_DIAGNOSTIC_CANARY!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+
+    for (path, reason) in [
+        (missing, "failed to load CA bundle"),
+        (malformed, "CA bundle failed trust-store admission"),
+    ] {
+        let client = http_client_with_dns_config(
+            DnsConfig::default(),
+            production_egress_policy(),
+            Some(path.to_str().unwrap()),
+        );
+        let error = LdapAuth::new(
+            &json!({
+                "ldap_url": "ldaps://localhost:636",
+                "bind_dn_template": "uid={username},dc=example,dc=com",
+                "canonical_identity_attribute": "uid"
+            }),
+            client,
+        )
+        .err()
+        .expect("invalid CA source must still reject admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("`FERRUM_TLS_CA_BUNDLE_PATH`"), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        assert!(!rendered.contains("LDAP_DIAGNOSTIC_CANARY"), "{rendered}");
+    }
 }

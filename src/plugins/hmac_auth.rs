@@ -909,7 +909,7 @@ impl HmacAuth {
         })?;
         if config_obj.get("require_digest").is_some() {
             return Err(
-                "hmac_auth: 'require_digest' was removed; request digests are always required"
+                "hmac_auth: `require_digest` was removed; request digests are always required"
                     .to_string(),
             );
         }
@@ -929,10 +929,10 @@ impl HmacAuth {
             Some(Value::String(mode)) if matches!(mode.as_str(), "local" | "redis") => {}
             Some(Value::String(mode)) => {
                 return Err(format!(
-                    "hmac_auth: 'sync_mode' must be exactly 'local' or 'redis', got: {mode:?}"
+                    "hmac_auth: `sync_mode` must be exactly `local` or `redis`, got: {mode:?}"
                 ));
             }
-            Some(_) => return Err("hmac_auth: 'sync_mode' must be a string".to_string()),
+            Some(_) => return Err("hmac_auth: `sync_mode` must be a string".to_string()),
         }
 
         let clock_skew_seconds = parse_u64_field(
@@ -941,11 +941,11 @@ impl HmacAuth {
             300,
         )?;
         if clock_skew_seconds == 0 {
-            return Err("hmac_auth: 'clock_skew_seconds' must be greater than 0".to_string());
+            return Err("hmac_auth: `clock_skew_seconds` must be greater than 0".to_string());
         }
         if clock_skew_seconds > MAX_HMAC_CLOCK_SKEW_SECONDS {
             return Err(format!(
-                "hmac_auth: 'clock_skew_seconds' must be <= {MAX_HMAC_CLOCK_SKEW_SECONDS} — the \
+                "hmac_auth: `clock_skew_seconds` must be <= {MAX_HMAC_CLOCK_SKEW_SECONDS} — the \
                  freshness window bounds how long a captured request stays acceptable, and the \
                  fixed replay retention horizon is derived from this ceiling"
             ));
@@ -954,7 +954,7 @@ impl HmacAuth {
         let allow_unsafe_v1 = match config_obj.get("allow_unsafe_replayable_v1") {
             None => false,
             Some(value) => value.as_bool().ok_or_else(|| {
-                "hmac_auth: 'allow_unsafe_replayable_v1' must be a boolean".to_string()
+                "hmac_auth: `allow_unsafe_replayable_v1` must be a boolean".to_string()
             })?,
         };
         let profile = match config_obj.get("signing_profile") {
@@ -962,7 +962,7 @@ impl HmacAuth {
             Some(value) => {
                 let value = value
                     .as_str()
-                    .ok_or_else(|| "hmac_auth: 'signing_profile' must be a string".to_string())?;
+                    .ok_or_else(|| "hmac_auth: `signing_profile` must be a string".to_string())?;
                 // Exact, untrimmed: the diagnostic below promises "exactly",
                 // and the published enum lists only the canonical spellings.
                 match value {
@@ -970,8 +970,8 @@ impl HmacAuth {
                     HMAC_SIGNING_VERSION_V1 => HmacSigningProfile::V1Unsafe,
                     _ => {
                         return Err(format!(
-                            "hmac_auth: 'signing_profile' must be exactly \
-                             '{HMAC_SIGNING_VERSION_V2}' or '{HMAC_SIGNING_VERSION_V1}'"
+                            "hmac_auth: `signing_profile` must be exactly \
+                             `{HMAC_SIGNING_VERSION_V2}` or `{HMAC_SIGNING_VERSION_V1}`"
                         ));
                     }
                 }
@@ -982,18 +982,18 @@ impl HmacAuth {
         // copied config snippet or a one-word typo.
         if profile == HmacSigningProfile::V1Unsafe && !allow_unsafe_v1 {
             return Err(format!(
-                "hmac_auth: 'signing_profile' = '{HMAC_SIGNING_VERSION_V1}' has no replay \
+                "hmac_auth: `signing_profile` = `{HMAC_SIGNING_VERSION_V1}` has no replay \
                  protection — a captured valid request can be replayed verbatim for the whole \
-                 'clock_skew_seconds' window. It is unsuitable for non-idempotent routes and \
-                 requires an explicit 'allow_unsafe_replayable_v1': true acknowledgement. Prefer \
-                 '{HMAC_SIGNING_VERSION_V2}', which binds a mandatory client nonce and makes each \
+                 `clock_skew_seconds` window. It is unsuitable for non-idempotent routes and \
+                 requires an explicit `allow_unsafe_replayable_v1`: true acknowledgement. Prefer \
+                 `{HMAC_SIGNING_VERSION_V2}`, which binds a mandatory client nonce and makes each \
                  signed request single-use."
             ));
         }
         if profile == HmacSigningProfile::V2 && allow_unsafe_v1 {
             return Err(format!(
-                "hmac_auth: 'allow_unsafe_replayable_v1' is only meaningful with \
-                 'signing_profile' = '{HMAC_SIGNING_VERSION_V1}'"
+                "hmac_auth: `allow_unsafe_replayable_v1` is only meaningful with \
+                 `signing_profile` = `{HMAC_SIGNING_VERSION_V1}`"
             ));
         }
 
@@ -1019,7 +1019,7 @@ impl HmacAuth {
             Some(value) => {
                 let value = value
                     .as_str()
-                    .ok_or_else(|| "hmac_auth: 'replay_scope' must be a string".to_string())?;
+                    .ok_or_else(|| "hmac_auth: `replay_scope` must be a string".to_string())?;
                 // `ReplayScope::parse` trims and ASCII-lowercases, which would
                 // admit spellings the published enum does not list. Screen the
                 // exact wire form first (same pattern as `sync_mode` above) so
@@ -1027,9 +1027,9 @@ impl HmacAuth {
                 // the shared parser still owns the value mapping.
                 if !matches!(value, "process" | "shared") {
                     return Err(
-                        "hmac_auth: 'replay_scope' must be exactly 'process' or 'shared' — use \
-                         'shared' together with sync_mode: 'redis' for any deployment running \
-                         more than one gateway replica, or 'process' to declare a single-process \
+                        "hmac_auth: `replay_scope` must be exactly `process` or `shared` — use \
+                         `shared` together with `sync_mode`: `redis` for any deployment running \
+                         more than one gateway replica, or `process` to declare a single-process \
                          deployment whose replay protection is not cross-replica"
                             .to_string(),
                     );
@@ -1041,13 +1041,13 @@ impl HmacAuth {
             None => DEFAULT_HMAC_REPLAY_MAX_ENTRIES,
             Some(value) => {
                 let parsed = value.as_u64().ok_or_else(|| {
-                    "hmac_auth: 'replay_max_entries' must be an unsigned integer".to_string()
+                    "hmac_auth: `replay_max_entries` must be an unsigned integer".to_string()
                 })?;
                 let parsed = usize::try_from(parsed)
-                    .map_err(|_| "hmac_auth: 'replay_max_entries' is too large".to_string())?;
+                    .map_err(|_| "hmac_auth: `replay_max_entries` is too large".to_string())?;
                 if parsed == 0 {
                     return Err(
-                        "hmac_auth: 'replay_max_entries' must be greater than 0".to_string()
+                        "hmac_auth: `replay_max_entries` must be greater than 0".to_string()
                     );
                 }
                 parsed
@@ -1060,25 +1060,25 @@ impl HmacAuth {
             // is one process" from "we silently accept one replay per replica".
             (HmacSigningProfile::V2, None) => {
                 return Err(format!(
-                    "hmac_auth: 'replay_scope' is required for \
-                     '{HMAC_SIGNING_VERSION_V2}' — use 'shared' together with sync_mode: 'redis' \
-                     for any deployment running more than one gateway replica, or 'process' to \
+                    "hmac_auth: `replay_scope` is required for \
+                     `{HMAC_SIGNING_VERSION_V2}` — use `shared` together with sync_mode: `redis` \
+                     for any deployment running more than one gateway replica, or `process` to \
                      declare a single-process deployment whose replay protection is not \
                      cross-replica"
                 ));
             }
             (HmacSigningProfile::V1Unsafe, Some(_)) => {
                 return Err(format!(
-                    "hmac_auth: 'replay_scope' is not accepted with 'signing_profile' = \
-                     '{HMAC_SIGNING_VERSION_V1}', which has no replay state at all"
+                    "hmac_auth: `replay_scope` is not accepted with `signing_profile` = \
+                     `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
                 ));
             }
             _ => {}
         }
         if profile == HmacSigningProfile::V1Unsafe && redis_configured {
             return Err(format!(
-                "hmac_auth: sync_mode: 'redis' is not accepted with 'signing_profile' = \
-                 '{HMAC_SIGNING_VERSION_V1}', which has no replay state at all"
+                "hmac_auth: sync_mode: `redis` is not accepted with `signing_profile` = \
+                 `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
             ));
         }
         if let Some(scope) = declared_scope {
@@ -1112,8 +1112,8 @@ impl HmacAuth {
                 // `validate_scope_backend` above already rejected `shared`
                 // without a backend, so `redis_config` is present here.
                 let redis_config = redis_config.ok_or_else(|| {
-                    "hmac_auth: 'replay_scope' = 'shared' requires sync_mode: 'redis' and a \
-                     'redis_url'"
+                    "hmac_auth: `replay_scope` = `shared` requires sync_mode: `redis` and a \
+                     `redis_url`"
                         .to_string()
                 })?;
                 // Classification-only diagnostics: never raw RedisError text or
