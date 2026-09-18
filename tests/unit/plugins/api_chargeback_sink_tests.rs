@@ -182,7 +182,7 @@ fn constructor_validation_diagnostics_keep_fields_and_fixed_suggestions() {
         (
             json!({
                 "url": "http://localhost:8123",
-                "insert_query_params": {"'UNREGISTERED_password\"\\`map.key`": "value"}
+                "insert_query_params": {"'UNREGISTERED_secret\"\\`map.key`": "value"}
             }),
             "`clickhouse.insert_query_params`",
             "names a credential",
@@ -7836,7 +7836,7 @@ fn config_validation_rejects_stale_ttl_shorter_than_snapshot_interval() {
         Err(err) => err,
     };
     assert!(
-        err.contains("stale_entry_ttl_secs must be >= snapshot.interval_secs"),
+        err.contains("`snapshot.stale_entry_ttl_secs` must be >= `snapshot.interval_secs`"),
         "unexpected error: {err}"
     );
 }
