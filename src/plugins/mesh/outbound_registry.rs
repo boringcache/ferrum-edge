@@ -36,13 +36,15 @@
 //!   candidate suffix after the request host's first label and probe a
 //!   precomputed `HashSet`, so cost does not grow with unrelated wildcard
 //!   count.
-//! - An empty registry is valid and fails closed: every request is rejected,
+//! - An empty registry is valid and fails closed: every enforced request is rejected,
 //!   but the plugin remains installed so REGISTRY_ONLY never silently falls
 //!   back to ALLOW_ANY.
-//! - Auto-injected mesh instances are scoped to the outbound capture listener
-//!   port, so inbound sidecar/ambient traffic is not gated by an outbound
-//!   policy. Operator-managed instances without `outbound_listen_ports`
-//!   preserve the historical behavior and enforce wherever the plugin runs.
+//! - Every instance skips requests stamped with the Inbound mesh direction:
+//!   inbound sidecar/ambient traffic is never egress, even when its listener
+//!   shares a numeric port with an outbound listener. Auto-injected instances
+//!   also scope enforcement to the outbound capture listener ports.
+//!   Operator-managed instances without `outbound_listen_ports` enforce on
+//!   every other direction, including non-mesh listeners.
 //!   Port `0` is rejected at construction; intentional global scope is only
 //!   represented by an empty `outbound_listen_ports` vector.
 //!
@@ -61,6 +63,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::modes::mesh::MeshTrafficDirection;
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
@@ -97,10 +100,10 @@ pub struct OutboundRegistryConfig {
     #[serde(default = "default_reject_status")]
     pub reject_status: u16,
     /// Optional frontend listener ports where the registry should be enforced.
-    /// Mesh auto-injection sets this to the outbound capture listener port so
-    /// the global plugin does not apply to inbound listeners. Empty keeps
-    /// operator-managed plugin instances backwards compatible and enforces on
-    /// every HTTP-family request that reaches this plugin. Entries must be
+    /// The listener-stamped Inbound mesh direction always skips enforcement,
+    /// independently of this list. Mesh auto-injection sets this to the
+    /// outbound capture listener ports. Empty enforces on every HTTP-family
+    /// request in any other direction, including non-mesh listeners. Entries must be
     /// `>= 1`; port `0` is rejected (use `[]` for intentional global scope).
     #[serde(default)]
     pub outbound_listen_ports: Vec<u16>,
@@ -288,6 +291,9 @@ impl OutboundRegistry {
 
     #[inline]
     fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {
+        if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound) {
+            return false;
+        }
         self.outbound_listen_ports.is_empty()
             || ctx
                 .frontend_listen_port
