@@ -1625,9 +1625,9 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
     })?;
 
     debug!(
-        "ldap_auth: loaded {} CA certificate(s) from '{}' (CA exclusivity enforced)",
+        "ldap_auth: loaded {} CA certificate(s) from {} (CA exclusivity enforced)",
         root_store.len(),
-        source_id
+        crate::startup::sanitize_startup_scalar(&source_id)
     );
     Ok(root_store)
 }

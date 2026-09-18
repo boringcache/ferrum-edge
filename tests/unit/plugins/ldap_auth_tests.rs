@@ -3256,6 +3256,51 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn successful_ca_bundle_load_log_withholds_source_path() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("'LDAP_CA_LOG_CANARY`-ca.pem");
+    std::fs::write(&path, ca_cert.pem()).unwrap();
+    let client = http_client_with_dns_config(
+        DnsConfig::default(),
+        production_egress_policy(),
+        Some(path.to_str().unwrap()),
+    );
+
+    let (logs, _guard) = super::plugin_utils::capture_debug_logs();
+    let result = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldaps://localhost:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
+        }),
+        client,
+    );
+    assert!(result.is_ok(), "valid custom CA must still be admitted");
+
+    let output = logs.contents();
+    let event = output
+        .lines()
+        .find(|line| line.contains("ldap_auth: loaded "))
+        .expect("successful CA load must emit its debug diagnostic");
+    assert!(event.trim_start().starts_with("DEBUG "), "{output}");
+    assert!(
+        event.contains(
+            "ldap_auth: loaded 1 CA certificate(s) from <redacted scalar> (CA exclusivity enforced)"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("LDAP_CA_LOG_CANARY"), "{output}");
+    assert!(!output.contains(path.to_str().unwrap()), "{output}");
+}
+
 #[tokio::test]
 async fn ca_bundle_admission_diagnostics_withhold_source_and_parser_payloads() {
     let directory = tempfile::tempdir().unwrap();

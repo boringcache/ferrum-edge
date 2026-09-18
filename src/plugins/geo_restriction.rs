@@ -190,9 +190,9 @@ impl GeoRestriction {
         if !on_lookup_failure_explicit && on_lookup_failure == LookupFailureAction::Allow {
             warn!(
                 plugin = "geo_restriction",
-                "'on_lookup_failure' is not set; defaulting to 'allow' (fail-open) — \
+                "`on_lookup_failure` is not set; defaulting to `allow` (fail-open) — \
                  unresolved IPs and a missing/stale .mmdb will be permitted. Set \
-                 'on_lookup_failure' explicitly ('allow' or 'deny') to silence this warning"
+                 `on_lookup_failure` explicitly (`allow` or `deny`) to silence this warning"
             );
         }
 
@@ -202,9 +202,11 @@ impl GeoRestriction {
         let reader = match loader(&db_path) {
             Ok(reader) => Some(reader),
             Err(CountryMmdbLoadError::Unavailable(error)) => {
+                // The loader Debug-quotes the path around native filesystem
+                // errors, so cause sanitization retains the I/O stage/reason.
                 warn!(
-                    db_path = %db_path,
-                    error = %error,
+                    db_path = %crate::startup::sanitize_startup_scalar(&db_path),
+                    error = %crate::startup::sanitize_startup_cause(&error, &[]),
                     plugin = "geo_restriction",
                     "MaxMind database file not available — plugin will use on_lookup_failure policy until file is present"
                 );
