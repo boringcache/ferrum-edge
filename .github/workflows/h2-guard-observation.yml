@@ -59,8 +59,11 @@ jobs:
           # Compare both complete same-toolchain builds; every new/changed
           # diagnostic and every compiler error fails. No lint is suppressed.
           cargo fmt --manifest-path "$upstream/Cargo.toml" --all
-          cargo clippy --manifest-path "$upstream/Cargo.toml" --locked --lib --tests --message-format=json > "$evidence/clippy-upstream.jsonl"
-          cargo clippy --manifest-path "$crate/Cargo.toml" --locked --lib --tests --message-format=json > "$evidence/clippy-observed.jsonl"
+          # Upstream cfg(test) denies all warnings. Retain them as warnings in
+          # both JSON streams so the comparison can reject every added warning.
+          # Compiler errors still fail Cargo; non-Clippy warnings fail lint.py.
+          cargo clippy --manifest-path "$upstream/Cargo.toml" --locked --lib --tests --message-format=json -- --cap-lints warn > "$evidence/clippy-upstream.jsonl"
+          cargo clippy --manifest-path "$crate/Cargo.toml" --locked --lib --tests --message-format=json -- --cap-lints warn > "$evidence/clippy-observed.jsonl"
           python3 tests/performance/multi_protocol/h2_guard/lint.py "$evidence/clippy-upstream.jsonl" "$evidence/clippy-observed.jsonl" > "$evidence/clippy-comparison.json"
           cargo test --manifest-path "$crate/Cargo.toml" --locked --lib guard_observation -- --nocapture 2>&1 | tee "$evidence/guard-tests.log"
           cargo test --manifest-path "$crate/Cargo.toml" --locked --lib data_frame_budget 2>&1 | tee "$evidence/upstream-budget-tests.log"

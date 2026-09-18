@@ -66,8 +66,10 @@ diff, compiler identities and logs. No local project execution is required.
 
 Clippy runs on both an unmodified copy of the checksum-verified archive and the
 instrumented copy with the same toolchain and flags. Existing upstream warnings
-are retained in both JSON logs; every new or changed diagnostic fails, as does
-every compiler error, missing completion record or non-Clippy warning. Matching
+are retained in both JSON logs. Both Clippy invocations use `--cap-lints warn`
+because upstream's test build declares `deny(warnings)`; no diagnostic is
+suppressed, and the comparison is the gate. Every new or changed diagnostic
+fails, as does every compiler error, missing completion record or non-Clippy warning. Matching
 uses the lint code, message, file, primary source text and multiplicity, so moving
 line numbers cannot hide a new warning. This avoids changing upstream behavior
 just to address style warnings in newer Clippy. Ordinary repository lint gates
