@@ -1282,7 +1282,8 @@ fn udp_coexists_when_http_and_tcp_protocol_conflict_on_same_port() {
     );
     assert!(
         !translation.warnings.iter().any(|warning| {
-            warning.contains(r#"Gateway "default"/"edge" listener "udp" rejected: ProtocolConflict"#)
+            warning
+                .contains(r#"Gateway "default"/"edge" listener "udp" rejected: ProtocolConflict"#)
         }),
         "UDP must not receive ProtocolConflict warnings: {:?}",
         translation.warnings
