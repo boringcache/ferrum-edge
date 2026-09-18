@@ -4652,10 +4652,7 @@ async fn functional_cli_plaintext_basic_auth_withholds_consumer_ids() {
                 diagnostic.contains("consumer IDs: <redacted scalar>"),
                 "{diagnostic}"
             );
-            assert!(
-                !diagnostic.contains("UNREGISTERED_CONSUMER_5589"),
-                "{diagnostic}"
-            );
+            assert!(!diagnostic.contains(token), "{diagnostic}");
             assert!(!diagnostic.contains("synthetic-password"), "{diagnostic}");
         }
     }

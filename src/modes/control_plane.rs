@@ -4341,7 +4341,8 @@ mod tests {
         });
 
         assert_eq!(
-            logs.matches("authoritative namespace discovery failed").count(),
+            logs.matches("authoritative namespace discovery failed")
+                .count(),
             2
         );
         assert!(logs.contains("scope=All"), "{logs}");

@@ -3681,7 +3681,8 @@ pub(super) mod tests {
         assert!(logs.contains("still rejected"), "{logs}");
         assert_eq!(logs.matches("`proxies[0].name`: invalid value").count(), 2);
         assert_eq!(
-            logs.matches("`proxies[1].upstream_id`: missing reference").count(),
+            logs.matches("`proxies[1].upstream_id`: missing reference")
+                .count(),
             2
         );
         assert!(!logs.contains("unterminated-canary"), "{logs}");

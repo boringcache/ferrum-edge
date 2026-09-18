@@ -436,7 +436,10 @@ pub(super) fn listener_failure_for_log(error: &anyhow::Error) -> String {
             let kind = io_error.kind();
             // Construct from the kind alone: this preserves the address-in-use
             // spelling used by bind-race classifiers without the original payload.
-            return format!("listener I/O failed: {} ({kind:?})", std::io::Error::from(kind));
+            return format!(
+                "listener I/O failed: {} ({kind:?})",
+                std::io::Error::from(kind)
+            );
         }
     }
     "listener operation failed".to_string()
@@ -974,31 +977,30 @@ pub async fn serve(
     // The candidate carries the client-certificate verifier and trust identity
     // of this same load, so the client-trust baseline armed below describes
     // exactly the material these listeners serve (issue #3857).
-    let tls_startup =
-        match startup_security::try_load_frontend_tls_candidate(&env_config, &tls_policy, &crls) {
-            Ok(Some(candidate)) => {
-                let mut config = candidate.config;
-                info!("Loading TLS configuration with client certificate verification...");
-                tls::enable_early_data(&mut config, &tls_policy);
-                if env_config.ktls_enabled.could_be_enabled() {
-                    tls::enable_secret_extraction_for_ktls(&mut config);
-                }
-                Some((config, candidate.client_trust))
+    let tls_startup = match startup_security::try_load_frontend_tls_candidate(
+        &env_config,
+        &tls_policy,
+        &crls,
+    ) {
+        Ok(Some(candidate)) => {
+            let mut config = candidate.config;
+            info!("Loading TLS configuration with client certificate verification...");
+            tls::enable_early_data(&mut config, &tls_policy);
+            if env_config.ktls_enabled.could_be_enabled() {
+                tls::enable_secret_extraction_for_ktls(&mut config);
             }
-            Ok(None) => None,
-            Err(e) => {
-                error!(
-                    "TLS configuration validation failed: frontend certificate, key, or client trust material could not be loaded"
-                );
-                shutdown_file_background_startup_tasks(
-                    &shutdown_tx,
-                    &proxy_state,
-                    background_handles,
-                )
+            Some((config, candidate.client_trust))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(
+                "TLS configuration validation failed: frontend certificate, key, or client trust material could not be loaded"
+            );
+            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
                 .await;
-                return Err(e);
-            }
-        };
+            return Err(e);
+        }
+    };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
     // rationale). File-mode listeners participate identically: live reload is
@@ -1714,7 +1716,10 @@ mod tests {
         assert!(logs.contains("HTTP proxy listener"), "{logs}");
         assert!(logs.contains("AddrInUse"), "{logs}");
         assert!(logs.contains("address in use"), "{logs}");
-        assert!(!logs.contains("bare-unregistered-listener-canary"), "{logs}");
+        assert!(
+            !logs.contains("bare-unregistered-listener-canary"),
+            "{logs}"
+        );
     }
 
     // Regression: a stuck background task must not wedge graceful shutdown.
