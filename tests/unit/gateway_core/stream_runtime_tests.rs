@@ -18,8 +18,22 @@ async fn read_bytes(stream: &mut (impl AsyncRead + Unpin), bytes: &mut [u8]) {
         .unwrap();
 }
 
-// Real bind collision is the barrier: the manager has already observed the
-// occupied socket before it is released. Only the supervisor may reconcile it.
+// Call with time paused before starting the supervisor. Sleeping lets Tokio
+// register and drive timers in deadline order; yield_now/advance are not task
+// completion barriers. Bound the wait to one 30-second retry plus polling slack,
+// and require an observable lifecycle change before resuming real socket I/O.
+async fn wait_for_supervisor(mut completed: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(31), async {
+        while !completed() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("supervisor must complete its next retry on the paused clock");
+}
+
+// A fresh collision snapshot proves the supervisor has run before the socket
+// is released. Only the supervisor may reconcile after the initial collision.
 #[tokio::test]
 async fn stream_supervisor_recovers_bind_without_config_change() {
     let mut bind_races = Vec::new();
@@ -34,12 +48,22 @@ async fn stream_supervisor_recovers_bind_without_config_change() {
         assert_eq!(manager.reconcile().await.len(), 1);
         assert!(!manager.is_ready());
         assert_eq!(manager.overload_snapshot().bind_failures_total, 1);
-        manager.start_supervisor();
-        manager.start_supervisor(); // Idempotent: there is only one retry owner.
-        tokio::task::yield_now().await;
-        drop(blocked);
+        let initial = manager.stream_bind_failures();
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(30)).await;
+        manager.start_supervisor();
+        let retry_owners = Arc::weak_count(&manager);
+        manager.start_supervisor(); // Idempotent: there is only one retry owner.
+        assert_eq!(Arc::weak_count(&manager), retry_owners);
+        // reconcile publishes a new Arc even when the collision is unchanged.
+        // Holding the old Arc makes pointer identity an unambiguous barrier.
+        wait_for_supervisor(|| !Arc::ptr_eq(&initial, &manager.stream_bind_failures())).await;
+        let blocked_snapshot = manager.stream_bind_failures();
+        assert!(only_port_collision(&blocked_snapshot, port));
+        assert!(!manager.is_ready());
+        // Release the socket but retain the registry lease for the supervisor.
+        blocked.drop_and_take_port();
+        wait_for_supervisor(|| !Arc::ptr_eq(&blocked_snapshot, &manager.stream_bind_failures()))
+            .await;
         tokio::time::resume();
         let started = manager.wait_until_started(Duration::from_secs(5)).await;
         if started.is_err() {
@@ -93,22 +117,17 @@ async fn stream_supervisor_retries_soft_degradation_without_withdrawing_readines
     assert!(manager.reconcile().await.is_empty());
     assert!(manager.is_ready());
     assert!(manager.has_degraded_listeners());
+    tokio::time::pause();
     manager.start_supervisor();
-    tokio::task::yield_now().await;
     // Only the supervisor may reconcile this withdrawal. It must retry soft
     // degradation even though readiness never went false.
     config_arc.store(Arc::new(empty_config()));
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(30)).await;
-    tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while manager.has_degraded_listeners() {
-            assert!(manager.is_ready());
-            tokio::task::yield_now().await;
-        }
+    wait_for_supervisor(|| {
+        assert!(manager.is_ready());
+        !manager.has_degraded_listeners()
     })
-    .await
-    .expect("supervisor must reconcile soft degradation using current config");
+    .await;
+    tokio::time::resume();
     assert!(manager.is_ready());
     manager.shutdown_all().await;
 }
@@ -208,8 +227,11 @@ async fn stream_supervisor_does_not_restore_withdrawn_or_shutdown_listener() {
         let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
         let manager = Arc::new(create_manager_with_config_arc(config_arc.clone(), &config));
         assert_eq!(manager.reconcile().await.len(), 1);
+        let initial = manager.stream_bind_failures();
+        tokio::time::pause();
         manager.start_supervisor();
-        tokio::task::yield_now().await;
+        // Prove recovery is running before withdrawing or stopping its owner.
+        wait_for_supervisor(|| !Arc::ptr_eq(&initial, &manager.stream_bind_failures())).await;
         if shutdown {
             manager.shutdown_all().await;
         } else {
@@ -221,9 +243,7 @@ async fn stream_supervisor_does_not_restore_withdrawn_or_shutdown_listener() {
         // port another fixture could steal. Inspect the manager as well so a
         // stale recovery attempt cannot hide behind this occupied socket.
         let guard = blocked.into_listener();
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
         tokio::time::resume();
         assert!(manager.active_binds().await.is_empty());
         if !shutdown {
@@ -536,7 +556,6 @@ async fn healthy_stream_listener_keeps_serving_across_supervisor_tick() {
     .await;
     let manager = Arc::new(manager);
     assert!(manager.is_ready());
-    manager.start_supervisor();
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     client.write_all(b"a").await.unwrap();
     let listener = backend.into_listener();
@@ -548,8 +567,10 @@ async fn healthy_stream_listener_keeps_serving_across_supervisor_tick() {
     read_bytes(&mut socket, &mut byte).await;
     assert_eq!(byte, *b"a");
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(30)).await;
-    tokio::task::yield_now().await;
+    manager.start_supervisor();
+    // With no manual clock jump, the runtime runs the supervisor's 30-second
+    // tick before auto-advancing to this later deadline. Socket I/O stays real.
+    tokio::time::sleep(Duration::from_secs(31)).await;
     tokio::time::resume();
     assert!(manager.is_ready());
     assert_eq!(manager.overload_snapshot().bind_failures_total, 0);
