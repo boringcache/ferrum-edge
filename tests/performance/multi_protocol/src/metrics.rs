@@ -1,13 +1,17 @@
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use serde::Serialize;
+
+use crate::phases::{Admission, CompletionPhase, Observed, PhaseReport, Worker};
 
 /// Merge every worker outcome. A failed task must not become a zero-error row.
 pub async fn collect_results(
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<BenchMetrics>>>,
 ) -> BenchMetrics {
     let mut combined = BenchMetrics::new();
-    for handle in handles {
-        match handle.await {
+    let mut pending: FuturesUnordered<_> = handles.into_iter().collect();
+    while let Some(result) = pending.next().await {
+        match result {
             Ok(Ok(metrics)) => combined.merge(&metrics),
             Ok(Err(error)) => {
                 eprintln!("  task error: {error}");
@@ -28,6 +32,13 @@ pub struct BenchMetrics {
     pub total_requests: u64,
     pub total_errors: u64,
     pub total_bytes: u64,
+    pub warmup_requests: u64,
+    pub drain_requests: u64,
+    pub drain_bytes: u64,
+    pub transport_close_timed_out: bool,
+    pub phases: Option<PhaseReport>,
+    pub observed: Option<Observed>,
+    worker: Option<Worker>,
 }
 
 impl Default for BenchMetrics {
@@ -45,11 +56,61 @@ impl BenchMetrics {
             total_requests: 0,
             total_errors: 0,
             total_bytes: 0,
+            warmup_requests: 0,
+            drain_requests: 0,
+            drain_bytes: 0,
+            transport_close_timed_out: false,
+            phases: None,
+            observed: None,
+            worker: None,
         }
+    }
+
+    pub fn with_worker(worker: Worker) -> Self {
+        Self {
+            worker: Some(worker),
+            ..Self::new()
+        }
+    }
+
+    pub async fn next_request(&mut self) -> bool {
+        match self.worker.as_mut() {
+            Some(worker) => worker.next_request().await,
+            None => false,
+        }
+    }
+
+    pub fn admission(&self) -> Option<Admission> {
+        self.worker.as_ref().map(Worker::admission)
+    }
+
+    pub fn admitted(&self) {
+        if let Some(admission) = self.admission() {
+            admission.admitted();
+        }
+    }
+
+    pub fn finish_worker(mut self) -> Self {
+        drop(self.worker.take());
+        self
     }
 
     /// Record a successful request with latency in microseconds and response bytes.
     pub fn record(&mut self, latency_us: u64, bytes: usize) {
+        if let Some(worker) = &self.worker {
+            match worker.completion_phase(std::time::Instant::now()) {
+                CompletionPhase::Warmup => {
+                    self.warmup_requests += 1;
+                    return;
+                }
+                CompletionPhase::Drain => {
+                    self.drain_requests += 1;
+                    self.drain_bytes += bytes as u64;
+                    return;
+                }
+                CompletionPhase::Measurement => {}
+            }
+        }
         let _ = self.histogram.record(latency_us);
         self.total_requests += 1;
         self.total_bytes += bytes as u64;
@@ -66,6 +127,10 @@ impl BenchMetrics {
         self.total_requests += other.total_requests;
         self.total_errors += other.total_errors;
         self.total_bytes += other.total_bytes;
+        self.warmup_requests += other.warmup_requests;
+        self.drain_requests += other.drain_requests;
+        self.drain_bytes += other.drain_bytes;
+        self.transport_close_timed_out |= other.transport_close_timed_out;
     }
 
     /// Generate a wrk-like text report.
@@ -187,6 +252,11 @@ impl BenchMetrics {
             p99_us: self.histogram.value_at_quantile(0.99),
             total_bytes: self.total_bytes,
             throughput_mbps,
+            warmup_requests: self.warmup_requests,
+            drain_requests: self.drain_requests,
+            drain_bytes: self.drain_bytes,
+            phases: self.phases.clone(),
+            observed: self.observed.clone(),
         }
     }
 }
@@ -211,6 +281,11 @@ pub struct BenchReport {
     pub p99_us: u64,
     pub total_bytes: u64,
     pub throughput_mbps: f64,
+    pub warmup_requests: u64,
+    pub drain_requests: u64,
+    pub drain_bytes: u64,
+    pub phases: Option<PhaseReport>,
+    pub observed: Option<Observed>,
 }
 
 /// Format microseconds into a human-readable duration string.

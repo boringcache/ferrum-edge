@@ -108,7 +108,7 @@ fn test_unknown_config_key_max_frame_bytez_is_rejected() {
     .expect("typo max_frame_bytez must be rejected");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("max_frame_bytez"), "{err}");
-    assert!(err.contains("did you mean 'max_frame_bytes'?"), "{err}");
+    assert!(err.contains("did you mean `max_frame_bytes`?"), "{err}");
 }
 
 #[test]

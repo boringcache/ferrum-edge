@@ -8,6 +8,8 @@ pub struct SocketHost {
     pub warmup_hostname: Option<String>,
 }
 
+/// `field` must be a schema-authored label. `plugin_name` can include document
+/// content (notification channel names), so it is Debug-escaped as a whole.
 pub fn parse_socket_host(
     plugin_name: &str,
     field: &str,
@@ -15,7 +17,7 @@ pub fn parse_socket_host(
 ) -> Result<SocketHost, String> {
     let host = raw_host.trim();
     if host.is_empty() {
-        return Err(format!("{plugin_name}: '{field}' must not be empty"));
+        return Err(format!("{plugin_name:?}: `{field}` must not be empty"));
     }
     if host
         .chars()
@@ -24,7 +26,7 @@ pub fn parse_socket_host(
         || host.contains(['/', '?', '#', '@'])
     {
         return Err(format!(
-            "{plugin_name}: '{field}' must be a hostname or IP address without scheme, path, query, fragment, or credentials"
+            "{plugin_name:?}: `{field}` must be a hostname or IP address without scheme, path, query, fragment, or credentials"
         ));
     }
 
@@ -44,7 +46,7 @@ pub fn parse_socket_host(
 
     if bracketed || host.contains(':') {
         return Err(format!(
-            "{plugin_name}: '{field}' must not include brackets or a port unless it is an IPv6 literal"
+            "{plugin_name:?}: `{field}` must not include brackets or a port unless it is an IPv6 literal"
         ));
     }
 
@@ -57,7 +59,7 @@ pub fn parse_socket_host(
             })
         }
         _ => Err(format!(
-            "{plugin_name}: '{field}' must be a valid hostname or IP address"
+            "{plugin_name:?}: `{field}` must be a valid hostname or IP address"
         )),
     }
 }
@@ -69,6 +71,7 @@ impl SocketHost {
     /// their `host` directly rather than through the policy-screened HTTP
     /// client. A hostname (`warmup_hostname` set) is screened at resolution
     /// time by the DNS cache instead.
+    /// `plugin_name` and `field` must be fixed diagnostic labels.
     pub fn screen_egress_ip(
         &self,
         plugin_name: &str,
@@ -84,9 +87,9 @@ impl SocketHost {
         match backend_allow_ips.deny_reason(&ip) {
             None => Ok(()),
             Some(reason) => Err(format!(
-                "{plugin_name}: '{field}' address {ip} is blocked by the backend egress \
+                "{plugin_name}: `{field}` address is blocked by the backend egress \
                  policy ({reason}); refusing to send telemetry there. Adjust \
-                 FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS or point the sink at \
+                 `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_ALLOW_CIDRS` or point the sink at \
                  an allowed address."
             )),
         }

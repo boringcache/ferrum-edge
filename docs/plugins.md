@@ -3959,6 +3959,8 @@ config:
 
 Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a configured registry. Mesh mode auto-injects this plugin when the effective outbound traffic policy is `REGISTRY_ONLY` and the topology has an outbound capture listener. Operators can also configure it directly on non-mesh gateways as a generic Host allowlist.
 
+HBONE inner reuse is advertised only for CONNECTs the registry did not decide. A scoped instance permits reuse when its direction/port gate skips the admitting listener; a matching outbound listener can terminate CONNECT and must withhold reuse. Unscoped instances always refuse reuse. Every fence sweep reclassifies with the recorded admission facts and current plugin scope. See [HBONE Inner Application Connection Reuse](mesh.md#hbone-inner-application-connection-reuse).
+
 **Priority:** 130
 **Supported protocols:** HTTP, gRPC, WebSocket, HTTP/3
 
@@ -3966,7 +3968,7 @@ Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a
 |---|---|---|---|
 | `registry` | String[] | `[]` | Known destinations. Entries can be bare hosts (`reviews.default.svc.cluster.local`), exact host/port pairs (`reviews.default.svc.cluster.local:8080`), any-explicit-port markers (`reviews.default.svc.cluster.local:*`), or one-label wildcards (`*.example.com`, `*.example.com:443`, `*.example.com:*`). |
 | `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
-| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports (1–65535) where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs; use `[]` for intentional global scope. |
+| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports (1–65535) where the registry applies. Every instance skips the listener-stamped Inbound mesh direction before any registry decision, even on a matching port. Mesh auto-injection names the outbound capture ports. Empty enforces on every other direction, including non-mesh listeners; use `[]` for intentional global scope. |
 | `namespace` | String | `ferrum` | Value of the `mesh_namespace` label on `ferrum_mesh_outbound_registry_decisions_total`. Mesh injection explicitly supplies the runtime namespace. Direct instances use this config value independently of the enclosing `PluginConfig` resource namespace. |
 
 Unknown top-level keys (for example `regsitry`) are rejected at construction. An intentionally empty registry is valid and rejects all destinations wherever enforcement applies. Empty or whitespace-only entries are ignored, so a registry containing only those entries also fails closed.

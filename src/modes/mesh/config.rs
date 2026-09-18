@@ -6968,7 +6968,10 @@ fn validate_mesh_config_internal(
         }
         for port in svc.protocol_overrides.keys() {
             validate_non_zero_port(
-                format!("MeshService {:?}.protocol_overrides[\"{}\"]", svc.name, port),
+                format!(
+                    "MeshService {:?}.protocol_overrides[\"{}\"]",
+                    svc.name, port
+                ),
                 *port,
                 &mut errors,
             );
@@ -6977,7 +6980,7 @@ fn validate_mesh_config_internal(
             if vip.parse::<std::net::IpAddr>().is_err() {
                 errors.push(format!(
                     "MeshService {:?}.cluster_ips[{}]: {:?} is not a valid IP address \
-                     (headless services should omit cluster_ips, not carry 'None')",
+                     (headless services should omit cluster_ips, not carry `None`)",
                     svc.name, i, vip
                 ));
             }
@@ -7071,7 +7074,7 @@ fn validate_mesh_config_internal(
                             "MeshPolicy {:?}.rules[{}].to[{}].hosts[{}] \
                              {:?} is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or '*' port)",
+                             with u16 numeric or `*` port)",
                             policy.name, i, j, k, host
                         ));
                     }
@@ -7082,7 +7085,7 @@ fn validate_mesh_config_internal(
                             "MeshPolicy {:?}.rules[{}].to[{}].not_hosts[{}] \
                              {:?} is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or '*' port)",
+                             with u16 numeric or `*` port)",
                             policy.name, i, j, k, host
                         ));
                     }
@@ -7092,7 +7095,7 @@ fn validate_mesh_config_internal(
                         errors.push(format!(
                             "MeshPolicy {:?}.rules[{}].to[{}].port_patterns[{}] \
                              is not an admissible port pattern \
-                             (expected '*', '<digits>*', or '*<digits>' that can \
+                             (expected `*`, `<digits>*`, or `*<digits>` that can \
                              match a destination/listener port in 1..=65535)",
                             policy.name, i, j, k
                         ));
@@ -7103,7 +7106,7 @@ fn validate_mesh_config_internal(
                         errors.push(format!(
                             "MeshPolicy {:?}.rules[{}].to[{}].not_port_patterns[{}] \
                              is not an admissible port pattern \
-                             (expected '*', '<digits>*', or '*<digits>' that can \
+                             (expected `*`, `<digits>*`, or `*<digits>` that can \
                              match a destination/listener port in 1..=65535)",
                             policy.name, i, j, k
                         ));
@@ -7152,21 +7155,24 @@ fn validate_mesh_config_internal(
         }
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
-                format!("PeerAuthentication {:?}.port_overrides[\"{}\"]", pa.name, port),
+                format!(
+                    "PeerAuthentication {:?}.port_overrides[\"{}\"]",
+                    pa.name, port
+                ),
                 *port,
                 &mut errors,
             );
         }
         if !pa.mtls_mode.is_peer_auth_mode() {
             errors.push(format!(
-                "PeerAuthentication {:?}: mtls_mode `{:?}` is invalid for server-side policy",
+                "PeerAuthentication {:?}: mtls_mode \"{:?}\" is invalid for server-side policy",
                 pa.name, pa.mtls_mode
             ));
         }
         for (port, mode) in &pa.port_overrides {
             if !mode.is_peer_auth_mode() {
                 errors.push(format!(
-                    "PeerAuthentication {:?}: port_overrides[\"{port}\"] mode `{mode:?}` is \
+                    "PeerAuthentication {:?}: port_overrides[\"{port}\"] mode \"{mode:?}\" is \
                      invalid for server-side policy",
                     pa.name
                 ));
@@ -7354,7 +7360,7 @@ fn validate_mesh_config_internal(
         for (port, policy) in &dr.port_level_settings {
             validate_non_zero_port(
                 format!(
-                    "MeshDestinationRule {:?}.port_level_settings[{}]",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"]",
                     dr.name, port
                 ),
                 *port,
@@ -7362,7 +7368,7 @@ fn validate_mesh_config_internal(
             );
             validate_mesh_traffic_policy(
                 format!(
-                    "MeshDestinationRule {:?}.port_level_settings[{}]",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"]",
                     dr.name, port
                 ),
                 policy,
@@ -7370,7 +7376,7 @@ fn validate_mesh_config_internal(
             );
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule {:?}.port_level_settings[{}].trafficPolicy",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"].trafficPolicy",
                     dr.name, port
                 ),
                 Some(policy),

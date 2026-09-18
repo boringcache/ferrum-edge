@@ -174,7 +174,7 @@ pub async fn start_native_mesh_client_with_shutdown(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         cp_urls = cp_urls.len(),
-        liveness_bound_secs = config.timings.liveness_bound_seconds(),
+        liveness_bound_secs = %sanitize_startup_scalar(config.timings.liveness_bound_seconds()),
         "Native mesh client starting"
     );
 
@@ -303,11 +303,11 @@ pub async fn start_native_mesh_client_with_shutdown(
                             &[]
                         ),
                         outcome = MeshStreamAttempt::AdmissionRefused.as_metric_label(),
-                        status = %crate::startup::sanitize_startup_cause(status.message(), &[]),
+                        status = %admission_status_diagnostic(status),
                         "Control plane REFUSED the native MeshSubscribe stream for \
                          capacity/tenancy reasons: it is reachable and answering, but a CP gRPC \
-                         stream admission budget is saturated. Raise the budget named in the \
-                         status message (the sizing unit is one stream per DP or per mesh \
+                         stream admission budget is saturated. Check the CP stream admission \
+                         budget identified by a recognized status (one stream per DP or per mesh \
                          workload) or add CP replicas"
                     );
                 }
@@ -343,7 +343,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                             ),
                             outcome = attempt.as_metric_label(),
                             native_tls_class = class.as_str(),
-                            error = %crate::startup::sanitize_startup_cause(&e, &[]),
+                            error = connection_error_diagnostic(&e, attempt),
                             "Native MeshSubscribe connection failed"
                         );
                     }
@@ -354,7 +354,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                                 &[]
                             ),
                             outcome = attempt.as_metric_label(),
-                            error = %crate::startup::sanitize_startup_cause(&e, &[]),
+                            error = connection_error_diagnostic(&e, attempt),
                             "Native MeshSubscribe connection failed"
                         );
                     }
@@ -403,6 +403,35 @@ pub async fn start_native_mesh_client_with_shutdown(
         }
         backoff_secs = next_secs;
     }
+}
+
+/// Preserve known CP budget guidance, but never trust arbitrary peer status
+/// text merely because the status code is RESOURCE_EXHAUSTED.
+fn admission_status_diagnostic(status: &tonic::Status) -> String {
+    use crate::grpc::admission::CpGrpcAdmissionRejection;
+
+    for rejection in [
+        CpGrpcAdmissionRejection::TotalStreams,
+        CpGrpcAdmissionRejection::NamespaceStreams,
+        CpGrpcAdmissionRejection::PrincipalStreams,
+        CpGrpcAdmissionRejection::NodeStreams,
+        CpGrpcAdmissionRejection::NodeCardinality,
+    ] {
+        let known = rejection.into_native_status();
+        if status.message() == known.message() {
+            return known.message().to_string();
+        }
+    }
+    "CP gRPC stream admission refused (unrecognized details withheld)".to_string()
+}
+
+fn connection_error_diagnostic(error: &anyhow::Error, attempt: MeshStreamAttempt) -> &'static str {
+    // Local refusals have a closed reason enum. Provider and peer errors can
+    // carry arbitrary text; the existing attempt classification is safe.
+    error
+        .downcast_ref::<MeshApplyError>()
+        .map(MeshApplyError::reason_label)
+        .unwrap_or_else(|| attempt.as_metric_label())
 }
 
 async fn connect_mesh_subscribe(
@@ -475,7 +504,7 @@ async fn connect_mesh_subscribe(
     info!(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
-        cp_url = %cp_url,
+        cp_url = %sanitize_startup_scalar(cp_url),
         "Connected to CP, subscribing for native mesh config"
     );
 
@@ -572,7 +601,7 @@ async fn connect_mesh_subscribe(
                         format!("{:?}", cp_url.to_string()),
                         &[]
                     ),
-                    max_silence_secs = config.timings.max_silence.as_secs(),
+                    max_silence_secs = %sanitize_startup_scalar(config.timings.max_silence.as_secs()),
                     "Native MeshSubscribe stream went silent past the heartbeat bound; failing over"
                 );
                 return Ok(MeshStreamAttempt::HeartbeatSilenceTimeout);
@@ -902,6 +931,27 @@ mod tests {
     use super::*;
     use crate::grpc::dp_client::generate_dp_jwt_full;
     use crate::modes::mesh::config_consumer::update_validation::MeshUpdateRejectReason;
+
+    #[test]
+    fn admission_diagnostic_keeps_only_exact_known_budget_guidance() {
+        use crate::grpc::admission::CpGrpcAdmissionRejection;
+
+        let known = CpGrpcAdmissionRejection::NamespaceStreams.into_native_status();
+        let diagnostic = admission_status_diagnostic(&known);
+        assert!(diagnostic.contains("FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE"));
+        for message in [
+            "UNREGISTERED_STATUS5591".to_string(),
+            format!("{} UNREGISTERED_STATUS5591", known.message()),
+            "'UNREGISTERED_STATUS5591\"\\\n".to_string(),
+        ] {
+            let status = tonic::Status::resource_exhausted(message.clone());
+            let diagnostic = admission_status_diagnostic(&status);
+            assert!(diagnostic.contains("admission refused"), "{diagnostic}");
+            assert!(!diagnostic.contains("UNREGISTERED_STATUS5591"));
+            assert_eq!(status.message(), message);
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        }
+    }
 
     fn test_client_config() -> NativeMeshClientConfig {
         NativeMeshClientConfig {

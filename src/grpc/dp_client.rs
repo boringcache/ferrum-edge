@@ -2445,10 +2445,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
                         Ok(update) => update,
                         Err(msg) => {
-                            error!(
-                                "CP config rejected — {}",
-                                sanitize_startup_cause(msg, &[])
-                            );
+                            error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                             error!("Ignoring config update with invalid gateway trust bundles");
                             return Ok(refuse_unusable_snapshot(subscription.base_applied));
                         }
@@ -2470,7 +2467,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         "DP namespace filter {} excluded {} cross-namespace resources from CP \
                          snapshot — \
                          the CP should have filtered these (verify CP namespace matches DP)",
-                        sanitize_startup_cause(format!("{namespace:?}"), &[]), filtered
+                        sanitize_startup_cause(format!("{namespace:?}"), &[]),
+                        filtered
                     );
                 }
                 if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
@@ -2485,80 +2483,56 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     &proxy_state.env_config.backend_allow_ips,
                 ) {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with invalid field values");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_hosts() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with invalid hosts");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_regex_listen_paths() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with invalid regex listen_paths");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_listen_path_encodings() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with encoded-slash listen_paths");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_unique_listen_paths() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with conflicting listen paths");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_stream_proxies() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with invalid stream proxy config");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_upstream_references() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with invalid upstream references");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_plugin_references() {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!("Ignoring config update with invalid plugin references");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
@@ -2567,10 +2541,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
                 {
                     for msg in &errors {
-                        error!(
-                            "CP config rejected — {}",
-                            sanitize_startup_cause(msg, &[])
-                        );
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
                     }
                     error!(
                         "Ignoring config update with invalid mesh_route_dispatch upstream references"
@@ -2892,7 +2863,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             warn!(
                                 "DP namespace filter {} excluded {} cross-namespace resources \
                                  from CP delta",
-                                sanitize_startup_cause(format!("{namespace:?}"), &[]), filtered
+                                sanitize_startup_cause(format!("{namespace:?}"), &[]),
+                                filtered
                             );
                         }
 

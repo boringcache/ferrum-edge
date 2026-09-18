@@ -3086,7 +3086,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
                     "channels": ["ops"]
                 }]
             }),
-            "'quiet_hours_utc' must be an array",
+            "`quiet_hours_utc` must be an array",
         ),
         (
             "proxy-alerts-unused-default-resolved-window-out-of-range",

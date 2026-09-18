@@ -313,7 +313,7 @@ async fn kafka_rejects_overrides_of_managed_delivery_reporting() {
             let error = KafkaLogging::new(&config, &client)
                 .err()
                 .expect("delivery reporting overrides must be rejected at construction");
-            assert!(error.contains(&format!("producer_config.{property}")));
+            assert!(error.contains(&format!("`producer_config` key {property:?}")));
             assert!(error.contains("delivery reporting is managed"));
             assert!(!error.contains(value));
             assert_eq!(
@@ -1521,7 +1521,7 @@ fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
         .err()
         .unwrap_or_else(|| panic!("protocol mismatch must be rejected"));
     assert!(
-        error.contains("does not match security_protocol"),
+        error.contains("does not match `security_protocol`"),
         "{error}"
     );
     assert!(parse_kafka_bootstrap_servers("ssl://broker:9093", Some("ssl")).is_ok());
@@ -2022,4 +2022,35 @@ async fn kafka_message_timeout_ms_is_bounded_by_the_documented_range() {
         "the diagnostic must name the field rather than report an opaque client \
          config error, got: {error}"
     );
+}
+
+#[test]
+fn startup_diagnostics_withhold_kafka_enums_and_producer_keys() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (field, value) in [
+        ("security_protocol", json!(secret)),
+        ("key_field", json!(secret)),
+        ("compression", json!(secret)),
+        ("acks", json!(secret)),
+        ("producer_config", json!({"'diagnostic-secret-5594": 987654321})),
+    ] {
+        let mut config = json!({"broker_list": "localhost:9092", "topic": "logs"});
+        config[field] = value;
+        let error = KafkaLogging::new(&config, &default_http_client())
+            .err()
+            .expect("invalid Kafka configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+        assert!(!rendered.contains("987654321"), "{rendered}");
+    }
+
+    let error = ferrum_edge::plugins::kafka_logging::parse_kafka_bootstrap_servers(
+        "'diagnostic-secret-5594://localhost:9092",
+        None,
+    )
+    .unwrap_err();
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains("unsupported protocol"), "{rendered}");
+    assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
 }

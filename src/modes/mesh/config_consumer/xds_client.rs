@@ -89,6 +89,15 @@ impl XdsAttemptError {
     fn transport(error: impl Into<anyhow::Error>) -> Self {
         Self::Transport(error.into())
     }
+
+    fn log_diagnostic(&self) -> String {
+        match self {
+            // Transport errors include arbitrary peer status and provider text.
+            // Keep the original error for propagation, never for log rendering.
+            Self::Transport(_) => "xDS transport failed (details withheld)".to_string(),
+            Self::Policy(refusal) => crate::startup::sanitize_startup_cause(refusal, &[]),
+        }
+    }
 }
 
 impl std::fmt::Display for XdsAttemptError {
@@ -709,7 +718,7 @@ pub async fn start_xds_client_with_shutdown(
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         cluster = %sanitize_startup_scalar(config.cluster.as_str()),
         cp_urls = cp_urls.len(),
-        liveness_bound_secs = timings.liveness_bound_seconds(),
+        liveness_bound_secs = %sanitize_startup_scalar(timings.liveness_bound_seconds()),
         "xDS mesh client starting"
     );
 
@@ -729,8 +738,8 @@ pub async fn start_xds_client_with_shutdown(
         if last_cp_url.as_deref() != Some(cp_url.as_str()) {
             if let Some(previous_cp_url) = last_cp_url.as_deref() {
                 info!(
-                    previous_cp_url,
-                    cp_url = %cp_url,
+                    previous_cp_url = %sanitize_startup_scalar(previous_cp_url),
+                    cp_url = %sanitize_startup_scalar(cp_url),
                     "xDS control plane changed; resetting ADS version state"
                 );
                 stream_state.reset_for_new_control_plane();
@@ -847,7 +856,7 @@ pub async fn start_xds_client_with_shutdown(
                         &[]
                     ),
                     outcome = attempt.as_metric_label(),
-                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
+                    error = %e.log_diagnostic(),
                     "xDS ADS attempt failed"
                 );
                 attempt
@@ -965,7 +974,7 @@ async fn connect_ads(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         cluster = %sanitize_startup_scalar(config.cluster.as_str()),
-        cp_url = %cp_url,
+        cp_url = %sanitize_startup_scalar(cp_url),
         "Connected to CP, subscribing for xDS ADS config"
     );
 
@@ -1302,7 +1311,7 @@ async fn handle_ads_response(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         type_url = %type_url,
         version = %sanitize_startup_scalar(response.version_info.to_string()),
-        nonce = %response.nonce,
+        nonce = %sanitize_startup_scalar(&response.nonce),
         resources = response.resources.len(),
         "Received xDS ADS response"
     );
@@ -1318,7 +1327,7 @@ async fn handle_ads_response(
         debug!(
             node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = %type_url,
-            nonce = %nonce,
+            nonce = %sanitize_startup_scalar(&nonce),
             "Ignoring stale/duplicate xDS ADS response (nonce already processed)"
         );
         return Ok(None);
@@ -1767,8 +1776,8 @@ fn reverse_translate(
             Ok(trust_domain) => trust_domains.push(bounded_xds_log_value(&trust_domain)),
             Err(e) => {
                 debug!(
-                    resource_name = %bounded_xds_log_value(&resource.name),
-                    error = %bounded_xds_log_value(&e),
+                    resource_name = %sanitize_startup_scalar(bounded_xds_log_value(&resource.name)),
+                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
                     "Ignoring unsupported xDS SDS secret name"
                 );
                 ignored_sds_names.push(bounded_xds_log_value(&resource.name));
@@ -1792,13 +1801,13 @@ fn reverse_translate(
                     runtime_overlay.fields.insert(key, value);
                 }
             }
-            Err(e) => {
+            Err(_) => {
                 warn!(
                     resource_name = %crate::startup::sanitize_startup_cause(
                         format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
                         &[]
                     ),
-                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
+                    error = "failed to decode Runtime resource",
                     "xDS RTDS resource failed Runtime decode; skipping"
                 );
             }
@@ -2440,9 +2449,9 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
 fn decode_ecds_typed_extension(
     resource: &AccumulatedResource,
 ) -> Result<proto::TypedExtensionConfig, String> {
-    proto::TypedExtensionConfig::decode(resource.bytes.as_slice()).map_err(|e| {
+    proto::TypedExtensionConfig::decode(resource.bytes.as_slice()).map_err(|_| {
         format!(
-            "xDS ECDS resource {:?} failed TypedExtensionConfig decode: {e}",
+            "xDS ECDS resource {:?} failed TypedExtensionConfig decode",
             resource.name
         )
     })
@@ -2563,19 +2572,14 @@ fn mesh_slice_carrier_inner<'a>(
             ));
         }
         if warn_on_non_reserved_name {
+            // Both schema fields are from the closed carrier-name lookup above.
             warn!(
                 resource_name = %crate::startup::sanitize_startup_cause(
                     format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
                     &[]
                 ),
-                expected_name = %crate::startup::sanitize_startup_cause(
-                    format!("{:?}", expected_name.to_string()),
-                    &[]
-                ),
-                inner_type_url = %crate::startup::sanitize_startup_cause(
-                    format!("{:?}", inner.type_url.to_string()),
-                    &[]
-                ),
+                expected_name,
+                inner_type_url = %inner.type_url,
                 "xDS ECDS resource used reserved Ferrum mesh-slice carrier type_url with non-reserved name; skipping"
             );
         }
@@ -2763,7 +2767,7 @@ fn parse_route_resource_name(name: &str) -> Result<ServiceResourceName, String> 
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 3 || parts[0] != "route" {
         return Err(
-            "resource name <redacted scalar> must use 'route/{namespace}/{service}'".to_string(),
+            "resource name <redacted scalar> must use `route/{namespace}/{service}`".to_string(),
         );
     }
     let namespace = parts[1];
@@ -2784,7 +2788,7 @@ fn parse_spiffe_bundle_secret_name(name: &str) -> Result<String, String> {
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 3 || parts[0] != "secret" || parts[1] != "spiffe-bundle" {
         return Err(
-            "resource name <redacted scalar> must use 'secret/spiffe-bundle/{trust_domain}'"
+            "resource name <redacted scalar> must use `secret/spiffe-bundle/{trust_domain}`"
                 .to_string(),
         );
     }
@@ -2804,7 +2808,7 @@ fn log_omitted_sds_trust_domains(mut trust_domains: Vec<String>) {
     trust_domains.dedup();
 
     debug!(
-        trust_domains = ?trust_domains,
+        trust_domains = %crate::startup::sanitize_startup_cause(format!("{trust_domains:?}"), &[]),
         "xDS SDS resource names do not include authority material; omitting trust bundles"
     );
 }
@@ -2818,7 +2822,7 @@ fn log_ignored_sds_resource_names(mut names: Vec<String>) {
     names.dedup();
 
     debug!(
-        resource_names = ?names,
+        resource_names = %crate::startup::sanitize_startup_cause(format!("{names:?}"), &[]),
         "Ignored xDS SDS resources with unsupported secret names"
     );
 }
@@ -2851,6 +2855,91 @@ mod tests {
         MeshStreamTracker,
     };
     use crate::xds::translator::translate_mesh_slice_to_snapshot;
+
+    #[test]
+    fn transport_diagnostic_does_not_render_arbitrary_peer_text() {
+        let error = XdsAttemptError::from(tonic::Status::unavailable(
+            "UNREGISTERED_PROVIDER5591 'unclosed",
+        ));
+        assert!(error.to_string().contains("UNREGISTERED_PROVIDER5591"));
+        let diagnostic = error.log_diagnostic();
+        assert!(diagnostic.contains("transport failed"));
+        assert!(!diagnostic.contains("UNREGISTERED_PROVIDER5591"));
+    }
+
+    #[test]
+    fn sds_emissions_withhold_supplied_names_and_keep_schema_guidance() {
+        use super::super::common::diagnostic_test_support::DiagnosticLogs;
+
+        let logs = DiagnosticLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                SDS_TYPE_URL,
+                &[
+                    any_resource(SDS_TYPE_URL, "secret/spiffe-bundle/'UNREGISTERED_TD5591"),
+                    any_resource(SDS_TYPE_URL, "'UNREGISTERED_NAME5591\"\\\n"),
+                ],
+                "v1",
+            )
+            .unwrap();
+        let slice = reverse_translate(&accumulator, &test_config()).unwrap();
+        assert!(slice.trust_bundles.is_none());
+        let output = logs.output();
+        for field in [
+            "resource_name=",
+            "resource_names=",
+            "trust_domains=",
+            "error=",
+        ] {
+            assert!(output.contains(field), "{output}");
+        }
+        assert!(
+            output.contains("`secret/spiffe-bundle/{trust_domain}`"),
+            "{output}"
+        );
+        for secret in ["UNREGISTERED_TD5591", "UNREGISTERED_NAME5591"] {
+            assert!(!output.contains(secret), "{output}");
+        }
+        let route_error = parse_route_resource_name("UNREGISTERED_ROUTE5591").unwrap_err();
+        let rendered = crate::startup::sanitize_startup_cause(route_error, &[]);
+        assert!(rendered.contains("`route/{namespace}/{service}`"));
+        assert!(!rendered.contains("UNREGISTERED_ROUTE5591"));
+    }
+
+    #[test]
+    fn carrier_warning_keeps_closed_schema_names() {
+        use super::super::common::diagnostic_test_support::DiagnosticLogs;
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        let logs = DiagnosticLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let resource = AccumulatedResource {
+            name: "'UNREGISTERED_CARRIER5591\"\\\n".to_string(),
+            bytes: Vec::new(),
+        };
+        let extension = proto::TypedExtensionConfig {
+            name: resource.name.clone(),
+            typed_config: Some(proto::Any {
+                type_url: FERRUM_ECDS_PEER_AUTH_TYPE_URL.to_string(),
+                value: Vec::new(),
+            }),
+        };
+        assert!(
+            mesh_slice_carrier_inner(&resource, &extension, true)
+                .unwrap()
+                .is_none()
+        );
+        let output = logs.output();
+        let expected_name = carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL)
+            .expect("known carrier schema");
+        assert!(output.contains(expected_name), "{output}");
+        assert!(output.contains(FERRUM_ECDS_PEER_AUTH_TYPE_URL), "{output}");
+        assert!(!output.contains("UNREGISTERED_CARRIER5591"), "{output}");
+    }
 
     fn test_config() -> XdsClientConfig {
         XdsClientConfig {
@@ -4391,8 +4480,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn stale_duplicate_response_is_ignored_without_reack() {
+        use super::super::common::diagnostic_test_support::DiagnosticLogs;
+
+        let logs = DiagnosticLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let version = "'UNREGISTERED_VERSION5591\"\\\n";
+        let nonce = "'UNREGISTERED_NONCE5591\"\\\n";
         let (tx, mut rx) = mpsc::channel(8);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
@@ -4402,8 +4497,8 @@ mod tests {
         let first = handle_ads_response(
             discovery_response(
                 CDS_TYPE_URL,
-                "v1",
-                "n1",
+                version,
+                nonce,
                 vec![any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
             ),
             &test_config(),
@@ -4417,7 +4512,7 @@ mod tests {
         assert!(first.is_none(), "single CDS type cannot build a full slice");
         let ack = rx.recv().await.expect("ACK sent for first response");
         assert_eq!(ack.type_url, CDS_TYPE_URL);
-        assert_eq!(ack.response_nonce, "n1");
+        assert_eq!(ack.response_nonce, nonce);
         assert!(ack.error_detail.is_none());
 
         // Server retransmits the SAME nonce (reconnect race / buggy CP). The
@@ -4426,8 +4521,8 @@ mod tests {
         let duplicate = handle_ads_response(
             discovery_response(
                 CDS_TYPE_URL,
-                "v1",
-                "n1",
+                version,
+                nonce,
                 vec![any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
             ),
             &test_config(),
@@ -4448,6 +4543,13 @@ mod tests {
             resources_before.as_slice(),
             "stale duplicate must not mutate accumulated resources"
         );
+        let output = logs.output();
+        assert!(output.contains("resources=1"), "{output}");
+        assert_eq!(output.matches("nonce=").count(), 3, "{output}");
+        assert!(output.contains(CDS_TYPE_URL), "{output}");
+        for secret in ["UNREGISTERED_VERSION5591", "UNREGISTERED_NONCE5591"] {
+            assert!(!output.contains(secret), "{output}");
+        }
     }
 
     #[tokio::test]

@@ -85,7 +85,7 @@ impl StdoutLogging {
                     && min > max
                 {
                     return Err(
-                        "stdout_logging: filter.status_code_min must be less than or equal to filter.status_code_max"
+                        "stdout_logging: `filter.status_code_min` must be less than or equal to `filter.status_code_max`"
                             .to_string(),
                     );
                 }
@@ -99,11 +99,11 @@ impl StdoutLogging {
                             value,
                             "stdout_logging.filter.expression",
                         )?;
-                        let expression = serde_json::from_value(value.clone()).map_err(|err| {
-                            format!("stdout_logging: filter.expression is invalid: {err}")
+                        let expression = serde_json::from_value(value.clone()).map_err(|_| {
+                            "stdout_logging: `filter.expression` is invalid: invalid expression shape or scalar type".to_string()
                         })?;
                         validate_access_log_filter_expr(&expression).map_err(|err| {
-                            format!("stdout_logging: filter.expression is invalid: {err}")
+                            format!("stdout_logging: `filter.expression` is invalid: {err}")
                         })?;
                         Some(expression)
                     }
@@ -118,7 +118,7 @@ impl StdoutLogging {
                 .any(|key| filter_config.contains_key(*key));
                 if expression.is_some() && has_flat_predicate_key {
                     return Err(
-                        "stdout_logging: filter.expression cannot be combined with flat filter predicates"
+                        "stdout_logging: `filter.expression` cannot be combined with flat filter predicates"
                             .to_string(),
                     );
                 }
@@ -132,7 +132,7 @@ impl StdoutLogging {
                     expression,
                 })
             }
-            Some(_) => return Err("stdout_logging: filter must be an object".to_string()),
+            Some(_) => return Err("stdout_logging: `filter` must be an object".to_string()),
         };
         let schema = resolve_schema(config, "stdout_logging", SchemaCapabilities::BASE)?;
         Ok(Self { filter, schema })
@@ -270,7 +270,7 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "stdout_logging: unknown configuration key(s): {}",
+        "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
         unknown.join(", ")
     ))
 }
@@ -295,7 +295,7 @@ fn reject_unknown_errors_only_fields(value: &Value, path: &str) -> Result<(), St
             }
             unknown.sort_unstable();
             Err(format!(
-                "stdout_logging: unknown configuration key(s): {}",
+                "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
                 unknown.join(", ")
             ))
         }
@@ -317,11 +317,11 @@ fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u
         return Ok(None);
     };
     let Some(raw) = value.as_u64() else {
-        return Err(format!("stdout_logging: filter.{key} must be an integer"));
+        return Err(format!("stdout_logging: `filter.{key}` must be an integer"));
     };
     u16::try_from(raw)
         .map(Some)
-        .map_err(|_| format!("stdout_logging: filter.{key} must be between 0 and 65535"))
+        .map_err(|_| format!("stdout_logging: `filter.{key}` must be between 0 and 65535"))
 }
 
 fn parse_optional_u64(config: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
@@ -331,7 +331,7 @@ fn parse_optional_u64(config: &Map<String, Value>, key: &str) -> Result<Option<u
     value
         .as_u64()
         .map(Some)
-        .ok_or_else(|| format!("stdout_logging: filter.{key} must be an integer"))
+        .ok_or_else(|| format!("stdout_logging: `filter.{key}` must be an integer"))
 }
 
 fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
@@ -341,7 +341,7 @@ fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("stdout_logging: filter.{key} must be a boolean"))
+        .ok_or_else(|| format!("stdout_logging: `filter.{key}` must be a boolean"))
 }
 
 /// Serialize and enqueue one access-log line after capacity reservation.

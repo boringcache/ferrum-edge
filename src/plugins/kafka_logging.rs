@@ -204,21 +204,21 @@ pub fn parse_kafka_bootstrap_servers(
         if let Some(scheme_end) = entry.find("://") {
             let scheme = &entry[..scheme_end];
             if scheme.is_empty() {
-                return Err("broker_list entry has an empty protocol name".to_string());
+                return Err("`broker_list` entry has an empty protocol name".to_string());
             }
             let lowered = scheme.to_ascii_lowercase();
             if !KAFKA_SECPROTO_NAMES.contains(&lowered.as_str()) {
                 return Err(format!(
-                    "broker_list entry uses unsupported protocol '{lowered}' \
-                     (expected one of plaintext/ssl/sasl_plaintext/sasl_ssl)"
+                    "`broker_list` entry uses unsupported protocol {lowered:?} \
+                     (expected one of `plaintext`/`ssl`/`sasl_plaintext`/`sasl_ssl`)"
                 ));
             }
             if let Some(configured) = security_protocol
                 && configured != lowered
             {
                 return Err(format!(
-                    "broker_list entry protocol '{lowered}' does not match \
-                     security_protocol '{configured}'; librdkafka would reject the entry \
+                    "`broker_list` entry protocol {lowered:?} does not match \
+                     `security_protocol` {configured:?}; librdkafka would reject the entry \
                      and stop parsing the remaining brokers"
                 ));
             }
@@ -250,7 +250,7 @@ pub fn parse_kafka_bootstrap_servers(
     }
 
     if entries.is_empty() {
-        return Err("'broker_list' must contain at least one broker address".to_string());
+        return Err("`broker_list` must contain at least one broker address".to_string());
     }
     Ok(entries)
 }
@@ -369,7 +369,7 @@ pub fn screen_kafka_broker_list_egress(
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             return Err(format!(
-                "broker_list IP {ip} denied by backend egress policy: {reason}"
+                "`broker_list` IP \"{ip}\" denied by backend egress policy: {reason}"
             ));
         }
     }
@@ -419,12 +419,12 @@ fn is_kafka_topic_char(character: char) -> bool {
 fn validate_kafka_topic_name(topic: &str) -> Result<(), String> {
     if topic == "." || topic == ".." {
         return Err(format!(
-            "kafka_logging: 'topic' must not be '{topic}' (Kafka reserves '.' and '..')"
+            "kafka_logging: `topic` must not be {topic:?} (Kafka reserves `.` and `..`)"
         ));
     }
     if topic.chars().count() > MAX_KAFKA_TOPIC_NAME_LENGTH {
         return Err(format!(
-            "kafka_logging: 'topic' must be at most {MAX_KAFKA_TOPIC_NAME_LENGTH} characters"
+            "kafka_logging: `topic` must be at most {MAX_KAFKA_TOPIC_NAME_LENGTH} characters"
         ));
     }
     if let Some(offending) = topic
@@ -434,9 +434,9 @@ fn validate_kafka_topic_name(topic: &str) -> Result<(), String> {
         // Escape the offending character so a control byte cannot reshape the
         // diagnostic, and name only that character rather than the whole value.
         return Err(format!(
-            "kafka_logging: 'topic' contains unsupported character '{}' (Kafka topic \
-             names use ASCII letters, digits, '.', '_', and '-')",
-            offending.escape_debug()
+            "kafka_logging: `topic` contains unsupported character {:?} (Kafka topic \
+             names use ASCII letters, digits, `.`, `_`, and `-`)",
+            offending.to_string()
         ));
     }
     Ok(())
@@ -510,8 +510,8 @@ impl KafkaSecurityProtocol {
             "sasl_plaintext" => Ok(Self::SaslPlaintext),
             "sasl_ssl" => Ok(Self::SaslSsl),
             other => Err(format!(
-                "kafka_logging: unsupported security_protocol '{other}' \
-                 (use plaintext/ssl/sasl_plaintext/sasl_ssl)"
+                "kafka_logging: unsupported `security_protocol` {other:?} \
+                 (use `plaintext`/`ssl`/`sasl_plaintext`/`sasl_ssl`)"
             )),
         }
     }
@@ -561,13 +561,13 @@ impl KafkaSecuritySettings {
 
         if ssl_certificate_location.is_some() != ssl_key_location.is_some() {
             return Err(
-                "kafka_logging: 'ssl_certificate_location' and 'ssl_key_location' must be provided together"
+                "kafka_logging: `ssl_certificate_location` and `ssl_key_location` must be provided together"
                     .to_string(),
             );
         }
         if sasl_username.is_some() != sasl_password.is_some() {
             return Err(
-                "kafka_logging: 'sasl_username' and 'sasl_password' must be provided together"
+                "kafka_logging: `sasl_username` and `sasl_password` must be provided together"
                     .to_string(),
             );
         }
@@ -581,7 +581,7 @@ impl KafkaSecuritySettings {
             ] {
                 if config.get(key).is_some() {
                     return Err(format!(
-                        "kafka_logging: '{key}' requires security_protocol 'ssl' or 'sasl_ssl'"
+                        "kafka_logging: `{key}` requires `security_protocol` `ssl` or `sasl_ssl`"
                     ));
                 }
             }
@@ -590,7 +590,7 @@ impl KafkaSecuritySettings {
             for key in ["sasl_mechanism", "sasl_username", "sasl_password"] {
                 if config.get(key).is_some() {
                     return Err(format!(
-                        "kafka_logging: '{key}' requires security_protocol 'sasl_plaintext' or 'sasl_ssl'"
+                        "kafka_logging: `{key}` requires `security_protocol` `sasl_plaintext` or `sasl_ssl`"
                     ));
                 }
             }
@@ -1572,13 +1572,18 @@ impl KafkaLogging {
         let object = config
             .as_object()
             .ok_or_else(|| "kafka_logging: config must be an object".to_string())?;
-        reject_unknown_keys(object, "config", ALLOWED_CONFIG_KEYS, "kafka_logging: ")?;
+        reject_unknown_keys(
+            object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "kafka_logging: `config`: ",
+        )?;
 
         let broker_list = required_non_empty_string(config, "broker_list").ok_or_else(|| {
             near_miss_hint(
                 object,
                 "broker_list",
-                "kafka_logging: 'broker_list' is required (comma-separated broker addresses)",
+                "kafka_logging: `broker_list` is required (comma-separated broker addresses)",
             )
         })?;
         let brokers = broker_list
@@ -1588,7 +1593,7 @@ impl KafkaLogging {
             .collect::<Vec<_>>();
         if brokers.is_empty() {
             return Err(
-                "kafka_logging: 'broker_list' must contain at least one broker address".to_string(),
+                "kafka_logging: `broker_list` must contain at least one broker address".to_string(),
             );
         }
         let broker_list = brokers.join(",");
@@ -1601,7 +1606,7 @@ impl KafkaLogging {
                 return Err(near_miss_hint(
                     object,
                     "topic",
-                    "kafka_logging: 'topic' is required",
+                    "kafka_logging: `topic` is required",
                 ));
             }
         };
@@ -1609,47 +1614,47 @@ impl KafkaLogging {
 
         let buffer_capacity = match optional_u64(config, "buffer_capacity")? {
             Some(0) => {
-                return Err("kafka_logging: 'buffer_capacity' must be >= 1".to_string());
+                return Err("kafka_logging: `buffer_capacity` must be >= 1".to_string());
             }
             Some(value) => value,
             None => DEFAULT_BUFFER_CAPACITY as u64,
         };
         if buffer_capacity > HARD_MAX_BUFFER_CAPACITY as u64 {
             return Err(format!(
-                "kafka_logging: 'buffer_capacity' must be <= {HARD_MAX_BUFFER_CAPACITY}"
+                "kafka_logging: `buffer_capacity` must be <= {HARD_MAX_BUFFER_CAPACITY}"
             ));
         }
         let buffer_capacity = buffer_capacity as usize;
 
         let max_entry_bytes = match optional_u64(config, "max_entry_bytes")? {
             Some(0) => {
-                return Err("kafka_logging: 'max_entry_bytes' must be >= 1".to_string());
+                return Err("kafka_logging: `max_entry_bytes` must be >= 1".to_string());
             }
             Some(value) => value,
             None => DEFAULT_MAX_ENTRY_BYTES as u64,
         };
         if max_entry_bytes > HARD_MAX_ENTRY_BYTES as u64 {
             return Err(format!(
-                "kafka_logging: 'max_entry_bytes' must be <= {HARD_MAX_ENTRY_BYTES}"
+                "kafka_logging: `max_entry_bytes` must be <= {HARD_MAX_ENTRY_BYTES}"
             ));
         }
         let max_entry_bytes = max_entry_bytes as usize;
 
         let buffer_max_bytes = match optional_u64(config, "buffer_max_bytes")? {
             Some(0) => {
-                return Err("kafka_logging: 'buffer_max_bytes' must be >= 1".to_string());
+                return Err("kafka_logging: `buffer_max_bytes` must be >= 1".to_string());
             }
             Some(value) => value,
             None => DEFAULT_BUFFER_MAX_BYTES as u64,
         };
         if buffer_max_bytes > HARD_MAX_BUFFER_MAX_BYTES as u64 {
             return Err(format!(
-                "kafka_logging: 'buffer_max_bytes' must be <= {HARD_MAX_BUFFER_MAX_BYTES}"
+                "kafka_logging: `buffer_max_bytes` must be <= {HARD_MAX_BUFFER_MAX_BYTES}"
             ));
         }
         if buffer_max_bytes < max_entry_bytes as u64 {
             return Err(
-                "kafka_logging: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+                "kafka_logging: `buffer_max_bytes` must be greater than or equal to `max_entry_bytes`"
                     .to_string(),
             );
         }
@@ -1657,14 +1662,14 @@ impl KafkaLogging {
 
         let flush_timeout_seconds = match optional_u64(config, "flush_timeout_seconds")? {
             Some(0) => {
-                return Err("kafka_logging: 'flush_timeout_seconds' must be >= 1".to_string());
+                return Err("kafka_logging: `flush_timeout_seconds` must be >= 1".to_string());
             }
             Some(value) => value,
             None => DEFAULT_FLUSH_TIMEOUT_SECONDS,
         };
         if flush_timeout_seconds > HARD_MAX_FLUSH_TIMEOUT_SECONDS {
             return Err(format!(
-                "kafka_logging: 'flush_timeout_seconds' must be <= {HARD_MAX_FLUSH_TIMEOUT_SECONDS}"
+                "kafka_logging: `flush_timeout_seconds` must be <= {HARD_MAX_FLUSH_TIMEOUT_SECONDS}"
             ));
         }
 
@@ -1675,8 +1680,8 @@ impl KafkaLogging {
             Some("none") => KeyField::None,
             Some(other) => {
                 return Err(format!(
-                    "kafka_logging: unsupported key_field '{other}' \
-                     (use client_ip/proxy_id/none)"
+                    "kafka_logging: unsupported `key_field` {other:?} \
+                     (use `client_ip`/`proxy_id`/`none`)"
                 ));
             }
         };
@@ -1692,7 +1697,7 @@ impl KafkaLogging {
             // and so the OpenAPI component can state the same range (#5217).
             if value > MAX_MESSAGE_TIMEOUT_MS {
                 return Err(format!(
-                    "kafka_logging: 'message_timeout_ms' must be <= {MAX_MESSAGE_TIMEOUT_MS}"
+                    "kafka_logging: `message_timeout_ms` must be <= {MAX_MESSAGE_TIMEOUT_MS}"
                 ));
             }
             kafka_config.set("message.timeout.ms", value.to_string());
@@ -1705,8 +1710,8 @@ impl KafkaLogging {
             }
             other => {
                 return Err(format!(
-                    "kafka_logging: unsupported compression '{other}' \
-                     (use none/gzip/snappy/lz4/zstd)"
+                    "kafka_logging: unsupported `compression` {other:?} \
+                     (use `none`/`gzip`/`snappy`/`lz4`/`zstd`)"
                 ));
             }
         }
@@ -1718,7 +1723,7 @@ impl KafkaLogging {
                 }
                 other => {
                     return Err(format!(
-                        "kafka_logging: unsupported acks '{other}' (use 0/1/all)"
+                        "kafka_logging: unsupported `acks` {other:?} (use `0`/`1`/`all`)"
                     ));
                 }
             }
@@ -2485,21 +2490,21 @@ fn admit_producer_config(
     };
     let props = producer_config
         .as_object()
-        .ok_or_else(|| "kafka_logging: 'producer_config' must be an object".to_string())?;
+        .ok_or_else(|| "kafka_logging: `producer_config` must be an object".to_string())?;
     for (key, value) in props {
         let normalized = key.to_ascii_lowercase();
         if key.trim().is_empty() || key.trim() != key {
             return Err(
-                "kafka_logging: 'producer_config' keys must be non-empty and have no surrounding whitespace"
+                "kafka_logging: `producer_config` keys must be non-empty and have no surrounding whitespace"
                     .to_string(),
             );
         }
         let prop = value
             .as_str()
-            .ok_or_else(|| format!("kafka_logging: 'producer_config.{key}' must be a string"))?;
+            .ok_or_else(|| format!("kafka_logging: `producer_config` key {key:?} must be a string"))?;
         if prop.trim().is_empty() {
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' must not be empty"
+                "kafka_logging: `producer_config` key {key:?} must not be empty"
             ));
         }
         // `producer_config` is an open escape hatch forwarded verbatim to
@@ -2512,13 +2517,13 @@ fn admit_producer_config(
         // property, never the rejected material.
         if contains_inline_private_key(prop) {
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' contains inline private-key material; \
-                 use top-level 'ssl_key_location' (or an external secret reference) instead"
+                "kafka_logging: `producer_config` key {key:?} contains inline private-key material; \
+                 use top-level `ssl_key_location` (or an external secret reference) instead"
             ));
         }
         if normalized == "bootstrap.servers" || normalized == "metadata.broker.list" {
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' is not allowed"
+                "kafka_logging: `producer_config` key {key:?} is not allowed"
             ));
         }
         if let Some((_, rationale)) = UNSUPPORTED_PRODUCER_KEYS
@@ -2528,7 +2533,7 @@ fn admit_producer_config(
             // Do not echo the configured value; the property name and the fixed
             // rationale are enough for an operator to act on.
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' is not supported — {rationale}"
+                "kafka_logging: `producer_config` key {key:?} is not supported — {rationale}"
             ));
         }
         if let Some((_, authoritative)) = FORBIDDEN_PRODUCER_SECURITY_KEYS
@@ -2538,14 +2543,14 @@ fn admit_producer_config(
             // Do not echo the configured value — it may be a secret
             // (sasl.password) or otherwise sensitive identity material.
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' is not allowed; use top-level '{authoritative}'"
+                "kafka_logging: `producer_config` key {key:?} is not allowed; use top-level `{authoritative}`"
             ));
         }
         if (normalized.starts_with("ssl.") || normalized.starts_with("enable.ssl."))
             && !security_protocol.uses_tls()
         {
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' requires security_protocol 'ssl' or 'sasl_ssl'"
+                "kafka_logging: `producer_config` key {key:?} requires `security_protocol` `ssl` or `sasl_ssl`"
             ));
         }
         if (normalized.starts_with("sasl.")
@@ -2554,7 +2559,7 @@ fn admit_producer_config(
             && !security_protocol.uses_sasl()
         {
             return Err(format!(
-                "kafka_logging: 'producer_config.{key}' requires security_protocol 'sasl_plaintext' or 'sasl_ssl'"
+                "kafka_logging: `producer_config` key {key:?} requires `security_protocol` `sasl_plaintext` or `sasl_ssl`"
             ));
         }
         if normalized == "ssl.crl.location" {
@@ -2605,7 +2610,7 @@ fn admit_producer_crl_location(
 ) -> Result<(), String> {
     if !tls_enabled {
         return Err(
-            "kafka_logging: 'producer_config.ssl.crl.location' requires security_protocol 'ssl' or 'sasl_ssl'"
+            "kafka_logging: `producer_config.ssl.crl.location` requires `security_protocol` `ssl` or `sasl_ssl`"
                 .to_string(),
         );
     }
@@ -2614,7 +2619,7 @@ fn admit_producer_crl_location(
     }
     if gateway_crl_path.is_some_and(|gateway| producer_crl != gateway) {
         return Err(
-            "kafka_logging: 'producer_config.ssl.crl.location' conflicts with gateway FERRUM_TLS_CRL_FILE_PATH"
+            "kafka_logging: `producer_config.ssl.crl.location` conflicts with gateway FERRUM_TLS_CRL_FILE_PATH"
                 .to_string(),
         );
     }
@@ -2623,7 +2628,7 @@ fn admit_producer_crl_location(
 
 fn near_miss_hint(object: &Map<String, Value>, required: &str, fallback: &str) -> String {
     match crate::util::unknown_keys::near_miss_for_missing_key(object, required) {
-        Some(near) => format!("{fallback} (did you mean '{near}'?)"),
+        Some(near) => format!("{fallback} (did you mean `{required}` instead of {near:?}?)"),
         None => fallback.to_string(),
     }
 }
@@ -2631,12 +2636,12 @@ fn near_miss_hint(object: &Map<String, Value>, required: &str, fallback: &str) -
 fn parse_bounded_u32(raw: &str, field: &str, hard_max: u32) -> Result<u32, String> {
     let value: u32 = raw
         .parse()
-        .map_err(|_| format!("kafka_logging: '{field}' must be an unsigned integer string"))?;
+        .map_err(|_| format!("kafka_logging: `{field}` must be an unsigned integer string"))?;
     if value == 0 {
-        return Err(format!("kafka_logging: '{field}' must be >= 1"));
+        return Err(format!("kafka_logging: `{field}` must be >= 1"));
     }
     if value > hard_max {
-        return Err(format!("kafka_logging: '{field}' must be <= {hard_max}"));
+        return Err(format!("kafka_logging: `{field}` must be <= {hard_max}"));
     }
     Ok(value)
 }
@@ -2662,9 +2667,9 @@ fn optional_exact_string<'a>(config: &'a Value, key: &str) -> Result<Option<&'a 
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("kafka_logging: '{key}' must be a string"))?;
+                .ok_or_else(|| format!("kafka_logging: `{key}` must be a string"))?;
             if value.is_empty() {
-                return Err(format!("kafka_logging: '{key}' must not be empty"));
+                return Err(format!("kafka_logging: `{key}` must not be empty"));
             }
             Ok(Some(value))
         }
@@ -2686,19 +2691,19 @@ fn optional_credential_string(config: &Value, key: &str) -> Result<Option<String
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("kafka_logging: '{key}' must be a string"))?;
+                .ok_or_else(|| format!("kafka_logging: `{key}` must be a string"))?;
             if value.is_empty() {
-                return Err(format!("kafka_logging: '{key}' must not be empty"));
+                return Err(format!("kafka_logging: `{key}` must not be empty"));
             }
             if value.trim().is_empty() {
                 return Err(format!(
-                    "kafka_logging: '{key}' must not be entirely whitespace"
+                    "kafka_logging: `{key}` must not be entirely whitespace"
                 ));
             }
             if value.contains('\0') {
                 // Never echo the value itself — it is credential material.
                 return Err(format!(
-                    "kafka_logging: '{key}' must not contain a NUL byte (it would \
+                    "kafka_logging: `{key}` must not contain a NUL byte (it would \
                      truncate the credential librdkafka authenticates with)"
                 ));
             }
@@ -2713,10 +2718,10 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("kafka_logging: '{key}' must be a string"))?
+                .ok_or_else(|| format!("kafka_logging: `{key}` must be a string"))?
                 .trim();
             if value.is_empty() {
-                return Err(format!("kafka_logging: '{key}' must not be empty"));
+                return Err(format!("kafka_logging: `{key}` must not be empty"));
             }
             Ok(Some(value.to_string()))
         }
@@ -2729,7 +2734,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
         Some(value) => value
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("kafka_logging: '{key}' must be a boolean")),
+            .ok_or_else(|| format!("kafka_logging: `{key}` must be a boolean")),
         None => Ok(None),
     }
 }
@@ -2739,7 +2744,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(value) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("kafka_logging: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("kafka_logging: `{key}` must be an unsigned integer")),
         None => Ok(None),
     }
 }

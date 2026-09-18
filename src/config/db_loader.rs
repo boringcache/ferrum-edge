@@ -6093,7 +6093,7 @@ impl DatabaseStore {
                 Some(plugin) => match plugin.scope {
                     PluginScope::Global => {
                         errors.push(format!(
-                            "Proxy {:?} references plugin_config {:?} with scope 'global' — proxy \
+                            "Proxy {:?} references plugin_config {:?} with scope `global` — proxy \
                              associations may only reference proxy-scoped or proxy_group-scoped \
                              plugin configs",
                             proxy_id, plugin.id

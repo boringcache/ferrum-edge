@@ -423,8 +423,8 @@ fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(
         err.contains("unknown configuration key")
-            && err.contains("'config.enabeld'")
-            && err.contains("did you mean 'enabled'"),
+            && err.contains("\"config.enabeld\"")
+            && err.contains("did you mean `enabled`"),
         "{err}"
     );
 
@@ -441,13 +441,13 @@ fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
         "providers": [valid_provider()]
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("'config.fail_on_missing_mode'"), "{err}");
-    assert!(err.contains("'config.inject_usage_option'"), "{err}");
-    assert!(err.contains("'config.normalize_response_strem'"), "{err}");
+    assert!(err.contains("\"config.fail_on_missing_mode\""), "{err}");
+    assert!(err.contains("\"config.inject_usage_option\""), "{err}");
+    assert!(err.contains("\"config.normalize_response_strem\""), "{err}");
     assert!(
-        err.contains("did you mean 'fail_on_missing_model'")
-            || err.contains("did you mean 'inject_usage_options'")
-            || err.contains("did you mean 'normalize_response_stream'"),
+        err.contains("did you mean `fail_on_missing_model`")
+            || err.contains("did you mean `inject_usage_options`")
+            || err.contains("did you mean `normalize_response_stream`"),
         "{err}"
     );
 }
@@ -532,16 +532,16 @@ fn test_config_rejects_unknown_provider_keys() {
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(
-        err.contains("'config.providers[0].allow_plaintex'"),
+        err.contains("\"config.providers[0].allow_plaintex\""),
         "{err}"
     );
     assert!(
-        err.contains("'config.providers[0].inherit_backend_tl'"),
+        err.contains("\"config.providers[0].inherit_backend_tl\""),
         "{err}"
     );
     assert!(
-        err.contains("did you mean 'allow_plaintext'")
-            || err.contains("did you mean 'inherit_backend_tls'"),
+        err.contains("did you mean `allow_plaintext`")
+            || err.contains("did you mean `inherit_backend_tls`"),
         "{err}"
     );
 }
@@ -559,7 +559,7 @@ fn test_shared_admission_and_failure_policy_for_unknown_keys() {
     )
     .expect_err("shared plugin validation must reject unknown keys");
     assert!(
-        err.contains("'config.enabeld'") && err.contains("did you mean 'enabled'"),
+        err.contains("\"config.enabeld\"") && err.contains("did you mean `enabled`"),
         "{err}"
     );
     assert_eq!(

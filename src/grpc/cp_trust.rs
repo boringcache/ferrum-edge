@@ -470,8 +470,8 @@ impl PinnedTrustBundleSource {
                         "{subject} is served from a projected `{PROJECTED_GENERATION_LINK}` \
                          generation, which this platform cannot pin. Ferrum refuses to fall back \
                          to re-resolving the live symlink per file, because that is exactly how a \
-                         rotation can pair one generation's namespace policy with another \
-                         generation's key material. Place the bundle on an ordinary filesystem \
+                         rotation can pair namespace policy from one generation with another \
+                         generation of key material. Place the bundle on an ordinary filesystem \
                          and bind each referenced file with `material_sha256`, or inline public \
                          material with `public_key_pem`."
                     ),
@@ -785,8 +785,8 @@ fn resolve_entry_material(
                         "CP/DP trust bundle {origin:?}: key {kid:?} resolves material outside a \
                          pinned projected generation, so nothing proves the bytes read belong to \
                          the generation the document itself was read from — a rotation can pair \
-                         one generation's namespace ceiling with another's key material. Declare \
-                         this key's `material_sha256`, move the material into the same projected \
+                         namespace policy from one generation with key material from another. Declare \
+                         `material_sha256` for this key, move the material into the same projected \
                          mount as the bundle document, or inline public material with \
                          `public_key_pem`."
                     ),
@@ -1966,7 +1966,7 @@ fn fleet_secret_reuse_error(origin: &str, kid: &str) -> String {
     format!(
         "CP/DP trust bundle {origin:?}: key {kid:?} is backed by the fleet-wide \
          {FLEET_SECRET_ENV}. Every data plane holds that value, so any of them could name this \
-         `kid` and reach this credential's namespaces — the cross-tenant forgery advisory \
+         `kid` and reach namespaces bound to this credential — the cross-tenant forgery advisory \
          GHSA-3f2j-wwqw-grmg exists to close. Give each credential its own material, or use an \
          asymmetric public key so no data plane can sign at all."
     )
@@ -2012,7 +2012,7 @@ impl TrustBundleKeyDocument {
         {
             return Err(format!(
                 "CP/DP trust bundle {origin:?}: key {kid:?} declares a JWS algorithm outside \
-                 Ferrum's approved set while FIPS mode is enforced"
+                 the Ferrum approved set while FIPS mode is enforced"
             ));
         }
 

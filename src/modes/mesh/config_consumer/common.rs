@@ -80,10 +80,10 @@ pub fn refresh_dp_grpc_tls_config_if_changed(
                 reload.label
             );
         }
-        Err(error) => {
+        Err(_) => {
             tracing::warn!(
                 revision,
-                error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                error = "gRPC TLS material rebuild failed (details withheld)",
                 "{} gRPC TLS source revision changed but rebuild failed; keeping previous mesh client TLS material",
                 reload.label
             );
@@ -92,8 +92,121 @@ pub fn refresh_dp_grpc_tls_config_if_changed(
 }
 
 #[cfg(test)]
+pub(crate) mod diagnostic_test_support {
+    // Same thread-local fmt-writer capture used by the CLI diagnostic tests.
+    // Kept here so the scoped inline tests share it without a global subscriber.
+    #[derive(Clone, Default)]
+    pub(crate) struct DiagnosticLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl DiagnosticLogs {
+        pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(self.clone())
+                .finish()
+        }
+
+        pub(crate) fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for DiagnosticLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_stream_emission_fields_are_sanitized_individually() {
+        // Connecting startup/subscription paths needs a live CP. Pin each
+        // scalar field at its emission, not just the presence of one sanitizer
+        // elsewhere in the event. Counters and closed protocol labels stay raw.
+        let cases: &[(&str, &[&str])] = &[
+            (
+                include_str!("native_client.rs"),
+                &["cp_url", "liveness_bound_secs", "max_silence_secs"],
+            ),
+            (
+                include_str!("xds_client.rs"),
+                &["cp_url", "previous_cp_url", "liveness_bound_secs", "nonce"],
+            ),
+            (
+                include_str!("stock_xds_client.rs"),
+                &["liveness_bound_secs", "authorization_lifetime_secs"],
+            ),
+            (
+                include_str!("stock_xds_credential.rs"),
+                &[
+                    "watch_interval_secs",
+                    "max_stream_lifetime_secs",
+                    "refresh_skew_secs",
+                ],
+            ),
+            (
+                include_str!("../federation.rs"),
+                &[
+                    "cluster",
+                    "trust_domain",
+                    "endpoint",
+                    "poll_interval_seconds",
+                    "max_stale_seconds",
+                    "fail_open",
+                ],
+            ),
+        ];
+        for (source, fields) in cases {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for field in *fields {
+                let assignment = format!("{field} =");
+                let shorthand = format!("{field},");
+                let mut emissions = 0;
+                let mut in_event = false;
+                for line in production.lines().map(str::trim) {
+                    in_event |= ["info!(", "warn!(", "error!(", "debug!(", "trace!("]
+                        .iter()
+                        .any(|event| line.contains(*event));
+                    if !in_event {
+                        continue;
+                    }
+                    assert_ne!(line, shorthand, "raw shorthand emission: {field}");
+                    if line.starts_with(&assignment) {
+                        emissions += 1;
+                        assert!(
+                            line.contains("sanitize_startup_scalar(")
+                                || line.contains("sanitize_startup_cause("),
+                            "unsanitized {field} emission: {line}"
+                        );
+                    }
+                    if line.ends_with(");") {
+                        in_event = false;
+                    }
+                }
+                assert!(emissions > 0, "field disappeared from diagnostics: {field}");
+            }
+        }
+    }
 
     #[test]
     fn next_backoff_does_not_increase_after_clean_stream_end() {

@@ -2349,11 +2349,11 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
     assert!(
-        error.contains("'config.vary_by_header'"),
+        error.contains("\"config.vary_by_header\""),
         "reload error must path-qualify Vary typo: {error}"
     );
     assert!(
-        error.contains("'config.cache_key_include_consumr'"),
+        error.contains("\"config.cache_key_include_consumr\""),
         "reload error must path-qualify consumer typo: {error}"
     );
 
@@ -2457,11 +2457,11 @@ fn test_ws_rate_limiting_unknown_key_reload_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
     assert!(
-        error.contains("'config.frames_per_secod'"),
+        error.contains("\"config.frames_per_secod\""),
         "reload error must path-qualify FPS typo: {error}"
     );
     assert!(
-        error.contains("'config.redis_tsl'"),
+        error.contains("\"config.redis_tsl\""),
         "reload error must path-qualify TLS typo: {error}"
     );
 
@@ -11804,7 +11804,7 @@ async fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good()
             )
             .expect_err("unknown ai_semantic_cache key must reject reload");
         assert!(
-            error.contains("ai_semantic_cache: unknown configuration key(s):"),
+            error.contains("ai_semantic_cache: `config`: unknown configuration key(s):"),
             "unexpected reload error for {bad_config}: {error}"
         );
         let after_reject = cache.get_plugins("ferrum", "p1");

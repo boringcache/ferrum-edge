@@ -126,7 +126,7 @@ async fn test_tcp_logging_tls_rejects_empty_custom_ca_store() {
     )
     .err()
     .expect("an empty custom CA store must reject plugin construction");
-    assert!(error.contains("no valid PEM certificates"), "got: {error}");
+    assert!(error.contains("invalid CA bundle"), "got: {error}");
 }
 
 /// Counterpart to the above: TLS with no custom CA (system/webpki roots) still
@@ -499,7 +499,7 @@ async fn test_tcp_logging_rejects_unknown_keys_with_suggestion() {
     assert!(
         err.contains("unknown configuration key")
             && err.contains("tlls")
-            && err.contains("did you mean 'tls'?"),
+            && err.contains("did you mean `tls`?"),
         "got: {err}"
     );
 }
@@ -690,4 +690,88 @@ async fn test_tcp_logging_rejects_malformed_and_out_of_range_batching() {
         .is_ok(),
         "valid batching and connect-timeout boundaries must be admitted"
     );
+}
+
+#[test]
+fn startup_diagnostics_withhold_tls_identity_and_numeric_values() {
+    ensure_crypto_provider();
+    for (extra, field, hidden) in [
+        (
+            json!({"tls": true, "tls_server_name": "'diagnostic-secret-5594"}),
+            "`tls_server_name`",
+            "diagnostic-secret-5594",
+        ),
+        (json!({"port": 987654321}), "`port`", "987654321"),
+        (
+            json!({"connect_timeout_ms": 987654321}),
+            "`connect_timeout_ms`",
+            "987654321",
+        ),
+    ] {
+        let mut config = json!({"host": "logs.example.com", "port": 9000});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = TcpLogging::new(&config, default_client())
+            .err()
+            .expect("invalid sink configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("tcp_logging"), "{rendered}");
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
+    }
+}
+
+#[test]
+fn startup_diagnostics_preserve_socket_sink_context_and_egress_remediation() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::plugins::{statsd_logging::StatsdLogging, udp_logging::UdpLogging};
+
+    for plugin in ["tcp_logging", "udp_logging", "statsd_logging"] {
+        for (host, reason) in [
+            (
+                "https://credential5594:'hostValue5594`\"\\\n@logs.example.com/path",
+                "must be a hostname or IP address without scheme, path, query, fragment, or credentials",
+            ),
+            (
+                "hostValue5594.example.com:987654321",
+                "must not include brackets or a port unless it is an IPv6 literal",
+            ),
+            (
+                "169.254.169.254",
+                "cloud-metadata/link-local/multicast/unspecified range blocked by default",
+            ),
+        ] {
+            let client = PluginHttpClient::default_with_backend_allow_ips(
+                BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true)
+                    .expect("valid explicit egress policy"),
+            );
+            let config = json!({"host": host, "port": 9000});
+            let result = match plugin {
+                "tcp_logging" => TcpLogging::new(&config, client).map(|_| ()),
+                "udp_logging" => UdpLogging::new(&config, client).map(|_| ()),
+                "statsd_logging" => StatsdLogging::new(&config, client).map(|_| ()),
+                _ => unreachable!(),
+            };
+            let error = result.expect_err("invalid or denied socket host must be rejected");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            for visible in [plugin, "`host`", reason] {
+                assert!(rendered.contains(visible), "{plugin}: {rendered}");
+            }
+            if host == "169.254.169.254" {
+                for visible in [
+                    "blocked by the backend egress policy",
+                    "`FERRUM_BACKEND_ALLOW_IPS`",
+                    "`FERRUM_BACKEND_ALLOW_CIDRS`",
+                ] {
+                    assert!(rendered.contains(visible), "{plugin}: {rendered}");
+                }
+            }
+            for hidden in [host, "hostValue5594", "credential5594", "987654321"] {
+                assert!(!rendered.contains(hidden), "{plugin}: {rendered}");
+            }
+        }
+    }
 }

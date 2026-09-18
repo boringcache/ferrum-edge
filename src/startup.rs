@@ -37,7 +37,10 @@ pub fn quoted_config_value(env_key: &str, rendered: &str) -> String {
     if crate::secrets::is_external_secret_key(env_key) {
         crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string()
     } else {
-        format!("{:?}", crate::secrets::redact_external_secret_values(rendered))
+        format!(
+            "{:?}",
+            crate::secrets::redact_external_secret_values(rendered)
+        )
     }
 }
 

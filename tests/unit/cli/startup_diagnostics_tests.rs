@@ -205,7 +205,11 @@ fn destination_rule_translation_warning_withholds_document_fields_at_emission() 
 fn early_scalar_helpers_withhold_unregistered_values_and_preserve_secret_placeholders() {
     use ferrum_edge::startup::{quoted_config_value, sanitize_startup_scalar};
 
-    for value in ["'UNREGISTERED_ENV5591", "a\"UNREGISTERED_ENV5591", "918273641"] {
+    for value in [
+        "'UNREGISTERED_ENV5591",
+        "a\"UNREGISTERED_ENV5591",
+        "918273641",
+    ] {
         let cause = format!(
             "FERRUM_MODE {}: unsupported value",
             quoted_config_value("FERRUM_MODE", value)
@@ -247,7 +251,12 @@ fn istio_semantic_diagnostics_withhold_apostrophe_leading_values() {
             "unsupported",
         ),
     ];
-    for field in ["ipBlocks", "notIpBlocks", "remoteIpBlocks", "notRemoteIpBlocks"] {
+    for field in [
+        "ipBlocks",
+        "notIpBlocks",
+        "remoteIpBlocks",
+        "notRemoteIpBlocks",
+    ] {
         cases.push((
             "AuthorizationPolicy",
             json!({"rules": [{"from": [{"source": {field: [value]}}]}]}),
@@ -256,7 +265,11 @@ fn istio_semantic_diagnostics_withhold_apostrophe_leading_values() {
         ));
     }
     for field in ["serviceAccounts", "notServiceAccounts"] {
-        for malformed in [format!("{value}*"), format!("{value}/a/b"), format!("/{value}")] {
+        for malformed in [
+            format!("{value}*"),
+            format!("{value}/a/b"),
+            format!("/{value}"),
+        ] {
             cases.push((
                 "AuthorizationPolicy",
                 json!({"rules": [{"from": [{"source": {field: [malformed]}}]}]}),
@@ -367,7 +380,10 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
             receiver.recv().await.is_none(),
             "failed listener must release its queue"
         );
-        assert!(!socket.exists(), "failed listener must not publish a socket");
+        assert!(
+            !socket.exists(),
+            "failed listener must not publish a socket"
+        );
         if failure == "parent" {
             assert_eq!(std::fs::read(&parent).unwrap(), b"occupied");
         } else {
@@ -386,6 +402,63 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
         assert!(output.contains(reason), "{output}");
         assert!(!output.contains(token), "{output}");
         drop(owner);
+    }
+}
+
+#[tokio::test]
+async fn mongo_failover_emissions_withhold_invalid_options_before_network_io() {
+    use ferrum_edge::config::mongo_store::MongoStore;
+
+    // Invalid maxPoolSize is rejected by ClientOptions before any client/socket
+    // exists. Exercise the real early failure events without a live database.
+    // The values are unregistered: URL credential scrubbing alone is insufficient.
+    for value in [
+        "'UNREGISTERED_MONGO5591",
+        "a\"UNREGISTERED_MONGO5591",
+        "918273641999999999999",
+        "true",
+    ] {
+        let logs = DiagnosticLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let url = format!("mongodb://localhost/?maxPoolSize={value}");
+        let result = MongoStore::connect_with_failover(
+            &url,
+            "unused",
+            None,
+            None,
+            None,
+            Some(1),
+            Some(1),
+            false,
+            None,
+            None,
+            None,
+            false,
+            std::slice::from_ref(&url),
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("invalid options must reject the connection");
+        assert!(error.to_string().contains("All MongoDB URLs failed"));
+        assert!(error.to_string().contains("Tried 1 failover URL(s)"));
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("Primary MongoDB connection failed"),
+            "{output}"
+        );
+        assert!(output.contains("Trying 1 failover URL(s)"), "{output}");
+        assert!(output.contains("Failover MongoDB #1"), "{output}");
+        assert!(output.contains("<redacted scalar>"), "{output}");
+        assert!(output.contains("details withheld"), "{output}");
+        for withheld in ["UNREGISTERED_MONGO5591", "918273641999999999999", "true"] {
+            assert!(!output.contains(withheld), "{output}");
+        }
     }
 }
 

@@ -45,7 +45,7 @@ pub fn parse_claim_path_value(field: &str, value: &Value, plugin: &str) -> Resul
     let path = raw.trim();
     if path.is_empty() || path.split('.').any(str::is_empty) {
         return Err(format!(
-            "{plugin}: '{field}' must be a non-empty dot path without empty segments"
+            "{plugin}: `{field}` must be a non-empty dot path without empty segments"
         ));
     }
     Ok(path.to_string())

@@ -98,15 +98,15 @@ pub fn parse_claim_headers(
         )
     })?;
     let mut mappings = Vec::with_capacity(object.len());
-    for (claim_path, header_value) in object {
+    for (index, (claim_path, header_value)) in object.iter().enumerate() {
         let parsed_claim_path = parse_claim_path_value(
-            &format!("{field}.{claim_path}"),
+            &format!("{field}[{index}].claim"),
             &Value::String(claim_path.clone()),
             plugin,
         )?;
         let raw_header = header_value.as_str().ok_or_else(|| {
             format!(
-                "{plugin}: `{field}.{claim_path}` must be a header name string, got: {header_value:?}",
+                "{plugin}: `{field}[{index}].header` must be a header name string, got: {header_value:?}",
                 header_value = header_value.to_string()
             )
         })?;

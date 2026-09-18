@@ -11,6 +11,10 @@ const ROOTS: &[&str] = &[
     "src/config_sources",
     "src/grpc",
     "src/plugins/waf",
+    "src/notifications",
+    "src/util/unknown_keys.rs",
+    "src/plugins/utils/rate_limit.rs",
+    "src/plugins/utils/socket_host.rs",
 ];
 
 // Exact exceptions only; adding one requires a producer/consumer justification.
@@ -196,8 +200,14 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                 && pair[1].text == "("
         });
         for literal in body.iter().filter(|token| token.string) {
-            let line = source[..literal.offset].bytes().filter(|b| *b == b'\n').count() + 1;
-            if literal.text.contains("'{") && !SINGLE_QUOTE_EXCEPTIONS.contains(&(path, literal.text)) {
+            let line = source[..literal.offset]
+                .bytes()
+                .filter(|b| *b == b'\n')
+                .count()
+                + 1;
+            if literal.text.contains("'{")
+                && !SINGLE_QUOTE_EXCEPTIONS.contains(&(path, literal.text))
+            {
                 failures.push(format!(
                     "{path}:{line}: {}!: single-quoted interpolation",
                     name.text
@@ -271,5 +281,208 @@ fn diagnostic_guard_recognizes_multiline_raw_and_nested_macros() {
         r#"let character = '"'; let lifetime: &'a str; format!("`{field}` is invalid");"#,
     ] {
         assert!(violations("fixture.rs", source).is_empty(), "{source}");
+    }
+}
+
+fn group_end(tokens: &[Token<'_>], start: usize) -> usize {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if !token.string {
+            match token.text {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return index;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    panic!("unbalanced source group");
+}
+
+fn compact_tokens(tokens: &[Token<'_>]) -> String {
+    tokens
+        .iter()
+        .map(|token| {
+            if token.string {
+                format!("{:?}", token.text)
+            } else {
+                token.text.to_string()
+            }
+        })
+        .collect()
+}
+
+fn mongo_safe_emitted_value(value: &[Token<'_>]) -> bool {
+    let expression = compact_tokens(value);
+    // Reviewed provenance: lease labels/modes and resource/operation names are
+    // fixed at their callers; reason is a bounded enum. The rest are observed
+    // counts, indexes or elapsed time, never supplied scalar configuration.
+    const FIXED_OR_OBSERVED: &[&str] = &[
+        "self.label",
+        "self.mode",
+        "label",
+        "renew_label",
+        "resource_type",
+        "operation",
+        "reason.as_str()",
+        "elapsed_ms",
+        "i+1",
+        "failover_urls.len()",
+        "result.deleted_count",
+        "chunk.len()",
+        "confirmed_absent.len()",
+        "resource_ids.len()",
+        "proxies.len()",
+        "consumers.len()",
+        "plugin_configs.len()",
+        "upstreams.len()",
+        "quarantined.len()",
+    ];
+    if FIXED_OR_OBSERVED.contains(&expression.as_str()) {
+        return true;
+    }
+    if value.len() == 1 && value[0].string {
+        return true;
+    }
+    // A scalar sanitizer must own the ENTIRE emitted expression. A neighboring
+    // sanitizer, or appending an unsanitized suffix, cannot bless an argument.
+    if let Some(open) = value
+        .iter()
+        .position(|token| !token.string && token.text == "(")
+        && compact_tokens(&value[..open]) == "crate::startup::sanitize_startup_scalar"
+        && group_end(value, open) == value.len() - 1
+    {
+        return true;
+    }
+    // Only these reviewed validation/typed BSON decoder outputs use the cause
+    // sanitizer. It is NOT a general secret detector for driver/provider text.
+    if matches!(
+        expression.as_str(),
+        "crate::startup::sanitize_startup_cause(message,&[])"
+            | "crate::startup::sanitize_startup_cause(msg,&[])"
+            | "crate::startup::sanitize_startup_cause(decode_error,&[])"
+    ) {
+        return true;
+    }
+    // TLS option branches preserve fixed absence labels. Check the Some branch
+    // independently so a sanitizer elsewhere in the event does not suffice.
+    for (option, fallback) in [
+        ("tls_ca_cert_path", "system-roots"),
+        ("tls_client_cert_path", "none"),
+    ] {
+        let prefix = format!("{option}.map(|value|{{");
+        let suffix = format!("}}).unwrap_or_else(||{fallback:?}.to_string())");
+        if let Some(inner) = expression
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(&suffix))
+        {
+            return mongo_safe_emitted_value(&tokens(inner));
+        }
+    }
+    false
+}
+
+fn mongo_emission_violations(source: &str) -> Vec<String> {
+    let tokens = tokens(source);
+    let mut failures = Vec::new();
+    for index in 0..tokens.len().saturating_sub(2) {
+        if tokens[index].string
+            || !matches!(
+                tokens[index].text,
+                "trace" | "debug" | "info" | "warn" | "error" | "event"
+            )
+            || tokens[index + 1].text != "!"
+            || !matches!(tokens[index + 2].text, "(" | "[" | "{")
+        {
+            continue;
+        }
+        let end = group_end(&tokens, index + 2);
+        let mut start = index + 3;
+        let mut cursor = start;
+        while cursor <= end {
+            if cursor == end || (!tokens[cursor].string && tokens[cursor].text == ",") {
+                let argument = &tokens[start..cursor];
+                if !argument.is_empty() {
+                    // Named fields keep their field name; only their value may
+                    // contain supplied data. Handle both Display and Debug.
+                    let mut value = if argument.len() > 2 && argument[1].text == "=" {
+                        &argument[2..]
+                    } else {
+                        argument
+                    };
+                    if matches!(value[0].text, "%" | "?") {
+                        value = &value[1..];
+                    }
+                    // Mongo events deliberately use explicit arguments. Forbid
+                    // implicit captures (including numeric/boolean values) and
+                    // dynamic format widths/precisions in the message literal.
+                    let implicit_capture = argument.len() == 1
+                        && argument[0].string
+                        && argument[0].text.split('{').skip(1).any(|part| {
+                            let placeholder = part.split('}').next().unwrap();
+                            placeholder
+                                .chars()
+                                .any(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                        });
+                    if implicit_capture || !mongo_safe_emitted_value(value) {
+                        let line = source[..argument[0].offset].lines().count();
+                        failures.push(format!(
+                            "mongo_store.rs:{line}: unsafe emitted argument {}",
+                            compact_tokens(argument)
+                        ));
+                    }
+                }
+                start = cursor + 1;
+            } else if !tokens[cursor].string && matches!(tokens[cursor].text, "(" | "[" | "{") {
+                cursor = group_end(&tokens, cursor);
+            }
+            cursor += 1;
+        }
+    }
+    failures
+}
+
+#[test]
+fn mongo_emissions_withhold_each_supplied_value_and_provider_payload() {
+    // Lock/rollback/load emissions require a live database. Check every actual
+    // event's arguments, not a list of expected message strings. The public
+    // failover path also has captured-output coverage in startup_diagnostics.
+    let source = include_str!("../../../src/config/mongo_store.rs");
+    let failures = mongo_emission_violations(source);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn mongo_emission_guard_rejects_positional_structured_and_partial_sanitization() {
+    for source in [
+        r#"info!("namespace={:?}", namespace);"#,
+        r#"warn!("rollback: {}", provider_error);"#,
+        r#"error!(namespace = %namespace, error = ?provider_error, "cleanup failed");"#,
+        r#"info!("threshold={}", threshold_ms);"#,
+        r#"info!("replica_set={}", replica_set_configured);"#,
+        r#"debug!("threshold={threshold_ms}");"#,
+        r#"trace!("enabled={enabled:?}");"#,
+        r#"warn!("{} {}", crate::startup::sanitize_startup_scalar(namespace), provider_error);"#,
+        r#"warn!(namespace = %crate::startup::sanitize_startup_scalar(namespace), error = %provider_error, "cleanup");"#,
+        r#"warn!("{}", crate::startup::sanitize_startup_scalar(namespace) + &provider_error);"#,
+        r#"warn!("{}", crate::startup::sanitize_startup_cause(provider_error, &[]));"#,
+        r#"warn!("{}", crate::startup::sanitize_startup_cause(format!("{provider_error}"), &[]));"#,
+        r#"info!("{}", threshold_ms); crate::startup::sanitize_startup_scalar(threshold_ms);"#,
+    ] {
+        assert!(!mongo_emission_violations(source).is_empty(), "{source}");
+    }
+    for source in [
+        r#"info!("namespace={}", crate::startup::sanitize_startup_scalar("'UNREGISTERED"));"#,
+        r#"warn!("id={}", crate::startup::sanitize_startup_scalar("a\"UNREGISTERED"));"#,
+        r#"debug!("threshold={}", crate::startup::sanitize_startup_scalar(918273641));"#,
+        r#"trace!(enabled = %crate::startup::sanitize_startup_scalar(true), "TLS");"#,
+        r#"error!(error = "database error (details withheld)", "cleanup failed");"#,
+        r#"info!("{} resources", proxies.len());"#,
+    ] {
+        assert!(mongo_emission_violations(source).is_empty(), "{source}");
     }
 }

@@ -242,7 +242,9 @@ fn mesh_ports_reject_zero_on_core_resources() {
         "expected mesh service port error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("protocol_overrides[\"0\"]")),
+        errors
+            .iter()
+            .any(|e| e.contains("protocol_overrides[\"0\"]")),
         "expected protocol override port error, got: {errors:?}"
     );
     assert!(
@@ -298,7 +300,9 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
     let errors = mesh.validate();
 
     assert!(
-        errors.iter().any(|e| e.contains("port_level_settings[0]")),
+        errors
+            .iter()
+            .any(|e| e.contains("port_level_settings[\"0\"]")),
         "expected DestinationRule port-level settings error, got: {errors:?}"
     );
     assert!(
@@ -2647,6 +2651,13 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
     };
 
     let errors = mesh.validate();
+    let rendered =
+        ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+    assert!(
+        rendered.contains("port_level_settings[<redacted scalar>].tls.mode"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("8080"), "{rendered}");
     assert!(
         errors
             .iter()
@@ -2656,7 +2667,7 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("port_level_settings[8080].tls.mode")),
+            .any(|e| e.contains("port_level_settings[\"8080\"].tls.mode")),
         "expected server-side mode error, got: {errors:?}"
     );
     assert!(

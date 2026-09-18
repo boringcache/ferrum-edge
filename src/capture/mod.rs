@@ -9,6 +9,7 @@ use std::net::IpAddr;
 use tracing::warn;
 
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::startup::quoted_config_value;
 
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 pub(crate) const XTABLES_LOCK_WAIT_SECONDS: u8 = 5;
@@ -765,7 +766,7 @@ impl CaptureMode {
             "ebpf" => Ok(Self::Ebpf),
             other => Err(format!(
                 "Invalid FERRUM_MESH_CAPTURE_MODE {}. Expected: explicit, iptables, or ebpf",
-                crate::secrets::quoted_env_value("FERRUM_MESH_CAPTURE_MODE", other)
+                quoted_config_value("FERRUM_MESH_CAPTURE_MODE", other)
             )),
         }
     }
@@ -786,7 +787,7 @@ impl Ip6TablesMode {
             "false" | "disabled" => Ok(Self::Disabled),
             other => Err(format!(
                 "Invalid FERRUM_MESH_IP6TABLES_ENABLED {}. Expected: auto, true, or false",
-                crate::secrets::quoted_env_value("FERRUM_MESH_IP6TABLES_ENABLED", other)
+                quoted_config_value("FERRUM_MESH_IP6TABLES_ENABLED", other)
             )),
         }
     }
@@ -1184,18 +1185,18 @@ pub fn validate_host_capture_interface(name: &str) -> Result<(), String> {
         ));
     }
     if name == "." || name == ".." {
-        return Err("host capture interface name must not be '.' or '..'".to_string());
+        return Err("host capture interface name must not be `.` or `..`".to_string());
     }
     if name.starts_with('-') {
-        return Err("host capture interface name must not start with '-'".to_string());
+        return Err("host capture interface name must not start with `-`".to_string());
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
     {
         return Err(
-            "host capture interface name must contain only ASCII letters, digits, '.', '_', \
-             or '-' (a '+' suffix would be an iptables prefix wildcard)"
+            "host capture interface name must contain only ASCII letters, digits, `.`, `_`, \
+             or `-` (a `+` suffix would be an iptables prefix wildcard)"
                 .to_string(),
         );
     }
@@ -1238,10 +1239,10 @@ fn parse_port_list(raw: &str) -> Result<Vec<u16>, String> {
         .map(|s| {
             let port = s
                 .parse::<u16>()
-                .map_err(|_| format!("Invalid port '{s}' in capture exclude ports"))?;
+                .map_err(|_| format!("Invalid port {s:?} in capture exclude ports"))?;
             if port == 0 {
                 return Err(format!(
-                    "Invalid port '{s}' in capture exclude ports: port must be 1-65535"
+                    "Invalid port {s:?} in capture exclude ports: port must be 1-65535"
                 ));
             }
             Ok(port)
@@ -1304,19 +1305,19 @@ pub fn parse_include_port_list(raw: Option<&str>) -> Result<ParsedIncludePorts, 
     {
         if token == "*" {
             if saw_wildcard || !ports.is_empty() {
-                return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
+                return Err("wildcard `*` must be the only includeOutboundPorts token".to_string());
             }
             saw_wildcard = true;
             continue;
         }
         if saw_wildcard {
-            return Err("wildcard '*' must be the only includeOutboundPorts token".to_string());
+            return Err("wildcard `*` must be the only includeOutboundPorts token".to_string());
         }
         let port = token
             .parse::<u16>()
-            .map_err(|e| format!("port '{token}': {e}"))?;
+            .map_err(|e| format!("port {token:?}: {e}"))?;
         if port == 0 {
-            return Err("port '0': port must be 1-65535".to_string());
+            return Err(format!("port {token:?}: port must be 1-65535"));
         }
         ports.push(port);
     }
@@ -1350,15 +1351,27 @@ where
     let mut saw_wildcard = false;
     let mut wildcard_key: Option<&str> = None;
     let mut explicit_ports_key: Option<&str> = None;
+    // Only the two fixed schema keys are safe to retain as labels. This public
+    // helper also accepts other keys, which must stay inside escaped quotes.
+    let diagnostic_key = |key: &str| match key {
+        ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION | FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION => {
+            format!("`{key}`")
+        }
+        _ => format!("{key:?}"),
+    };
     for (key, raw) in annotations {
-        match parse_include_port_list(raw).map_err(|e| format!("invalid {key}: {e}"))? {
+        match parse_include_port_list(raw)
+            .map_err(|e| format!("invalid {}: {e}", diagnostic_key(key)))?
+        {
             ParsedIncludePorts::Absent => {}
             ParsedIncludePorts::All => {
                 if !ports.is_empty() {
-                    let explicit_key =
-                        explicit_ports_key.unwrap_or("another includeOutboundPorts annotation");
+                    let explicit_key = explicit_ports_key
+                        .map(diagnostic_key)
+                        .unwrap_or_else(|| "another includeOutboundPorts annotation".to_string());
                     return Err(format!(
-                        "invalid {key}: wildcard '*' cannot be combined with explicit includeOutboundPorts in {explicit_key}"
+                        "invalid {}: wildcard `*` cannot be combined with explicit includeOutboundPorts in {explicit_key}",
+                        diagnostic_key(key)
                     ));
                 }
                 saw_wildcard = true;
@@ -1366,10 +1379,12 @@ where
             }
             ParsedIncludePorts::Ports(annotation_ports) => {
                 if saw_wildcard && !annotation_ports.is_empty() {
-                    let wildcard_key =
-                        wildcard_key.unwrap_or("another includeOutboundPorts annotation");
+                    let wildcard_key = wildcard_key
+                        .map(diagnostic_key)
+                        .unwrap_or_else(|| "another includeOutboundPorts annotation".to_string());
                     return Err(format!(
-                        "invalid {key}: explicit includeOutboundPorts cannot be combined with wildcard '*' in {wildcard_key}"
+                        "invalid {}: explicit includeOutboundPorts cannot be combined with wildcard `*` in {wildcard_key}",
+                        diagnostic_key(key)
                     ));
                 }
                 if !annotation_ports.is_empty() {
@@ -1405,7 +1420,8 @@ fn parse_bool_env(raw: Option<&str>, var: &str) -> Result<bool, String> {
             "true" | "1" => Ok(true),
             "false" | "0" => Ok(false),
             _ => Err(format!(
-                "Invalid {var} '{value}'. Expected true, false, 1, or 0"
+                "Invalid {var} {}. Expected true, false, 1, or 0",
+                quoted_config_value(var, value)
             )),
         },
     }
@@ -1414,11 +1430,17 @@ fn parse_bool_env(raw: Option<&str>, var: &str) -> Result<bool, String> {
 /// Parse a single 1..=65535 destination port from an env var.
 fn parse_single_port(raw: &str, var: &str) -> Result<u16, String> {
     let trimmed = raw.trim();
-    let port = trimmed
-        .parse::<u16>()
-        .map_err(|_| format!("Invalid {var} '{raw}'. Expected a port in 1-65535"))?;
+    let port = trimmed.parse::<u16>().map_err(|_| {
+        format!(
+            "Invalid {var} {}. Expected a port in 1-65535",
+            quoted_config_value(var, raw)
+        )
+    })?;
     if port == 0 {
-        return Err(format!("Invalid {var} '{raw}': port must be 1-65535"));
+        return Err(format!(
+            "Invalid {var} {}: port must be 1-65535",
+            quoted_config_value(var, raw)
+        ));
     }
     Ok(port)
 }
@@ -1438,10 +1460,16 @@ fn parse_tproxy_mark(raw: &str) -> Result<u32, String> {
         trimmed.parse::<u32>()
     }
     .map_err(|_| {
-        format!("Invalid FERRUM_MESH_TPROXY_MARK '{raw}'. Expected a 32-bit hex (0x...) or decimal value")
+        format!(
+            "Invalid FERRUM_MESH_TPROXY_MARK {}. Expected a 32-bit hex (0x...) or decimal value",
+            quoted_config_value("FERRUM_MESH_TPROXY_MARK", raw)
+        )
     })?;
     if parsed == 0 {
-        return Err("Invalid FERRUM_MESH_TPROXY_MARK '0': mark must be non-zero".to_string());
+        return Err(format!(
+            "Invalid FERRUM_MESH_TPROXY_MARK {}: mark must be non-zero",
+            quoted_config_value("FERRUM_MESH_TPROXY_MARK", raw)
+        ));
     }
     Ok(parsed)
 }
@@ -1451,9 +1479,12 @@ fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
     if trimmed.is_empty() {
         return Ok(DEFAULT_PROXY_UID);
     }
-    trimmed
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid FERRUM_MESH_PROXY_UID '{raw}'. Expected unsigned integer"))
+    trimmed.parse::<u32>().map_err(|_| {
+        format!(
+            "Invalid FERRUM_MESH_PROXY_UID {}. Expected unsigned integer",
+            quoted_config_value("FERRUM_MESH_PROXY_UID", raw)
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2049,18 +2080,18 @@ pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
 pub fn validate_cidr_list(cidrs: &[String]) -> Result<(), String> {
     for cidr in cidrs {
         let Some((addr, prefix)) = cidr.split_once('/') else {
-            return Err(format!("CIDR '{cidr}' must include a prefix length"));
+            return Err(format!("CIDR {cidr:?} must include a prefix length"));
         };
         let ip: IpAddr = addr
             .parse()
-            .map_err(|_| format!("CIDR '{cidr}' has invalid IP address"))?;
+            .map_err(|_| format!("CIDR {cidr:?} has invalid IP address"))?;
         let prefix: u8 = prefix
             .parse()
-            .map_err(|_| format!("CIDR '{cidr}' has invalid prefix length"))?;
+            .map_err(|_| format!("CIDR {cidr:?} has invalid prefix length"))?;
         let max = if ip.is_ipv4() { 32 } else { 128 };
         if prefix > max {
             return Err(format!(
-                "CIDR '{cidr}' prefix length {prefix} exceeds max {max}"
+                "CIDR {cidr:?} prefix length \"{prefix}\" exceeds max {max}"
             ));
         }
     }
@@ -4289,6 +4320,268 @@ iptables() {{
     }
 
     #[test]
+    fn capture_parser_errors_withhold_unregistered_quoted_values() {
+        // Leading apostrophes escape the old single-quoted interpolation;
+        // embedded double quotes, backslashes and newlines exercise Debug escaping.
+        for value in [
+            "'capture-secret-5589",
+            "prefix'capture-secret-5589'visible-tail",
+            "\"capture-secret-5589`visible-tail`",
+            "prefix\\\"capture-secret-5589\nvisible-tail",
+        ] {
+            for (error, expected) in [
+                (
+                    parse_bool_env(Some(value), "FERRUM_MESH_CAPTURE_UDP_ENABLED").unwrap_err(),
+                    "Invalid FERRUM_MESH_CAPTURE_UDP_ENABLED <redacted scalar>. Expected true, false, 1, or 0",
+                ),
+                (
+                    parse_single_port(value, "FERRUM_MESH_CAPTURE_UDP_PORT").unwrap_err(),
+                    "Invalid FERRUM_MESH_CAPTURE_UDP_PORT <redacted scalar>. Expected a port in 1-65535",
+                ),
+                (
+                    parse_tproxy_mark(value).unwrap_err(),
+                    "Invalid FERRUM_MESH_TPROXY_MARK <redacted scalar>. Expected a 32-bit hex (0x...) or decimal value",
+                ),
+                (
+                    parse_proxy_uid(value).unwrap_err(),
+                    "Invalid FERRUM_MESH_PROXY_UID <redacted scalar>. Expected unsigned integer",
+                ),
+                (
+                    CaptureMode::parse(value).unwrap_err(),
+                    "Invalid FERRUM_MESH_CAPTURE_MODE <redacted scalar>. Expected: explicit, iptables, or ebpf",
+                ),
+                (
+                    Ip6TablesMode::parse(value).unwrap_err(),
+                    "Invalid FERRUM_MESH_IP6TABLES_ENABLED <redacted scalar>. Expected: auto, true, or false",
+                ),
+                (
+                    parse_port_list(&format!("80,{value}")).unwrap_err(),
+                    "Invalid port <redacted scalar> in capture exclude ports",
+                ),
+                (
+                    parse_include_port_list(Some(value)).unwrap_err(),
+                    "port <redacted scalar>: invalid digit found in string",
+                ),
+            ] {
+                assert_eq!(crate::startup::sanitize_startup_cause(error, &[]), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn capture_bool_and_mode_parsing_decisions_are_unchanged() {
+        let var = "FERRUM_MESH_CAPTURE_IPV6_ENABLED";
+        for (raw, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some(" \t "), false),
+            (Some(" true "), true),
+            (Some("TRUE"), true),
+            (Some("1"), true),
+            (Some(" false "), false),
+            (Some("FALSE"), false),
+            (Some("0"), false),
+        ] {
+            assert_eq!(parse_bool_env(raw, var).unwrap(), expected);
+        }
+        for raw in ["2", "-1", "01", "yes", "auto"] {
+            let error = parse_bool_env(Some(raw), var).unwrap_err();
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(error, &[]),
+                "Invalid FERRUM_MESH_CAPTURE_IPV6_ENABLED <redacted scalar>. Expected true, false, 1, or 0"
+            );
+        }
+        for (raw, expected) in [
+            ("AUTO", Ip6TablesMode::Auto),
+            ("true", Ip6TablesMode::Required),
+            ("REQUIRED", Ip6TablesMode::Required),
+            ("false", Ip6TablesMode::Disabled),
+            ("DISABLED", Ip6TablesMode::Disabled),
+        ] {
+            assert_eq!(Ip6TablesMode::parse(raw).unwrap(), expected);
+        }
+        for raw in ["", " auto ", "1", "0"] {
+            assert!(Ip6TablesMode::parse(raw).is_err());
+        }
+        for (raw, expected) in [
+            ("EXPLICIT", CaptureMode::Explicit),
+            ("IPTABLES", CaptureMode::Iptables),
+            ("EBPF", CaptureMode::Ebpf),
+        ] {
+            assert_eq!(CaptureMode::parse(raw).unwrap(), expected);
+        }
+        assert!(CaptureMode::parse(" explicit ").is_err());
+    }
+
+    #[test]
+    fn capture_numeric_boundaries_preserve_decisions_and_rendered_reasons() {
+        let var = "FERRUM_MESH_CAPTURE_UDP_PORT";
+        for (raw, expected) in [("1", 1), (" 65535 ", u16::MAX), ("+1", 1)] {
+            assert_eq!(parse_single_port(raw, var).unwrap(), expected);
+            assert_eq!(parse_port_list(raw).unwrap(), vec![expected]);
+            assert_eq!(
+                parse_include_port_list(Some(raw)).unwrap(),
+                ParsedIncludePorts::Ports(vec![expected])
+            );
+        }
+        for raw in ["0", " 000 ", "+0"] {
+            for (error, expected) in [
+                (
+                    parse_single_port(raw, var).unwrap_err(),
+                    "Invalid FERRUM_MESH_CAPTURE_UDP_PORT <redacted scalar>: port must be 1-65535",
+                ),
+                (
+                    parse_port_list(raw).unwrap_err(),
+                    "Invalid port <redacted scalar> in capture exclude ports: port must be 1-65535",
+                ),
+                (
+                    parse_include_port_list(Some(raw)).unwrap_err(),
+                    "port <redacted scalar>: port must be 1-65535",
+                ),
+            ] {
+                assert_eq!(crate::startup::sanitize_startup_cause(error, &[]), expected);
+            }
+        }
+        for raw in ["", "-1", "65536", "4294967296"] {
+            let error = parse_single_port(raw, var).unwrap_err();
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(error, &[]),
+                "Invalid FERRUM_MESH_CAPTURE_UDP_PORT <redacted scalar>. Expected a port in 1-65535"
+            );
+        }
+        for (raw, expected) in [("1", 1), (" 4294967295 ", u32::MAX), ("+1", 1)] {
+            assert_eq!(parse_tproxy_mark(raw).unwrap(), expected);
+            assert_eq!(parse_proxy_uid(raw).unwrap(), expected);
+        }
+        for (raw, expected) in [("0x1", 1), (" 0XFFFFFFFF ", u32::MAX)] {
+            assert_eq!(parse_tproxy_mark(raw).unwrap(), expected);
+        }
+        assert_eq!(parse_proxy_uid("0").unwrap(), 0);
+        assert_eq!(parse_proxy_uid(" \t ").unwrap(), DEFAULT_PROXY_UID);
+        for raw in ["0", " 000 ", "0x0", "0X00"] {
+            let error = parse_tproxy_mark(raw).unwrap_err();
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(error, &[]),
+                "Invalid FERRUM_MESH_TPROXY_MARK <redacted scalar>: mark must be non-zero"
+            );
+        }
+        for raw in ["-1", "4294967296", "0x100000000"] {
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(parse_tproxy_mark(raw).unwrap_err(), &[]),
+                "Invalid FERRUM_MESH_TPROXY_MARK <redacted scalar>. Expected a 32-bit hex (0x...) or decimal value"
+            );
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(parse_proxy_uid(raw).unwrap_err(), &[]),
+                "Invalid FERRUM_MESH_PROXY_UID <redacted scalar>. Expected unsigned integer"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_cidr_errors_withhold_values_and_keep_family_bounds() {
+        for (cidr, expected) in [
+            (
+                "'capture-secret`5589`\"\nvisible-tail",
+                "CIDR <redacted scalar> must include a prefix length",
+            ),
+            (
+                "'capture-secret`5589`\"\nvisible-tail/8",
+                "CIDR <redacted scalar> has invalid IP address",
+            ),
+            (
+                "fd00::/'capture-secret`5589`\"\nvisible-tail",
+                "CIDR <redacted scalar> has invalid prefix length",
+            ),
+            (
+                "10.0.0.0/33",
+                "CIDR <redacted scalar> prefix length <redacted scalar> exceeds max 32",
+            ),
+            (
+                "fd00::/129",
+                "CIDR <redacted scalar> prefix length <redacted scalar> exceeds max 128",
+            ),
+            (
+                "fd00::/256",
+                "CIDR <redacted scalar> has invalid prefix length",
+            ),
+        ] {
+            let error = validate_cidr_list(&[cidr.to_string()]).unwrap_err();
+            assert_eq!(crate::startup::sanitize_startup_cause(error, &[]), expected);
+        }
+        for cidr in ["0.0.0.0/0", "10.0.0.1/32", "::/0", "fd00::1/128"] {
+            assert!(validate_cidr_list(&[cidr.to_string()]).is_ok());
+        }
+    }
+
+    #[test]
+    fn capture_annotation_errors_keep_schema_keys_and_fixed_examples() {
+        let istio = ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION;
+        let ferrum = FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION;
+        let value = "'capture-secret`5589`\"\nvisible-tail";
+        let error = include_outbound_ports_from_annotations([(ferrum, Some(value))]).unwrap_err();
+        assert_eq!(
+            crate::startup::sanitize_startup_cause(error, &[]),
+            "invalid `ferrum.io/includeOutboundPorts`: port <redacted scalar>: invalid digit found in string"
+        );
+        // Arbitrary keys accepted by the public helper are values, not schema.
+        let error = include_outbound_ports_from_annotations([(value, Some(value))]).unwrap_err();
+        assert_eq!(
+            crate::startup::sanitize_startup_cause(error, &[]),
+            "invalid <redacted scalar>: port <redacted scalar>: invalid digit found in string"
+        );
+        for key in [istio, value] {
+            for (first, second, reason) in [
+                (
+                    "80",
+                    "*",
+                    "wildcard `*` cannot be combined with explicit includeOutboundPorts",
+                ),
+                (
+                    "*",
+                    "80",
+                    "explicit includeOutboundPorts cannot be combined with wildcard `*`",
+                ),
+            ] {
+                let error = include_outbound_ports_from_annotations([
+                    (key, Some(first)),
+                    (ferrum, Some(second)),
+                ])
+                .unwrap_err();
+                let key_label = if key == istio {
+                    "`traffic.sidecar.istio.io/includeOutboundPorts`"
+                } else {
+                    "<redacted scalar>"
+                };
+                assert_eq!(
+                    crate::startup::sanitize_startup_cause(error, &[]),
+                    format!("invalid `ferrum.io/includeOutboundPorts`: {reason} in {key_label}")
+                );
+            }
+        }
+        for raw in ["*,80", "80,*", "*,*"] {
+            let error = parse_include_port_list(Some(raw)).unwrap_err();
+            assert_eq!(
+                crate::startup::sanitize_startup_cause(error, &[]),
+                "wildcard `*` must be the only includeOutboundPorts token"
+            );
+        }
+        for (name, expected) in [
+            ("..", "host capture interface name must not be `.` or `..`"),
+            (
+                "-veth",
+                "host capture interface name must not start with `-`",
+            ),
+            (
+                "veth+",
+                "host capture interface name must contain only ASCII letters, digits, `.`, `_`, or `-` (a `+` suffix would be an iptables prefix wildcard)",
+            ),
+        ] {
+            let error = validate_host_capture_interface(name).unwrap_err();
+            assert_eq!(crate::startup::sanitize_startup_cause(error, &[]), expected);
+        }
+    }
+
+    #[test]
     fn iptables_plan_emits_inbound_exclude_return_rules_before_redirect() {
         let mut config = CaptureConfig::explicit(15006, 15001);
         config.mode = CaptureMode::Iptables;
@@ -4871,12 +5164,12 @@ iptables() {{
         let err = parse_include_port_list(Some("*,80")).expect_err("mixed wildcard");
         assert_eq!(
             err,
-            "wildcard '*' must be the only includeOutboundPorts token"
+            "wildcard `*` must be the only includeOutboundPorts token"
         );
         let err = parse_include_port_list(Some("80,*")).expect_err("ports-then-wildcard");
         assert_eq!(
             err,
-            "wildcard '*' must be the only includeOutboundPorts token"
+            "wildcard `*` must be the only includeOutboundPorts token"
         );
     }
 
@@ -4885,7 +5178,7 @@ iptables() {{
         let err = parse_include_port_list(Some("*,*")).expect_err("repeated wildcard");
         assert_eq!(
             err,
-            "wildcard '*' must be the only includeOutboundPorts token"
+            "wildcard `*` must be the only includeOutboundPorts token"
         );
     }
 
@@ -4945,7 +5238,7 @@ iptables() {{
         ])
         .expect_err("mixed wildcard across aliases");
         assert!(err.contains("ferrum.io/includeOutboundPorts"));
-        assert!(err.contains("wildcard '*' cannot be combined"));
+        assert!(err.contains("wildcard `*` cannot be combined"));
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
     }
 
@@ -4968,7 +5261,7 @@ iptables() {{
             Some("80,bogus"),
         )])
         .expect_err("malformed token");
-        assert!(err.contains("invalid ferrum.io/includeOutboundPorts"));
+        assert!(err.contains("invalid `ferrum.io/includeOutboundPorts`"));
     }
 
     // ---- F3 §3.3 Stage 2: UDP TPROXY capture rules (flag-gated, default-off) ----

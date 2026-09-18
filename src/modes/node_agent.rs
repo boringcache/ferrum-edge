@@ -389,7 +389,7 @@ impl NodeAgentConfig {
             capture_contract.ingress_capture_supports_ipv6 = capture_addr.is_ipv6();
             if !capture_contract.ingress_capture_supports_ipv6 {
                 info!(
-                    %capture_addr,
+                    capture_addr = %crate::startup::sanitize_startup_scalar(capture_addr),
                     "The NodeWaypoint inbound capture listener is bound IPv4-only; enrolled pods' \
                      IPv6 inbound traffic is left un-redirected and keeps its existing direct-pod \
                      behavior. Bind FERRUM_MESH_INBOUND_LISTEN_ADDR to [::] to redirect IPv6 too."
@@ -448,7 +448,7 @@ impl NodeAgentConfig {
         let udp_capture_requested = capture_config.udp_capture_enabled;
         if udp_capture_requested && !ambient_topology {
             warn!(
-                mesh_topology = mesh_topology.trim(),
+                mesh_topology = %crate::startup::sanitize_startup_scalar(mesh_topology.trim()),
                 "FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient; the Ambient UDP readiness guard is disabled and registry publication remains topology-dependent"
             );
         }
@@ -826,7 +826,7 @@ fn install_ingress_redirect_routing_impl(supports_ipv6: bool) -> Result<(), Stri
                 Ok(output) if best_effort => {
                     debug!(
                         args = ?args,
-                        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                        stderr = %crate::startup::sanitize_startup_scalar(String::from_utf8_lossy(&output.stderr).trim()),
                         "Idempotence delete of the inbound redirect routing found nothing to remove"
                     );
                 }
@@ -860,9 +860,9 @@ fn install_ingress_redirect_routing_impl(_supports_ipv6: bool) -> Result<(), Str
 /// will silently pre-satisfy a later reinstall.
 ///
 /// So each command's exit status is inspected and reported. The diagnostic is
-/// bounded (`ip`'s stderr, trimmed, first line only, capped) and carries nothing
-/// operator-sensitive: the argv is Ferrum's own fixed rule/route/table/priority
-/// constants and `ip` reports only netlink-level failures.
+/// bounded (`ip`'s stderr, trimmed, first line only, capped) for classification.
+/// Logs withhold provider text in full; only the argv's fixed Ferrum
+/// rule/route/table/priority constants and the measured exit status are emitted.
 #[cfg(all(target_os = "linux", not(test)))]
 fn remove_ingress_redirect_routing_impl() {
     /// Upper bound on the `ip` stderr text folded into a log line.
@@ -882,14 +882,14 @@ fn remove_ingress_redirect_routing_impl() {
                         debug!(
                             args = ?args,
                             status = ?output.status.code(),
-                            stderr = %stderr,
+                            stderr = %crate::startup::sanitize_startup_scalar(&stderr),
                             "Inbound redirect routing teardown found nothing to remove"
                         );
                     } else {
                         warn!(
                             args = ?args,
                             status = ?output.status.code(),
-                            stderr = %stderr,
+                            stderr = %crate::startup::sanitize_startup_scalar(&stderr),
                             "Inbound redirect routing teardown command exited non-zero; the \
                              Ferrum-owned rule/route may still claim the redirect fwmark. Remove \
                              it manually with the same `ip` arguments if it persists."
@@ -899,7 +899,7 @@ fn remove_ingress_redirect_routing_impl() {
                 Err(e) => {
                     warn!(
                         args = ?args,
-                        error = %e,
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Could not run the inbound redirect routing teardown command; the \
                          Ferrum-owned rule/route may still claim the redirect fwmark"
                     );
@@ -1047,6 +1047,23 @@ fn valid_probe_port(port: i32) -> Option<u16> {
     u16::try_from(port).ok().filter(|port| *port != 0)
 }
 
+fn log_node_agent_startup(config: &NodeAgentConfig) {
+    // Configuration and opaque provider fields are withheld independently at
+    // tracing boundaries. Fixed event text identifies the operation; provider
+    // text must never be treated as a safely quoted validation cause.
+    info!(
+        node_name = %crate::startup::sanitize_startup_scalar(&config.node_name),
+        capture_mode = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", config.capture_config.mode)),
+        proxy_mode = %crate::startup::sanitize_startup_scalar(config.capture_contract.proxy_mode),
+        outbound_capture_port = %crate::startup::sanitize_startup_scalar(config.capture_contract.outbound_capture_port),
+        hbone_redirect_port = %crate::startup::sanitize_startup_scalar(config.capture_contract.hbone_redirect_port),
+        cgroup_root = %crate::startup::sanitize_startup_scalar(&config.cgroup_root),
+        bpf_fs_path = %crate::startup::sanitize_startup_scalar(&config.bpf_fs_path),
+        fallback_mode = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", config.fallback_mode)),
+        "Starting node agent"
+    );
+}
+
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -1058,31 +1075,11 @@ pub async fn run(
     let admin_handles =
         start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready.clone()).await?;
 
-    info!(
-        node_name = %crate::startup::sanitize_startup_cause(
-            format!("{:?}", config.node_name), &[]
-        ),
-        capture_mode = ?config.capture_config.mode,
-        proxy_mode = %config.capture_contract.proxy_mode,
-        outbound_capture_port = %crate::startup::sanitize_startup_cause(
-            format!("\"{}\"", config.capture_contract.outbound_capture_port), &[]
-        ),
-        hbone_redirect_port = %crate::startup::sanitize_startup_cause(
-            format!("\"{}\"", config.capture_contract.hbone_redirect_port), &[]
-        ),
-        cgroup_root = %crate::startup::sanitize_startup_cause(
-            format!("{:?}", config.cgroup_root), &[]
-        ),
-        bpf_fs_path = %crate::startup::sanitize_startup_cause(
-            format!("{:?}", config.bpf_fs_path), &[]
-        ),
-        fallback_mode = ?config.fallback_mode,
-        "Starting node agent"
-    );
+    log_node_agent_startup(&config);
 
     let probe = kernel_probe::probe_kernel(&config.cgroup_root, &config.bpf_fs_path);
     info!(
-        kernel_release = %probe.kernel_release,
+        kernel_release = %crate::startup::sanitize_startup_scalar(&probe.kernel_release),
         meets_version = probe.meets_version_requirement,
         cgroup_v2 = probe.cgroup_v2_available,
         bpf_fs = probe.bpf_fs_available,
@@ -1118,7 +1115,7 @@ pub async fn run(
         let _ = shutdown_tx.send(true);
         for handle in admin_handles {
             if let Err(err) = handle.await {
-                warn!(error = %err, "Node agent admin listener task failed");
+                warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent admin listener task failed");
             }
         }
         anyhow::bail!(
@@ -1164,7 +1161,7 @@ pub async fn run(
     let _ = shutdown_tx.send(true);
     for handle in admin_handles {
         if let Err(err) = handle.await {
-            warn!(error = %err, "Node agent admin listener task failed");
+            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent admin listener task failed");
         }
     }
 
@@ -1243,9 +1240,12 @@ async fn start_node_agent_admin_listeners(
             warn!(
                 "No node_agent admin API listeners are active — {} and admin HTTPS not configured or {}. The admin API is unreachable.",
                 crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0"),
-                crate::secrets::report_env_assignment(
-                    "FERRUM_ADMIN_HTTPS_PORT",
-                    &env_config.admin_https_port.to_string()
+                format_args!(
+                    "FERRUM_ADMIN_HTTPS_PORT={}",
+                    crate::startup::sanitize_startup_scalar(crate::secrets::report_env_field(
+                        "FERRUM_ADMIN_HTTPS_PORT",
+                        &env_config.admin_https_port.to_string()
+                    ))
                 )
             );
         }
@@ -1408,11 +1408,11 @@ async fn start_node_agent_admin_listeners(
         handles.push(tokio::spawn(async move {
             info!(
                 "Starting node_agent admin HTTP listener on {}",
-                crate::secrets::report_listener_addr(
+                crate::startup::sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
                     &admin_http_addr.to_string()
-                )
+                ))
             );
             if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
@@ -1424,7 +1424,10 @@ async fn start_node_agent_admin_listeners(
             )
             .await
             {
-                error!("Node agent admin HTTP listener error: {}", err);
+                error!(
+                    "Node agent admin HTTP listener error: {}",
+                    crate::startup::sanitize_startup_scalar(&err)
+                );
             }
         }));
         startup_signals.push(("Node agent admin HTTP listener".to_string(), started_rx));
@@ -1448,11 +1451,11 @@ async fn start_node_agent_admin_listeners(
         handles.push(tokio::spawn(async move {
             info!(
                 "Starting node_agent admin HTTPS listener on {}",
-                crate::secrets::report_listener_addr(
+                crate::startup::sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTPS_PORT",
                     &admin_https_addr.to_string()
-                )
+                ))
             );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(
@@ -1476,7 +1479,10 @@ async fn start_node_agent_admin_listeners(
                 .await
             };
             if let Err(err) = result {
-                error!("Node agent admin HTTPS listener error: {}", err);
+                error!(
+                    "Node agent admin HTTPS listener error: {}",
+                    crate::startup::sanitize_startup_scalar(&err)
+                );
             }
         }));
         startup_signals.push(("Node agent admin HTTPS listener".to_string(), started_rx));
@@ -1491,7 +1497,7 @@ async fn start_node_agent_admin_listeners(
         for handle in handles {
             if let Err(join_err) = handle.await {
                 warn!(
-                    error = %join_err,
+                    error = %crate::startup::sanitize_startup_scalar(&join_err),
                     "Node agent admin listener task failed during startup rollback"
                 );
             }
@@ -1577,10 +1583,11 @@ fn decide_admin_bind_address(
     if signals.allowed_cidrs_set {
         warn!(
             "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with FERRUM_ADMIN_ALLOWED_CIDRS and no explicit \
-             FERRUM_ADMIN_BIND_ADDRESS; binding node-agent admin to 0.0.0.0:{port} (restricted by the \
+             FERRUM_ADMIN_BIND_ADDRESS; binding node-agent admin to 0.0.0.0:{} (restricted by the \
              admin allowlist) so admin routes are reachable for cluster scraping; endpoint authentication \
              and observability-detail policies still apply. \
-             Set FERRUM_ADMIN_BIND_ADDRESS to pin a specific address."
+             Set FERRUM_ADMIN_BIND_ADDRESS to pin a specific address.",
+            crate::startup::sanitize_startup_scalar(port)
         );
         return Ok(std::net::SocketAddr::new(
             std::net::Ipv4Addr::UNSPECIFIED.into(),
@@ -1594,9 +1601,10 @@ fn decide_admin_bind_address(
     if !configured_ip.is_loopback() {
         warn!(
             "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no allowlist or explicit bind address configured; \
-             defaulting node-agent admin listener to 127.0.0.1:{port} so the admin surface is not exposed \
+             defaulting node-agent admin listener to 127.0.0.1:{} so the admin surface is not exposed \
              on the network. To expose it, set FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list> \
-             or FERRUM_ADMIN_BIND_ADDRESS=<address>."
+             or FERRUM_ADMIN_BIND_ADDRESS=<address>.",
+            crate::startup::sanitize_startup_scalar(port)
         );
         return Ok(std::net::SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
@@ -1882,7 +1890,7 @@ fn apply_ingress_topology_outcome(
                 configured_interfaces = status.configured_interfaces,
                 expected_interfaces = status.expected_interfaces,
                 ipv4_covered = status.ipv4_covered,
-                ipv6_required = status.ipv6_required,
+                ipv6_required = %crate::startup::sanitize_startup_scalar(status.ipv6_required),
                 ipv6_covered = status.ipv6_covered,
                 "NodeWaypoint ingress interface topology is proved"
             );
@@ -1896,9 +1904,9 @@ fn apply_ingress_topology_outcome(
                 reason = status.reason.label(),
                 configured_interfaces = status.configured_interfaces,
                 expected_interfaces = status.expected_interfaces,
-                ipv4_required = status.ipv4_required,
-                ipv6_required = status.ipv6_required,
-                diagnostic,
+                ipv4_required = %crate::startup::sanitize_startup_scalar(status.ipv4_required),
+                ipv6_required = %crate::startup::sanitize_startup_scalar(status.ipv6_required),
+                diagnostic = %crate::startup::sanitize_startup_scalar(diagnostic),
                 "NodeWaypoint ingress interface topology is unproved; readiness withdrawn. \
                  Correct the explicit interface set or restore the node routes/link state; \
                  Ferrum will not guess or broaden capture."
@@ -2110,7 +2118,7 @@ where
     {
         udp_registry_sync_retraction_pending = true;
         warn!(
-            %error,
+            error = %crate::startup::sanitize_startup_scalar(&error),
             "Ambient UDP registry proof retraction failed at startup; keeping capture mutations and readiness fenced while retrying"
         );
     }
@@ -2133,7 +2141,7 @@ where
         configure_cni_ownership_store(Some(ownership_store_path));
         if let Err(error) = rehydrate_cni_owned_attachments(&pod_states) {
             error!(
-                %error,
+                error = %crate::startup::sanitize_startup_scalar(&error),
                 "Failed to rehydrate durable Ferrum CNI ownership; GC will fail closed"
             );
         }
@@ -2156,7 +2164,7 @@ where
 
     info!(
         "Node agent initialized, watching pod events on node {}",
-        config.node_name
+        crate::startup::sanitize_startup_scalar(&config.node_name)
     );
 
     // Periodic re-drive of transiently-failed enrollments. Failed pods are not
@@ -2225,7 +2233,7 @@ where
                                 startup_ready.store(false, Ordering::Release);
                                 pending_pod_event = Some(Event::Apply(pod));
                                 warn!(
-                                    %error,
+                                    error = %crate::startup::sanitize_startup_scalar(&error),
                                     "Deferring pod Apply until the stale Ambient UDP registry proof is retracted"
                                 );
                                 continue;
@@ -2281,7 +2289,7 @@ where
                                 startup_ready.store(false, Ordering::Release);
                                 pending_pod_event = Some(Event::Delete(pod));
                                 warn!(
-                                    %error,
+                                    error = %crate::startup::sanitize_startup_scalar(&error),
                                     "Deferring pod Delete until the stale Ambient UDP registry proof is retracted"
                                 );
                                 continue;
@@ -2329,7 +2337,7 @@ where
                             startup_ready.store(false, Ordering::Release);
                             pending_pod_event = Some(Event::Init);
                             warn!(
-                                %error,
+                                error = %crate::startup::sanitize_startup_scalar(&error),
                                 "Deferring pod relist until the stale Ambient UDP registry proof is retracted"
                             );
                             continue;
@@ -2406,7 +2414,7 @@ where
                         }
                     }
                     Some(Err(e)) => {
-                        warn!(error = %e, "Pod watcher error; kube-rs will retry");
+                        warn!(error = %crate::startup::sanitize_startup_scalar(&e), "Pod watcher error; kube-rs will retry");
                         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     None => {
@@ -2471,7 +2479,7 @@ where
                                         .to_string(),
                                 });
                                 warn!(
-                                    %error,
+                                    error = %crate::startup::sanitize_startup_scalar(&error),
                                     verb = ?work.request.verb,
                                     "Refusing CNI capture mutation until the stale Ambient UDP registry proof is retracted"
                                 );
@@ -2653,7 +2661,7 @@ where
                         Err(error) => {
                             startup_ready.store(false, Ordering::Release);
                             warn!(
-                                %error,
+                                error = %crate::startup::sanitize_startup_scalar(&error),
                                 "Deferring capture retry tick until the stale Ambient UDP registry proof is retracted"
                             );
                             continue;
@@ -2842,7 +2850,7 @@ where
         Ok(_) => true,
         Err(error) => {
             warn!(
-                %error,
+                error = %crate::startup::sanitize_startup_scalar(&error),
                 "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
             );
             false
@@ -2864,13 +2872,13 @@ where
     if let Some(monitor) = topology_monitor
         && let Err(err) = monitor.task.await
     {
-        warn!(error = %err, "Node ingress-topology monitor task panicked");
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node ingress-topology monitor task panicked");
     }
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
     {
-        warn!(error = %err, "Node agent CNI listener task panicked");
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI listener task panicked");
     }
 
     match exit_reason {
@@ -3173,7 +3181,7 @@ where
             Ok(Ok(uid)) => Some(uid),
             Ok(Err(error)) => {
                 warn!(
-                    %error,
+                    error = %crate::startup::sanitize_startup_scalar(&error),
                     "could not revalidate this node's Kubernetes object; retracting identity and remaining fail-closed until the node-agent can read its own Node object"
                 );
                 None
@@ -3186,7 +3194,7 @@ where
 
     let registry_sync_retraction_failed = if let Err(error) = retract_registry_sync() {
         warn!(
-            %error,
+            error = %crate::startup::sanitize_startup_scalar(&error),
             "could not retract the Ambient UDP registry proof before a node identity lookup or change; retracting node identity and keeping capture mutations and readiness fenced"
         );
         true
@@ -3195,7 +3203,7 @@ where
     };
     if let Err(error) = retract_identity() {
         error!(
-            %error,
+            error = %crate::startup::sanitize_startup_scalar(&error),
             "could not retract the previously published node identity before resolving this \
              node's Kubernetes UID; refusing to publish a node identity or a node-bound Ambient \
              UDP registry proof on this incarnation, because a surviving stale publication names \
@@ -3218,7 +3226,7 @@ where
             Ok(Ok(uid)) => Some(uid),
             Ok(Err(error)) => {
                 warn!(
-                    %error,
+                    error = %crate::startup::sanitize_startup_scalar(&error),
                     "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
                      will stay fail-closed until the node-agent can read its own Node object"
                 );
@@ -3234,13 +3242,13 @@ where
     };
     if let Err(error) = publish_identity(&uid) {
         warn!(
-            %error,
+            error = %crate::startup::sanitize_startup_scalar(&error),
             "could not publish this node's Kubernetes UID; Ambient UDP host-placement adoption \
              will stay fail-closed until the node-agent can read its own Node object"
         );
         if let Err(error) = retract_identity() {
             error!(
-                %error,
+                error = %crate::startup::sanitize_startup_scalar(&error),
                 "could not remove the published Ambient UDP node identity after a failed \
                  publication; remove it manually before relying on node-specific placement proof"
             );
@@ -3309,7 +3317,7 @@ fn publish_udp_migration_registry_sync_with_recovery(
             let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
                 *retraction_pending = true;
                 warn!(
-                    %error,
+                    error = %crate::startup::sanitize_startup_scalar(&error),
                     "Ambient UDP registry proof publication failed without a registry directory; keeping mutation fence closed"
                 );
                 return;
@@ -3318,15 +3326,15 @@ fn publish_udp_migration_registry_sync_with_recovery(
                 Ok(()) => {
                     *retraction_pending = false;
                     warn!(
-                        %error,
+                        error = %crate::startup::sanitize_startup_scalar(&error),
                         "Ambient UDP registry proof publication failed; proof remains withheld and will be retried"
                     );
                 }
                 Err(retraction_error) => {
                     *retraction_pending = true;
                     warn!(
-                        %error,
-                        %retraction_error,
+                        error = %crate::startup::sanitize_startup_scalar(&error),
+                        retraction_error = %crate::startup::sanitize_startup_scalar(&retraction_error),
                         "Ambient UDP registry proof publication and rollback both failed; refusing capture mutations until retraction recovers"
                     );
                 }
@@ -3520,9 +3528,9 @@ async fn apply_cni_request_with_kube_metadata(
         Ok(Ok(pod)) => apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod),
         Ok(Err(err)) => {
             debug!(
-                namespace = %request.pod_namespace,
-                pod_name = %request.pod_name,
-                error = %err,
+                namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
+                pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
+                error = %crate::startup::sanitize_startup_scalar(&err),
                 "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
             );
             (
@@ -3532,8 +3540,8 @@ async fn apply_cni_request_with_kube_metadata(
         }
         Err(_elapsed) => {
             debug!(
-                namespace = %request.pod_namespace,
-                pod_name = %request.pod_name,
+                namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
+                pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
                 timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
                 "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
             );
@@ -3936,7 +3944,7 @@ fn include_outbound_ports_to_policy(
     }
     if include.ports.len() > INCLUDE_PORTS_MAX {
         warn!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             requested = include.ports.len(),
             cap = INCLUDE_PORTS_MAX,
             "includeOutboundPorts annotation exceeds BPF map capacity; truncating to first {INCLUDE_PORTS_MAX} ports"
@@ -3983,8 +3991,8 @@ fn apply_include_outbound_ports(
         Ok(None) => return None,
         Err(e) => {
             warn!(
-                pod_uid,
-                error = %e,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Skipping includeOutboundPorts BPF narrowing; pod will capture all outbound ports"
             );
             return None;
@@ -3993,8 +4001,8 @@ fn apply_include_outbound_ports(
     let cgroup_ids = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(cgroup_path));
     if cgroup_ids.is_empty() {
         warn!(
-            pod_uid,
-            cgroup_path,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            cgroup_path = %crate::startup::sanitize_startup_scalar(cgroup_path),
             "Could not read any cgroup inode for pod; includeOutboundPorts narrowing will not engage"
         );
         return None;
@@ -4006,9 +4014,9 @@ fn apply_include_outbound_ports(
             Ok(()) => written.push(cgroup_id),
             Err(e) => {
                 warn!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     cgroup_id,
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to write FERRUM_INCLUDE_PORTS for a pod cgroup inode; that cgroup's capture will not narrow"
                 );
             }
@@ -4016,15 +4024,15 @@ fn apply_include_outbound_ports(
     }
     if written.is_empty() {
         warn!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             "No FERRUM_INCLUDE_PORTS entries written for pod; capture will not narrow"
         );
         return None;
     }
     debug!(
-        pod_uid,
+        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
         cgroup_ids = written.len(),
-        all_ports = policy.is_all_ports(),
+        all_ports = %crate::startup::sanitize_startup_scalar(policy.is_all_ports()),
         port_count = policy.port_count,
         "Wrote per-pod includeOutboundPorts entries across pod cgroup tree"
     );
@@ -4073,8 +4081,8 @@ fn apply_workload_identity(
     let cgroup_ids = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(cgroup_path));
     if cgroup_ids.is_empty() {
         warn!(
-            pod_uid,
-            cgroup_path,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            cgroup_path = %crate::startup::sanitize_startup_scalar(cgroup_path),
             "Could not read any cgroup inode for pod; node-waypoint identity resolution will \
              fail closed for traffic from this pod"
         );
@@ -4087,9 +4095,9 @@ fn apply_workload_identity(
             Ok(()) => written.push(cgroup_id),
             Err(e) => {
                 warn!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     cgroup_id,
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to write FERRUM_WORKLOAD_IDENTITY for a pod cgroup inode; \
                      traffic from that cgroup will fail closed"
                 );
@@ -4098,13 +4106,13 @@ fn apply_workload_identity(
     }
     if written.is_empty() {
         warn!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             "No FERRUM_WORKLOAD_IDENTITY entries written for pod; node-waypoint identity \
              resolution will fail closed for traffic from this pod"
         );
     } else {
         debug!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             cgroup_ids = written.len(),
             "Wrote source workload identity to FERRUM_WORKLOAD_IDENTITY across pod cgroup tree"
         );
@@ -4143,9 +4151,9 @@ fn cleanup_pre_enrollment_maps(
     for cgroup_id in &state.include_ports_cgroup_ids {
         if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
             warn!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 cgroup_id = *cgroup_id,
-                error = %e,
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Failed to remove pre-enrollment includeOutboundPorts entry from BPF map"
             );
         }
@@ -4153,9 +4161,9 @@ fn cleanup_pre_enrollment_maps(
     for cgroup_id in &state.workload_identity_cgroup_ids {
         if let Err(e) = backend.remove_workload_identity(*cgroup_id) {
             warn!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 cgroup_id = *cgroup_id,
-                error = %e,
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Failed to remove pre-enrollment workload-identity entry from BPF map"
             );
         }
@@ -4246,8 +4254,8 @@ fn apply_node_probe_ports_collecting(
     }
     if !state.node_probe_ports.is_empty() {
         debug!(
-            pod_uid,
-            ?state.node_probe_ports,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            state.node_probe_ports = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", state.node_probe_ports)),
             "Wrote node-source probe-port exemptions for enrolled pod"
         );
     }
@@ -4328,10 +4336,10 @@ fn remove_node_probe_port_if_unowned(
         other_pod_owning_probe_port_addr(pod_states, removal.pod_uid, removal.ip, removal.port)
     {
         debug!(
-            pod_uid = removal.pod_uid,
-            owner_pod_uid,
-            ip = %removal.ip,
-            port = removal.port,
+            pod_uid = %crate::startup::sanitize_startup_scalar(removal.pod_uid),
+            owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(removal.ip),
+            port = %crate::startup::sanitize_startup_scalar(removal.port),
             removal_reason = removal.reason,
             "Skipping node probe-port map removal; key is owned by another tracked pod"
         );
@@ -4353,10 +4361,10 @@ fn remove_node_probe_port_if_unowned(
     };
     if let Err(e) = result {
         warn!(
-            pod_uid = removal.pod_uid,
-            ip = %removal.ip,
-            port = removal.port,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(removal.pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(removal.ip),
+            port = %crate::startup::sanitize_startup_scalar(removal.port),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             removal_reason = removal.reason,
             "Failed to remove node probe-port entry from BPF map"
         );
@@ -4408,7 +4416,7 @@ fn cleanup_partial_pod_enrollment(
     state: &PodAttachmentState,
 ) {
     if let Err(e) = backend.detach_pod(pod_uid) {
-        warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clean up partially attached pod");
     }
     cleanup_pre_enrollment_maps(backend, pod_states, metrics, pod_uid, state);
 }
@@ -4418,10 +4426,12 @@ fn build_workload_spiffe_id(
     service_account: &str,
     trust_domain: &str,
 ) -> Option<crate::identity::SpiffeId> {
+    // These typed SPIFFE validators Debug-quote supplied values; retain their
+    // safe rejection reasons while withholding each scalar sibling separately.
     let trust_domain = match crate::identity::spiffe::TrustDomain::new(trust_domain) {
         Ok(td) => td,
         Err(e) => {
-            warn!(trust_domain, error = %e, "Cannot derive workload identity: invalid trust domain");
+            warn!(trust_domain = %crate::startup::sanitize_startup_scalar(trust_domain), error = %crate::startup::sanitize_startup_cause(&e, &[]), "Cannot derive workload identity: invalid trust domain");
             return None;
         }
     };
@@ -4430,9 +4440,9 @@ fn build_workload_spiffe_id(
         Ok(id) => Some(id),
         Err(e) => {
             warn!(
-                namespace,
-                service_account,
-                error = %e,
+                namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                service_account = %crate::startup::sanitize_startup_scalar(service_account),
+                error = %crate::startup::sanitize_startup_cause(&e, &[]),
                 "Cannot derive workload identity: invalid SPIFFE components"
             );
             None
@@ -4452,7 +4462,7 @@ fn build_workload_identity(
     let uid_bytes = match crate::modes::mesh::node_waypoint::parse_pod_uid(pod_uid) {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!(pod_uid, error = %e, "Cannot derive workload identity: invalid pod UID");
+            warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Cannot derive workload identity: invalid pod UID");
             return None;
         }
     };
@@ -4886,7 +4896,7 @@ fn rehydrate_cni_owned_attachments(
         Ok(Some(records)) => records,
         Err(err) => {
             warn!(
-                error = %err,
+                error = %crate::startup::sanitize_startup_scalar(&err),
                 "Durable Ferrum CNI ownership state rejected; GC will fail closed until the store is repaired"
             );
             return Err(err.to_string());
@@ -5524,9 +5534,9 @@ fn retry_backed_off_pod_enrollments(
     for (_state_key, snapshot) in due {
         let event = snapshot.as_event();
         debug!(
-            pod_uid = event.pod_uid,
-            pod_name = event.pod_name,
-            namespace = event.namespace,
+            pod_uid = %crate::startup::sanitize_startup_scalar(event.pod_uid),
+            pod_name = %crate::startup::sanitize_startup_scalar(event.pod_name),
+            namespace = %crate::startup::sanitize_startup_scalar(event.namespace),
             "Re-driving backed-off pod enrollment after retry window"
         );
         handle_pod_added_after_backoff(backend, pod_states, config, metrics, &event);
@@ -5669,7 +5679,7 @@ fn retry_pending_node_probe_port_updates(
         let Some(mut state) = pod_states.get_mut(&pod_uid) else {
             PENDING_CAPTURE_FAILURES.remove(&failure_key);
             debug!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                 "Cleared pending node probe-port update because the pod is no longer tracked"
             );
             continue;
@@ -5717,8 +5727,8 @@ fn retry_pending_node_probe_port_updates(
                     pod_states, &pod_uid,
                 ));
                 debug!(
-                    pod_uid,
-                    ?desired_ports,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
+                    desired_ports = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", desired_ports)),
                     "Recovered pending node probe-port map update failure"
                 );
             }
@@ -5727,8 +5737,8 @@ fn retry_pending_node_probe_port_updates(
                     remember_applied_node_probe_port(&mut state.node_probe_ports, port);
                 }
                 warn!(
-                    pod_uid,
-                    error = %e.message,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
+                    error = %crate::startup::sanitize_startup_scalar(&e.message),
                     "Retrying pending node probe-port map update failed; keeping capture state degraded"
                 );
             }
@@ -5753,9 +5763,9 @@ fn retry_pending_node_probe_port_removals(
         if let Some(owner_pod_uid) = pod_owning_probe_port_addr(pod_states, ip, port) {
             PENDING_CAPTURE_FAILURES.remove(&failure_key);
             debug!(
-                owner_pod_uid,
-                %ip,
-                port,
+                owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+                ip = %crate::startup::sanitize_startup_scalar(ip),
+                port = %crate::startup::sanitize_startup_scalar(port),
                 "Cleared pending node probe-port removal because another tracked pod owns the key"
             );
             complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
@@ -5769,14 +5779,14 @@ fn retry_pending_node_probe_port_removals(
         match result {
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
-                debug!(%ip, port, "Recovered pending node probe-port map removal failure");
+                debug!(ip = %crate::startup::sanitize_startup_scalar(ip), port = %crate::startup::sanitize_startup_scalar(port), "Recovered pending node probe-port map removal failure");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
-                    %ip,
-                    port,
-                    error = %e,
+                    ip = %crate::startup::sanitize_startup_scalar(ip),
+                    port = %crate::startup::sanitize_startup_scalar(port),
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Retrying pending node probe-port map removal failed; keeping capture state degraded"
                 );
             }
@@ -5813,8 +5823,8 @@ fn retry_pending_cgroup_map_removals(
             if let Some(owner_pod_uid) = live_owner {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
                 debug!(
-                    pod_uid,
-                    owner_pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
+                    owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
                     cgroup_id,
                     operation,
                     "Cleared stale cgroup map removal because a tracked pod owns the key"
@@ -5831,17 +5841,17 @@ fn retry_pending_cgroup_map_removals(
                 Ok(()) => {
                     PENDING_CAPTURE_FAILURES.remove(&failure_key);
                     debug!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                         cgroup_id, operation, "Recovered pending cgroup map removal failure"
                     );
                     complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
                 }
                 Err(e) => {
                     warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                         cgroup_id,
                         operation,
-                        error = %e,
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Retrying pending cgroup map removal failed; keeping capture state degraded"
                     );
                 }
@@ -5867,8 +5877,8 @@ fn retry_pending_pod_ip_removals(
         if let Some(owner_pod_uid) = pod_owning_ip_addr(pod_states, ip) {
             PENDING_CAPTURE_FAILURES.remove(&failure_key);
             debug!(
-                owner_pod_uid,
-                %ip,
+                owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+                ip = %crate::startup::sanitize_startup_scalar(ip),
                 "Cleared pending pod IP removal failure because another tracked pod owns the IP"
             );
             complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
@@ -5885,8 +5895,8 @@ fn retry_pending_pod_ip_removals(
         };
         if let Err(e) = remove_result {
             warn!(
-                %ip,
-                error = %e,
+                ip = %crate::startup::sanitize_startup_scalar(ip),
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Retrying pending pod IP map removal failed; keeping capture state degraded"
             );
             continue;
@@ -5898,13 +5908,13 @@ fn retry_pending_pod_ip_removals(
         match clear_result {
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
-                debug!(%ip, "Recovered pending pod IP map removal and inbound redirect scope clear");
+                debug!(ip = %crate::startup::sanitize_startup_scalar(ip), "Recovered pending pod IP map removal and inbound redirect scope clear");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
-                    %ip,
-                    error = %e,
+                    ip = %crate::startup::sanitize_startup_scalar(ip),
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Retrying pending inbound redirect scope clear after pod IP removal failed; \
                      keeping capture state degraded"
                 );
@@ -5935,13 +5945,13 @@ fn retry_pending_pod_detaches(
         match backend.detach_pod(&pod_uid) {
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
-                debug!(pod_uid, "Recovered pending pod BPF detach failure");
+                debug!(pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid), "Recovered pending pod BPF detach failure");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
-                    pod_uid,
-                    error = %e,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Retrying pending pod BPF detach failed; keeping capture state degraded"
                 );
             }
@@ -5978,7 +5988,7 @@ fn publish_pod_registry(
 ) -> bool {
     if pod_registry_uid_is_unsafe(pod_uid) {
         warn!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             "Refusing to publish node-waypoint pod registry entry: pod UID is empty or contains \
              path separators / '..'"
         );
@@ -5986,9 +5996,9 @@ fn publish_pod_registry(
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         warn!(
-            pod_uid,
-            dir = %dir.display(),
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            dir = %crate::startup::sanitize_startup_scalar(dir.display()),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             "Failed to create node-waypoint pod registry directory"
         );
         return false;
@@ -6013,7 +6023,7 @@ fn publish_pod_registry(
     {
         Ok(temporary) => temporary,
         Err(e) => {
-            warn!(pod_uid, path = %path.display(), error = %e, "Failed to create node-waypoint pod registry temporary file");
+            warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), path = %crate::startup::sanitize_startup_scalar(path.display()), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to create node-waypoint pod registry temporary file");
             return false;
         }
     };
@@ -6036,9 +6046,9 @@ fn publish_pod_registry(
     })();
     if let Err(e) = publication {
         warn!(
-            pod_uid,
-            path = %path.display(),
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            path = %crate::startup::sanitize_startup_scalar(path.display()),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             "Failed to write node-waypoint pod registry entry"
         );
         return false;
@@ -6053,7 +6063,7 @@ fn publish_pod_registry(
 fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         warn!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             "Refusing to remove node-waypoint pod registry entry: pod UID is empty or contains \
              path separators / '..'"
         );
@@ -6064,9 +6074,9 @@ fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
         Ok(()) => {
             if let Err(e) = std::fs::File::open(dir).and_then(|directory| directory.sync_all()) {
                 warn!(
-                    pod_uid,
-                    path = %path.display(),
-                    error = %e,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                    path = %crate::startup::sanitize_startup_scalar(path.display()),
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to sync node-waypoint pod registry removal"
                 );
             }
@@ -6074,9 +6084,9 @@ fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             warn!(
-                pod_uid,
-                path = %path.display(),
-                error = %e,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                path = %crate::startup::sanitize_startup_scalar(path.display()),
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Failed to remove node-waypoint pod registry entry"
             );
         }
@@ -6106,9 +6116,9 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) -> bool {
         {
             removed = false;
             warn!(
-                pod_uid,
-                path = %path.display(),
-                error = %e,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                path = %crate::startup::sanitize_startup_scalar(path.display()),
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Failed to remove node-waypoint readiness marker"
             );
         }
@@ -6122,11 +6132,11 @@ fn write_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
     }
     let ack_dir = dir.join(".udp-not-ready");
     if let Err(error) = std::fs::create_dir_all(&ack_dir) {
-        warn!(pod_uid, %error, "Failed to create Ambient UDP not-ready acknowledgement dir");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to create Ambient UDP not-ready acknowledgement dir");
         return;
     }
     if let Err(error) = std::fs::write(ack_dir.join(pod_uid), b"") {
-        warn!(pod_uid, %error, "Failed to publish Ambient UDP not-ready acknowledgement");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to publish Ambient UDP not-ready acknowledgement");
     }
 }
 
@@ -6137,7 +6147,7 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
     if let Err(error) = std::fs::remove_file(dir.join(".udp-not-ready").join(pod_uid))
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        warn!(pod_uid, %error, "Failed to remove Ambient UDP not-ready acknowledgement");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to remove Ambient UDP not-ready acknowledgement");
     }
 }
 
@@ -6167,7 +6177,7 @@ fn remove_udp_ack_requirement_older_than(
     if let Err(error) = std::fs::remove_file(&path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        warn!(pod_uid, %error, "Failed to remove stale Ambient UDP close request");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to remove stale Ambient UDP close request");
     }
 }
 
@@ -6187,11 +6197,11 @@ fn write_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
         return false;
     };
     if let Err(error) = std::fs::create_dir_all(proof_dir) {
-        warn!(pod_uid, %error, "Failed to create Ambient UDP cleaned-gate proof dir");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to create Ambient UDP cleaned-gate proof dir");
         return false;
     }
     if let Err(error) = std::fs::write(&path, b"") {
-        warn!(pod_uid, path = %path.display(), %error, "Failed to persist Ambient UDP cleaned-gate proof");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), path = %crate::startup::sanitize_startup_scalar(path.display()), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to persist Ambient UDP cleaned-gate proof");
         return false;
     }
     true
@@ -6205,7 +6215,7 @@ fn remove_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => {
-            warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP cleaned-gate proof");
+            warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), path = %crate::startup::sanitize_startup_scalar(path.display()), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to remove Ambient UDP cleaned-gate proof");
             false
         }
     }
@@ -6247,7 +6257,7 @@ fn complete_removed_udp_close_handoff(
         write_udp_not_ready_ack(dir, pod_uid);
     } else {
         warn!(
-            pod_uid,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
             "Withholding Ambient UDP not-ready acknowledgement because durable cleaned-gate proof could not be persisted after removal cleanup retry"
         );
     }
@@ -6271,7 +6281,7 @@ fn reconcile_removed_udp_close_acknowledgements(
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
-            warn!(path = %required_dir.display(), %error, "Failed to scan Ambient UDP close requests");
+            warn!(path = %crate::startup::sanitize_startup_scalar(required_dir.display()), error = %crate::startup::sanitize_startup_scalar(&error), "Failed to scan Ambient UDP close requests");
             return;
         }
     };
@@ -6305,7 +6315,7 @@ fn reconcile_removed_udp_close_acknowledgements(
             udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
         if !gate_cleaned {
             debug!(
-                pod_uid = uid.as_str(),
+                pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                 "Withholding Ambient UDP close acknowledgement for unknown pod without verified cleaned-gate proof"
             );
             continue;
@@ -6371,9 +6381,9 @@ fn reap_orphaned_udp_handshake_markers_older_than(
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!(
-                    path = %ack_dir.display(),
+                    path = %crate::startup::sanitize_startup_scalar(ack_dir.display()),
                     marker_dir,
-                    %error,
+                    error = %crate::startup::sanitize_startup_scalar(&error),
                     "Failed to scan Ambient UDP handshake dir for orphan cleanup"
                 );
             }
@@ -6424,9 +6434,9 @@ fn reap_orphaned_udp_handshake_markers_older_than(
                 && let Err(error) = std::fs::write(&ack_path, b"")
             {
                 warn!(
-                    pod_uid = uid.as_str(),
-                    path = %ack_path.display(),
-                    %error,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
+                    path = %crate::startup::sanitize_startup_scalar(ack_path.display()),
+                    error = %crate::startup::sanitize_startup_scalar(&error),
                     "Failed to refresh Ambient UDP acknowledgement for TTL drain"
                 );
                 continue;
@@ -6436,9 +6446,9 @@ fn reap_orphaned_udp_handshake_markers_older_than(
             && error.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
-                pod_uid = uid.as_str(),
+                pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                 marker_dir,
-                %error,
+                error = %crate::startup::sanitize_startup_scalar(&error),
                 "Failed to reap orphaned Ambient UDP handshake marker"
             );
             continue;
@@ -6491,14 +6501,14 @@ impl NodeWaypointUdpReplySourceState {
         match (reason, detail) {
             (Some("authorization_gate_disable_failed"), Some(detail)) => warn!(
                 reason = "authorization_gate_disable_failed",
-                detail,
+                detail = %crate::startup::sanitize_startup_scalar(detail),
                 "NodeWaypoint UDP/DTLS reply-source authorization could not be fenced; the \
                  prior gate state is unknown, no successor map mutation or acknowledgement was \
                  attempted, and the hard residual will be retried"
             ),
             (Some(reason), Some(detail)) => warn!(
                 reason,
-                detail,
+                detail = %crate::startup::sanitize_startup_scalar(detail),
                 "NodeWaypoint UDP/DTLS reply-source authorization refused; the generation stays \
                  unacknowledged and the shared BPF gate stays closed, so stale or partial map \
                  entries are inert until the exact generation converges"
@@ -7105,7 +7115,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                     CAPTURE_FAILURE_DETAIL_UDP_READINESS,
                 );
                 warn!(
-                    pod_uid = uid.as_str(),
+                    pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                     "Failed to verify disabled Ambient UDP pod-map posture; withholding cleanup acknowledgement and retrying"
                 );
             }
@@ -7190,7 +7200,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 }
             }
             debug!(
-                pod_uid = uid.as_str(),
+                pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                 udp_ready = ready,
                 "Reconciled Ambient UDP producer readiness guard"
             );
@@ -7202,7 +7212,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 CAPTURE_FAILURE_DETAIL_UDP_READINESS,
             );
             warn!(
-                pod_uid = uid.as_str(),
+                pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                 udp_ready = ready,
                 "Failed to reconcile Ambient UDP producer readiness guard; will retry"
             );
@@ -7283,9 +7293,9 @@ fn handle_pod_added_inner(
         match decision {
             EnrollmentDecision::SkipHostNetwork => {
                 warn!(
-                    pod_uid,
-                    pod_name,
-                    namespace,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                    pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
+                    namespace = %crate::startup::sanitize_startup_scalar(namespace),
                     "Node-agent skipping enrollment for pod with spec.hostNetwork=true: \
                      the pod shares the node's network namespace, so cgroup-keyed capture \
                      and per-pod veth tc attachment cannot be scoped safely; leaving the \
@@ -7294,8 +7304,8 @@ fn handle_pod_added_inner(
             }
             _ => {
                 debug!(
-                    pod_uid,
-                    pod_name, namespace, "Pod does not meet enrollment criteria"
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                    pod_name = %crate::startup::sanitize_startup_scalar(pod_name), namespace = %crate::startup::sanitize_startup_scalar(namespace), "Pod does not meet enrollment criteria"
                 );
             }
         }
@@ -7437,8 +7447,8 @@ fn handle_pod_added_inner(
             let current_pod_ip6 = state.pod_ip6;
             let stale_node_probe_ports = node_probe_reconcile.stale_probe_ports.clone();
             debug!(
-                pod_uid,
-                pod_name,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
                 inbound_redirect_retry_pending = inbound_redirect_reconcile.update_failed,
                 "Pod already enrolled, reconciled state"
             );
@@ -7518,8 +7528,8 @@ fn handle_pod_added_inner(
             } else {
                 if let Err(error) = cleanup_snapshot_result {
                     warn!(
-                        pod_uid,
-                        error = %error,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                        error = %crate::startup::sanitize_startup_scalar(&error),
                         "Failed to persist refreshed CNI cleanup ownership; GC will retry after reconciliation"
                     );
                     metrics.record_attach_error();
@@ -7545,8 +7555,8 @@ fn handle_pod_added_inner(
         pod_enrollment_attempt_signature(event, pod_ip, &cgroup_path, &veth_iface);
     if !bypass_retry_backoff && recently_failed_pod_enrollment(&state_key, &attempt_signature) {
         debug!(
-            pod_uid,
-            pod_name, namespace, "Skipping repeated pod enrollment attempt during retry backoff"
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            pod_name = %crate::startup::sanitize_startup_scalar(pod_name), namespace = %crate::startup::sanitize_startup_scalar(namespace), "Skipping repeated pod enrollment attempt during retry backoff"
         );
         return;
     }
@@ -7563,9 +7573,9 @@ fn handle_pod_added_inner(
 
     if config.capture_config.udp_capture_enabled && pod_ip.is_none() && pod_ip6.is_none() {
         warn!(
-            pod_uid,
-            pod_name,
-            namespace,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
+            namespace = %crate::startup::sanitize_startup_scalar(namespace),
             "Ambient UDP enrollment has no pod source IP yet; deferring until the readiness guard can be keyed"
         );
         metrics.record_attach_error();
@@ -7670,7 +7680,7 @@ fn handle_pod_added_inner(
         let mut attach_ok = true;
         for prog in programs {
             if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, prog) {
-                warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
+                warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), program = prog, error = %crate::startup::sanitize_startup_scalar(&e), "Failed to attach cgroup program");
                 metrics.record_attach_error();
                 attach_ok = false;
                 break;
@@ -7685,7 +7695,7 @@ fn handle_pod_added_inner(
                 if let Some(ip) = pod_ip
                     && let Err(e) = backend.update_pod_ip(ip, &info)
                 {
-                    warn!(pod_uid, %ip, error = %e, "Failed to arm UDP enrollment guard");
+                    warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to arm UDP enrollment guard");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment_with_merged_cleanup_state(
@@ -7700,7 +7710,7 @@ fn handle_pod_added_inner(
                 if let Some(ip) = pod_ip6
                     && let Err(e) = backend.update_pod_ip6(ip, &info)
                 {
-                    warn!(pod_uid, %ip, error = %e, "Failed to arm IPv6 UDP enrollment guard");
+                    warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to arm IPv6 UDP enrollment guard");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment_with_merged_cleanup_state(
@@ -7715,9 +7725,9 @@ fn handle_pod_added_inner(
             }
             let Some(ref iface) = veth_iface else {
                 warn!(
-                    pod_uid,
-                    pod_name,
-                    namespace,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                    pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
+                    namespace = %crate::startup::sanitize_startup_scalar(namespace),
                     "Could not resolve pod veth interface, skipping attachment"
                 );
                 metrics.record_attach_error();
@@ -7735,10 +7745,10 @@ fn handle_pod_added_inner(
             for direction in [TcAttachDirection::Ingress, TcAttachDirection::Egress] {
                 if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound", direction) {
                     warn!(
-                        pod_uid,
-                        iface,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                        iface = %crate::startup::sanitize_startup_scalar(iface),
                         direction = direction.as_str(),
-                        error = %e,
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Failed to attach tc program"
                     );
                     metrics.record_attach_error();
@@ -7763,7 +7773,7 @@ fn handle_pod_added_inner(
             if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
                 if pod_ip.is_some() && !backend.has_node_source_ipv4() {
                     warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                         "NodeWaypoint enrolled an IPv4 pod but no trusted IPv4 node source IP is \
                          configured (FERRUM_NODE_AGENT_NODE_IP / FERRUM_NODE_AGENT_NODE_IPS); the \
                          inbound relay dial to this pod will be dropped until an IPv4 node source \
@@ -7773,7 +7783,7 @@ fn handle_pod_added_inner(
                 }
                 if pod_ip6.is_some() && !backend.has_node_source_ipv6() {
                     warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                         "NodeWaypoint enrolled an IPv6 pod but no trusted IPv6 node source IP is \
                          configured (FERRUM_NODE_AGENT_NODE_IP / FERRUM_NODE_AGENT_NODE_IPS); the \
                          inbound relay dial to this pod will be dropped until an IPv6 node source \
@@ -7830,9 +7840,9 @@ fn handle_pod_added_inner(
                 }
                 if let Err(e) = scope_result {
                     warn!(
-                        pod_uid,
-                        ?redirect_ports,
-                        error = %e,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                        redirect_ports = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", redirect_ports)),
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Failed to write the inbound redirect scope; the pod is not enrolled for \
                          inbound capture"
                     );
@@ -7854,12 +7864,12 @@ fn handle_pod_added_inner(
                 if let Some(ip) = pod_ip
                     && let Err(e) = backend.clear_pod_inbound_ports(ip)
                 {
-                    warn!(pod_uid, %ip, error = %e, "Failed to clear stale inbound redirect scope");
+                    warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clear stale inbound redirect scope");
                 }
                 if let Some(ip) = pod_ip6
                     && let Err(e) = backend.clear_pod_inbound_ports6(ip)
                 {
-                    warn!(pod_uid, %ip, error = %e, "Failed to clear stale IPv6 inbound redirect scope");
+                    warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clear stale IPv6 inbound redirect scope");
                 }
             }
 
@@ -7870,7 +7880,7 @@ fn handle_pod_added_inner(
             if let Some(ip) = pod_ip {
                 let info = pod_map_info(config, false).with_inbound_redirect(redirect_pod_v4);
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
-                    warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
+                    warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IP map");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment_with_merged_cleanup_state(
@@ -7886,7 +7896,7 @@ fn handle_pod_added_inner(
             if let Some(ip) = pod_ip6 {
                 let info = pod_map_info(config, false).with_inbound_redirect(redirect_pod_v6);
                 if let Err(e) = backend.update_pod_ip6(ip, &info) {
-                    warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
+                    warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment_with_merged_cleanup_state(
@@ -7900,7 +7910,7 @@ fn handle_pod_added_inner(
                 }
             }
             if let Err(e) = apply_node_probe_ports(backend, pod_uid, &state) {
-                warn!(pod_uid, error = %e, "Failed to update node probe-port maps");
+                warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update node probe-port maps");
                 metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                 remember_failed_pod_enrollment_with_merged_cleanup_state(
@@ -7915,11 +7925,11 @@ fn handle_pod_added_inner(
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
-                pod_uid,
-                pod_name,
-                namespace,
-                ?pod_ip,
-                ?pod_ip6,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
+                namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                pod_ip = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", pod_ip)),
+                pod_ip6 = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", pod_ip6)),
                 include_ports_cgroups = state.include_ports_cgroup_ids.len(),
                 workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
@@ -7936,8 +7946,8 @@ fn handle_pod_added_inner(
         }
     } else {
         warn!(
-            pod_uid,
-            pod_name, "Could not resolve cgroup path, skipping attachment"
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            pod_name = %crate::startup::sanitize_startup_scalar(pod_name), "Could not resolve cgroup path, skipping attachment"
         );
         metrics.record_attach_error();
         remember_failed_pod_enrollment_preserving_cleanup(
@@ -7957,7 +7967,7 @@ fn handle_pod_added_inner(
             CAPTURE_FAILURE_DETAIL_POD_DETACH,
         ) {
             debug!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Cleared superseded detach failure after same-UID pod re-enrollment"
             );
         }
@@ -7971,8 +7981,8 @@ fn handle_pod_added_inner(
         pod_states.insert(pod_uid.to_string(), state);
         if let Err(error) = refresh_cni_owned_cleanup_snapshot(pod_states, pod_uid) {
             warn!(
-                pod_uid,
-                error = %error,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                error = %crate::startup::sanitize_startup_scalar(&error),
                 "Failed to persist refreshed CNI cleanup ownership; GC will retry after reconciliation"
             );
             metrics.record_attach_error();
@@ -8069,8 +8079,8 @@ fn reconcile_existing_node_probe_ports(
             remember_applied_node_probe_port(&mut state.node_probe_ports, port);
         }
         warn!(
-            pod_uid,
-            error = %e.message,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            error = %crate::startup::sanitize_startup_scalar(&e.message),
             "Failed to reconcile node probe-port maps for existing pod"
         );
         metrics.record_attach_error();
@@ -8119,9 +8129,9 @@ fn reconcile_existing_pod_ip(
         && let Err(e) = backend.update_pod_inbound_ports(new_ip, &redirect_ports)
     {
         warn!(
-            pod_uid,
-            %new_ip,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            new_ip = %crate::startup::sanitize_startup_scalar(new_ip),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             "Failed to move the inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
@@ -8138,7 +8148,7 @@ fn reconcile_existing_pod_ip(
     let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid))
         .with_inbound_redirect(!redirect_ports.is_empty());
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
-        warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IP map for existing pod");
         metrics.record_attach_error();
         remember_pending_capture_failure(
             state_key,
@@ -8191,9 +8201,9 @@ fn reconcile_existing_pod_ip6(
         && let Err(e) = backend.update_pod_inbound_ports6(new_ip, &redirect_ports)
     {
         warn!(
-            pod_uid,
-            %new_ip,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            new_ip = %crate::startup::sanitize_startup_scalar(new_ip),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             "Failed to move the IPv6 inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
@@ -8210,7 +8220,7 @@ fn reconcile_existing_pod_ip6(
     let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid))
         .with_inbound_redirect(!redirect_ports.is_empty());
     if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
-        warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IPv6 map for existing pod");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IPv6 map for existing pod");
         metrics.record_attach_error();
         remember_pending_capture_failure(
             state_key,
@@ -8344,10 +8354,10 @@ fn reconcile_existing_pod_inbound_redirect(
         && let Err(e) = apply_pod_inbound_redirect_v4(backend, base.clone(), ip, &desired)
     {
         warn!(
-            pod_uid,
-            %ip,
-            ?desired,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
+            desired = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", desired)),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             "Failed to reconcile the inbound redirect scope for an existing pod; will retry"
         );
         failed = true;
@@ -8356,10 +8366,10 @@ fn reconcile_existing_pod_inbound_redirect(
         && let Err(e) = apply_pod_inbound_redirect_v6(backend, base, ip, desired_v6)
     {
         warn!(
-            pod_uid,
-            %ip,
-            desired = ?desired_v6,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
+            desired = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", desired_v6)),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             "Failed to reconcile the IPv6 inbound redirect scope for an existing pod; will retry"
         );
         failed = true;
@@ -8400,9 +8410,9 @@ fn remove_pod_ip_if_unowned(
 ) {
     if let Some(owner_pod_uid) = other_pod_owning_ip(pod_states, pod_uid, ip) {
         debug!(
-            pod_uid,
-            owner_pod_uid,
-            %ip,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
             removal_reason,
             "Skipping pod IP map removal; IP is owned by another tracked pod"
         );
@@ -8414,7 +8424,7 @@ fn remove_pod_ip_if_unowned(
     }
     let state_key = pod_state_key(pod_states, pod_uid);
     if let Err(e) = backend.remove_pod_ip(ip) {
-        warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IP from map");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), removal_reason, "Failed to remove pod IP from map");
         metrics.record_attach_error();
         remember_pending_capture_failure(
             &state_key,
@@ -8453,9 +8463,9 @@ fn remove_pod_ip6_if_unowned(
 ) {
     if let Some(owner_pod_uid) = other_pod_owning_ip6(pod_states, pod_uid, ip) {
         debug!(
-            pod_uid,
-            owner_pod_uid,
-            %ip,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
             removal_reason,
             "Skipping pod IPv6 map removal; IP is owned by another tracked pod"
         );
@@ -8467,7 +8477,7 @@ fn remove_pod_ip6_if_unowned(
     }
     let state_key = pod_state_key(pod_states, pod_uid);
     if let Err(e) = backend.remove_pod_ip6(ip) {
-        warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IPv6 from map");
+        warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), removal_reason, "Failed to remove pod IPv6 from map");
         metrics.record_attach_error();
         remember_pending_capture_failure(
             &state_key,
@@ -8581,9 +8591,9 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
     let state_key = pod_state_key(pod_states, pod_uid);
     if let Some(owner_pod_uid) = other_pod_owning_ip(pod_states, pod_uid, ip) {
         debug!(
-            pod_uid,
-            owner_pod_uid,
-            %ip,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
             removal_reason,
             "Skipping pre-enrollment pod IP map removal; IP is owned by another tracked pod"
         );
@@ -8593,9 +8603,9 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
     }
     if let Err(e) = backend.remove_pod_ip(ip) {
         warn!(
-            pod_uid,
-            %ip,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             removal_reason,
             "Failed to remove pre-enrollment pod IP from map"
         );
@@ -8634,9 +8644,9 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
     let state_key = pod_state_key(pod_states, pod_uid);
     if let Some(owner_pod_uid) = other_pod_owning_ip6(pod_states, pod_uid, ip) {
         debug!(
-            pod_uid,
-            owner_pod_uid,
-            %ip,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
             removal_reason,
             "Skipping pre-enrollment pod IPv6 map removal; IP is owned by another tracked pod"
         );
@@ -8646,9 +8656,9 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
     }
     if let Err(e) = backend.remove_pod_ip6(ip) {
         warn!(
-            pod_uid,
-            %ip,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             removal_reason,
             "Failed to remove pre-enrollment pod IPv6 from map"
         );
@@ -8703,9 +8713,9 @@ fn finish_pod_ip_removal_scope_clear(
             "Failed to clear inbound redirect scope after pod IP removal"
         };
         warn!(
-            pod_uid,
-            %ip,
-            error = %e,
+            pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+            ip = %crate::startup::sanitize_startup_scalar(ip),
+            error = %crate::startup::sanitize_startup_scalar(&e),
             removal_reason,
             "{scope_label}"
         );
@@ -8757,8 +8767,8 @@ fn reconcile_existing_pod_include_ports(
         Ok(None) => None,
         Err(e) => {
             warn!(
-                pod_uid,
-                error = %e,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Mid-life pod annotation update failed to parse; keeping previous includeOutboundPorts policy"
             );
             metrics
@@ -8795,7 +8805,7 @@ fn reconcile_existing_pod_include_ports(
                 // watcher before kubelet created the cgroup). Skip and let a
                 // future event retry; operationally normal, not a failure.
                 debug!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     "Mid-life includeOutboundPorts update deferred: no cgroup inode available"
                 );
                 return;
@@ -8816,9 +8826,9 @@ fn reconcile_existing_pod_include_ports(
                     && let Err(e) = backend.remove_pod_include_ports(*cgroup_id)
                 {
                     warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                         cgroup_id = *cgroup_id,
-                        error = %e,
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Failed to remove stale includeOutboundPorts entry for a departed cgroup inode"
                     );
                 }
@@ -8828,9 +8838,9 @@ fn reconcile_existing_pod_include_ports(
                 match backend.update_pod_include_ports(cgroup_id, &new_policy) {
                     Ok(()) => written.push(cgroup_id),
                     Err(e) => warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                         cgroup_id,
-                        error = %e,
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Failed to write mid-life includeOutboundPorts update for a cgroup inode"
                     ),
                 }
@@ -8844,10 +8854,10 @@ fn reconcile_existing_pod_include_ports(
             let prev_summary = describe_policy(state.include_ports_policy.as_ref());
             let new_summary = describe_policy(Some(&new_policy));
             info!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 cgroup_ids = written.len(),
-                prev_policy = %prev_summary,
-                new_policy = %new_summary,
+                prev_policy = %crate::startup::sanitize_startup_scalar(&prev_summary),
+                new_policy = %crate::startup::sanitize_startup_scalar(&new_summary),
                 "Re-applied mid-life pod includeOutboundPorts annotation update across cgroup tree"
             );
             state.include_ports_cgroup_ids = written;
@@ -8869,18 +8879,18 @@ fn reconcile_existing_pod_include_ports(
             for cgroup_id in &state.include_ports_cgroup_ids {
                 if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
                     warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                         cgroup_id = *cgroup_id,
-                        error = %e,
+                        error = %crate::startup::sanitize_startup_scalar(&e),
                         "Failed to drop mid-life pod includeOutboundPorts BPF entry"
                     );
                 }
             }
             let prev_summary = describe_policy(state.include_ports_policy.as_ref());
             info!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 cgroup_ids = state.include_ports_cgroup_ids.len(),
-                prev_policy = %prev_summary,
+                prev_policy = %crate::startup::sanitize_startup_scalar(&prev_summary),
                 "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entries"
             );
             state.include_ports_cgroup_ids.clear();
@@ -8956,14 +8966,14 @@ fn reconcile_existing_pod_workload_identity(
         }
         match backend.remove_workload_identity(*cgroup_id) {
             Ok(()) => debug!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 cgroup_id = *cgroup_id,
                 "Removed stale (restarted-container) cgroup inode from FERRUM_WORKLOAD_IDENTITY"
             ),
             Err(e) => warn!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 cgroup_id = *cgroup_id,
-                error = %e,
+                error = %crate::startup::sanitize_startup_scalar(&e),
                 "Failed to remove stale pod cgroup inode from FERRUM_WORKLOAD_IDENTITY"
             ),
         }
@@ -8986,7 +8996,7 @@ fn reconcile_existing_pod_workload_identity(
         match backend.update_workload_identity(cgroup_id, &identity) {
             Ok(()) => {
                 debug!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     cgroup_id,
                     "Enrolled newly-observed pod cgroup inode into FERRUM_WORKLOAD_IDENTITY"
                 );
@@ -8994,9 +9004,9 @@ fn reconcile_existing_pod_workload_identity(
             }
             Err(e) => {
                 warn!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     cgroup_id,
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to write FERRUM_WORKLOAD_IDENTITY for a newly-observed pod cgroup inode"
                 );
             }
@@ -9036,7 +9046,7 @@ fn record_removed_pod_detach_result(
             true
         }
         Err(e) => {
-            warn!(pod_uid, error = %e, "Failed to detach BPF programs");
+            warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to detach BPF programs");
             metrics.record_attach_error();
             remember_pending_capture_failure(
                 state_key,
@@ -9079,9 +9089,9 @@ fn remove_pod_cgroup_maps_recording_failures(
             }
             Err(e) => {
                 warn!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     cgroup_id = *cgroup_id,
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to remove pod includeOutboundPorts entry"
                 );
                 metrics.record_attach_error();
@@ -9119,9 +9129,9 @@ fn remove_pod_cgroup_maps_recording_failures(
             }
             Err(e) => {
                 warn!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     cgroup_id = *cgroup_id,
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to remove pod workload-identity entry"
                 );
                 metrics.record_attach_error();
@@ -9249,7 +9259,7 @@ pub fn handle_pod_removed(
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, pod_uid);
             } else {
                 warn!(
-                    pod_uid,
+                    pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                     "Withholding Ambient UDP not-ready acknowledgement because failed-enrollment BPF cleanup is incomplete"
                 );
             }
@@ -9272,7 +9282,7 @@ pub fn handle_pod_removed(
             // success merely because live `pod_states` is empty. Plant a
             // removal blocker so GC retains ownership and retries.
             warn!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Retaining Ferrum CNI ownership because rehydrated attachment lacks a cleanup snapshot"
             );
             remember_pending_capture_failure(
@@ -9329,7 +9339,7 @@ fn unenroll_pod_attachment_state(
             backend, pod_states, metrics, state_key, pod_uid, state,
         );
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
-        info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
+        info!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), pod_name = %crate::startup::sanitize_startup_scalar(&state.pod_name), "Pod unenrolled from eBPF capture");
         udp_gate_cleanup_succeeded &= !has_pending_removal_blocking_failure(state_key);
     }
     if udp_readiness_reconcile_enabled(config) {
@@ -9339,14 +9349,14 @@ fn unenroll_pod_attachment_state(
                     write_udp_not_ready_ack(dir, pod_uid);
                 } else {
                     warn!(
-                        pod_uid,
+                        pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                         "Withholding Ambient UDP not-ready acknowledgement because durable cleaned-gate proof could not be persisted"
                     );
                 }
             }
         } else {
             warn!(
-                pod_uid,
+                pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Withholding Ambient UDP not-ready acknowledgement because BPF gate cleanup is incomplete"
             );
         }
@@ -9394,10 +9404,10 @@ async fn handle_fallback(
     if let Some((listener, worker)) = cni_handles {
         let _ = shutdown_tx.send(true);
         if let Err(err) = listener.await {
-            warn!(error = %err, "Node agent CNI passthrough listener task panicked");
+            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
         }
         if let Err(err) = worker.await {
-            warn!(error = %err, "Node agent CNI passthrough worker task panicked");
+            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
         }
     }
 
@@ -9514,7 +9524,7 @@ where
     match config.fallback_mode {
         FallbackMode::Iptables => {
             warn!(
-                kernel_release = %probe.kernel_release,
+                kernel_release = %crate::startup::sanitize_startup_scalar(&probe.kernel_release),
                 meets_version = probe.meets_version_requirement,
                 cgroup_v2 = probe.cgroup_v2_available,
                 bpf_fs = probe.bpf_fs_available,
@@ -9578,7 +9588,7 @@ where
                 execute(pre_setup_udp_teardown, "pre-setup UDP teardown").await
             {
                 warn!(
-                    error = %teardown_err,
+                    error = %crate::startup::sanitize_startup_scalar(&teardown_err),
                     "Failed to tear down stale Ferrum UDP capture state before setup; continuing"
                 );
             }
@@ -9588,7 +9598,7 @@ where
                 let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
                 if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
                     warn!(
-                        error = %cleanup_err,
+                        error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
                         "Failed to clean up iptables fallback rules after setup failure"
                     );
                 }
@@ -9604,14 +9614,14 @@ where
             info!("Shutdown signal received, cleaning up iptables rules");
             let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
             if let Err(e) = execute(cleanup, "cleanup").await {
-                warn!(error = %e, "Failed to clean up iptables fallback rules");
+                warn!(error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clean up iptables fallback rules");
             }
 
             Ok(())
         }
         FallbackMode::Fail => {
             error!(
-                kernel_release = %probe.kernel_release,
+                kernel_release = %crate::startup::sanitize_startup_scalar(&probe.kernel_release),
                 meets_version = probe.meets_version_requirement,
                 cgroup_v2 = probe.cgroup_v2_available,
                 bpf_fs = probe.bpf_fs_available,
@@ -9757,7 +9767,7 @@ fn ip6tables_best_effort_wrapped_command_for_table(cmd: &str, table: &str) -> St
 /// (`validate_cidr_list`, `parse_port_list`, `parse_proxy_uid`).
 async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(), anyhow::Error> {
     for cmd in commands {
-        debug!(command = %cmd, phase, "Executing iptables command");
+        debug!(command = %crate::startup::sanitize_startup_scalar(cmd), phase, "Executing iptables command");
         match tokio::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
@@ -9766,15 +9776,15 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(
         {
             Ok(output) => {
                 if output.status.success() {
-                    debug!(command = %cmd, phase, "iptables command succeeded");
+                    debug!(command = %crate::startup::sanitize_startup_scalar(cmd), phase, "iptables command succeeded");
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let exit_code = output.status.code();
                     error!(
-                        command = %cmd,
+                        command = %crate::startup::sanitize_startup_scalar(cmd),
                         phase,
                         exit_code,
-                        stderr = %stderr.trim(),
+                        stderr = %crate::startup::sanitize_startup_scalar(stderr.trim()),
                         "iptables command failed"
                     );
                     anyhow::bail!(
@@ -9786,9 +9796,9 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(
             }
             Err(e) => {
                 error!(
-                    command = %cmd,
+                    command = %crate::startup::sanitize_startup_scalar(cmd),
                     phase,
-                    error = %e,
+                    error = %crate::startup::sanitize_startup_scalar(&e),
                     "Failed to spawn iptables command"
                 );
                 return Err(anyhow::anyhow!(
@@ -9966,16 +9976,14 @@ fn initialize_backend_after_load(
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
             error!(
-                cgroup_root = %crate::startup::sanitize_startup_cause(
-            format!("{:?}", config.cgroup_root), &[]
-        ),
-                error = %e,
+                cgroup_root = %crate::startup::sanitize_startup_scalar(&config.cgroup_root),
+                error = "SOCK_OPS attachment failed",
                 "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
-                 cookie bridge is not running, so per-pod source-identity resolution would \
-                 be disabled and scoped node-waypoint authz would fail closed (TCP-layer \
-                 telemetry is also lost). Refusing startup so /health cannot report Ready \
-                 for a partially attached node-waypoint topology. Set \
-                 ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
+                     cookie bridge is not running, so per-pod source-identity resolution would \
+                     be disabled and scoped node-waypoint authz would fail closed (TCP-layer \
+                     telemetry is also lost). Refusing startup so /health cannot report Ready \
+                     for a partially attached node-waypoint topology. Set \
+                     ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
             );
             anyhow::bail!(
                 "node-waypoint eBPF capture requires the SOCK_OPS identity bridge to attach; \
@@ -10031,7 +10039,7 @@ fn initialize_backend_after_load(
                 // withholds it if the classifier still cannot be proven gone.
                 if let Err(detach_err) = backend.detach_ingress_redirect() {
                     warn!(
-                        error = %detach_err,
+                        error = %crate::startup::sanitize_startup_scalar(&detach_err),
                         "Failed to detach the NodeWaypoint inbound tc ingress redirect while \
                          unwinding a failed attach; cleanup will retry before its routing is \
                          removed"
@@ -10048,9 +10056,9 @@ fn initialize_backend_after_load(
             }
         }
         info!(
-            ifaces = ?config.capture_contract.ingress_redirect_ifaces,
-            capture_port = config.capture_contract.ingress_capture_port,
-            hbone_port = config.capture_contract.hbone_redirect_port,
+            ifaces = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", config.capture_contract.ingress_redirect_ifaces)),
+            capture_port = %crate::startup::sanitize_startup_scalar(config.capture_contract.ingress_capture_port),
+            hbone_port = %crate::startup::sanitize_startup_scalar(config.capture_contract.hbone_redirect_port),
             mark = format!("{:#x}", config.capture_contract.node_waypoint_ingress_redirect_mark),
             table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
             "NodeWaypoint inbound tc ingress redirect installed; enrolled workloads no longer \
@@ -10067,7 +10075,7 @@ fn initialize_backend_after_load(
         // is the rollback sweep's, after `cleanup_all` retries this detach.
         if ingress_redirect_enabled && let Err(detach_err) = backend.detach_ingress_redirect() {
             warn!(
-                error = %detach_err,
+                error = %crate::startup::sanitize_startup_scalar(&detach_err),
                 "Failed to detach the NodeWaypoint inbound tc ingress redirect while unwinding \
                  a failed startup validation; cleanup will retry before its routing is removed"
             );
@@ -10143,8 +10151,8 @@ impl<'a, 'r> LoadedBackendRollback<'a, 'r> {
         self.armed = false;
         if let Err(cleanup_err) = self.backend.cleanup_all() {
             warn!(
-                error = %cleanup_err,
-                original_error = %original,
+                error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
+                original_error = %crate::startup::sanitize_startup_scalar(original),
                 "Failed to roll back BPF state after node-agent initialization failure; \
                  original error preserved"
             );
@@ -10173,7 +10181,7 @@ impl Drop for LoadedBackendRollback<'_, '_> {
         self.armed = false;
         if let Err(cleanup_err) = self.backend.cleanup_all() {
             warn!(
-                error = %cleanup_err,
+                error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
                 "Failed to roll back BPF state while unwinding out of node-agent initialization"
             );
         }
@@ -10311,7 +10319,7 @@ impl<'a> InitializedBackendOwner<'a> {
         self.cleaned_up = true;
         if let Err(cleanup_err) = self.backend.as_mut().cleanup_all() {
             warn!(
-                error = %cleanup_err,
+                error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
                 context,
                 "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
             );
@@ -10326,8 +10334,8 @@ impl<'a> InitializedBackendOwner<'a> {
         self.cleaned_up = true;
         if let Err(cleanup_err) = self.backend.as_mut().cleanup_all() {
             warn!(
-                error = %cleanup_err,
-                original_error = %original,
+                error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
+                original_error = %crate::startup::sanitize_startup_scalar(original),
                 context,
                 "Failed to cleanup BPF state after error; original error preserved"
             );
@@ -10372,7 +10380,7 @@ fn detach_enrolled_pods(
         if state.attached
             && let Err(e) = backend.detach_pod(&state.pod_uid)
         {
-            warn!(pod_uid = %state.pod_uid, error = %e, "Failed to detach BPF programs during shutdown");
+            warn!(pod_uid = %crate::startup::sanitize_startup_scalar(&state.pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to detach BPF programs during shutdown");
         }
     }
 }
@@ -10418,7 +10426,7 @@ fn shutdown_backend_state(
     // classifier still cannot be proven gone.
     if ingress_redirect_enabled && let Err(e) = backend.detach_ingress_redirect() {
         warn!(
-            error = %e,
+            error = %crate::startup::sanitize_startup_scalar(&e),
             context = "shutdown",
             "Failed to detach the inbound tc ingress redirect; inbound traffic for enrolled \
              pods may be steered at a listener that is going away until the classifier is \
@@ -10428,7 +10436,7 @@ fn shutdown_backend_state(
     }
     if let Err(cleanup_err) = backend.cleanup_all() {
         warn!(
-            error = %cleanup_err,
+            error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
             context = "shutdown",
             "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
         );
@@ -10677,6 +10685,73 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureMode, Ip6TablesMode};
     use crate::ebpf::MockEbpfBackend;
+
+    #[test]
+    fn startup_and_identity_logs_withhold_each_configured_scalar() {
+        let mut config =
+            node_waypoint_redirect_config("/'UNREGISTERED_cgroup\"\\\npath".to_string(), false);
+        config.node_name = "'UNREGISTERED_node\"\\\nname".to_string();
+        config.bpf_fs_path = "/'UNREGISTERED_bpffs\"\\\npath".to_string();
+        config.capture_contract.outbound_capture_port = 49387;
+        config.capture_contract.hbone_redirect_port = 49388;
+        let ((), logs) = crate::modes::tests::capture_logs(|| {
+            log_node_agent_startup(&config);
+            assert!(
+                build_workload_spiffe_id("default", "default", "'UNREGISTERED_trust\"\\").is_none()
+            );
+            assert!(
+                build_workload_spiffe_id(
+                    "UNREGISTERED_namespace?",
+                    "UNREGISTERED_account#",
+                    "private-trust.invalid",
+                )
+                .is_none()
+            );
+            assert!(
+                build_workload_identity("'UNREGISTERED_uid\"", "default", "default", "local")
+                    .is_none()
+            );
+        });
+        for expected in [
+            "Starting node agent",
+            "node_name=",
+            "capture_mode=",
+            "proxy_mode=",
+            "outbound_capture_port=",
+            "hbone_redirect_port=",
+            "cgroup_root=",
+            "bpf_fs_path=",
+            "fallback_mode=",
+            "invalid trust domain",
+            "invalid SPIFFE components",
+            "must not include a query string",
+            "invalid pod UID",
+        ] {
+            assert!(logs.contains(expected), "{logs}");
+        }
+        for value in ["UNREGISTERED", "private-trust.invalid", "49387", "49388"] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+    }
+
+    #[test]
+    fn rollback_logs_withhold_opaque_original_error_without_replacing_it() {
+        let mut backend = MockEbpfBackend {
+            fail_cleanup_all: true,
+            ..MockEbpfBackend::default()
+        };
+        let routing = std::cell::Cell::new(false);
+        let original = anyhow::anyhow!("bare UNREGISTERED_provider 'unbalanced\" payload");
+        let ((), logs) = crate::modes::tests::capture_logs(|| {
+            LoadedBackendRollback::new(&mut backend, &routing).roll_back(&original);
+        });
+        assert!(logs.contains("Failed to roll back BPF state"), "{logs}");
+        assert!(logs.contains("original_error="), "{logs}");
+        assert!(!logs.contains("UNREGISTERED_provider"), "{logs}");
+        assert!(!logs.contains("injected cleanup_all failure"), "{logs}");
+        assert!(original.to_string().contains("UNREGISTERED_provider"));
+        assert_eq!(backend.cleanup_all_calls, 1);
+    }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static CNI_OWNERSHIP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -12049,7 +12124,7 @@ mod tests {
         let mut config = NodeAgentConfig {
             node_name: "test-node".to_string(),
             capture_config,
-            cgroup_root: "/sys/fs/cgroup".to_string(),
+            cgroup_root: "/'UNREGISTERED_sock_ops\"\\path".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
@@ -12067,16 +12142,24 @@ mod tests {
         // Seed node source IPs so initialization reaches the sock-ops attach
         // branch under test rather than failing closed on the (separately
         // tested) empty trusted-node-source guard.
-        let err = with_env_vars(
-            &[
-                ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
-                ("FERRUM_NODE_AGENT_NODE_IPS", "192.0.2.11,fd00::10"),
-            ],
-            || {
-                initialize_backend(&mut backend, &config, &metrics)
-                    .expect_err("missing identity bridge must fail startup")
-            },
-        );
+        let (err, logs) = crate::modes::tests::capture_logs(|| {
+            with_env_vars(
+                &[
+                    ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
+                    ("FERRUM_NODE_AGENT_NODE_IPS", "192.0.2.11,fd00::10"),
+                ],
+                || {
+                    initialize_backend(&mut backend, &config, &metrics)
+                        .expect_err("missing identity bridge must fail startup")
+                },
+            )
+        });
+        assert!(logs.contains("Failed to attach SOCK_OPS"), "{logs}");
+        assert!(logs.contains("cgroup_root="), "{logs}");
+        assert!(logs.contains("SOCK_OPS attachment failed"), "{logs}");
+        assert!(!logs.contains("UNREGISTERED_sock_ops"), "{logs}");
+        assert!(!logs.contains("sock_ops attach failed"), "{logs}");
+        assert!(err.to_string().contains("sock_ops attach failed"));
 
         assert!(err.to_string().contains("SOCK_OPS identity bridge"));
         assert!(backend.cleaned_up);

@@ -79,9 +79,7 @@ impl<S> Drop for TrackedMeshStream<S> {
         info!(
             "{}",
             crate::startup::sanitize_startup_cause(
-                format!(
-                    "Mesh node {:?} disconnected (stream dropped)", self.node_id
-                ),
+                format!("Mesh node {:?} disconnected (stream dropped)", self.node_id),
                 &[]
             )
         );
@@ -488,9 +486,7 @@ impl MeshGrpcServer {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
-                    format!(
-                        "Failed to serialize mesh slice: {}", e
-                    ),
+                    format!("Failed to serialize mesh slice: {}", e),
                     &[]
                 )
             );

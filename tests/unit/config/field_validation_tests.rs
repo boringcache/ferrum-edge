@@ -1668,7 +1668,7 @@ fn test_plugin_config_proxy_scope_requires_proxy_id() {
     let errs = pc.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("scope 'proxy' requires proxy_id"))
+            .any(|e| e.contains("scope `proxy` requires proxy_id"))
     );
 }
 

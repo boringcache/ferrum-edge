@@ -3696,7 +3696,10 @@ async fn functional_cli_dp_initial_snapshot_rejection_withholds_document_values(
     .unwrap_or_else(|_| panic!("DP did not refuse the delivered snapshot: {}", combined()));
     gateway.shutdown();
     let output = combined();
-    assert!(output.contains("references non-existent upstream"), "{output}");
+    assert!(
+        output.contains("references non-existent upstream"),
+        "{output}"
+    );
     assert!(
         !output.contains("Full configuration snapshot accepted"),
         "{output}"
@@ -4649,10 +4652,7 @@ async fn functional_cli_plaintext_basic_auth_withholds_consumer_ids() {
                 diagnostic.contains("consumer IDs: <redacted scalar>"),
                 "{diagnostic}"
             );
-            assert!(
-                !diagnostic.contains("UNREGISTERED_CONSUMER_5589"),
-                "{diagnostic}"
-            );
+            assert!(!diagnostic.contains(token), "{diagnostic}");
             assert!(!diagnostic.contains("synthetic-password"), "{diagnostic}");
         }
     }

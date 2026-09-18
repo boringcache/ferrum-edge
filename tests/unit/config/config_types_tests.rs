@@ -6190,7 +6190,7 @@ fn transaction_log_schema_proxy_group_scope_rejected_by_both_surfaces() {
     assert!(
         field_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_fields errors: {field_errors:?}"
     );
 
@@ -6202,7 +6202,7 @@ fn transaction_log_schema_proxy_group_scope_rejected_by_both_surfaces() {
     assert!(
         ref_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_plugin_references errors: {ref_errors:?}"
     );
 }
@@ -6219,7 +6219,7 @@ fn transaction_log_schema_proxy_scope_rejected_by_both_surfaces() {
     assert!(
         field_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_fields errors: {field_errors:?}"
     );
 
@@ -6232,7 +6232,7 @@ fn transaction_log_schema_proxy_scope_rejected_by_both_surfaces() {
     assert!(
         ref_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_plugin_references errors: {ref_errors:?}"
     );
 }
@@ -6248,7 +6248,7 @@ fn prometheus_metrics_requires_global_scope_on_both_validation_surfaces() {
             .validate_fields()
             .expect_err("admin validation must reject scoped prometheus_metrics");
         assert!(field_errors.iter().any(|error| {
-            error.contains("prometheus_metrics") && error.contains("scope 'global'")
+            error.contains("prometheus_metrics") && error.contains("scope `global`")
         }));
 
         let mut config = empty_config();
@@ -6258,9 +6258,34 @@ fn prometheus_metrics_requires_global_scope_on_both_validation_surfaces() {
             .validate_plugin_references()
             .expect_err("runtime validation must reject scoped prometheus_metrics");
         assert!(reference_errors.iter().any(|error| {
-            error.contains("prometheus_metrics") && error.contains("scope 'global'")
+            error.contains("prometheus_metrics") && error.contains("scope `global`")
         }));
     }
+}
+
+#[test]
+fn rendered_configuration_guidance_retains_scope_and_wildcard_examples() {
+    let sensitive_id = "'SENSITIVE_PLUGIN_ID\"";
+    let pc = prometheus_metrics_pc(sensitive_id, PluginScope::ProxyGroup, None);
+    let mut config = empty_config();
+    config.plugin_configs = vec![pc.clone()];
+    for errors in [
+        pc.validate_fields().expect_err("invalid plugin scope"),
+        config
+            .validate_plugin_references()
+            .expect_err("invalid runtime plugin scope"),
+    ] {
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+        assert!(rendered.contains("scope `global`"), "{rendered}");
+        assert!(!rendered.contains("SENSITIVE_PLUGIN_ID"), "{rendered}");
+    }
+
+    let error = ferrum_edge::config::types::validate_host_entry("bad*private_host_token")
+        .expect_err("invalid wildcard host");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+    assert!(rendered.contains("prefix `*.domain`"), "{rendered}");
+    assert!(!rendered.contains("private_host_token"), "{rendered}");
 }
 
 #[test]

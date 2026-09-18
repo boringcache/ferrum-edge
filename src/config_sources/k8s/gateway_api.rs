@@ -1939,7 +1939,7 @@ pub(crate) fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8
             warnings.push(format!(
                 "Gateway API {} {:?}/{:?} listener {:?} field \
                  spec.listeners[].tls.certificateRefs has at least one reference that is not an \
-                 authorized, valid kubernetes.io/tls Secret; leaving this listener's frontend \
+                 authorized, valid kubernetes.io/tls Secret; leaving this listener frontend \
                  TLS unmaterialized",
                 object.kind, object.metadata.namespace, object.metadata.name, listener_name
             ));
@@ -1949,7 +1949,7 @@ pub(crate) fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8
             warnings.push(format!(
                 "Gateway API {} {:?}/{:?} listener {:?} field \
                  spec.listeners[].tls.certificateRefs is empty on a Terminate-mode listener; \
-                 leaving this listener's frontend TLS unmaterialized",
+                 leaving this listener frontend TLS unmaterialized",
                 object.kind, object.metadata.namespace, object.metadata.name, listener_name
             ));
             continue;
@@ -2043,7 +2043,7 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
             acc.warnings.push(format!(
                 "Gateway API {} {:?}/{:?} listener {:?} field \
                  spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS \
-                 certificate limit for its serving namespace; leaving this listener's \
+                 certificate limit for its serving namespace; leaving this listener \
                  certificate set and route traffic unmaterialized",
                 key.parent_kind.as_str(),
                 key.namespace,
@@ -3370,7 +3370,11 @@ fn upsert_http_route_resources(
                 "Gateway API route proxies {:?}/{:?} and {:?}/{:?} claim the same host+path on \
                  listener port {:?} from different Gateway API listeners; the claim is \
                  physically ambiguous, so both are refused (Conflicted)",
-                conflict.0, conflict.1, proxy.namespace, proxy.id, proxy.listen_port
+                conflict.0,
+                conflict.1,
+                proxy.namespace,
+                proxy.id,
+                proxy.listen_port.map(|port| port.to_string())
             ));
             // Everything the withdrawn side was serving — its own claims plus
             // any claim merged into it — is refused too, captured before the
@@ -4752,9 +4756,7 @@ fn mesh_services_from_gateway(
                 acc.warnings.push(format!(
                     "Gateway API Gateway {:?}/{:?} listener {:?} uses unsupported protocol TLS \
                      with a non-Passthrough mode and will not be exposed",
-                    object.metadata.namespace,
-                    object.metadata.name,
-                    listener_name
+                    object.metadata.namespace, object.metadata.name, listener_name
                 ));
                 return Ok(());
             }
@@ -4766,9 +4768,7 @@ fn mesh_services_from_gateway(
                 acc.warnings.push(format!(
                     "Gateway API Gateway {:?}/{:?} listener {:?} is not materializable and will \
                      not be exposed",
-                    object.metadata.namespace,
-                    object.metadata.name,
-                    listener_name
+                    object.metadata.namespace, object.metadata.name, listener_name
                 ));
                 return Ok(());
             }
@@ -4776,9 +4776,7 @@ fn mesh_services_from_gateway(
                 acc.warnings.push(format!(
                     "Gateway API Gateway {:?}/{:?} listener {:?} has no admitted frontend TLS \
                      source and will not be exposed",
-                    object.metadata.namespace,
-                    object.metadata.name,
-                    listener_name
+                    object.metadata.namespace, object.metadata.name, listener_name
                 ));
                 return Ok(());
             }
@@ -8407,7 +8405,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("listener https is not materializable and will not be exposed")
+                warning.contains("listener \"https\" is not materializable and will not be exposed")
             }),
             "expected exposure-skip diagnostic, got: {:?}",
             result.warnings
@@ -8446,7 +8444,7 @@ mod tests {
         assert!(
             result.warnings.iter().any(|warning| {
                 warning.contains(
-                    "certificateRefs is empty on a Terminate-mode listener; leaving this listener's frontend TLS unmaterialized",
+                    "certificateRefs is empty on a Terminate-mode listener; leaving this listener frontend TLS unmaterialized",
                 )
             }),
             "expected empty-certificateRefs diagnostic, got: {:?}",
@@ -8454,7 +8452,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("listener https is not materializable and will not be exposed")
+                warning.contains("listener \"https\" is not materializable and will not be exposed")
             }),
             "expected exposure-skip diagnostic, got: {:?}",
             result.warnings
@@ -8493,7 +8491,7 @@ mod tests {
         assert!(
             result.warnings.iter().any(|warning| {
                 warning.contains(
-                    "certificateRefs is empty on a Terminate-mode listener; leaving this listener's frontend TLS unmaterialized",
+                    "certificateRefs is empty on a Terminate-mode listener; leaving this listener frontend TLS unmaterialized",
                 )
             }),
             "expected empty-certificateRefs diagnostic, got: {:?}",
@@ -8501,7 +8499,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("listener https is not materializable and will not be exposed")
+                warning.contains("listener \"https\" is not materializable and will not be exposed")
             }),
             "expected exposure-skip diagnostic, got: {:?}",
             result.warnings
@@ -9156,9 +9154,13 @@ mod tests {
             result.config.proxies[0].id.contains("api-a"),
             "oldest route must win the conflicting host/path"
         );
-        assert!(result.warnings.iter().any(
-            |warning| warning.contains("api-b") && warning.contains("winner is default/api-a")
-        ));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("api-b")
+                    && warning.contains("winner is \"default\"/\"api-a\""))
+        );
     }
 
     #[test]
@@ -9214,7 +9216,8 @@ mod tests {
             "case-equivalent hostnames must share one conflict bucket"
         );
         assert!(result.warnings.iter().any(|warning| {
-            warning.contains("host=api.example.com") && warning.contains("winner is default/api-a")
+            warning.contains("host=\"api.example.com\"")
+                && warning.contains("winner is \"default\"/\"api-a\"")
         }));
     }
 
@@ -9279,8 +9282,9 @@ mod tests {
         assert!(result.config.validate_unique_listen_paths().is_ok());
         assert!(result.warnings.iter().any(|warning| {
             warning.contains("api-new")
-                && warning.contains("parent=gateway.networking.k8s.io/Gateway/default/edge-a/*/*")
-                && warning.contains("winner is default/api-old")
+                && warning
+                    .contains("parent=\"gateway.networking.k8s.io/Gateway/default/edge-a/*/*\"")
+                && warning.contains("winner is \"default\"/\"api-old\"")
         }));
     }
 
@@ -9524,7 +9528,7 @@ mod tests {
         assert!(
             result.warnings.iter().any(|warning| {
                 warning.contains(
-                    "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+                    "Port \"8443\" is claimed by both plaintext and an effective TLS-serving \
                      frontend shape",
                 )
             }),
@@ -9535,7 +9539,7 @@ mod tests {
             assert_eq!(conflict.reason, "ProtocolConflict");
             assert_eq!(
                 conflict.message,
-                "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+                "Port \"8443\" is claimed by both plaintext and an effective TLS-serving \
                  frontend shape, so every conflicting claim on this port is refused \
                  (Conflicted)."
             );
@@ -9930,8 +9934,8 @@ mod tests {
         );
         assert!(result.warnings.iter().any(|warning| {
             warning.contains("api-b")
-                && warning.contains("host=api.example.com")
-                && warning.contains("winner is default/api-a")
+                && warning.contains("host=\"api.example.com\"")
+                && warning.contains("winner is \"default\"/\"api-a\"")
         }));
     }
 
@@ -12912,7 +12916,7 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("GRPCRoute default/grpc")
+                warning.contains("GRPCRoute \"default\"/\"grpc\"")
                     && warning.contains("Gateway API forbids merging")
             }),
             "the whole-route rejection must be reported: {:?}",
@@ -12948,7 +12952,7 @@ mod tests {
             "the rejected HTTPRoute must contribute no proxy"
         );
         assert!(result.warnings.iter().any(|warning| {
-            warning.contains("HTTPRoute default/web")
+            warning.contains("HTTPRoute \"default\"/\"web\"")
                 && warning.contains("Gateway API forbids merging")
         }));
     }
@@ -13211,7 +13215,7 @@ mod tests {
                 );
                 assert!(
                     result.warnings.iter().any(|warning| {
-                        warning.contains("GRPCRoute default/grpc")
+                        warning.contains("GRPCRoute \"default\"/\"grpc\"")
                             && warning.contains("Gateway API forbids merging")
                     }),
                     "expected a whole-route rejection for {grpc_parent_ref}: {:?}",
@@ -13434,7 +13438,7 @@ mod tests {
             );
             assert!(
                 result.warnings.iter().any(|warning| {
-                    warning.contains("GRPCRoute default/grpc")
+                    warning.contains("GRPCRoute \"default\"/\"grpc\"")
                         && warning.contains("Gateway API forbids merging")
                 }),
                 "the shared-listener loss must still be reported: {:?}",

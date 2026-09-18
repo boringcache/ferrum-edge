@@ -195,7 +195,7 @@ fn test_ws_logging_rejects_unknown_endpont_url_key() {
     .expect("typo endpont_url must fail construction");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("endpont_url"), "{err}");
-    assert!(err.contains("did you mean 'endpoint_url'?"), "{err}");
+    assert!(err.contains("did you mean `endpoint_url`?"), "{err}");
 }
 
 #[tokio::test]
@@ -293,7 +293,7 @@ async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
     )
     .err()
     .expect("an empty custom CA store must reject plugin construction");
-    assert!(error.contains("no valid PEM certificates"), "got: {error}");
+    assert!(error.contains("invalid CA bundle"), "got: {error}");
 }
 
 #[tokio::test]
@@ -354,7 +354,7 @@ async fn test_ws_logging_rejects_malformed_endpoint_url() {
         default_client(),
     );
     match result {
-        Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
+        Err(e) => assert!(e.contains("invalid `endpoint_url`")),
         Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
     }
 }
