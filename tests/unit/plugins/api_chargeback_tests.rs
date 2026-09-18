@@ -244,6 +244,136 @@ fn test_invalid_config_shapes_rejected() {
 }
 
 #[test]
+fn test_pricing_constructor_diagnostics_render_without_document_content() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::api_chargeback_sink::ApiChargebackSink;
+    use ferrum_edge::startup::render_startup_error;
+
+    let hostile = "'UNREGISTERED\"\\\n`billing-key`";
+    let cases = [
+        (
+            json!({"bandwidth_pricing": {(hostile): true}}),
+            "`bandwidth_pricing`",
+            "unknown key",
+        ),
+        (
+            json!({"stream_connection_pricing": {(hostile): 918273641}}),
+            "`stream_connection_pricing`",
+            "unknown key",
+        ),
+        (
+            json!({"pricing_tiers": [hostile]}),
+            "`pricing_tiers[0]`",
+            "must be an object",
+        ),
+        (
+            json!({"pricing_tiers": [{"status_codes": [hostile], "price_per_call": 0.01}]}),
+            "`pricing_tiers[0].status_codes`",
+            "non-integer value",
+        ),
+        (
+            json!({"pricing_tiers": [{"status_codes": [918273641], "price_per_call": 0.01}]}),
+            "`pricing_tiers[0].status_codes`",
+            "invalid HTTP status code",
+        ),
+        (
+            json!({"pricing_tiers": [{"status_codes": [299, 299], "price_per_call": 0.01}]}),
+            "`pricing_tiers[0].status_codes`",
+            "appears in multiple pricing tiers",
+        ),
+        (
+            json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": true}]}),
+            "`pricing_tiers[0].price_per_call`",
+            "must be a number",
+        ),
+        (
+            json!({"bandwidth_pricing": {"price_per_byte_sent": -918273641}}),
+            "`bandwidth_pricing.price_per_byte_sent`",
+            "finite non-negative number",
+        ),
+        (
+            json!({"bandwidth_pricing": {"price_per_byte_received": hostile}}),
+            "`bandwidth_pricing.price_per_byte_received`",
+            "must be a number",
+        ),
+        (
+            json!({"stream_connection_pricing": {"price_per_connection": false}}),
+            "`stream_connection_pricing.price_per_connection`",
+            "must be a number",
+        ),
+        (
+            json!({"pricing_tiers": [{"unknown_billing_key": true}]}),
+            "`pricing_tiers[0]`",
+            "unknown configuration key",
+        ),
+    ];
+
+    for (mut config, field, reason) in cases {
+        let report_error = ApiChargeback::new(&config, "ferrum")
+            .err()
+            .expect("report constructor must reject invalid pricing");
+        config["clickhouse"] = json!({"url": "http://localhost:8123"});
+        config["spool"] = json!({"enabled": false});
+        let sink_error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .err()
+            .expect("sink constructor must reject the same invalid pricing");
+        for error in [report_error, sink_error] {
+            let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+            assert!(rendered.contains(field), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            for withheld in [
+                "UNREGISTERED",
+                "billing-key",
+                "unknown_billing_key",
+                "918273641",
+                "299",
+                "true",
+                "false",
+            ] {
+                assert!(!rendered.contains(withheld), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_report_constructor_diagnostics_keep_schema_fields() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for (config, field, reason) in [
+        (json!(918273641), "`config`", "must be an object"),
+        (
+            json!({"currency": 918273641}),
+            "`currency`",
+            "must be a string",
+        ),
+        (
+            json!({"max_entries": "'UNREGISTERED\"\\"}),
+            "`max_entries`",
+            "must be an unsigned integer",
+        ),
+        (
+            json!({"max_retained_bytes": false}),
+            "`max_retained_bytes`",
+            "must be an unsigned integer",
+        ),
+        (
+            json!({"unknown_billing_key": true}),
+            "`config`",
+            "unknown configuration key",
+        ),
+    ] {
+        let error = ApiChargeback::new(&config, "ferrum").err().unwrap();
+        let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED", "unknown_billing_key", "918273641", "false", "true"] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+}
+
+#[test]
 fn test_missing_all_pricing_blocks_rejected() {
     // No pricing_tiers, no bandwidth_pricing, no stream_connection_pricing.
     let config = json!({ "currency": "USD" });
@@ -3521,6 +3651,67 @@ fn test_validate_composition_resolves_associations_by_namespace_and_id() {
     ferrum_edge::plugins::api_chargeback::validate_composition(&config).unwrap_or_else(|err| {
         panic!("same-id plugin in another namespace must not attach: {err:?}")
     });
+}
+
+#[test]
+fn test_composition_diagnostics_withhold_identities_and_keep_tunable_context() {
+    use ferrum_edge::config::types::PluginScope;
+    use ferrum_edge::plugins::api_chargeback::validate_composition;
+    use ferrum_edge::startup::render_startup_error;
+
+    let mut first = chargeback_chain_plugin(
+        "'UNREGISTERED_A\"\\\n`id`",
+        "unused-proxy",
+        "USD",
+        json!({"max_entries": 918273641}),
+    );
+    first.scope = PluginScope::Global;
+    first.proxy_id = None;
+    let mut second = first.clone();
+    second.id = "'UNREGISTERED_B\"\\\n`id`".to_string();
+    second.config["max_entries"] = json!(918273642);
+    second.config["schema"] = json!({});
+    let mut config = GatewayConfig {
+        plugin_configs: vec![first, second],
+        ..GatewayConfig::default()
+    };
+
+    let errors = validate_composition(&config).expect_err("conflicting globals must be rejected");
+    let rendered = errors
+        .into_iter()
+        .map(|error| render_startup_error(anyhow::anyhow!(error), &[]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for required in [
+        "at most one enabled global instance",
+        "`/charges`",
+        "shared render/cleanup tunables must match",
+        "`max_entries`",
+        "render projection must match",
+        "`schema` / `schema_ref`",
+    ] {
+        assert!(rendered.contains(required), "{rendered}");
+    }
+    for withheld in ["UNREGISTERED", "918273641", "918273642", "`id`"] {
+        assert!(!rendered.contains(withheld), "{rendered}");
+    }
+
+    // Both the reference and a later sibling can carry a malformed tunable.
+    for invalid_index in 0..2 {
+        config.plugin_configs[0].config["max_entries"] = json!(918273641);
+        config.plugin_configs[1].config["max_entries"] = json!(918273641);
+        config.plugin_configs[invalid_index].config["max_entries"] = json!(false);
+        let errors = validate_composition(&config).expect_err("invalid tunable must be rejected");
+        let error = errors
+            .into_iter()
+            .find(|error| error.contains("shared tunables in"))
+            .expect("invalid tunable diagnostic");
+        let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains("`max_entries` must be an unsigned integer"), "{rendered}");
+        for withheld in ["UNREGISTERED", "false", "`id`"] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
 }
 
 // --- Billing identity integrity (GHSA-m28c-f3v5-26qg) ---

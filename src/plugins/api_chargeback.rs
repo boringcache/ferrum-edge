@@ -619,12 +619,12 @@ fn required_positive_usize(config: &Value, key: &str, default: usize) -> Result<
     let value = optional_u64(config, key, default as u64)?;
     if value == 0 {
         return Err(format!(
-            "api_chargeback: '{key}' must be greater than 0; the shared /charges registry has no \
+            "api_chargeback: `{key}` must be greater than 0; the shared `/charges` registry has no \
              unlimited mode"
         ));
     }
     usize::try_from(value)
-        .map_err(|_| format!("api_chargeback: '{key}' (\"{value}\") exceeds this platform's usize"))
+        .map_err(|_| format!("api_chargeback: `{key}` (\"{value}\") exceeds platform `usize`"))
 }
 
 /// Resolve enabled chargeback plugin configs that the plugin cache would
@@ -742,7 +742,7 @@ pub fn validate_composition(
     if global_ids.len() > 1 {
         errors.push(format!(
             "api_chargeback permits at most one enabled global instance \
-             (shared /charges registry is exactly-once); found: {}",
+             (shared `/charges` registry is exactly-once); found: {:?}",
             global_ids.join(", ")
         ));
     }
@@ -752,7 +752,7 @@ pub fn validate_composition(
             let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
             errors.push(format!(
                 "api_chargeback permits at most one effective instance per proxy \
-                 (shared /charges registry is exactly-once); proxy {:?} has: {:?}",
+                 (shared `/charges` registry is exactly-once); proxy {:?} has: {:?}",
                 proxy.id,
                 ids.join(", ")
             ));
@@ -783,7 +783,7 @@ pub fn validate_composition(
             Ok(tunables) => tunables,
             Err(error) => {
                 errors.push(format!(
-                    "api_chargeback shared tunables in '{}': {error}",
+                    "api_chargeback shared tunables in {:?}: {error}",
                     reference.id
                 ));
                 return Err(errors);
@@ -795,14 +795,14 @@ pub fn validate_composition(
                 Ok(tunables) if tunables == reference_tunables => {}
                 Ok(_) => errors.push(format!(
                     "api_chargeback shared render/cleanup tunables must match across all enabled \
-                     instances; '{}' disagrees with '{}'. \
-                     Align render_cache_ttl_seconds, stale_entry_ttl_seconds, \
-                     cache_invalidation_min_age_ms, cleanup_interval_seconds, \
-                     max_entries, and max_retained_bytes",
+                     instances; {:?} disagrees with {:?}. \
+                     Align `render_cache_ttl_seconds`, `stale_entry_ttl_seconds`, \
+                     `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`, \
+                     `max_entries`, and `max_retained_bytes`",
                     reference.id, sibling.id
                 )),
                 Err(error) => errors.push(format!(
-                    "api_chargeback shared tunables in '{}': {error}",
+                    "api_chargeback shared tunables in {:?}: {error}",
                     sibling.id
                 )),
             }
@@ -811,9 +811,9 @@ pub fn validate_composition(
             // must resolve to the same 'schema' / 'schema_ref'.
             if render_projection_config(&sibling.config) != reference_projection {
                 errors.push(format!(
-                    "api_chargeback '/charges' render projection must match across all enabled \
-                     instances (one process-global render cache serves them all); '{}' disagrees \
-                     with '{}'. Align 'schema' / 'schema_ref'",
+                    "api_chargeback `/charges` render projection must match across all enabled \
+                     instances (one process-global render cache serves them all); {:?} disagrees \
+                     with {:?}. Align `schema` / `schema_ref`",
                     reference.id, sibling.id
                 ));
             }
@@ -2712,7 +2712,7 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
     match config.get(key) {
         Some(value) => value
             .as_u64()
-            .ok_or_else(|| format!("api_chargeback: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("api_chargeback: `{key}` must be an unsigned integer")),
         None => Ok(default),
     }
 }
@@ -2740,7 +2740,7 @@ impl ApiChargeback {
     ) -> Result<Self, String> {
         let object = config
             .as_object()
-            .ok_or_else(|| "api_chargeback: config must be an object".to_string())?;
+            .ok_or_else(|| "api_chargeback: `config` must be an object".to_string())?;
         // Compile / resolve once here — never on the `/charges` render path.
         // `schema_ref` keeps the global-first lifecycle and fails closed for a
         // missing or incompatible named definition.
@@ -2750,7 +2750,7 @@ impl ApiChargeback {
             object,
             "config",
             API_CHARGEBACK_CONFIG_KEYS,
-            "api_chargeback: ",
+            "api_chargeback: `config`: ",
         )?;
 
         let registry = global_registry_with_shard_amount(shard_amount);
@@ -2759,10 +2759,10 @@ impl ApiChargeback {
             Some(value) => {
                 let currency = value
                     .as_str()
-                    .ok_or_else(|| "api_chargeback: 'currency' must be a string".to_string())?
+                    .ok_or_else(|| "api_chargeback: `currency` must be a string".to_string())?
                     .trim();
                 if currency.is_empty() {
-                    return Err("api_chargeback: 'currency' must not be empty".to_string());
+                    return Err("api_chargeback: `currency` must not be empty".to_string());
                 }
                 currency
             }
@@ -2781,8 +2781,8 @@ impl ApiChargeback {
 
         if !pricing.has_any_pricing() {
             return Err(
-                "api_chargeback: at least one of 'pricing_tiers', 'bandwidth_pricing', or \
-                 'stream_connection_pricing' must be configured — the plugin would otherwise \
+                "api_chargeback: at least one of `pricing_tiers`, `bandwidth_pricing`, or \
+                 `stream_connection_pricing` must be configured — the plugin would otherwise \
                  record nothing"
                     .to_string(),
             );
