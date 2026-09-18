@@ -367,7 +367,13 @@ fn test_report_constructor_diagnostics_keep_schema_fields() {
         let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains(reason), "{rendered}");
-        for withheld in ["UNREGISTERED", "unknown_billing_key", "918273641", "false", "true"] {
+        for withheld in [
+            "UNREGISTERED",
+            "unknown_billing_key",
+            "918273641",
+            "false",
+            "true",
+        ] {
             assert!(!rendered.contains(withheld), "{rendered}");
         }
     }
@@ -3707,7 +3713,10 @@ fn test_composition_diagnostics_withhold_identities_and_keep_tunable_context() {
             .find(|error| error.contains("shared tunables in"))
             .expect("invalid tunable diagnostic");
         let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
-        assert!(rendered.contains("`max_entries` must be an unsigned integer"), "{rendered}");
+        assert!(
+            rendered.contains("`max_entries` must be an unsigned integer"),
+            "{rendered}"
+        );
         for withheld in ["UNREGISTERED", "false", "`id`"] {
             assert!(!rendered.contains(withheld), "{rendered}");
         }

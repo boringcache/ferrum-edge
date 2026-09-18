@@ -136,7 +136,11 @@ fn constructor_decode_diagnostics_withhold_values_and_document_paths() {
         ("spool", "`spool`"),
         ("snapshot", "`snapshot`"),
     ] {
-        cases.push((json!({(container): {(hostile): true}}), field, "unknown field"));
+        cases.push((
+            json!({(container): {(hostile): true}}),
+            field,
+            "unknown field",
+        ));
     }
     cases.push((
         json!({"clickhouse": {"tls": {(hostile): true}}}),
@@ -164,11 +168,7 @@ fn constructor_validation_diagnostics_keep_fields_and_fixed_suggestions() {
     let hostile = "'UNREGISTERED\"\\`map.key`";
     let mut cases = Vec::new();
     for (clickhouse, field, reason) in [
-        (
-            json!({"url": hostile}),
-            "`clickhouse.url`",
-            "malformed URL",
-        ),
+        (json!({"url": hostile}), "`clickhouse.url`", "malformed URL"),
         (
             json!({"url": "unregistered://host/UNREGISTERED"}),
             "`clickhouse.url`",
@@ -222,7 +222,14 @@ fn constructor_validation_diagnostics_keep_fields_and_fixed_suggestions() {
         let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains(reason), "{rendered}");
-        for withheld in ["UNREGISTERED", "unregistered", "map.key", "false", "59001", "649011"] {
+        for withheld in [
+            "UNREGISTERED",
+            "unregistered",
+            "map.key",
+            "false",
+            "59001",
+            "649011",
+        ] {
             assert!(!rendered.contains(withheld), "{rendered}");
         }
     }

@@ -5358,7 +5358,9 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     }
     if config.spool.enabled {
         if config.spool.max_bytes == 0 {
-            return Err(format!("{PLUGIN_NAME}: `spool.max_bytes` must be at least 1"));
+            return Err(format!(
+                "{PLUGIN_NAME}: `spool.max_bytes` must be at least 1"
+            ));
         }
         if config.spool.replay_interval_secs == 0 {
             return Err(format!(
@@ -5462,7 +5464,9 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         ));
     }
     if config.pricing_version.trim().is_empty() {
-        return Err(format!("{PLUGIN_NAME}: `pricing_version` must not be empty"));
+        return Err(format!(
+            "{PLUGIN_NAME}: `pricing_version` must not be empty"
+        ));
     }
     if config.currency.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: `currency` must not be empty"));
@@ -5737,9 +5741,8 @@ fn build_clickhouse_http_client(
         builder = builder.tls_danger_accept_invalid_hostnames(true);
     }
     if let Some(ca_file) = cfg.tls.ca_file.as_ref() {
-        let pem = fs::read(ca_file).map_err(|_| {
-            format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`")
-        })?;
+        let pem = fs::read(ca_file)
+            .map_err(|_| format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`"))?;
         let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
             format!("{PLUGIN_NAME}: failed to parse `clickhouse.tls.ca_file`: invalid PEM bundle")
         })?;
