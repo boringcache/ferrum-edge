@@ -208,7 +208,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObservedIo<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let result = in_scope(this.layer.scope(), || Pin::new(&mut this.inner).poll_flush(cx));
+        let result = in_scope(this.layer.scope(), || {
+            Pin::new(&mut this.inner).poll_flush(cx)
+        });
         this.control_result(7, &result);
         result
     }

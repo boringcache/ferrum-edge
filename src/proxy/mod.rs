@@ -14234,10 +14234,8 @@ async fn handle_connection(
     set_tcp_keepalive(&stream);
 
     #[cfg(feature = "bench-h1-profile")]
-    let stream = crate::h1_profile::io::ObservedIo::new(
-        stream,
-        crate::h1_profile::io::Layer::ClearMixed,
-    );
+    let stream =
+        crate::h1_profile::io::ObservedIo::new(stream, crate::h1_profile::io::Layer::ClearMixed);
 
     // Observe raw H1 framing before Hyper normalizes TE-first CL+TE requests.
     // The adapter disables itself for the H2 prior-knowledge preface.
@@ -22265,10 +22263,8 @@ async fn handle_tls_connection(
     }
 
     #[cfg(feature = "bench-h1-profile")]
-    let stream = crate::h1_profile::io::ObservedIo::new(
-        stream,
-        crate::h1_profile::io::Layer::TlsWireMixed,
-    );
+    let stream =
+        crate::h1_profile::io::ObservedIo::new(stream, crate::h1_profile::io::Layer::TlsWireMixed);
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = crate::tls::accept_with_optional_timeout(
         &acceptor,

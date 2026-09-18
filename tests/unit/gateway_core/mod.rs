@@ -65,13 +65,13 @@ mod grpc_auth_iss_claim_tests;
 mod grpc_capability_probe_log_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
+#[cfg(feature = "bench-h1-profile")]
+mod h1_profile_tests;
 mod h3_cross_protocol_backend_header_tests;
 mod h3_cross_protocol_bytes_share_tests;
 mod h3_native_reject_bytes_share_tests;
 mod h3_retry_eligibility_tests;
 mod hbone_inner_reuse_classification_tests;
-#[cfg(feature = "bench-h1-profile")]
-mod h1_profile_tests;
 mod health_check_tests;
 mod http3_config_tests;
 mod http3_connect_udp_tests;

@@ -225,13 +225,21 @@ fn drive(mut writer: impl AsyncWrite + Unpin) {
     let mut cx = Context::from_waker(&waker);
     let first = [23, 3];
     let second = [3, 0, 3, 10, 11, 12];
-    let bufs = [IoSlice::new(&first), IoSlice::new(&[]), IoSlice::new(&second)];
+    let bufs = [
+        IoSlice::new(&first),
+        IoSlice::new(&[]),
+        IoSlice::new(&second),
+    ];
     assert!(writer.is_write_vectored());
     assert!(matches!(
         Pin::new(&mut writer).poll_write_vectored(&mut cx, &bufs),
         Poll::Ready(Ok(3))
     ));
-    assert!(Pin::new(&mut writer).poll_write(&mut cx, &second[1..]).is_pending());
+    assert!(
+        Pin::new(&mut writer)
+            .poll_write(&mut cx, &second[1..])
+            .is_pending()
+    );
     let error = Pin::new(&mut writer).poll_write(&mut cx, &second[1..]);
     assert!(matches!(error, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe));
     assert!(matches!(
@@ -442,7 +450,10 @@ fn h1_profile_copy_sites_count_payload_copies_only() {
     );
     assert_eq!(single.poll_once().data().unwrap().as_ptr(), data.as_ptr());
     let after_single = current_thread_counters();
-    assert_eq!(after_single[schema::COPY_PROMOTE], before[schema::COPY_PROMOTE]);
+    assert_eq!(
+        after_single[schema::COPY_PROMOTE],
+        before[schema::COPY_PROMOTE]
+    );
     let mut merged = CoalesceProbe::new(
         vec![
             CoalesceStep::Data(data.clone()),
@@ -455,6 +466,9 @@ fn h1_profile_copy_sites_count_payload_copies_only() {
     );
     assert_eq!(merged.poll_once().data().unwrap().len(), 9);
     let after = current_thread_counters();
-    assert_eq!(after[schema::COPY_PROMOTE] - before[schema::COPY_PROMOTE], 6);
+    assert_eq!(
+        after[schema::COPY_PROMOTE] - before[schema::COPY_PROMOTE],
+        6
+    );
     assert_eq!(after[schema::COPY_MERGE] - before[schema::COPY_MERGE], 3);
 }
