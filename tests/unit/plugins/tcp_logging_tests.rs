@@ -472,9 +472,10 @@ async fn test_tcp_logging_rejects_metadata_host_under_default_policy() {
         Err(e) => e,
     };
     assert!(
-        err.contains("169.254.169.254") && err.contains("backend egress policy"),
+        err.contains("`host`") && err.contains("backend egress policy"),
         "got: {err}"
     );
+    assert!(!err.contains("169.254.169.254"), "got: {err}");
 
     // A loopback sink (local agent) still constructs under the default policy.
     let client = PluginHttpClient::default_with_backend_allow_ips(

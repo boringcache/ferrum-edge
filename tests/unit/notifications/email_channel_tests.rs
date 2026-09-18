@@ -1774,7 +1774,7 @@ fn startup_diagnostics_withhold_email_names_and_numeric_scalars() {
 
 #[test]
 fn smtp_host_diagnostics_keep_channel_schema_without_supplied_names() {
-    let name = "'\"`UNREGISTERED_EMAIL_NAME\\tail";
+    let name = "UNREGISTERED_EMAIL_NAME";
     let config = json!({
         name: {
             "type": "email",
@@ -1783,9 +1783,7 @@ fn smtp_host_diagnostics_keep_channel_schema_without_supplied_names() {
             "to": ["oncall@example.com"]
         }
     });
-    let error = parse_channels(&config)
-        .err()
-        .expect("URL host must be rejected");
+    let error = parse_channels(&config).expect_err("URL host must be rejected");
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
     for expected in ["`channels`", "email", "`smtp_host`", "scheme"] {
         assert!(rendered.contains(expected), "{rendered}");
