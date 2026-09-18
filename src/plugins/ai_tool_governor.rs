@@ -1570,7 +1570,7 @@ impl AiToolGovernor {
             "dry_run" => Mode::DryRun,
             other => {
                 return Err(format!(
-                    "ai_tool_governor: 'mode' must be one of 'enforce' or 'dry_run', got {other:?}"
+                    "ai_tool_governor: `mode` must be one of `enforce` or `dry_run`, got {other:?}"
                 ));
             }
         };
@@ -1581,7 +1581,7 @@ impl AiToolGovernor {
             "require_approval" => DefaultAction::RequireApproval,
             other => {
                 return Err(format!(
-                    "ai_tool_governor: 'default_action' must be one of 'allow', 'deny', or 'require_approval', got {other:?}"
+                    "ai_tool_governor: `default_action` must be one of `allow`, `deny`, or `require_approval`, got {other:?}"
                 ));
             }
         };
@@ -1597,7 +1597,7 @@ impl AiToolGovernor {
             "allow" => UnknownShapeAction::Allow,
             other => {
                 return Err(format!(
-                    "ai_tool_governor: 'unknown_shape_action' must be one of 'deny' or 'allow', got {other:?}"
+                    "ai_tool_governor: `unknown_shape_action` must be one of `deny` or `allow`, got {other:?}"
                 ));
             }
         };
@@ -1654,7 +1654,7 @@ impl AiToolGovernor {
             && !inspect.a2a_methods
         {
             return Err(
-                "ai_tool_governor: at least one 'inspect.*' surface must be enabled".to_string(),
+                "ai_tool_governor: at least one `inspect.*` surface must be enabled".to_string(),
             );
         }
 
@@ -1662,7 +1662,7 @@ impl AiToolGovernor {
         // only when `default_action` itself governs (deny / require_approval).
         if tools.is_empty() && default_action == DefaultAction::Allow {
             return Err(
-                "ai_tool_governor: no tool policies configured and default_action is 'allow' — plugin would have no effect"
+                "ai_tool_governor: no tool policies configured and `default_action` is `allow` — plugin would have no effect"
                     .to_string(),
             );
         }
@@ -1677,7 +1677,7 @@ impl AiToolGovernor {
             && approval.is_none()
         {
             return Err(
-                "ai_tool_governor: 'approval.endpoint_url' is required when any policy uses 'require_approval'"
+                "ai_tool_governor: `approval.endpoint_url` is required when any policy uses `require_approval`"
                     .to_string(),
             );
         }
@@ -7098,7 +7098,7 @@ fn parse_inspect(config: &Value) -> Result<InspectConfig, String> {
     if let Some(inspect) = inspect
         && !inspect.is_object()
     {
-        return Err("ai_tool_governor: 'inspect' must be an object".to_string());
+        return Err("ai_tool_governor: `inspect` must be an object".to_string());
     }
     if let Some(object) = inspect.and_then(Value::as_object) {
         reject_unknown_keys(
@@ -7113,7 +7113,7 @@ fn parse_inspect(config: &Value) -> Result<InspectConfig, String> {
             None => Ok(default),
             Some(v) => v
                 .as_bool()
-                .ok_or_else(|| format!("ai_tool_governor: 'inspect.{key}' must be a boolean")),
+                .ok_or_else(|| format!("ai_tool_governor: `inspect.{key}` must be a boolean")),
         }
     };
     Ok(InspectConfig {
@@ -7150,7 +7150,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         Some(value) => value.as_str().ok_or_else(|| {
             let kind = json_kind(value);
             format!(
-                "ai_tool_governor: tool {name:?} `action` must be a string (expected allow, deny, redact_args, require_approval, or dry_run), got {kind}"
+                "ai_tool_governor: tool {name:?} `action` must be a string (expected `allow`, `deny`, `redact_args`, `require_approval`, or `dry_run`), got {kind}"
             )
         })?,
     };
@@ -7162,7 +7162,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         "dry_run" => ToolAction::DryRun,
         other => {
             return Err(format!(
-                "ai_tool_governor: tool {name:?} has invalid action {other:?} (expected allow, deny, redact_args, require_approval, or dry_run)"
+                "ai_tool_governor: tool {name:?} has invalid `action` {other:?} (expected `allow`, `deny`, `redact_args`, `require_approval`, or `dry_run`)"
             ));
         }
     };
@@ -7176,7 +7176,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
             let spelled = value.as_str().ok_or_else(|| {
                 let kind = json_kind(value);
                 format!(
-                    "ai_tool_governor: tool {name:?} `risk` must be a string (expected low, medium, high, or critical), got {kind}"
+                    "ai_tool_governor: tool {name:?} `risk` must be a string (expected `low`, `medium`, `high`, or `critical`), got {kind}"
                 )
             })?;
             match spelled {
@@ -7186,7 +7186,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 "critical" => RiskLevel::Critical,
                 other => {
                     return Err(format!(
-                        "ai_tool_governor: tool {name:?} has invalid risk {other:?} (expected low, medium, high, or critical)"
+                        "ai_tool_governor: tool {name:?} has invalid `risk` {other:?} (expected `low`, `medium`, `high`, or `critical`)"
                     ));
                 }
             }
@@ -7327,7 +7327,7 @@ fn parse_approval(
     };
     let obj = approval
         .as_object()
-        .ok_or_else(|| "ai_tool_governor: 'approval' must be an object".to_string())?;
+        .ok_or_else(|| "ai_tool_governor: `approval` must be an object".to_string())?;
     reject_unknown_keys(
         obj,
         "config.approval",
@@ -7339,22 +7339,22 @@ fn parse_approval(
     // wrong-typed or empty one (issue #5395): all three used to report the key
     // as required, which is wrong for the two cases where it is supplied.
     let Some(endpoint_value) = obj.get("endpoint_url") else {
-        return Err("ai_tool_governor: 'approval.endpoint_url' is required".to_string());
+        return Err("ai_tool_governor: `approval.endpoint_url` is required".to_string());
     };
     let endpoint_url = endpoint_value.as_str().ok_or_else(|| {
         let kind = json_kind(endpoint_value);
-        format!("ai_tool_governor: 'approval.endpoint_url' must be a string, got {kind}")
+        format!("ai_tool_governor: `approval.endpoint_url` must be a string, got {kind}")
     })?;
     if endpoint_url.is_empty() {
-        return Err("ai_tool_governor: 'approval.endpoint_url' must not be empty".to_string());
+        return Err("ai_tool_governor: `approval.endpoint_url` must not be empty".to_string());
     }
 
-    let parsed = url::Url::parse(endpoint_url).map_err(|e| {
-        format!("ai_tool_governor: 'approval.endpoint_url' is not a valid URL: {e}")
+    let parsed = url::Url::parse(endpoint_url).map_err(|_| {
+        "ai_tool_governor: `approval.endpoint_url` is not a valid URL".to_string()
     })?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(
-            "ai_tool_governor: 'approval.endpoint_url' must be an http/https URL".to_string(),
+            "ai_tool_governor: `approval.endpoint_url` must be an http/https URL".to_string(),
         );
     }
     crate::plugins::utils::log_helpers::screen_url_host_egress(
@@ -7367,7 +7367,7 @@ fn parse_approval(
         .host_str()
         .filter(|h| !h.is_empty())
         .ok_or_else(|| {
-            "ai_tool_governor: 'approval.endpoint_url' must have a hostname".to_string()
+            "ai_tool_governor: `approval.endpoint_url` must have a hostname".to_string()
         })?
         .to_string();
 
@@ -7375,11 +7375,11 @@ fn parse_approval(
         None => DEFAULT_APPROVAL_TIMEOUT_MS,
         Some(v) => {
             let n = v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                "ai_tool_governor: 'approval.timeout_ms' must be a positive integer".to_string()
+                "ai_tool_governor: `approval.timeout_ms` must be a positive integer".to_string()
             })?;
             if n > MAX_APPROVAL_TIMEOUT_MS {
                 return Err(format!(
-                    "ai_tool_governor: 'approval.timeout_ms' must be <= {MAX_APPROVAL_TIMEOUT_MS}"
+                    "ai_tool_governor: `approval.timeout_ms` must be <= {MAX_APPROVAL_TIMEOUT_MS}"
                 ));
             }
             n
@@ -7389,13 +7389,13 @@ fn parse_approval(
     let cache_ttl_seconds = match obj.get("cache_ttl_seconds") {
         None => DEFAULT_APPROVAL_CACHE_TTL_S,
         Some(v) => v.as_u64().ok_or_else(|| {
-            "ai_tool_governor: 'approval.cache_ttl_seconds' must be a non-negative integer"
+            "ai_tool_governor: `approval.cache_ttl_seconds` must be a non-negative integer"
                 .to_string()
         })?,
     };
     if cache_ttl_seconds > MAX_APPROVAL_CACHE_TTL_S {
         return Err(format!(
-            "ai_tool_governor: 'approval.cache_ttl_seconds' must be <= {MAX_APPROVAL_CACHE_TTL_S}"
+            "ai_tool_governor: `approval.cache_ttl_seconds` must be <= {MAX_APPROVAL_CACHE_TTL_S}"
         ));
     }
 
@@ -7407,7 +7407,7 @@ fn parse_approval(
             let spelled = value.as_str().ok_or_else(|| {
                 let kind = json_kind(value);
                 format!(
-                    "ai_tool_governor: 'approval.fail_on_error' must be a string (expected 'reject', 'warn', or 'allow'), got {kind}"
+                    "ai_tool_governor: `approval.fail_on_error` must be a string (expected `reject`, `warn`, or `allow`), got {kind}"
                 )
             })?;
             match spelled {
@@ -7416,7 +7416,7 @@ fn parse_approval(
                 "allow" => FailOnError::Allow,
                 other => {
                     return Err(format!(
-                        "ai_tool_governor: 'approval.fail_on_error' must be one of 'reject', 'warn', or 'allow', got {other:?}"
+                        "ai_tool_governor: `approval.fail_on_error` must be one of `reject`, `warn`, or `allow`, got {other:?}"
                     ));
                 }
             }
@@ -7426,7 +7426,7 @@ fn parse_approval(
     let include_arguments = match obj.get("include_arguments") {
         None => false,
         Some(v) => v.as_bool().ok_or_else(|| {
-            "ai_tool_governor: 'approval.include_arguments' must be a boolean".to_string()
+            "ai_tool_governor: `approval.include_arguments` must be a boolean".to_string()
         })?,
     };
 
@@ -7446,7 +7446,7 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
     if let Some(response) = response
         && !response.is_object()
     {
-        return Err("ai_tool_governor: 'response' must be an object".to_string());
+        return Err("ai_tool_governor: `response` must be an object".to_string());
     }
     if let Some(object) = response.and_then(Value::as_object) {
         reject_unknown_keys(
@@ -7461,11 +7461,11 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
         None => DEFAULT_DENY_STATUS,
         Some(v) => {
             let n = v.as_u64().ok_or_else(|| {
-                "ai_tool_governor: 'response.deny_status_code' must be an integer".to_string()
+                "ai_tool_governor: `response.deny_status_code` must be an integer".to_string()
             })?;
             if !(400..=599).contains(&n) {
                 return Err(
-                    "ai_tool_governor: 'response.deny_status_code' must be an HTTP error status (400-599)"
+                    "ai_tool_governor: `response.deny_status_code` must be an HTTP error status (400-599)"
                         .to_string(),
                 );
             }
@@ -7477,21 +7477,21 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
         .and_then(|r| r.get("redaction_placeholder"))
         .map(|v| {
             v.as_str().map(str::to_string).ok_or_else(|| {
-                "ai_tool_governor: 'response.redaction_placeholder' must be a string".to_string()
+                "ai_tool_governor: `response.redaction_placeholder` must be a string".to_string()
             })
         })
         .transpose()?
         .unwrap_or_else(|| DEFAULT_REDACTION_PLACEHOLDER.to_string());
     if redaction_placeholder.len() > MAX_REDACTION_PLACEHOLDER_BYTES {
         return Err(format!(
-            "ai_tool_governor: 'response.redaction_placeholder' must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
+            "ai_tool_governor: `response.redaction_placeholder` must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
         ));
     }
 
     let streaming_deny_event = match response.and_then(|r| r.get("streaming_deny_event")) {
         None => true,
         Some(v) => v.as_bool().ok_or_else(|| {
-            "ai_tool_governor: 'response.streaming_deny_event' must be a boolean".to_string()
+            "ai_tool_governor: `response.streaming_deny_event` must be a boolean".to_string()
         })?,
     };
 
@@ -7507,7 +7507,7 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
     if let Some(obs) = obs
         && !obs.is_object()
     {
-        return Err("ai_tool_governor: 'observability' must be an object".to_string());
+        return Err("ai_tool_governor: `observability` must be an object".to_string());
     }
     if let Some(object) = obs.and_then(Value::as_object) {
         reject_unknown_keys(
@@ -7521,24 +7521,24 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
     let emit_metadata = match obs.and_then(|o| o.get("emit_metadata")) {
         None => true,
         Some(v) => v.as_bool().ok_or_else(|| {
-            "ai_tool_governor: 'observability.emit_metadata' must be a boolean".to_string()
+            "ai_tool_governor: `observability.emit_metadata` must be a boolean".to_string()
         })?,
     };
     let hash_arguments = match obs.and_then(|o| o.get("hash_arguments")) {
         None => true,
         Some(v) => v.as_bool().ok_or_else(|| {
-            "ai_tool_governor: 'observability.hash_arguments' must be a boolean".to_string()
+            "ai_tool_governor: `observability.hash_arguments` must be a boolean".to_string()
         })?,
     };
     let max_argument_log_bytes = match obs.and_then(|o| o.get("max_argument_log_bytes")) {
         None => 0,
         Some(v) => {
             let n = v.as_u64().ok_or_else(|| {
-                "ai_tool_governor: 'observability.max_argument_log_bytes' must be a non-negative integer"
+                "ai_tool_governor: `observability.max_argument_log_bytes` must be a non-negative integer"
                     .to_string()
             })?;
             usize::try_from(n).map_err(|_| {
-                "ai_tool_governor: 'observability.max_argument_log_bytes' is too large".to_string()
+                "ai_tool_governor: `observability.max_argument_log_bytes` is too large".to_string()
             })?
         }
     };
@@ -7573,7 +7573,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
         Some(v) => v
             .as_str()
             .map(Some)
-            .ok_or_else(|| format!("ai_tool_governor: '{field}' must be a string")),
+            .ok_or_else(|| format!("ai_tool_governor: `{field}` must be a string")),
     }
 }
 
@@ -7583,7 +7583,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         Some(v) => v
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("ai_tool_governor: '{field}' must be a boolean")),
+            .ok_or_else(|| format!("ai_tool_governor: `{field}` must be a boolean")),
     }
 }
 
@@ -7596,6 +7596,6 @@ fn optional_object<'a>(
         Some(v) => v
             .as_object()
             .map(Some)
-            .ok_or_else(|| format!("ai_tool_governor: '{field}' must be an object")),
+            .ok_or_else(|| format!("ai_tool_governor: `{field}` must be an object")),
     }
 }

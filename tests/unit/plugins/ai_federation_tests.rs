@@ -2806,7 +2806,7 @@ fn test_missing_provider_name_rejected() {
     let err = ai_federation::AiFederation::new(&config, http_client)
         .err()
         .unwrap();
-    assert!(err.contains("missing 'name'"), "got: {err}");
+    assert!(err.contains("missing `name`"), "got: {err}");
 }
 
 #[test]
@@ -2821,7 +2821,7 @@ fn test_missing_provider_type_rejected() {
     let err = ai_federation::AiFederation::new(&config, http_client)
         .err()
         .unwrap();
-    assert!(err.contains("missing 'provider_type'"), "got: {err}");
+    assert!(err.contains("missing `provider_type`"), "got: {err}");
 }
 
 #[test]
@@ -2837,7 +2837,7 @@ fn test_unknown_provider_type_rejected() {
     let err = ai_federation::AiFederation::new(&config, http_client)
         .err()
         .unwrap();
-    assert!(err.contains("unknown provider_type"), "got: {err}");
+    assert!(err.contains("unknown `provider_type`"), "got: {err}");
 }
 
 #[test]
@@ -2852,7 +2852,7 @@ fn test_missing_api_key_rejected() {
     let err = ai_federation::AiFederation::new(&config, http_client)
         .err()
         .unwrap();
-    assert!(err.contains("missing 'api_key'"), "got: {err}");
+    assert!(err.contains("missing `api_key`"), "got: {err}");
 }
 
 #[test]
@@ -8643,7 +8643,7 @@ fn test_multimodal_mode_rejects_unknown_value() {
         .err()
         .unwrap();
     assert!(
-        err.contains("unknown multimodal_mode 'bogus'"),
+        err.contains("unknown `multimodal_mode` \"bogus\""),
         "got: {err}"
     );
 }
@@ -8843,7 +8843,7 @@ fn provider_api_key_that_cannot_be_sent_as_a_header_fails_admission() {
         let error = ai_federation::AiFederation::new(&config, create_test_http_client())
             .err()
             .expect("a credential that cannot be sent as a header must fail admission");
-        assert!(error.contains("'api_key'"), "{provider_type}: {error}");
+        assert!(error.contains("`api_key`"), "{provider_type}: {error}");
         assert!(
             error.contains("not a valid HTTP header value"),
             "{provider_type}: {error}"
@@ -9117,4 +9117,45 @@ fn create_test_http_client_with_backend_allow_ips(
         std::sync::Arc::new(Vec::new()),
         0,
     )
+}
+
+#[test]
+fn service_account_config_errors_keep_fields_without_parser_payloads() {
+    use ferrum_edge::plugins::validate_plugin_config;
+    use ferrum_edge::startup::render_startup_error;
+
+    for (service_account, field) in [
+        (
+            "\"'unregistered_oauth_secret\\q\"".to_string(),
+            "`google_service_account_json`",
+        ),
+        (
+            json!({
+                "client_email": "account@example.com",
+                "private_key": "'unregistered_oauth_secret"
+            })
+            .to_string(),
+            "`private_key`",
+        ),
+        (
+            json!({
+                "client_email": "account@example.com",
+                "private_key": "unused",
+                "token_uri": "'unregistered_oauth_secret"
+            })
+            .to_string(),
+            "`token_uri`",
+        ),
+    ] {
+        let config = json!({"providers": [{
+            "name": "vertex", "provider_type": "google_vertex",
+            "google_project_id": "project", "google_region": "us-central1",
+            "google_service_account_json": service_account
+        }]});
+        let error = validate_plugin_config("ai_federation", &config).unwrap_err();
+        assert!(!error.contains("unregistered_oauth_secret"), "{error}");
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains("invalid") || rendered.contains("not a valid URL"));
+    }
 }

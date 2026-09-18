@@ -1911,7 +1911,7 @@ fn test_default_max_tokens_exceeding_limit_rejected() {
     .err()
     .unwrap();
     assert!(
-        err.contains("'default_max_tokens'") && err.contains("max_tokens_limit"),
+        err.contains("`default_max_tokens`") && err.contains("max_tokens_limit"),
         "got: {err}"
     );
 }
@@ -4190,5 +4190,215 @@ fn documented_example_and_rejections_survive_the_numeric_bounds() {
             "construction must refuse {refused}"
         );
         assert!(!validator.is_valid(&refused), "schema refuses {refused}");
+    }
+}
+
+#[test]
+fn ai_family_config_diagnostics_withhold_hostile_strings_and_keep_schema_context() {
+    use ferrum_edge::plugins::validate_plugin_config;
+    use ferrum_edge::startup::render_startup_error;
+
+    for secret in [
+        "'unregistered_ai_secret",
+        "unregistered_ai_secret\"\\\n`schema`",
+    ] {
+        for (plugin, config, field) in [
+            (
+                "ai_request_guard",
+                json!({"enforce_max_tokens": secret}),
+                "`enforce_max_tokens`",
+            ),
+            (
+                "ai_rate_limiter",
+                json!({"token_limit": 100, "count_mode": secret}),
+                "`count_mode`",
+            ),
+            (
+                "ai_token_metrics",
+                json!({"provider": secret}),
+                "`provider`",
+            ),
+            (
+                "ai_prompt_compressor",
+                json!({"request_family": secret}),
+                "`request_family`",
+            ),
+            (
+                "ai_prompt_shield",
+                json!({"patterns": [secret]}),
+                "`patterns`",
+            ),
+            (
+                "ai_response_guard",
+                json!({"pii_patterns": [secret]}),
+                "`pii_patterns`",
+            ),
+            (
+                "ai_semantic_cache",
+                json!({"cache_multimodal": secret}),
+                "`cache_multimodal`",
+            ),
+            (
+                "ai_semantic_firewall",
+                json!({"mode": secret}),
+                "`mode`",
+            ),
+            (
+                "ai_federation",
+                json!({"providers": [{
+                    "name": "route", "provider_type": "openai", "multimodal_mode": secret
+                }]}),
+                "`multimodal_mode`",
+            ),
+            (
+                "ai_stream_router",
+                json!({"providers": [{
+                    "name": secret, "provider_type": "openai", "model_patterns": ["*"],
+                    "endpoint": secret
+                }]}),
+                "`endpoint`",
+            ),
+            (
+                "ai_tool_governor",
+                json!({"tools": {(secret): {"action": secret}}}),
+                "`action`",
+            ),
+            (
+                "ai_transcript_audit",
+                json!({"mode": secret}),
+                "`mode`",
+            ),
+        ] {
+            let error = validate_plugin_config(plugin, &config).expect_err(plugin);
+            assert!(error.contains(field), "{plugin}: {error}");
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains(plugin), "{rendered}");
+            assert!(rendered.contains(field), "{rendered}");
+            assert!(!rendered.contains("unregistered_ai_secret"), "{rendered}");
+            assert!(!rendered.contains("`schema`"), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn ai_config_numeric_diagnostics_withhold_document_scalars() {
+    use ferrum_edge::plugins::validate_plugin_config;
+    use ferrum_edge::startup::render_startup_error;
+
+    for (plugin, config, fields, secrets) in [
+        (
+            "ai_request_guard",
+            json!({"default_max_tokens": 918273, "max_tokens_limit": 817263}),
+            vec!["`default_max_tokens`", "`max_tokens_limit`", "must be <="],
+            vec!["918273", "817263"],
+        ),
+        (
+            "ai_federation",
+            json!({
+                "providers": [{"name": "route", "provider_type": "openai", "api_key": "test"}],
+                "fallback_on_status_codes": [299]
+            }),
+            vec!["`fallback_on_status_codes`", "cannot replay committed success"],
+            vec!["299"],
+        ),
+        (
+            "ai_request_guard",
+            json!({"strict_schema": 918273}),
+            vec!["`strict_schema`", "must be a boolean"],
+            vec!["918273"],
+        ),
+        (
+            "ai_request_guard",
+            json!({"enforce_max_tokens": true}),
+            vec!["`enforce_max_tokens`", "must be a string"],
+            vec!["true"],
+        ),
+    ] {
+        let error = validate_plugin_config(plugin, &config).expect_err(plugin);
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        for field in fields {
+            assert!(rendered.contains(field), "{rendered}");
+        }
+        for secret in secrets {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn ai_bespoke_unknown_key_diagnostics_preserve_only_schema_paths() {
+    use ferrum_edge::plugins::validate_plugin_config;
+    use ferrum_edge::startup::render_startup_error;
+
+    let key = "'unregistered_ai_key\"\\\n`document`";
+    for (plugin, config, context) in [
+        ("ai_request_guard", json!({(key): true}), "`max_tokens_limit`"),
+        ("ai_prompt_compressor", json!({(key): true}), "`compress_roles`"),
+        ("ai_token_metrics", json!({(key): true}), "`provider`"),
+        ("ai_federation", json!({(key): true}), "`config`"),
+        (
+            "ai_prompt_shield",
+            json!({"custom_patterns": [{(key): true}]}),
+            "`custom_patterns[0]`",
+        ),
+        (
+            "ai_response_guard",
+            json!({"custom_pii_patterns": [{(key): true}]}),
+            "`custom_pii_patterns[0]`",
+        ),
+        (
+            "ai_semantic_firewall",
+            json!({"provider": {(key): true}}),
+            "`config.provider`",
+        ),
+    ] {
+        let error = validate_plugin_config(plugin, &config).expect_err(plugin);
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("unknown"), "{rendered}");
+        assert!(rendered.contains(context), "{rendered}");
+        assert!(!rendered.contains("unregistered_ai_key"), "{rendered}");
+        assert!(!rendered.contains("`document`"), "{rendered}");
+    }
+}
+
+#[test]
+fn ai_regex_diagnostics_omit_library_text_and_preserve_field_indexes() {
+    use ferrum_edge::plugins::validate_plugin_config;
+    use ferrum_edge::startup::render_startup_error;
+
+    let pattern = "'unregistered_regex_secret[";
+    for (plugin, config, field) in [
+        (
+            "ai_prompt_shield",
+            json!({"custom_patterns": [{"name": "custom", "regex": pattern}]}),
+            "`custom_patterns[0].regex`",
+        ),
+        (
+            "ai_response_guard",
+            json!({"blocked_patterns": [{"name": "custom", "regex": pattern}]}),
+            "`blocked_patterns[0].regex`",
+        ),
+        (
+            "ai_tool_governor",
+            json!({"tools": {"lookup": {
+                "action": "deny", "blocked_arg_patterns": [{"name": "custom", "regex": pattern}]
+            }}}),
+            "`blocked_arg_patterns[0]`",
+        ),
+        (
+            "ai_transcript_audit",
+            json!({"redaction": {"custom_patterns": [{"name": "custom", "regex": pattern}]}}),
+            "`redaction.custom_patterns[0].regex`",
+        ),
+    ] {
+        let error = validate_plugin_config(plugin, &config).expect_err(plugin);
+        assert!(!error.contains("unregistered_regex_secret"), "{error}");
+        let rendered = render_startup_error(
+            anyhow::Error::msg(error).context("plugin `config` rejected"),
+            &[],
+        );
+        assert!(rendered.contains("plugin `config` rejected"), "{rendered}");
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains("invalid regex") || rendered.contains("invalid or too complex"));
     }
 }

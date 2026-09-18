@@ -217,7 +217,7 @@ fn test_shared_validation_rejects_invalid_ai_stream_router_config() {
         .expect_err("shared plugin validation must require a providers array");
     assert_eq!(
         err,
-        "ai_stream_router: 'providers' must be a non-empty array"
+        "ai_stream_router: `providers` must be a non-empty array"
     );
 }
 
@@ -231,7 +231,7 @@ fn test_config_rejects_unknown_provider_type() {
         }]
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("unknown provider_type"), "{err}");
+    assert!(err.contains("unknown `provider_type`"), "{err}");
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn test_config_rejects_malformed_endpoint() {
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(
-        err.contains("invalid endpoint") || err.contains("no host"),
+        err.contains("invalid `endpoint`") || err.contains("no host"),
         "{err}"
     );
 }
@@ -425,7 +425,7 @@ fn test_config_rejects_fallback_block_in_every_shape() {
             .err()
             .unwrap_or_else(|| panic!("fallback {fallback} must be rejected"));
         assert!(
-            err.contains("unsupported field 'fallback'"),
+            err.contains("unsupported field `fallback`"),
             "fallback {fallback}: {err}"
         );
         assert!(
@@ -453,7 +453,7 @@ fn test_fallback_rejection_is_specific_not_a_typo_suggestion() {
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(!err.contains("did you mean"), "{err}");
     assert!(!err.contains("unknown configuration key"), "{err}");
-    assert!(err.contains("Remove the 'fallback' block"), "{err}");
+    assert!(err.contains("Remove the `fallback` block"), "{err}");
 }
 
 /// Omitting `fallback` preserves the plugin's existing behavior exactly: the

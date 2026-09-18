@@ -252,9 +252,9 @@ impl AiPromptCompressor {
         if !unknown.is_empty() {
             unknown.sort_unstable();
             return Err(format!(
-                "ai_prompt_compressor: unknown config field(s): {} (allowed: {})",
+                "ai_prompt_compressor: unknown config field(s): {:?} (allowed: `{}`)",
                 unknown.join(", "),
-                CONFIG_FIELDS.join(", ")
+                CONFIG_FIELDS.join("`, `")
             ));
         }
 
@@ -262,7 +262,7 @@ impl AiPromptCompressor {
             Some(roles) => {
                 if roles.is_empty() {
                     return Err(
-                        "ai_prompt_compressor: 'compress_roles' must not be empty — the plugin \
+                        "ai_prompt_compressor: `compress_roles` must not be empty — the plugin \
                          would have no effect"
                             .to_string(),
                     );
@@ -271,7 +271,7 @@ impl AiPromptCompressor {
                     roles.into_iter().map(|r| r.trim().to_lowercase()).collect();
                 if normalized.iter().any(String::is_empty) {
                     return Err(
-                        "ai_prompt_compressor: 'compress_roles' entries must not be blank"
+                        "ai_prompt_compressor: `compress_roles` entries must not be blank"
                             .to_string(),
                     );
                 }
@@ -286,7 +286,7 @@ impl AiPromptCompressor {
         let target_ratio = match config.get("target_ratio") {
             Some(value) => {
                 let ratio = value.as_f64().ok_or_else(|| {
-                    "ai_prompt_compressor: 'target_ratio' must be a number".to_string()
+                    "ai_prompt_compressor: `target_ratio` must be a number".to_string()
                 })?;
                 if !(ratio > 0.0 && ratio < 1.0) {
                     return Err(format!(
@@ -303,7 +303,7 @@ impl AiPromptCompressor {
             optional_usize(config, "min_content_tokens")?.unwrap_or(DEFAULT_MIN_CONTENT_TOKENS);
         if min_content_tokens > MAX_MIN_CONTENT_TOKENS {
             return Err(format!(
-                "ai_prompt_compressor: 'min_content_tokens' must not exceed \
+                "ai_prompt_compressor: `min_content_tokens` must not exceed \
                  {MAX_MIN_CONTENT_TOKENS}"
             ));
         }
@@ -311,7 +311,7 @@ impl AiPromptCompressor {
         let max_scan_bytes = match optional_usize(config, "max_scan_bytes")? {
             Some(0) => {
                 return Err(
-                    "ai_prompt_compressor: 'max_scan_bytes' must be greater than zero".to_string(),
+                    "ai_prompt_compressor: `max_scan_bytes` must be greater than zero".to_string(),
                 );
             }
             Some(bytes) if bytes <= HARD_MAX_SCAN_BYTES => bytes,
@@ -328,7 +328,7 @@ impl AiPromptCompressor {
             Some(tag) => {
                 if tag.trim() != tag {
                     return Err(
-                        "ai_prompt_compressor: 'preserve_tag' must not contain leading or \
+                        "ai_prompt_compressor: `preserve_tag` must not contain leading or \
                          trailing whitespace"
                             .to_string(),
                     );
@@ -340,8 +340,8 @@ impl AiPromptCompressor {
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 {
                     return Err(
-                        "ai_prompt_compressor: 'preserve_tag' must be a non-empty name of ASCII \
-                         letters, digits, '-', or '_', at most 64 bytes long"
+                        "ai_prompt_compressor: `preserve_tag` must be a non-empty name of ASCII \
+                         letters, digits, `-`, or `_`, at most 64 bytes long"
                             .to_string(),
                     );
                 }
@@ -356,15 +356,15 @@ impl AiPromptCompressor {
             Some("text_completions") => RequestFamilyPolicy::TextCompletions,
             Some(other) => {
                 return Err(format!(
-                    "ai_prompt_compressor: 'request_family' must be 'auto', \
-                     'chat_completions', or 'text_completions', got {other:?}"
+                    "ai_prompt_compressor: `request_family` must be `auto`, \
+                     `chat_completions`, or `text_completions`, got {other:?}"
                 ));
             }
         };
         if request_family == RequestFamilyPolicy::TextCompletions && !compress_prompt_field {
             return Err(
-                "ai_prompt_compressor: 'compress_roles' must include 'user' when \
-                 'request_family' is 'text_completions'"
+                "ai_prompt_compressor: `compress_roles` must include `user` when \
+                 `request_family` is `text_completions`"
                     .to_string(),
             );
         }
@@ -1666,26 +1666,26 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     match config.get(field) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!("ai_prompt_compressor: '{field}' must not be null")),
+        Some(Value::Null) => Err(format!("ai_prompt_compressor: `{field}` must not be null")),
         Some(value) => value
             .as_str()
             .map(Some)
-            .ok_or_else(|| format!("ai_prompt_compressor: '{field}' must be a string")),
+            .ok_or_else(|| format!("ai_prompt_compressor: `{field}` must be a string")),
     }
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
     match config.get(field) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!("ai_prompt_compressor: '{field}' must not be null")),
+        Some(Value::Null) => Err(format!("ai_prompt_compressor: `{field}` must not be null")),
         Some(value) => {
             let array = value
                 .as_array()
-                .ok_or_else(|| format!("ai_prompt_compressor: '{field}' must be an array"))?;
+                .ok_or_else(|| format!("ai_prompt_compressor: `{field}` must be an array"))?;
             let mut out = Vec::with_capacity(array.len());
             for entry in array {
                 let text = entry.as_str().ok_or_else(|| {
-                    format!("ai_prompt_compressor: '{field}' must contain only strings")
+                    format!("ai_prompt_compressor: `{field}` must contain only strings")
                 })?;
                 out.push(text.to_string());
             }
@@ -1697,13 +1697,13 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
 fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
     match config.get(field) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!("ai_prompt_compressor: '{field}' must not be null")),
+        Some(Value::Null) => Err(format!("ai_prompt_compressor: `{field}` must not be null")),
         Some(value) => {
             let number = value.as_u64().ok_or_else(|| {
-                format!("ai_prompt_compressor: '{field}' must be a non-negative integer")
+                format!("ai_prompt_compressor: `{field}` must be a non-negative integer")
             })?;
             usize::try_from(number).map(Some).map_err(|_| {
-                format!("ai_prompt_compressor: '{field}' is too large for this platform")
+                format!("ai_prompt_compressor: `{field}` is too large for this platform")
             })
         }
     }

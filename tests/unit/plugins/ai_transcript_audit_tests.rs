@@ -339,7 +339,7 @@ async fn sink_is_required() {
         .err()
         .expect("expected config rejection");
     assert!(
-        err.contains("'sink' configuration is required"),
+        err.contains("`sink` configuration is required"),
         "got: {err}"
     );
 }
@@ -372,7 +372,7 @@ async fn invalid_mode_rejected() {
     let err = AiTranscriptAudit::new(&config, loopback_http_client())
         .err()
         .expect("expected config rejection");
-    assert!(err.contains("'mode' must be one of"), "got: {err}");
+    assert!(err.contains("`mode` must be one of"), "got: {err}");
 }
 
 #[tokio::test]
@@ -12785,4 +12785,65 @@ async fn http_records_never_carry_a_grpc_status() {
         record.get("grpc_status").is_none(),
         "an HTTP record must not carry a gRPC application status: {record:?}"
     );
+}
+
+#[test]
+fn transcript_config_header_diagnostics_withhold_keys_and_secret_references() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for headers in [
+        json!({"'unregistered_header_secret": "bad\nvalue"}),
+        json!({"'unregistered_header_secret": 918273}),
+        json!({"'unregistered_header_secret\n": "value"}),
+        json!({"authorization": "${'unregistered_reference_secret}"}),
+        json!({"authorization": "${secret:'unregistered_reference_secret}"}),
+        json!({"authorization": "${secret:'unregistered_reference_secret"}),
+    ] {
+        let config = json!({"sink": {
+            "endpoint_url": "https://audit.example.com/ingest",
+            "custom_headers": headers
+        }});
+        let error = validate_plugin_config("ai_transcript_audit", &config).unwrap_err();
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("`sink.custom_headers`"), "{rendered}");
+        assert!(!rendered.contains("unregistered_header_secret"), "{rendered}");
+        assert!(!rendered.contains("unregistered_reference_secret"), "{rendered}");
+        assert!(!rendered.contains("918273"), "{rendered}");
+    }
+}
+
+#[test]
+fn transcript_config_limit_diagnostics_withhold_supplied_and_derived_sizes() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for (limits, field, secrets) in [
+        (
+            json!({
+                "max_request_bytes": 900001,
+                "max_response_bytes": 900001,
+                "max_stream_capture_bytes": 900001
+            }),
+            "`limits.max_request_bytes`",
+            vec!["900001", "2700003"],
+        ),
+        (
+            json!({"max_entry_bytes": 91827}),
+            "`limits.max_entry_bytes`",
+            vec!["91827"],
+        ),
+        (
+            json!({"buffer_max_bytes": 91827}),
+            "`limits.buffer_max_bytes`",
+            vec!["91827"],
+        ),
+    ] {
+        let error = validate_plugin_config("ai_transcript_audit", &json!({"limits": limits}))
+            .unwrap_err();
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains("must be"), "{rendered}");
+        for secret in secrets {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
 }

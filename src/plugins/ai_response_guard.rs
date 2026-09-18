@@ -278,7 +278,7 @@ impl AiResponseGuard {
             "warn" => GuardAction::Warn,
             other => {
                 return Err(format!(
-                    "ai_response_guard: 'action' must be one of 'reject', 'redact', or 'warn', got {other:?}"
+                    "ai_response_guard: `action` must be one of `reject`, `redact`, or `warn`, got {other:?}"
                 ));
             }
         };
@@ -288,7 +288,7 @@ impl AiResponseGuard {
             "all" => ScanMode::All,
             other => {
                 return Err(format!(
-                    "ai_response_guard: 'scan_fields' must be one of 'content' or 'all', got {other:?}"
+                    "ai_response_guard: `scan_fields` must be one of `content` or `all`, got {other:?}"
                 ));
             }
         };
@@ -318,19 +318,18 @@ impl AiResponseGuard {
                             placeholder,
                         });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         // Built-in pattern failures are fatal so the operator
                         // is alerted instead of silently losing detection
                         // coverage. Symmetric with custom-pattern handling.
                         return Err(format!(
-                            "ai_response_guard: failed to compile built-in PII pattern '{}': {}",
-                            name, e,
+                            "ai_response_guard: `pii_patterns` built-in pattern {name:?} is invalid or too complex"
                         ));
                     }
                 }
             } else {
                 return Err(format!(
-                    "ai_response_guard: unknown built-in PII pattern '{}'",
+                    "ai_response_guard: `pii_patterns` unknown built-in PII pattern {:?}",
                     name,
                 ));
             }
@@ -341,7 +340,7 @@ impl AiResponseGuard {
             for (idx, entry) in custom.iter().enumerate() {
                 if !entry.is_object() {
                     return Err(format!(
-                        "ai_response_guard: 'custom_pii_patterns[{idx}]' must be an object"
+                        "ai_response_guard: `custom_pii_patterns[{idx}]` must be an object"
                     ));
                 }
                 reject_unknown_keys(
@@ -378,7 +377,7 @@ impl AiResponseGuard {
                 let phrase_str = phrase.as_str();
                 if phrase_str.is_empty() {
                     return Err(format!(
-                        "ai_response_guard: 'blocked_phrases[{i}]' must not be empty"
+                        "ai_response_guard: `blocked_phrases[{i}]` must not be empty"
                     ));
                 }
                 // Treat as case-insensitive literal match
@@ -397,10 +396,9 @@ impl AiResponseGuard {
                             placeholder,
                         });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         return Err(format!(
-                            "ai_response_guard: failed to compile blocked phrase {}: {}",
-                            i, e,
+                            "ai_response_guard: `blocked_phrases[{i}]` is too complex"
                         ));
                     }
                 }
@@ -412,7 +410,7 @@ impl AiResponseGuard {
             for (idx, entry) in patterns.iter().enumerate() {
                 if !entry.is_object() {
                     return Err(format!(
-                        "ai_response_guard: 'blocked_patterns[{idx}]' must be an object"
+                        "ai_response_guard: `blocked_patterns[{idx}]` must be an object"
                     ));
                 }
                 reject_unknown_keys(
@@ -447,7 +445,7 @@ impl AiResponseGuard {
         for (idx, field) in required_fields.iter().enumerate() {
             if field.is_empty() {
                 return Err(format!(
-                    "ai_response_guard: 'required_fields[{idx}]' must not be empty"
+                    "ai_response_guard: `required_fields[{idx}]` must not be empty"
                 ));
             }
         }
@@ -462,19 +460,19 @@ impl AiResponseGuard {
             // unenforced without the operator ever being told.
             if require_json {
                 return Err(
-                    "ai_response_guard: 'require_json' is JSON-only and cannot be combined with 'grpc'"
+                    "ai_response_guard: `require_json` is JSON-only and cannot be combined with `grpc`"
                         .to_string(),
                 );
             }
             if !required_fields.is_empty() {
                 return Err(
-                    "ai_response_guard: 'required_fields' is JSON-only and cannot be combined with 'grpc'"
+                    "ai_response_guard: `required_fields` is JSON-only and cannot be combined with `grpc`"
                         .to_string(),
                 );
             }
             if pii_patterns.is_empty() && blocked_phrases.is_empty() && max_completion_length == 0 {
                 return Err(
-                    "ai_response_guard: 'grpc' requires at least one detection pattern, blocked phrase, or 'max_completion_length'"
+                    "ai_response_guard: `grpc` requires at least one detection pattern, blocked phrase, or `max_completion_length`"
                         .to_string(),
                 );
             }
@@ -507,11 +505,9 @@ impl AiResponseGuard {
                 .chain(blocked_phrases.iter())
                 .map(|p| p.regex.as_str()),
         )
-        .map_err(|e| {
-            format!(
-                "ai_response_guard: failed to build detection RegexSet: {}",
-                e
-            )
+        .map_err(|_| {
+            "ai_response_guard: `pii_patterns` / `custom_pii_patterns` / `blocked_phrases` / `blocked_patterns` detection set is invalid or too complex"
+                .to_string()
         })?;
 
         Ok(Self {
@@ -2991,7 +2987,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         return Ok(None);
     };
     if !grpc.is_object() {
-        return Err("ai_response_guard: 'grpc' must be an object".to_string());
+        return Err("ai_response_guard: `grpc` must be an object".to_string());
     }
     reject_unknown_keys(grpc, AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS, "grpc")?;
 
@@ -2999,7 +2995,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .ok_or_else(|| {
-            "ai_response_guard: 'grpc.descriptor_path' is required and must be a \
+            "ai_response_guard: `grpc.descriptor_path` is required and must be a \
              non-empty string"
                 .to_string()
         })?
@@ -3012,12 +3008,12 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
 
     let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
         return Err(
-            "ai_response_guard: 'grpc.methods' is required and must be an object".to_string(),
+            "ai_response_guard: `grpc.methods` is required and must be an object".to_string(),
         );
     };
     if method_configs.is_empty() {
         return Err(
-            "ai_response_guard: 'grpc.methods' must configure at least one method".to_string(),
+            "ai_response_guard: `grpc.methods` must configure at least one method".to_string(),
         );
     }
 
@@ -3025,7 +3021,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
     for (method_path, method_config) in method_configs {
         let normalized = normalize_grpc_method_path(method_path)?;
         if !method_config.is_object() {
-            return Err("ai_response_guard: a 'grpc.methods' entry must be an object".to_string());
+            return Err("ai_response_guard: a `grpc.methods` entry must be an object".to_string());
         }
         reject_unknown_keys(
             method_config,
@@ -3036,8 +3032,8 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                "ai_response_guard: a 'grpc.methods' entry requires a non-empty \
-                 'response_type'"
+                "ai_response_guard: a `grpc.methods` entry requires a non-empty \
+                 `response_type`"
                     .to_string()
             })?
             .to_string();
@@ -3048,7 +3044,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         };
         if methods.insert(normalized, shape).is_some() {
             return Err(
-                "ai_response_guard: a 'grpc.methods' method path is configured more than once"
+                "ai_response_guard: a `grpc.methods` method path is configured more than once"
                     .to_string(),
             );
         }
@@ -3074,7 +3070,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     let trimmed = method_path.trim();
     if trimmed.is_empty() {
         return Err(
-            "ai_response_guard: a 'grpc.methods' key must be a non-empty method path".to_string(),
+            "ai_response_guard: a `grpc.methods` key must be a non-empty method path".to_string(),
         );
     }
     // Reject whitespace interior to the path (trim only clears the edges) and
@@ -3084,7 +3080,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
         .any(|ch| ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';'))
     {
         return Err(
-            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+            "ai_response_guard: a `grpc.methods` key must be a `/package.Service/Method` path"
                 .to_string(),
         );
     }
@@ -3096,7 +3092,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     let rest = &normalized[1..];
     let Some((service, method_name)) = rest.split_once('/') else {
         return Err(
-            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+            "ai_response_guard: a `grpc.methods` key must be a `/package.Service/Method` path"
                 .to_string(),
         );
     };
@@ -3107,7 +3103,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
         || !is_valid_grpc_identifier(method_name)
     {
         return Err(
-            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+            "ai_response_guard: a `grpc.methods` key must be a `/package.Service/Method` path"
                 .to_string(),
         );
     }
@@ -3138,7 +3134,7 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
     };
     if fields.is_empty() {
         return Err(
-            "ai_response_guard: 'grpc.methods' 'text_fields' must not be empty".to_string(),
+            "ai_response_guard: `grpc.methods` `text_fields` must not be empty".to_string(),
         );
     }
     let mut parsed = Vec::with_capacity(fields.len());
@@ -3150,14 +3146,14 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
             .collect();
         if segments.iter().any(String::is_empty) {
             return Err(
-                "ai_response_guard: a 'grpc.methods' 'text_fields' entry must be a dotted \
+                "ai_response_guard: a `grpc.methods` `text_fields` entry must be a dotted \
                  field path with non-empty segments"
                     .to_string(),
             );
         }
         if segments.len() > GRPC_MAX_MESSAGE_DEPTH {
             return Err(
-                "ai_response_guard: a 'grpc.methods' 'text_fields' path exceeds the maximum \
+                "ai_response_guard: a `grpc.methods` `text_fields` path exceeds the maximum \
                  nesting depth"
                     .to_string(),
             );
@@ -3167,7 +3163,7 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
         let normalized = segments.join(".");
         if !seen.insert(normalized) {
             return Err(
-                "ai_response_guard: a 'grpc.methods' 'text_fields' path is configured more \
+                "ai_response_guard: a `grpc.methods` `text_fields` path is configured more \
                  than once"
                     .to_string(),
             );
@@ -3210,7 +3206,7 @@ fn resolve_grpc_shape(
         let descriptor = pool
             .get_message_by_name(&method.response_type)
             .ok_or_else(|| {
-                "ai_response_guard: a 'grpc.methods' 'response_type' was not found in the \
+                "ai_response_guard: a `grpc.methods` `response_type` was not found in the \
                  descriptor"
                     .to_string()
             })?;
@@ -3236,14 +3232,14 @@ fn resolve_text_field_path(root: &MessageDescriptor, path: &[String]) -> Result<
     for (index, segment) in path.iter().enumerate() {
         let Some(field) = current.get_field_by_name(segment) else {
             return Err(
-                "ai_response_guard: a 'grpc.methods' 'text_fields' path names a field that \
+                "ai_response_guard: a `grpc.methods` `text_fields` path names a field that \
                  is not in the descriptor"
                     .to_string(),
             );
         };
         if field.is_map() {
             return Err(
-                "ai_response_guard: a 'grpc.methods' 'text_fields' path may not traverse a \
+                "ai_response_guard: a `grpc.methods` `text_fields` path may not traverse a \
                  map field"
                     .to_string(),
             );
@@ -3254,14 +3250,14 @@ fn resolve_text_field_path(root: &MessageDescriptor, path: &[String]) -> Result<
             Kind::Message(next) if !last => current = next,
             _ => {
                 return Err(
-                    "ai_response_guard: a 'grpc.methods' 'text_fields' path must end at a \
+                    "ai_response_guard: a `grpc.methods` `text_fields` path must end at a \
                      string field"
                         .to_string(),
                 );
             }
         }
     }
-    Err("ai_response_guard: a 'grpc.methods' 'text_fields' path must not be empty".to_string())
+    Err("ai_response_guard: a `grpc.methods` `text_fields` path must not be empty".to_string())
 }
 
 /// Validate the `grpc` block against an already-loaded descriptor pool.
@@ -5047,7 +5043,7 @@ fn reject_unknown_keys(value: &Value, allowed: &[&str], path: &str) -> Result<()
         return Ok(());
     };
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("ai_response_guard: unknown field '{path}.{key}'"));
+        return Err(format!("ai_response_guard: unknown field `{path}` key {key:?}"));
     }
     Ok(())
 }
@@ -5059,7 +5055,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ai_response_guard: '{field}' must be a string"))
+        .ok_or_else(|| format!("ai_response_guard: `{field}` must be a string"))
 }
 
 fn optional_array<'a>(
@@ -5072,7 +5068,7 @@ fn optional_array<'a>(
     value
         .as_array()
         .map(Some)
-        .ok_or_else(|| format!("ai_response_guard: '{field}' must be an array"))
+        .ok_or_else(|| format!("ai_response_guard: `{field}` must be an array"))
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -5083,7 +5079,7 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
     for (idx, value) in values.iter().enumerate() {
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "ai_response_guard: '{field}[{idx}]' must be a string"
+                "ai_response_guard: `{field}[{idx}]` must be a string"
             ));
         };
         out.push(value.to_string());
@@ -5098,7 +5094,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("ai_response_guard: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("ai_response_guard: `{field}` must be a boolean"))
 }
 
 fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
@@ -5107,17 +5103,17 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "ai_response_guard: '{field}' must be an integer greater than zero"
+            "ai_response_guard: `{field}` must be an integer greater than zero"
         ));
     };
     if value == 0 {
         return Err(format!(
-            "ai_response_guard: '{field}' must be greater than zero"
+            "ai_response_guard: `{field}` must be greater than zero"
         ));
     }
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("ai_response_guard: '{field}' is too large for this platform"))
+        .map_err(|_| format!("ai_response_guard: `{field}` is too large for this platform"))
 }
 
 fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
@@ -5126,12 +5122,12 @@ fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, 
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "ai_response_guard: '{field}' must be an unsigned integer"
+            "ai_response_guard: `{field}` must be an unsigned integer"
         ));
     };
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("ai_response_guard: '{field}' is too large for this platform"))
+        .map_err(|_| format!("ai_response_guard: `{field}` is too large for this platform"))
 }
 
 fn required_non_empty_string<'a>(
@@ -5142,17 +5138,17 @@ fn required_non_empty_string<'a>(
 ) -> Result<&'a str, String> {
     let Some(value) = value.get(field) else {
         return Err(format!(
-            "ai_response_guard: '{list_field}[{idx}].{field}' is required"
+            "ai_response_guard: `{list_field}[{idx}].{field}` is required"
         ));
     };
     let Some(value) = value.as_str() else {
         return Err(format!(
-            "ai_response_guard: '{list_field}[{idx}].{field}' must be a string"
+            "ai_response_guard: `{list_field}[{idx}].{field}` must be a string"
         ));
     };
     if value.is_empty() {
         return Err(format!(
-            "ai_response_guard: '{list_field}[{idx}].{field}' must not be empty"
+            "ai_response_guard: `{list_field}[{idx}].{field}` must not be empty"
         ));
     }
     Ok(value)

@@ -190,7 +190,7 @@ fn rejects_invalid_tool_action() {
     let err = try_make(json!({ "tools": { "x": { "action": "explode" } } }))
         .err()
         .unwrap();
-    assert!(err.contains("invalid action"), "{err}");
+    assert!(err.contains("invalid `action`"), "{err}");
 }
 
 #[test]
@@ -12057,7 +12057,7 @@ fn non_string_tool_risk_is_rejected_rather_than_defaulted() {
     let err = try_make(misspelled.clone())
         .err()
         .expect("an unknown risk band must fail admission");
-    assert!(err.contains("invalid risk"), "{err}");
+    assert!(err.contains("invalid `risk`"), "{err}");
     assert!(!validator.is_valid(&misspelled));
 
     // Omission and every valid spelling are unchanged.
@@ -12381,7 +12381,7 @@ fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
     let err = try_make(misspelled.clone())
         .err()
         .expect("an unknown action must fail admission");
-    assert!(err.contains("invalid action"), "{err}");
+    assert!(err.contains("invalid `action`"), "{err}");
     assert!(!validator.is_valid(&misspelled));
 
     // Every valid spelling reachable without an approval webhook is unchanged.
@@ -12415,7 +12415,7 @@ fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_ke
         let err = try_make(config.clone())
             .err()
             .expect("a present non-string endpoint_url must fail admission");
-        assert!(err.contains("'approval.endpoint_url'"), "{err}");
+        assert!(err.contains("`approval.endpoint_url`"), "{err}");
         assert!(err.contains("must be a string"), "{err}");
         assert!(
             err.contains(kind),
@@ -12446,7 +12446,7 @@ fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_ke
     let err = try_make(omitted.clone())
         .err()
         .expect("an omitted endpoint_url must fail admission");
-    assert!(err.contains("'approval.endpoint_url' is required"), "{err}");
+    assert!(err.contains("`approval.endpoint_url` is required"), "{err}");
     assert!(!validator.is_valid(&omitted));
 
     // A valid URL is unchanged.
