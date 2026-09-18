@@ -305,10 +305,7 @@ impl PhaseReport {
                     .is_some_and(|t| at >= t)
                 {
                     "measurement"
-                } else if self
-                    .warmup_start_monotonic_secs
-                    .is_some_and(|t| at >= t)
-                {
+                } else if self.warmup_start_monotonic_secs.is_some_and(|t| at >= t) {
                     "warmup"
                 } else {
                     "setup"
@@ -331,10 +328,12 @@ impl PhaseReport {
             }
             .to_string();
         }
-        events.sort_by(|left, right| match (left.monotonic_secs, right.monotonic_secs) {
-            (Some(left), Some(right)) => left.total_cmp(&right),
-            _ => left.unix_secs.total_cmp(&right.unix_secs),
-        });
+        events.sort_by(
+            |left, right| match (left.monotonic_secs, right.monotonic_secs) {
+                (Some(left), Some(right)) => left.total_cmp(&right),
+                _ => left.unix_secs.total_cmp(&right.unix_secs),
+            },
+        );
         self.transport_events = events;
     }
 }

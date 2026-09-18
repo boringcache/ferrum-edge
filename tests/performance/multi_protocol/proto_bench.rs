@@ -171,7 +171,11 @@ async fn main() -> anyhow::Result<()> {
 static REPORTED_TRANSPORT_ERRORS: AtomicUsize = AtomicUsize::new(0);
 const MAX_REPORTED_TRANSPORT_ERRORS: usize = 512;
 
-fn report_transport_error(protocol: &str, operation: &str, error: &(dyn std::error::Error + 'static)) {
+fn report_transport_error(
+    protocol: &str,
+    operation: &str,
+    error: &(dyn std::error::Error + 'static),
+) {
     let reported = REPORTED_TRANSPORT_ERRORS.fetch_add(1, Ordering::Relaxed);
     if reported < MAX_REPORTED_TRANSPORT_ERRORS {
         eprintln!("  {protocol} {operation} error: {}", error_chain(error));
