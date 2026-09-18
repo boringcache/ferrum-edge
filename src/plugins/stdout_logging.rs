@@ -591,7 +591,7 @@ mod tests {
                         }
                     }
                 }),
-                "unknown field",
+                "`filter.expression` is invalid: invalid expression shape or scalar type",
             ),
         ] {
             let err = match StdoutLogging::new(&config) {
