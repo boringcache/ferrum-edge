@@ -108,7 +108,7 @@ fi
 if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
     PROCESS_USAGE=false
 fi
-if ! $PROCESS_USAGE; then
+if [ "$PROCESS_USAGE" != true ]; then
     echo "[warn] process_usage unavailable; samples are diagnostic and invalid for paired comparisons" >&2
 fi
 
@@ -838,7 +838,7 @@ run_bench() {
         sampler_args+=(--http3)
         case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
     fi
-    if $PROCESS_USAGE; then
+    if [ "$PROCESS_USAGE" = true ]; then
         : > "$usage"
         # /proc/<container-pid>/io requires ptrace read permission across UIDs.
         # Elevate ONLY the passive reader. A stop file avoids signalling sudo's
@@ -991,7 +991,7 @@ main() {
                 H2_OBSERVE=1
                 PAIRS="${campaign%% *}"
                 PAYLOAD_SIZES="${campaign#* }"
-                if ! $PROCESS_USAGE; then
+                if [ "$PROCESS_USAGE" != true ]; then
                     echo "[experiment] H2 campaign requires process observations" >&2
                     exit 2
                 fi
@@ -1006,8 +1006,7 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" \
-        "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
