@@ -68,6 +68,11 @@ libc = "0.2"
 [build-dependencies]
 tonic-prost-build = "0.14.5"
 
+[dev-dependencies]
+# Reuse the repository's socket lease registry for real connector regressions.
+socket2 = "0.6"
+uuid = { version = "1.23.1", features = ["v4"] }
+
 [profile.dev]
 opt-level = 0
 debug = true
