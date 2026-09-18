@@ -90,23 +90,10 @@ fn classification_bodies(source: &str) -> Vec<String> {
 ///   decision, no per-request budget, no rejection. Reuse costs record
 ///   fidelity, not enforcement.
 ///
-/// One entry is neither `true` nor `false` but a property of the INSTANCE:
-///
-/// * `mesh/outbound_registry` — (a) while the instance is scoped to listener
-///   ports. The port gate is the first statement of its hook, so on every port
-///   it does not name it returns `Continue` before any lookup, record, or
-///   rejection — it decided nothing, and eliding a CONNECT it decided nothing
-///   about costs nothing. Mesh auto-injection under `REGISTRY_ONLY` names
-///   exactly the OUTBOUND-direction capture ports and removes the plugin
-///   outright when there are none, and an HBONE CONNECT is only terminated by
-///   an INBOUND listener — but the row is `PluginScope::Global`, so it IS in
-///   the inbound chain and an unconditional `false` would take reuse away from
-///   every inbound tunnel on a REGISTRY_ONLY mesh. An UNSCOPED instance (the
-///   operator-managed generic Host allowlist) enforces wherever it runs, and
-///   its registry verdict is a per-operation decision no sweep re-issues, so
-///   it takes the fail-closed answer. The gate's position inside the hook is
-///   what makes the scoped half sound, so it is pinned separately by
-///   [`the_outbound_registry_port_gate_precedes_every_decision_in_its_hook`].
+/// `mesh/outbound_registry` also refuses reuse. Its listener scope contains
+/// only numeric ports, so a non-empty scope can match the HBONE listener when
+/// inbound and outbound listeners share a port on different bind addresses.
+/// Registry membership can change and the fence does not re-run that lookup.
 ///
 /// The three `false` entries are REDUNDANT against the trait default and kept
 /// deliberately, because each one is where an operation is CHARGED and that is
@@ -125,10 +112,7 @@ const EXPECTED_CLASSIFICATION: &[(&str, &str)] = &[
     ("adaptive_concurrency.rs", "false"),
     ("mesh/authz.rs", "self.ext_authz.is_none()"),
     ("mesh/bpf_metrics.rs", "true"),
-    (
-        "mesh/outbound_registry.rs",
-        "!self.outbound_listen_ports.is_empty()",
-    ),
+    ("mesh/outbound_registry.rs", "false"),
     ("mesh/spiffe_identity.rs", "true"),
     ("mesh/workload_metrics.rs", "true"),
     ("otel_tracing.rs", "true"),
@@ -207,67 +191,6 @@ fn every_builtin_that_classifies_itself_is_in_the_reuse_table() {
              move the table entry and its recorded reason together"
         );
     }
-}
-
-/// `mesh_outbound_registry`'s scoped-instance `true` is only sound while its
-/// port gate is the FIRST thing the hook does and the gate itself decides
-/// nothing.
-///
-/// The plugin is injected `PluginScope::Global` under `REGISTRY_ONLY`, so it is
-/// in the chain that admits every inbound HBONE CONNECT. What keeps it out of
-/// the DECISION is that `should_enforce_for_request` runs before any registry
-/// lookup, any Prometheus record, and any rejection, and answers from the
-/// instance's own port list plus the frontend listener port alone. Move one
-/// statement above that gate — a counter, a metric, a header read that can
-/// reject — and an elided CONNECT stops being one that decided nothing, which
-/// is the whole justification recorded in `EXPECTED_CLASSIFICATION`.
-#[test]
-fn the_outbound_registry_port_gate_precedes_every_decision_in_its_hook() {
-    let src = read_source(&repo_root().join("src/plugins/mesh/outbound_registry.rs"));
-
-    let hook_start = src
-        .find("async fn on_request_received(")
-        .expect("the outbound registry must implement the request hook");
-    let hook = normalized(&src[hook_start..]);
-    assert!(
-        hook.starts_with(
-            "async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult { if \
-             !self.should_enforce_for_request(ctx) { return PluginResult::Continue; }"
-        ),
-        "the port gate must be the FIRST statement of the hook and must return `Continue` \
-         immediately: a scoped instance claims reuse on the grounds that it decided nothing on \
-         the listener that terminated the CONNECT"
-    );
-
-    const GATE: &str = "fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {";
-    let flat = normalized(&src);
-    let gate_start = flat.find(GATE).expect("the port gate must exist");
-    let after_gate = &flat[gate_start + GATE.len()..];
-    let gate_end = after_gate
-        .find('}')
-        .expect("the port gate body must close with `}`");
-    let gate_body = after_gate[..gate_end].trim();
-    for forbidden in [
-        "record_decision",
-        "record_deny_decision",
-        "reject(",
-        "ctx.headers",
-        "self.contains",
-        "self.hosts",
-        "self.host_ports",
-    ] {
-        assert!(
-            !gate_body.contains(forbidden),
-            "the port gate must decide, record, and reject nothing (found `{forbidden}` in \
-             `{gate_body}`)"
-        );
-    }
-    assert!(
-        gate_body.contains("self.outbound_listen_ports")
-            && gate_body.contains("frontend_listen_port"),
-        "the port gate must answer from the instance's own port list and the frontend listener \
-         port alone, got `{gate_body}`"
-    );
 }
 
 /// The default decides every UNCLASSIFIED plugin, including every custom one,

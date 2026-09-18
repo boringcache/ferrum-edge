@@ -3509,29 +3509,19 @@ fn assert_registry_only_gate_is_injected(config: &GatewayConfig) {
     );
 }
 
-/// `REGISTRY_ONLY` must neither withhold inbound reuse nor revoke the tunnels
-/// that already have it.
+/// Publishing `REGISTRY_ONLY` withdraws reuse even when its injected numeric
+/// port scope does not match this inbound listener.
 ///
-/// `mesh_outbound_registry` is injected `PluginScope::Global`, and a global
-/// plugin enters EVERY proxy chain — including the one that admits an inbound
-/// HBONE CONNECT. What keeps it out of that decision is its port gate, the
-/// first statement of its hook: the CONNECT arrives on the inbound listener,
-/// which is not an outbound capture port, so the hook returns `Continue` before
-/// any registry lookup. A blanket `false` classification would therefore have
-/// turned inner reuse off mesh-wide for a common Istio posture — and, because
-/// eligibility is re-judged on every sweep, revoked every already-reusable
-/// inbound tunnel the moment an operator applied the policy.
-///
-/// Both halves are asserted against the production dispatcher: a live tunnel
-/// survives the publication still carrying bytes, and a fresh CONNECT under the
-/// new generation is admitted AND advertised.
+/// The scope cannot prove that another valid deployment will not use the same
+/// numeric port for inbound HBONE and outbound capture on different bind
+/// addresses. The registry membership decision is not re-issued by the fence,
+/// so the plugin must classify every instance fail-closed. The CONNECT remains
+/// admitted here because the gate does not apply on this listener, but it may
+/// not carry the reuse capability.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse() {
+async fn a_registry_only_publication_withdraws_inbound_reuse_fail_closed() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
     let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
-
-    // ALLOW_ANY start, on the SAME runtime the publication uses, so the only
-    // delta between the two generations is the outbound traffic policy.
     let state = build_state(prepared_config_from_mesh_with_runtime(
         Some(backend_addr.port()),
         None,
@@ -3551,8 +3541,7 @@ async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         tunnel_reuse_advertisement(&response).as_deref(),
-        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
-        "the ALLOW_ANY chain is the ordinary reusable one, or this test proves nothing"
+        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED)
     );
     let mut tunnel = Tunnel {
         request_body,
@@ -3572,35 +3561,25 @@ async fn a_registry_only_publication_neither_revokes_nor_withholds_inbound_reuse
         state.update_config(registry_only),
         ConfigApplyOutcome::Applied
     );
-    wait_for_settled_sweeps(&state).await;
 
-    assert_eq!(
-        state.hbone_admission_fence.live_tunnels(),
-        1,
-        "arming REGISTRY_ONLY must not revoke an inbound tunnel: the gate it installs answers \
-         `Continue` on the listener that terminated this CONNECT"
-    );
+    assert_tunnel_closed(&mut tunnel.response_body).await;
+    wait_for_no_live_tunnels(&state).await;
     assert_eq!(
         revocation_counts(&state),
-        [0, 0, 0, 0, 0, 0, 0, 0, 0],
-        "no reuse_withdrawn, and no refusal either"
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],
+        "the registry classification must withdraw reuse without treating the CONNECT as denied"
     );
-    // Still carrying bytes, not merely still registered.
-    echo_round_trip(&mut tunnel, b"after-registry-only").await;
 
-    // And the capability survives into the new generation. The empty registry
-    // would refuse every destination if this gate decided inbound at all, so a
-    // 200 here is itself the proof that it did not.
     let (response, _request_body) = send_connect(&mut sender, None).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "an outbound egress policy must not refuse an inbound CONNECT"
+        "the outbound-only gate must still leave this inbound CONNECT admitted"
     );
     assert_eq!(
-        tunnel_reuse_advertisement(&response).as_deref(),
-        Some(ferrum_edge::modes::mesh::hbone::TUNNEL_REUSE_FENCED),
-        "and it must not cost the new tunnel its capability either"
+        tunnel_reuse_advertisement(&response),
+        None,
+        "a scoped registry must fail closed because numeric scope cannot prove listener identity"
     );
 
     let _ = shutdown_tx.send(true);

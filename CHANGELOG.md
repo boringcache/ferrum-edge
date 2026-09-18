@@ -292,20 +292,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RequestAuthentication` is in play (correct and permanent — the fence bounds
   the mTLS leaf, not a bearer token's own lifetime); `__mesh_bpf_metrics` is
   classified reusable (it implements no request hook at all); and
-  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) is
-  classified per INSTANCE, `!outbound_listen_ports.is_empty()`. It is injected
-  as a `PluginScope::Global` row and globals enter every proxy chain, so it is
-  in every inbound admitting chain; the outbound-port list gates the request
-  hook's ENFORCEMENT, not the plugin's membership. What keeps it out of the
-  CONNECT's decision is that its port gate is the first statement of the hook,
-  so a request on a port the instance does not name returns `Continue` before
-  any registry lookup, metric, or rejection — and auto-injection names exactly
-  the outbound-direction capture ports, while only an inbound listener
-  terminates an HBONE CONNECT. A blanket `false` would have withheld inbound
-  reuse mesh-wide on a REGISTRY_ONLY mesh and revoked every already-reusable
-  inbound tunnel when the policy was applied; a blanket `true` would have
-  granted reuse to an operator-managed UNSCOPED instance, which really does
-  enforce on the inbound listener, so that shape keeps the fail-closed default.
+  `mesh_outbound_registry` (`outboundTrafficPolicy: REGISTRY_ONLY`) explicitly
+  refuses reuse. Its listener scope contains only numeric ports and can match an
+  HBONE listener when inbound and outbound listeners share a port on different
+  bind addresses. Because the fence does not re-run registry membership checks,
+  refusing reuse prevents a pooled inner connection from retaining access after
+  its destination is removed.
 - **A live HBONE tunnel loses inner reuse when its chain stops permitting it**
   (issue #5583). The admission snapshot records whether reuse was advertised —
   the same value the header was stamped from — and every admission-fence sweep
