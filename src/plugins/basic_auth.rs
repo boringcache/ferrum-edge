@@ -76,7 +76,7 @@ impl BasicAuth {
                     obj,
                     "config",
                     BASIC_AUTH_CONFIG_KEYS,
-                    "basic_auth: ",
+                    "basic_auth: `config`: ",
                 )?;
                 match obj.get("hide_credentials") {
                     Some(value) => value.as_bool().ok_or_else(|| {

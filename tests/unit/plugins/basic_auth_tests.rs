@@ -844,3 +844,34 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn unknown_key_diagnostic_preserves_root_context_without_supplied_data() {
+    let canary = "'CALLER_QUOTED_CANARY\"`\n\\payload";
+    let config = json!({
+        "hide_credentails": {"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]},
+        "CALLER_KEY_CANARY": "CALLER_VALUE_CANARY",
+        "975318642": ["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}],
+        (canary): canary
+    });
+    let error = ferrum_edge::plugins::basic_auth::BasicAuth::new(&config)
+        .err()
+        .expect("unknown root keys must be rejected before secret admission");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in [
+        "basic_auth: `config`:",
+        "unknown configuration key(s)",
+        "did you mean `hide_credentials`?",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected:?}: {rendered}");
+    }
+    for supplied in [
+        "hide_credentails",
+        "CALLER_",
+        "8675309",
+        "975318642",
+        "payload",
+    ] {
+        assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+    }
+}

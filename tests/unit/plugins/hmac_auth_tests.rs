@@ -403,7 +403,7 @@ fn test_hmac_auth_unknown_key_diagnostic_names_the_plugin_and_the_key() {
         panic!("a misspelled root key must be refused");
     };
     assert!(
-        error.starts_with("hmac_auth: unknown configuration key(s):"),
+        error.starts_with("hmac_auth: `config`: unknown configuration key(s):"),
         "diagnostic must be plugin-qualified: {error}"
     );
     assert!(
@@ -3418,5 +3418,30 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ] {
             assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
         }
+    }
+}
+
+#[test]
+fn unknown_key_diagnostic_preserves_root_context_without_supplied_data() {
+    let canary = "'CALLER_QUOTED_CANARY\"`\n\\payload";
+    let config = json!({
+        "replay_scpoe": {"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]},
+        "CALLER_KEY_CANARY": "CALLER_VALUE_CANARY",
+        "975318642": ["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}],
+        (canary): canary
+    });
+    let error = HmacAuth::new(&config)
+        .err()
+        .expect("unknown root keys must be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in [
+        "hmac_auth: `config`:",
+        "unknown configuration key(s)",
+        "did you mean `replay_scope`?",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected:?}: {rendered}");
+    }
+    for supplied in ["replay_scpoe", "CALLER_", "8675309", "975318642", "payload"] {
+        assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
     }
 }

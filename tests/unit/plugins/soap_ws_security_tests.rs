@@ -9446,3 +9446,88 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn unknown_key_diagnostics_preserve_every_schema_path_and_credential_ordinal() {
+    let canary = "'CALLER_QUOTED_CANARY\"`\n\\payload";
+    let base = json!({
+        "content_type": {},
+        "timestamp": {"require": true},
+        "username_token": {
+            "credentials": [
+                {"username": "CALLER_FIRST_USER_CANARY", "password": "CALLER_PASSWORD_CANARY"},
+                {"username": canary, "password": "CALLER_SECOND_PASSWORD_CANARY"}
+            ]
+        },
+        "x509_signature": {},
+        "saml": {},
+        "nonce": {}
+    });
+    for (pointer, path, typo, suggestion) in [
+        ("", "config", "timestmap", "timestamp"),
+        (
+            "/content_type",
+            "config.content_type",
+            "allow_mtmo",
+            "allow_mtom",
+        ),
+        (
+            "/timestamp",
+            "config.timestamp",
+            "clock_skwe_seconds",
+            "clock_skew_seconds",
+        ),
+        (
+            "/username_token",
+            "config.username_token",
+            "enabeld",
+            "enabled",
+        ),
+        (
+            "/username_token/credentials/1",
+            "config.username_token.credentials[1]",
+            "passwrod",
+            "password",
+        ),
+        (
+            "/x509_signature",
+            "config.x509_signature",
+            "enabeld",
+            "enabled",
+        ),
+        ("/saml", "config.saml", "enabeld", "enabled"),
+        ("/nonce", "config.nonce", "replay_scpoe", "replay_scope"),
+    ] {
+        let mut config = base.clone();
+        let object = config.pointer_mut(pointer).unwrap().as_object_mut().unwrap();
+        // Pair the missing required credential field with its structured typo.
+        if pointer == "/username_token/credentials/1" {
+            object.remove("password");
+        }
+        object.insert(
+            typo.to_string(),
+            json!({"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]}),
+        );
+        object.insert("CALLER_KEY_CANARY".to_string(), json!("CALLER_VALUE_CANARY"));
+        object.insert(
+            "975318642".to_string(),
+            json!(["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}]),
+        );
+        object.insert(canary.to_string(), json!(canary));
+        let error = SoapWsSecurity::new(&config)
+            .err()
+            .expect("unknown keys must be rejected at the selected schema path");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for expected in [
+            format!("soap_ws_security: `{path}`:"),
+            "unknown configuration key(s)".to_string(),
+            format!("did you mean `{suggestion}`?"),
+        ] {
+            assert!(rendered.contains(&expected), "missing {expected:?}: {rendered}");
+        }
+        assert!(!rendered.contains(typo), "leaked {typo:?}: {rendered}");
+        for supplied in ["CALLER_", "8675309", "975318642", "payload"] {
+            assert!(!rendered.contains(supplied), "leaked {supplied:?}: {rendered}");
+        }
+    }
+}

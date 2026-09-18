@@ -638,7 +638,7 @@ impl OpenapiValidator {
         // Fail closed on typos before any default is applied: a misspelled
         // enforcement control would otherwise construct successfully with the
         // weaker default still in force (GHSA-692x-352q-6gm8).
-        reject_unknown_keys(object, "config", CONFIG_KEYS, ERROR_PREFIX)?;
+        reject_unknown_keys(object, "config", CONFIG_KEYS, "openapi_validator: `config`: ")?;
 
         let mode = parse_mode(optional_string(object, "enforcement_mode")?.unwrap_or("block"))?;
         let validate_request = optional_bool(object, "validate_request")?.unwrap_or(true);
@@ -727,7 +727,12 @@ impl OpenapiValidator {
 
         let bypass = optional_object(object, "bypass")?;
         if let Some(bypass) = bypass {
-            reject_unknown_keys(bypass, "config.bypass", BYPASS_KEYS, ERROR_PREFIX)?;
+            reject_unknown_keys(
+                bypass,
+                "config.bypass",
+                BYPASS_KEYS,
+                "openapi_validator: `config.bypass`: ",
+            )?;
         }
         let bypass_paths = parse_regex_set(bypass.and_then(|b| b.get("paths")), "bypass.paths")?;
         let bypass_methods = optional_string_vec_from_object(bypass, "methods")?
@@ -748,7 +753,7 @@ impl OpenapiValidator {
                 error_response,
                 "config.error_response",
                 ERROR_RESPONSE_KEYS,
-                ERROR_PREFIX,
+                "openapi_validator: `config.error_response`: ",
             )?;
         }
         let request_error_status =
@@ -1591,7 +1596,7 @@ fn parse_operation(
         object,
         &format!("config.operations[{index}]"),
         OPERATION_KEYS,
-        ERROR_PREFIX,
+        &format!("{ERROR_PREFIX}`config.operations[{index}]`: "),
     )?;
     let method = optional_string(object, "method")?
         .ok_or_else(|| format!("openapi_validator: `operations[{index}].method` is required"))?
@@ -1672,7 +1677,12 @@ fn parse_request_validators(
         .iter()
         .any(|key| object.contains_key(*key));
     if is_inline_form {
-        reject_unknown_keys(object, &path, REQUEST_BODY_INLINE_KEYS, ERROR_PREFIX)?;
+        reject_unknown_keys(
+            object,
+            &path,
+            REQUEST_BODY_INLINE_KEYS,
+            &format!("{ERROR_PREFIX}`{path}`: "),
+        )?;
         let content_type = object
             .get("content_type")
             .and_then(Value::as_str)
@@ -1699,7 +1709,12 @@ fn parse_request_validators(
         )?;
         return Ok(validators);
     }
-    reject_unknown_keys(object, &path, REQUEST_BODY_CONTENT_KEYS, ERROR_PREFIX)?;
+    reject_unknown_keys(
+        object,
+        &path,
+        REQUEST_BODY_CONTENT_KEYS,
+        &format!("{ERROR_PREFIX}`{path}`: "),
+    )?;
     let content = object
         .get("content")
         .and_then(Value::as_object)
@@ -1765,11 +1780,13 @@ fn parse_response_validators(
         // accepted in the media map form and is skipped.
         let content = match response_object.get("content") {
             Some(content) => {
+                // The visible prefix is schema-only; response_path includes a
+                // supplied status key, even though that key is Debug-escaped.
                 reject_unknown_keys(
                     response_object,
                     &format!("config.operations[{operation_index}].responses"),
                     RESPONSE_OBJECT_KEYS,
-                    ERROR_PREFIX,
+                    &format!("{ERROR_PREFIX}`config.operations[{operation_index}].responses`: "),
                 )?;
                 content.as_object().ok_or_else(|| {
                     format!("openapi_validator: `{response_path}.content` must be an object")
@@ -2325,7 +2342,7 @@ fn parse_property_encoding(
                     } else {
                         ENCODING_HEADER_OBJECT_SCHEMA_KEYS
                     },
-                    ERROR_PREFIX,
+                    "openapi_validator: `encoding.headers`: ",
                 )?;
                 if let Some(description) = header_object.get("description")
                     && !description.is_null()
@@ -2372,7 +2389,7 @@ fn parse_property_encoding(
                         media_object,
                         "encoding.headers.content",
                         &["schema", "example", "examples"],
-                        ERROR_PREFIX,
+                        "openapi_validator: `encoding.headers.content`: ",
                     )?;
                     if let Some(examples) = media_object.get("examples")
                         && !examples.is_object()

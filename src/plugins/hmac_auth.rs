@@ -918,7 +918,12 @@ impl HmacAuth {
         // posture than the operator wrote.
         // The prefix carries its own separator: `reject_unknown_keys` renders
         // `{error_prefix}unknown configuration key(s): …` verbatim.
-        reject_unknown_keys(config_obj, "config", &root_config_keys(), "hmac_auth: ")?;
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            &root_config_keys(),
+            "hmac_auth: `config`: ",
+        )?;
 
         // The shared Redis helper ASCII-lowercases `sync_mode` before matching,
         // which would admit spellings the published enum does not list. Screen

@@ -949,6 +949,7 @@ const DIGEST_ALGORITHM_VARIANTS: &[(&str, DigestAlgorithm)] = &[
 
 /// Reject unknown keys on a fixed-shape object with the shared path-qualified
 /// diagnostics (including spelling suggestions).
+/// Every caller supplies only schema literals and credential array ordinals.
 fn reject_unknown(
     object: Option<&ConfigObject>,
     path: &str,
@@ -957,7 +958,7 @@ fn reject_unknown(
     let Some(map) = object else {
         return Ok(());
     };
-    reject_unknown_keys(map, path, allowed, "soap_ws_security: ")
+    reject_unknown_keys(map, path, allowed, &format!("soap_ws_security: `{path}`: "))
 }
 
 /// Configured duration, converted once at admission so the request path never
