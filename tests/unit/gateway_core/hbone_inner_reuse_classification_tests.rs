@@ -90,12 +90,22 @@ fn classification_bodies(source: &str) -> Vec<String> {
 ///   decision, no per-request budget, no rejection. Reuse costs record
 ///   fidelity, not enforcement.
 ///
-/// `mesh/outbound_registry` also refuses reuse. Its listener scope contains
-/// only numeric ports, so a non-empty scope can match the HBONE listener when
-/// inbound and outbound listeners share a port on different bind addresses.
-/// Registry membership can change and the fence does not re-run that lookup.
+/// `mesh/outbound_registry` is classified per INSTANCE:
 ///
-/// The three `false` entries are REDUNDANT against the trait default and kept
+/// * A scoped instance qualifies under (a). Its first hook statement gates on
+///   listener direction before the numeric port scope: Inbound always returns
+///   `Continue` before any lookup, metric, or rejection, even on a matching
+///   port. An inbound CONNECT therefore decided nothing, and eliding it costs
+///   nothing. Auto-injection names the outbound capture ports (and removes the
+///   plugin when there are none), but the Global row enters inbound chains too.
+///   A blanket `false` would withhold reuse and revoke live advertised tunnels
+///   on REGISTRY_ONLY publication. The direction boundary and gate position are
+///   pinned by [`the_outbound_registry_port_gate_precedes_every_decision_in_its_hook`].
+/// * An UNSCOPED instance also skips Inbound, but enforces as a generic Host
+///   allowlist on non-mesh listeners. That verdict is a per-operation decision
+///   no sweep re-issues, so this instance keeps the fail-closed answer.
+///
+/// The three literal `false` entries are REDUNDANT against the trait default and kept
 /// deliberately, because each one is where an operation is CHARGED and that is
 /// the fact a future reader needs at the charge site:
 ///
@@ -112,7 +122,10 @@ const EXPECTED_CLASSIFICATION: &[(&str, &str)] = &[
     ("adaptive_concurrency.rs", "false"),
     ("mesh/authz.rs", "self.ext_authz.is_none()"),
     ("mesh/bpf_metrics.rs", "true"),
-    ("mesh/outbound_registry.rs", "false"),
+    (
+        "mesh/outbound_registry.rs",
+        "!self.outbound_listen_ports.is_empty()",
+    ),
     ("mesh/spiffe_identity.rs", "true"),
     ("mesh/workload_metrics.rs", "true"),
     ("otel_tracing.rs", "true"),
@@ -191,6 +204,51 @@ fn every_builtin_that_classifies_itself_is_in_the_reuse_table() {
              move the table entry and its recorded reason together"
         );
     }
+}
+
+/// The scoped registry's reuse classification depends on its direction/port
+/// gate running before every decision and side effect. Pin the complete gate
+/// body so adding a lookup, metric, or new request input cannot silently weaken
+/// that proof. Numeric port scoping alone does not identify an inbound listener.
+#[test]
+fn the_outbound_registry_port_gate_precedes_every_decision_in_its_hook() {
+    let src = read_source(&repo_root().join("src/plugins/mesh/outbound_registry.rs"));
+    let hook_start = src
+        .find("async fn on_request_received(")
+        .expect("the outbound registry must implement the request hook");
+    let hook = normalized(&src[hook_start..]);
+    assert!(
+        hook.starts_with(
+            "async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult { if \
+             !self.should_enforce_for_request(ctx) { return PluginResult::Continue; }"
+        ),
+        "the direction/port gate must be the FIRST statement and return Continue immediately"
+    );
+
+    const GATE: &str = "fn should_enforce_for_request(&self, ctx: &RequestContext) -> bool {";
+    let flat = normalized(&src);
+    let gate_start = flat.find(GATE).expect("the direction/port gate must exist");
+    let after_gate = &flat[gate_start + GATE.len()..];
+    let mut depth = 1;
+    let gate_end = after_gate
+        .char_indices()
+        .find_map(|(index, ch)| {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(index)
+        })
+        .expect("the gate body must close with `}`");
+    let gate_body = after_gate[..gate_end].trim();
+    assert_eq!(
+        gate_body,
+        "if ctx.mesh_direction == Some(MeshTrafficDirection::Inbound) { return false; } \
+         self.outbound_listen_ports.is_empty() || ctx .frontend_listen_port \
+         .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())",
+        "the gate must skip Inbound for every instance and otherwise read only the port scope"
+    );
 }
 
 /// The default decides every UNCLASSIFIED plugin, including every custom one,

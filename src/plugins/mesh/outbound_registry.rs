@@ -516,14 +516,27 @@ impl Plugin for OutboundRegistry {
         HTTP_FAMILY_PROTOCOLS
     }
 
-    /// Registry membership is a per-operation decision that the admission
-    /// fence does not re-run. Listener scoping uses only a numeric port, so a
-    /// non-empty scope can still match the HBONE listener (for example when
-    /// inbound and outbound listeners use the same port on different bind
-    /// addresses). Refuse reuse for every instance rather than letting a live
-    /// tunnel retain access after its destination is removed from the registry.
+    /// Reusable while this instance is scoped to explicit listener ports.
+    ///
+    /// `should_enforce_for_request` is the FIRST statement of the request
+    /// hook and reads only the listener-stamped direction, frontend port, and
+    /// this instance's port list. Inbound always returns `Continue` before
+    /// any registry lookup, metric, or rejection, even if its numeric port
+    /// appears in the scope. An inbound HBONE CONNECT can therefore never be
+    /// decided by this egress plugin, whatever the listener port numbers.
+    ///
+    /// Auto-injection names the outbound capture ports and removes the plugin
+    /// when none exist. Its Global row still enters every inbound chain, so a
+    /// blanket refusal would withhold inbound reuse and revoke live advertised
+    /// tunnels on REGISTRY_ONLY publication despite deciding nothing on them.
+    ///
+    /// An UNSCOPED operator-managed instance (also built by `Self::deny_all`)
+    /// skips Inbound too, but enforces on non-mesh listeners as a generic Host
+    /// allowlist. Its registry verdict is a per-operation decision no sweep
+    /// re-issues: the fence re-issues authorization and the mTLS credential,
+    /// never this lookup. Keep the fail-closed default for that instance shape.
     fn allows_hbone_inner_reuse(&self) -> bool {
-        false
+        !self.outbound_listen_ports.is_empty()
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
