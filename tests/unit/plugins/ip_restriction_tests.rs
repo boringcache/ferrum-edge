@@ -707,7 +707,7 @@ fn mapped_ipv6_cidr_prefixes_below_96_reject_construction() {
         let error = IpRestriction::new(&config)
             .err()
             .expect("mapped IPv6 CIDRs below /96 must be rejected");
-        assert!(error.contains("invalid allow rule"), "{error}");
+        assert!(error.contains("invalid `allow` rule"), "{error}");
     }
 }
 
@@ -977,7 +977,7 @@ fn unknown_keys_are_rejected_even_when_another_policy_list_is_valid() {
             .err()
             .expect("unknown key must be rejected");
         assert!(error.contains("unknown configuration field"), "{error}");
-        assert!(error.contains("allow, deny, mode"), "{error}");
+        assert!(error.contains("`allow`, `deny`, `mode`"), "{error}");
     }
 }
 

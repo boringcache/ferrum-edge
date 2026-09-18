@@ -494,15 +494,12 @@ fn test_x509_no_trusted_certs_is_error() {
 const MALFORMED_INLINE_PEM: &str =
     "-----BEGIN CERTIFICATE-----\nSOAP-INLINE-SOURCE-SENTINEL\n-----END CERTIFICATE-----\n";
 
-/// The plugin's operator-facing label for the fixture above.
-const INLINE_PEM_DISPLAY: &str = "inline-pem:<redacted>";
+/// Fixed schema paths identify material without echoing its configured source.
+const X509_CERT_FIELD: &str = "`config.x509_signature.trusted_certs[0]`";
+const SAML_CERT_FIELD: &str = "`config.saml.trusted_signing_certs[0]`";
 
-/// A successful fetch followed by a failed PEM decode must name the material by
-/// its redacted display label, never by the configured source.
-///
-/// The UTF-8 arm already did this; the decode/parse/key arms interpolated the
-/// raw configured string, so a `vault://…` path — or, as here, inline private
-/// material — was disclosed on exactly the paths most likely to fire.
+/// Decode/parse failures preserve field context while withholding inline
+/// material and configured provider paths.
 #[test]
 fn test_x509_malformed_pem_error_withholds_configured_source() {
     let config = json!({
@@ -524,8 +521,8 @@ fn test_x509_malformed_pem_error_withholds_configured_source() {
         "the configured source must not be echoed: {err}"
     );
     assert!(
-        err.contains(INLINE_PEM_DISPLAY),
-        "the redacted display label must identify the material: {err}"
+        err.contains(X509_CERT_FIELD),
+        "the fixed schema path must identify the material: {err}"
     );
 }
 
@@ -547,8 +544,8 @@ fn test_x509_end_marker_before_begin_fails_without_panicking() {
         .expect("misordered PEM markers must fail admission");
     assert!(err.contains("failed to decode PEM"), "got: {err}");
     assert!(
-        !err.contains(source) && err.contains(INLINE_PEM_DISPLAY),
-        "misordered inline PEM must be rejected under a redacted source label: {err}"
+        !err.contains(source) && err.contains(X509_CERT_FIELD),
+        "misordered inline PEM must be rejected under its fixed schema path: {err}"
     );
 }
 
@@ -578,8 +575,8 @@ fn test_saml_malformed_pem_error_withholds_configured_source() {
         "the configured source must not be echoed: {err}"
     );
     assert!(
-        err.contains(INLINE_PEM_DISPLAY),
-        "the redacted display label must identify the material: {err}"
+        err.contains(SAML_CERT_FIELD),
+        "the fixed schema path must identify the material: {err}"
     );
 }
 
@@ -611,8 +608,8 @@ fn test_x509_unparsable_cert_error_withholds_configured_source() {
         "the configured source must not be echoed: {err}"
     );
     assert!(
-        err.contains(INLINE_PEM_DISPLAY),
-        "the redacted display label must identify the material: {err}"
+        err.contains(X509_CERT_FIELD),
+        "the fixed schema path must identify the material: {err}"
     );
 }
 
