@@ -43,7 +43,7 @@ impl CompiledExemptions {
             object,
             "config.global_exemptions",
             GLOBAL_EXEMPTION_KEYS,
-            "waf: ",
+            "waf: `config.global_exemptions`: ",
         )?;
 
         let paths = optional_string_vec(object, "paths")?.unwrap_or_default();
