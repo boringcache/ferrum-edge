@@ -1041,24 +1041,19 @@ async fn functional_cli_validate_withholds_secret_backed_scalar_in_range_error()
     );
 }
 
-/// Non-vacuity control for the test above: an ordinary, non-secret-backed value
-/// stays visible in the same diagnostic.
-///
-/// Key-tied withholding is scoped to variables that were externally resolved.
-/// Without this control, a site that withheld the value unconditionally — or one
-/// that simply stopped printing it — would satisfy the redaction assertion while
-/// making an ordinary misconfiguration undiagnosable.
+/// A directly configured scalar is withheld at the final emission boundary too.
+/// Keep the field and fixed legal bounds so the failure remains actionable;
+/// a possessive apostrophe must not consume the rest of the diagnostic.
 #[ignore]
 #[tokio::test]
-async fn functional_cli_validate_shows_ordinary_scalar_in_range_error() {
+async fn functional_cli_validate_keeps_range_context_while_withholding_scalar() {
     let temp_dir = TempDir::new().unwrap();
     let jwt_path = temp_dir.path().join("jwt-secret");
     std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
 
     let output = validate_database_mode_command(&temp_dir)
         .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
-        // Set directly rather than through a `_FILE` suffix: this variable was
-        // not externally resolved, so the value must survive.
+        // Direct input still follows the document-scalar withholding contract.
         .env("FERRUM_HTTP3_INITIAL_MTU", "1199")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1073,9 +1068,18 @@ async fn functional_cli_validate_shows_ordinary_scalar_in_range_error() {
         "an out-of-range MTU must fail validation: stdout={stdout}, stderr={stderr}"
     );
     assert!(
-        stderr.contains("FERRUM_HTTP3_INITIAL_MTU (1199)"),
-        "an ordinary configuration value must stay diagnosable, got: {stderr}"
+        stderr.contains("FERRUM_HTTP3_INITIAL_MTU (<redacted scalar>)")
+            && stderr.contains("is outside the legal QUIC range [1200, 65527]"),
+        "the field and fixed legal bounds must stay diagnosable, got: {stderr}"
     );
+    for output in [stdout.as_ref(), stderr.as_ref()] {
+        assert!(
+            !output
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|token| token == "1199"),
+            "the rejected scalar must be withheld: {output}"
+        );
+    }
 }
 
 /// Redaction must read the original diagnostic only, never the text it just
@@ -3660,6 +3664,10 @@ async fn functional_cli_dp_initial_snapshot_rejection_withholds_document_values(
     let mut command = installed_cli_command(&directory, &["run", "-m", "dp"]);
     command
         .env("FERRUM_NAMESPACE", "ferrum")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "synthetic-admin-secret-at-least-32-characters",
+        )
         .env("FERRUM_DP_CP_GRPC_URLS", address)
         .env(
             "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -4714,10 +4722,15 @@ async fn functional_cli_cp_startup_withholds_apostrophe_leading_trust_kid() {
         "secret": "synthetic-trust-secret-at-least-32-characters", "namespaces": ["ferrum"]
     }]});
     std::fs::write(&path, document.to_string()).unwrap();
+    // A file keeps every connection in the CP pool on the same schema.
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("control-plane.db").display()
+    );
     let mut command = installed_cli_command(&directory, &["run", "-m", "cp"]);
     command
         .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", "sqlite::memory:")
+        .env("FERRUM_DB_URL", &db_url)
         .env("FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH", &path)
         .env("FERRUM_CP_GRPC_LISTEN_ADDR", "127.0.0.1:0")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
