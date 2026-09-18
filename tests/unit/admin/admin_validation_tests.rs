@@ -802,7 +802,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
         (
             "outer-key",
             json!({"schemas": {"audit": {}}, "strict": true}),
-            "config.strict",
+            "unknown config key \"strict\" at `config`",
         ),
         (
             "derived-key",
@@ -815,7 +815,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
                     }
                 }
             }),
-            "derived_fields[0].from",
+            "unknown schema key \"from\" at `derived_fields[0]`",
         ),
         (
             "metadata-key",
@@ -826,7 +826,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
                     }
                 }
             }),
-            "metadata.on_collison",
+            "unknown schema key \"on_collison\" at `metadata`",
         ),
     ] {
         let plugin_config = ferrum_edge::config::types::PluginConfig {

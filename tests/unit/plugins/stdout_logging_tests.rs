@@ -109,7 +109,7 @@ fn test_stdout_logging_rejects_non_object_config() {
 fn test_shared_validation_rejects_invalid_stdout_logging_config() {
     let err = validate_plugin_config("stdout_logging", &json!({"filter": "errors"}))
         .expect_err("shared plugin validation must reject a non-object filter");
-    assert_eq!(err, "stdout_logging: filter must be an object");
+    assert_eq!(err, "stdout_logging: `filter` must be an object");
 }
 
 #[test]
