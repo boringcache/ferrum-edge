@@ -1,7 +1,7 @@
 # Hosted H1 internal profiling foundation (#5588)
 
-`bench-h1-profile` is a **default-off diagnostic feature**. This change adds
-measurement only. It does not change coalescing, Content-Length, body limits,
+`bench-h1-profile` is a **default-off diagnostic feature**, accompanied by
+hosted regression fixtures. It does not change coalescing, Content-Length, body limits,
 timeouts, retries, offered load, TLS verification, release optimization settings,
 or forwarding policy. #5600's client frame/chunk/TLS observations and `/proc/io`
 remain distinct sources. This branch starts at #5602 head
@@ -131,7 +131,8 @@ was executed locally for this implementation. Static inspection and
 feature-enabled clippy/binary compilation, registered external observer tests,
 private publication-seam tests located under `tests/unit/gateway_core/`, existing
 coalescer contracts with observers on/off, existing live functional streaming
-contracts, and H1 schema/completeness tests. The independent Benchmark Harness
+contracts, the explicit H1 cadence/safety matrix below, supported-protocol
+trailer gates, and H1 schema/completeness tests. The independent Benchmark Harness
 Tests discovery also runs the new Python tests. These are registrations, not
 claims of passing execution.
 
@@ -180,6 +181,73 @@ overhead calibration; shared-host process CPU is not isolated proxy cost, and RS
 is not allocation traffic. Scrape overhead is included in the gateway process and
 sampler timings, not analytically subtracted.
 
+## Live cadence and safety gate
+
+`tests/functional/h1_cadence_tests.rs` is registered in the functional binary on
+Linux and explicitly selected by the dedicated `cadence` job. The existing
+`functional_streaming` filter does not select it. Each observer-off/on matrix
+job compiles and lints the functional target, builds and copies its external
+binary, pins `FERRUM_EDGE_TEST_BIN`, and retains the revision, binary SHA-256,
+test output and failures in `h1-cadence-{off,on}-<sha>` artifacts. No implicit
+harness rebuild is allowed. Measurement now depends on both cadence jobs as
+well as the existing checks. PR events run these gates without measurements;
+manual dispatch uses the unchanged `payloads` input and command above, and
+also runs the calibration/measurement job. These are hosted registrations;
+no passing execution is claimed by this implementation.
+
+Each of five tests runs cutoffs **0 and 1**, with cleartext H1 on both hops and
+with **verified TLS on both hops**. The TLS backend uses the existing `TestCa`
+and scripted `TlsConfig` with H1-only ALPN; the client trusts only that CA.
+Leased sockets and `TestGateway` supply listener ownership, child-authenticated
+readiness and cleanup. The existing scripted steps have no release barrier, so
+this module owns a small channel-driven script without changing shared runners.
+
+| Contract | Observable assertion |
+| --- | --- |
+| Tiny/delayed ordinary DATA and mixed tiny/256 KiB/tiny body | Exact ordered bytes for every released marker before the next release; first DATA and complete-marker arrival recorded |
+| One tiny frame followed by idle | Complete DATA arrives with backend EOF still withheld; no extra bytes or terminal event during the idle gate |
+| Declared-length and chunked truncation | After observed prefix, clean transport shutdown with incomplete HTTP framing causes a body error; clean EOF and client timeout cannot pass |
+| Cancellation after observed DATA | Active request count is first 1; dropping the response yields backend peer EOF/reset and a joined task within 10 seconds, followed by accounting returning to 0 within 10 seconds |
+| Delayed allowed-prefix/blocked policy window | Exact allowed SSE prefix arrives first; the later lexical leakage window yields only the exact policy error event and its `[DONE]` marker, clean downstream EOF, backend cessation and accounting release |
+
+There are 24 scenarios per observer build (truncation has two framing cases).
+All release/readiness/terminal waits are bounded. A sequence-numbered backend
+notification follows each flushed write, and only client-observed exact bytes
+authorize the next release or EOF. A **5-second** release-to-client scheduling
+tolerance covers both the write acknowledgement and complete marker; explicit
+elapsed checks complement async timeouts. The **200 ms** idle dwell starts only
+after readiness or observed DATA. The backend read timeout is **60 seconds**,
+so it cannot satisfy the cancellation bound. These are progress guards, not
+latency benchmarks. HTTP-decoded bytes may split or combine arbitrarily across
+TCP reads, TLS records and DATA callbacks.
+
+The lane checks the child executable through `/proc/<pid>/exe`, safe selected
+environment values, the exact file config, the authenticated effective route,
+and presence/absence of observer schema metrics (including child PID when on).
+An empty settings file and cleared child environment prevent inherited config
+from selecting another path. Size limiting and latency tracking are disabled.
+The fixture uses one gateway runtime worker so the existing metrics publication
+seam exposes positive direct/coalesced input evidence after completion; the
+opposite branch must stay unused. This proves branch selection, not complete
+profile accounting or coverage of multithreaded scheduling. Observer-off uses
+the same pinned source/config and direct/coalescing selection predicates.
+
+The policy case exercises `inspected_streaming_body`, which intentionally
+bypasses coalescing. It reuses the existing semantic-firewall lexical leakage
+policy and `on_error: warn` with a leased unavailable embedding provider for
+the allowed prefix; it does not establish successful embedding-provider
+inspection or ordinary-body policy semantics. The configured lexical violation
+must still block the later window. No production behavior is changed.
+
+H1 trailer preservation remains **unproven and unsupported by this adapter**:
+`body.rs::{direct_streaming_body,coalescing_body}` map reqwest `bytes_stream()`
+items to `Frame::data`; they cannot forward trailer frames. No H1 trailer pass
+is claimed. The lane explicitly retains the existing H2/gRPC hop-by-hop trailer
+filter, H2-frontend/H3-backend streaming trailer policy, and delayed-FIN trailer
+forwarding cases with both builds. These supported-protocol gates remain
+necessary for future shared-coalescer work; root must disposition the H1
+adapter limitation separately.
+
 ## Open obligations before any optimization
 
 Actual syscall collection is **not implemented**. AsyncWrite polls, TLS records,
@@ -191,10 +259,11 @@ write/writev/send* returns, lost events and measured tracing overhead. No infere
 from a zero field or missing trace closes that obligation. Sampled CPU stacks and
 native/hidden copy completeness also remain open.
 
-The new lane runs existing live streaming regressions; it does **not** establish
-the full proposed tiny/delayed-frame first-byte/inter-frame latency, truncation,
-trailers, cancellation and late-policy-failure fixture. That stronger live
-regression remains a prerequisite to any later aggregation/adapter optimization.
+The live cadence/safety gates above must pass on the exact reviewed head before
+any later aggregation/adapter optimization. They cover only their declared
+contracts, not H1 trailers, all policy modes, full native memory/copy coverage,
+syscalls, sampled CPU, backpressure saturation or performance. Syscall/CPU
+tracing remains later work after the H3 foundation settles.
 Review allocator safety/publication, the nondefault feature's hosted results,
 calibration, partial-profile residuals, all-size traffic failures and source
 coverage before interpreting measurements. #5588 is not closed by instrumentation.
