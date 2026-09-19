@@ -449,8 +449,7 @@ async fn missing_reader_deny_hooks_withhold_source_path() {
             } => {
                 assert_eq!(status_code, 403, "{hook}");
                 assert_eq!(
-                    body,
-                    r#"{"error":"Access denied: GeoIP database not available"}"#,
+                    body, r#"{"error":"Access denied: GeoIP database not available"}"#,
                     "{hook}"
                 );
                 assert!(headers.is_empty(), "{hook}");
@@ -473,7 +472,10 @@ async fn missing_reader_deny_hooks_withhold_source_path() {
             "reason=\"db_not_loaded\"",
             "MaxMind database not loaded, denying by on_lookup_failure policy",
         ] {
-            assert!(event.contains(expected), "{hook}: missing {expected:?}: {output}");
+            assert!(
+                event.contains(expected),
+                "{hook}: missing {expected:?}: {output}"
+            );
         }
         assert!(!output.contains("GEO_DENY_PATH_CANARY"), "{hook}: {output}");
         assert!(!output.contains(path_text(&path)), "{hook}: {output}");
