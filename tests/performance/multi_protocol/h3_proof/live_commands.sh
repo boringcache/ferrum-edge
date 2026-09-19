@@ -29,7 +29,7 @@ case "${H3_LIVE_ACTION:?}" in
       export H3_PROFILE=4194304
       exec setpriv --reuid=65534 --regid=65534 --clear-groups \
         --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
-        /tmp/ferrum-h3-live/build/proto_backend
+        /tmp/ferrum-h3-live/build/proto_backend --h3-only
     fi
     case "${H3_LIVE_PAYLOAD:?}" in 10240|71680|512000|1048576|5242880) ;; *) exit 2 ;; esac
     case "${H3_LIVE_WORKERS:?}" in 200|100|50) ;; *) exit 2 ;; esac

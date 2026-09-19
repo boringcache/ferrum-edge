@@ -75,6 +75,24 @@ class SocketCoverageTests(unittest.TestCase):
         on = dict(rps=100, p99_us=100, traffic_issues=[], observer_ok=True)
         self.assertFalse(calibration([(off, on), (off, on)])['active_main'])
 
+    def test_unrelated_owned_backend_udp_sockets_still_reject_population(self):
+        original = copy.deepcopy(self.usage)
+        for port in (3005, 3006, 3999):
+            for arm in ('direct', 'ferrum', 'envoy', 'envoy-limit-4'):
+                with self.subTest(port=port, arm=arm):
+                    self.usage = copy.deepcopy(original)
+                    # A clean H3 lifetime cannot authorize a second owned socket,
+                    # even with equal buffers and no drops. Include an unknown port
+                    # so this cannot become an exception list for UDP/DTLS.
+                    sockets = self.usage['timeline'][1]['transport']['sockets']
+                    extra = copy.deepcopy(sockets[0])
+                    extra.update(cookie=[99, 0], inode=99, local_port=port, peer_port=0, socket_drops=0)
+                    sockets.append(extra)
+                    result = live.passive_roles(self.usage, [], arm, self.phases, self.context)
+                    self.assertIn('unassigned_owned_socket', result['socket_evidence_issues'])
+                    self.assertFalse(result['equal_socket_budget_verified'])
+                    self.assertFalse(result['observed_lifetime_drop_coverage_verified'])
+
     def test_missing_initial_boundary_is_not_excused_by_birth(self):
         self.timeline[0]['transport']['sockets'] = self.timeline[0]['transport']['sockets'][1:]
         self.assert_failure('missing_initial_boundary')

@@ -57,8 +57,9 @@ def tls_fixture(out, arm, provenance):
         child = live.launch('tls-fixture', log, log, stdin=subprocess.PIPE, mode='backend', cgroup=scope / 'backend')
         wait_event(out / 'backend.jsonl', 'ready', child)
         record['backend_owner'] = live.owner(child.pid, 'backend')
-        live.command('create', out / 'create', slice=scope.name, name=name, arm=arm, cpus=os.cpu_count())
+        # Cleanup owns the unique container name even if recording create fails.
         created = True
+        live.command('create', out / 'create', slice=scope.name, name=name, arm=arm, cpus=os.cpu_count())
         current = json.loads(live.command('inspect', out / 'created', name=name))[0]
         if current['Image'] != provenance['images']['ferrum' if arm == 'ferrum' else 'envoy']['Id']:
             raise ValueError('TLS fixture image mismatch')
@@ -113,15 +114,20 @@ def tls_fixture(out, arm, provenance):
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         record['error'] = str(error)
     finally:
-        if child and child.poll() is None:
-            child.terminate()
-            try: child.wait(timeout=5)
-            except subprocess.TimeoutExpired: child.kill(); child.wait(); record['status'] = 'error'
-        if log: log.close()
+        if child is not None:
+            try:
+                if live.stop_process(child, timeout=5):
+                    record['forced_workload_stop'] = True; record['status'] = 'error'
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                record.setdefault('cleanup_errors', []).append(str(error)); record['status'] = 'error'
+        if log:
+            try: log.close()
+            except OSError as error:
+                record.setdefault('cleanup_errors', []).append(str(error)); record['status'] = 'error'
         if created:
             for action in ('logs', 'stop', 'inspect', 'remove'):
                 try: live.command(action, out / ('final-' + action), name=name)
-                except (OSError, RuntimeError) as error:
+                except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
                     record.setdefault('cleanup_errors', []).append(str(error)); record['status'] = 'error'
         try:
             for path in sorted(scope.rglob('*'), key=lambda p: len(p.parts), reverse=True):

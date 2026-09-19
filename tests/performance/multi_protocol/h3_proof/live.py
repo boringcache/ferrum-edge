@@ -76,20 +76,61 @@ def launch(action, stdout, stderr, *, stdin=None, **data):
                             stdout=stdout, stderr=stderr, start_new_session=True)
 
 
+def signal_process_group(process, sig):
+    # launch() gives each owned child its own session. A concurrent exit is
+    # harmless; never use a process-name or an unrelated cgroup as the target.
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def stop_process(process, timeout=10):
+    forced = False
+    try:
+        if process.poll() is None:
+            signal_process_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            forced = True
+            signal_process_group(process, signal.SIGKILL)
+            process.wait(timeout=5)
+    except BaseException:
+        signal_process_group(process, signal.SIGKILL)
+        process.wait(timeout=5)
+        raise
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+    return forced
+
+
 def command(action, output, *, timeout=30, **data):
+    # Paths are command data, not a JSON extension. Record the same path text
+    # that environment() passes to the literal launcher; retain numeric types.
+    data = {key: os.fspath(value) if isinstance(value, os.PathLike) else value
+            for key, value in data.items()}
+    status = {'action': action, 'data': data, 'start_ns': time.monotonic_ns(), 'returncode': None}
+    # Serialization or artifact I/O failure must happen before child ownership.
+    write(output.with_suffix('.json'), status)
     with output.with_suffix('.stdout').open('wb') as out, output.with_suffix('.stderr').open('wb') as err:
         process = launch(action, out, err, **data)
-        status = {'action': action, 'data': data, 'start_ns': time.monotonic_ns(), 'returncode': None}
-        write(output.with_suffix('.json'), status)
         try:
             status['returncode'] = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
             status['timeout'] = True
+            signal_process_group(process, signal.SIGKILL)
+            status['returncode'] = process.wait(timeout=5)
+        except BaseException:
+            # Includes cancellation and unexpected wait errors. Reap before the
+            # caller can remove cgroups or close the inherited output files.
+            signal_process_group(process, signal.SIGKILL)
+            process.wait(timeout=5)
+            raise
         status['end_ns'] = time.monotonic_ns()
         write(output.with_suffix('.json'), status)
-    if status['returncode'] != 0:
+    if status['returncode'] != 0 or status.get('timeout'):
         raise RuntimeError(f'{action} failed: {status}')
     return output.with_suffix('.stdout').read_text()
 
@@ -595,8 +636,9 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance, idle
         record['backend_owner'] = backend_owner
         record['ca_sha256'] = digest(STAGE / 'runtime/certs/ca.pem')
         if arm != 'direct':
-            command('create', out / 'create', slice=scope.name, name=identity, arm=arm, cpus=os.cpu_count())
+            # Own this unique name even if create succeeds but metadata fails.
             created = True
+            command('create', out / 'create', slice=scope.name, name=identity, arm=arm, cpus=os.cpu_count())
             initial = json.loads(command('inspect', out / 'container-created', name=identity))[0]
             expected = provenance['images']['ferrum' if arm == 'ferrum' else 'envoy']['Id']
             if initial['Image'] != expected: raise ValueError('container image differs from qualified artifact')
@@ -663,20 +705,21 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance, idle
             raise ValueError('malformed_benchmark_document')
         record['status'] = 'captured'
         record.pop('reason', None)
-    except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         record.update(status='error', reason=str(error))
     finally:
         record['workload_teardown_ns'] = time.monotonic_ns()
         record['workload_teardown_unix_secs'] = time.time()
         for child in reversed(children):
-            if child.poll() is None:
-                child.terminate()
-                try: child.wait(timeout=10)
-                except subprocess.TimeoutExpired: child.kill(); child.wait(); record['forced_workload_stop'] = True
+            try:
+                if stop_process(child): record['forced_workload_stop'] = True
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                record.setdefault('cleanup_errors', []).append(str(error))
         if created:
             for action in ('logs', 'stop', 'inspect', 'remove'):
                 try: command(action, out / f'final-{action}', name=identity)
-                except (OSError, RuntimeError) as error: record.setdefault('cleanup_errors', []).append(str(error))
+                except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
+                    record.setdefault('cleanup_errors', []).append(str(error))
         # Keep tracing through workload teardown; final map reads follow detach.
         time.sleep(0.2)
         observer_results = [obs.finish() for obs in observers]

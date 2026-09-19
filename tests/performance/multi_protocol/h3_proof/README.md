@@ -150,6 +150,22 @@ and host network. They have no Docker socket or writable observer maps. Only the
 provisioner/observer is privileged. Process privilege records are retained and
 checked. Socket budgets are set on the disposable runner before workload birth.
 
+The proof launcher selects `proto_backend --h3-only`: it generates the usual
+certificates and serves QUIC on UDP 3445 plus readiness on TCP 3010, with both
+listeners supervised for startup/runtime failure. No UDP echo or DTLS listener
+is started in this mode. Invoking `proto_backend` without arguments retains all
+ordinary protocol listeners. Every owned UDP socket still requires an assigned
+proof role; unexpected sockets invalidate admission rather than being ignored.
+
+Command metadata converts path arguments to their launcher text before spawning.
+Serialization or initial artifact errors therefore create no child; wait errors
+and timeouts kill and reap the owned process group before cgroup cleanup. TLS
+fixture cleanup also retains ownership of an attempted container creation through
+metadata errors and continues stop/removal if log collection fails. Hosted
+semantic regressions cover these error paths; the real smoke and TLS/idle jobs
+remain required to establish behavior at the new head. No historical failed
+sample or retirement evidence is reclassified by these fixture repairs.
+
 ## Calibration and raw retention
 
 For each payload/arm, two paired off/on pilots reverse treatment order. Both
