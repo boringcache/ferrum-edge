@@ -401,10 +401,8 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
                 )],
                 vec![plugin],
             );
-            let baseline =
-                make_config(vec![make_proxy(DIAGNOSTIC_PROXY_ID, "/", vec![])], vec![]);
-            let changed =
-                HashSet::from([NamespacedResourceId::new("ferrum", DIAGNOSTIC_PROXY_ID)]);
+            let baseline = make_config(vec![make_proxy(DIAGNOSTIC_PROXY_ID, "/", vec![])], vec![]);
+            let changed = HashSet::from([NamespacedResourceId::new("ferrum", DIAGNOSTIC_PROXY_ID)]);
             for path in ["startup", "rebuild", "delta"] {
                 let cache = PluginCache::new(&baseline).unwrap();
                 let prior = cache.get_plugins("ferrum", DIAGNOSTIC_PROXY_ID);
@@ -473,10 +471,7 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
                     if message.starts_with("Config reload:") && scope != PluginScope::Global {
                         assert_eq!(record["fields"]["proxy_id"], "<redacted scalar>");
                         if scope == PluginScope::ProxyGroup {
-                            assert_eq!(
-                                record["fields"]["plugin_config_id"],
-                                "<redacted scalar>"
-                            );
+                            assert_eq!(record["fields"]["plugin_config_id"], "<redacted scalar>");
                         }
                     }
                 }
@@ -499,7 +494,11 @@ fn cache_composition_diagnostics_keep_ordering_and_reason_but_withhold_prioritie
     second.id = "second".to_string();
     second.config = json!({"header_name": "x-second"});
     let config = make_config(
-        vec![make_proxy(DIAGNOSTIC_PROXY_ID, "/", vec!["first", "second"])],
+        vec![make_proxy(
+            DIAGNOSTIC_PROXY_ID,
+            "/",
+            vec!["first", "second"],
+        )],
         vec![first, second],
     );
     let admission =
@@ -515,7 +514,10 @@ fn cache_composition_diagnostics_keep_ordering_and_reason_but_withhold_prioritie
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
         assert_cache_diagnostic_withholds_values(&rendered);
         assert!(!rendered.contains("54321"), "{rendered}");
-        assert!(rendered.contains("proxy_id=<redacted scalar>"), "{rendered}");
+        assert!(
+            rendered.contains("proxy_id=<redacted scalar>"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("duplicate effective priority <redacted scalar>"),
             "{rendered}"
@@ -565,9 +567,8 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
     );
     // A trigger forces concrete construction during candidate admission too;
     // an ordinary IP restriction is otherwise only a topology placeholder.
-    invalid_mode.trigger = Some(
-        serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap(),
-    );
+    invalid_mode.trigger =
+        Some(serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap());
     let config = make_config(vec![], vec![triggered, invalid_mode]);
     for error in [
         validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
@@ -640,9 +641,8 @@ fn cache_policy_warnings_withhold_structured_proxy_and_namespace_fields() {
         Some(DIAGNOSTIC_PROXY_ID),
     );
     auth.namespace = namespace.to_string();
-    auth.trigger = Some(
-        serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap(),
-    );
+    auth.trigger =
+        Some(serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap());
     let config = make_config(vec![proxy], vec![cors, auth]);
     let (cache, records) = capture_cache_diagnostics(|| PluginCache::new(&config).unwrap());
     assert_eq!(cache.get_plugins(namespace, DIAGNOSTIC_PROXY_ID).len(), 2);

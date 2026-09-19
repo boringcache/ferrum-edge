@@ -2596,7 +2596,10 @@ fn finalize_created_plugin(
                     "Removed security plugin {:?} (plugin_config_id={:?}) is not supported; migrate to a supported auth plugin before startup/reload",
                     pc.plugin_name, pc.id
                 );
-                error!("FATAL: {}", crate::startup::sanitize_startup_cause(&msg, &[]));
+                error!(
+                    "FATAL: {}",
+                    crate::startup::sanitize_startup_cause(&msg, &[])
+                );
                 Err(msg)
             } else {
                 let msg = format!(
