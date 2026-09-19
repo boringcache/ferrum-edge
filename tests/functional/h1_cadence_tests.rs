@@ -153,8 +153,7 @@ impl Backend {
                         sequence += 1;
                     }
                     Command::Finish | Command::Truncate => {
-                        if matches!(command, Command::Finish)
-                            && matches!(framing, Framing::Chunked)
+                        if matches!(command, Command::Finish) && matches!(framing, Framing::Chunked)
                         {
                             stream.write_all(b"0\r\n\r\n").await.expect("body EOF");
                         }
@@ -211,7 +210,10 @@ impl Backend {
         })
         .await
         .expect("backend cessation deadline");
-        assert!(started.elapsed() <= LIFECYCLE, "backend cessation tolerance");
+        assert!(
+            started.elapsed() <= LIFECYCLE,
+            "backend cessation tolerance"
+        );
     }
 }
 
@@ -420,7 +422,10 @@ impl Fixture {
             "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=false".to_string(),
             "FERRUM_WORKER_THREADS=1".to_string(),
         ] {
-            assert!(env.split(|b| *b == 0).any(|value| value == entry.as_bytes()));
+            assert!(
+                env.split(|b| *b == 0)
+                    .any(|value| value == entry.as_bytes())
+            );
         }
         assert_eq!(
             std::fs::read_to_string(self.gateway.config_path.as_ref().unwrap()).unwrap(),
@@ -559,7 +564,10 @@ async fn receive_marker(response: &mut reqwest::Response, expected: &[u8], relea
                 first_data = Some(released.elapsed());
             }
             received.extend_from_slice(&bytes);
-            assert!(expected.starts_with(&received), "ordered exact marker bytes");
+            assert!(
+                expected.starts_with(&received),
+                "ordered exact marker bytes"
+            );
         }
         assert_eq!(received, expected);
     })
@@ -591,12 +599,7 @@ async fn tiny_and_mixed_markers_arrive_before_next_release() {
             let mut fixture = Fixture::start(tls, cutoff, Framing::Chunked, false).await;
             let mut response = fixture.first(b"first").await;
             let large: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
-            for marker in [
-                b"x".to_vec(),
-                b"second".to_vec(),
-                large,
-                b"tail".to_vec(),
-            ] {
+            for marker in [b"x".to_vec(), b"second".to_vec(), large, b"tail".to_vec()] {
                 assert_idle(&mut response).await;
                 let released = fixture.backend.release(&marker).await;
                 receive_marker(&mut response, &marker, released).await;
