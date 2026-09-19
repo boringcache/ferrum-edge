@@ -1037,7 +1037,7 @@ class H1InternalProfileTests(unittest.TestCase):
             config.write_text("proxies: []\n")
             for gateway in ("ferrum", "ferrum-baseline", "ferrum-exp-cutoff-one"):
                 mode = "calibration" if gateway == "ferrum-baseline" else "cutoff"
-                container, image = docker_inspect(config, gateway)
+                container, image = docker_inspect(config, gateway, mode=mode)
                 with patch.object(profile, "process_start_ticks", return_value=100), \
                         patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))) as inspect:
                     profile.retain_runtime(path, container, config, 1, gateway, "campaign-host", mode)
