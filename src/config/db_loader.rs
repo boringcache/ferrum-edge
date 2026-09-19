@@ -6221,8 +6221,8 @@ impl DatabaseStore {
         for change in changes {
             if change.operation != "upsert" && change.operation != "delete" {
                 warn!(
-                    "Ignoring `config_changes` row with unknown operation {:?} for {:?} {:?}",
-                    change.operation, change.resource_type, change.resource_id
+                    "Ignoring `config_changes` row with unknown `operation`; \
+                     `operation`, `resource_type`, and `resource_id` values withheld"
                 );
                 continue;
             }
@@ -6242,11 +6242,10 @@ impl DatabaseStore {
                 GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
                     gateway_trust_bundle_changed = true;
                 }
-                other => {
+                _ => {
                     warn!(
-                        "Ignoring `config_changes` row with unknown `resource_type` {:?} for id \
-                         {:?}",
-                        other, change.resource_id
+                        "Ignoring `config_changes` row with unknown `resource_type`; \
+                         `resource_type` and `resource_id` values withheld"
                     );
                 }
             }

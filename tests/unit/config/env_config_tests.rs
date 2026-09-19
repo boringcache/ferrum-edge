@@ -1278,6 +1278,50 @@ fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
             assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED"));
             assert!(error.contains("FERRUM_GATEWAY_SVID"));
             assert!(error.contains("overrides automatic CA-backed issuance"));
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error.clone()), &[]);
+            assert_eq!(rendered, error);
+            assert!(rendered.contains("Remove the FERRUM_GATEWAY_SVID_* override"));
+            assert!(rendered.contains("or disable the Ferrum Workload API"));
+        },
+    );
+}
+
+#[test]
+fn workload_api_spire_refusal_retains_complete_rendered_recovery_guidance() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+        ],
+        || {
+            let error =
+                EnvConfig::from_env().expect_err("SPIRE cannot issue downstream identities");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error.clone()), &[]);
+            assert_eq!(rendered, error);
+            for expected in [
+                "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported",
+                "identity of the calling process",
+                "cannot mint an X.509-SVID or a JWT-SVID for an attested downstream workload",
+                "Point workloads at their local SPIRE agent socket",
+                "FERRUM_MESH_SPIRE_AGENT_SOCKET",
+                "FERRUM_MESH_CA_BACKEND=internal with FERRUM_MESH_JWT_SIGNING_KEY_PEM",
+                "Ferrum still consumes the SPIRE X.509 SVID and trust bundles",
+                "only serving a Workload API is refused",
+            ] {
+                assert!(rendered.contains(expected), "{rendered}");
+            }
         },
     );
 }
