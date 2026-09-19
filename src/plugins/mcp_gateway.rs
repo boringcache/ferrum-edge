@@ -227,7 +227,7 @@ impl McpGatewayMode {
             "transparent_proxy" => Ok(Self::TransparentProxy),
             "aggregate_router" => Ok(Self::AggregateRouter),
             other => Err(format!(
-                "mcp_gateway: `mode` must be transparent_proxy or aggregate_router, got {other:?}"
+                "mcp_gateway: `mode` must be `transparent_proxy` or `aggregate_router`, got {other:?}"
             )),
         }
     }
@@ -254,7 +254,7 @@ impl InitializeStrategy {
             "startup" => Ok(Self::Startup),
             "passthrough" => Ok(Self::Passthrough),
             other => Err(format!(
-                "mcp_gateway: `{field}` must be lazy, startup, or passthrough, got {other:?}"
+                "mcp_gateway: `{field}` must be `lazy`, `startup`, or `passthrough`, got {other:?}"
             )),
         }
     }
@@ -274,7 +274,7 @@ impl PolicyAction {
             "deny" => Ok(Self::Deny),
             "hide_from_discovery" => Ok(Self::HideFromDiscovery),
             other => Err(format!(
-                "mcp_gateway: `{field}` must be allow, deny, or hide_from_discovery, got {other:?}"
+                "mcp_gateway: `{field}` must be `allow`, `deny`, or `hide_from_discovery`, got {other:?}"
             )),
         }
     }
@@ -300,7 +300,7 @@ impl DiscoveryBehavior {
             "allow" | "allow_immediately" | "expose" => Ok(Self::Allow),
             "hide_until_configured" => Ok(Self::HideUntilConfigured),
             other => Err(format!(
-                "mcp_gateway: `{field}` must be allow or hide_until_configured, got {other:?}"
+                "mcp_gateway: `{field}` must be `allow` or `hide_until_configured`, got {other:?}"
             )),
         }
     }
@@ -1004,13 +1004,13 @@ impl McpGateway {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let object = config
             .as_object()
-            .ok_or_else(|| "mcp_gateway: config must be an object".to_string())?;
+            .ok_or_else(|| "mcp_gateway: `config` must be an object".to_string())?;
         reject_unknown_mcp_keys(object, "config", MCP_CONFIG_KEYS)?;
 
         let enabled = optional_bool(object, "enabled")?.unwrap_or(true);
         let mode = McpGatewayMode::parse(
             optional_string(object, "mode")?
-                .ok_or_else(|| "mcp_gateway: 'mode' is required".to_string())?,
+                .ok_or_else(|| "mcp_gateway: `mode` is required".to_string())?,
         )?;
 
         let endpoint = optional_object(object, "endpoint")?;
@@ -1018,7 +1018,7 @@ impl McpGateway {
             reject_unknown_mcp_keys(endpoint, "config.endpoint", MCP_ENDPOINT_KEYS)?;
         }
         let endpoint_path = optional_string_from_object(endpoint, "path")?
-            .ok_or_else(|| "mcp_gateway: 'endpoint.path' is required".to_string())?;
+            .ok_or_else(|| "mcp_gateway: `endpoint.path` is required".to_string())?;
         validate_path(&endpoint_path, "endpoint.path")?;
         // The endpoint reserves its whole slash-delimited subtree, so a root
         // endpoint would reserve the entire origin and 404 every other handler
@@ -1026,7 +1026,7 @@ impl McpGateway {
         // total outage on the first request after a reload.
         if endpoint_path == "/" {
             return Err(
-                "mcp_gateway: 'endpoint.path' must not be '/': an MCP endpoint reserves its whole path subtree, so a root endpoint would refuse every other request on this proxy; use a sub-path such as '/mcp'"
+                "mcp_gateway: `endpoint.path` must not be `/`: an MCP endpoint reserves its whole path subtree, so a root endpoint would refuse every other request on this proxy; use a sub-path such as `/mcp`"
                     .to_string(),
             );
         }
@@ -1035,14 +1035,14 @@ impl McpGateway {
             optional_string_vec_from_object(endpoint, "protocol_versions")?
                 .unwrap_or_else(|| vec![DEFAULT_PROTOCOL_VERSION.to_string()]);
         if supported_protocol_versions.is_empty() {
-            return Err("mcp_gateway: 'endpoint.protocol_versions' must not be empty".to_string());
+            return Err("mcp_gateway: `endpoint.protocol_versions` must not be empty".to_string());
         }
         if supported_protocol_versions
             .iter()
             .any(|version| version.trim().is_empty())
         {
             return Err(
-                "mcp_gateway: 'endpoint.protocol_versions' entries must not be empty".to_string(),
+                "mcp_gateway: `endpoint.protocol_versions` entries must not be empty".to_string(),
             );
         }
         // `2025-03-26` is admitted: JSON-RPC batches are handled by the gateway
@@ -1056,7 +1056,7 @@ impl McpGateway {
         let observability = parse_observability(object)?;
         if mode == McpGatewayMode::TransparentProxy && validation.validate_tool_results {
             return Err(
-                "mcp_gateway: 'validation.validate_tool_results' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
+                "mcp_gateway: `validation.validate_tool_results` requires mode `aggregate_router` because `transparent_proxy` has no mediated tool catalog"
                     .to_string(),
             );
         }
@@ -1086,7 +1086,7 @@ impl McpGateway {
                     for field in fields {
                         if config.contains_key(*field) {
                             return Err(format!(
-                                "mcp_gateway: '{section}.{field}' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
+                                "mcp_gateway: `{section}.{field}` requires mode `aggregate_router` because `transparent_proxy` has no mediated tool catalog"
                             ));
                         }
                     }
@@ -1095,7 +1095,7 @@ impl McpGateway {
         }
         let servers = parse_servers(object, sessions.initialize_upstreams)?;
         if servers.is_empty() {
-            return Err("mcp_gateway: 'servers' must not be empty".to_string());
+            return Err("mcp_gateway: `servers` must not be empty".to_string());
         }
         // Screen each upstream's literal-IP URL against the egress policy at
         // config-load: these are dialed through the shared client, but reqwest
@@ -1105,7 +1105,7 @@ impl McpGateway {
             if let Ok(parsed) = url::Url::parse(&server.upstream_url) {
                 crate::plugins::utils::log_helpers::screen_url_host_egress(
                     "mcp_gateway",
-                    "upstream_url",
+                    "servers.*.upstream_url",
                     &parsed,
                     http_client.backend_allow_ips(),
                 )?;
@@ -1131,7 +1131,7 @@ impl McpGateway {
         }
         if mode == McpGatewayMode::TransparentProxy && enabled_server_ids.len() != 1 {
             return Err(
-                "mcp_gateway: transparent_proxy mode requires exactly one enabled server"
+                "mcp_gateway: `transparent_proxy` mode requires exactly one enabled server"
                     .to_string(),
             );
         }
@@ -1142,7 +1142,7 @@ impl McpGateway {
             })
         {
             return Err(
-                "mcp_gateway: aggregate_router mode requires at least one enabled exposed item"
+                "mcp_gateway: `aggregate_router` mode requires at least one enabled exposed item"
                     .to_string(),
             );
         }
@@ -1159,7 +1159,7 @@ impl McpGateway {
             ] {
                 if advertised {
                     return Err(format!(
-                        "mcp_gateway: capabilities.{capability} requires capabilities.passthrough_unknown_methods=true in aggregate_router mode until that method is routed or implemented"
+                        "mcp_gateway: `capabilities.{capability}` requires `capabilities.passthrough_unknown_methods=true` in `aggregate_router` mode until that method is routed or implemented"
                     ));
                 }
             }
@@ -7818,7 +7818,7 @@ fn optional_u64_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("mcp_gateway: '{key}' must be a positive integer"))
+            .ok_or_else(|| format!("mcp_gateway: `{key}` must be a positive integer"))
             .map(Some),
         Some(other) => Err(format!(
             "mcp_gateway: `{key}` must be a positive integer, got {other:?}",
@@ -7839,12 +7839,12 @@ fn optional_string_vec_from_object(
     }
     let array = value
         .as_array()
-        .ok_or_else(|| format!("mcp_gateway: '{key}' must be an array"))?;
+        .ok_or_else(|| format!("mcp_gateway: `{key}` must be an array"))?;
     let mut values = Vec::with_capacity(array.len());
     for (idx, item) in array.iter().enumerate() {
         values.push(
             item.as_str()
-                .ok_or_else(|| format!("mcp_gateway: '{key}[{idx}]' must be a string"))?
+                .ok_or_else(|| format!("mcp_gateway: `{key}[{idx}]` must be a string"))?
                 .to_string(),
         );
     }
@@ -7852,13 +7852,14 @@ fn optional_string_vec_from_object(
 }
 
 /// Reject unknown keys after calling out Claude-Desktop-style stdio spawn fields.
+/// `path` is a fixed schema path; callers must omit supplied map keys.
 fn reject_unknown_mcp_keys(
     object: &Map<String, Value>,
     path: &str,
     allowed: &[&str],
 ) -> Result<(), String> {
     reject_stdio_transport_keys(object, path)?;
-    reject_unknown_keys(object, path, allowed, "mcp_gateway: ")
+    reject_unknown_keys(object, path, allowed, &format!("mcp_gateway: `{path}`: "))
 }
 
 /// `command` / `args` / `stdio` look like a stdio MCP spawn. The plugin is HTTP-only.
@@ -7874,11 +7875,11 @@ fn reject_stdio_transport_keys(object: &Map<String, Value>, path: &str) -> Resul
     found.sort_unstable();
     let names = found
         .iter()
-        .map(|key| format!("'{key}'"))
+        .map(|key| format!("`{key}`"))
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "mcp_gateway: {path} field(s) {names} are not supported because mcp_gateway is HTTP-only and does not spawn stdio MCP processes; set servers.*.upstream_url to an http:// or https:// MCP endpoint instead"
+        "mcp_gateway: `{path}` field(s) {names} are not supported because mcp_gateway is HTTP-only and does not spawn stdio MCP processes; set `servers.*.upstream_url` to an `http://` or `https://` MCP endpoint instead"
     ))
 }
 
@@ -7890,13 +7891,13 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<McpDiscoveryConfig, St
     let namespace_separator = optional_string_from_object(discovery, "namespace_separator")?
         .unwrap_or_else(|| ".".to_string());
     if namespace_separator.is_empty() {
-        return Err("mcp_gateway: 'discovery.namespace_separator' must not be empty".to_string());
+        return Err("mcp_gateway: `discovery.namespace_separator` must not be empty".to_string());
     }
     let cache_ttl_seconds =
         optional_u64_from_object(discovery, "cache_ttl_seconds")?.unwrap_or(300);
     if cache_ttl_seconds == 0 {
         return Err(
-            "mcp_gateway: 'discovery.cache_ttl_seconds' must be greater than zero".to_string(),
+            "mcp_gateway: `discovery.cache_ttl_seconds` must be greater than zero".to_string(),
         );
     }
     let on_new_tool = DiscoveryBehavior::parse(
@@ -7941,16 +7942,16 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         .unwrap_or(DEFAULT_SESSION_TTL_SECONDS);
     if session_ttl_seconds == 0 {
         return Err(
-            "mcp_gateway: 'sessions.session_ttl_seconds' must be greater than zero".to_string(),
+            "mcp_gateway: `sessions.session_ttl_seconds` must be greater than zero".to_string(),
         );
     }
     let max_sessions =
         optional_u64_from_object(sessions, "max_sessions")?.unwrap_or(DEFAULT_MAX_SESSIONS as u64);
     if max_sessions == 0 {
-        return Err("mcp_gateway: 'sessions.max_sessions' must be greater than zero".to_string());
+        return Err("mcp_gateway: `sessions.max_sessions` must be greater than zero".to_string());
     }
     let max_sessions = usize::try_from(max_sessions)
-        .map_err(|_| "mcp_gateway: 'sessions.max_sessions' is too large".to_string())?;
+        .map_err(|_| "mcp_gateway: `sessions.max_sessions` is too large".to_string())?;
     let downstream_session_header =
         optional_string_from_object(sessions, "downstream_session_header")?
             .unwrap_or_else(|| "mcp-session-id".to_string());
@@ -7969,8 +7970,8 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         &downstream_session_header,
     ) {
         return Err(format!(
-            "mcp_gateway: 'sessions.downstream_session_header' is protocol-managed (hop-by-hop or \
-             framing) and cannot carry an MCP session id: {}",
+            "mcp_gateway: `sessions.downstream_session_header` is protocol-managed (hop-by-hop or \
+             framing) and cannot carry an MCP session id: {:?}",
             downstream_session_header.to_ascii_lowercase()
         ));
     }
@@ -8037,7 +8038,7 @@ fn parse_sse_bounds(sessions: Option<&Map<String, Value>>) -> Result<AggregateSs
 fn sse_usize(value: u64, key: &str) -> Result<usize, String> {
     match usize::try_from(value) {
         Ok(value) => Ok(value),
-        Err(_) => Err(format!("mcp_gateway: 'sessions.{key}' is too large")),
+        Err(_) => Err(format!("mcp_gateway: `sessions.{key}` is too large")),
     }
 }
 
@@ -8080,7 +8081,7 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         "deny" => PolicyAction::Deny,
         other => {
             return Err(format!(
-                "mcp_gateway: 'policy.default_action' must be allow or deny, got {other:?}"
+                "mcp_gateway: `policy.default_action` must be `allow` or `deny`, got {other:?}"
             ));
         }
     };
@@ -8092,18 +8093,16 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
     {
         for (tool_name, tool_policy) in tools_object {
             let object = tool_policy.as_object().ok_or_else(|| {
-                format!("mcp_gateway: policy.tools[{tool_name:?}] must be an object")
+                format!("mcp_gateway: `policy.tools` entry {tool_name:?} must be an object")
             })?;
-            reject_unknown_mcp_keys(
-                object,
-                &format!("config.policy.tools.{tool_name}"),
-                MCP_POLICY_TOOL_KEYS,
-            )?;
+            reject_unknown_mcp_keys(object, "config.policy.tools.*", MCP_POLICY_TOOL_KEYS)?;
             let action = PolicyAction::parse(
                 optional_string(object, "action")?.ok_or_else(|| {
-                    format!("mcp_gateway: policy.tools[{tool_name:?}].action is required")
+                    format!(
+                        "mcp_gateway: `policy.tools.*.action` is required for tool {tool_name:?}"
+                    )
                 })?,
-                &format!("policy.tools[{tool_name:?}].action"),
+                "policy.tools.*.action",
             )?;
             tools.insert(tool_name.clone(), action);
         }
@@ -8111,7 +8110,7 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         .and_then(|policy| policy.get("tools"))
         .is_some_and(|value| !value.is_null())
     {
-        return Err("mcp_gateway: 'policy.tools' must be an object".to_string());
+        return Err("mcp_gateway: `policy.tools` must be an object".to_string());
     }
     Ok(McpPolicy {
         default_action,
@@ -8133,7 +8132,7 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
             .unwrap_or(DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES);
     if max_upstream_response_bytes == 0 {
         return Err(
-            "mcp_gateway: 'validation.max_upstream_response_bytes' must be greater than 0"
+            "mcp_gateway: `validation.max_upstream_response_bytes` must be greater than 0"
                 .to_string(),
         );
     }
@@ -8143,7 +8142,7 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
             .unwrap_or(DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST);
     if max_catalog_items_per_list == 0 {
         return Err(
-            "mcp_gateway: 'validation.max_catalog_items_per_list' must be greater than 0"
+            "mcp_gateway: `validation.max_catalog_items_per_list` must be greater than 0"
                 .to_string(),
         );
     }
@@ -8153,7 +8152,7 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
             .unwrap_or(DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST);
     if max_catalog_bytes_per_list == 0 {
         return Err(
-            "mcp_gateway: 'validation.max_catalog_bytes_per_list' must be greater than 0"
+            "mcp_gateway: `validation.max_catalog_bytes_per_list` must be greater than 0"
                 .to_string(),
         );
     }
@@ -8161,25 +8160,25 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_ITEMS);
     if max_batch_items == 0 {
-        return Err("mcp_gateway: 'validation.max_batch_items' must be greater than 0".to_string());
+        return Err("mcp_gateway: `validation.max_batch_items` must be greater than 0".to_string());
     }
     let max_batch_bytes = optional_u64_from_object(validation, "max_batch_bytes")?
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_BYTES);
     if max_batch_bytes == 0 {
-        return Err("mcp_gateway: 'validation.max_batch_bytes' must be greater than 0".to_string());
+        return Err("mcp_gateway: `validation.max_batch_bytes` must be greater than 0".to_string());
     }
     let max_batch_item_bytes = optional_u64_from_object(validation, "max_batch_item_bytes")?
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES);
     if max_batch_item_bytes == 0 {
         return Err(
-            "mcp_gateway: 'validation.max_batch_item_bytes' must be greater than 0".to_string(),
+            "mcp_gateway: `validation.max_batch_item_bytes` must be greater than 0".to_string(),
         );
     }
     if max_batch_item_bytes > max_batch_bytes {
         return Err(
-            "mcp_gateway: 'validation.max_batch_item_bytes' must not exceed 'validation.max_batch_bytes'"
+            "mcp_gateway: `validation.max_batch_item_bytes` must not exceed `validation.max_batch_bytes`"
                 .to_string(),
         );
     }
@@ -8189,7 +8188,7 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
             .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_RESPONSE_BYTES);
     if max_batch_response_bytes == 0 {
         return Err(
-            "mcp_gateway: 'validation.max_batch_response_bytes' must be greater than 0".to_string(),
+            "mcp_gateway: `validation.max_batch_response_bytes` must be greater than 0".to_string(),
         );
     }
     Ok(McpValidationConfig {
@@ -8230,12 +8229,12 @@ fn parse_servers(
 ) -> Result<HashMap<String, McpServerConfig>, String> {
     let servers_value = object
         .get("servers")
-        .ok_or_else(|| "mcp_gateway: 'servers' is required".to_string())?;
+        .ok_or_else(|| "mcp_gateway: `servers` is required".to_string())?;
     let servers_object = servers_value
         .as_object()
-        .ok_or_else(|| "mcp_gateway: 'servers' must be an object".to_string())?;
+        .ok_or_else(|| "mcp_gateway: `servers` must be an object".to_string())?;
     if servers_object.is_empty() {
-        return Err("mcp_gateway: 'servers' must not be empty".to_string());
+        return Err("mcp_gateway: `servers` must not be empty".to_string());
     }
     let mut namespaces = HashSet::new();
     let mut servers = HashMap::with_capacity(servers_object.len());
@@ -8247,25 +8246,21 @@ fn parse_servers(
         let object = value
             .as_object()
             .ok_or_else(|| format!("mcp_gateway: server {server_id:?} must be an object"))?;
-        reject_unknown_mcp_keys(
-            object,
-            &format!("config.servers.{server_id}"),
-            MCP_SERVER_KEYS,
-        )?;
+        reject_unknown_mcp_keys(object, "config.servers.*", MCP_SERVER_KEYS)?;
         let upstream_url = optional_string(object, "upstream_url")?
-            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires 'upstream_url'"))?
+            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires `upstream_url`"))?
             .to_string();
         let namespace = optional_string(object, "namespace")?
-            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires 'namespace'"))?
+            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires `namespace`"))?
             .to_string();
         if namespace.trim().is_empty() {
             return Err(format!(
-                "mcp_gateway: server {server_id:?} namespace must not be empty"
+                "mcp_gateway: server {server_id:?} `namespace` must not be empty"
             ));
         }
         if !namespaces.insert(namespace.clone()) {
             return Err(format!(
-                "mcp_gateway: duplicate server namespace {namespace:?}"
+                "mcp_gateway: duplicate server `namespace` {namespace:?}"
             ));
         }
         let initialize_strategy = optional_string(object, "initialize_strategy")?
@@ -8291,17 +8286,17 @@ fn parse_servers(
 }
 
 fn parse_upstream_target(url: &str, server_id: &str) -> Result<McpUpstreamTarget, String> {
-    let parsed = Url::parse(url).map_err(|error| {
-        format!("mcp_gateway: server {server_id:?} upstream_url invalid: {error}")
+    let parsed = Url::parse(url).map_err(|_| {
+        format!("mcp_gateway: server {server_id:?} `upstream_url` must be a valid URL")
     })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
-            "mcp_gateway: server {server_id:?} upstream_url must not contain credentials"
+            "mcp_gateway: server {server_id:?} `upstream_url` must not contain credentials"
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(format!(
-            "mcp_gateway: server {server_id:?} upstream_url must not contain query or fragment"
+            "mcp_gateway: server {server_id:?} `upstream_url` must not contain query or fragment"
         ));
     }
     let scheme = match parsed.scheme() {
@@ -8309,17 +8304,17 @@ fn parse_upstream_target(url: &str, server_id: &str) -> Result<McpUpstreamTarget
         "https" => BackendScheme::Https,
         other => {
             return Err(format!(
-                "mcp_gateway: server {server_id:?} upstream_url scheme must be http or https, got {other:?}"
+                "mcp_gateway: server {server_id:?} `upstream_url` scheme must be `http` or `https`, got {other:?}"
             ));
         }
     };
     let host = parsed
         .host_str()
-        .ok_or_else(|| format!("mcp_gateway: server {server_id:?} upstream_url missing host"))?
+        .ok_or_else(|| format!("mcp_gateway: server {server_id:?} `upstream_url` missing host"))?
         .to_string();
     let port = parsed
         .port_or_known_default()
-        .ok_or_else(|| format!("mcp_gateway: server {server_id:?} upstream_url missing port"))?;
+        .ok_or_else(|| format!("mcp_gateway: server {server_id:?} `upstream_url` missing port"))?;
     let path = if parsed.path().is_empty() {
         "/".to_string()
     } else {
@@ -8466,10 +8461,10 @@ pub fn validate_composition(
                     continue;
                 }
                 errors.push(format!(
-                    "mcp_gateway instances '{id}' and '{other_id}' on proxy '{}' have nesting \
-                     endpoint.path scopes: an MCP endpoint reserves its whole path subtree and \
+                    "mcp_gateway instances {id:?} and {other_id:?} on proxy {:?} have nesting \
+                     `endpoint.path` scopes: an MCP endpoint reserves its whole path subtree and \
                      answers 404 inside it, so one of these gateways can never be reached. Give \
-                     them disjoint endpoint.path values, or disable one of them on this proxy",
+                     them disjoint `endpoint.path` values, or disable one of them on this proxy",
                     proxy.id
                 ));
             }
@@ -8484,10 +8479,10 @@ pub fn validate_composition(
 
 fn validate_path(path: &str, field: &str) -> Result<(), String> {
     if path.is_empty() || !path.starts_with('/') {
-        return Err(format!("mcp_gateway: '{field}' must be a non-empty path"));
+        return Err(format!("mcp_gateway: `{field}` must be a non-empty path"));
     }
     if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(path) {
-        return Err(format!("mcp_gateway: '{field}' is not canonical: {reason}"));
+        return Err(format!("mcp_gateway: `{field}` is not canonical: {reason}"));
     }
     Ok(())
 }
@@ -8503,7 +8498,7 @@ fn validate_server_id(server_id: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
         return Err(format!(
-            "mcp_gateway: server id {server_id:?} must contain only ASCII alphanumerics, '.', '_', or '-'"
+            "mcp_gateway: server id {server_id:?} must contain only ASCII alphanumerics, `.`, `_`, or `-`"
         ));
     }
     Ok(())
@@ -8514,11 +8509,11 @@ fn validate_server_id(server_id: &str) -> Result<(), String> {
 /// config time instead of failing every routed upstream request at runtime.
 fn validate_session_header_name(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err(format!("mcp_gateway: '{field}' must not be empty"));
+        return Err(format!("mcp_gateway: `{field}` must not be empty"));
     }
     http::header::HeaderName::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| {
-            format!("mcp_gateway: '{field}' must be a valid HTTP header name, got {value:?}")
+            format!("mcp_gateway: `{field}` must be a valid HTTP header name, got {value:?}")
         })
 }

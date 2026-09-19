@@ -131,6 +131,11 @@ paths:
   document deserializer is unchanged by this scoped adapter.
   Workload exporters retain safe option bounds and provider endpoint ordinals;
   CEL failures retain fixed coercion, length, nesting and syntax remedies.
+- The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
+  configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
+  visible while supplied service/tool names, paths, tokens and parser payloads
+  are withheld. Registered real-constructor rendered regressions preserve the
+  existing admission decisions and protocol behavior assertions.
 - The #5594 security conversion covers authentication/authorization, IP/GeoIP,
   JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
   admission. Fixed schema paths and credential/operation ordinals survive
