@@ -422,7 +422,7 @@ def validate_selection(mode, protocol, pairs, duration, workers, gateways, sizes
                 "http1-tls", "1", "30", "200", "ferrum", "5242880", "", ""):
             raise ValueError("H1 diagnostic requires one pass, 5 MiB, 50 scaled workers, 30 seconds")
         return
-    if mode not in ("calibration", "cutoff") or protocol != "http1-tls":
+    if mode not in ("calibration", "cutoff", "trace-calibration") or protocol != "http1-tls":
         raise ValueError("H1-only calibration/cutoff selection required")
     if (pairs, duration, workers, gateways) != ("4", "15", "200", "ferrum") or extra:
         raise ValueError("H1 profile requires four pairs, 15 seconds, 200 scaled workers, ferrum only")
@@ -430,7 +430,7 @@ def validate_selection(mode, protocol, pairs, duration, workers, gateways, sizes
     if not selected or len(set(selected)) != len(selected) or any(
             size not in MANIFEST["payload_sizes"] for size in selected):
         raise ValueError("invalid H1 payload subset")
-    if bool(baseline) != (mode == "calibration"):
+    if bool(baseline) != (mode in ("calibration", "trace-calibration")):
         raise ValueError("only calibration requires the identical-revision observer-off image")
 
 
@@ -572,7 +572,8 @@ def runtime_issues(runtime, config_path, pair, gateway, manifest, mode):
         issues.append("container not running at capture")
     if not matches(r"sha256:[0-9a-f]{64}", runtime.get("image_id")):
         issues.append("missing or invalid immutable image ID")
-    expected_observer = "off" if mode == "diagnostic" or gateway == "ferrum-baseline" else "on"
+    expected_observer = "off" if (mode == "diagnostic" or
+                                  (mode == "calibration" and gateway == "ferrum-baseline")) else "on"
     for key in ("container_labels", "image_labels"):
         labels = runtime.get(key)
         if (not isinstance(labels, dict) or labels.keys() != {REVISION_LABEL, OBSERVER_LABEL}
@@ -686,7 +687,7 @@ def campaign_runtimes(directory, manifest, mode):
         if valid and any(select(record["runtime"]) != select(valid[0]["runtime"]) for record in valid):
             for record in valid:
                 record["issues"].append("campaign " + label + " pairing mismatch")
-    groups = ([valid] if mode == "cutoff" else
+    groups = ([valid] if mode in ("cutoff", "trace-calibration") else
               [[r for r in valid if r["runtime"]["gateway"] == gateway]
                for gateway in MANIFEST["campaigns"][mode]])
     for group in groups:
@@ -742,11 +743,15 @@ def report(directory, mode):
         manifest["payload_sizes"] = MANIFEST["payload_sizes"]
     manifest["pairs"] = 4
     manifest["gateways"] = expected_gateways
+    trace_mode = manifest.get("h1_trace_mode", "none")
+    if trace_mode not in ("none", "syscalls", "cpu") or (mode == "trace-calibration" and trace_mode == "none"):
+        manifest_issues.append("missing or invalid selected external trace mode")
     runtimes = campaign_runtimes(directory, manifest, mode)
     report = dict(mode=mode, manifest_issues=manifest_issues, observations=[],
                   traffic_complete=True, profiles_complete=True, runtime_complete=True,
-                  actual_syscalls="unavailable: no collector implemented",
-                  cpu_stacks="unavailable: no collector implemented",
+                  external_traces_complete=True,
+                  actual_syscalls="separate trace manifest; never inferred from internal counters",
+                  cpu_stacks="separate trace manifest; never inferred from process CPU",
                   overhead="raw same-revision on/off pairs; no guessed subtraction",
                   claims="no performance result asserted by this implementation")
     if manifest_issues:
@@ -824,9 +829,30 @@ def report(directory, mode):
                         report["profiles_complete"] = False
                 else:
                     row["profile"] = dict(expected=False, reason="direct or observer-off control")
+                from h1_trace_contract import load_trace
+                if gateway != "direct" and trace_mode != "none":
+                    row["external_trace"] = load_trace(
+                        folder / "traces" / f"{gateway}_{size}" / "trace-manifest.json",
+                        expected=dict(arm=gateway, pair=pair, payload=size, runtime=runtime,
+                            folder=folder, builds=directory.parent / "builds",
+                            host_id=manifest.get("host_id"), revision=manifest.get("h1_revision"),
+                            selected_mode=trace_mode, enabled=not (mode == "trace-calibration" and gateway == "ferrum-baseline"),
+                            files=dict(runtime=f"diagnostics/{gateway}_runtime.json",
+                                config=f"diagnostics/{gateway}_config.yaml",
+                                sample=path.name, raw_sample=f"diagnostics/{gateway}_{size}_client.raw.json",
+                                client_exit=f"diagnostics/{gateway}_{size}_client.exit")))
+                    if not row["external_trace"]["capture_complete"] or row["runtime_issues"]:
+                        report["external_traces_complete"] = False
+                else:
+                    row["external_trace"] = dict(expected=False, complete=False, capture_complete=False,
+                                                  reason="direct control or external tracing not selected")
                 report["observations"].append(row)
-    report["fully_measured_comparison_eligible"] = (
+    report["internal_comparison_eligible"] = (
         report["traffic_complete"] and report["profiles_complete"] and report["runtime_complete"])
+    report["trace_comparison_eligible"] = (trace_mode in ("syscalls", "cpu") and not manifest_issues
+        and report["internal_comparison_eligible"] and report["external_traces_complete"])
+    report["fully_measured_comparison_eligible"] = False
+    report["missing_dimensions_remain_open"] = ["complete native allocation/copy coverage", "separately calibrated syscall and CPU dimensions", "complete unwinding"]
     (directory / "h1_profile_report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
@@ -996,6 +1022,6 @@ if __name__ == "__main__":
     elif command == "report":
         result = report(*arguments)
         # Retained partial profiles can guide follow-up coverage; never a win.
-        sys.exit(0 if result["traffic_complete"] else 1)
+        sys.exit(0 if result["traffic_complete"] and result["external_traces_complete"] else 1)
     else:
         raise ValueError("unknown H1 profile command")

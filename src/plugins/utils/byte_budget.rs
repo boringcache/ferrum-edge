@@ -916,7 +916,7 @@ pub fn admit_byte_limits(
         Some(value) => {
             let Some(parsed) = value.as_u64() else {
                 return Err(format!(
-                    "{plugin_name}: 'max_entry_bytes' must be an unsigned integer"
+                    "{plugin_name}: `max_entry_bytes` must be an unsigned integer"
                 ));
             };
             parsed
@@ -924,12 +924,12 @@ pub fn admit_byte_limits(
     };
     if max_entry_bytes < MIN_MAX_ENTRY_BYTES as u64 {
         return Err(format!(
-            "{plugin_name}: 'max_entry_bytes' must be >= {MIN_MAX_ENTRY_BYTES}"
+            "{plugin_name}: `max_entry_bytes` must be >= {MIN_MAX_ENTRY_BYTES}"
         ));
     }
     if max_entry_bytes > HARD_MAX_ENTRY_BYTES as u64 {
         return Err(format!(
-            "{plugin_name}: 'max_entry_bytes' must be <= {HARD_MAX_ENTRY_BYTES}"
+            "{plugin_name}: `max_entry_bytes` must be <= {HARD_MAX_ENTRY_BYTES}"
         ));
     }
 
@@ -938,7 +938,7 @@ pub fn admit_byte_limits(
         Some(value) => {
             let Some(parsed) = value.as_u64() else {
                 return Err(format!(
-                    "{plugin_name}: 'buffer_max_bytes' must be an unsigned integer"
+                    "{plugin_name}: `buffer_max_bytes` must be an unsigned integer"
                 ));
             };
             parsed
@@ -947,14 +947,14 @@ pub fn admit_byte_limits(
     let minimum_buffer_bytes = accounted_summary_bytes(max_entry_bytes as usize) as u64;
     if buffer_max_bytes < minimum_buffer_bytes {
         return Err(format!(
-            "{plugin_name}: 'buffer_max_bytes' must be greater than or equal to \
-             {SUMMARY_ENTRY_RETAINED_COPIES} * ('max_entry_bytes' + \
+            "{plugin_name}: `buffer_max_bytes` must be greater than or equal to \
+             {SUMMARY_ENTRY_RETAINED_COPIES} * (`max_entry_bytes` + \
              {SUMMARY_ENTRY_FRAMING_BYTES})"
         ));
     }
     if buffer_max_bytes > HARD_MAX_BUFFER_MAX_BYTES as u64 {
         return Err(format!(
-            "{plugin_name}: 'buffer_max_bytes' must be <= {HARD_MAX_BUFFER_MAX_BYTES}"
+            "{plugin_name}: `buffer_max_bytes` must be <= {HARD_MAX_BUFFER_MAX_BYTES}"
         ));
     }
 

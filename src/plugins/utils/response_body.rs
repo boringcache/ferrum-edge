@@ -109,12 +109,12 @@ pub fn parse_max_response_body_bytes(
         Some(v) => {
             let raw = v
                 .as_u64()
-                .ok_or_else(|| format!("{plugin_name}: '{key}' must be a non-negative integer"))?;
+                .ok_or_else(|| format!("{plugin_name}: `{key}` must be a non-negative integer"))?;
             if raw == 0 {
-                return Err(format!("{plugin_name}: '{key}' must be greater than zero"));
+                return Err(format!("{plugin_name}: `{key}` must be greater than zero"));
             }
             usize::try_from(raw)
-                .map_err(|_| format!("{plugin_name}: '{key}' is too large for this platform"))
+                .map_err(|_| format!("{plugin_name}: `{key}` is too large for this platform"))
         }
     }
 }

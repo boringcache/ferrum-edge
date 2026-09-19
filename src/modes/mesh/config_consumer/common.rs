@@ -100,6 +100,7 @@ pub(crate) mod diagnostic_test_support {
 
     impl DiagnosticLogs {
         pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            crate::diagnostic_test_interest::ensure_interest_floor();
             tracing_subscriber::fmt()
                 .without_time()
                 .with_ansi(false)
@@ -132,6 +133,11 @@ pub(crate) mod diagnostic_test_support {
             self.clone()
         }
     }
+
+    crate::diagnostic_test_interest::capture_regression!(
+        subscriber = super::DiagnosticLogs,
+        tracing::Level::TRACE
+    );
 }
 
 #[cfg(test)]

@@ -79,6 +79,265 @@ fn valid_config(spool_dir: &Path) -> Value {
     })
 }
 
+#[test]
+fn constructor_decode_diagnostics_withhold_values_and_document_paths() {
+    use ferrum_edge::startup::render_startup_error;
+
+    let hostile = "'UNREGISTERED\"\\`map.key`";
+    let mut cases = vec![
+        (json!(918273641), "`config`", "must be an object"),
+        (json!({"mode": hostile}), "`mode`", "unknown variant"),
+        (
+            json!({"mode": {"snapshot": 918273641}}),
+            "`mode`",
+            "expected unit",
+        ),
+        (
+            json!({"mode": {"per_event": hostile}}),
+            "`mode`",
+            "expected unit",
+        ),
+        (
+            json!({"spool": {"compression": {"zstd": hostile}}}),
+            "`spool.compression`",
+            "expected unit",
+        ),
+        (
+            json!({"spool": {"compression": {"none": 918273641}}}),
+            "`spool.compression`",
+            "expected unit",
+        ),
+        (
+            json!({"batch": {"size": -918273641}}),
+            "`batch.size`",
+            "invalid value",
+        ),
+        (
+            json!({"retry": {"jitter": 918273641}}),
+            "`retry.jitter`",
+            "expected a boolean",
+        ),
+        (
+            json!({"clickhouse": {"tls": {"verify_hostname": 918273641}}}),
+            "`clickhouse.tls.verify_hostname`",
+            "expected a boolean",
+        ),
+        (
+            json!({"pricing_version": false}),
+            "`pricing_version`",
+            "expected a string",
+        ),
+        (
+            json!({"include_request_id": hostile}),
+            "`include_request_id`",
+            "expected a boolean",
+        ),
+        (
+            json!({"spool": {"compression": hostile}}),
+            "`spool.compression`",
+            "unknown variant",
+        ),
+        (
+            json!({"clickhouse": {"insert_query_params": {(hostile): 918273641}}}),
+            "`clickhouse.insert_query_params`",
+            "expected a string",
+        ),
+        (
+            json!({"clickhouse": {"insert_query_params": {(hostile): true}}}),
+            "`clickhouse.insert_query_params`",
+            "expected a string",
+        ),
+        (json!({(hostile): false}), "`config`", "unknown field"),
+    ];
+    for (container, field) in [
+        ("clickhouse", "`clickhouse`"),
+        ("batch", "`batch`"),
+        ("retry", "`retry`"),
+        ("spool", "`spool`"),
+        ("snapshot", "`snapshot`"),
+    ] {
+        cases.push((
+            json!({(container): {(hostile): true}}),
+            field,
+            "unknown field",
+        ));
+    }
+    cases.push((
+        json!({"clickhouse": {"tls": {(hostile): true}}}),
+        "`clickhouse.tls`",
+        "unknown field",
+    ));
+
+    for (config, field, reason) in cases {
+        let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .err()
+            .expect("constructor must reject invalid configuration");
+        let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED", "map.key", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn constructor_unknown_fields_keep_schema_owned_choices_for_every_sink_struct() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for (path, fields) in [
+        (
+            "",
+            "mode clickhouse batch retry spool snapshot pricing_version currency \
+             include_request_id include_trace_id pricing_tiers bandwidth_pricing \
+             stream_connection_pricing schema schema_ref",
+        ),
+        (
+            "clickhouse",
+            "url database table username password_ref tls insert_query_params \
+             allow_lossy_async_insert timeout_ms",
+        ),
+        (
+            "clickhouse.tls",
+            "ca_file client_cert_file client_key_file verify_hostname insecure_skip_verify",
+        ),
+        (
+            "batch",
+            "size flush_interval_ms buffer_capacity buffer_max_bytes",
+        ),
+        ("retry", "max_attempts initial_delay_ms max_delay_ms jitter"),
+        (
+            "spool",
+            "enabled dir max_bytes replay_interval_secs delivery_queue_capacity compression",
+        ),
+        (
+            "snapshot",
+            "interval_secs emit_zero_deltas cleanup_interval_secs stale_entry_ttl_secs \
+             max_entries max_retained_bytes",
+        ),
+    ] {
+        for key in [
+            "szie",
+            "'SINK_KEY\"\\\n`map.key`",
+            "SINK_KEY`, expected one of `SINK_FAKE_CHOICE`, `password=SINK_SECRET`",
+            "https://SINK_USER:SINK_PASSWORD@example.invalid/?token=SINK_TOKEN",
+        ] {
+            let mut config = json!({(key): {"SINK_PAYLOAD": "SINK_VALUE"}});
+            for parent in path.split('.').rev().filter(|parent| !parent.is_empty()) {
+                config = json!({(parent): config});
+            }
+            let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+                .err()
+                .expect("unknown fields must reject before sink validation");
+            let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+            let field = if path.is_empty() { "config" } else { path };
+            let choices = fields
+                .split_ascii_whitespace()
+                .map(|field| format!("`{field}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_eq!(
+                rendered,
+                format!(
+                    "api_chargeback_sink: invalid `config` at `{field}`: \
+                     unknown field; expected one of {choices}"
+                ),
+            );
+            for withheld in [key, "szie", "SINK_", "map.key"] {
+                assert!(!rendered.contains(withheld), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
+fn constructor_preserves_known_unit_enum_object_representations() {
+    let temp = tempfile::tempdir().unwrap();
+    for mode in ["per_event", "snapshot"] {
+        for compression in ["none", "zstd"] {
+            let mut config = valid_config(temp.path());
+            config["mode"] = json!({(mode): null});
+            config["spool"]["compression"] = json!({(compression): null});
+            ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+                .expect("known unit enum object forms remain valid");
+        }
+    }
+}
+
+#[test]
+fn constructor_validation_diagnostics_keep_fields_and_fixed_suggestions() {
+    use ferrum_edge::startup::render_startup_error;
+
+    let hostile = "'UNREGISTERED\"\\`map.key`";
+    let mut cases = Vec::new();
+    for (clickhouse, field, reason) in [
+        (json!({"url": hostile}), "`clickhouse.url`", "malformed URL"),
+        (
+            json!({"url": "unregistered://host/UNREGISTERED"}),
+            "`clickhouse.url`",
+            "must use `http://` or `https://`",
+        ),
+        (
+            json!({"url": "http://localhost:8123", "database": hostile}),
+            "`clickhouse.database`",
+            "may only contain",
+        ),
+        (
+            json!({
+                "url": "http://localhost:8123",
+                "insert_query_params": {"'UNREGISTERED_secret\"\\`map.key`": "value"}
+            }),
+            "`clickhouse.insert_query_params`",
+            "names a credential",
+        ),
+        (
+            json!({
+                "url": "http://localhost:8123",
+                "insert_query_params": {(hostile): "UNREGISTERED\nvalue"}
+            }),
+            "`clickhouse.insert_query_params`",
+            "contains invalid value",
+        ),
+        (
+            json!({
+                "url": "http://localhost:8123",
+                "insert_query_params": {"wait_for_async_insert": "false"}
+            }),
+            "`clickhouse.insert_query_params.wait_for_async_insert`",
+            "`wait_for_async_insert` to `1`",
+        ),
+    ] {
+        let mut config = valid_config(Path::new("unused-diagnostic-spool"));
+        config["clickhouse"] = clickhouse;
+        cases.push((config, field, reason));
+    }
+    let mut retry = valid_config(Path::new("unused-diagnostic-spool"));
+    retry["retry"] = json!({"max_attempts": 12, "initial_delay_ms": 59001, "max_delay_ms": 59001});
+    cases.push((retry, "`retry`", "exceeds the 600000 ms budget"));
+    let mut spool = valid_config(Path::new("unused-diagnostic-spool"));
+    spool["spool"]["dir"] = json!("'UNREGISTERED\0path");
+    cases.push((spool, "`spool.dir`", "must not contain NUL bytes"));
+
+    for (config, field, reason) in cases {
+        let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .err()
+            .expect("constructor must reject invalid configuration");
+        let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in [
+            "UNREGISTERED",
+            "unregistered",
+            "map.key",
+            "false",
+            "59001",
+            "649011",
+        ] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+}
+
 fn sample_event(id: &str) -> ChargeEvent {
     ChargeEvent {
         event_id: id.to_string(),
@@ -442,7 +701,7 @@ async fn config_validation_rejects_snapshot_without_spool() {
         Ok(_) => panic!("snapshot mode without spool should be rejected"),
         Err(error) => error,
     };
-    assert!(error.contains("snapshot mode requires spool.enabled=true"));
+    assert!(error.contains("`snapshot` mode requires `spool.enabled=true`"));
 }
 
 #[test]
@@ -590,7 +849,9 @@ async fn password_ref_requires_https_clickhouse_url() {
         Ok(_) => panic!("password_ref over http should be rejected"),
         Err(error) => error,
     };
-    assert!(error.contains("password_ref requires clickhouse.url to use https://"));
+    assert!(
+        error.contains("`clickhouse.password_ref` requires `clickhouse.url` to use `https://`")
+    );
 }
 
 #[tokio::test]
@@ -605,7 +866,7 @@ async fn password_ref_rejects_disabled_tls_verification() {
         Ok(_) => panic!("password_ref with insecure_skip_verify should be rejected"),
         Err(error) => error,
     };
-    assert!(error.contains("password_ref cannot be used when ClickHouse TLS"));
+    assert!(error.contains("`clickhouse.password_ref` cannot be used when ClickHouse TLS"));
 }
 
 /// Issue #2627: OpenAPI must reject the same required/cross-field failures the
@@ -863,7 +1124,7 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
         .err()
         .unwrap_or_else(|| panic!("inverted retry bounds must fail runtime admission"));
     assert!(
-        retry_err.contains("retry.max_delay_ms must be >= retry.initial_delay_ms"),
+        retry_err.contains("`retry.max_delay_ms` must be >= `retry.initial_delay_ms`"),
         "unexpected retry admission error: {retry_err}"
     );
 
@@ -903,7 +1164,7 @@ async fn password_ref_must_use_ferrum_prefix() {
         Ok(_) => panic!("non-FERRUM password_ref should be rejected"),
         Err(error) => error,
     };
-    assert!(error.contains("password_ref must reference a FERRUM_*"));
+    assert!(error.contains("`clickhouse.password_ref` must reference a `FERRUM_*`"));
 }
 
 #[tokio::test]
@@ -5936,7 +6197,7 @@ fn clickhouse_timeout_bound_keeps_claim_lease_above_delivery_budget() {
         Err(error) => error,
     };
     assert!(
-        error.contains("clickhouse.timeout_ms must be between 1 and 600000"),
+        error.contains("`clickhouse.timeout_ms` must be between 1 and 600000"),
         "unexpected error: {error}"
     );
 }
@@ -7678,7 +7939,7 @@ fn config_validation_rejects_stale_ttl_shorter_than_snapshot_interval() {
         Err(err) => err,
     };
     assert!(
-        err.contains("stale_entry_ttl_secs must be >= snapshot.interval_secs"),
+        err.contains("`snapshot.stale_entry_ttl_secs` must be >= `snapshot.interval_secs`"),
         "unexpected error: {err}"
     );
 }
@@ -14086,7 +14347,7 @@ async fn oversized_billing_labels_are_refused_at_admission() {
             .err()
             .unwrap_or_else(|| panic!("an unexportable label must be refused"));
         assert!(
-            error.contains(&format!("{field} must be at most 512 UTF-8 bytes")),
+            error.contains(&format!("`{field}` must be at most 512 UTF-8 bytes")),
             "unexpected error for {field}: {error}"
         );
 
@@ -14142,7 +14403,9 @@ async fn cold_admission_rejects_an_incomplete_clickhouse_client_certificate_pair
             .err()
             .unwrap_or_else(|| panic!("an unpaired client identity must be refused"));
         assert!(
-            error.contains("client_cert_file and client_key_file must be set together"),
+            error.contains(
+                "`clickhouse.tls.client_cert_file` and `clickhouse.tls.client_key_file` must be set together"
+            ),
             "unexpected error for {field}: {error}"
         );
         assert!(

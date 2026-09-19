@@ -27,5 +27,6 @@ struct task_struct { struct nsproxy *nsproxy; struct task_struct *group_leader;
 struct sk_buff { struct sock *sk; };
 struct inet_cork { __u16 gso_size; };
 struct msghdr { unsigned int msg_flags; void *msg_name; int msg_namelen; };
+struct pt_regs { unsigned long di, si, dx, r10, r8, r9, cs, orig_ax; };
 #pragma clang attribute pop
 #endif

@@ -179,8 +179,8 @@ impl AnonymousCallerScope {
             "caller_address" | "caller-address" => Ok(Self::CallerAddress),
             "shared" => Ok(Self::Shared),
             other => Err(format!(
-                "{plugin}: unknown 'anonymous_caller_scope' value '{other}' \
-                 (expected caller_address or shared)"
+                "{plugin}: unknown `anonymous_caller_scope` value {other:?} \
+                 (expected `caller_address` or `shared`)"
             )),
         }
     }

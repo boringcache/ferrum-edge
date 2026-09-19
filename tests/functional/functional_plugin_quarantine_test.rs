@@ -390,9 +390,19 @@ async fn malformed_fail_closed_plugin_row_refuses_cold_start_without_backup() {
 
     let output = failure.combined_output();
     assert!(
-        output.contains(KEY_AUTH_PLUGIN_ID) && output.contains("key_auth"),
-        "startup must name the offending row; captured output was:\n{output}"
+        output.contains("Config rejected: Plugin <redacted scalar>")
+            && output.contains("plugin_config_id=<redacted scalar>")
+            && output.contains("scope=Proxy")
+            && output.contains("key_auth: unknown configuration field(s): <redacted scalar>")
+            && output.contains("allowed fields are `key_location` and `hide_credentials`"),
+        "startup must retain the rejection and safe repair guidance; captured output was:\n{output}"
     );
+    for withheld in [KEY_AUTH_PLUGIN_ID, PROXY_ID, API_KEY, "typo"] {
+        assert!(
+            !output.contains(withheld),
+            "startup must withhold configured values; captured output was:\n{output}"
+        );
+    }
     assert!(
         !output.contains("serving without them"),
         "a FailClosed row must never be quarantined and served without; captured output was:\n{output}"

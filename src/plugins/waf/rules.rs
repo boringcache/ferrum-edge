@@ -498,11 +498,28 @@ pub(super) fn compile_rules(
     let mut seen_default = HashSet::new();
     let mut compiled_rules = Vec::new();
     let mut builders = RuleSetBuilders::default();
+    let mut next_custom_index = 0usize;
 
     for (mut rule, is_default) in rules.drain(..) {
-        validate_rule(&rule)?;
+        // Count source entries before any disabled/paranoia filtering. Built-in
+        // rules must not shift the custom_rules ordinal in a rejection.
+        let custom_index = if is_default {
+            None
+        } else {
+            let index = next_custom_index;
+            next_custom_index += 1;
+            Some(index)
+        };
+        let with_rule_context = |error: String| match custom_index {
+            Some(index) => format!("waf: `config.custom_rules[{index}]`: {error}"),
+            None => error,
+        };
+        validate_rule(&rule).map_err(with_rule_context)?;
         if !seen.insert(rule.id.clone()) {
-            return Err(format!("waf: duplicate rule id {:?}", rule.id));
+            return Err(with_rule_context(format!(
+                "waf: duplicate rule id {:?}",
+                rule.id
+            )));
         }
         if is_default {
             seen_default.insert(rule.id.clone());
@@ -556,13 +573,13 @@ pub(super) fn compile_rules(
             continue;
         }
 
-        let fp_filters = compile_fp_filters(&rule)?;
+        let fp_filters = compile_fp_filters(&rule).map_err(with_rule_context)?;
         let cidr = if rule.match_kind == MatchKind::Cidr {
             Some(IpCidr::parse(&rule.pattern).ok_or_else(|| {
-                format!(
+                with_rule_context(format!(
                     "waf: rule {:?} has invalid CIDR {:?}",
                     rule.id, rule.pattern
-                )
+                ))
             })?)
         } else {
             None
@@ -573,7 +590,7 @@ pub(super) fn compile_rules(
             .as_ref()
             .map(CompiledConditions::compile)
             .transpose()
-            .map_err(|e| format!("waf: rule {:?}: {e}", rule.id))?;
+            .map_err(|e| with_rule_context(format!("waf: rule {:?}: {e}", rule.id)))?;
 
         let rule_index = compiled_rules.len();
         let compiled = CompiledRule {
@@ -588,7 +605,9 @@ pub(super) fn compile_rules(
             cidr,
             score: rule.score,
         };
-        builders.add_rule(rule_index, &rule)?;
+        builders
+            .add_rule(rule_index, &rule)
+            .map_err(with_rule_context)?;
         compiled_rules.push(compiled);
     }
 
@@ -1150,12 +1169,12 @@ fn parse_target_string(
 ) -> Result<RuleTarget, String> {
     if path.is_some() && raw != "body_json_path" {
         return Err(format!(
-            "waf: target {raw:?} does not support 'path'; 'path' is only valid for body_json_path"
+            "waf: target {raw:?} does not support `path`; `path` is only valid for body_json_path"
         ));
     }
     if names.is_some() && !matches!(raw, "header_values" | "request_headers") {
         return Err(format!(
-            "waf: target {raw:?} does not support 'names'; 'names' is only valid for header_values/request_headers"
+            "waf: target {raw:?} does not support `names`; `names` is only valid for header_values/request_headers"
         ));
     }
     match raw {
@@ -1163,7 +1182,7 @@ fn parse_target_string(
         "header_values" | "request_headers" => {
             if names.as_ref().is_some_and(Vec::is_empty) {
                 return Err(
-                    "waf: header_values target 'names' must be non-empty when provided".to_string(),
+                    "waf: header_values target `names` must be non-empty when provided".to_string(),
                 );
             }
             Ok(RuleTarget::HeaderValues(names))
@@ -1176,7 +1195,7 @@ fn parse_target_string(
         "method" | "request_method" => Ok(RuleTarget::Method),
         "body_text" | "request_body" => Ok(RuleTarget::BodyText),
         "body_json_path" => Ok(RuleTarget::BodyJsonPath(path.ok_or_else(|| {
-            "waf: body_json_path target requires string 'path'".to_string()
+            "waf: body_json_path target requires string `path`".to_string()
         })?)),
         "response_headers" => Ok(RuleTarget::ResponseHeaders),
         "response_body" => Ok(RuleTarget::ResponseBody),

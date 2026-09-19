@@ -318,16 +318,16 @@ pub mod pricing {
     ) -> Result<f64, String> {
         let number = value
             .as_f64()
-            .ok_or_else(|| format!("{plugin_name}: '{ctx}' must be a number"))?;
+            .ok_or_else(|| format!("{plugin_name}: `{ctx}` must be a number"))?;
         if !number.is_finite() || number < 0.0 {
             return Err(format!(
-                "{plugin_name}: '{ctx}' must be a finite non-negative number \
+                "{plugin_name}: `{ctx}` must be a finite non-negative number \
                  no greater than {MAX_UNIT_PRICE}"
             ));
         }
         if number > MAX_UNIT_PRICE {
             return Err(format!(
-                "{plugin_name}: '{ctx}' must be a finite non-negative number \
+                "{plugin_name}: `{ctx}` must be a finite non-negative number \
                  no greater than {MAX_UNIT_PRICE}, got \"{number}\""
             ));
         }
@@ -346,11 +346,11 @@ pub mod pricing {
     fn parse_pricing_tiers(value: &Value, plugin_name: &str) -> Result<HashMap<u16, f64>, String> {
         let tiers = value
             .as_array()
-            .ok_or_else(|| format!("{plugin_name}: 'pricing_tiers' must be an array"))?;
+            .ok_or_else(|| format!("{plugin_name}: `pricing_tiers` must be an array"))?;
 
         if tiers.is_empty() {
             return Err(format!(
-                "{plugin_name}: 'pricing_tiers' must contain at least one pricing tier"
+                "{plugin_name}: `pricing_tiers` must contain at least one pricing tier"
             ));
         }
 
@@ -358,12 +358,12 @@ pub mod pricing {
         for (i, tier) in tiers.iter().enumerate() {
             let tier_obj = tier
                 .as_object()
-                .ok_or_else(|| format!("{plugin_name}: pricing_tiers[{i}] must be an object"))?;
+                .ok_or_else(|| format!("{plugin_name}: `pricing_tiers[{i}]` must be an object"))?;
             reject_unknown_keys(
                 tier_obj,
                 &format!("pricing_tiers[{i}]"),
                 PRICING_TIER_KEYS,
-                &format!("{plugin_name}: "),
+                &format!("{plugin_name}: `pricing_tiers[{i}]`: "),
             )?;
 
             let status_codes = tier
@@ -371,19 +371,19 @@ pub mod pricing {
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
                     format!(
-                        "{plugin_name}: pricing_tiers[{i}].status_codes is required and must be an array"
+                        "{plugin_name}: `pricing_tiers[{i}].status_codes` is required and must be an array"
                     )
                 })?;
 
             if status_codes.is_empty() {
                 return Err(format!(
-                    "{plugin_name}: pricing_tiers[{i}].status_codes must not be empty"
+                    "{plugin_name}: `pricing_tiers[{i}].status_codes` must not be empty"
                 ));
             }
 
             let price_value = tier.get("price_per_call").ok_or_else(|| {
                 format!(
-                    "{plugin_name}: pricing_tiers[{i}].price_per_call is required and must be a number"
+                    "{plugin_name}: `pricing_tiers[{i}].price_per_call` is required and must be a number"
                 )
             })?;
             let price = optional_non_negative_f64(
@@ -395,20 +395,20 @@ pub mod pricing {
             for code_val in status_codes {
                 let code_u64 = code_val.as_u64().ok_or_else(|| {
                     format!(
-                        "{plugin_name}: pricing_tiers[{i}].status_codes contains non-integer value"
+                        "{plugin_name}: `pricing_tiers[{i}].status_codes` contains non-integer value"
                     )
                 })?;
 
                 if !(100..=599).contains(&code_u64) {
                     return Err(format!(
-                        "{plugin_name}: pricing_tiers[{i}].status_codes contains invalid HTTP status code \"{code_u64}\""
+                        "{plugin_name}: `pricing_tiers[{i}].status_codes` contains invalid HTTP status code \"{code_u64}\""
                     ));
                 }
                 let code = code_u64 as u16;
 
                 if price_by_status.contains_key(&code) {
                     return Err(format!(
-                        "{plugin_name}: status code \"{code}\" appears in multiple pricing tiers"
+                        "{plugin_name}: `pricing_tiers[{i}].status_codes` status code \"{code}\" appears in multiple pricing tiers"
                     ));
                 }
 
@@ -421,7 +421,7 @@ pub mod pricing {
     fn parse_bandwidth_pricing(value: &Value, plugin_name: &str) -> Result<(f64, f64), String> {
         if !value.is_object() {
             return Err(format!(
-                "{plugin_name}: 'bandwidth_pricing' must be an object"
+                "{plugin_name}: `bandwidth_pricing` must be an object"
             ));
         }
         let allowed = ["price_per_byte_sent", "price_per_byte_received"];
@@ -429,8 +429,8 @@ pub mod pricing {
             for key in obj.keys() {
                 if !allowed.contains(&key.as_str()) {
                     return Err(format!(
-                        "{plugin_name}: unknown key '{key}' in bandwidth_pricing (allowed: {})",
-                        allowed.join(", ")
+                        "{plugin_name}: unknown key {key:?} in `bandwidth_pricing` \
+                         (allowed: `price_per_byte_sent`, `price_per_byte_received`)"
                     ));
                 }
             }
@@ -455,7 +455,7 @@ pub mod pricing {
     fn parse_stream_connection_pricing(value: &Value, plugin_name: &str) -> Result<f64, String> {
         if !value.is_object() {
             return Err(format!(
-                "{plugin_name}: 'stream_connection_pricing' must be an object"
+                "{plugin_name}: `stream_connection_pricing` must be an object"
             ));
         }
         let allowed = ["price_per_connection"];
@@ -463,8 +463,8 @@ pub mod pricing {
             for key in obj.keys() {
                 if !allowed.contains(&key.as_str()) {
                     return Err(format!(
-                        "{plugin_name}: unknown key '{key}' in stream_connection_pricing (allowed: {})",
-                        allowed.join(", ")
+                        "{plugin_name}: unknown key {key:?} in `stream_connection_pricing` \
+                         (allowed: `price_per_connection`)"
                     ));
                 }
             }
@@ -476,7 +476,7 @@ pub mod pricing {
                 plugin_name,
             ),
             None => Err(format!(
-                "{plugin_name}: 'stream_connection_pricing.price_per_connection' is required"
+                "{plugin_name}: `stream_connection_pricing.price_per_connection` is required"
             )),
         }
     }

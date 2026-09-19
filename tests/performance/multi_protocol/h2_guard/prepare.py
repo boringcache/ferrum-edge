@@ -71,7 +71,7 @@ def patch_source(source, provenance):
         destination.write_bytes(raw)
 
 
-def select_dependency(context, evidence):
+def select_dependency(context, evidence, provenance):
     original = (context / "Cargo.toml").read_text()
     if original.count("[patch.crates-io]\n") != 1:
         raise ValueError("unexpected root patch table")
@@ -99,6 +99,24 @@ def select_dependency(context, evidence):
     (context / "Dockerfile").write_text(locked)
     diff += "".join(difflib.unified_diff(docker.splitlines(True), locked.splitlines(True),
                                         fromfile="a/Dockerfile", tofile="b/Dockerfile"))
+    # No shipping route/API change: insert the narrow authenticated snapshot
+    # trigger only in this disposable build, with exact context identities.
+    hook = (ASSETS / "metrics-hook.txt").read_bytes()
+    if sha(hook) != provenance["assets"]["metrics-hook.txt"]:
+        raise ValueError("metrics hook identity mismatch")
+    admin = context / "src/admin/mod.rs"
+    before = admin.read_bytes()
+    pin = provenance["context_files"]["src/admin/mod.rs"]
+    anchor = b"        let mut metrics_output = registry.render();\n"
+    if sha(before) != pin["before"] or before.count(anchor) != 1:
+        raise ValueError("diagnostic metrics context drift")
+    after = before.replace(anchor, anchor + hook)
+    if sha(after) != pin["after"]:
+        raise ValueError("diagnostic metrics postimage mismatch")
+    admin.write_bytes(after)
+    shutil.copy2(admin, evidence / "diagnostic-admin.rs")
+    diff += "".join(difflib.unified_diff(before.decode().splitlines(True), after.decode().splitlines(True),
+                                       fromfile="a/src/admin/mod.rs", tofile="b/src/admin/mod.rs"))
     (evidence / "selection.patch").write_text(diff)
     for name in ("Cargo.toml", "Cargo.lock", "Dockerfile", ".dockerignore"):
         shutil.copy2(context / name, evidence / name.lstrip("."))
@@ -133,7 +151,7 @@ def main():
     # comparison. Do not alter upstream code merely to silence newer Clippy.
     shutil.copytree(source, output / "upstream")
     patch_source(source, provenance)
-    select_dependency(context, evidence)
+    select_dependency(context, evidence, provenance)
     identity = dict(source=provenance, checkout=os.environ["GITHUB_SHA"],
                     run_id=os.environ["GITHUB_RUN_ID"], attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                     features="cloud-secrets", profile="release", image_target="runtime",

@@ -196,6 +196,21 @@ fn test_ldap_url_empty_authority_rejected() {
 }
 
 #[test]
+fn rendered_ldap_missing_hostname_keeps_field_after_url_normalization() {
+    // URL parsing removes the embedded tab; the raw authority is nonempty,
+    // so this reaches the parsed-host check rather than the raw-authority guard.
+    let error = LdapAuth::new(
+        &json!({"ldap_url": "ldap://\t/LDAP_RESIDUAL_SECRET"}),
+        http_client(),
+    )
+    .err()
+    .expect("a URL without a parsed hostname must reject construction");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert_eq!(rendered, "ldap_auth: `ldap_url` must include a hostname");
+    assert!(!rendered.contains("LDAP_RESIDUAL_SECRET"), "{rendered}");
+}
+
+#[test]
 fn test_no_bind_mode_rejected() {
     let result = LdapAuth::new(
         &json!({

@@ -31,10 +31,41 @@
     "cutoff": {
       "ferrum": "observer on cutoff 0",
       "ferrum-exp-cutoff-one": "observer on cutoff 1"
+    },
+    "trace-calibration": {
+      "ferrum": "internal observer on cutoff 0 external observer on",
+      "ferrum-baseline": "same exact image/internal observer/cutoff, external observer off"
     }
   },
   "direct": "repeated for every pair",
-  "actual_syscalls": "not collected; separate intrusive pass remains open",
-  "sampled_cpu_stacks": "not collected",
-  "streaming_regression": "required before any optimization; this branch changes no forwarding policy"
+  "actual_syscalls": "opt-in hosted syscalls lane; per-repeat explicit total/socket/lifecycle completeness",
+  "sampled_cpu_stacks": "opt-in separate hosted cpu-clock:u 99 Hz DWARF8192 lane; matching ELF/DSOs",
+  "streaming_regression": "required before any optimization; this branch changes no forwarding policy",
+  "external_trace": {
+    "modes": [
+      "none",
+      "syscalls",
+      "cpu"
+    ],
+    "default": "none",
+    "one_payload_per_shard": true,
+    "same_binary_external_calibration": true,
+    "pairs": 4,
+    "fully_profiled_with_missing_dimensions": false,
+    "dependency_provenance": {
+      "meaning": "Historical dependency checkpoints, not the complete integrated ancestry; exact source hashes and runner revision identify each capture.",
+      "initial_bases": {
+        "h1": "a798c0bac68151fbe860e3cb48843cbd434c0f84",
+        "h3": "d19abaa3c4fbb40af6136cb577a1ed7e82bf8529"
+      },
+      "integration_checkpoints": {
+        "h1": "2491d44b1149bf33dece351595244351d2dbc322",
+        "h3": "e00f0a91cb5ae2b0686392f504471283e6f52b4c"
+      },
+      "reviewed_checkpoints": {
+        "h1": "ac7ff645f766597b9e4f38aa9e18272c0b3c249d",
+        "h3": "45dbde8ccc9575b225890afb450579213d62cb21"
+      }
+    }
+  }
 }

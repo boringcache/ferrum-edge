@@ -4,6 +4,7 @@
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <sys/prctl.h>
 #include <poll.h>
@@ -17,13 +18,14 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 #include "contract.h"
 
 _Static_assert(sizeof(void *) == 8 && sizeof(struct msghdr) == 56, "native amd64 ABI");
 _Static_assert(offsetof(struct msghdr, msg_flags) == 48, "native msg_flags");
 _Static_assert(sizeof(struct mmsghdr) == 64 && offsetof(struct mmsghdr, msg_len) == 56, "native mmsghdr");
 _Static_assert(sizeof(struct cmsghdr) == 16 && CMSG_ALIGN(1) == 8, "native cmsg");
-static bool live;
+static bool live, h1_mode;
 static unsigned int lifecycle_rows, lifecycle_omitted;
 static int rx_argc;
 static volatile sig_atomic_t stopping;
@@ -34,6 +36,26 @@ static char verifier[256 * 1024];
 static size_t log_bytes;
 static bool log_truncated;
 
+// Redact H1 address-shaped diagnostics before they reach disk, including when
+// the supervisor dies before it can run its final evidence sanitizer.
+static void h1_redact(char *data, size_t length)
+{
+    if (!h1_mode) return;
+    for (size_t i = 0; i + 4 < length; i++) {
+        bool prefix = data[i] == '0' && (data[i + 1] == 'x' || data[i + 1] == 'X');
+        bool kernel = tolower((unsigned char)data[i]) == 'f' &&
+                      tolower((unsigned char)data[i + 1]) == 'f' &&
+                      tolower((unsigned char)data[i + 2]) == 'f' &&
+                      tolower((unsigned char)data[i + 3]) == 'f';
+        if (!prefix && !kernel) continue;
+        size_t start = i + (prefix ? 2 : 0), end = start;
+        while (end < length && isxdigit((unsigned char)data[end])) end++;
+        if (end - start >= (prefix ? 8U : 16U)) {
+            for (size_t j = start; j < end; j++) data[j] = 'x';
+            i = end - 1;
+        }
+    }
+}
 static int logger(enum libbpf_print_level level, const char *fmt, va_list ap)
 {
     (void)level;
@@ -45,6 +67,7 @@ static int logger(enum libbpf_print_level level, const char *fmt, va_list ap)
     if (log_bytes + length > 512 * 1024) { log_truncated = true; return n; }
     log_bytes += length;
     // libbpf diagnostics are metadata/verifier instructions, never packet bytes.
+    h1_redact(buf, length);
     fwrite(buf, 1, length, stderr);
     return n;
 }
@@ -87,6 +110,10 @@ static bool integer(const struct btf *b, __u32 id, unsigned int size)
     return t && btf_is_int(t) && t->size == size;
 }
 struct site { const char *name; int argc; const char *args[5]; const char *ret; };
+static const struct site h1_sites[] = {
+    {"tcp_sendmsg", 3, {"sock", "msghdr", "8"}, "4"},
+    {"tcp_recvmsg", 5, {"sock", "msghdr", "8", "4", "int_ptr"}, "4"},
+};
 static const struct site tx_sites[] = {
     {"udp_sendmsg", 3, {"sock", "msghdr", "8"}, "4"},
     {"udp_send_skb", 3, {"sk_buff", "flowi4", "inet_cork"}, "4"},
@@ -121,6 +148,10 @@ static const struct site classic_sites[] = {
 };
 static bool matches(const struct btf *btf, __u32 type, const char *spec)
 {
+    if (!strcmp(spec, "int_ptr")) {
+        const struct btf_type *t = resolve(btf, type);
+        return t && btf_is_ptr(t) && integer(btf, t->type, 4);
+    }
     if (!strcmp(spec, "void")) return type == 0;
     if (spec[0] >= '0' && spec[0] <= '9') return integer(btf, type, (unsigned int)atoi(spec));
     return pointer_to(btf, type, spec);
@@ -309,16 +340,18 @@ static int snapshot(struct bpf_object *obj, const char *phase, unsigned long lon
     fflush(stdout);
     return failures ? 1 : 0;
 }
+#include "h1_loader.h"
 int main(int argc, char **argv)
 {
     if (argc != 6 && argc != 7) {
-        fprintf(stderr, "usage: observer OBJECT {tx|rx|classic|attach|lifetime|destroy|group|process} NETNS {4096|512|1} {normal|missing-btf|missing-symbol} [OWNED_CGROUP]\n");
+        fprintf(stderr, "usage: observer OBJECT {tx|rx|classic|attach|lifetime|destroy|group|process|h1} NETNS {8192|4096|512|1} {normal|missing-btf|missing-symbol} [OWNED_CGROUP]\n");
         return 2;
     }
     const struct site *sites;
     size_t nsites;
     char prefix;
-    if (!strcmp(argv[2], "tx")) { sites = tx_sites; nsites = 2; prefix = 't'; }
+    if (!strcmp(argv[2], "h1")) { sites = h1_sites; nsites = 2; prefix = 'h'; }
+    else if (!strcmp(argv[2], "tx")) { sites = tx_sites; nsites = 2; prefix = 't'; }
     else if (!strcmp(argv[2], "rx")) { sites = rx_sites; nsites = 1; prefix = 'r'; }
     else if (!strcmp(argv[2], "classic")) { sites = classic_sites; nsites = 4; prefix = 'c'; }
     else if (!strcmp(argv[2], "attach")) { sites = attach_sites; nsites = 1; prefix = 'a'; }
@@ -327,12 +360,19 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[2], "group")) { sites = group_sites; nsites = 4; prefix = 'g'; }
     else if (!strcmp(argv[2], "process")) { sites = NULL; nsites = 0; prefix = 'p'; }
     else return 2;
+    h1_mode = prefix == 'h';
     live = argc == 7;
     pid_t parent = getppid();
     if (prctl(PR_SET_PDEATHSIG, SIGTERM)) return unavailable("error", "parent_death_signal", errno);
     signal(SIGTERM, stop_signal); signal(SIGINT, stop_signal);
     if (getppid() != parent) stopping = 1;
-    if (strcmp(argv[4], "512") && strcmp(argv[4], "1") && strcmp(argv[4], "4096")) return 2;
+    if (strcmp(argv[4], "512") && strcmp(argv[4], "1") && strcmp(argv[4], "4096") &&
+        !(prefix == 'h' && !strcmp(argv[4], "8192"))) return 2;
+    if (prefix == 'h') {
+        struct utsname host;
+        if (live || uname(&host) || strcmp(host.machine, "x86_64"))
+            return unavailable("unsupported", "native_amd64_required", EINVAL);
+    }
     if (strcmp(argv[5], "normal") && strcmp(argv[5], "missing-btf") && strcmp(argv[5], "missing-symbol")) return 2;
     libbpf_set_print(logger);
     const char *btf_path = !strcmp(argv[5], "missing-btf") ? "/nonexistent/h3-proof-btf" : "/sys/kernel/btf/vmlinux";
@@ -383,7 +423,14 @@ int main(int argc, char **argv)
                     ATTACH_LOG_STATS, sizeof(verifier));
         }
     }
-    struct bpf_map *map = bpf_object__find_map_by_name(obj, "counts");
+    // H1 resources cannot change H3 memory admission or verifier behavior.
+    struct bpf_map *selected_map;
+    bpf_object__for_each_map(selected_map, obj) {
+        const char *name = bpf_map__name(selected_map);
+        bool h1_map = name[0] == 'h' && name[1] == '_';
+        if (h1_map != (prefix == 'h')) bpf_map__set_autocreate(selected_map, false);
+    }
+    struct bpf_map *map = bpf_object__find_map_by_name(obj, prefix == 'h' ? "h_counts" : "counts");
     if (!map || bpf_map__set_max_entries(map, (__u32)atoi(argv[4]))) return unavailable("error", "map_config", errno);
     // Eight independently qualified families share a total 4 MiB ring budget.
     if (live && bpf_map__set_max_entries(bpf_object__find_map_by_name(obj, "lifecycle"), 512 * 1024))
@@ -399,11 +446,15 @@ int main(int argc, char **argv)
             err, verifier_bytes, sizeof(verifier), log_truncated ? "true" : "false");
     // The shared buffer belongs to the last kernel load attempt, not necessarily
     // the attachment program. Retain it on success too, including stack stats.
+    h1_redact(verifier, verifier_bytes);
     fwrite(verifier, 1, verifier_bytes, stderr);
     if (err) {
         bpf_object__close(obj);
-        return unavailable(err == -EOPNOTSUPP ? "unsupported" : "error", "load", -err);
+        return unavailable(err == -EOPNOTSUPP ||
+            (prefix == 'h' && (err == -EPERM || err == -EACCES || err == -ENOENT))
+            ? "unsupported" : "error", "load", -err);
     }
+    if (prefix == 'h') return h1_run(obj);
     __u32 zero = 0;
     char *end = NULL;
     struct config cfg = {.netns = strtoull(argv[3], &end, 10), .live = live, .start_ns = now_ns()};

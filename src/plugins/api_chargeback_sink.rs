@@ -1427,7 +1427,7 @@ pub struct ChargeEventProjection {
 impl ChargeEventProjection {
     fn new(schema: Arc<SummarySchema>) -> Result<Self, String> {
         let row_overhead_bytes = projection_row_overhead_bytes(&schema).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: schema adds an unboundable number of bytes per exported row")
+            format!("{PLUGIN_NAME}: `schema` adds an unboundable number of bytes per exported row")
         })?;
         Ok(Self {
             schema,
@@ -2975,7 +2975,7 @@ impl ApiChargebackSink {
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
         if !raw_config.is_object() {
-            return Err(format!("{PLUGIN_NAME}: config must be an object"));
+            return Err(format!("{PLUGIN_NAME}: `config` must be an object"));
         }
         // Compile / resolve once here — never on a flush path. `schema_ref`
         // keeps the global-first lifecycle and fails closed when the named
@@ -2999,14 +2999,14 @@ impl ApiChargebackSink {
             None => Arc::<str>::from(DEFAULT_PLUGIN_CONFIG_ID),
         };
 
-        let config: ApiChargebackSinkConfig = serde_json::from_value(raw_config.clone())
-            .map_err(|error| format!("{PLUGIN_NAME}: invalid config: {error}"))?;
+        let config: ApiChargebackSinkConfig =
+            serde_path_to_error::deserialize(raw_config.clone()).map_err(config_decode_error)?;
         validate_config(&config)?;
         let pricing = PricingConfig::from_config(raw_config, PLUGIN_NAME)?;
         if !pricing.has_any_pricing() {
             return Err(format!(
-                "{PLUGIN_NAME}: at least one of 'pricing_tiers', 'bandwidth_pricing', or \
-                 'stream_connection_pricing' must be configured"
+                "{PLUGIN_NAME}: at least one of `pricing_tiers`, `bandwidth_pricing`, or \
+                 `stream_connection_pricing` must be configured"
             ));
         }
 
@@ -5207,11 +5207,127 @@ fn classify_reqwest_failure(error: &reqwest::Error) -> FailureReason {
     }
 }
 
+fn config_decode_error(error: serde_path_to_error::Error<serde_json::Error>) -> String {
+    let path = error.path().to_string();
+    // This allowlist controls diagnostic text only, never admission. Serde paths
+    // can include document keys, notably below `insert_query_params`; retain
+    // only complete schema paths and fixed parent context for all other paths.
+    let field = match path.as_str() {
+        "mode"
+        | "clickhouse"
+        | "clickhouse.url"
+        | "clickhouse.database"
+        | "clickhouse.table"
+        | "clickhouse.username"
+        | "clickhouse.password_ref"
+        | "clickhouse.tls"
+        | "clickhouse.tls.ca_file"
+        | "clickhouse.tls.client_cert_file"
+        | "clickhouse.tls.client_key_file"
+        | "clickhouse.tls.verify_hostname"
+        | "clickhouse.tls.insecure_skip_verify"
+        | "clickhouse.insert_query_params"
+        | "clickhouse.allow_lossy_async_insert"
+        | "clickhouse.timeout_ms"
+        | "batch"
+        | "batch.size"
+        | "batch.flush_interval_ms"
+        | "batch.buffer_capacity"
+        | "batch.buffer_max_bytes"
+        | "retry"
+        | "retry.max_attempts"
+        | "retry.initial_delay_ms"
+        | "retry.max_delay_ms"
+        | "retry.jitter"
+        | "spool"
+        | "spool.enabled"
+        | "spool.dir"
+        | "spool.max_bytes"
+        | "spool.replay_interval_secs"
+        | "spool.delivery_queue_capacity"
+        | "spool.compression"
+        | "snapshot"
+        | "snapshot.interval_secs"
+        | "snapshot.emit_zero_deltas"
+        | "snapshot.cleanup_interval_secs"
+        | "snapshot.stale_entry_ttl_secs"
+        | "snapshot.max_entries"
+        | "snapshot.max_retained_bytes"
+        | "pricing_version"
+        | "currency"
+        | "include_request_id"
+        | "include_trace_id"
+        | "pricing_tiers"
+        | "bandwidth_pricing"
+        | "stream_connection_pricing"
+        | "schema"
+        | "schema_ref" => path.as_str(),
+        path if path.starts_with("clickhouse.insert_query_params.") => {
+            "clickhouse.insert_query_params"
+        }
+        path if path.starts_with("clickhouse.tls.") => "clickhouse.tls",
+        path if path.starts_with("clickhouse.") => "clickhouse",
+        path if path.starts_with("mode.") => "mode",
+        path if path.starts_with("batch.") => "batch",
+        path if path.starts_with("retry.") => "retry",
+        path if path.starts_with("spool.compression.") => "spool.compression",
+        path if path.starts_with("spool.") => "spool",
+        path if path.starts_with("snapshot.") => "snapshot",
+        _ => "config",
+    };
+    let inner = error.into_inner().to_string();
+    // Serde renders unknown document keys in unescaped backticks. Do not pass
+    // that family through the scalar sanitizer, which preserves schema names.
+    let reason = if inner.starts_with("unknown field ") {
+        // Reconstruct choices from the derived structs above, never from an
+        // error suffix: a document key can itself contain serde delimiters.
+        // Keep these diagnostic-only sets in sync with all seven config structs.
+        let fields = match field {
+            "config" => {
+                "mode clickhouse batch retry spool snapshot pricing_version currency \
+                include_request_id include_trace_id pricing_tiers bandwidth_pricing \
+                stream_connection_pricing schema schema_ref"
+            }
+            "clickhouse" => {
+                "url database table username password_ref tls insert_query_params \
+                allow_lossy_async_insert timeout_ms"
+            }
+            "clickhouse.tls" => {
+                "ca_file client_cert_file client_key_file verify_hostname \
+                insecure_skip_verify"
+            }
+            "batch" => "size flush_interval_ms buffer_capacity buffer_max_bytes",
+            "retry" => "max_attempts initial_delay_ms max_delay_ms jitter",
+            "spool" => {
+                "enabled dir max_bytes replay_interval_secs delivery_queue_capacity \
+                compression"
+            }
+            "snapshot" => {
+                "interval_secs emit_zero_deltas cleanup_interval_secs \
+                stale_entry_ttl_secs max_entries max_retained_bytes"
+            }
+            _ => "",
+        };
+        let choices = fields
+            .split_ascii_whitespace()
+            .map(|field| format!("`{field}`"))
+            .collect::<Vec<_>>();
+        if choices.is_empty() {
+            "unknown field".to_string()
+        } else {
+            format!("unknown field; expected one of {}", choices.join(", "))
+        }
+    } else {
+        crate::util::deserialization::sanitize_message(&inner)
+    };
+    format!("{PLUGIN_NAME}: invalid `config` at `{field}`: {reason}")
+}
+
 fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     let url = parse_clickhouse_url(&config.clickhouse.url)?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.url must not contain user-info; use username/password_ref"
+            "{PLUGIN_NAME}: `clickhouse.url` must not contain user-info; use `clickhouse.username`/`clickhouse.password_ref`"
         ));
     }
     validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
@@ -5219,7 +5335,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     if config.clickhouse.timeout_ms == 0 || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
     {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.timeout_ms must be between 1 and {MAX_CLICKHOUSE_TIMEOUT_MS}"
+            "{PLUGIN_NAME}: `clickhouse.timeout_ms` must be between 1 and {MAX_CLICKHOUSE_TIMEOUT_MS}"
         ));
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
@@ -5227,46 +5343,46 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
 
     if config.batch.size == 0 || config.batch.size > MAX_BATCH_SIZE {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.size must be between 1 and {MAX_BATCH_SIZE}"
+            "{PLUGIN_NAME}: `batch.size` must be between 1 and {MAX_BATCH_SIZE}"
         ));
     }
     if config.batch.buffer_capacity == 0 || config.batch.buffer_capacity > MAX_BUFFER_CAPACITY {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.buffer_capacity must be between 1 and {MAX_BUFFER_CAPACITY}"
+            "{PLUGIN_NAME}: `batch.buffer_capacity` must be between 1 and {MAX_BUFFER_CAPACITY}"
         ));
     }
     if config.batch.buffer_max_bytes < MAX_CHARGE_EVENT_BYTES
         || config.batch.buffer_max_bytes > HARD_MAX_BUFFER_MAX_BYTES
     {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.buffer_max_bytes must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
+            "{PLUGIN_NAME}: `batch.buffer_max_bytes` must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
         ));
     }
     if config.batch.flush_interval_ms == 0
         || config.batch.flush_interval_ms > MAX_BATCH_FLUSH_INTERVAL_MS
     {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.flush_interval_ms must be between 1 and {MAX_BATCH_FLUSH_INTERVAL_MS}"
+            "{PLUGIN_NAME}: `batch.flush_interval_ms` must be between 1 and {MAX_BATCH_FLUSH_INTERVAL_MS}"
         ));
     }
     if config.retry.max_attempts == 0 || config.retry.max_attempts > MAX_RETRY_MAX_ATTEMPTS {
         return Err(format!(
-            "{PLUGIN_NAME}: retry.max_attempts must be between 1 and {MAX_RETRY_MAX_ATTEMPTS}"
+            "{PLUGIN_NAME}: `retry.max_attempts` must be between 1 and {MAX_RETRY_MAX_ATTEMPTS}"
         ));
     }
     if config.retry.initial_delay_ms > MAX_RETRY_DELAY_MS {
         return Err(format!(
-            "{PLUGIN_NAME}: retry.initial_delay_ms must be between 0 and {MAX_RETRY_DELAY_MS}"
+            "{PLUGIN_NAME}: `retry.initial_delay_ms` must be between 0 and {MAX_RETRY_DELAY_MS}"
         ));
     }
     if config.retry.max_delay_ms > MAX_RETRY_DELAY_MS {
         return Err(format!(
-            "{PLUGIN_NAME}: retry.max_delay_ms must be between 0 and {MAX_RETRY_DELAY_MS}"
+            "{PLUGIN_NAME}: `retry.max_delay_ms` must be between 0 and {MAX_RETRY_DELAY_MS}"
         ));
     }
     if config.retry.max_delay_ms < config.retry.initial_delay_ms {
         return Err(format!(
-            "{PLUGIN_NAME}: retry.max_delay_ms must be >= retry.initial_delay_ms"
+            "{PLUGIN_NAME}: `retry.max_delay_ms` must be >= `retry.initial_delay_ms`"
         ));
     }
     let worst_case_delay_ms = worst_case_inter_attempt_delay_ms(
@@ -5276,23 +5392,25 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     );
     if worst_case_delay_ms > MAX_RETRY_TOTAL_DELAY_MS {
         return Err(format!(
-            "{PLUGIN_NAME}: retry worst-case cumulative inter-attempt delay ({worst_case_delay_ms} ms) exceeds the {MAX_RETRY_TOTAL_DELAY_MS} ms budget; reduce retry.max_attempts, retry.initial_delay_ms, and/or retry.max_delay_ms"
+            "{PLUGIN_NAME}: `retry` worst-case cumulative inter-attempt delay (\"{worst_case_delay_ms}\" ms) exceeds the {MAX_RETRY_TOTAL_DELAY_MS} ms budget; reduce `retry.max_attempts`, `retry.initial_delay_ms`, and/or `retry.max_delay_ms`"
         ));
     }
     if config.spool.enabled {
         if config.spool.max_bytes == 0 {
-            return Err(format!("{PLUGIN_NAME}: spool.max_bytes must be at least 1"));
+            return Err(format!(
+                "{PLUGIN_NAME}: `spool.max_bytes` must be at least 1"
+            ));
         }
         if config.spool.replay_interval_secs == 0 {
             return Err(format!(
-                "{PLUGIN_NAME}: spool.replay_interval_secs must be at least 1"
+                "{PLUGIN_NAME}: `spool.replay_interval_secs` must be at least 1"
             ));
         }
         if config.spool.delivery_queue_capacity == 0
             || config.spool.delivery_queue_capacity > MAX_BUFFER_CAPACITY
         {
             return Err(format!(
-                "{PLUGIN_NAME}: spool.delivery_queue_capacity must be between 1 and {MAX_BUFFER_CAPACITY}"
+                "{PLUGIN_NAME}: `spool.delivery_queue_capacity` must be between 1 and {MAX_BUFFER_CAPACITY}"
             ));
         }
         // Shape-only: do not mkdir/chmod/probe here. Live storage preparation
@@ -5300,39 +5418,39 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         validate_spool_dir_shape(&config.spool.dir)?;
     } else if config.mode == SinkMode::Snapshot {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot mode requires spool.enabled=true so emitted deltas remain durable during ClickHouse outages"
+            "{PLUGIN_NAME}: `snapshot` mode requires `spool.enabled=true` so emitted deltas remain durable during ClickHouse outages"
         ));
     }
     if config.snapshot.interval_secs == 0 {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot.interval_secs must be at least 1"
+            "{PLUGIN_NAME}: `snapshot.interval_secs` must be at least 1"
         ));
     }
     if config.snapshot.cleanup_interval_secs == 0 {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot.cleanup_interval_secs must be at least 1"
+            "{PLUGIN_NAME}: `snapshot.cleanup_interval_secs` must be at least 1"
         ));
     }
     if config.snapshot.stale_entry_ttl_secs == 0 {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be at least 1"
+            "{PLUGIN_NAME}: `snapshot.stale_entry_ttl_secs` must be at least 1"
         ));
     }
     if config.snapshot.stale_entry_ttl_secs < config.snapshot.interval_secs {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be >= snapshot.interval_secs so idle keys cannot expire before their first durable emission window"
+            "{PLUGIN_NAME}: `snapshot.stale_entry_ttl_secs` must be >= `snapshot.interval_secs` so idle keys cannot expire before their first durable emission window"
         ));
     }
     if config.snapshot.max_entries == 0 || config.snapshot.max_entries > MAX_BUFFER_CAPACITY {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot.max_entries must be between 1 and {MAX_BUFFER_CAPACITY}"
+            "{PLUGIN_NAME}: `snapshot.max_entries` must be between 1 and {MAX_BUFFER_CAPACITY}"
         ));
     }
     if config.snapshot.max_retained_bytes < MAX_CHARGE_EVENT_BYTES
         || config.snapshot.max_retained_bytes > HARD_MAX_BUFFER_MAX_BYTES
     {
         return Err(format!(
-            "{PLUGIN_NAME}: snapshot.max_retained_bytes must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
+            "{PLUGIN_NAME}: `snapshot.max_retained_bytes` must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
         ));
     }
     if config
@@ -5342,7 +5460,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         .is_some_and(|value| !value.trim().is_empty() && url.scheme() != "https")
     {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.password_ref requires clickhouse.url to use https://"
+            "{PLUGIN_NAME}: `clickhouse.password_ref` requires `clickhouse.url` to use `https://`"
         ));
     }
     if config
@@ -5356,7 +5474,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         })
     {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.password_ref cannot be used when ClickHouse TLS certificate or hostname verification is disabled"
+            "{PLUGIN_NAME}: `clickhouse.password_ref` cannot be used when ClickHouse TLS certificate or hostname verification is disabled"
         ));
     }
     // Shape-only secret-ref check (do not materialize the env value here).
@@ -5369,7 +5487,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         && !reference.starts_with("FERRUM_")
     {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
+            "{PLUGIN_NAME}: `clickhouse.password_ref` must reference a `FERRUM_*` environment variable"
         ));
     }
     // Pair completeness is a pure Option shape, so it belongs in cold
@@ -5381,14 +5499,16 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         != config.clickhouse.tls.client_key_file.is_some()
     {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.tls.client_cert_file and client_key_file must be set together"
+            "{PLUGIN_NAME}: `clickhouse.tls.client_cert_file` and `clickhouse.tls.client_key_file` must be set together"
         ));
     }
     if config.pricing_version.trim().is_empty() {
-        return Err(format!("{PLUGIN_NAME}: pricing_version must not be empty"));
+        return Err(format!(
+            "{PLUGIN_NAME}: `pricing_version` must not be empty"
+        ));
     }
     if config.currency.trim().is_empty() {
-        return Err(format!("{PLUGIN_NAME}: currency must not be empty"));
+        return Err(format!("{PLUGIN_NAME}: `currency` must not be empty"));
     }
     // Both labels are copied verbatim into every exported row and count
     // against `MAX_CHARGE_EVENT_BYTES`. An unbounded label therefore admits a
@@ -5398,12 +5518,12 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     // generation would merge two distinct billing identities in ClickHouse.
     if config.currency.len() > MAX_LABEL_LEN {
         return Err(format!(
-            "{PLUGIN_NAME}: currency must be at most {MAX_LABEL_LEN} UTF-8 bytes"
+            "{PLUGIN_NAME}: `currency` must be at most {MAX_LABEL_LEN} UTF-8 bytes"
         ));
     }
     if config.pricing_version.len() > MAX_LABEL_LEN {
         return Err(format!(
-            "{PLUGIN_NAME}: pricing_version must be at most {MAX_LABEL_LEN} UTF-8 bytes"
+            "{PLUGIN_NAME}: `pricing_version` must be at most {MAX_LABEL_LEN} UTF-8 bytes"
         ));
     }
     Ok(())
@@ -5411,13 +5531,13 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
 
 fn validate_spool_dir_shape(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
-        return Err(format!("{PLUGIN_NAME}: spool.dir must not be empty"));
+        return Err(format!("{PLUGIN_NAME}: `spool.dir` must not be empty"));
     }
     // Reject NUL-containing paths without touching the filesystem.
     let display = path.to_string_lossy();
     if display.contains('\0') {
         return Err(format!(
-            "{PLUGIN_NAME}: spool.dir must not contain NUL bytes"
+            "{PLUGIN_NAME}: `spool.dir` must not contain NUL bytes"
         ));
     }
     Ok(())
@@ -5425,18 +5545,18 @@ fn validate_spool_dir_shape(path: &Path) -> Result<(), String> {
 
 fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
     let url = Url::parse(raw)
-        .map_err(|error| format!("{PLUGIN_NAME}: invalid clickhouse.url: {error}"))?;
+        .map_err(|_| format!("{PLUGIN_NAME}: invalid `clickhouse.url`: malformed URL"))?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "{PLUGIN_NAME}: clickhouse.url must use http:// or https:// (got {scheme:?})"
+                "{PLUGIN_NAME}: `clickhouse.url` must use `http://` or `https://` (got {scheme:?})"
             ));
         }
     }
     if url.host_str().is_none() {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.url must include a hostname or IP address"
+            "{PLUGIN_NAME}: `clickhouse.url` must include a hostname or IP address"
         ));
     }
     Ok(url)
@@ -5450,7 +5570,7 @@ fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
 fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.{field} must not be empty"
+            "{PLUGIN_NAME}: `clickhouse.{field}` must not be empty"
         ));
     }
     if !value
@@ -5458,7 +5578,7 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
     {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.{field} may only contain ASCII letters, digits, underscores, and dots"
+            "{PLUGIN_NAME}: `clickhouse.{field}` may only contain ASCII letters, digits, underscores, and dots"
         ));
     }
     Ok(())
@@ -5498,7 +5618,7 @@ fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String>
     for (key, value) in params {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
             return Err(format!(
-                "{PLUGIN_NAME}: clickhouse.insert_query_params contains invalid key"
+                "{PLUGIN_NAME}: `clickhouse.insert_query_params` contains invalid key"
             ));
         }
         // Reject credential-bearing *names* outright. Values stay arbitrary
@@ -5512,15 +5632,15 @@ fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String>
                 .any(|marker| lowered.contains(marker))
         {
             return Err(format!(
-                "{PLUGIN_NAME}: clickhouse.insert_query_params['{key}'] names a credential; \
-                 ClickHouse credentials belong in clickhouse.username and \
-                 clickhouse.password_ref, which are sent as an HTTP Basic header rather than \
+                "{PLUGIN_NAME}: `clickhouse.insert_query_params` key {key:?} names a credential; \
+                 ClickHouse credentials belong in `clickhouse.username` and \
+                 `clickhouse.password_ref`, which are sent as an HTTP Basic header rather than \
                  appended to the INSERT URL"
             ));
         }
         if value.len() > 512 || value.chars().any(char::is_control) {
             return Err(format!(
-                "{PLUGIN_NAME}: clickhouse.insert_query_params['{key}'] contains invalid value"
+                "{PLUGIN_NAME}: `clickhouse.insert_query_params` key {key:?} contains invalid value"
             ));
         }
     }
@@ -5538,10 +5658,10 @@ fn validate_insert_durability_settings(cfg: &ClickHouseConfig) -> Result<(), Str
     }
     if !cfg.allow_lossy_async_insert {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.insert_query_params['{WAIT_FOR_ASYNC_INSERT_PARAM}']=\
+            "{PLUGIN_NAME}: `clickhouse.insert_query_params.{WAIT_FOR_ASYNC_INSERT_PARAM}`=\
              {wait_value:?} disables persistence-aware acknowledgement; set \
-             wait_for_async_insert to \"1\" for durable export, or set \
-             clickhouse.allow_lossy_async_insert=true to explicitly opt into \
+             `wait_for_async_insert` to `1` for durable export, or set \
+             `clickhouse.allow_lossy_async_insert=true` to explicitly opt into \
              fire-and-forget loss"
         ));
     }
@@ -5602,14 +5722,14 @@ fn resolve_password_ref(password_ref: Option<&str>) -> Result<Option<String>, St
     };
     if !reference.starts_with("FERRUM_") {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
+            "{PLUGIN_NAME}: `clickhouse.password_ref` must reference a `FERRUM_*` environment variable"
         ));
     }
     if let Ok(value) = std::env::var(reference) {
         return Ok(Some(value));
     }
     Err(format!(
-        "{PLUGIN_NAME}: clickhouse.password_ref references unset environment variable"
+        "{PLUGIN_NAME}: `clickhouse.password_ref` references unset environment variable"
     ))
 }
 
@@ -5660,52 +5780,44 @@ fn build_clickhouse_http_client(
         builder = builder.tls_danger_accept_invalid_hostnames(true);
     }
     if let Some(ca_file) = cfg.tls.ca_file.as_ref() {
-        let pem = fs::read(ca_file).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to read clickhouse.tls.ca_file '{}': {error}",
-                ca_file.display()
-            )
-        })?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to parse clickhouse.tls.ca_file '{}': {error}",
-                ca_file.display()
-            )
+        let pem = fs::read(ca_file)
+            .map_err(|_| format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`"))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
+            format!("{PLUGIN_NAME}: failed to parse `clickhouse.tls.ca_file`: invalid PEM bundle")
         })?;
         builder = builder.tls_certs_only(certs);
     }
     match (&cfg.tls.client_cert_file, &cfg.tls.client_key_file) {
         (Some(cert), Some(key)) => {
-            let mut pem = fs::read(cert).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: failed to read clickhouse.tls.client_cert_file '{}': {error}",
-                    cert.display()
-                )
+            let mut pem = fs::read(cert).map_err(|_| {
+                format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.client_cert_file`")
             })?;
-            let mut key_pem = fs::read(key).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: failed to read clickhouse.tls.client_key_file '{}': {error}",
-                    key.display()
-                )
+            let mut key_pem = fs::read(key).map_err(|_| {
+                format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.client_key_file`")
             })?;
             pem.push(b'\n');
             pem.append(&mut key_pem);
-            let identity = reqwest::Identity::from_pem(&pem).map_err(|error| {
-                format!("{PLUGIN_NAME}: failed to parse ClickHouse client identity: {error}")
+            let identity = reqwest::Identity::from_pem(&pem).map_err(|_| {
+                format!(
+                    "{PLUGIN_NAME}: failed to parse ClickHouse client identity: invalid PEM in \
+                     `clickhouse.tls.client_cert_file` or `clickhouse.tls.client_key_file`"
+                )
             })?;
             builder = builder.identity(identity);
         }
         (None, None) => {}
         _ => {
             return Err(format!(
-                "{PLUGIN_NAME}: clickhouse.tls.client_cert_file and client_key_file must be set together"
+                "{PLUGIN_NAME}: `clickhouse.tls.client_cert_file` and `clickhouse.tls.client_key_file` must be set together"
             ));
         }
     }
     builder
         .build()
         .map(ClickHouseHttpClient::Dedicated)
-        .map_err(|error| format!("{PLUGIN_NAME}: failed to build ClickHouse HTTP client: {error}"))
+        .map_err(|_| {
+            format!("{PLUGIN_NAME}: failed to build ClickHouse HTTP client for `clickhouse.tls`")
+        })
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]

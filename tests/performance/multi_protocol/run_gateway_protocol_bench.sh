@@ -79,6 +79,10 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
+H1_TRACE=none
+H1_TRACE_BUILDS=""
+h1_trace_pid=""
+h1_trace_output=""
 POOL_PROFILE=""
 UDP_PROFILE=""
 H2_GUARD_OBSERVE=0
@@ -99,6 +103,8 @@ while [[ $# -gt 0 ]]; do
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
+        --h1-trace) H1_TRACE="$2"; shift 2 ;;
+        --h1-trace-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         --pool-profile) POOL_PROFILE="$2"; shift 2 ;;
         --udp-profile) UDP_PROFILE="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -137,6 +143,15 @@ if [ -n "$H1_PROFILE" ]; then
         "$H1_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
         "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
     [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+fi
+
+case "$H1_TRACE" in none|syscalls|cpu) ;; *) exit 2 ;; esac
+if [ "$H1_TRACE" != none ]; then
+    # One existing payload shard per bounded collector lifetime; all five shards
+    # remain required. Direct controls are never profiled.
+    [[ "$H1_PROFILE" == trace-calibration || "$H1_PROFILE" == cutoff ]] || exit 2
+    [[ "$PAYLOAD_SIZES" != *" "* && -d "$H1_TRACE_BUILDS" ]] || exit 2
+    [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 2
 fi
 
 # Independent fixed-policy pool lane; ordinary experiment.json stays disabled.
@@ -310,6 +325,7 @@ cleanup() {
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    h1_trace_stop
     for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
                 50052 50053 \
                 $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
@@ -507,6 +523,22 @@ start_ferrum() {
             python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
                 "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
                 "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
+    fi
+    if [ "$H1_TRACE" != none ]; then
+        python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
+            --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
+            --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
+            --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
+            --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
+            --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
+            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit"
+        local trace_wait=0
+        while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
+            [ ! -s "$h1_trace_output/stopped.json" ] || return 1
+            sleep 0.05
+            trace_wait=$(( trace_wait + 1 ))
+        done
+        [ -s "$h1_trace_output/ready.json" ] || return 1
     fi
     if [ -n "$UDP_PROFILE" ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
@@ -883,9 +915,43 @@ wait_for_gateway() {
     return 1
 }
 
+h1_trace_start() {
+    [ "$H1_TRACE" != none ] && [ "$gw" != direct ] || return 0
+    h1_trace_output="$OUTPUT_DIR/traces/${gw}_${PAYLOAD_SIZES}"
+    mkdir -p "$h1_trace_output"
+    local enabled=(--enabled)
+    if [ "$H1_PROFILE" = trace-calibration ] && [ "$gw" = ferrum-baseline ]; then enabled=(); fi
+    sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
+        python3 "$SCRIPT_DIR/h1_trace.py" supervise --mode "$H1_TRACE" "${enabled[@]}" \
+        --parent "$$" --builds "$H1_TRACE_BUILDS" --artifact-root "$(dirname "$H1_TRACE_BUILDS")" --output "$h1_trace_output" \
+        > "$h1_trace_output/supervisor.stdout" 2> "$h1_trace_output/supervisor.stderr" &
+    h1_trace_pid=$!
+    local attempts=0
+    while [ ! -s "$h1_trace_output/supervisor-ready.json" ] && [ "$attempts" -lt 600 ]; do
+        [ ! -s "$h1_trace_output/stopped.json" ] || return 1
+        sleep 0.05
+        attempts=$(( attempts + 1 ))
+    done
+    [ -s "$h1_trace_output/supervisor-ready.json" ]
+}
+
+h1_trace_stop() {
+    if [ -n "$h1_trace_pid" ]; then
+        touch "$h1_trace_output/stop"
+        # Supervisor enforces its own 300s bound and kills/reaps owned children;
+        # decoder bounds are additional finite teardown work, never measurement.
+        wait "$h1_trace_pid" || true
+        h1_trace_pid=""
+        h1_trace_output=""
+    fi
+}
+
 stop_gateway() {
+    # Successful run_bench already obtained the supervisor's teardown receipt.
+    # Startup/abort cleanup has no receipt and must remain an incomplete capture.
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    h1_trace_stop
     GATEWAY_CID=""
     REDIS_CID=""
     sleep 2
@@ -1026,6 +1092,16 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" \
+            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
+    fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
+    fi
     if [ "$H1_PROFILE" = diagnostic ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
@@ -1055,6 +1131,10 @@ run_bench() {
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
+    fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
@@ -1077,6 +1157,10 @@ run_bench() {
         cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     fi
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json" \
+                --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
+        fi
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
             curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
@@ -1085,6 +1169,11 @@ run_bench() {
         fi
     fi
 
+    if [ "$H1_TRACE" != none ]; then
+        # Preserve even partial stdout before error placeholders or stamping.
+        cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"
+        printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
+    fi
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"
@@ -1118,6 +1207,14 @@ run_bench() {
         err_lines=$(wc -l < "$err_file")
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
         head -10 "$err_file" | sed 's/^/[bench]     /'
+    fi
+    if [ -n "$h1_trace_pid" ]; then
+        # The synchronous client has returned and its raw result/exit and stamped
+        # sample are retained. The supervisor validates full request drain and
+        # live target/collectors before acknowledging; capture stays enabled.
+        # A failed handshake never changes client work or certifies abort cleanup.
+        python3 "$SCRIPT_DIR/h1_trace.py" request-teardown --output "$h1_trace_output" \
+            || echo '[trace] teardown not verified; capture remains incomplete' >&2
     fi
 }
 
@@ -1187,7 +1284,7 @@ main() {
     if [ -n "$H1_PROFILE" ]; then
         h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
     fi
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" "$H1_TRACE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1197,7 +1294,7 @@ with open(sys.argv[1], "w") as manifest:
                **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
                **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
                    "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
-                   "h1_revision": sys.argv[11]}
+                   "h1_revision": sys.argv[11], "h1_trace_mode": sys.argv[12]}
                   if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
@@ -1237,6 +1334,19 @@ PYEOF
             BASELINE_IMAGE=$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')
         fi
     fi
+    if [ "$H1_PROFILE" = trace-calibration ]; then
+        if [ "$FERRUM_IMAGE" != "$BASELINE_IMAGE" ]; then
+            echo 'external calibration requires the identical binary/image in both arms' >&2
+            exit 2
+        fi
+        local internal_observer
+        internal_observer=$(docker image inspect "$FERRUM_IMAGE" \
+            --format '{{index .Config.Labels "ferrum.h1-profile"}}') || return 2
+        if [ "$internal_observer" != on ]; then
+            echo 'external calibration requires the internal observer ON in both arms' >&2
+            exit 2
+        fi
+    fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"
@@ -1266,6 +1376,7 @@ PYEOF
                     wait "$BACKEND_PID" 2>/dev/null || true
                 fi
                 start_backend
+                h1_trace_start || { stop_gateway; continue; }
                 case "$gw" in
                     direct) ;;
                     ferrum|ferrum-exp-*)
@@ -1292,6 +1403,19 @@ PYEOF
                     if [[ "$gw" == envoy* ]]; then
                         cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
                     fi
+                fi
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$gw" != direct ]; then
+                    # Explicit trigger/HTTP ack/log-fence smoke before offered work.
+                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" \
+                        --identity "$gw" "$PROTOCOL" 0 "$PAIR" "$HOST_ID"
+                    docker logs --timestamps "$GATEWAY_CID" \
+                        > "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.log" 2>&1 || true
+                    python3 "$SCRIPT_DIR/h2_guard/verify.py" smoke \
+                        "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" || {
+                        echo "[guard] snapshot smoke incomplete; retained raw evidence" >&2
+                        stop_gateway
+                        continue
+                    }
                 fi
                 for size in $PAYLOAD_SIZES; do
                     if [ "$gw" = direct ]; then

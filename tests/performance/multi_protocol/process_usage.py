@@ -173,7 +173,13 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
     def sample():
         for pid in client_pids(parent):
             roles[pid] = "client"
-        snapshot = {"unix_secs": time.time(), "processes": []}
+        before = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        unix_ns = time.time_ns()
+        after = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        snapshot = {"unix_secs": unix_ns / 1e9, "processes": [],
+                    "clock": {"before_ns": before, "unix_ns": unix_ns, "after_ns": after},
+                    "clock_domain": "CLOCK_MONOTONIC", "sampler_pid": os.getpid(),
+                    "time_namespace": Path("/proc/self/ns/time").stat().st_ino}
         for pid, role in roles.items():
             state = capture(pid, ticks, page_size)
             if state is None:

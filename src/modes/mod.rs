@@ -514,6 +514,7 @@ mod tests {
             }
         }
 
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let output = bytes.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -526,6 +527,8 @@ mod tests {
         let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         (result, logs)
     }
+
+    crate::diagnostic_test_interest::capture_regression!(capture_logs, tracing::Level::TRACE);
 
     #[test]
     fn config_rejection_logs_withhold_values_on_first_and_repeated_failures() {

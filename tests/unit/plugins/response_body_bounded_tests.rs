@@ -10,6 +10,10 @@ use ferrum_edge::plugins::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
     read_response_body_bounded,
 };
+use ferrum_edge::plugins::{
+    PluginHttpClient, opa::Opa, request_mirror::RequestMirror,
+    serverless_function::ServerlessFunction, spec_expose::SpecExpose,
+};
 use serde_json::json;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -60,6 +64,72 @@ fn test_parse_max_response_body_bytes_defaults_and_validates() {
             !err.chars().any(|c| c.is_ascii_digit()),
             "overflow message must not echo the offending value: {err}"
         );
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+        assert_eq!(
+            rendered,
+            "test_plugin: `limit` is too large for this platform"
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_body_limit_rejections_retain_rendered_fields_for_every_caller() {
+    for (plugin, field, base) in [
+        (
+            "spec_expose",
+            "max_response_body_bytes",
+            json!({"spec_url": "https://spec.example.test/openapi.json"}),
+        ),
+        (
+            "serverless_function",
+            "max_response_body_bytes",
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://function.example.test/run"
+            }),
+        ),
+        (
+            "request_mirror",
+            "max_response_body_bytes",
+            json!({"mirror_host": "mirror.example.test"}),
+        ),
+        (
+            "opa",
+            "max_response_bytes",
+            json!({"opa_host": "https://policy.example.test", "policy_path": "authz/allow"}),
+        ),
+        (
+            "opa",
+            "max_body_bytes",
+            json!({"opa_host": "https://policy.example.test", "policy_path": "authz/allow"}),
+        ),
+    ] {
+        for (value, reason) in [
+            (
+                json!("'RESPONSE_LIMIT_SECRET\"`\\\n"),
+                "must be a non-negative integer",
+            ),
+            (json!(-918273641), "must be a non-negative integer"),
+            (json!(0), "must be greater than zero"),
+        ] {
+            let mut config = base.clone();
+            config[field] = value;
+            let client = PluginHttpClient::default();
+            let result = match plugin {
+                "spec_expose" => SpecExpose::new(&config, client).map(|_| ()),
+                "serverless_function" => ServerlessFunction::new(&config, client).map(|_| ()),
+                "request_mirror" => RequestMirror::new(&config, client).map(|_| ()),
+                "opa" => Opa::new(&config, client).map(|_| ()),
+                _ => unreachable!(),
+            };
+            let error = result.expect_err("invalid body limits must reject construction");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert_eq!(rendered, format!("{plugin}: `{field}` {reason}"));
+            for supplied in ["RESPONSE_LIMIT_SECRET", "918273641", ".example.test", "0"] {
+                assert!(!rendered.contains(supplied), "{supplied}: {rendered}");
+            }
+        }
     }
 }
 
