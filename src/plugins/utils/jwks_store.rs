@@ -372,7 +372,7 @@ impl JwksKeyStore {
     /// Create a non-refreshing key store from inline JWKS JSON.
     pub fn from_inline_jwks(jwks_json: &str) -> Result<Self, String> {
         let jwks: JwksResponse = serde_json::from_str(jwks_json)
-            .map_err(|e| format!("inline JWKS parse failed: {}", e))?;
+            .map_err(|_| "inline JWKS parse failed: invalid JWKS JSON".to_string())?;
         let keys = Self::parse_jwks_response(&jwks)?;
 
         Ok(Self {

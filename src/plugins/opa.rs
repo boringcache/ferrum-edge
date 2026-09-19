@@ -185,7 +185,7 @@ impl QueryAmbiguityPolicy {
             None | Some("reject") => Ok(Self::Reject),
             Some("delegate") => Ok(Self::Delegate),
             Some(_) => Err(
-                "opa: 'query_ambiguity_policy' must be one of 'reject' or 'delegate'".to_string(),
+                "opa: `query_ambiguity_policy` must be one of `reject` or `delegate`".to_string(),
             ),
         }
     }
@@ -210,7 +210,7 @@ impl Opa {
         let custom_headers = parse_header_map(object, "headers", "opa")?;
         let timeout_ms = parse_optional_u64(object, "timeout_ms")?.unwrap_or(DEFAULT_TIMEOUT_MS);
         if timeout_ms == 0 {
-            return Err("opa: 'timeout_ms' must be greater than zero".to_string());
+            return Err("opa: `timeout_ms` must be greater than zero".to_string());
         }
         let timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
         let max_response_bytes = parse_max_response_body_bytes(
@@ -697,7 +697,7 @@ fn parse_decision_endpoint(
 ) -> Result<(String, String, String), String> {
     let opa_host = required_string(object, "opa_host")?;
     let parsed =
-        Url::parse(opa_host).map_err(|error| format!("opa: invalid 'opa_host': {error}"))?;
+        Url::parse(opa_host).map_err(|error| format!("opa: invalid `opa_host`: {error}"))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
@@ -710,17 +710,17 @@ fn parse_decision_endpoint(
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(
-            "opa: 'opa_host' must not include credentials; configure OPA auth with 'headers'"
+            "opa: `opa_host` must not include credentials; configure OPA auth with `headers`"
                 .to_string(),
         );
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err("opa: 'opa_host' must not include query or fragment components".to_string());
+        return Err("opa: `opa_host` must not include query or fragment components".to_string());
     }
 
     let host = parsed
         .host()
-        .ok_or_else(|| "opa: 'opa_host' must include a hostname or IP address".to_string())?;
+        .ok_or_else(|| "opa: `opa_host` must include a hostname or IP address".to_string())?;
     let hostname = match host {
         Host::Domain(hostname) => hostname.to_string(),
         Host::Ipv4(address) => address.to_string(),
@@ -748,23 +748,23 @@ fn parse_decision_endpoint(
 
 fn validate_policy_path(policy_path: &str) -> Result<(), String> {
     if policy_path.is_empty() {
-        return Err("opa: 'policy_path' must not be empty".to_string());
+        return Err("opa: `policy_path` must not be empty".to_string());
     }
     if policy_path.starts_with('/') {
-        return Err("opa: 'policy_path' must not start with '/'".to_string());
+        return Err("opa: `policy_path` must not start with `/`".to_string());
     }
     if policy_path.contains('?') || policy_path.contains('#') {
-        return Err("opa: 'policy_path' must not contain '?' or '#'".to_string());
+        return Err("opa: `policy_path` must not contain `?` or `#`".to_string());
     }
     if policy_path.contains('%') {
-        return Err("opa: 'policy_path' must not contain percent-encoding".to_string());
+        return Err("opa: `policy_path` must not contain percent-encoding".to_string());
     }
     if policy_path
         .split('/')
         .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(
-            "opa: 'policy_path' must not contain empty, '.', or '..' path segments".to_string(),
+            "opa: `policy_path` must not contain empty, `.`, or `..` path segments".to_string(),
         );
     }
     Ok(())
@@ -775,7 +775,7 @@ fn parse_fail_open(object: &Map<String, Value>) -> Result<bool, String> {
     let fail_closed = parse_optional_bool(object, "fail_closed")?;
     match (fail_open, fail_closed) {
         (Some(_), Some(_)) => {
-            Err("opa: configure only one of 'fail_open' or 'fail_closed'".to_string())
+            Err("opa: configure only one of `fail_open` or `fail_closed`".to_string())
         }
         (Some(value), None) => Ok(value),
         (None, Some(value)) => Ok(!value),
@@ -786,7 +786,7 @@ fn parse_fail_open(object: &Map<String, Value>) -> Result<bool, String> {
 fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
     for key in object.keys() {
         if !OPA_CONFIG_KEYS.contains(&key.as_str()) {
-            return Err(format!("opa: unknown config key '{key}'"));
+            return Err(format!("opa: unknown config key {key:?}"));
         }
     }
     Ok(())
@@ -798,12 +798,12 @@ fn parse_decision_pointer(object: &Map<String, Value>) -> Result<Vec<String>, St
     };
     let array = value
         .as_array()
-        .ok_or_else(|| "opa: 'decision_pointer' must be an array of strings".to_string())?;
+        .ok_or_else(|| "opa: `decision_pointer` must be an array of strings".to_string())?;
     let mut pointer = Vec::with_capacity(array.len());
     for (idx, value) in array.iter().enumerate() {
         let segment = value
             .as_str()
-            .ok_or_else(|| format!("opa: 'decision_pointer[{idx}]' must be a string"))?;
+            .ok_or_else(|| format!("opa: `decision_pointer[{idx}]` must be a string"))?;
         pointer.push(segment.to_string());
     }
     Ok(pointer)
@@ -816,14 +816,14 @@ fn parse_redact_headers(object: &Map<String, Value>) -> Result<HashSet<String>, 
     };
     let array = value
         .as_array()
-        .ok_or_else(|| "opa: 'redact_headers' must be an array of strings".to_string())?;
+        .ok_or_else(|| "opa: `redact_headers` must be an array of strings".to_string())?;
     for (idx, value) in array.iter().enumerate() {
         let header = value
             .as_str()
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("opa: 'redact_headers[{idx}]' must be a non-empty string"))?;
+            .ok_or_else(|| format!("opa: `redact_headers[{idx}]` must be a non-empty string"))?;
         let header_name = HeaderName::from_bytes(header.as_bytes()).map_err(|error| {
-            format!("opa: invalid redact_headers[{idx}] header name '{header}': {error}")
+            format!("opa: invalid `redact_headers[{idx}]` header name {header:?}: {error}")
         })?;
         headers.insert(header_name.as_str().to_string());
     }
@@ -836,13 +836,13 @@ fn parse_redact_query_keys(object: &Map<String, Value>) -> Result<HashSet<String
     };
     let array = value
         .as_array()
-        .ok_or_else(|| "opa: 'redact_query_keys' must be an array of strings".to_string())?;
+        .ok_or_else(|| "opa: `redact_query_keys` must be an array of strings".to_string())?;
     let mut keys = HashSet::with_capacity(array.len());
     for (idx, value) in array.iter().enumerate() {
         let key = value
             .as_str()
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("opa: 'redact_query_keys[{idx}]' must be a non-empty string"))?;
+            .ok_or_else(|| format!("opa: `redact_query_keys[{idx}]` must be a non-empty string"))?;
         keys.insert(key.to_ascii_lowercase());
     }
     Ok(keys)
@@ -907,21 +907,21 @@ fn parse_header_map(
     };
     let map = value
         .as_object()
-        .ok_or_else(|| format!("{plugin_name}: '{field}' must be an object"))?;
+        .ok_or_else(|| format!("{plugin_name}: `{field}` must be an object"))?;
     let mut headers = Vec::with_capacity(map.len());
     for (key, value) in map {
         let value = value
             .as_str()
-            .ok_or_else(|| format!("{plugin_name}: {field}['{key}'] must be a string"))?;
+            .ok_or_else(|| format!("{plugin_name}: `{field}` entry {key:?} must be a string"))?;
         let header_name = HeaderName::from_bytes(key.as_bytes())
-            .map_err(|error| format!("{plugin_name}: invalid {field} name '{key}': {error}"))?;
+            .map_err(|error| format!("{plugin_name}: invalid `{field}` name {key:?}: {error}"))?;
         if field == "headers" && header_name == CONTENT_TYPE {
             return Err(format!(
-                "{plugin_name}: '{field}' must not include 'content-type'; OPA decision requests are always sent as JSON"
+                "{plugin_name}: `{field}` must not include `content-type`; OPA decision requests are always sent as JSON"
             ));
         }
         let header_value = HeaderValue::from_str(value).map_err(|error| {
-            format!("{plugin_name}: invalid {field} value for '{key}': {error}")
+            format!("{plugin_name}: invalid `{field}` value for {key:?}: {error}")
         })?;
         headers.retain(|(existing, _)| *existing != header_name);
         headers.push((header_name, header_value));
@@ -951,19 +951,19 @@ fn parse_string_header_map(
     };
     let map = value
         .as_object()
-        .ok_or_else(|| format!("{plugin_name}: '{field}' must be an object"))?;
+        .ok_or_else(|| format!("{plugin_name}: `{field}` must be an object"))?;
     parsed.reserve(map.len());
     for (key, value) in map {
         let value = value
             .as_str()
-            .ok_or_else(|| format!("{plugin_name}: {field}['{key}'] must be a string"))?;
+            .ok_or_else(|| format!("{plugin_name}: `{field}` entry {key:?} must be a string"))?;
         let header_name = HeaderName::from_bytes(key.as_bytes())
-            .map_err(|error| format!("{plugin_name}: invalid {field} name '{key}': {error}"))?;
+            .map_err(|error| format!("{plugin_name}: invalid `{field}` name {key:?}: {error}"))?;
         if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
             header_name.as_str(),
         ) {
             return Err(format!(
-                "{plugin_name}: {field} name '{}' is protocol-managed (hop-by-hop or framing) and \
+                "{plugin_name}: `{field}` name {:?} is protocol-managed (hop-by-hop or framing) and \
                  cannot be configured; the gateway derives Content-Length from the reject body and \
                  strips Connection/Transfer-Encoding/Trailer/Upgrade at the final response \
                  boundary",
@@ -971,7 +971,7 @@ fn parse_string_header_map(
             ));
         }
         HeaderValue::from_str(value).map_err(|error| {
-            format!("{plugin_name}: invalid {field} value for '{key}': {error}")
+            format!("{plugin_name}: invalid `{field}` value for {key:?}: {error}")
         })?;
         parsed.insert(header_name.as_str().to_string(), value.to_string());
     }
@@ -985,7 +985,7 @@ fn parse_response_status(
 ) -> Result<u16, String> {
     let status = parse_optional_u16(object, field)?.unwrap_or(default_status);
     if !(400..=599).contains(&status) {
-        return Err(format!("opa: '{field}' must be in the 4xx or 5xx range"));
+        return Err(format!("opa: `{field}` must be in the 4xx or 5xx range"));
     }
     Ok(status)
 }
@@ -998,7 +998,7 @@ fn required_string<'a>(
         .get(field)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("opa: '{field}' is required and must be a non-empty string"))
+        .ok_or_else(|| format!("opa: `{field}` is required and must be a non-empty string"))
 }
 
 fn parse_optional_string(
@@ -1011,7 +1011,7 @@ fn parse_optional_string(
             value
                 .as_str()
                 .map(str::to_string)
-                .ok_or_else(|| format!("opa: '{field}' must be a string"))
+                .ok_or_else(|| format!("opa: `{field}` must be a string"))
         })
         .transpose()
 }
@@ -1025,7 +1025,7 @@ fn parse_optional_bool(
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("opa: '{field}' must be a boolean"))
+                .ok_or_else(|| format!("opa: `{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -1039,7 +1039,7 @@ fn parse_optional_u64(
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| format!("opa: '{field}' must be an unsigned integer"))
+                .ok_or_else(|| format!("opa: `{field}` must be an unsigned integer"))
         })
         .transpose()
 }
@@ -1053,8 +1053,8 @@ fn parse_optional_u16(
         .map(|value| {
             let raw = value
                 .as_u64()
-                .ok_or_else(|| format!("opa: '{field}' must be an unsigned integer"))?;
-            u16::try_from(raw).map_err(|_| format!("opa: '{field}' is too large"))
+                .ok_or_else(|| format!("opa: `{field}` must be an unsigned integer"))?;
+            u16::try_from(raw).map_err(|_| format!("opa: `{field}` is too large"))
         })
         .transpose()
 }

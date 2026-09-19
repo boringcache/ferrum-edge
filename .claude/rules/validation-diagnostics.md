@@ -102,6 +102,15 @@ paths:
   visible while supplied service/tool names, paths, tokens and parser payloads
   are withheld. Registered real-constructor rendered regressions preserve the
   existing admission decisions and protocol behavior assertions.
+- The #5594 security conversion covers authentication/authorization, IP/GeoIP,
+  JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
+  admission. Fixed schema paths and credential/operation ordinals survive
+  rendering while supplied credentials, keys, identities, paths, patterns and
+  parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor and
+  request/stream deny logs sanitize configured paths at emission. Fixed OIDC
+  cookie separator examples spell out double quote so the full reason survives.
+  Registered rendered/captured regressions and existing rejection/reload-retention
+  assertions cover these boundaries.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength

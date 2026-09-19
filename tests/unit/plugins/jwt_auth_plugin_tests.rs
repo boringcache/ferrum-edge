@@ -158,7 +158,7 @@ fn test_jwt_auth_rejects_unknown_security_policy_keys() {
         let err = JwtAuth::new(&config)
             .err()
             .expect("unknown jwt_auth config key must fail closed");
-        assert_eq!(err, format!("jwt_auth: unknown config key '{unknown_key}'"));
+        assert_eq!(err, format!("jwt_auth: unknown config key {unknown_key:?}"));
     }
 }
 
@@ -1103,4 +1103,45 @@ async fn array_issuer_rejects_even_with_no_issuer_configured() {
 
     assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(401));
     assert!(ctx.identified_consumer.is_none());
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({"audiences": [true]}),
+            &["`audiences[0]`", "must be a string"],
+        ),
+        (
+            json!({"leeway_secs": -8675309}),
+            &["`leeway_secs`", "unsigned integer"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("jwt_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }

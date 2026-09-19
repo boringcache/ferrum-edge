@@ -110,7 +110,8 @@ pub fn parse_claim_headers(
                 header_value = header_value.to_string()
             )
         })?;
-        let header_name = normalize_allowed_header(raw_header, plugin, field)?;
+        let header_name =
+            normalize_allowed_header(raw_header, plugin, &format!("{field}[{index}].header"))?;
         let metadata_key = format!("{metadata_prefix}{header_name}");
         mappings.push(ClaimHeaderMapping {
             claim_path: parsed_claim_path,
@@ -151,24 +152,24 @@ pub fn parse_claim_header_list(
     })?;
     if entries.len() > MAX_OUTPUT_CLAIM_HEADERS {
         return Err(format!(
-            "{plugin}: '{field}' supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
+            "{plugin}: `{field}` supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
         ));
     }
     let mut mappings: Vec<ClaimHeaderMapping> = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let object = entry
             .as_object()
-            .ok_or_else(|| format!("{plugin}: '{field}[{index}]' must be an object"))?;
+            .ok_or_else(|| format!("{plugin}: `{field}[{index}]` must be an object"))?;
         for key in object.keys() {
             if key != "claim" && key != "header" {
                 return Err(format!(
-                    "{plugin}: '{field}[{index}]' does not support field '{key}'"
+                    "{plugin}: `{field}[{index}]` does not support field {key:?}"
                 ));
             }
         }
         let claim_value = object
             .get("claim")
-            .ok_or_else(|| format!("{plugin}: '{field}[{index}].claim' is required"))?;
+            .ok_or_else(|| format!("{plugin}: `{field}[{index}].claim` is required"))?;
         let claim_path =
             parse_claim_path_value(&format!("{field}[{index}].claim"), claim_value, plugin)?;
         if claim_path.len() > MAX_OUTPUT_CLAIM_PATH_LEN
@@ -177,25 +178,26 @@ pub fn parse_claim_header_list(
                 .any(|character| character.is_control() || character.is_whitespace())
         {
             return Err(format!(
-                "{plugin}: '{field}[{index}].claim' must be at most \
+                "{plugin}: `{field}[{index}].claim` must be at most \
                  {MAX_OUTPUT_CLAIM_PATH_LEN} bytes and contain no whitespace or control characters"
             ));
         }
         let raw_header = object
             .get("header")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("{plugin}: '{field}[{index}].header' must be a string"))?;
-        let header_name = normalize_allowed_header(raw_header, plugin, field)?;
+            .ok_or_else(|| format!("{plugin}: `{field}[{index}].header` must be a string"))?;
+        let header_name =
+            normalize_allowed_header(raw_header, plugin, &format!("{field}[{index}].header"))?;
         if header_name.len() > MAX_OUTPUT_CLAIM_HEADER_NAME_LEN {
             return Err(format!(
-                "{plugin}: '{field}[{index}].header' must be at most \
+                "{plugin}: `{field}[{index}].header` must be at most \
                  {MAX_OUTPUT_CLAIM_HEADER_NAME_LEN} bytes"
             ));
         }
         if is_output_claim_reserved_header(&header_name) {
             return Err(format!(
-                "{plugin}: '{field}' cannot target framing, provenance, credential-bearing, \
-                 or gateway-reserved header '{header_name}'"
+                "{plugin}: `{field}` cannot target framing, provenance, credential-bearing, \
+                 or gateway-reserved header {header_name:?}"
             ));
         }
         if mappings
@@ -203,7 +205,7 @@ pub fn parse_claim_header_list(
             .any(|mapping| mapping.destination_header == header_name)
         {
             return Err(format!(
-                "{plugin}: '{field}' declares header '{header_name}' more than once; \
+                "{plugin}: `{field}` declares header {header_name:?} more than once; \
                  a destination may be asserted from exactly one claim"
             ));
         }
@@ -396,7 +398,7 @@ pub fn parse_separator(
         )
     })?;
     if raw.is_empty() {
-        return Err(format!("{plugin}: '{field}' must not be empty"));
+        return Err(format!("{plugin}: `{field}` must not be empty"));
     }
     Ok(raw.to_string())
 }
@@ -429,15 +431,15 @@ fn claim_value_for_header(claims: &Value, claim_path: &str, separator: &str) -> 
 fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Result<String, String> {
     let trimmed = raw_header.trim();
     if trimmed.is_empty() {
-        return Err(format!("{plugin}: '{field}' header name must not be empty"));
+        return Err(format!("{plugin}: `{field}` header name must not be empty"));
     }
     let header = HeaderName::from_bytes(trimmed.as_bytes())
-        .map_err(|e| format!("{plugin}: '{field}' header name is invalid: {e}"))?
+        .map_err(|e| format!("{plugin}: `{field}` header name is invalid: {e}"))?
         .as_str()
         .to_string();
     if is_reserved_header(&header) {
         return Err(format!(
-            "{plugin}: '{field}' cannot target reserved header '{header}'"
+            "{plugin}: `{field}` cannot target reserved header {header:?}"
         ));
     }
     Ok(header)

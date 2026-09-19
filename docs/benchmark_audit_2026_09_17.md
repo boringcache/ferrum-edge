@@ -14,6 +14,11 @@ The [September 18 H2/gRPC campaign](benchmark_h2_grpc_2026_09_18.md) reproduces
 adaptive-window failures with typed transport evidence. Fixed-window request
 observations do not establish a production repair or a throughput gain.
 
+The [September 19 WSS/TCP-TLS audit](benchmark_wss_tcp_2026_09_19.md) retains
+all 72 additional 500 KiB / 1 MiB observations and their paired uncertainty.
+Client useful-work validation passed throughout; transport diagnostics,
+shared-host effects and historical causality remain qualified.
+
 **Evidence and scope.** [Run 35071334026](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35071334026)
 tested `ff96f30468517706695538ffc74bc6770014ab07`, 15 seconds, base concurrency
 200, three iterations. I downloaded and inspected all 359 JSON samples and

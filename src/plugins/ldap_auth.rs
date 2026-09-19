@@ -234,11 +234,11 @@ impl LdapAuth {
 
         let ldap_url = parse_required_ldap_url(config_obj)?.to_owned();
         let parsed_ldap_url = Url::parse(&ldap_url)
-            .map_err(|e| format!("ldap_auth: 'ldap_url' is not a valid URL: {e}"))?;
+            .map_err(|e| format!("ldap_auth: `ldap_url` is not a valid URL: {e}"))?;
 
         if !parsed_ldap_url.username().is_empty() || parsed_ldap_url.password().is_some() {
             return Err(
-                "ldap_auth: 'ldap_url' must not contain embedded credentials; use the service account fields"
+                "ldap_auth: `ldap_url` must not contain embedded credentials; use the service account fields"
                     .to_string(),
             );
         }
@@ -254,11 +254,11 @@ impl LdapAuth {
             false
         } else {
             return Err(
-                "ldap_auth: 'ldap_url' must start with 'ldap://' or 'ldaps://'".to_string(),
+                "ldap_auth: `ldap_url` must start with `ldap://` or `ldaps://`".to_string(),
             );
         };
         if !has_non_empty_authority(&ldap_url) {
-            return Err("ldap_auth: 'ldap_url' must include a hostname".to_string());
+            return Err("ldap_auth: `ldap_url` must include a hostname".to_string());
         }
         let ldap_hostname = ldap_url_hostname(&parsed_ldap_url)?;
         let ldap_port = parsed_ldap_url
@@ -285,8 +285,8 @@ impl LdapAuth {
 
         if !has_direct_bind && !has_search_bind {
             return Err(
-                "ldap_auth: must configure either 'bind_dn_template' for direct bind, \
-                 or both 'search_base_dn' and 'search_filter' for search-then-bind"
+                "ldap_auth: must configure either `bind_dn_template` for direct bind, \
+                 or both `search_base_dn` and `search_filter` for search-then-bind"
                     .to_string(),
             );
         }
@@ -296,8 +296,8 @@ impl LdapAuth {
         // the search keys silently inert, so refuse the ambiguous shape outright.
         if has_direct_bind && (search_base_dn.is_some() || search_filter.is_some()) {
             return Err(
-                "ldap_auth: 'bind_dn_template' (direct bind) cannot be combined with the \
-                 search-then-bind keys 'search_base_dn'/'search_filter'; configure exactly \
+                "ldap_auth: `bind_dn_template` (direct bind) cannot be combined with the \
+                 search-then-bind keys `search_base_dn`/`search_filter`; configure exactly \
                  one authentication mode"
                     .to_string(),
             );
@@ -305,15 +305,15 @@ impl LdapAuth {
 
         if has_search_bind && (service_account_dn.is_none() || service_account_password.is_none()) {
             return Err(
-                "ldap_auth: search-then-bind mode requires 'service_account_dn' and \
-                 'service_account_password'"
+                "ldap_auth: search-then-bind mode requires `service_account_dn` and \
+                 `service_account_password`"
                     .to_string(),
             );
         }
 
         if canonical_identity_attribute.is_none() {
             return Err(
-                "ldap_auth: both bind modes require 'canonical_identity_attribute' so the authenticated directory entry, not the presented username, defines the Ferrum identity"
+                "ldap_auth: both bind modes require `canonical_identity_attribute` so the authenticated directory entry, not the presented username, defines the Ferrum identity"
                     .to_string(),
             );
         }
@@ -322,14 +322,14 @@ impl LdapAuth {
             && !tmpl.contains("{username}")
         {
             return Err(
-                "ldap_auth: 'bind_dn_template' must contain '{username}' placeholder".to_string(),
+                "ldap_auth: `bind_dn_template` must contain `{username}` placeholder".to_string(),
             );
         }
 
         if let Some(ref f) = search_filter {
             if !f.contains("{username}") {
                 return Err(
-                    "ldap_auth: 'search_filter' must contain '{username}' placeholder".to_string(),
+                    "ldap_auth: `search_filter` must contain `{username}` placeholder".to_string(),
                 );
             }
             validate_ldap_filter_syntax(f, "search_filter")?;
@@ -351,7 +351,7 @@ impl LdapAuth {
 
         if !required_groups.is_empty() && group_base_dn.is_none() {
             return Err(
-                "ldap_auth: 'group_base_dn' is required when 'required_groups' is set".to_string(),
+                "ldap_auth: `group_base_dn` is required when `required_groups` is set".to_string(),
             );
         }
 
@@ -361,7 +361,7 @@ impl LdapAuth {
             })
         {
             return Err(
-                "ldap_auth: 'group_filter' must contain '{user_dn}' or '{username}' when 'required_groups' is set"
+                "ldap_auth: `group_filter` must contain `{user_dn}` or `{username}` when `required_groups` is set"
                     .to_string(),
             );
         }
@@ -393,7 +393,7 @@ impl LdapAuth {
 
         if starttls && is_ldaps {
             return Err(
-                "ldap_auth: 'starttls' cannot be used with 'ldaps://' URLs (STARTTLS is for upgrading ldap:// connections)"
+                "ldap_auth: `starttls` cannot be used with `ldaps://` URLs (STARTTLS is for upgrading ldap:// connections)"
                     .to_string(),
             );
         }
@@ -405,16 +405,16 @@ impl LdapAuth {
         )?;
         if connect_timeout_secs == 0 {
             return Err(
-                "ldap_auth: 'connect_timeout_seconds' must be greater than zero".to_string(),
+                "ldap_auth: `connect_timeout_seconds` must be greater than zero".to_string(),
             );
         }
         if connect_timeout_secs > LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS {
             return Err(format!(
-                "ldap_auth: 'connect_timeout_seconds' must not exceed {LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS}"
+                "ldap_auth: `connect_timeout_seconds` must not exceed {LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS}"
             ));
         }
         let search_time_limit_seconds = i32::try_from(connect_timeout_secs).map_err(|_| {
-            "ldap_auth: 'connect_timeout_seconds' cannot be represented as an LDAP search time limit"
+            "ldap_auth: `connect_timeout_seconds` cannot be represented as an LDAP search time limit"
                 .to_string()
         })?;
 
@@ -427,12 +427,12 @@ impl LdapAuth {
         )?;
         if request_timeout_secs == 0 {
             return Err(
-                "ldap_auth: 'request_timeout_seconds' must be greater than zero".to_string(),
+                "ldap_auth: `request_timeout_seconds` must be greater than zero".to_string(),
             );
         }
         if request_timeout_secs > LDAP_AUTH_MAX_REQUEST_TIMEOUT_SECONDS {
             return Err(format!(
-                "ldap_auth: 'request_timeout_seconds' must not exceed {LDAP_AUTH_MAX_REQUEST_TIMEOUT_SECONDS}"
+                "ldap_auth: `request_timeout_seconds` must not exceed {LDAP_AUTH_MAX_REQUEST_TIMEOUT_SECONDS}"
             ));
         }
 
@@ -443,12 +443,12 @@ impl LdapAuth {
         )?;
         if max_concurrent_requests == 0 {
             return Err(
-                "ldap_auth: 'max_concurrent_requests' must be greater than zero".to_string(),
+                "ldap_auth: `max_concurrent_requests` must be greater than zero".to_string(),
             );
         }
         if max_concurrent_requests > LDAP_AUTH_MAX_CONCURRENT_REQUESTS {
             return Err(format!(
-                "ldap_auth: 'max_concurrent_requests' must not exceed {LDAP_AUTH_MAX_CONCURRENT_REQUESTS}"
+                "ldap_auth: `max_concurrent_requests` must not exceed {LDAP_AUTH_MAX_CONCURRENT_REQUESTS}"
             ));
         }
 
@@ -459,7 +459,7 @@ impl LdapAuth {
         )?;
         if cache_ttl_secs > LDAP_AUTH_MAX_CACHE_TTL_SECONDS {
             return Err(format!(
-                "ldap_auth: 'cache_ttl_seconds' must not exceed {LDAP_AUTH_MAX_CACHE_TTL_SECONDS}"
+                "ldap_auth: `cache_ttl_seconds` must not exceed {LDAP_AUTH_MAX_CACHE_TTL_SECONDS}"
             ));
         }
 
@@ -469,11 +469,11 @@ impl LdapAuth {
             LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES,
         )?;
         if max_cache_entries == 0 {
-            return Err("ldap_auth: 'max_cache_entries' must be greater than zero".to_string());
+            return Err("ldap_auth: `max_cache_entries` must be greater than zero".to_string());
         }
         if max_cache_entries > LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT {
             return Err(format!(
-                "ldap_auth: 'max_cache_entries' must not exceed {LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT}"
+                "ldap_auth: `max_cache_entries` must not exceed {LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT}"
             ));
         }
 
@@ -490,7 +490,7 @@ impl LdapAuth {
         if !is_ldaps && !starttls && !is_loopback_ldap_endpoint(&parsed_ldap_url) {
             if !allow_plaintext {
                 return Err(
-                    "ldap_auth: non-loopback 'ldap://' endpoints require STARTTLS or LDAPS; set 'allow_plaintext: true' only for an isolated development environment"
+                    "ldap_auth: non-loopback `ldap://` endpoints require STARTTLS or LDAPS; set `allow_plaintext: true` only for an isolated development environment"
                         .to_string(),
                 );
             }
@@ -1332,7 +1332,7 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
     ];
     for key in config.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("ldap_auth: unknown config key '{key}'"));
+            return Err(format!("ldap_auth: unknown config key {key:?}"));
         }
     }
     Ok(())
@@ -1341,7 +1341,7 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
 fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> {
     let Some(value) = config.get("ldap_url") else {
         return Err(
-            "ldap_auth: 'ldap_url' is required (e.g. \"ldap://ldap.example.com:389\" or \"ldaps://ldap.example.com:636\")"
+            "ldap_auth: `ldap_url` is required (e.g. `ldap://ldap.example.com:389` or `ldaps://ldap.example.com:636`)"
                 .to_string(),
         );
     };
@@ -1352,13 +1352,13 @@ fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> 
         )
     })?;
     if raw.is_empty() {
-        return Err("ldap_auth: 'ldap_url' must not be empty".to_string());
+        return Err("ldap_auth: `ldap_url` must not be empty".to_string());
     }
     // Trimming here would admit a padded value that `openapi.yaml` rejects and
     // that no directory URL legitimately carries.
     if raw.trim() != raw {
         return Err(
-            "ldap_auth: 'ldap_url' must not have leading or trailing whitespace".to_string(),
+            "ldap_auth: `ldap_url` must not have leading or trailing whitespace".to_string(),
         );
     }
     Ok(raw)
@@ -1421,7 +1421,7 @@ fn parse_optional_string(
     })?;
     let value = raw.trim();
     if value.is_empty() {
-        return Err(format!("ldap_auth: '{field}' must not be empty"));
+        return Err(format!("ldap_auth: `{field}` must not be empty"));
     }
     Ok(Some(value.to_string()))
 }
@@ -1443,9 +1443,9 @@ fn parse_optional_secret_string(
     };
     let raw = value
         .as_str()
-        .ok_or_else(|| format!("ldap_auth: '{field}' must be a string"))?;
+        .ok_or_else(|| format!("ldap_auth: `{field}` must be a string"))?;
     if raw.is_empty() {
-        return Err(format!("ldap_auth: '{field}' must not be empty"));
+        return Err(format!("ldap_auth: `{field}` must not be empty"));
     }
     Ok(Some(raw.to_string()))
 }
@@ -1484,7 +1484,7 @@ fn parse_usize(
     default_value: usize,
 ) -> Result<usize, String> {
     let raw = parse_u64(config, field, default_value as u64)?;
-    usize::try_from(raw).map_err(|_| format!("ldap_auth: '{field}' is too large"))
+    usize::try_from(raw).map_err(|_| format!("ldap_auth: `{field}` is too large"))
 }
 
 fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<String>, String> {
@@ -1507,7 +1507,7 @@ fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<St
             })?;
             let value = raw.trim();
             if value.is_empty() {
-                return Err(format!("ldap_auth: '{field}' entries must not be empty"));
+                return Err(format!("ldap_auth: `{field}` entries must not be empty"));
             }
             Ok(value.to_string())
         })
@@ -1589,7 +1589,7 @@ fn build_ldap_tls_config(
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
         });
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
-            .map_err(|e| format!("ldap_auth: failed to build TLS verifier: {e}"))?;
+            .map_err(|_| "ldap_auth: failed to build TLS verifier".to_string())?;
         builder.with_webpki_verifier(verifier).with_no_client_auth()
     };
 
@@ -1611,20 +1611,23 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
     };
 
     let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-    let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-        .map_err(|e| format!("ldap_auth: failed to load CA bundle: {e}"))?;
+    let ca_material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(|_| {
+        "ldap_auth: `FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle".to_string()
+    })?;
     let source_id = ca_material.display_source_id.clone();
     let root_store = crate::tls::root_cert_store_from_pem_bundle(
         ca_material.bytes.expose_secret(),
         "ldap_auth CA bundle",
         &source_id,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|_| {
+        "ldap_auth: `FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission".to_string()
+    })?;
 
     debug!(
-        "ldap_auth: loaded {} CA certificate(s) from '{}' (CA exclusivity enforced)",
+        "ldap_auth: loaded {} CA certificate(s) from {} (CA exclusivity enforced)",
         root_store.len(),
-        source_id
+        crate::startup::sanitize_startup_scalar(&source_id)
     );
     Ok(root_store)
 }
@@ -1677,7 +1680,7 @@ fn validate_ldap_filter_syntax(filter: &str, field: &str) -> Result<(), String> 
         .replace("{user_dn}", LDAP_FILTER_VALIDATION_USER_DN);
     if parse_filter(&resolved).is_err() {
         return Err(format!(
-            "ldap_auth: '{field}' is not a valid RFC 4515 LDAP search filter"
+            "ldap_auth: `{field}` is not a valid RFC 4515 LDAP search filter"
         ));
     }
     Ok(())
@@ -2399,7 +2402,7 @@ mod tests {
         let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(false, f.path().to_str(), &[]).unwrap_err();
         assert!(
-            err.contains("no valid PEM certificates"),
+            err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"),
             "unexpected error: {err}"
         );
     }
@@ -2410,7 +2413,7 @@ mod tests {
         let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(true, f.path().to_str(), &[]).unwrap_err();
         assert!(
-            err.contains("no valid PEM certificates"),
+            err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"),
             "unexpected error: {err}"
         );
     }
@@ -2419,7 +2422,11 @@ mod tests {
     fn missing_ca_bundle_file_rejected() {
         ensure_crypto_provider();
         let err = build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem"), &[]).unwrap_err();
-        assert!(err.contains("failed to read"), "unexpected error: {err}");
+        assert!(
+            err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle"),
+            "unexpected error: {err}"
+        );
+        assert!(!err.contains("/nonexistent/path/ca.pem"), "{err}");
     }
 
     /// Proves CA exclusivity: a config built with CA-A successfully completes a
