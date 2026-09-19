@@ -86,6 +86,7 @@ use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher
 use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::fips::approved::{HmacSha256, Sha256};
+use crate::startup::sanitize_startup_scalar;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// The single response field this plugin writes, in the bounded form
@@ -1214,18 +1215,20 @@ impl AiSemanticCache {
             "local"
         };
         let semantic_similarity_enabled = semantic.is_some();
+        // Successful construction bypasses the startup error renderer; normalized
+        // selections are still configuration values and must be withheld here.
         debug!(
-            ttl_seconds,
-            max_entries,
-            max_entry_size_bytes,
-            max_total_size_bytes,
-            include_model_in_key,
-            include_params_in_key,
-            scope_by_consumer,
-            cache_multimodal = cache_multimodal.as_str(),
-            anonymous_caller_scope = anonymous_caller_scope.as_str(),
-            semantic_similarity_enabled,
-            sync_mode,
+            ttl_seconds = %sanitize_startup_scalar(ttl_seconds),
+            max_entries = %sanitize_startup_scalar(max_entries),
+            max_entry_size_bytes = %sanitize_startup_scalar(max_entry_size_bytes),
+            max_total_size_bytes = %sanitize_startup_scalar(max_total_size_bytes),
+            include_model_in_key = %sanitize_startup_scalar(include_model_in_key),
+            include_params_in_key = %sanitize_startup_scalar(include_params_in_key),
+            scope_by_consumer = %sanitize_startup_scalar(scope_by_consumer),
+            cache_multimodal = %sanitize_startup_scalar(cache_multimodal.as_str()),
+            anonymous_caller_scope = %sanitize_startup_scalar(anonymous_caller_scope.as_str()),
+            semantic_similarity_enabled = %sanitize_startup_scalar(semantic_similarity_enabled),
+            sync_mode = %sanitize_startup_scalar(sync_mode),
             "ai_semantic_cache: admitted with effective retention and storage posture"
         );
 

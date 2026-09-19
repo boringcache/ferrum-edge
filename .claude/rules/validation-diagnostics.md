@@ -87,6 +87,9 @@ paths:
   are withheld. JSON Schema and regex admission retain fixed classifications.
   Registered constructor/rendered-output regressions cover these configuration
   paths independently of the scoped mechanical producer guard.
+  Semantic-cache successful admission DEBUG fields sanitize every scalar at
+  emission, including defaults and normalized/derived selections; captured
+  constructor regressions pin the structured fields and fixed event message.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength
