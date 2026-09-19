@@ -1266,7 +1266,7 @@ main() {
     if [ -n "$H1_PROFILE" ]; then
         h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
     fi
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" "$H1_TRACE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1276,7 +1276,7 @@ with open(sys.argv[1], "w") as manifest:
                **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
                **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
                    "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
-                   "h1_revision": sys.argv[11]}
+                   "h1_revision": sys.argv[11], "h1_trace_mode": sys.argv[12]}
                   if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
@@ -1316,9 +1316,18 @@ PYEOF
             BASELINE_IMAGE=$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')
         fi
     fi
-    if [ "$H1_PROFILE" = trace-calibration ] && [ "$FERRUM_IMAGE" != "$BASELINE_IMAGE" ]; then
-        echo 'external calibration requires the identical binary/image in both arms' >&2
-        exit 2
+    if [ "$H1_PROFILE" = trace-calibration ]; then
+        if [ "$FERRUM_IMAGE" != "$BASELINE_IMAGE" ]; then
+            echo 'external calibration requires the identical binary/image in both arms' >&2
+            exit 2
+        fi
+        local internal_observer
+        internal_observer=$(docker image inspect "$FERRUM_IMAGE" \
+            --format '{{index .Config.Labels "ferrum.h1-profile"}}') || return 2
+        if [ "$internal_observer" != on ]; then
+            echo 'external calibration requires the internal observer ON in both arms' >&2
+            exit 2
+        fi
     fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \

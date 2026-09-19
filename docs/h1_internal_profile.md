@@ -564,15 +564,48 @@ coverage before interpreting measurements. #5588 is not closed by instrumentatio
 
 ## Hosted syscall and CPU follow-up (issue #5588)
 
-The follow-up integrates H1 parent
-`2491d44b1149bf33dece351595244351d2dbc322` and the reviewed H3 foundation
-`e00f0a91cb5ae2b0686392f504471283e6f52b4c` by normal merge. It adds no production
+The authoritative historical dependency record is
+`h1_profile_manifest.json` → `external_trace.dependency_provenance`; generated
+capabilities and trace manifests read that same record. These are three distinct
+historical checkpoints, **not** three competing definitions of the current head:
+
+| Role | H1 | H3 |
+| --- | --- | --- |
+| Initial bases | `a798c0bac68151fbe860e3cb48843cbd434c0f84` | `d19abaa3c4fbb40af6136cb577a1ed7e82bf8529` |
+| Integration checkpoints | `2491d44b1149bf33dece351595244351d2dbc322` | `e00f0a91cb5ae2b0686392f504471283e6f52b4c` |
+| Reviewed checkpoints | `ac7ff645f766597b9e4f38aa9e18272c0b3c249d` | `45dbde8ccc9575b225890afb450579213d62cb21` |
+
+Subsequent normal integrations are described by Git ancestry. Each capture's
+runner revision and exact source/object/tool hashes identify its actual code;
+the historical pairs do not claim to enumerate all integrated parents. This
+follow-up adds no production
 forwarding change, Cargo dependency, tuning, competitor arm, pool/UDP profiling,
 frame-pointer rebuild or measurement claim. The H3 probes, fixture commands,
 calibration and campaign remain separate. The H1 cadence and fixed 5 MiB drain
 slice above remain required and unchanged.
 
 Manual input `trace_mode=none|syscalls|cpu` defaults to `none`.
+The campaign manifest records that selection as `h1_trace_mode`. External
+calibration requires the internal observer **ON in both arms** and one immutable
+image across every pair; ordinary observer calibration and observer-off drain
+diagnostics retain their separate build rules.
+
+The retained report validates every selected external capture against its own
+arm/pair/payload/mode, runtime PID generation/container, binding and client
+completion hashes, release ELF and required artifact hashes. It validates typed
+readiness/termination/clock evidence, recomputes syscall completeness from raw
+records, and reconciles CPU decoder/attribute receipts and sample counts.
+Original absolute producer paths are checked for the selected pair, while reads
+use the caller's retained artifact tree, allowing relocation. Missing evidence
+or substitution leaves `validation_complete=false` and `capture_complete=false`;
+the original failed claim remains under `producer_claim`. Live supervisor stdout
+and stderr remain raw artifacts but are explicitly excluded from final hashes
+because the process still writes them during handoff. `external_traces_complete`
+and `trace_comparison_eligible` are separate from internal counters and from the
+always-false full measurement eligibility. The report command fails when a
+selected capture cannot validate. Hashes establish retained-file association,
+not a signed attestation or a performance result.
+
 `diagnostic_only=true` still stops after the existing drain slice even if a trace
 mode was supplied. An intrusive campaign requires `diagnostic_only=false`, a
 successful slice and explicit `syscalls` or `cpu`, plus **one payload selection**.
@@ -633,9 +666,22 @@ min/max and first/last timestamps are explicitly approximate during concurrent
 updates. Counter overflow/reset, pending calls, unmatched entry/exit, abandoned
 calls, map exhaustion and unknown cookies remain explicit. The first 4096
 syscall witnesses are diagnostic examples, not an event-complete stream.
+The shared `read_failed` counter includes whole-call ownership/register failures,
+so any nonzero count invalidates aggregate, measurement, offered-length and
+accepted-byte completeness; surviving partial counters remain retained. Loss
+counter resets also invalidate the capture. Lifecycle/witness certification
+requires exactly one typed requested, bound termination, all three omission/
+failure fields present and zero, matching PID generation/cgroup/netns, and no
+loss capable of suppressing lifecycle records. Witness-cap exhaustion alone
+still does not invalidate otherwise complete aggregate totals.
 
-The supervisor exists before `start_ferrum`; the loader attaches unbound, then
-receives the verified PID/start ticks/cgroup/netns. The process remains ordinary
+The supervisor exists before `start_ferrum`. Before any collector attach or
+binding, it requires the live PID/start ticks to match the retained Docker runtime
+and the full container ID to be an exact Docker cgroup path component. The same
+ELF alone cannot establish ownership. It rechecks this identity immediately
+before attachment, before BPF target binding, and after acknowledgement. The
+loader attaches initially unbound only after that first admission, then receives
+the verified PID/start ticks/cgroup/netns. The process remains ordinary
 UID with zero effective/permitted/ambient capabilities. All existing threads
 are inventoried, new threads use actual task generation, exec invalidates the
 binding, and fork/exit events are retained. Health-check child processes, client,
@@ -644,7 +690,7 @@ namespace inodes, selected safe runtime settings, exact config hash, image and
 matching retained release ELF bind the evidence. No arbitrary environment is
 copied. Startup before binding is an explicit coverage gap.
 
-TCP INET_DIAG runs in the target network namespace before admission and refreshes
+TCP INET_DIAG runs in the admitted target network namespace before tracing and refreshes
 during capture; it primes the kernel cookie through the existing diag ABI/parser.
 Each syscall socket join comes from its actual `tcp_sendmsg/tcp_recvmsg` context.
 A zero cookie or socket created/closed between dumps stays unknown forever.
@@ -683,9 +729,27 @@ samples and folded/decoded call chains are retained. Matching mapped ELF/DSOs
 come from the target mount namespace while alive, never substituted host libc.
 The gateway's retained ELF must match exactly one symbolized release twin.
 Only this disposable synthetic benchmark process's user stack memory may enter
-perf.data. Matching DSO packages are retained once under the corresponding
-`builds/<twin>/symfs`, verified again before reuse, with a separate 512 MiB
-package ceiling; repeat artifacts reference that package.
+perf.data. Matching DSO packages are retained under `builds/<twin>/symfs`, with
+a separate 512 MiB ceiling that includes existing partial files and metadata
+reservations; repeat artifacts reference that package. Acquisition pins the
+admitted target's root directory, walks every subsequent source component without
+following symlinks, and requires a regular file with the `/proc/<pid>/maps`
+device/inode. One pinned readable descriptor supplies ELF magic, bounded copy,
+and SHA-256. Destination traversal also uses pinned directories and refuses
+symlinks, hard-linked files and nonregular files. Reuse compares bounded bytes
+against the pinned source; readelf receives the retained descriptor itself. Each
+repeat keeps a distinct metadata output/receipt, including failed decoders.
+
+The byte budget and 30-second deadline are checked throughout acquisition,
+including between reads/writes; a growing source is rejected before its newly
+read bytes are written, and no read extends beyond its admitted initial size.
+Existing partial files remain charged to the package. Replaced, changed,
+symlinked, deleted, anonymous or otherwise unsupported mappings retain explicit
+errors and any safe partial ELF diagnostics. No host-library substitution or
+broader file access is enabled. Decoder output has the existing combined output
+cap checked again after every reap, including already-exited children, and a
+matching per-file child limit. Partial CPU capture remains distinct from full
+symbol/CFI coverage and complete unwinding.
 
 Attribute verification reads the retained, hash-matched `perf evlist -v` output
 within the existing 2 MiB metadata cap (at most 32 lines, 16 KiB per line).

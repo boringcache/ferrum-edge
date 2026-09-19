@@ -1,5 +1,8 @@
 """Fixed H1 external evidence consumers. Unknown evidence never becomes zero."""
 import collections
+import hashlib
+import os
+import stat
 import json
 import math
 import re
@@ -127,10 +130,20 @@ def syscall_coverage(rows, identity, boundaries):
         return dict(available=False, complete=False, issues=['missing supported ready/final'], ready=ready)
     final = final[0]
     losses = dict(zip(LOSSES, final['losses']))
-    if len(bound) != 1 or bound[0].get('pid') != identity.get('pid') or bound[0].get('start_ticks') != identity.get('start_ticks'):
+    binding_valid = (len(bound) == 1 and all(
+        natural(bound[0].get(k)) and bound[0][k] > 0 for k in ('pid', 'start_ticks', 'cgroup', 'netns', 'at_ns'))
+        and all(bound[0][k] == v for k, v in dict(pid=identity.get('pid'),
+            start_ticks=identity.get('start_ticks'), cgroup=identity.get('cgroup_id'),
+            netns=identity.get('namespaces', {}).get('net')).items()))
+    if not binding_valid:
         issues.append('process binding missing/mismatched')
-    if len(terminal) != 1 or terminal[0].get('requested_stop') is not True:
-        issues.append('missing requested termination')
+    terminal_valid = (len(terminal) == 1 and terminal[0].get('requested_stop') is True
+        and terminal[0].get('bound') is True and natural(terminal[0].get('at_ns'))
+        and terminal[0]['at_ns'] >= final['after_ns']
+        and all(type(terminal[0].get(k)) is int and terminal[0][k] == 0
+                for k in ('lifecycle_omitted', 'checkpoints_omitted', 'snapshot_failures')))
+    if not terminal_valid:
+        issues.append('missing/invalid requested termination or omitted records')
     if final['pending'] or final['map_read_failures']:
         issues.append('pending calls or failed map reads')
     snapshots = [r for r in rows if r['phase'] in ('checkpoint', 'snapshot', 'final')]
@@ -138,13 +151,14 @@ def syscall_coverage(rows, identity, boundaries):
     for a, b in zip(snapshots, snapshots[1:]):
         previous = {r['id']: r for r in a['totals']}
         current = {r['id']: r for r in b['totals']}
-        if any(i not in current or any(current[i][k] < v[k] for k in COUNTERS)
-               for i, v in previous.items()):
+        if (any(i not in current or any(current[i][k] < v[k] for k in COUNTERS)
+                for i, v in previous.items()) or any(y < x for x, y in zip(a['losses'], b['losses']))):
             reset = True
     if reset:
         issues.append('counter reset or inconsistent snapshot')
-    total_loss = ('map_full', 'nested', 'unmatched', 'abandoned', 'compat', 'generation', 'exec', 'overflow')
-    issues.extend(name for name in total_loss if losses[name])
+    total_loss = ('read_failed', 'map_full', 'nested', 'unmatched', 'abandoned', 'compat', 'generation', 'exec', 'overflow')
+    observed_losses = {name: max(r['losses'][index] for r in snapshots) for index, name in enumerate(LOSSES)}
+    issues.extend(name for name in total_loss if observed_losses[name])
     if not boundaries.get('measurement', {}).get('valid'):
         issues.append('missing measurement clock/coverage')
     attempted = {r['id']: r['attempts'] for r in final['totals']}
@@ -184,9 +198,13 @@ def syscall_coverage(rows, identity, boundaries):
     if unsupported or losses['compat']:
         socket_issues.append('unsupported path census')
     # Lifetimes are an event stream, distinct from totals. FD records never grant roles.
-    lifetime_complete = not any(losses[n] for n in ('ring_full', 'generation', 'exec')) and not any(
-        t.get('lifecycle_omitted') or t.get('checkpoints_omitted') or t.get('snapshot_failures') for t in terminal)
+    # Shared admission/read/pending losses can suppress whole lifecycle calls.
+    # A capped syscall witness stream alone does not invalidate aggregate totals.
+    lifetime_complete = (binding_valid and terminal_valid and not foreign and not reset
+        and not any(observed_losses[n] for n in (*total_loss, 'ring_full', 'inner_unmatched'))
+        and not any(r['pending'] or r['map_read_failures'] for r in snapshots))
     return dict(available=True, complete=not issues, issues=sorted(set(issues)), losses=losses,
+                observed_loss_maxima=observed_losses,
                 syscall_totals=final['totals'], socket_rows=final['rows'], census=final['census'],
                 unsupported_census=unsupported, reset=reset, measurement_delta=phase_delta,
                 measurement_complete=not issues and phase_delta["complete"],
@@ -326,11 +344,358 @@ def nested_fixture_proof(chains):
                 witnesses=witnesses, complete_unwinding=False)
 
 
-def load_trace(path):
+def trace_identity_issues(runtime, owner):
+    """The same typed runtime/container binding is used live and after retention."""
+    issues = []
+    if not isinstance(runtime, dict) or not isinstance(owner, dict):
+        return ['missing runtime/process identity']
+    for recorded, observed in (('host_pid', 'pid'), ('start_ticks', 'start_ticks')):
+        if (not natural(runtime.get(recorded)) or not runtime[recorded]
+                or not natural(owner.get(observed)) or owner[observed] != runtime[recorded]):
+            issues.append('runtime PID generation mismatch: ' + recorded)
+    container = runtime.get('container_id')
+    cgroup = owner.get('cgroup')
+    if (not isinstance(container, str) or re.fullmatch(r'[0-9a-f]{64}', container) is None
+            or not isinstance(cgroup, str) or not cgroup.startswith('/')
+            or '..' in Path(cgroup).parts
+            or not any(part in (container, 'docker-' + container + '.scope') for part in Path(cgroup).parts)):
+        issues.append('runtime container/cgroup ownership mismatch')
+    if (not natural(owner.get('cgroup_id')) or not owner['cgroup_id']
+            or not isinstance(owner.get('boot_id'), str) or not owner['boot_id']
+            or not sha256_value(owner.get('executable_sha256'))
+            or not isinstance(owner.get('namespaces'), dict)
+            or not all(natural(owner['namespaces'].get(k)) and owner['namespaces'][k] > 0
+                       for k in ('pid', 'mnt', 'net', 'time', 'user'))):
+        issues.append('missing/invalid process cgroup, ELF or namespace identity')
+    return issues
+
+
+def sha256_value(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+
+
+def retained_file(root, relative, *, limit=BOUNDS['raw_perf_bytes'], keep=False):
+    """Read only regular evidence beneath the caller's retained tree.
+
+    Producer paths never select arbitrary files. Hash streaming is bounded and
+    refuses links, replacement, growth, and nonregular evidence.
+    """
+    parts = Path(relative).parts
+    if not parts or Path(relative).is_absolute() or '..' in parts:
+        raise ValueError('unsafe retained evidence path')
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        result = json.loads(Path(path).read_text())
-        if result.get('schema') != 1 or result.get('mode') not in ('none', 'syscalls', 'cpu'):
-            raise ValueError('trace manifest schema')
-        return result
-    except (OSError, ValueError, AttributeError):
-        return dict(complete=False, issues=['missing/malformed external trace manifest'])
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory); directory = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > limit:
+                raise ValueError('nonregular/oversize retained evidence')
+            sha, size, chunks = hashlib.sha256(), 0, []
+            while True:
+                chunk = os.read(fd, min(65536, limit - size + 1))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError('retained evidence grew beyond bound')
+                sha.update(chunk)
+                if keep:
+                    chunks.append(chunk)
+            after = os.fstat(fd)
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError('retained evidence changed during validation')
+            return dict(sha256=sha.hexdigest(), bytes=size), b''.join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+
+
+def load_trace(path, *, expected=None):
+    """Validate a producer claim against THIS report observation and retained bytes.
+
+    Keep the original claim even on failure, but never export its successful
+    capture/dimension flags as validated evidence. This is integrity/association
+    validation of local artifacts, not a cryptographic signature by the runner.
+    """
+    path = Path(path)
+    result = dict(complete=False, capture_complete=False, validation_complete=False,
+                  issues=[], producer_claim=None)
+    issues = result['issues']
+    def require(condition, message):
+        if not condition:
+            raise ValueError(message)
+    def valid_clock(row):
+        return (isinstance(row, dict) and all(natural(row.get(k)) for k in ('before_ns', 'after_ns', 'unix_ns'))
+                and 0 < row['before_ns'] <= row['after_ns'])
+    def document(name):
+        return json.loads(retained_file(path.parent, name, keep=True, limit=16 * 1024**2)[1])
+    try:
+        claim = document(path.name)
+        result['producer_claim'] = claim
+        require(isinstance(claim, dict), 'trace manifest must be an object')
+        require(isinstance(expected, dict), 'expected observation binding required')
+        for key, value in dict(schema=1, selected_mode=expected['selected_mode'],
+                external_enabled=expected['enabled'],
+                mode=expected['selected_mode'] if expected['enabled'] else 'none').items():
+            require(type(claim.get(key)) is type(value) and claim[key] == value, 'trace selection mismatch: ' + key)
+        mode = claim['mode']
+        require(claim.get('bounds') == BOUNDS and all(type(value) is int for value in claim['bounds'].values()),
+                'missing/mismatched fixed capture bounds')
+        require(claim['selected_mode'] in ('syscalls', 'cpu'), 'invalid selected trace mode')
+        for key in ('capture_complete', 'stop_requested', 'complete', 'fully_profiled'):
+            require(type(claim.get(key)) is bool, 'missing typed trace flag: ' + key)
+        require(claim['complete'] is False and claim['fully_profiled'] is False, 'unsupported full-profile claim')
+        require(isinstance(claim.get('issues'), list) and all(isinstance(v, str) for v in claim['issues']),
+                'missing typed producer issues')
+        binding = document('bind.json')
+        require(binding == claim.get('binding'), 'retained binding differs from manifest')
+        for key in ('arm', 'pair', 'payload'):
+            require(type(binding.get(key)) is type(expected[key])
+                    and type(claim['binding'].get(key)) is type(expected[key]) and binding[key] == expected[key],
+                    'trace observation mismatch: ' + key)
+        # Relocated artifact trees are supported. Original absolute paths must
+        # still name the selected pair/arm, and only caller-selected files read.
+        original = Path(binding['sample']).parent
+        require(original.is_absolute() and '..' not in original.parts
+                and original.name == f"pair_{expected['pair']:03d}", 'invalid original pair path')
+        receipts = claim['input_hashes']
+        require(isinstance(receipts, dict) and set(receipts) == {'binding', 'runtime', 'config'}
+                and all(sha256_value(value) for value in receipts.values()), 'missing typed admission hashes')
+        for key in ('runtime', 'config', 'sample', 'raw_sample', 'client_exit'):
+            relative = expected['files'][key]
+            require(binding[key] == str(original / relative), 'trace input path mismatch: ' + key)
+            info, data = retained_file(expected['folder'], relative, keep=key in ('runtime', 'sample', 'raw_sample', 'client_exit'),
+                                       limit=16 * 1024**2)
+            if key in ('runtime', 'config'):
+                require(sha256_value(receipts.get(key)) and receipts[key] == info['sha256'], 'input hash mismatch: ' + key)
+            if key == 'runtime':
+                runtime = json.loads(data)
+                require(runtime == expected['runtime'] == claim['runtime'], 'runtime record substitution')
+            elif key == 'sample':
+                sample = json.loads(data)
+            elif key == 'raw_sample':
+                raw_sample = json.loads(data)
+            elif key == 'client_exit':
+                require(data.strip() == b'0', 'client exit incomplete')
+        owner = claim['identity']
+        problems = trace_identity_issues(runtime, owner)
+        require(not problems, '; '.join(problems))
+        require(document('identity.json') == owner, 'identity artifact substitution')
+        require(owner['boot_id'] == expected['host_id'], 'trace host mismatch')
+        artifacts = claim['artifacts']
+        require(isinstance(artifacts, dict) and 0 < len(artifacts) <= 512, 'missing/bounded artifact inventory')
+        required = {'bind.json', 'identity.json', 'ready.json', 'teardown-request.json', 'teardown-ready.json',
+                    'capabilities.json', 'build-mappings.json', 'initial-sockets.json'}
+        if mode == 'syscalls':
+            required.update(('syscalls.jsonl', 'syscalls.json', 'fd-lifetimes.json', 'loader.stderr'))
+        elif mode == 'cpu':
+            required.update(('perf.data', 'perf.stderr', 'cpu-coverage.json', 'stacks.txt', 'stacks.folded',
+                             'perf-records.json', 'perf-attributes.txt', 'perf-attributes.txt.status.json',
+                             'perf-buildids.txt', 'perf-buildids.txt.status.json', 'perf-header.txt',
+                             'perf-header.txt.status.json', 'stacks.txt.status.json'))
+        require(required <= artifacts.keys(), 'mandatory retained artifacts missing')
+        retained_bytes = 0
+        for name, receipt in artifacts.items():
+            require(isinstance(receipt, dict) and sha256_value(receipt.get('sha256'))
+                    and natural(receipt.get('bytes')), 'invalid artifact receipt: ' + name)
+            retained_bytes += receipt['bytes']
+            require(retained_bytes <= BOUNDS['total_artifact_bytes'], 'retained trace artifact cap')
+            actual, _ = retained_file(path.parent, name)
+            require(actual == receipt, 'artifact hash/size mismatch: ' + name)
+        binding_hash = artifacts['bind.json']['sha256']
+        require(receipts.get('binding') == binding_hash, 'admission binding hash mismatch')
+        ready = document('ready.json')
+        require(ready['binding_sha256'] == binding_hash and ready['owner'] == owner
+                and isinstance(ready['session'], str) and re.fullmatch(r'[0-9a-f]{32}', ready['session']) is not None,
+                'ready identity/session/hash mismatch')
+        require(ready['status'] == claim['ready']['status'] == ('off' if mode == 'none' else 'supported'),
+                'collector readiness incomplete')
+        teardown = document('teardown-ready.json')
+        request = document('teardown-request.json')
+        require(teardown == claim['lifecycle']['teardown'] and teardown['request'] == request,
+                'termination artifact substitution')
+        require(teardown['phase'] == 'verified_teardown' and claim['lifecycle']['target_gone'] is not None,
+                'missing verified target teardown')
+        for row in (request, teardown):
+            require(row['session'] == ready['session'] and row['binding_sha256'] == binding_hash,
+                    'termination session/binding mismatch')
+            require(not trace_identity_issues(runtime, row['owner']) and
+                    all(row['owner'][key] == owner[key] for key in
+                        ('pid', 'start_ticks', 'cgroup_id', 'cgroup', 'executable_sha256', 'boot_id', 'namespaces')),
+                    'termination identity mismatch')
+        for key in ('sample', 'raw_sample', 'client_exit'):
+            evidence = request['evidence']['files'][key]
+            actual, _ = retained_file(expected['folder'], expected['files'][key], limit=16 * 1024**2)
+            require(evidence['path'] == binding[key] and evidence['sha256'] == actual['sha256'],
+                    'completion sample hash mismatch: ' + key)
+        for row in (ready, request, teardown):
+            require(valid_clock(row.get('at')), 'missing typed lifecycle clock')
+        require(ready['at']['after_ns'] <= request['at']['before_ns']
+                <= request['at']['after_ns'] <= teardown['at']['before_ns'], 'lifecycle clock order mismatch')
+        require(valid_clock(claim['lifecycle']['target_gone'].get('observed_at')),
+                'missing typed target removal receipt')
+        phases = sample['phases']
+        require(phases == raw_sample['phases'] == request['evidence']['phases']
+                and phases.get('timed_out') is False and phases.get('stalled_workers') == []
+                and phases.get('transport_close_timed_out') is False, 'client drain evidence incomplete')
+        completion_window = clock_receipt_window(phases, [ready['at'], request['at']],
+            boot_id=owner['boot_id'], time_namespace=owner['namespaces']['time'])
+        require(completion_window['valid'] and teardown['completion'] == dict(
+            kind='retained_client_report', measurement=completion_window), 'teardown completion clock mismatch')
+        window = clock_receipt_window(phases, [row['clock'] for row in claim['timeline']],
+                                      boot_id=owner['boot_id'], time_namespace=owner['namespaces']['time'])
+        require(window['valid'] and claim['boundaries']['measurement'] == window,
+                'measurement clock evidence mismatch')
+        start, end = claim['boundaries']['capture_start_ns'], claim['boundaries']['capture_end_ns']
+        require(natural(start) and natural(end) and start <= window['start_bounds_ns'][0]
+                and end >= window['end_bounds_ns'][1], 'capture does not bracket measurement')
+        collectors = claim['lifecycle']['collectors']
+        require(isinstance(collectors, dict) and set(collectors) == (
+            {'observer'} if mode == 'syscalls' else {'cpu'} if mode == 'cpu' else set()),
+            'missing or unexpected collector lifecycle')
+        for name, collector in collectors.items():
+            require(valid_clock(collector.get('last_alive')) and valid_clock(collector.get('reaped_at'))
+                    and collector['last_alive']['before_ns'] >= window['end_bounds_ns'][1]
+                    and type(collector['exit'].get('returncode')) is int and collector['exit']['returncode'] == 0,
+                    'collector did not cover measurement/reap successfully: ' + name)
+        capability = document('capabilities.json')
+        require(capability.get('capture_complete') is True and capability.get('discovered') is True
+                and capability.get('attached') is (mode != 'none')
+                and capability.get('loaded') is (mode == 'syscalls'), 'capability disposition incomplete')
+        provenance = claim['dependency_provenance']
+        require(provenance == capability['dependency_provenance'] and isinstance(provenance, dict)
+                and isinstance(provenance.get('meaning'), str), 'dependency provenance mismatch')
+        for group in ('initial_bases', 'integration_checkpoints', 'reviewed_checkpoints'):
+            require(isinstance(provenance.get(group), dict) and set(provenance[group]) == {'h1', 'h3'}
+                    and all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}', value) is not None
+                            for value in provenance[group].values()), 'missing typed dependency checkpoint')
+        for field, mandatory in (('source_hashes', ('h1_trace.py', 'h1_trace_contract.py', 'h1_syscalls.bpf.h', 'h1_loader.h')),
+                                 ('object_hashes', ('observer', 'observer.bpf.o', 'perf', 'h1_trace_fixture'))):
+            hashes = capability[field]
+            require(isinstance(hashes, dict) and set(mandatory) <= hashes.keys()
+                    and all(sha256_value(value) for value in hashes.values()), 'missing source/object/tool hashes')
+        require(capability['runner']['GITHUB_SHA'] == expected['revision'], 'source revision mismatch')
+        matching = claim['matching_elf']
+        require(matching in ('off/ferrum-edge', 'on/ferrum-edge'), 'unknown retained release twin')
+        elf, _ = retained_file(expected['builds'], matching, limit=512 * 1024**2)
+        require(elf['sha256'] == owner['executable_sha256'], 'retained gateway ELF mismatch')
+        if mode == 'syscalls':
+            raw = retained_file(path.parent, 'syscalls.jsonl', keep=True)[1]
+            require(raw.endswith(b'\n'), 'truncated observer terminal record')
+            rows = [json.loads(line) for line in raw.splitlines()]
+            for row in rows:
+                if row.get('phase') in ('snapshot', 'checkpoint', 'final'):
+                    roles = {}
+                    for entry in row['rows']:
+                        totals = roles.setdefault(str(entry['role']), {k: 0 for k in COUNTERS})
+                        for key in COUNTERS:
+                            totals[key] += entry[key]
+                    row['role_totals'] = roles
+            checked = syscall_coverage(rows, owner, claim['boundaries'])
+            require(checked == claim['syscalls'] == document('syscalls.json'), 'syscall coverage claim mismatch')
+            require(checked['complete'], 'syscall evidence incomplete')
+            result['syscalls'] = checked
+            exit_status = claim['observer_exit']
+            require(exit_status.get('partial_record') is False, 'partial observer termination')
+        elif mode == 'cpu':
+            coverage = document('cpu-coverage.json')
+            require(coverage == {k: v for k, v in claim['cpu'].items() if k != 'phases'}, 'CPU coverage claim mismatch')
+            for flag in ('samples_complete', 'stack_useful', 'complete', 'unwind_complete', 'attributes_verified'):
+                require(type(coverage.get(flag)) is bool, 'missing typed CPU flag: ' + flag)
+            require(coverage['attributes_verified'] and coverage['complete'] is False
+                    and isinstance(coverage.get('issues'), list)
+                    and all(issue in ('missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples')
+                            for issue in coverage['issues']), 'CPU capture issues/inconsistent flags')
+            require(coverage['samples_complete'] == (not coverage['issues']), 'CPU sample completeness mismatch')
+            from h1_trace import read_cpu_attributes
+            attributes = read_cpu_attributes(path.parent / 'perf-attributes.txt', document('perf-attributes.txt.status.json'))
+            require(attributes['verified'] and attributes == coverage['attribute_validation'], 'CPU attributes unverified')
+            for filename, field in (('stacks.txt', 'decoder_status'), ('perf-buildids.txt', 'buildid_status'),
+                                    ('perf-header.txt', 'header_status'), ('perf-attributes.txt', 'attributes_status')):
+                status = document(filename + '.status.json')
+                limit = (16 if filename == 'stacks.txt' else 2) * 1024**2
+                require(coverage[field] == status and artifacts[filename]['bytes'] +
+                        artifacts[filename + '.stderr']['bytes'] <= limit, 'CPU command output cap/receipt mismatch')
+                require(type(status['returncode']) is int and status['returncode'] == 0
+                        and status['forced'] is False and status['incomplete'] is None
+                        and status['stdout_sha256'] == artifacts[filename]['sha256']
+                        and status['stderr_sha256'] == artifacts[filename + '.stderr']['sha256'],
+                        'CPU decoder receipt incomplete: ' + filename)
+            records = document('perf-records.json')
+            require(records['incomplete'] is None and type(records['status']['returncode']) is int
+                    and records['status']['returncode'] == 0 and records['status']['forced'] is False, 'raw decoder incomplete')
+            decoded = decode_cpu(retained_file(path.parent, 'stacks.txt', keep=True)[1].decode(),
+                                 '\n'.join(records['records']), {owner['pid']})
+            for key in ('samples', 'foreign_samples', 'unresolved_samples', 'multi_frame_samples',
+                        'raw_sample_records', 'lost_records', 'throttle_records', 'mmap_records', 'task_records'):
+                require(type(coverage.get(key)) is int and coverage[key] == decoded[key], 'CPU counter mismatch: ' + key)
+            for key, value in decoded.items():
+                if key not in ('callchains', 'folded'):
+                    require(type(coverage.get(key)) is type(value) and coverage[key] == value,
+                            'CPU decoded evidence mismatch: ' + key)
+            require(decoded['samples'] > 0 and not decoded['foreign_samples'] and not decoded['lost_records']
+                    and not decoded['throttle_records'] and decoded['samples'] == decoded['raw_sample_records'],
+                    'CPU sample capture incomplete')
+            require(cpu_phases(decoded['callchains'], window) == claim['cpu']['phases'], 'CPU phase evidence mismatch')
+            dsos = document('build-mappings.json')
+            require(type(dsos.get('complete')) is bool and isinstance(dsos.get('errors'), list)
+                    and isinstance(dsos.get('dsos'), list), 'missing typed DSO disposition')
+            require(dsos['complete'] == (not dsos['errors']), 'DSO completeness mismatch')
+            for dso in dsos['dsos']:
+                require(isinstance(dso['path'], str) and dso['path'].startswith('/')
+                        and sha256_value(dso.get('sha256'))
+                        and all(natural(dso.get(key)) for key in ('device_major', 'device_minor', 'inode', 'bytes'))
+                        and dso['inode'] > 0 and type(dso.get('eh_frame')) is bool
+                        and isinstance(dso.get('build_id_lines'), list)
+                        and all(isinstance(line, str) for line in dso['build_id_lines']), 'invalid mapped DSO identity')
+                actual, _ = retained_file(expected['builds'], str(Path(matching).parent / 'symfs') + dso['path'],
+                                          limit=512 * 1024**2)
+                require(actual == {k: dso[k] for k in ('sha256', 'bytes')}, 'DSO artifact mismatch')
+                metadata = dso['metadata_path']
+                require(isinstance(metadata, str) and metadata.startswith('/')
+                        and Path(metadata).parent == Path(dso['path']).parent, 'invalid DSO metadata path')
+                relative = str(Path(matching).parent / 'symfs') + metadata
+                for suffix, key in (('', 'stdout_sha256'), ('.stderr', 'stderr_sha256')):
+                    actual, metadata_bytes = retained_file(expected['builds'], relative + suffix, keep=not suffix,
+                                                           limit=2 * 1024**2)
+                    require(actual['sha256'] == dso['decoder'][key], 'DSO metadata hash mismatch')
+                    if not suffix:
+                        metadata_text = metadata_bytes.decode()
+                        require(dso['build_id_lines'] == [line.strip() for line in metadata_text.splitlines() if 'Build ID:' in line]
+                                and dso['eh_frame'] == ('.eh_frame' in metadata_text), 'DSO ELF metadata claim mismatch')
+                status = json.loads(retained_file(expected['builds'], relative + '.status.json', keep=True,
+                                                 limit=4096)[1])
+                require(status == dso['decoder'], 'DSO decoder receipt mismatch')
+            build_ids = {}
+            for line in retained_file(path.parent, 'perf-buildids.txt', keep=True)[1].decode().splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2 and re.fullmatch(r'[a-fA-F0-9]{8,64}', parts[0]):
+                    build_ids[parts[1].strip()] = parts[0].lower()
+            retained_ids = {d['path']: [line.rsplit(' ', 1)[-1].lower() for line in d['build_id_lines']]
+                            for d in dsos['dsos']}
+            require(build_ids and all(not name.startswith('/') or build_id in retained_ids.get(name, [])
+                    for name, build_id in build_ids.items()), 'recorded build ID lacks matching retained ELF')
+            missing_cfi = not dsos['complete'] or any(not d['build_id_lines'] or not d['eh_frame'] for d in dsos['dsos'])
+            partial = bool(decoded['unresolved_samples'] or decoded['multi_frame_samples'] != decoded['samples'])
+            require(('missing matching ELF/build IDs/CFI' in coverage['issues']) == missing_cfi
+                    and ('partial unwinding/unresolved samples' in coverage['issues']) == partial,
+                    'CPU partial coverage disposition mismatch')
+            require(coverage.get('unwind_complete') is False, 'unsupported complete unwinding claim')
+            result['cpu'] = claim['cpu']
+            exit_status = claim['perf_exit']
+        else:
+            exit_status = dict(returncode=0, forced=False)
+        require(type(exit_status.get('returncode')) is int and exit_status['returncode'] == 0
+                and exit_status.get('forced') is False, 'collector exit incomplete')
+        require(claim['capture_complete'] and claim['stop_requested'] and not claim['issues'], 'producer capture incomplete')
+        result.update(validation_complete=True, capture_complete=True, mode=mode)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, OverflowError, RecursionError) as error:
+        issues.append('external trace validation: ' + str(error))
+        # Partial producer dimension claims remain solely under producer_claim.
+        result.pop('cpu', None)
+        result.pop('syscalls', None)
+    return result
