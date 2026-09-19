@@ -1,7 +1,7 @@
 //! Shared closed-loop phases. Setup and warmup never consume measurement time.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -220,7 +220,14 @@ pub struct Observed {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TransportEvent {
     pub unix_secs: f64,
+    pub monotonic_secs: Option<f64>,
     pub connection_id: usize,
+    pub worker_id: Option<usize>,
+    pub channel_id: Option<usize>,
+    pub hop: Option<String>,
+    pub h2_reason: Option<u32>,
+    pub h2_kind: Option<String>,
+    pub h2_initiator: Option<String>,
     pub event: String,
     pub detail: String,
     pub phase: String,
@@ -235,13 +242,27 @@ impl TransportEvent {
             connection_id,
             event: event.to_string(),
             detail,
-            phase: String::new(),
+            monotonic_secs: Some(monotonic_secs()),
+            ..Self::default()
         }
     }
 }
 
+/// Process-local epoch shared by events and the actual coordinator boundaries.
+/// Unix time is retained for approximate cross-process correlation only.
+pub fn monotonic_secs() -> f64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PhaseReport {
+    pub setup_start_monotonic_secs: f64,
+    pub setup_start_unix_secs: f64,
+    pub warmup_start_monotonic_secs: Option<f64>,
+    pub measurement_start_monotonic_secs: Option<f64>,
+    pub drain_start_monotonic_secs: Option<f64>,
+    pub transport_close_start_monotonic_secs: Option<f64>,
     pub setup_secs: f64,
     pub warmup_secs: f64,
     pub barrier_secs: f64,
@@ -255,6 +276,9 @@ pub struct PhaseReport {
     pub transport_close_timed_out: bool,
     pub transport_close_start_unix_secs: Option<f64>,
     pub transport_events: Vec<TransportEvent>,
+    pub transport_events_total: usize,
+    pub transport_errors_total: usize,
+    pub transport_events_suppressed: usize,
     pub observation_hold_secs: f64,
     pub preflight_bound_secs: f64,
     pub stalled_workers: Vec<usize>,
@@ -264,7 +288,29 @@ pub struct PhaseReport {
 impl PhaseReport {
     pub fn set_transport_events(&mut self, mut events: Vec<TransportEvent>) {
         for event in &mut events {
-            event.phase = if self
+            event.phase = if let Some(at) = event.monotonic_secs {
+                if self
+                    .transport_close_start_monotonic_secs
+                    .is_some_and(|t| at >= t)
+                {
+                    "transport_close"
+                } else if self
+                    .measurement_start_monotonic_secs
+                    .is_some_and(|t| at >= t + self.measurement_secs)
+                    || self.drain_start_monotonic_secs.is_some_and(|t| at >= t)
+                {
+                    "drain"
+                } else if self
+                    .measurement_start_monotonic_secs
+                    .is_some_and(|t| at >= t)
+                {
+                    "measurement"
+                } else if self.warmup_start_monotonic_secs.is_some_and(|t| at >= t) {
+                    "warmup"
+                } else {
+                    "setup"
+                }
+            } else if self
                 .transport_close_start_unix_secs
                 .is_some_and(|start| event.unix_secs >= start)
             {
@@ -282,13 +328,20 @@ impl PhaseReport {
             }
             .to_string();
         }
-        events.sort_by(|left, right| left.unix_secs.total_cmp(&right.unix_secs));
+        events.sort_by(
+            |left, right| match (left.monotonic_secs, right.monotonic_secs) {
+                (Some(left), Some(right)) => left.total_cmp(&right),
+                _ => left.unix_secs.total_cmp(&right.unix_secs),
+            },
+        );
         self.transport_events = events;
     }
 }
 
 pub struct Phases {
     created: Instant,
+    created_monotonic: f64,
+    created_unix: f64,
     duration: Duration,
     preflight_bound: Duration,
     observation_settle: Duration,
@@ -303,6 +356,10 @@ impl Phases {
         let (phase, _) = watch::channel(Phase::Setup);
         Self {
             created: Instant::now(),
+            created_monotonic: monotonic_secs(),
+            created_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64()),
             duration,
             preflight_bound: preflight_bound(0),
             observation_settle: Duration::ZERO,
@@ -375,6 +432,8 @@ impl Phases {
             }
         });
         let mut phases = PhaseReport {
+            setup_start_monotonic_secs: self.created_monotonic,
+            setup_start_unix_secs: self.created_unix,
             preflight_bound_secs: self.preflight_bound.as_secs_f64(),
             ..PhaseReport::default()
         };
@@ -386,6 +445,7 @@ impl Phases {
             self.wait_for(READY).await;
             phases.setup_secs = self.created.elapsed().as_secs_f64();
             let warmup = Instant::now();
+            phases.warmup_start_monotonic_secs = Some(monotonic_secs());
             self.phase.send_replace(Phase::Warmup);
             self.wait_for(BARRIER).await;
             phases.warmup_secs = warmup.elapsed().as_secs_f64();
@@ -416,6 +476,7 @@ impl Phases {
             let end = start + self.duration;
             phases.barrier_secs = start.duration_since(barrier).as_secs_f64();
             phases.measurement_secs = self.duration.as_secs_f64();
+            phases.measurement_start_monotonic_secs = Some(monotonic_secs());
             phases.measurement_start_unix_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -467,6 +528,7 @@ impl Phases {
             }
         }
         self.phase.send_replace(Phase::Stop);
+        phases.drain_start_monotonic_secs = Some(monotonic_secs());
         let drain = Instant::now();
         // Abort only after a bounded drain. Join every task; never detach it.
         if phases.timed_out {

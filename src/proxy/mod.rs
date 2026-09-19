@@ -14355,6 +14355,7 @@ async fn handle_connection(
         }
     });
 
+    let observation = http2_pool::H2DriverObservation::new("frontend_auto_plain");
     let conn = builder.serve_connection_with_upgrades(io, svc);
     tokio::pin!(conn);
 
@@ -14408,6 +14409,13 @@ async fn handle_connection(
             }
         }
     };
+
+    observation.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|e| e.as_ref() as &dyn std::error::Error),
+    );
 
     // Issue #4543: each HTTP/1 parse-layer reject answered a request hyper never
     // saw, so nothing on the service path counted it. Drain the connection's
@@ -22447,6 +22455,7 @@ async fn handle_tls_connection(
         }
     });
 
+    let observation = http2_pool::H2DriverObservation::new("frontend_auto_tls");
     let conn = builder.serve_connection_with_upgrades(io, svc);
     tokio::pin!(conn);
 
@@ -22524,6 +22533,12 @@ async fn handle_tls_connection(
         }
     };
     drop(client_trust_guard);
+    observation.finish(
+        result
+            .as_ref()
+            .err()
+            .map(|e| e.as_ref() as &dyn std::error::Error),
+    );
 
     // Issue #4543: each HTTP/1 parse-layer reject answered a request hyper never
     // saw, so nothing on the service path counted it. Drain the connection's

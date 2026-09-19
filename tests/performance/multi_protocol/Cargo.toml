@@ -20,6 +20,7 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 http = "1"
+h2 = "0.4"
 
 # TLS
 rustls = { version = "0.23", features = ["ring", "std"] }
@@ -66,6 +67,11 @@ libc = "0.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"
+
+[dev-dependencies]
+# Reuse the repository's socket lease registry for real connector regressions.
+socket2 = "0.6"
+uuid = { version = "1.23.1", features = ["v4"] }
 
 [profile.dev]
 opt-level = 0

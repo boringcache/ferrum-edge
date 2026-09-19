@@ -10,6 +10,10 @@ independent socket diagnostics and effective listener configuration. Section 2
 records those measurements and the pinned Envoy packet-drop counter bug.
 There is no evidence yet that one change will make Ferrum faster than every competitor.
 
+The [September 18 H2/gRPC campaign](benchmark_h2_grpc_2026_09_18.md) reproduces
+adaptive-window failures with typed transport evidence. Fixed-window request
+observations do not establish a production repair or a throughput gain.
+
 **Evidence and scope.** [Run 35071334026](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35071334026)
 tested `ff96f30468517706695538ffc74bc6770014ab07`, 15 seconds, base concurrency
 200, three iterations. I downloaded and inspected all 359 JSON samples and
