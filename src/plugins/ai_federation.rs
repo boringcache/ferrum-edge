@@ -193,7 +193,7 @@ impl ProviderType {
             "deepseek" => Ok(Self::DeepSeek),
             "meta_llama" => Ok(Self::MetaLlama),
             "hugging_face" => Ok(Self::HuggingFace),
-            _ => Err("ai_federation: unknown provider_type".to_string()),
+            _ => Err("ai_federation: unknown `provider_type`".to_string()),
         }
     }
 
@@ -284,7 +284,7 @@ impl MultimodalMode {
             "translate" => Ok(Self::Translate),
             "text_only_with_warning" => Ok(Self::TextOnlyWithWarning),
             other => Err(format!(
-                "ai_federation: provider '{provider_name}' unknown multimodal_mode '{other}' (expected reject, translate, or text_only_with_warning)"
+                "ai_federation: provider {provider_name:?} unknown `multimodal_mode` {other:?} (expected `reject`, `translate`, or `text_only_with_warning`)"
             )),
         }
     }
@@ -354,25 +354,28 @@ struct OAuth2Cache {
 
 impl OAuth2Cache {
     fn new(service_account_json: String) -> Result<Self, String> {
-        let service_account: Value = serde_json::from_str(&service_account_json)
-            .map_err(|e| format!("ai_federation: invalid service account JSON: {e}"))?;
+        let service_account: Value = serde_json::from_str(&service_account_json).map_err(|_| {
+            "ai_federation: invalid `google_service_account_json`: invalid JSON".to_string()
+        })?;
         let client_email = service_account["client_email"]
             .as_str()
             .filter(|value| !value.is_empty())
-            .ok_or("ai_federation: service account JSON missing client_email")?
+            .ok_or("ai_federation: service account JSON missing `client_email`")?
             .to_string();
         let private_key_pem = service_account["private_key"]
             .as_str()
             .filter(|value| !value.is_empty())
-            .ok_or("ai_federation: service account JSON missing private_key")?
+            .ok_or("ai_federation: service account JSON missing `private_key`")?
             .to_string();
         let token_uri = service_account["token_uri"]
             .as_str()
             .unwrap_or("https://oauth2.googleapis.com/token")
             .to_string();
         validate_google_token_uri(&token_uri)?;
-        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-            .map_err(|e| format!("ai_federation: invalid service account RSA private key: {e}"))?;
+        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|_| {
+            "ai_federation: invalid service account `private_key`: invalid RSA private key"
+                .to_string()
+        })?;
 
         Ok(Self {
             cache: ArcSwapOption::empty(),
@@ -894,12 +897,12 @@ fn validate_base_url(
     allow_plaintext: bool,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let parsed = Url::parse(base_url).map_err(|e| {
-        format!("ai_federation: provider '{provider_name}' has an invalid base_url: {e}")
+    let parsed = Url::parse(base_url).map_err(|_| {
+        format!("ai_federation: provider {provider_name:?} has an invalid `base_url`")
     })?;
     if !base_url.starts_with("https://") && !base_url.starts_with("http://") {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url must use a lowercase explicit https:// or http:// scheme"
+            "ai_federation: provider {provider_name:?} `base_url` must use a lowercase explicit `https://` or `http://` scheme"
         ));
     }
 
@@ -908,39 +911,40 @@ fn validate_base_url(
         "http" => {
             if !allow_plaintext {
                 return Err(format!(
-                    "ai_federation: provider '{provider_name}' base_url uses 'http://' which is rejected by default; set 'allow_plaintext: true' on the provider to override"
+                    "ai_federation: provider {provider_name:?} `base_url` uses `http://` which is rejected by default; set `allow_plaintext: true` on the provider to override"
                 ));
             }
         }
         other => {
             return Err(format!(
-                "ai_federation: provider '{provider_name}' base_url has unsupported scheme '{other}' (expected 'https' or 'http' with allow_plaintext)"
+                "ai_federation: provider {provider_name:?} `base_url` has unsupported scheme {other:?} (expected `https` or `http` with `allow_plaintext`)"
             ));
         }
     }
 
     if !has_non_empty_authority(base_url) {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url has no host"
+            "ai_federation: provider {provider_name:?} `base_url` has no host"
         ));
     }
 
-    let host = normalized_url_hostname(&parsed)
-        .ok_or_else(|| format!("ai_federation: provider '{provider_name}' base_url has no host"))?;
+    let host = normalized_url_hostname(&parsed).ok_or_else(|| {
+        format!("ai_federation: provider {provider_name:?} `base_url` has no host")
+    })?;
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url must not contain URL userinfo; use the provider's dedicated credential fields"
+            "ai_federation: provider {provider_name:?} `base_url` must not contain URL userinfo; use the dedicated provider credential fields"
         ));
     }
     if parsed.query().is_some() {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url must not contain a query string; use dedicated provider fields instead"
+            "ai_federation: provider {provider_name:?} `base_url` must not contain a query string; use dedicated provider fields instead"
         ));
     }
     if parsed.fragment().is_some() {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url must not contain a fragment"
+            "ai_federation: provider {provider_name:?} `base_url` must not contain a fragment"
         ));
     }
 
@@ -950,7 +954,7 @@ fn validate_base_url(
         && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by backend egress policy ({backend_allow_ips})"
+            "ai_federation: provider {provider_name:?} `base_url` IP \"{ip}\" denied by backend egress policy"
         ));
     }
 
@@ -959,7 +963,7 @@ fn validate_base_url(
 
 fn validate_google_token_uri(token_uri: &str) -> Result<(), String> {
     let parsed = Url::parse(token_uri)
-        .map_err(|e| format!("ai_federation: service account token_uri is invalid: {e}"))?;
+        .map_err(|_| "ai_federation: service account `token_uri` is not a valid URL".to_string())?;
     if parsed.scheme() != "https"
         || parsed.host_str() != Some("oauth2.googleapis.com")
         || parsed.port().is_some()
@@ -970,7 +974,7 @@ fn validate_google_token_uri(token_uri: &str) -> Result<(), String> {
         || parsed.password().is_some()
     {
         return Err(
-            "ai_federation: service account token_uri must be exactly https://oauth2.googleapis.com/token"
+            "ai_federation: service account `token_uri` must be exactly `https://oauth2.googleapis.com/token`"
                 .to_string(),
         );
     }
@@ -1097,7 +1101,7 @@ fn validate_dns_label(field: &str, value: &str, min: usize, max: usize) -> Resul
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     {
         return Err(format!(
-            "ai_federation: '{field}' must be an ASCII DNS label between {min} and {max} characters"
+            "ai_federation: `{field}` must be an ASCII DNS label between {min} and {max} characters"
         ));
     }
     Ok(())
@@ -1116,7 +1120,7 @@ fn validate_url_path_component(field: &str, value: &str, max: usize) -> Result<(
         })
     {
         return Err(format!(
-            "ai_federation: '{field}' contains characters that are unsafe in a provider endpoint component"
+            "ai_federation: `{field}` contains characters that are unsafe in a provider endpoint component"
         ));
     }
     Ok(())
@@ -1168,14 +1172,14 @@ impl AiFederation {
         let providers_val = config
             .get("providers")
             .and_then(|v| v.as_array())
-            .ok_or("ai_federation: 'providers' must be a non-empty array")?;
+            .ok_or("ai_federation: `providers` must be a non-empty array")?;
 
         if providers_val.is_empty() {
-            return Err("ai_federation: 'providers' array must not be empty".to_string());
+            return Err("ai_federation: `providers` array must not be empty".to_string());
         }
         if providers_val.len() > MAX_PROVIDERS {
             return Err(format!(
-                "ai_federation: 'providers' supports at most {MAX_PROVIDERS} entries"
+                "ai_federation: `providers` supports at most {MAX_PROVIDERS} entries"
             ));
         }
 
@@ -1189,7 +1193,7 @@ impl AiFederation {
         for (i, pv) in providers_val.iter().enumerate() {
             let provider_object = pv
                 .as_object()
-                .ok_or_else(|| format!("ai_federation: provider[{i}] must be an object"))?;
+                .ok_or_else(|| format!("ai_federation: `providers[{i}]` must be an object"))?;
             reject_unsupported_streaming_config(pv, &format!("provider[{i}]"), false)?;
             reject_unknown_config_keys(
                 provider_object,
@@ -1198,7 +1202,7 @@ impl AiFederation {
             )?;
 
             let name = optional_str(pv, "name")?
-                .ok_or(format!("ai_federation: provider[{i}] missing 'name'"))?
+                .ok_or(format!("ai_federation: `providers[{i}]` missing `name`"))?
                 .to_string();
 
             if name.is_empty()
@@ -1208,7 +1212,7 @@ impl AiFederation {
                 })
             {
                 return Err(format!(
-                    "ai_federation: provider[{i}] 'name' must contain 1 to 128 ASCII alphanumeric, dot, underscore, or hyphen characters"
+                    "ai_federation: `providers[{i}]` `name` must contain 1 to 128 ASCII alphanumeric, dot, underscore, or hyphen characters"
                 ));
             }
             if !provider_names.insert(name.clone()) {
@@ -1220,13 +1224,13 @@ impl AiFederation {
             validate_provider_field_types(pv)?;
 
             let provider_type_str = optional_str(pv, "provider_type")?.ok_or(format!(
-                "ai_federation: provider {name:?} missing 'provider_type'"
+                "ai_federation: provider {name:?} missing `provider_type`"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
 
             let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
             let priority = u32::try_from(priority_u64)
-                .map_err(|_| format!("ai_federation: provider {name:?} priority is too large"))?;
+                .map_err(|_| format!("ai_federation: provider {name:?} `priority` is too large"))?;
 
             let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
             if model_patterns.len() > MAX_MODEL_PATTERNS_PER_PROVIDER
@@ -1235,7 +1239,7 @@ impl AiFederation {
                     .any(|pattern| !is_valid_model_pattern(pattern))
             {
                 return Err(format!(
-                    "ai_federation: provider {name:?} model_patterns must contain at most {MAX_MODEL_PATTERNS_PER_PROVIDER} bounded model globs"
+                    "ai_federation: provider {name:?} `model_patterns` must contain at most {MAX_MODEL_PATTERNS_PER_PROVIDER} bounded model globs"
                 ));
             }
 
@@ -1246,7 +1250,7 @@ impl AiFederation {
                     .any(|model| !is_valid_model_identifier(model))
             {
                 return Err(format!(
-                    "ai_federation: provider {name:?} model_mapping must contain at most {MAX_MODEL_MAPPINGS_PER_PROVIDER} valid client model identifiers"
+                    "ai_federation: provider {name:?} `model_mapping` must contain at most {MAX_MODEL_MAPPINGS_PER_PROVIDER} valid client model identifiers"
                 ));
             }
 
@@ -1379,10 +1383,10 @@ impl AiFederation {
             optional_u64(config, "max_concurrent_requests")?
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS as u64),
         )
-        .map_err(|_| "ai_federation: 'max_concurrent_requests' is too large".to_string())?;
+        .map_err(|_| "ai_federation: `max_concurrent_requests` is too large".to_string())?;
         if max_concurrent_requests == 0 || max_concurrent_requests > MAX_CONCURRENT_REQUESTS {
             return Err(format!(
-                "ai_federation: 'max_concurrent_requests' must be between 1 and {MAX_CONCURRENT_REQUESTS}"
+                "ai_federation: `max_concurrent_requests` must be between 1 and {MAX_CONCURRENT_REQUESTS}"
             ));
         }
 
@@ -1465,9 +1469,9 @@ fn reject_unknown_config_keys(
     }
     unknown.sort();
     Err(format!(
-        "ai_federation: {scope} contains unknown field(s): {}; allowed fields: {}",
+        "ai_federation: `{scope}` contains unknown field(s): {:?}; allowed fields: `{}`",
         unknown.join(", "),
-        allowed.join(", ")
+        allowed.join("`, `")
     ))
 }
 
@@ -1498,11 +1502,11 @@ fn parse_provider_response_limit(provider: &Value, name: &str) -> Result<usize, 
             .unwrap_or(DEFAULT_MAX_PROVIDER_RESPONSE_BYTES as u64),
     )
     .map_err(|_| {
-        format!("ai_federation: provider {name:?} max_response_body_bytes is too large")
+        format!("ai_federation: provider {name:?} `max_response_body_bytes` is too large")
     })?;
     if limit == 0 || limit > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(format!(
-            "ai_federation: provider {name:?} max_response_body_bytes must be between 1 and {MAX_PROVIDER_RESPONSE_BYTES}"
+            "ai_federation: provider {name:?} `max_response_body_bytes` must be between 1 and {MAX_PROVIDER_RESPONSE_BYTES}"
         ));
     }
     Ok(limit)
@@ -1516,37 +1520,37 @@ fn parse_provider_circuit(
         return Ok(None);
     };
     let object = value.as_object().ok_or_else(|| {
-        format!("ai_federation: provider {name:?} circuit_breaker must be an object")
+        format!("ai_federation: provider {name:?} `circuit_breaker` must be an object")
     })?;
     reject_unknown_config_keys(
         object,
-        &format!("provider {name:?} circuit_breaker"),
+        "config.providers[].circuit_breaker",
         PROVIDER_CIRCUIT_KEYS,
     )?;
 
     let failure_threshold = u32::try_from(optional_u64(value, "failure_threshold")?.unwrap_or(3))
         .map_err(|_| {
-        format!("ai_federation: provider {name:?} circuit failure_threshold is too large")
+        format!("ai_federation: provider {name:?} circuit `failure_threshold` is too large")
     })?;
     let cooldown_seconds = optional_u64(value, "cooldown_seconds")?.unwrap_or(30);
     let success_threshold = u32::try_from(optional_u64(value, "success_threshold")?.unwrap_or(1))
         .map_err(|_| {
-        format!("ai_federation: provider {name:?} circuit success_threshold is too large")
+        format!("ai_federation: provider {name:?} circuit `success_threshold` is too large")
     })?;
 
     if failure_threshold == 0 || failure_threshold > 100 {
         return Err(format!(
-            "ai_federation: provider {name:?} circuit failure_threshold must be between 1 and 100"
+            "ai_federation: provider {name:?} circuit `failure_threshold` must be between 1 and 100"
         ));
     }
     if cooldown_seconds == 0 || cooldown_seconds > 86_400 {
         return Err(format!(
-            "ai_federation: provider {name:?} circuit cooldown_seconds must be between 1 and 86400"
+            "ai_federation: provider {name:?} circuit `cooldown_seconds` must be between 1 and 86400"
         ));
     }
     if success_threshold == 0 || success_threshold > 100 {
         return Err(format!(
-            "ai_federation: provider {name:?} circuit success_threshold must be between 1 and 100"
+            "ai_federation: provider {name:?} circuit `success_threshold` must be between 1 and 100"
         ));
     }
 
@@ -1574,7 +1578,7 @@ fn reject_unsupported_streaming_config(
     for field in UNSUPPORTED_STREAMING_FIELDS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_federation: {scope} field '{field}' is unsupported; configure incremental provider streaming with the root 'streaming' object ({{\"enabled\": true}})"
+                "ai_federation: `{scope}` field `{field}` is unsupported; configure incremental provider streaming with the root `streaming` object (`enabled: true`)"
             ));
         }
     }
@@ -1583,13 +1587,13 @@ fn reject_unsupported_streaming_config(
         Some(Value::Object(_)) if allow_streaming_block => {}
         Some(_) if allow_streaming_block => {
             return Err(format!(
-                "ai_federation: {scope} field 'streaming' must be an object with keys: {}",
-                AI_FEDERATION_STREAMING_KEYS.join(", ")
+                "ai_federation: `{scope}` field `streaming` must be an object with keys: `{}`",
+                AI_FEDERATION_STREAMING_KEYS.join("`, `")
             ));
         }
         Some(_) => {
             return Err(format!(
-                "ai_federation: {scope} field 'streaming' is unsupported; streaming is configured once at the root of the plugin config, not per provider"
+                "ai_federation: `{scope}` field `streaming` is unsupported; streaming is configured once at the root of the plugin config, not per provider"
             ));
         }
     }
@@ -1629,7 +1633,7 @@ fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
     };
     let object = value
         .as_object()
-        .ok_or_else(|| "ai_federation: 'streaming' must be an object".to_string())?;
+        .ok_or_else(|| "ai_federation: `streaming` must be an object".to_string())?;
     reject_unknown_config_keys(object, "streaming", AI_FEDERATION_STREAMING_KEYS)?;
 
     let enabled = optional_bool(value, "enabled")?.unwrap_or(false);
@@ -1637,13 +1641,13 @@ fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
         None => DEFAULT_MAX_STREAM_EVENT_BYTES,
         Some(raw) => usize::try_from(raw).map_err(|_| {
             format!(
-                "ai_federation: streaming max_event_bytes must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
+                "ai_federation: `streaming.max_event_bytes` must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
             )
         })?,
     };
     if !(MIN_STREAM_EVENT_BYTES..=MAX_STREAM_EVENT_BYTES).contains(&max_event_bytes) {
         return Err(format!(
-            "ai_federation: streaming max_event_bytes must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
+            "ai_federation: `streaming.max_event_bytes` must be between {MIN_STREAM_EVENT_BYTES} and {MAX_STREAM_EVENT_BYTES}"
         ));
     }
     let read_timeout_seconds = optional_u64(value, "read_timeout_seconds")?;
@@ -1651,7 +1655,7 @@ fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
         && seconds > MAX_STREAM_READ_TIMEOUT_SECONDS
     {
         return Err(format!(
-            "ai_federation: streaming read_timeout_seconds must be between 0 (unbounded) and {MAX_STREAM_READ_TIMEOUT_SECONDS}"
+            "ai_federation: `streaming.read_timeout_seconds` must be between 0 (unbounded) and {MAX_STREAM_READ_TIMEOUT_SECONDS}"
         ));
     }
 
@@ -1669,7 +1673,7 @@ fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, Stri
     value
         .as_u64()
         .map(Some)
-        .ok_or_else(|| format!("ai_federation: '{field}' must be an unsigned integer"))
+        .ok_or_else(|| format!("ai_federation: `{field}` must be an unsigned integer"))
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -1679,7 +1683,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("ai_federation: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("ai_federation: `{field}` must be a boolean"))
 }
 
 fn optional_str<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -1689,7 +1693,7 @@ fn optional_str<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ai_federation: '{field}' must be a string"))
+        .ok_or_else(|| format!("ai_federation: `{field}` must be a string"))
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -1697,13 +1701,13 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("ai_federation: '{field}' must be an array"));
+        return Err(format!("ai_federation: `{field}` must be an array"));
     };
     let mut out = Vec::with_capacity(values.len());
     for value in values {
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "ai_federation: '{field}' must contain only strings"
+                "ai_federation: `{field}` must contain only strings"
             ));
         };
         out.push(value.to_string());
@@ -1719,12 +1723,12 @@ fn optional_string_map(
         return Ok(None);
     };
     let Some(values) = value.as_object() else {
-        return Err(format!("ai_federation: '{field}' must be an object"));
+        return Err(format!("ai_federation: `{field}` must be an object"));
     };
     let mut out = HashMap::with_capacity(values.len());
     for (key, value) in values {
         let Some(value) = value.as_str() else {
-            return Err(format!("ai_federation: '{field}' values must be strings"));
+            return Err(format!("ai_federation: `{field}` values must be strings"));
         };
         out.insert(key.clone(), value.to_string());
     }
@@ -1739,13 +1743,13 @@ fn optional_status_code_set(
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("ai_federation: '{field}' must be an array"));
+        return Err(format!("ai_federation: `{field}` must be an array"));
     };
     let mut out = HashSet::with_capacity(values.len());
     for value in values {
         let Some(value) = value.as_u64() else {
             return Err(format!(
-                "ai_federation: '{field}' must contain integer status codes"
+                "ai_federation: `{field}` must contain integer status codes"
             ));
         };
         let status = u16::try_from(value).map_err(|_| {
@@ -1758,7 +1762,7 @@ fn optional_status_code_set(
         }
         if (200..300).contains(&status) {
             return Err(format!(
-                "ai_federation: '{field}' cannot replay committed success status {status}"
+                "ai_federation: `{field}` cannot replay committed success status \"{status}\""
             ));
         }
         out.insert(status);
@@ -1783,7 +1787,7 @@ fn validate_static_credential_header(
 ) -> Result<(), String> {
     if reqwest::header::HeaderValue::from_str(value).is_err() {
         return Err(format!(
-            "ai_federation: provider {provider:?} '{field}' is not a valid HTTP header value"
+            "ai_federation: provider {provider:?} `{field}` is not a valid HTTP header value"
         ));
     }
     Ok(())
@@ -1792,7 +1796,7 @@ fn validate_static_credential_header(
 /// Resolve a required static API key and prove it can be sent as a header value.
 fn required_api_key(config: &Value, name: &str) -> Result<String, String> {
     let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
-        "ai_federation: provider {name:?} missing 'api_key'"
+        "ai_federation: provider {name:?} missing `api_key`"
     ))?;
     // Header-value validity is a per-byte property, so proving the key itself
     // is sendable also proves the `Bearer {api_key}` form the bearer providers
@@ -1836,7 +1840,7 @@ fn build_auth(
 
         ProviderType::GoogleVertex => {
             let sa_json = config_or_env_str(config, "google_service_account_json", None).ok_or(
-                format!("ai_federation: provider {name:?} missing 'google_service_account_json'"),
+                format!("ai_federation: provider {name:?} missing `google_service_account_json`"),
             )?;
             Ok(AuthMethod::GoogleOAuth2 {
                 cache: Arc::new(OAuth2Cache::new(sa_json).map_err(|error| {
@@ -1852,12 +1856,12 @@ fn build_auth(
                 Some(&["AWS_DEFAULT_REGION", "AWS_REGION"]),
             )
             .ok_or(format!(
-                "ai_federation: provider {name:?} missing 'aws_region'"
+                "ai_federation: provider {name:?} missing `aws_region`"
             ))?;
             let access_key_id =
                 config_or_env_str(config, "aws_access_key_id", Some(&["AWS_ACCESS_KEY_ID"]))
                     .ok_or(format!(
-                        "ai_federation: provider {name:?} missing 'aws_access_key_id'"
+                        "ai_federation: provider {name:?} missing `aws_access_key_id`"
                     ))?;
             let secret_access_key = config_or_env_str(
                 config,
@@ -1865,7 +1869,7 @@ fn build_auth(
                 Some(&["AWS_SECRET_ACCESS_KEY"]),
             )
             .ok_or(format!(
-                "ai_federation: provider {name:?} missing 'aws_secret_access_key'"
+                "ai_federation: provider {name:?} missing `aws_secret_access_key`"
             ))?;
             let session_token =
                 config_or_env_str(config, "aws_session_token", Some(&["AWS_SESSION_TOKEN"]));
@@ -1918,24 +1922,24 @@ fn validate_provider_config(
         ProviderType::AzureOpenAi => {
             if config["azure_resource"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider {name:?} (azure_openai) missing 'azure_resource'"
+                    "ai_federation: provider {name:?} (azure_openai) missing `azure_resource`"
                 ));
             }
             if config["azure_deployment"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider {name:?} (azure_openai) missing 'azure_deployment'"
+                    "ai_federation: provider {name:?} (azure_openai) missing `azure_deployment`"
                 ));
             }
         }
         ProviderType::GoogleVertex => {
             if config["google_project_id"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider {name:?} (google_vertex) missing 'google_project_id'"
+                    "ai_federation: provider {name:?} (google_vertex) missing `google_project_id`"
                 ));
             }
             if config["google_region"].as_str().is_none() {
                 return Err(format!(
-                    "ai_federation: provider {name:?} (google_vertex) missing 'google_region'"
+                    "ai_federation: provider {name:?} (google_vertex) missing `google_region`"
                 ));
             }
         }

@@ -704,7 +704,7 @@ impl AiSemanticFirewall {
             "dry_run" => EnforcementMode::DryRun,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'mode' must be one of 'enforce' or 'dry_run', got {other:?}"
+                    "ai_semantic_firewall: `mode` must be one of `enforce` or `dry_run`, got {other:?}"
                 ));
             }
         };
@@ -719,7 +719,7 @@ impl AiSemanticFirewall {
             "reject" => OnErrorAction::Reject,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'on_error' must be one of 'warn', 'allow', or 'reject', got {other:?}"
+                    "ai_semantic_firewall: `on_error` must be one of `warn`, `allow`, or `reject`, got {other:?}"
                 ));
             }
         };
@@ -731,7 +731,7 @@ impl AiSemanticFirewall {
             Some("inspect") => Some(StreamingResponsePolicy::Inspect),
             Some(other) => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', 'buffer', or 'inspect', got {other:?}"
+                    "ai_semantic_firewall: `streaming_response` must be one of `skip`, `reject`, `buffer`, or `inspect`, got {other:?}"
                 ));
             }
             None => None,
@@ -744,7 +744,7 @@ impl AiSemanticFirewall {
         } else {
             if config.get("streaming").is_some() {
                 return Err(
-                    "ai_semantic_firewall: 'streaming' block is only valid when 'streaming_response' is 'inspect'"
+                    "ai_semantic_firewall: `streaming` block is only valid when `streaming_response` is `inspect`"
                         .to_string(),
                 );
             }
@@ -756,7 +756,7 @@ impl AiSemanticFirewall {
             "warn" => Action::Warn,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'default_action' must be one of 'reject' or 'warn', got {other:?}"
+                    "ai_semantic_firewall: `default_action` must be one of `reject` or `warn`, got {other:?}"
                 ));
             }
         };
@@ -764,7 +764,7 @@ impl AiSemanticFirewall {
         let privacy_object = optional_object(config, "privacy")?;
         if optional_bool_in_object(privacy_object, "log_raw_text")?.unwrap_or(false) {
             return Err(
-                "ai_semantic_firewall: privacy.log_raw_text is reserved for future use and must be false"
+                "ai_semantic_firewall: `privacy.log_raw_text` is reserved for future use and must be false"
                     .to_string(),
             );
         }
@@ -877,7 +877,7 @@ impl AiSemanticFirewall {
 
         if !inspect_request && !inspect_response {
             return Err(
-                "ai_semantic_firewall: at least one of inspect.request or inspect.response must be true"
+                "ai_semantic_firewall: at least one of `inspect.request` or `inspect.response` must be true"
                     .to_string(),
             );
         }
@@ -899,7 +899,7 @@ impl AiSemanticFirewall {
         let provider = parse_provider_config(config, http_client.backend_allow_ips())?;
         if provider.is_none() {
             return Err(
-                "ai_semantic_firewall: provider config is required when semantic rules are active"
+                "ai_semantic_firewall: `provider` config is required when semantic rules are active"
                     .to_string(),
             );
         }
@@ -923,13 +923,13 @@ impl AiSemanticFirewall {
 
         if has_request_rules && extraction.request_json_paths.is_empty() {
             return Err(
-                "ai_semantic_firewall: extraction.request_json_paths must not be empty when request rules are active"
+                "ai_semantic_firewall: `extraction.request_json_paths` must not be empty when request rules are active"
                     .to_string(),
             );
         }
         if has_response_rules && extraction.response_json_paths.is_empty() {
             return Err(
-                "ai_semantic_firewall: extraction.response_json_paths must not be empty when response rules are active"
+                "ai_semantic_firewall: `extraction.response_json_paths` must not be empty when response rules are active"
                     .to_string(),
             );
         }
@@ -2950,21 +2950,21 @@ fn builtin_pack_examples(
                 "replace" => {
                     let Some(custom_examples) = custom_examples else {
                         return Err(format!(
-                            "ai_semantic_firewall: builtins.{key}.examples is required when examples_mode is 'replace'"
+                            "ai_semantic_firewall: `builtins.{key}.examples` is required when `examples_mode` is `replace`"
                         ));
                     };
                     custom_examples
                 }
                 other => {
                     return Err(format!(
-                        "ai_semantic_firewall: builtins.{key}.examples_mode must be 'append' or 'replace', got {other:?}"
+                        "ai_semantic_firewall: `builtins.{key}.examples_mode` must be `append` or `replace`, got {other:?}"
                     ));
                 }
             };
             Ok(enabled.then_some(examples))
         }
         _ => Err(format!(
-            "ai_semantic_firewall: builtins.{key} must be a boolean or object"
+            "ai_semantic_firewall: `builtins.{key}` must be a boolean or object"
         )),
     }
 }
@@ -2977,23 +2977,23 @@ fn optional_examples_from_object(
         return Ok(None);
     };
     let Value::Array(values) = value else {
-        return Err(format!("ai_semantic_firewall: {field} must be an array"));
+        return Err(format!("ai_semantic_firewall: `{field}` must be an array"));
     };
     if values.is_empty() {
-        return Err(format!("ai_semantic_firewall: {field} must not be empty"));
+        return Err(format!("ai_semantic_firewall: `{field}` must not be empty"));
     }
 
     let mut examples = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(example) = value.as_str() else {
             return Err(format!(
-                "ai_semantic_firewall: {field}[{index}] must be a string"
+                "ai_semantic_firewall: `{field}[{index}]` must be a string"
             ));
         };
         let trimmed = example.trim();
         if trimmed.is_empty() {
             return Err(format!(
-                "ai_semantic_firewall: {field}[{index}] must not be empty"
+                "ai_semantic_firewall: `{field}[{index}]` must not be empty"
             ));
         }
         examples.push(trimmed.to_string());
@@ -3024,7 +3024,7 @@ fn parse_allow_topics(
     let mut topics = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
-            format!("ai_semantic_firewall: allow_topics[{index}] must be an object")
+            format!("ai_semantic_firewall: `allow_topics[{index}]` must be an object")
         })?;
         let id = required_non_empty_string(object.get("id"), &format!("allow_topics[{index}].id"))?;
         ensure_unique_id(ids, &id)?;
@@ -3042,7 +3042,7 @@ fn parse_allow_topics(
             "warn" => Action::Warn,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: allow_topics[{index}].action_on_no_match must be 'reject' or 'warn', got {other:?}"
+                    "ai_semantic_firewall: `allow_topics[{index}].action_on_no_match` must be `reject` or `warn`, got {other:?}"
                 ));
             }
         };
@@ -3069,7 +3069,7 @@ fn parse_deny_topics(
     let mut rules = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
-            format!("ai_semantic_firewall: deny_topics[{index}] must be an object")
+            format!("ai_semantic_firewall: `deny_topics[{index}]` must be an object")
         })?;
         let id = required_non_empty_string(object.get("id"), &format!("deny_topics[{index}].id"))?;
         ensure_unique_id(ids, &id)?;
@@ -3085,7 +3085,7 @@ fn parse_deny_topics(
         )?;
         if action == Action::Allow {
             return Err(format!(
-                "ai_semantic_firewall: deny_topics[{index}].action must be 'reject' or 'warn', got \"allow\""
+                "ai_semantic_firewall: `deny_topics[{index}].action` must be `reject` or `warn`, got \"allow\""
             ));
         }
         rules.push(SemanticRule {
@@ -3118,7 +3118,7 @@ fn parse_custom_rules(
     let mut rules = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
-            format!("ai_semantic_firewall: custom_rules[{index}] must be an object")
+            format!("ai_semantic_firewall: `custom_rules[{index}]` must be an object")
         })?;
         let id = required_non_empty_string(object.get("id"), &format!("custom_rules[{index}].id"))?;
         ensure_unique_id(ids, &id)?;
@@ -3143,7 +3143,7 @@ fn parse_custom_rules(
         )?;
         if action == Action::Allow {
             return Err(format!(
-                "ai_semantic_firewall: custom_rules[{index}].action 'allow' has no allowlist semantics; use allow_topics instead"
+                "ai_semantic_firewall: `custom_rules[{index}].action` `allow` has no allowlist semantics; use `allow_topics` instead"
             ));
         }
         rules.push(SemanticRule {
@@ -3179,13 +3179,13 @@ fn parse_provider_config(
     // schema-validating client and `ferrum-edge validate` disagreed on the same
     // config. Neither alias is documented anywhere, so nothing is preserved.
     let provider_type = match provider.get("type") {
-        None => return Err("ai_semantic_firewall: provider.type is required".to_string()),
+        None => return Err("ai_semantic_firewall: `provider.type` is required".to_string()),
         Some(Value::String(value)) => value.as_str(),
-        Some(_) => return Err("ai_semantic_firewall: provider.type must be a string".to_string()),
+        Some(_) => return Err("ai_semantic_firewall: `provider.type` must be a string".to_string()),
     };
     if provider_type != "openai_compatible_embeddings" {
         return Err(format!(
-            "ai_semantic_firewall: provider.type must be 'openai_compatible_embeddings', got {provider_type:?}"
+            "ai_semantic_firewall: `provider.type` must be `openai_compatible_embeddings`, got {provider_type:?}"
         ));
     }
 
@@ -3229,20 +3229,20 @@ fn validate_provider_endpoint(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<ValidatedProviderEndpoint, String> {
     let parsed = Url::parse(endpoint)
-        .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
+        .map_err(|_| "ai_semantic_firewall: `provider.endpoint` must be a valid URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("ai_semantic_firewall: provider.endpoint must use http or https".to_string());
+        return Err("ai_semantic_firewall: `provider.endpoint` must use http or https".to_string());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(
-            "ai_semantic_firewall: provider.endpoint must not include username or password; use provider.api_key_env for credentials"
+            "ai_semantic_firewall: `provider.endpoint` must not include username or password; use `provider.api_key_env` for credentials"
                 .to_string(),
         );
     }
 
-    let host = parsed
-        .host()
-        .ok_or_else(|| "ai_semantic_firewall: provider.endpoint must include a host".to_string())?;
+    let host = parsed.host().ok_or_else(|| {
+        "ai_semantic_firewall: `provider.endpoint` must include a host".to_string()
+    })?;
     let (literal_ip, warmup_hostname) = match host {
         Host::Ipv4(ip) => (Some(std::net::IpAddr::V4(ip)), None),
         Host::Ipv6(ip) => (Some(std::net::IpAddr::V6(ip)), None),
@@ -3252,7 +3252,7 @@ fn validate_provider_endpoint(
         && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_semantic_firewall: provider.endpoint IP {ip} denied by backend egress policy ({backend_allow_ips})"
+            "ai_semantic_firewall: `provider.endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
     }
 
@@ -4619,7 +4619,7 @@ fn streaming_u64(
         return Ok(None);
     };
     value.as_u64().map(Some).ok_or_else(|| {
-        format!("ai_semantic_firewall: streaming.{field} must be a non-negative integer")
+        format!("ai_semantic_firewall: `streaming.{field}` must be a non-negative integer")
     })
 }
 
@@ -4639,7 +4639,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
     // `StreamingInspectConfig`.
     let reject_token_only_fields = |field: &str| {
         format!(
-            "ai_semantic_firewall: streaming.{field} is only valid when streaming.window is 'tokens'"
+            "ai_semantic_firewall: `streaming.{field}` is only valid when `streaming.window` is `tokens`"
         )
     };
     if !matches!(window_raw, "tokens") {
@@ -4667,12 +4667,12 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
                 Some("unicode_words") => StreamTokenizer::UnicodeWords,
                 Some(other) => {
                     return Err(format!(
-                        "ai_semantic_firewall: streaming.tokenizer must be one of 'chars4', 'whitespace', or 'unicode_words', got {other:?}"
+                        "ai_semantic_firewall: `streaming.tokenizer` must be one of `chars4`, `whitespace`, or `unicode_words`, got {other:?}"
                     ));
                 }
                 None => {
                     return Err(
-                        "ai_semantic_firewall: streaming.tokenizer is required when streaming.window is 'tokens'"
+                        "ai_semantic_firewall: `streaming.tokenizer` is required when `streaming.window` is `tokens`"
                             .to_string(),
                     );
                 }
@@ -4682,13 +4682,13 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
                 None => DEFAULT_MAX_WINDOW_TOKENS,
                 Some(0) => {
                     return Err(
-                        "ai_semantic_firewall: streaming.max_window_tokens must be greater than 0"
+                        "ai_semantic_firewall: `streaming.max_window_tokens` must be greater than 0"
                             .to_string(),
                     );
                 }
                 Some(n) if n > MAX_STREAM_WINDOW_TOKENS => {
                     return Err(format!(
-                        "ai_semantic_firewall: streaming.max_window_tokens must be less than or equal to {MAX_STREAM_WINDOW_TOKENS}, got \"{n}\""
+                        "ai_semantic_firewall: `streaming.max_window_tokens` must be less than or equal to {MAX_STREAM_WINDOW_TOKENS}, got \"{n}\""
                     ));
                 }
                 Some(n) => n,
@@ -4698,7 +4698,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
                 None => DEFAULT_OVERLAP_TOKENS.min(max_tokens.saturating_sub(1)),
                 Some(n) if n >= max_tokens => {
                     return Err(
-                        "ai_semantic_firewall: streaming.overlap_tokens must be less than streaming.max_window_tokens"
+                        "ai_semantic_firewall: `streaming.overlap_tokens` must be less than `streaming.max_window_tokens`"
                             .to_string(),
                     );
                 }
@@ -4713,7 +4713,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         }
         other => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.window must be one of 'sentence', 'paragraph', 'bytes', or 'tokens', got {other:?}"
+                "ai_semantic_firewall: `streaming.window` must be one of `sentence`, `paragraph`, `bytes`, or `tokens`, got {other:?}"
             ));
         }
     };
@@ -4723,7 +4723,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         "detect" => StreamEnforcement::Detect,
         other => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.enforcement must be 'block' or 'detect', got {other:?}"
+                "ai_semantic_firewall: `streaming.enforcement` must be `block` or `detect`, got {other:?}"
             ));
         }
     };
@@ -4735,7 +4735,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         "cut_silent" => false,
         other => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.on_violation must be 'cut_with_error_event' or 'cut_silent', got {other:?}"
+                "ai_semantic_firewall: `streaming.on_violation` must be `cut_with_error_event` or `cut_silent`, got {other:?}"
             ));
         }
     };
@@ -4748,13 +4748,13 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         None => None,
         Some(0) => {
             return Err(
-                "ai_semantic_firewall: streaming.max_hold_ms must be greater than 0; omit the field to leave the hold unbounded"
+                "ai_semantic_firewall: `streaming.max_hold_ms` must be greater than 0; omit the field to leave the hold unbounded"
                     .to_string(),
             );
         }
         Some(millis) if millis > MAX_STREAM_HOLD_MS => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.max_hold_ms must be less than or equal to {MAX_STREAM_HOLD_MS}, got \"{millis}\""
+                "ai_semantic_firewall: `streaming.max_hold_ms` must be less than or equal to {MAX_STREAM_HOLD_MS}, got \"{millis}\""
             ));
         }
         Some(millis) => Some(Duration::from_millis(millis)),
@@ -4770,13 +4770,13 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         "forward" => HoldTimeoutPolicy::Forward,
         other => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.on_hold_timeout must be 'on_error', 'cut', or 'forward', got {other:?}"
+                "ai_semantic_firewall: `streaming.on_hold_timeout` must be `on_error`, `cut`, or `forward`, got {other:?}"
             ));
         }
     };
     if max_hold.is_none() && streaming.is_some_and(|obj| obj.contains_key("on_hold_timeout")) {
         return Err(
-            "ai_semantic_firewall: streaming.on_hold_timeout requires streaming.max_hold_ms to be set"
+            "ai_semantic_firewall: `streaming.on_hold_timeout` requires `streaming.max_hold_ms` to be set"
                 .to_string(),
         );
     }
@@ -4787,7 +4787,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
     // ordinary `on_error: reject` + `enforcement: detect` config stays valid.
     if hold_timeout == HoldTimeoutPolicy::Cut && enforcement == StreamEnforcement::Detect {
         return Err(
-            "ai_semantic_firewall: streaming.on_hold_timeout 'cut' is invalid with streaming.enforcement 'detect'; detect has already forwarded the window and cannot cut"
+            "ai_semantic_firewall: `streaming.on_hold_timeout` `cut` is invalid with `streaming.enforcement` `detect`; detect has already forwarded the window and cannot cut"
                 .to_string(),
         );
     }
@@ -4795,20 +4795,20 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
     let max_window_bytes = streaming_u64(streaming, "max_window_bytes")?.unwrap_or(4096);
     if max_window_bytes == 0 {
         return Err(
-            "ai_semantic_firewall: streaming.max_window_bytes must be greater than 0".to_string(),
+            "ai_semantic_firewall: `streaming.max_window_bytes` must be greater than 0".to_string(),
         );
     }
     let overlap_bytes = streaming_u64(streaming, "overlap_bytes")?.unwrap_or(256);
     if overlap_bytes >= max_window_bytes {
         return Err(
-            "ai_semantic_firewall: streaming.overlap_bytes must be less than streaming.max_window_bytes"
+            "ai_semantic_firewall: `streaming.overlap_bytes` must be less than `streaming.max_window_bytes`"
                 .to_string(),
         );
     }
     let max_inspections = streaming_u64(streaming, "max_inspections")?.unwrap_or(64);
     if max_inspections == 0 {
         return Err(
-            "ai_semantic_firewall: streaming.max_inspections must be greater than 0".to_string(),
+            "ai_semantic_firewall: `streaming.max_inspections` must be greater than 0".to_string(),
         );
     }
 
@@ -7814,8 +7814,8 @@ fn reject_unknown_keys(
 ) -> Result<(), String> {
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!(
-            "ai_semantic_firewall: unknown property {path}.{key}; allowed properties: {}",
-            allowed.join(", ")
+            "ai_semantic_firewall: unknown property in `{path}`: {key:?}; allowed properties: `{}`",
+            allowed.join("`, `")
         ));
     }
     Ok(())
@@ -7958,14 +7958,14 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
 
 fn required_non_empty_string(value: Option<&Value>, field: &str) -> Result<String, String> {
     let Some(value) = value else {
-        return Err(format!("ai_semantic_firewall: {field} is required"));
+        return Err(format!("ai_semantic_firewall: `{field}` is required"));
     };
     let Some(text) = value.as_str() else {
-        return Err(format!("ai_semantic_firewall: {field} must be a string"));
+        return Err(format!("ai_semantic_firewall: `{field}` must be a string"));
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(format!("ai_semantic_firewall: {field} must not be empty"));
+        return Err(format!("ai_semantic_firewall: `{field}` must not be empty"));
     }
     Ok(trimmed.to_string())
 }
@@ -7973,30 +7973,30 @@ fn required_non_empty_string(value: Option<&Value>, field: &str) -> Result<Strin
 fn required_examples(value: Option<&Value>, field: &str) -> Result<Vec<String>, String> {
     let Some(value) = value else {
         return Err(format!(
-            "ai_semantic_firewall: {field}.examples is required"
+            "ai_semantic_firewall: `{field}.examples` is required"
         ));
     };
     let Some(items) = value.as_array() else {
         return Err(format!(
-            "ai_semantic_firewall: {field}.examples must be an array"
+            "ai_semantic_firewall: `{field}.examples` must be an array"
         ));
     };
     if items.is_empty() {
         return Err(format!(
-            "ai_semantic_firewall: {field}.examples must not be empty"
+            "ai_semantic_firewall: `{field}.examples` must not be empty"
         ));
     }
     let mut examples = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let Some(text) = item.as_str() else {
             return Err(format!(
-                "ai_semantic_firewall: {field}.examples[{index}] must be a string"
+                "ai_semantic_firewall: `{field}.examples[{index}]` must be a string"
             ));
         };
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(format!(
-                "ai_semantic_firewall: {field}.examples[{index}] must not be empty"
+                "ai_semantic_firewall: `{field}.examples[{index}]` must not be empty"
             ));
         }
         examples.push(trimmed.to_string());
@@ -8009,11 +8009,11 @@ fn optional_threshold(value: Option<&Value>, field: &str) -> Result<Option<f32>,
         return Ok(None);
     };
     let Some(number) = value.as_f64() else {
-        return Err(format!("ai_semantic_firewall: {field} must be a number"));
+        return Err(format!("ai_semantic_firewall: `{field}` must be a number"));
     };
     if !number.is_finite() || !(0.0..=1.0).contains(&number) {
         return Err(format!(
-            "ai_semantic_firewall: {field} must be finite and between 0.0 and 1.0"
+            "ai_semantic_firewall: `{field}` must be finite and between 0.0 and 1.0"
         ));
     }
     Ok(Some(number as f32))
@@ -8028,12 +8028,12 @@ fn optional_positive_u64_from_object(
     };
     let Some(number) = value.as_u64() else {
         return Err(format!(
-            "ai_semantic_firewall: provider.{field} must be a positive integer"
+            "ai_semantic_firewall: `provider.{field}` must be a positive integer"
         ));
     };
     if number == 0 {
         return Err(format!(
-            "ai_semantic_firewall: provider.{field} must be greater than 0"
+            "ai_semantic_firewall: `provider.{field}` must be greater than 0"
         ));
     }
     Ok(Some(number))
@@ -8047,7 +8047,7 @@ fn validate_extraction_paths(
     for (index, path) in paths.iter().enumerate() {
         if !supported_paths.contains(&path.as_str()) {
             return Err(format!(
-                "ai_semantic_firewall: {field}[{index}] contains unsupported path {path:?}"
+                "ai_semantic_firewall: `{field}[{index}]` contains unsupported path {path:?}"
             ));
         }
     }
@@ -8060,7 +8060,7 @@ fn parse_action(value: &str, field: &str) -> Result<Action, String> {
         "warn" => Ok(Action::Warn),
         "reject" => Ok(Action::Reject),
         other => Err(format!(
-            "ai_semantic_firewall: {field} must be one of 'allow', 'warn', or 'reject', got {other:?}"
+            "ai_semantic_firewall: `{field}` must be one of `allow`, `warn`, or `reject`, got {other:?}"
         )),
     }
 }
@@ -8071,7 +8071,7 @@ fn parse_direction_scope(value: &str, field: &str) -> Result<DirectionScope, Str
         "response" => Ok(DirectionScope::Response),
         "both" => Ok(DirectionScope::Both),
         other => Err(format!(
-            "ai_semantic_firewall: {field} must be one of 'request', 'response', or 'both', got {other:?}"
+            "ai_semantic_firewall: `{field}` must be one of `request`, `response`, or `both`, got {other:?}"
         )),
     }
 }
@@ -8083,7 +8083,7 @@ fn parse_severity(value: &str, field: &str) -> Result<Severity, String> {
         "high" => Ok(Severity::High),
         "critical" => Ok(Severity::Critical),
         other => Err(format!(
-            "ai_semantic_firewall: {field} must be one of 'low', 'medium', 'high', or 'critical', got {other:?}"
+            "ai_semantic_firewall: `{field}` must be one of `low`, `medium`, `high`, or `critical`, got {other:?}"
         )),
     }
 }
@@ -8095,7 +8095,7 @@ fn optional_object<'a>(
     match config.get(field) {
         None => Ok(None),
         Some(Value::Object(object)) => Ok(Some(object)),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be an object")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be an object")),
     }
 }
 
@@ -8103,7 +8103,7 @@ fn optional_array<'a>(config: &'a Value, field: &str) -> Result<Option<&'a Vec<V
     match config.get(field) {
         None => Ok(None),
         Some(Value::Array(items)) => Ok(Some(items)),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be an array")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be an array")),
     }
 }
 
@@ -8111,7 +8111,7 @@ fn optional_bool(config: &Value, field: &str) -> Result<Option<bool>, String> {
     match config.get(field) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be a boolean")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a boolean")),
     }
 }
 
@@ -8122,7 +8122,7 @@ fn optional_bool_in_object(
     match object.and_then(|object| object.get(field)) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be a boolean")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a boolean")),
     }
 }
 
@@ -8130,7 +8130,7 @@ fn optional_string<'a>(config: &'a Value, field: &str) -> Result<Option<&'a str>
     match config.get(field) {
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be a string")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a string")),
     }
 }
 
@@ -8141,7 +8141,7 @@ fn optional_string_from_object<'a>(
     match object.get(field) {
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be a string")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a string")),
     }
 }
 
@@ -8156,12 +8156,12 @@ fn optional_string_vec_in_object(
             .enumerate()
             .map(|(index, value)| {
                 value.as_str().map(str::to_string).ok_or_else(|| {
-                    format!("ai_semantic_firewall: '{field}[{index}]' must be a string")
+                    format!("ai_semantic_firewall: `{field}[{index}]` must be a string")
                 })
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be an array")),
+        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be an array")),
     }
 }
 
