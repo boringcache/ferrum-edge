@@ -5267,8 +5267,10 @@ fn config_decode_error(error: serde_path_to_error::Error<serde_json::Error>) -> 
         }
         path if path.starts_with("clickhouse.tls.") => "clickhouse.tls",
         path if path.starts_with("clickhouse.") => "clickhouse",
+        path if path.starts_with("mode.") => "mode",
         path if path.starts_with("batch.") => "batch",
         path if path.starts_with("retry.") => "retry",
+        path if path.starts_with("spool.compression.") => "spool.compression",
         path if path.starts_with("spool.") => "spool",
         path if path.starts_with("snapshot.") => "snapshot",
         _ => "config",
