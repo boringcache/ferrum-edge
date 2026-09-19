@@ -62,7 +62,7 @@ fn test_unknown_config_key_max_bytez_is_rejected() {
     .expect("typo max_bytez must be rejected");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("max_bytez"), "{err}");
-    assert!(err.contains("did you mean 'max_bytes'?"), "{err}");
+    assert!(err.contains("did you mean `max_bytes`?"), "{err}");
 }
 
 // === Content-Length fast path ===

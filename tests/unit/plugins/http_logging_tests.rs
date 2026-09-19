@@ -121,7 +121,7 @@ fn test_http_logging_rejects_unknown_endpont_url_key() {
     .expect("typo endpont_url must fail construction");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("endpont_url"), "{err}");
-    assert!(err.contains("did you mean 'endpoint_url'?"), "{err}");
+    assert!(err.contains("did you mean `endpoint_url`?"), "{err}");
 }
 
 #[tokio::test]
