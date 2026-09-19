@@ -450,7 +450,7 @@ fn walk_validate(expr: &MetricTagCelExpr, depth: usize, nodes: &mut usize) -> Re
         MetricTagCelExpr::Attribute { name } => {
             if name.is_int() {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL integer attributes require string()"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL integer attributes require `string()`"
                         .into(),
                 );
             }
@@ -459,7 +459,7 @@ fn walk_validate(expr: &MetricTagCelExpr, depth: usize, nodes: &mut usize) -> Re
         MetricTagCelExpr::StringOfInt { attribute } => {
             if !attribute.is_int() {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL string() requires an integer attribute"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `string()` requires an integer attribute"
                         .into(),
                 );
             }
@@ -472,7 +472,7 @@ fn walk_validate(expr: &MetricTagCelExpr, depth: usize, nodes: &mut usize) -> Re
         } => {
             if attribute.is_int() {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL has() requires a string attribute"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `has()` requires a string attribute"
                         .into(),
                 );
             }
@@ -622,7 +622,7 @@ impl<'a> CelParser<'a> {
         self.skip_whitespace();
         if !self.consume_token(":")? {
             return Err(
-                "Telemetry metrics.overrides[].tagOverrides UPSERT CEL ternary is missing ':'"
+                "Telemetry metrics.overrides[].tagOverrides UPSERT CEL ternary is missing `:`"
                     .into(),
             );
         }
@@ -648,7 +648,7 @@ impl<'a> CelParser<'a> {
             self.skip_whitespace();
             if !self.consume_token(")")? {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL expression has unclosed '('"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL expression has unclosed `(`"
                         .into(),
                 );
             }
@@ -667,7 +667,7 @@ impl<'a> CelParser<'a> {
             self.skip_whitespace();
             if !self.consume_token("(")? {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL string() is malformed"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `string()` is malformed"
                         .into(),
                 );
             }
@@ -675,7 +675,7 @@ impl<'a> CelParser<'a> {
             self.skip_whitespace();
             if !self.consume_token(")")? {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL string() is malformed"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `string()` is malformed"
                         .into(),
                 );
             }
@@ -686,7 +686,7 @@ impl<'a> CelParser<'a> {
             self.skip_whitespace();
             if !self.consume_token("(")? {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL has() is malformed"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `has()` is malformed"
                         .into(),
                 );
             }
@@ -700,7 +700,7 @@ impl<'a> CelParser<'a> {
             self.skip_whitespace();
             if !self.consume_token(")")? {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL has() is malformed"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `has()` is malformed"
                         .into(),
                 );
             }
@@ -878,12 +878,12 @@ fn canonicalize(parsed: ParsedExpr) -> Result<MetricTagCelExpr, String> {
                 Ok(MetricTagCelExpr::StringOfInt { attribute })
             }
             _ => Err(
-                "Telemetry metrics.overrides[].tagOverrides UPSERT CEL string() requires an integer attribute"
+                "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `string()` requires an integer attribute"
                     .into(),
             ),
         },
         ParsedExpr::Has(_) => Err(
-            "Telemetry metrics.overrides[].tagOverrides UPSERT CEL has() is only valid as a ternary condition"
+            "Telemetry metrics.overrides[].tagOverrides UPSERT CEL `has()` is only valid as a ternary condition"
                 .into(),
         ),
         ParsedExpr::Ternary {
@@ -893,7 +893,7 @@ fn canonicalize(parsed: ParsedExpr) -> Result<MetricTagCelExpr, String> {
         } => {
             let ParsedExpr::Has(attribute) = *condition else {
                 return Err(
-                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL ternary conditions only support has(<attribute>)"
+                    "Telemetry metrics.overrides[].tagOverrides UPSERT CEL ternary conditions only support `has(<attribute>)`"
                         .into(),
                 );
             };

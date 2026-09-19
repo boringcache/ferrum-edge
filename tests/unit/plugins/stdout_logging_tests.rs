@@ -470,3 +470,27 @@ fn startup_diagnostics_withhold_expression_scalars_and_unknown_keys() {
         assert!(!rendered.contains("false"), "{rendered}");
     }
 }
+
+#[test]
+fn nested_expression_diagnostics_distinguish_missing_fields_and_integer_types() {
+    for (leaf, expected) in [
+        (json!({"op": "status_code_min"}), "missing field `value`"),
+        (
+            json!({"op": "status_code_min", "value": true}),
+            "expected an unsigned integer between 0 and 65535",
+        ),
+    ] {
+        let error = StdoutLogging::new(&json!({"filter": {"expression": {
+            "op": "and", "left": {"op": "errors_only"},
+            "right": {"op": "or", "left": leaf, "right": {"op": "errors_only"}}
+        }}}))
+        .err()
+        .expect("invalid nested expression must still fail admission");
+        assert!(error.contains(expected), "{error}");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in ["stdout_logging", "filter.expression.right.left", expected] {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        assert!(!rendered.contains("true"), "{rendered}");
+    }
+}

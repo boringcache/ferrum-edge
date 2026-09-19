@@ -1048,7 +1048,7 @@ fn rendered_metric_tag_diagnostics_withhold_names_operations_and_cel_payloads() 
         (
             json!({"name": hostile, "operation": {"type": "set_expr", "cel": hostile}}),
             "`metrics.tag_overrides[0].operation`",
-            "invalid, unsupported, or too complex",
+            "CEL string literal",
         ),
         (
             json!({"name": hostile, "operation": {"type": "set_expr", "expression": {"kind": hostile}}}),
@@ -1087,6 +1087,46 @@ fn rendered_metric_tag_diagnostics_withhold_names_operations_and_cel_payloads() 
                 !rendered.contains(fragment),
                 "disclosed {fragment:?}: {rendered}"
             );
+        }
+    }
+}
+
+#[test]
+fn cel_diagnostics_keep_coercion_length_and_complexity_remedies() {
+    let integer = json!({"op": "attribute", "name": "destination_port"});
+    let mut nested = json!({"op": "literal", "value": "CEL_VALUE_MARKER_5594"});
+    for _ in 0..20 {
+        nested = json!({
+            "op": "has_then_else", "attribute": "request_host",
+            "then_expr": nested, "else_expr": {"op": "literal", "value": "fallback"}
+        });
+    }
+    for (operation, reason) in [
+        (
+            json!({"type": "set_expr", "expression": integer}),
+            "require `string()`",
+        ),
+        (
+            json!({"type": "set_expr", "cel": "CEL_VALUE_MARKER_5594".repeat(30)}),
+            "maximum length of 512 bytes",
+        ),
+        (
+            json!({"type": "set_expr", "expression": nested}),
+            "maximum nesting depth",
+        ),
+    ] {
+        let error = WorkloadMetrics::new(&json!({"metrics": {"tag_overrides": [
+            {"name": "source_workload", "metric": "REQUEST_COUNT", "operation": {"type": "remove"}},
+            {"name": "destination_service", "metric": "REQUEST_COUNT", "operation": operation}
+        ]}}))
+        .err()
+        .expect("invalid CEL operation must still reject");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in ["metrics.tag_overrides[1].operation", reason] {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        for hidden in ["destination_service", "CEL_VALUE_MARKER_5594", "fallback"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
         }
     }
 }

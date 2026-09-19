@@ -3984,6 +3984,25 @@ pub fn load_dtls_certificate(
     load_dtls_certificate_with_key_drop_hook(cert_path, key_path, None)
 }
 
+/// Source/provider payloads and crypto-library errors are deliberately not
+/// retained as causes. PEM admission already supplies safe record diagnostics.
+#[derive(Debug, thiserror::Error)]
+enum DtlsMaterialError {
+    #[error("`{field}`: failed to load DTLS material ({class})")]
+    Source {
+        field: &'static str,
+        class: &'static str,
+    },
+    #[error("`DTLS private key`: invalid signing key (invalid_key)")]
+    InvalidKey,
+    #[error("`DTLS certificate` and `DTLS private key` do not form a valid pair (key_mismatch)")]
+    KeyMismatch,
+    #[error("`DTLS private key`: unsupported_key; dimpl requires ECDSA P-256 or P-384")]
+    UnsupportedKey,
+    #[error("`DTLS certificate`: invalid certificate chain (invalid_chain)")]
+    InvalidChain,
+}
+
 /// Test-only seam that observes Ferrum-managed DTLS key DER after zeroization
 /// and before the backing allocation is released.
 pub(crate) fn load_dtls_certificate_with_key_drop_hook(
@@ -3994,18 +4013,16 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
     let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load DTLS cert {}: {}",
-            cert_source.redacted_source_id(),
-            e
-        )
+        DtlsMaterialError::Source {
+            field: "DTLS certificate",
+            class: e.failure_class(),
+        }
     })?;
     let key_material = load_material_blocking(&key_source, MaterialKind::Key).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load DTLS key {}: {}",
-            key_source.redacted_source_id(),
-            e
-        )
+        DtlsMaterialError::Source {
+            field: "DTLS private key",
+            class: e.failure_class(),
+        }
     })?;
 
     crate::tls::check_cert_expiry_from_pem_bytes(
@@ -4037,24 +4054,13 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     // `clone_key()` into `CertifiedKey::from_der`, which would create another
     // owned DER allocation that ring drops without clearing.
     let borrowed_key = key_der.private_key_der();
-    let signing_key = crate::fips::any_supported_signing_key(&borrowed_key).map_err(|error| {
-        anyhow::anyhow!(
-            "DTLS certificate {} and private key {} do not form a valid pair: {error}",
-            cert_material.display_source_id,
-            key_material.display_source_id
-        )
-    })?;
+    let signing_key = crate::fips::any_supported_signing_key(&borrowed_key)
+        .map_err(|_| DtlsMaterialError::InvalidKey)?;
     let certified_key = rustls::sign::CertifiedKey::new(certificate_chain.clone(), signing_key);
     match certified_key.keys_match() {
         // Preserve rustls `CertifiedKey::from_der` semantics: Unknown is not fatal.
         Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "DTLS certificate {} and private key {} do not form a valid pair: {error}",
-                cert_material.display_source_id,
-                key_material.display_source_id
-            ));
-        }
+        Err(_) => return Err(DtlsMaterialError::KeyMismatch.into()),
     }
 
     // Copy into dimpl's zeroizing owner, then drop the Ferrum DER guard so the
@@ -4069,12 +4075,7 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
         .crypto_provider()
         .key_provider
         .load_private_key(&private_key)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Unsupported DTLS private key in {} (dimpl requires ECDSA P-256 or P-384): {e}",
-                key_material.display_source_id
-            )
-        })?;
+        .map_err(|_| DtlsMaterialError::UnsupportedKey)?;
 
     DtlsCertificateChain::new(
         certificate_chain
@@ -4083,7 +4084,7 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
             .collect(),
         private_key,
     )
-    .map_err(|error| anyhow::anyhow!("Invalid DTLS certificate chain: {error}"))
+    .map_err(|_| DtlsMaterialError::InvalidChain.into())
 }
 
 /// One bounded read of a declared PEM CA source, keeping BOTH the parsed root
@@ -4108,11 +4109,10 @@ pub(crate) struct LoadedPemRootStore {
 pub(crate) fn load_pem_root_store(pem_path: &str) -> Result<LoadedPemRootStore, anyhow::Error> {
     let source = CertSource::parse(pem_path, MaterialKind::CaBundle);
     let material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load PEM source {}: {}",
-            source.redacted_source_id(),
-            e
-        )
+        DtlsMaterialError::Source {
+            field: "DTLS CA bundle",
+            class: e.failure_class(),
+        }
     })?;
     let roots = crate::tls::root_cert_store_from_pem_bundle(
         material.bytes.expose_secret(),

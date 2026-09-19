@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 pub mod authz;
 pub mod bpf_metrics;
+pub(crate) mod diagnostics;
 pub mod ext_authz;
 pub mod outbound_registry;
 pub mod prometheus_helpers;

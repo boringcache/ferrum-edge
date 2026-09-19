@@ -2063,3 +2063,47 @@ async fn ws_logging_successful_retry_does_not_count_batch_discard() {
     drop(plugin);
     let _ = await_within("retry-success server", server).await;
 }
+
+#[test]
+fn wss_source_diagnostics_distinguish_io_invalid_source_and_size() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("MissingSourceMarker5594.pem");
+    let oversized = dir.path().join("OversizedSourceMarker5594.pem");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(ferrum_edge::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES as u64 + 1)
+        .unwrap();
+    for (source, class) in [
+        (missing.to_str().unwrap(), "io"),
+        (
+            "file://SourceUserMarker5594:SourceSecretMarker5594@localhost/private",
+            "invalid_source",
+        ),
+        (oversized.to_str().unwrap(), "oversized"),
+    ] {
+        let error = WsLogging::new(
+            &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+            client_with_ca(source),
+        )
+        .err()
+        .expect("declared invalid CA source must reject construction");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for expected in [
+            "ws_logging",
+            "`FERRUM_TLS_CA_BUNDLE_PATH`",
+            &format!("({class})"),
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        for hidden in [
+            source,
+            "SourceMarker5594",
+            "SourceUserMarker5594",
+            "SourceSecretMarker5594",
+        ] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}

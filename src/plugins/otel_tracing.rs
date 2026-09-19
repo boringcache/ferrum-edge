@@ -1565,43 +1565,61 @@ pub(crate) fn trace_exporters_from_providers(
     let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
     providers
         .iter()
-        .map(|provider| match provider {
-            TracingProvider::Zipkin { url } => Ok(Arc::new(ZipkinTraceExporter::new(
-                url.clone(),
-                options.clone(),
-            )?) as Arc<dyn TraceExporter>),
-            TracingProvider::Datadog { agent_url, service } => {
-                let provider_service = service.clone().unwrap_or_else(|| service_name.clone());
-                Ok(Arc::new(DatadogTraceExporter::new(
-                    agent_url.clone(),
-                    provider_service,
-                    options.clone(),
-                )?) as Arc<dyn TraceExporter>)
-            }
-            TracingProvider::Lightstep {
-                collector_url,
-                access_token_env,
-            } => {
-                let access_token = std::env::var(access_token_env).map_err(|_| {
-                    format!(
-                        "Lightstep `access_token_env` {access_token_env:?} is not set or unreadable"
-                    )
-                })?;
-                Ok(Arc::new(LightstepTraceExporter::new(
-                    collector_url.clone(),
-                    access_token,
-                    options.clone(),
-                )?) as Arc<dyn TraceExporter>)
-            }
-            TracingProvider::OpenTelemetry { endpoint } => Ok(Arc::new(OtlpTraceExporter::new(
-                endpoint.clone(),
-                None,
-                Vec::new(),
-                options.clone(),
-            )?)
-                as Arc<dyn TraceExporter>),
+        .enumerate()
+        .map(|(index, provider)| {
+            trace_exporter_from_provider(provider, &service_name, &options).map_err(|error| {
+                let field = if config.get("tracing_providers").is_some() {
+                    format!("tracing_providers[{index}].config")
+                } else {
+                    "tracing_provider.config".to_string()
+                };
+                format!("`{field}` (provider index {index}): {error}")
+            })
         })
         .collect()
+}
+
+// All errors below are schema-authored; supplied values are Debug-quoted.
+fn trace_exporter_from_provider(
+    provider: &TracingProvider,
+    service_name: &str,
+    options: &TraceExporterOptions,
+) -> Result<Arc<dyn TraceExporter>, String> {
+    match provider {
+        TracingProvider::Zipkin { url } => {
+            let exporter = ZipkinTraceExporter::new(url.clone(), options.clone())
+                .map_err(|error| format!("`url`: {error}"))?;
+            Ok(Arc::new(exporter))
+        }
+        TracingProvider::Datadog { agent_url, service } => {
+            let provider_service = service.clone().unwrap_or_else(|| service_name.to_string());
+            Ok(Arc::new(DatadogTraceExporter::new(
+                agent_url.clone(),
+                provider_service,
+                options.clone(),
+            )?) as Arc<dyn TraceExporter>)
+        }
+        TracingProvider::Lightstep {
+            collector_url,
+            access_token_env,
+        } => {
+            let access_token = std::env::var(access_token_env).map_err(|_| {
+                format!(
+                    "Lightstep `access_token_env` {access_token_env:?} is not set or unreadable"
+                )
+            })?;
+            let exporter =
+                LightstepTraceExporter::new(collector_url.clone(), access_token, options.clone())
+                    .map_err(|error| format!("`collector_url`: {error}"))?;
+            Ok(Arc::new(exporter))
+        }
+        TracingProvider::OpenTelemetry { endpoint } => Ok(Arc::new(OtlpTraceExporter::new(
+            endpoint.clone(),
+            None,
+            Vec::new(),
+            options.clone(),
+        )?) as Arc<dyn TraceExporter>),
+    }
 }
 
 /// Observations from [`probe_trace_batch_materialization_for_test`].
@@ -1747,21 +1765,29 @@ fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
 pub(crate) fn validate_trace_provider_endpoints(
     providers: &[TracingProvider],
 ) -> Result<(), String> {
-    for provider in providers {
-        match provider {
-            TracingProvider::Zipkin { url } => {
-                validate_endpoint_for_provider("Zipkin", url)?;
-            }
-            TracingProvider::Datadog { agent_url, .. } => {
-                let endpoint = datadog_traces_endpoint(agent_url)?;
-                validate_endpoint_for_provider("Datadog", &endpoint)?;
-            }
-            TracingProvider::Lightstep { collector_url, .. } => {
-                validate_endpoint_for_provider("Lightstep", collector_url)?;
-            }
-            TracingProvider::OpenTelemetry { endpoint } => {
-                validate_endpoint_for_provider("OTLP", endpoint)?;
-            }
+    for (index, provider) in providers.iter().enumerate() {
+        validate_trace_provider_endpoint(provider)
+            .map_err(|error| format!("`providers[{index}].config`: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_trace_provider_endpoint(provider: &TracingProvider) -> Result<(), String> {
+    match provider {
+        TracingProvider::Zipkin { url } => {
+            validate_endpoint_for_provider("Zipkin", url)
+                .map_err(|error| format!("`url`: {error}"))?;
+        }
+        TracingProvider::Datadog { agent_url, .. } => {
+            let endpoint = datadog_traces_endpoint(agent_url)?;
+            validate_endpoint_for_provider("Datadog", &endpoint)?;
+        }
+        TracingProvider::Lightstep { collector_url, .. } => {
+            validate_endpoint_for_provider("Lightstep", collector_url)
+                .map_err(|error| format!("`collector_url`: {error}"))?;
+        }
+        TracingProvider::OpenTelemetry { endpoint } => {
+            validate_endpoint_for_provider("OTLP", endpoint)?;
         }
     }
     Ok(())

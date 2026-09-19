@@ -175,9 +175,10 @@ impl OutboundRegistry {
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
-        let parsed = crate::util::deserialization::from_json_value::<
-            JsonObject<OutboundRegistryConfig>,
-        >(config.clone())
+        let parsed = super::diagnostics::from_value::<JsonObject<OutboundRegistryConfig>>(
+            config.clone(),
+            super::diagnostics::Schema::Registry,
+        )
         .map_err(|e| format!("mesh_outbound_registry: {e}"))?
         .0;
         if !(400..=599).contains(&parsed.reject_status) {
