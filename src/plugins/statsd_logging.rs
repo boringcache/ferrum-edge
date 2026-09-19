@@ -133,9 +133,8 @@ fn reject_unknown_config_keys(config: &serde_json::Map<String, Value>) -> Result
     }
     unknown.sort_unstable();
     Err(format!(
-        "statsd_logging: unknown configuration key(s): {}; allowed keys: {}",
-        unknown.join(", "),
-        STATSD_LOGGING_CONFIG_KEYS.join(", ")
+        "statsd_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
+        STATSD_LOGGING_CONFIG_KEYS.join("`, `")
     ))
 }
 

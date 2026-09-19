@@ -1944,3 +1944,33 @@ fn startup_diagnostics_preserve_dtls_dependency_host_context() {
         }
     }
 }
+
+#[test]
+fn startup_diagnostics_name_only_supported_dtls_verification_host() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    for host in [
+        "-DiagnosticHost5594.example.com",
+        "'DiagnosticHost5594.example.com",
+    ] {
+        let config = json!({"host": host, "port": 9514, "dtls": true});
+        validate_plugin_config("udp_logging", &config)
+            .expect("socket-host admission must reach DTLS verification-name validation");
+        let error = UdpLogging::new(&config, test_client())
+            .err()
+            .expect("invalid DTLS verification host must reject construction");
+        assert!(
+            error.contains(&format!("{:?}", host.to_ascii_lowercase())),
+            "{error}"
+        );
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for visible in ["udp_logging", "invalid DTLS server name", "`host`"] {
+            assert!(rendered.contains(visible), "{rendered}");
+        }
+        assert!(!rendered.contains("dtls_server_name"), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("diagnostichost5594"),
+            "{rendered}"
+        );
+    }
+}

@@ -21,6 +21,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 #[derive(Clone, Debug, Default)]
 struct CapturedWsLog {
+    message: Option<String>,
     preview: Option<String>,
     event: Option<String>,
     outcome: Option<String>,
@@ -79,6 +80,7 @@ where
         let mut visitor = WsLogVisitor::default();
         event.record(&mut visitor);
         self.events.lock().unwrap().push(CapturedWsLog {
+            message: visitor.message,
             preview: visitor.preview,
             event: visitor.event,
             outcome: visitor.outcome,
@@ -101,6 +103,7 @@ where
 
 #[derive(Default)]
 struct WsLogVisitor {
+    message: Option<String>,
     preview: Option<String>,
     event: Option<String>,
     outcome: Option<String>,
@@ -142,6 +145,7 @@ impl tracing::field::Visit for WsLogVisitor {
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         match field.name() {
+            "message" => self.message = Some(value.to_string()),
             "preview" => self.preview = Some(value.to_string()),
             "event" => self.event = Some(value.to_string()),
             "outcome" => self.outcome = Some(value.to_string()),
@@ -157,6 +161,7 @@ impl tracing::field::Visit for WsLogVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let rendered = format!("{value:?}").trim_matches('"').to_string();
         match field.name() {
+            "message" => self.message = Some(rendered),
             "preview" => self.preview = Some(rendered),
             "event" => self.event = Some(rendered),
             "outcome" => self.outcome = Some(rendered),
@@ -1086,7 +1091,7 @@ async fn default_empty_config_warns_when_default_gateway_filter_hides_records() 
     );
     assert_eq!(
         construction_events[0].configured_level.as_deref(),
-        Some("info")
+        Some("<redacted scalar>")
     );
 
     log_frame(&plugin, 1, &Message::Text("hello".into())).await;
@@ -1099,6 +1104,33 @@ async fn default_empty_config_warns_when_default_gateway_filter_hides_records() 
         1,
         "healthy info frame/disconnect records must remain filtered at warn"
     );
+}
+
+#[test]
+fn explicit_filtered_level_is_withheld_in_constructor_warning() {
+    let capture = WsLogCapture::default();
+    let _guard = install_filtered_ws_log_capture("warn", &capture);
+    let plugin =
+        WsFrameLogging::new(&json!({"log_level": "debug"})).expect("valid explicit level");
+    assert_eq!(plugin.configured_log_level(), "debug");
+    assert!(plugin.requires_ws_frame_hooks());
+
+    let events = capture.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].configured_level.as_deref(),
+        Some("<redacted scalar>")
+    );
+    let message = events[0].message.as_deref().expect("actionable warning");
+    for visible in [
+        "ws_frame_logging",
+        "filtered",
+        "FERRUM_LOG_LEVEL",
+        "is info",
+    ] {
+        assert!(message.contains(visible), "{message}");
+    }
+    assert!(!message.contains("debug"), "{message}");
 }
 
 #[tokio::test(flavor = "current_thread")]

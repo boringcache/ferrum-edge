@@ -275,7 +275,9 @@ impl SummarySchema {
                     caps.family.label()
                 ));
             }
-            Some(Value::String(s)) => SummaryType::parse(s)?,
+            Some(Value::String(s)) => {
+                SummaryType::parse(s).map_err(|error| format!("{plugin_name}: {error}"))?
+            }
             None => SummaryType::default(),
             Some(_) => {
                 return Err(format!(
@@ -362,7 +364,9 @@ impl SummarySchema {
                     caps.family.label()
                 ));
             }
-            Some(Value::String(s)) => TimestampFormat::parse(s)?,
+            Some(Value::String(s)) => {
+                TimestampFormat::parse(s).map_err(|error| format!("{plugin_name}: {error}"))?
+            }
             None => TimestampFormat::default(),
             Some(_) => {
                 return Err(format!(
@@ -829,7 +833,9 @@ fn parse_derived_fields(
         let kind_str = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
             format!("{plugin_name}: schema `derived_fields[{index}]` entry {name:?} missing `kind`")
         })?;
-        let kind = DerivedKind::parse(kind_str)?;
+        let kind = DerivedKind::parse(kind_str).map_err(|error| {
+            format!("{plugin_name}: schema `derived_fields[{index}].kind`: {error}")
+        })?;
         if is_sensitive_metadata_key(name) {
             return Err(format!(
                 "{plugin_name}: schema `derived_fields` name {name:?} matches a sensitive-data substring and would always be redacted; pick a different name"

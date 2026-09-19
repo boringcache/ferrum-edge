@@ -418,7 +418,8 @@ fn build_tls_connector(
                 "TCP logging CA bundle",
                 &ca_material.display_source_id,
             )
-            .map_err(|_| "TCP logging: invalid CA bundle".to_string())
+            // The shared parser returns safe classifications and record ordinals.
+            .map_err(|error| format!("TCP logging: `FERRUM_TLS_CA_BUNDLE_PATH`: {error}"))
         })
         .transpose()?;
 

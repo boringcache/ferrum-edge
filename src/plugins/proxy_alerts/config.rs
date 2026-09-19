@@ -329,13 +329,14 @@ impl ProxyAlertsConfig {
             let rule_enabled = match raw_rule.get("enabled") {
                 None => true,
                 Some(v) => v.as_bool().ok_or_else(|| {
-                    format!("proxy_alerts: rules[{idx}].enabled must be a boolean")
+                    format!("proxy_alerts: `rules[{idx}]`: `enabled` must be a boolean")
                 })?,
             };
             if !rule_enabled {
                 continue;
             }
             let rule_id = idx as u32;
+            // Keep the schema ordinal on every nested semantic failure.
             let rule = parse_rule(
                 rule_id,
                 raw_rule,
@@ -347,11 +348,12 @@ impl ProxyAlertsConfig {
                     resolved_window_seconds: default_resolved_window_seconds,
                     min_request_count: default_min_request_count,
                 },
-            )?;
+            )
+            .map_err(|error| format!("proxy_alerts: `rules[{idx}]`: {error}"))?;
             let name = rule.common().name.to_string();
             if !seen_rule_names.insert(name.clone()) {
                 return Err(format!(
-                    "proxy_alerts: duplicate rule name {name:?} (rule names must be unique)"
+                    "proxy_alerts: `rules[{idx}]`: duplicate rule name {name:?} (rule names must be unique)"
                 ));
             }
             rules.push(rule);
