@@ -118,6 +118,15 @@ paths:
   document deserializer is unchanged by this scoped adapter.
   Workload exporters retain safe option bounds and provider endpoint ordinals;
   CEL failures retain fixed coercion, length, nesting and syntax remedies.
+- The #5594 security conversion covers authentication/authorization, IP/GeoIP,
+  JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
+  admission. Fixed schema paths and credential/operation ordinals survive
+  rendering while supplied credentials, keys, identities, paths, patterns and
+  parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor and
+  request/stream deny logs sanitize configured paths at emission. Fixed OIDC
+  cookie separator examples spell out double quote so the full reason survives.
+  Registered rendered/captured regressions and existing rejection/reload-retention
+  assertions cover these boundaries.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength

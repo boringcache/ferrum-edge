@@ -22,6 +22,7 @@
 #   --wallclock-budget-seconds N (per invocation, default 4200)
 #   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
+#   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -76,6 +77,8 @@ HOST_ID=""
 EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
+H1_PROFILE=""
+UDP_PROFILE=""
 H2_GUARD_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
@@ -93,6 +96,8 @@ while [[ $# -gt 0 ]]; do
         --adaptive) ADAPTIVE=true; shift ;;
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
+        --h1-profile) H1_PROFILE="$2"; shift 2 ;;
+        --udp-profile) UDP_PROFILE="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -108,7 +113,7 @@ if [[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]; then
     exit 2
 fi
 
-if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]]; then
+if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]] && ! { [ "$H1_PROFILE" = diagnostic ] && [ "$PAIRS" = 1 ]; }; then
     echo "--pairs must be an EVEN integer from 2 through 12 for exact position balance" >&2
     exit 2
 fi
@@ -121,6 +126,32 @@ if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
 fi
 if [ "$PROCESS_USAGE" != true ]; then
     echo "[warn] process_usage unavailable; samples are diagnostic and invalid for paired comparisons" >&2
+fi
+
+# Separate manual H1 lane: never selects or rewrites the active H2 manifest.
+if [ -n "$H1_PROFILE" ]; then
+    python3 "$SCRIPT_DIR/h1_internal_profile.py" validate-selection \
+        "$H1_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
+        "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
+    [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+fi
+
+# Dedicated UDP campaign; never selects or rewrites H1/H2/H3 manifests.
+if [ -n "$UDP_PROFILE" ]; then
+    [ -z "$H1_PROFILE" ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+    python3 "$SCRIPT_DIR/udp_internal_profile.py" validate-selection \
+        "$UDP_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
+        "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
+fi
+
+if [ "$H1_PROFILE" = diagnostic ] && [ -z "${H1_DIAGNOSTIC_WORK_DEADLINE:-}" ]; then
+    # Independent parent owns startup, reader waits, docker and cleanup under
+    # one deadline. Re-entry uses a literal, fixed-workload child script.
+    exec python3 "$SCRIPT_DIR/h1_diagnostic_campaign.py" \
+        --output-dir "$OUTPUT_DIR" --budget "$WALLCLOCK_BUDGET"
+fi
+if [ "$H1_PROFILE" = diagnostic ]; then
+    [ "$PPID" = "${H1_DIAGNOSTIC_SUPERVISOR_PID:-}" ] || exit 2
 fi
 
 # UDP protocols are fixed to 1 KB regardless of caller.
@@ -274,7 +305,11 @@ cleanup() {
         lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     done
 }
-trap cleanup EXIT
+if [ "$H1_PROFILE" != diagnostic ]; then
+    trap cleanup EXIT
+fi
+# Diagnostic cleanup is unconditional in the independent supervisor. In
+# particular it does not inherit cleanup()'s unbounded waits or port-wide kill.
 
 # ── Build ────────────────────────────────────────────────────────────────────
 build_binaries() {
@@ -297,6 +332,11 @@ build_binaries() {
 # ── Backend ──────────────────────────────────────────────────────────────────
 start_backend() {
     echo "[backend] starting proto_backend..."
+    local backend_log="$SCRIPT_DIR/backend.log"
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        backend_log="$OUTPUT_DIR/diagnostics/${gw}_backend.raw.log"
+    fi
     # proto_backend writes self-signed certs to ./certs relative to its CWD
     # (see tests/performance/multi_protocol/proto_backend.rs — uses
     # std::env::current_dir().join("certs")). We must cd into $SCRIPT_DIR so
@@ -309,7 +349,7 @@ start_backend() {
     saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
     BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
-        ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
+        ./target/release/proto_backend > "$backend_log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
@@ -326,7 +366,7 @@ start_backend() {
         sleep 0.5
     done
     echo "[backend] failed to start" >&2
-    tail -30 "$SCRIPT_DIR/backend.log" >&2
+    tail -30 "$backend_log" >&2
     exit 1
 }
 
@@ -356,6 +396,7 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    local response_cutoff=0
     case "$PROTOCOL" in
         http3)
             extra_env+=(
@@ -370,6 +411,23 @@ start_ferrum() {
         for pair in $FERRUM_EXTRA_ENV; do
             extra_env+=(-e "$pair")
         done
+    fi
+    if [ -n "$H1_PROFILE" ]; then
+        extra_env+=(-e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1
+                    -e FERRUM_ADMIN_HTTP_PORT=9000
+                    -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
+        if [ "$gw" = ferrum-exp-cutoff-one ]; then
+            response_cutoff=1
+        fi
+    fi
+    if [ -n "$UDP_PROFILE" ]; then
+        extra_env+=(-e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1
+                    -e FERRUM_ADMIN_HTTP_PORT=9000
+                    -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
+    fi
+
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        extra_env+=(--name "$H1_DIAGNOSTIC_CONTAINER_PREFIX-$gw")
     fi
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
@@ -388,7 +446,7 @@ start_ferrum() {
         -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0" \
-        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0" \
+        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=$response_cutoff" \
         -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
@@ -413,6 +471,21 @@ start_ferrum() {
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/experiment_arms.py" verify-runtime \
                 "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw" "$root_output/manifest.json" || return 2
+    fi
+    if [ -n "$H1_PROFILE" ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
+                "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
+    fi
+    if [ -n "$UDP_PROFILE" ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/udp_internal_profile.py" runtime \
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
     fi
     wait_for_gateway
 }
@@ -566,7 +639,17 @@ start_kong() {
         -v "$CERT_DIR:/certs:ro" \
         "$KONG_IMAGE")
 
-    wait_for_gateway
+    if [ "$UDP_PROFILE" = profile ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$cfg_dst" "$OUTPUT_DIR/diagnostics/kong_config.yaml"
+    fi
+    wait_for_gateway || return 1
+    if [ "$UDP_PROFILE" = profile ]; then
+        # Capture the actual ready fixture before any measured traffic. Readback
+        # failures remain in the ledger; this never changes Kong/traffic policy.
+        bash "$SCRIPT_DIR/kong_udp_readback.sh" "$GATEWAY_CID" "$KONG_IMAGE" \
+            "$OUTPUT_DIR/diagnostics/kong-readback" || return 1
+    fi
 }
 
 kong_config_name() {
@@ -815,6 +898,9 @@ run_bench() {
             extra_args+=(--ca-cert "$CERT_DIR/ca.pem")
         fi
     fi
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        extra_args+=(--h1-diagnostic)
+    fi
     local effective_concurrency
     effective_concurrency=$(scale_concurrency_for_payload "$payload" "$CONCURRENCY")
 
@@ -842,6 +928,13 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
+    if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
+        sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
+                      --h1-container-id "$GATEWAY_CID")
+    fi
+    if [ -n "$UDP_PROFILE" ] && [ "$gateway" = ferrum ]; then
+        sampler_args+=(--udp-profile)
+    fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
     fi
@@ -857,10 +950,22 @@ run_bench() {
         if sudo -n true 2>/dev/null; then
             sampler_stop_file="$usage.stop"
             rm -f "$sampler_stop_file"
-            sudo -n python3 "$SCRIPT_DIR/process_usage.py" \
-                --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
-                --output "$usage" --interval 0.5 --parent-pid "$$" \
-                --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            if [ "$H1_PROFILE" = diagnostic ]; then
+                # The privileged reader also self-terminates even if sudo
+                # changes process groups or the runner is forcibly killed.
+                local reader_bound
+                reader_bound=$(python3 -c 'import os,time; print(max(0.001, float(os.environ["H1_DIAGNOSTIC_WORK_DEADLINE"])-time.monotonic()-1))')
+                sudo -n timeout --signal=TERM --kill-after=1s "${reader_bound}s" \
+                    python3 "$SCRIPT_DIR/process_usage.py" \
+                    --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                    --output "$usage" --interval 0.5 --parent-pid "$$" \
+                    --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            else
+                sudo -n python3 "$SCRIPT_DIR/process_usage.py" \
+                    --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                    --output "$usage" --interval 0.5 --parent-pid "$$" \
+                    --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            fi
             sampler_pid=$!
         else
             sampler_stop_file=""
@@ -888,7 +993,18 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
-    if [ -n "$TIMEOUT_CMD" ]; then
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        # Write directly to retained raw stdout so campaign termination during
+        # the client/readers/logging cannot lose the original partial output.
+        timeout "${bench_wallclock}s" \
+            "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
+            --target "$bench_target" --duration "$DURATION" \
+            --concurrency "$effective_concurrency" --payload-size "$payload" \
+            --json "${extra_args[@]}" > "$diagnostics/${gateway}_${payload}_client.raw.json" \
+            2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" || rc=$?
+        printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
+        cp "$diagnostics/${gateway}_${payload}_client.raw.json" "$out"
+    elif [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "${bench_wallclock}s" \
             "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
             --target "$bench_target" \
@@ -922,7 +1038,11 @@ run_bench() {
     mkdir -p "$diagnostics"
     # `set -e` is on: a best-effort capture must never abort the matrix that
     # the capture exists to diagnose.
-    cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        cp "$diagnostics/${gateway}_backend.raw.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
+    else
+        cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
+    fi
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
@@ -960,7 +1080,7 @@ run_bench() {
 
     # Surface proto_bench stderr (error detail lines) if non-empty.
     local err_file="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"
-    if [ -s "$err_file" ]; then
+    if [ -s "$err_file" ] && [ "$H1_PROFILE" != diagnostic ]; then
         local err_lines
         err_lines=$(wc -l < "$err_file")
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
@@ -988,7 +1108,10 @@ main() {
     if [ "$H3_BUDGET" -ne 0 ] && [[ " $expected_gateways " == *" envoy "* ]]; then
         expected_gateways+=" envoy-limit-4"
     fi
-    if [ -f "$EXPERIMENT_MANIFEST" ]; then
+    if [ "$H1_PROFILE" = cutoff ] || [ "$H1_PROFILE" = diagnostic ]; then
+        expected_gateways+=" ferrum-exp-cutoff-one"
+    fi
+    if [ -z "$H1_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
         EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
             "$EXPERIMENT_MANIFEST" "$PROTOCOL")
         if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
@@ -1027,25 +1150,42 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
+    local h1_revision=""
+    if [ -n "$H1_PROFILE" ]; then
+        h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
+    fi
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
                "payload_sizes": [int(size) for size in sys.argv[3].split()],
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
                "h2_observation_enabled": sys.argv[6] == "1",
+               **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
+               **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
+                   "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
+                   "h1_revision": sys.argv[11]}
+                  if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
         cp "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}" "$root_output/h3_experiment.json"
     fi
 
+    if [ -n "$H1_PROFILE" ]; then
+        cp "$SCRIPT_DIR/h1_profile_manifest.json" "$root_output/h1_profile_manifest.json"
+        cp "$SCRIPT_DIR/h1_profile_schema.json" "$root_output/h1_profile_schema.json"
+    fi
+    if [ -n "$UDP_PROFILE" ]; then
+        cp "$SCRIPT_DIR/udp_profile_manifest.json" "$root_output/udp_profile_manifest.json"
+        cp "$SCRIPT_DIR/udp_profile_schema.json" "$root_output/udp_profile_schema.json"
+    fi
     build_binaries
     # Save immutable image IDs as well as operator-supplied tags for revision A/B.
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
-    if [ "$H2_OBSERVE" -eq 1 ]; then
+    if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ] || [ -n "$UDP_PROFILE" ]; then
         if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
             local source_identity
             source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
@@ -1056,10 +1196,18 @@ PYEOF
         fi
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
+        if [ -n "$BASELINE_IMAGE" ]; then
+            BASELINE_IMAGE=$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')
+        fi
     fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"
+    fi
+    if [ "$UDP_PROFILE" = profile ]; then
+        # Preserve tag and immutable image evidence; no vendor correspondence inferred.
+        docker image inspect "$KONG_IMAGE" > "$root_output/kong-image.json"
+        KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')
     fi
     local requested_pairs="$PAIRS"
     local final_pairs="$PAIRS"
@@ -1119,6 +1267,10 @@ PYEOF
             done
         done
         OUTPUT_DIR="$root_output"
+        if [ "$H1_PROFILE" = diagnostic ]; then
+            # One pass only: never pair, extend, rerun, or promote a comparison.
+            break
+        fi
         local decision
         decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" summarize "$OUTPUT_DIR" \
             "$PROTOCOL" "$expected_gateways" "$PAYLOAD_SIZES" "$final_pairs")
@@ -1162,6 +1314,8 @@ plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
 with open(path, "w") as f:
     json.dump(plan, f, indent=2)
 PYEOF
+    # The diagnostic supervisor reports only AFTER bounded cleanup and records
+    # truthful termination status even if this runner never reaches this point.
     echo "[main] done. results in $OUTPUT_DIR"
 }
 

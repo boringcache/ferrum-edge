@@ -667,7 +667,7 @@ fn file_mode_config_requires_generated_operations_table() {
     .err()
     .expect("operations is required for direct/file-mode config");
     assert!(
-        err.contains("'operations' is required"),
+        err.contains("`operations` is required"),
         "expected operations requirement error, got: {err}"
     );
 }
@@ -4454,7 +4454,7 @@ fn encoding_wrapper_is_explicit_and_strict() {
         .err()
         .expect("ambiguous or malformed encoding wrapper must fail admission");
         assert!(
-            error.contains("media type object") || error.contains("encoding must be an object"),
+            error.contains("media type object") || error.contains("`encoding` must be an object"),
             "unexpected strict-wrapper error: {error}"
         );
     }
@@ -7602,7 +7602,7 @@ fn explicit_null_fixed_fields_are_rejected_instead_of_selecting_defaults() {
         }]
     }));
     assert!(
-        error.contains("contentType must be a string"),
+        error.contains("contentType` must be a string"),
         "explicit null Encoding Object fields must fail type admission: {error}"
     );
 }
@@ -9869,4 +9869,292 @@ async fn deeply_nested_xml_multipart_part_is_rejected() {
         "multipart XML part must be refused by the depth bound, got {:?}",
         request_error(&ctx)
     );
+}
+
+fn unknown_key_diagnostic_config() -> Value {
+    json!({
+        "bypass": {},
+        "error_response": {},
+        "operations": [
+            {
+                "method": "GET",
+                "path_template": "/first",
+                "path_regex": "^/first$",
+                "responses": {"200": {"application/json": {"type": "object"}}}
+            },
+            {
+                "method": "POST",
+                "path_template": "/CALLER_PATH_CANARY",
+                "path_regex": "^/CALLER_PATH_CANARY$",
+                "operation_label": "'CALLER_OPERATION_CANARY\"`\n\\payload",
+                "request_body": {
+                    "content": {"application/x-caller-media-canary": {"type": "object"}}
+                },
+                "responses": {
+                    "418": {
+                        "description": "CALLER_DESCRIPTION_CANARY",
+                        "content": {"application/x-caller-media-canary": {"type": "object"}}
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn insert_unknown_diagnostic_keys(value: &mut Value, typo: &str) {
+    let canary = "'CALLER_QUOTED_CANARY\"`\n\\payload";
+    let object = value.as_object_mut().unwrap();
+    object.insert(
+        typo.to_string(),
+        json!({"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]}),
+    );
+    object.insert(
+        "CALLER_KEY_CANARY".to_string(),
+        json!("CALLER_VALUE_CANARY"),
+    );
+    object.insert(
+        "975318642".to_string(),
+        json!(["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}]),
+    );
+    object.insert(canary.to_string(), json!(canary));
+}
+
+fn assert_unknown_key_context(config: Value, paths: &[&str], typo: &str, suggestion: &str) {
+    let error = config_error(config);
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in [
+        "openapi_validator:".to_string(),
+        "unknown configuration key(s)".to_string(),
+        format!("did you mean `{suggestion}`?"),
+    ] {
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected:?}: {rendered}"
+        );
+    }
+    for path in paths {
+        assert!(
+            rendered.contains(&format!("`{path}`")),
+            "missing schema path {path:?}: {rendered}"
+        );
+    }
+    for supplied in [
+        typo,
+        "CALLER_",
+        "caller-",
+        "8675309",
+        "975318642",
+        "864209753",
+        "418",
+        "payload",
+        "multipart/form-data",
+    ] {
+        assert!(
+            !rendered.contains(supplied),
+            "leaked {supplied:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn unknown_key_diagnostics_preserve_fixed_paths_and_second_operation() {
+    for (pointer, path, typo, suggestion) in [
+        ("", "config", "validate_requset", "validate_request"),
+        ("/bypass", "config.bypass", "pahts", "paths"),
+        (
+            "/error_response",
+            "config.error_response",
+            "request_status_coed",
+            "request_status_code",
+        ),
+        ("/operations/1", "config.operations[1]", "mehtod", "method"),
+        (
+            "/operations/1/responses/418",
+            "config.operations[1].responses",
+            "contnet",
+            "content",
+        ),
+    ] {
+        let mut config = unknown_key_diagnostic_config();
+        let object = config.pointer_mut(pointer).unwrap();
+        if pointer == "/operations/1" {
+            object.as_object_mut().unwrap().remove("method");
+        }
+        insert_unknown_diagnostic_keys(object, typo);
+        assert_unknown_key_context(config, &[path], typo, suggestion);
+    }
+}
+
+#[test]
+fn unknown_request_body_keys_preserve_second_operation_in_both_forms() {
+    for (body, typo, suggestion) in [
+        (
+            json!({"content_type": "application/x-caller-media-canary"}),
+            "scheam",
+            "schema",
+        ),
+        (json!({}), "contnet", "content"),
+    ] {
+        let mut config = unknown_key_diagnostic_config();
+        config["operations"][1]["request_body"] = body;
+        // The required schema/content is absent; its typo carries an object.
+        insert_unknown_diagnostic_keys(&mut config["operations"][1]["request_body"], typo);
+        assert_unknown_key_context(
+            config,
+            &["config.operations[1].request_body"],
+            typo,
+            suggestion,
+        );
+    }
+}
+
+#[test]
+fn unknown_encoding_keys_preserve_header_context_without_document_map_keys() {
+    // Properties allow arbitrary strings. Headers and media types must remain
+    // syntactically valid so their earlier shape checks reach unknown-key admission.
+    for (property, header, media) in [
+        (
+            "CALLER_PROPERTY_CANARY",
+            "X-Caller-Header-Canary",
+            "application/x-caller-media-canary",
+        ),
+        ("975318642", "864209753", "application/975318642"),
+        (
+            "'CALLER_PROPERTY_CANARY\"`\n\\payload",
+            "'x-caller-`header",
+            "application/x-caller-media-canary",
+        ),
+    ] {
+        for inline in [false, true] {
+            for target in ["schema_header", "content_header", "content_media"] {
+                let mut header_object = if target == "schema_header" {
+                    json!({"schema": {"type": "string"}})
+                } else {
+                    json!({"content": {(media): {"schema": {"type": "string"}}}})
+                };
+                let (path, typo, suggestion) = if target == "content_media" {
+                    insert_unknown_diagnostic_keys(&mut header_object["content"][media], "scheam");
+                    ("encoding.headers.content", "scheam", "schema")
+                } else {
+                    insert_unknown_diagnostic_keys(&mut header_object, "requried");
+                    ("encoding.headers", "requried", "required")
+                };
+                // A valid root/property schema must compile before encoding is parsed.
+                let schema = json!({
+                    "type": "object",
+                    "properties": {(property): {"type": "string"}}
+                });
+                let encoding = json!({(property): {"headers": {(header): header_object}}});
+                let body = if inline {
+                    json!({
+                        "content_type": "multipart/form-data",
+                        "schema": schema,
+                        "encoding": encoding
+                    })
+                } else {
+                    json!({"content": {"multipart/form-data": {
+                        "schema": schema,
+                        "encoding": encoding
+                    }}})
+                };
+                let mut config = unknown_key_diagnostic_config();
+                config["operations"][1]["request_body"] = body;
+                assert_unknown_key_context(
+                    config,
+                    &["operations[1].request_body", path],
+                    typo,
+                    suggestion,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let header = "'security-diagnostic-canary";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": format!("{canary}[")
+            }]}),
+            &["`operations[0].path_regex`", "invalid or too complex"],
+        ),
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": "/",
+                "responses": {(canary): {}}
+            }]}),
+            &["`operations[0].responses`", "invalid status"],
+        ),
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": "/",
+                "request_body": {
+                    "content_type": "application/x-www-form-urlencoded",
+                    "schema": {"type": "object", "properties": {(header): {"type": "string"}}},
+                    "encoding": {(header): {"style": canary}}
+                }
+            }]}),
+            &[
+                "`operations[0].request_body`",
+                "encoding[",
+                "style`",
+                "unsupported for request bodies",
+            ],
+        ),
+        (
+            json!({"operations": [{
+                "method": "POST",
+                "path_template": "/",
+                "path_regex": "/",
+                "request_body": {
+                    "content_type": "multipart/form-data",
+                    "schema": {"type": "object", "properties": {"payload": {"type": "string"}}},
+                    "encoding": {"payload": {"headers": {
+                        (header): {"content": {(header): {"schema": {"type": "string"}}}}
+                    }}}
+                }
+            }]}),
+            &[
+                "`operations[0].request_body`",
+                "encoding[",
+                "headers[",
+                "content[",
+                "must be a concrete media type",
+            ],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("openapi_validator", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }
