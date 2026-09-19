@@ -1502,6 +1502,23 @@ impl ProxyBody {
     }
 }
 
+impl ProxyBody {
+    fn poll_kind(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, ProxyBodyError>>> {
+        use http_body::Body as _;
+
+        match &mut self.kind {
+            ProxyBodyKind::Full(body) => Pin::new(body)
+                .poll_frame(cx)
+                .map(|opt| opt.map(|result| result.map_err(|never| match never {}))),
+            ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
+            ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+}
+
 impl http_body::Body for ProxyBody {
     type Data = Bytes;
     type Error = ProxyBodyError;
@@ -1520,13 +1537,14 @@ impl http_body::Body for ProxyBody {
         // the final poll on the same hyper task, so ordering is guaranteed
         // by the send/await chain even without Acquire/Release.
         this.polled.store(true, Ordering::Relaxed);
-        let result = match &mut this.kind {
-            ProxyBodyKind::Full(body) => Pin::new(body)
-                .poll_frame(cx)
-                .map(|opt| opt.map(|result| result.map_err(|never| match never {}))),
-            ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
-            ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
-        };
+        #[cfg(feature = "bench-h1-profile")]
+        let result = crate::h1_profile::in_scope(crate::h1_profile::Scope::BodyOutput, || {
+            this.poll_kind(cx)
+        });
+        #[cfg(not(feature = "bench-h1-profile"))]
+        let result = this.poll_kind(cx);
+        #[cfg(feature = "bench-h1-profile")]
+        crate::h1_profile::body_poll(2, &result);
         // The authorization-lifetime wrapper is classified exactly like the
         // client-chosen gRPC deadline: health-neutral for backend accounting
         // (the backend did nothing wrong) and terminal for this body.
@@ -3792,19 +3810,41 @@ impl CoalesceBuffer {
     /// pair needs, when that is larger.
     fn push(&mut self, data: Bytes, capacity: usize, spare: &mut Option<BytesMut>) {
         match std::mem::replace(self, Self::Empty) {
-            Self::Empty => *self = Self::Single(data),
+            Self::Empty => {
+                #[cfg(feature = "bench-h1-profile")]
+                crate::h1_profile::count(crate::h1_profile::schema::SINGLE_HOLD, 1);
+                *self = Self::Single(data);
+            }
             Self::Single(first) => {
                 let needed = first.len().saturating_add(data.len());
                 let mut merged = match spare.take() {
-                    Some(region) if region.capacity() >= needed => region,
-                    _ => BytesMut::with_capacity(capacity.max(needed)),
+                    Some(region) if region.capacity() >= needed => {
+                        #[cfg(feature = "bench-h1-profile")]
+                        crate::h1_profile::count(crate::h1_profile::schema::SPARE_REUSE, 1);
+                        region
+                    }
+                    _ => {
+                        #[cfg(feature = "bench-h1-profile")]
+                        crate::h1_profile::count(crate::h1_profile::schema::NEW_REGION, 1);
+                        BytesMut::with_capacity(capacity.max(needed))
+                    }
                 };
                 merged.extend_from_slice(&first);
+                #[cfg(feature = "bench-h1-profile")]
+                crate::h1_profile::count(crate::h1_profile::schema::COPY_PROMOTE, first.len());
                 merged.extend_from_slice(&data);
+                #[cfg(feature = "bench-h1-profile")]
+                crate::h1_profile::count(crate::h1_profile::schema::COPY_PROMOTE, data.len());
                 *self = Self::Merged(merged);
             }
             Self::Merged(mut merged) => {
+                #[cfg(feature = "bench-h1-profile")]
+                if merged.capacity().saturating_sub(merged.len()) < data.len() {
+                    crate::h1_profile::count(crate::h1_profile::schema::GROWTH, 1);
+                }
                 merged.extend_from_slice(&data);
+                #[cfg(feature = "bench-h1-profile")]
+                crate::h1_profile::count(crate::h1_profile::schema::COPY_MERGE, data.len());
                 *self = Self::Merged(merged);
             }
         }
@@ -3924,6 +3964,10 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn flush_buffer(&mut self) -> Option<Frame<Bytes>> {
+        #[cfg(feature = "bench-h1-profile")]
+        if !self.buffer.is_empty() {
+            crate::h1_profile::count(crate::h1_profile::schema::FLUSH, 1);
+        }
         self.flush_timer_armed = false;
         match std::mem::replace(&mut self.buffer, CoalesceBuffer::Empty) {
             CoalesceBuffer::Empty => None,
@@ -4028,6 +4072,8 @@ impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
                                 // Large-frame bypass: hand the backend's own
                                 // storage downstream without ever allocating
                                 // an aggregation buffer.
+                                #[cfg(feature = "bench-h1-profile")]
+                                crate::h1_profile::count(crate::h1_profile::schema::BYPASS, 1);
                                 return Poll::Ready(Some(Ok(Frame::data(data))));
                             }
 
@@ -4801,6 +4847,8 @@ pub(crate) fn coalescing_body(
     let stream = response
         .bytes_stream()
         .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    #[cfg(feature = "bench-h1-profile")]
+    let stream = crate::h1_profile::ObservedStream::new(stream, 1);
     let body = Coalescing::new(
         ReqwestFrameSource { inner: stream },
         COALESCE_TARGET,
@@ -4819,6 +4867,8 @@ pub(crate) fn direct_streaming_body(
     let stream = response
         .bytes_stream()
         .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    #[cfg(feature = "bench-h1-profile")]
+    let stream = crate::h1_profile::ObservedStream::new(stream, 0);
     let body = DirectStreamBody {
         inner: stream,
         content_length,
