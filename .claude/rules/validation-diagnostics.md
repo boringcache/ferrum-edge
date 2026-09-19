@@ -60,14 +60,16 @@ paths:
   federation/remote clusters, probe/injector names, node-agent addresses/paths,
   and revision identities; capture boolean/port/mark/UID/CIDR parsing and
   annotation overrides; shared unknown-key suggestions, rate-window/request/frame
-  bounds, and socket-host/egress errors. Shared helper context that may contain
-  document keys is Debug-escaped as a whole; callers must supply a separate fixed
-  schema field when one is available. HTTP rate-rule ordinals and GraphQL rate
-  collection names stay in a separate schema-authored prefix; supplied operation
-  keys stay in the opaque label. WAF rule/signature ordinals and API-spec
-  extension request/response/bypass paths preserve this separate fixed context;
-  supplied override IDs and extension keys never enter the visible prefix.
-  SQL literals, fixed migration/listener/fault labels,
+  bounds, socket-host/egress errors, and notification channel/SMTP/template
+  admission. Notification unknown-key failures retain the fixed `channels`
+  schema context separately from supplied channel names and keys. Shared helper
+  context that may contain document keys is Debug-escaped as a whole; callers
+  must supply a separate fixed schema field when one is available. HTTP rate-rule
+  ordinals and GraphQL rate collection names stay in a separate schema-authored
+  prefix; supplied operation keys stay in the opaque label. WAF rule/signature
+  ordinals and API-spec extension request/response/bypass paths preserve this
+  separate fixed context; supplied override IDs and extension keys never enter
+  the visible prefix. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
@@ -101,7 +103,7 @@ paths:
   generated shell commands also use quoted interpolation. Capture parsing has
   rendered-output and captured-log regressions. The guard scans every Rust file
   in its roots, plus the converted shared unknown-key, rate-limit, and socket-host
-  helpers, including multiline/nested macros
+  helpers and notifications, including multiline/nested macros
   and raw strings, for single-quoted interpolation in diagnostic macros and for
   named error/message captures in `warn!`/`error!` without a sanitizer call in
   that statement. Its exact, commented exception list contains SQL query syntax,
