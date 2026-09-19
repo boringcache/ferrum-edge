@@ -268,7 +268,7 @@ fn capture_cache_diagnostics<T>(operation: impl FnOnce() -> T) -> (T, Vec<serde_
 }
 
 fn assert_cache_diagnostic_withholds_values(message: &str) {
-    for withheld in ["UNREGISTERED_CACHE5594", "918273641", "true"] {
+    for withheld in ["UNREGISTERED_CACHE5594", "918273641", "true", "max_bytez"] {
         assert!(!message.contains(withheld), "{message}");
     }
 }
@@ -304,6 +304,43 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
             None,
             vec!["filter.errors_only", "must be a boolean"],
             true,
+        ),
+        (
+            "stdout_logging",
+            json!({"filter": {(DIAGNOSTIC_VALUE): true}}),
+            None,
+            vec!["unknown configuration key(s)", "`stdout_logging.filter`"],
+            true,
+        ),
+        (
+            "stdout_logging",
+            json!({"filter": {"status_code_max": 918273641}}),
+            None,
+            vec!["`filter.status_code_max`", "must be between 0 and 65535"],
+            true,
+        ),
+        (
+            "request_size_limiting",
+            json!({(DIAGNOSTIC_VALUE): true, "max_bytez": 918273641}),
+            None,
+            vec![
+                "config validation failed",
+                "request_size_limiting: `config`",
+                "unknown configuration key(s)",
+                "did you mean `max_bytes`?",
+            ],
+            false,
+        ),
+        (
+            "request_termination",
+            json!({"status_code": 918273641}),
+            None,
+            vec![
+                "config validation failed",
+                "`status_code`",
+                "must be a final response from 200 to 599",
+            ],
+            false,
         ),
         (
             "stdout_logging",

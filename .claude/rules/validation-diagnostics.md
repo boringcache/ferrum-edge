@@ -46,8 +46,14 @@ paths:
   field/index and a fixed rejection reason.
 - Plugin cache construction/composition, optional omission, startup and reload
   emissions quote supplied identities/priorities and sanitize before tracing.
-  Captured-log regressions cover global, proxy and proxy-group rejection paths;
-  constructor causes still depend on the producer convention above.
+  The registered `plugin_cache_tests` captured-log matrix exercises final
+  constructor, startup, full-rebuild and delta emissions for global, proxy and
+  proxy-group scopes, including hostile identities/unknown keys, fixed spelling
+  suggestions, numeric bounds and optional omission. It checks event counts,
+  levels, retained schema/reasons and rejected-reload snapshot identity with
+  scoped subscribers and no environment mutation. Returned constructor causes
+  still depend on the producer convention above; sanitize copies at emission,
+  retaining the original causes for the eventual rendering boundary.
 - Known converted sites: mesh config validators (services/cluster IPs, workload
   identities, hosts, policy/targetRefs names, CIDRs, ext-authz and JWT headers,
   trust bundles, remote clusters/gateways); CORS origin/method/header checks;
@@ -143,8 +149,9 @@ paths:
 - Scope of #5591: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
   `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, `src/capture`, and
   `src/plugins/waf`.
-  Other plugin families remain under #5594. Withholding is conditional on safe
-  producer interpolation: apostrophe-leading single-quoted values, bare values,
+  The #5594 family conversions listed above extend these diagnostics contracts.
+  Withholding is conditional on safe producer interpolation:
+  apostrophe-leading single-quoted values, bare values,
   and retained third-party parser text can still expose supplied data. Do not
   describe the renderer alone as fail-closed for arbitrary diagnostic text.
 - The mechanical producer/emitter contract is
