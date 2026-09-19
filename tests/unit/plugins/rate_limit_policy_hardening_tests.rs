@@ -67,6 +67,78 @@ fn shared_rate_limit_bounds_keep_schema_fields_and_withhold_values_and_labels() 
 }
 
 #[test]
+fn rendered_http_rate_bounds_preserve_the_real_nonzero_rule_ordinal() {
+    for (field, maximum) in [
+        ("window_seconds", MAX_RATE_LIMIT_WINDOW_SECONDS),
+        ("max_requests", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_second", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_minute", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_hour", MAX_RATE_LIMIT_MAX_REQUESTS),
+    ] {
+        for supplied in [0, maximum + 1] {
+            let mut rule = json!({
+                "scope": "consumers",
+                "consumers": ["UNREGISTERED_CONSUMER"],
+            });
+            if field == "window_seconds" || field == "max_requests" {
+                rule["window_seconds"] = json!(1);
+                rule["max_requests"] = json!(1);
+            }
+            rule[field] = json!(supplied);
+            let error = rate_limiting(json!({
+                "limit_by": "consumer",
+                "limits": [
+                    {"scope": "default", "requests_per_second": 10},
+                    rule,
+                ],
+            }))
+            .expect_err("the second rule must retain the shared bound rejection");
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            let reason = if supplied == 0 {
+                "must be greater than zero".to_string()
+            } else if field == "window_seconds" {
+                format!("must be <= {maximum} seconds, got: <redacted scalar>")
+            } else {
+                format!("must be <= {maximum}, got: <redacted scalar>")
+            };
+            assert_eq!(
+                rendered,
+                format!("rate_limiting: `limits[1]`: <redacted scalar>: `{field}` {reason}")
+            );
+        }
+    }
+}
+
+#[test]
+fn rendered_graphql_rate_bounds_preserve_the_schema_parent_without_operation_keys() {
+    for (parent, key) in [
+        ("type_rate_limits", "query"),
+        ("operation_rate_limits", "UNREGISTERED_OPERATION"),
+    ] {
+        for (field, supplied) in [
+            ("max_requests", OVER_REQUESTS),
+            ("window_seconds", OVER_WINDOW),
+        ] {
+            let mut spec = json!({"max_requests": 1, "window_seconds": 1});
+            spec[field] = json!(supplied);
+            let error = graphql(json!({(parent): {(key): spec}}))
+                .expect_err("the actual GraphQL constructor must reject the bound");
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(
+                rendered.starts_with(&format!("graphql: `{parent}`: <redacted scalar>: ")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("`{field}` must be <=")),
+                "{rendered}"
+            );
+            assert!(!rendered.contains(key), "{rendered}");
+            assert!(!rendered.contains(&supplied.to_string()), "{rendered}");
+        }
+    }
+}
+
+#[test]
 fn shared_rate_limit_diagnostics_withhold_method_keys_from_real_callers() {
     let method = "'UNREGISTERED_METHOD\"\\\n`method_rate_limits`";
     for spec in [
