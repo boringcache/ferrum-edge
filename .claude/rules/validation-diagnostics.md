@@ -87,6 +87,16 @@ paths:
   constructor warnings sanitize the selected level as a scalar. TCP/WebSocket
   CA wrappers retain shared TLS failure classes and record ordinals with fixed
   plugin/CA-field context; supplied source paths remain withheld when rendered.
+- The #5594 AI conversion covers prompt/response/PII filters, provider routing,
+  semantic caching, token limits, tool governance and transcript audit admission.
+  Provider/custom-pattern ordinals and fixed tool-pattern paths survive rendering;
+  supplied tool/provider/method names, patterns, schema payloads and numeric values
+  are withheld. JSON Schema and regex admission retain fixed classifications.
+  Registered constructor/rendered-output regressions cover these configuration
+  paths independently of the scoped mechanical producer guard.
+  Semantic-cache successful admission DEBUG fields sanitize every scalar at
+  emission, including defaults and normalized/derived selections; captured
+  constructor regressions pin the structured fields and fixed event message.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength
