@@ -35,12 +35,12 @@ def counter(**changes):
 
 def producer_records():
     return [dict(phase='ready', status='supported'),
-            dict(phase='bound', pid=7, start_ticks=9),
+            dict(phase='bound', pid=7, start_ticks=9, cgroup=42, netns=1, at_ns=90),
             dict(phase='final', before_ns=100, after_ns=110, pending=0, map_read_failures=0,
                  losses=[0] * len(LOSSES), totals=[counter()], census={'1': 2},
                  rows=[counter(attempts=0, pid=7, process_ns=90_000_000, cgroup=42,
                                cookie=55, netns=1, role=1, outcome=1, direction=1)]),
-            dict(phase='termination', requested_stop=True, lifecycle_omitted=0,
+            dict(phase='termination', requested_stop=True, bound=True, at_ns=111, lifecycle_omitted=0,
                  checkpoints_omitted=0, snapshot_failures=0)]
 
 
@@ -432,6 +432,26 @@ class H1ArtifactOwnershipTests(unittest.TestCase):
                 os._exit(0)
             self.assertEqual(os.waitpid(child, 0)[1], 0)
 
+    def test_acquired_mapped_elf_handoff_is_readable_by_ordinary_runner(self):
+        fixture = H1DSOAcquisitionTests()
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        record = fixture.acquire()
+        retained = fixture.destination / 'usr/lib/libfixture.so'
+        uid, gid = int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(trace.prepare_artifacts(Path(fixture.folder.name)), 0)
+        self.assertEqual(trace.digest(retained), record['sha256'])
+        self.assertEqual(retained.stat().st_uid, uid)
+        child = os.fork()
+        if child == 0:
+            try:
+                os.setgroups([]); os.setgid(gid); os.setuid(uid)
+                assert retained.read_bytes() == fixture.payload
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+        self.assertEqual(os.waitpid(child, 0)[1], 0)
+
     def test_links_and_unknown_fifos_fail_without_touching_external_data(self):
         with tempfile.TemporaryDirectory() as folder:
             parent = Path(folder)
@@ -458,7 +478,7 @@ class H1ArtifactOwnershipTests(unittest.TestCase):
 
 class H1TraceTests(unittest.TestCase):
     def assess(self, rows):
-        return syscall_coverage(rows, dict(pid=7, start_ticks=9, cgroup_id=42),
+        return syscall_coverage(rows, dict(pid=7, start_ticks=9, cgroup_id=42, namespaces={'net': 1}),
                                 dict(measurement={'valid': True}))
 
     def test_byte_returns_and_errors_stay_distinct(self):
@@ -496,6 +516,73 @@ class H1TraceTests(unittest.TestCase):
         self.assertFalse(result['witness_complete'])
         rows[2]['losses'][LOSSES.index('map_full')] = 1
         self.assertFalse(self.assess(rows)['complete'])
+
+    def test_shared_read_failure_invalidates_whole_call_completeness(self):
+        rows = producer_records()
+        rows[1]['at_ns'] = 5
+        prior = copy.deepcopy(rows[2])
+        prior.update(phase='checkpoint', before_ns=10, after_ns=20, rows=[], census={})
+        prior['totals'] = [counter(**dict.fromkeys(COUNTERS, 0), min_return=0, max_return=0)]
+        final = rows[2]
+        rows.insert(2, prior)
+        owner = dict(pid=7, start_ticks=9, cgroup_id=42, namespaces={'net': 1})
+        boundaries = dict(measurement=dict(valid=True, start_bounds_ns=[50, 51], end_bounds_ns=[90, 91]))
+        self.assertTrue(syscall_coverage(rows, owner, boundaries)['measurement_complete'])
+        final['losses'][LOSSES.index('read_failed')] = 1
+        result = syscall_coverage(rows, owner, boundaries)
+        for flag in ('complete', 'measurement_complete', 'offered_length_complete',
+                     'successful_return_bytes_complete', 'lifecycle_stream_complete', 'witness_complete'):
+            self.assertFalse(result[flag], flag)
+        self.assertEqual(result['syscall_totals'], final['totals'])
+        self.assertEqual(result['census'], {'1': 2})
+
+    def test_lifecycle_requires_typed_complete_bound_termination(self):
+        variants = []
+        for key in ('requested_stop', 'bound', 'at_ns', 'lifecycle_omitted', 'checkpoints_omitted', 'snapshot_failures'):
+            for value in (None, '0', False if key not in ('requested_stop', 'bound') else 1):
+                rows = producer_records(); rows[-1][key] = value; variants.append(rows)
+            rows = producer_records(); rows[-1].pop(key); variants.append(rows)
+        rows = producer_records(); rows.pop(); variants.append(rows)
+        rows = producer_records(); rows.append(copy.deepcopy(rows[-1])); variants.append(rows)
+        for loss in ('map_full', 'read_failed', 'ring_full', 'nested', 'unmatched', 'abandoned', 'compat', 'generation', 'exec'):
+            rows = producer_records(); rows[2]['losses'][LOSSES.index(loss)] = 1; variants.append(rows)
+        for key in ('cgroup', 'netns', 'start_ticks'):
+            rows = producer_records(); rows[1][key] += 1; variants.append(rows)
+        for rows in variants:
+            with self.subTest(rows=rows):
+                result = self.assess(rows)
+                self.assertFalse(result['lifecycle_stream_complete'])
+                self.assertFalse(result['witness_complete'])
+                self.assertEqual(result['syscall_totals'], rows[2]['totals'])
+        valid = self.assess(producer_records())
+        self.assertTrue(valid['lifecycle_stream_complete'])
+        self.assertTrue(valid['witness_complete'])
+
+    def test_truncated_terminal_stream_keeps_partial_counters_without_certification(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            (out / 'syscalls.jsonl').write_text('\n'.join(json.dumps(row) for row in producer_records()))
+            observer = object.__new__(trace.Observer)
+            observer.out, observer.offset, observer.pending, observer.rows = out, 0, b'', []
+            observer.poll()
+            self.assertTrue(observer.pending)
+            result = self.assess(observer.rows)
+            self.assertFalse(result['complete'])
+            self.assertFalse(result['lifecycle_stream_complete'])
+            self.assertFalse(result['witness_complete'])
+            self.assertEqual(result['syscall_totals'], producer_records()[2]['totals'])
+
+    def test_lifecycle_losses_in_earlier_snapshots_cannot_disappear(self):
+        rows = producer_records()
+        prior = copy.deepcopy(rows[2]); prior.update(phase='checkpoint', before_ns=95, after_ns=96)
+        prior['losses'][LOSSES.index('read_failed')] = 1
+        rows.insert(2, prior)
+        result = self.assess(rows)
+        self.assertTrue(result['reset'])
+        self.assertFalse(result['complete'])
+        self.assertFalse(result['lifecycle_stream_complete'])
+        self.assertEqual(result['losses']['read_failed'], 0)
+        self.assertEqual(result['observed_loss_maxima']['read_failed'], 1)
 
     def test_zero_cookie_and_foreign_generation_never_get_roles(self):
         rows = producer_records()
@@ -588,6 +675,225 @@ fixture 99/99 12.100000000: cpu-clock:u:
             validate_selection('trace-calibration', 'http1-tls', '4', '15', '100', 'ferrum', '5242880', 'same-image', '')
         with tempfile.TemporaryDirectory() as folder:
             self.assertFalse(load_trace(Path(folder) / 'missing.json')['complete'])
+
+
+class H1AdmissionTests(unittest.TestCase):
+    def test_actual_admission_binds_recorded_generation_and_container(self):
+        runtime = dict(host_pid=7, start_ticks=9, container_id='a' * 64)
+        owner = dict(pid=7, start_ticks=9, cgroup='/system.slice/docker-' + 'a' * 64 + '.scope',
+                     cgroup_id=42, boot_id='boot', executable_sha256='b' * 64,
+                     namespaces={name: 1 for name in ('pid', 'mnt', 'net', 'time', 'user')})
+        with patch.object(trace, 'identity', return_value=owner), patch.object(trace, 'admit') as admit:
+            self.assertEqual(trace.admit_runtime_target(runtime), owner)
+            admit.assert_called_once_with(owner)
+        for change in (dict(start_ticks=10), dict(cgroup='/docker/' + 'c' * 64),
+                       dict(cgroup='/docker/prefix-' + 'a' * 64), dict(pid=True)):
+            with self.subTest(change=change), patch.object(trace, 'identity', return_value=dict(owner, **change)), \
+                    patch.object(trace, 'admit') as admit:
+                with self.assertRaises(ValueError):
+                    trace.admit_runtime_target(runtime)
+                admit.assert_not_called()
+        for key, value in (('cgroup_id', 43), ('executable_sha256', 'c' * 64),
+                           ('namespaces', dict(owner['namespaces'], mnt=99))):
+            with patch.object(trace, 'identity', return_value=dict(owner, **{key: value})), \
+                    patch.object(trace, 'admit'):
+                with self.assertRaisesRegex(ValueError, 'adjacent'):
+                    trace.admit_runtime_target(runtime, owner)
+
+
+class H1CommandBoundTests(unittest.TestCase):
+    def test_already_exited_and_final_poll_output_are_rechecked_after_reap(self):
+        for race in ('already_exited', 'final_poll', 'reaped_after_deadline'):
+            with self.subTest(race=race), tempfile.TemporaryDirectory() as folder:
+                out = Path(folder) / 'metadata.txt'
+                process = Mock(returncode=0)
+                process.wait.return_value = 0
+                streams = {}
+                def overflow():
+                    for stream in streams.values():
+                        stream.write(b'x' * 3000); stream.flush()
+                    return 0
+                def launched(action, *, stdout, stderr, **data):
+                    self.assertEqual(data['file_limit'], 4096)
+                    streams.update(stdout=stdout, stderr=stderr)
+                    if race == 'already_exited':
+                        overflow(); process.poll.return_value = 0
+                    elif race == 'final_poll':
+                        process.poll.side_effect = [None, 0]
+                    else:
+                        process.poll.return_value = None
+                    return process
+                def reaped(child):
+                    overflow()
+                    return dict(returncode=0, forced=False)
+                with patch.object(trace, 'launch', side_effect=launched), \
+                        patch.object(trace.time, 'sleep', side_effect=lambda _: overflow()), \
+                        patch.object(trace, 'reap', side_effect=reaped):
+                    result = trace.command('perf-header', out, limit=4096,
+                                           timeout=0 if race == 'reaped_after_deadline' else 30)
+                self.assertEqual(result['returncode'], 0)
+                self.assertEqual(result['incomplete'], 'output_cap_after_reap')
+                self.assertEqual(result['retained_bytes'], 6000)
+                self.assertEqual(out.stat().st_size, 3000)
+                self.assertEqual(json.loads(out.with_suffix('.txt.status.json').read_text()), result)
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux pinned descriptor contract')
+class H1DSOAcquisitionTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.root = Path(self.folder.name) / 'root'; self.root.mkdir()
+        self.destination = Path(self.folder.name) / 'symfs'; self.destination.mkdir()
+        (self.root / 'usr/lib').mkdir(parents=True)
+        self.source = self.root / 'usr/lib/libfixture.so'
+        self.payload = b'\x7fELF' + b'a' * 131072
+        self.source.write_bytes(self.payload)
+        info = self.source.stat()
+        self.mapping = dict(path='/usr/lib/libfixture.so', device_major=os.major(info.st_dev),
+                            device_minor=os.minor(info.st_dev), inode=info.st_ino)
+        self.decoder = patch.object(trace, 'command', side_effect=self.decode)
+        self.command = self.decoder.start(); self.addCleanup(self.decoder.stop)
+
+    def decode(self, action, destination, *, elf_fd, output_directory_fd, **kwargs):
+        self.assertEqual(action, 'elf')
+        self.assertEqual(os.pread(elf_fd, len(self.payload), 0), self.payload)
+        fd = os.open(Path(destination).name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                     0o600, dir_fd=output_directory_fd)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write('Build ID: abcdef\n.eh_frame\n')
+        return dict(returncode=0, forced=False, incomplete=None)
+
+    def acquire(self, **kwargs):
+        budget = kwargs.pop('budget', dict(remaining=512 * 1024**2, package_remaining=512 * 1024**2))
+        with trace.directory_fd(self.root) as root, trace.directory_fd(self.destination) as target:
+            return trace.retain_mapped_elf(root, target, self.mapping, budget,
+                                           kwargs.pop('deadline', trace.time.monotonic() + 30))
+
+    def test_valid_mapped_elf_is_pinned_hashed_and_reused(self):
+        for path in ('/usr/lib/libfixture.so', '//usr/lib/libfixture.so'):
+            self.mapping['path'] = path
+            result = self.acquire()
+            self.assertEqual(result['sha256'], hashlib.sha256(self.payload).hexdigest())
+            self.assertEqual(result['inode'], self.mapping['inode'])
+            self.assertEqual(result['bytes'], len(self.payload))
+            self.assertTrue(result['eh_frame'])
+            self.assertEqual((self.destination / 'usr/lib/libfixture.so').read_bytes(), self.payload)
+
+    def test_wrong_inode_regular_replacement_never_copies_unmapped_bytes(self):
+        self.source.rename(self.source.with_suffix('.old'))
+        self.source.write_bytes(b'\x7fELFprivate replacement')
+        with self.assertRaisesRegex(ValueError, 'inode'):
+            self.acquire()
+        self.assertFalse((self.destination / 'usr').exists())
+        self.command.assert_not_called()
+
+    def test_source_links_and_nonregular_mappings_are_refused_before_read(self):
+        self.source.unlink()
+        outside = Path(self.folder.name) / 'private'; outside.write_bytes(self.payload)
+        for kind in ('absolute_link', 'relative_escape', 'fifo', 'directory'):
+            with self.subTest(kind=kind):
+                if kind == 'absolute_link':
+                    self.source.symlink_to(outside)
+                elif kind == 'relative_escape':
+                    self.source.symlink_to('../../../private')
+                elif kind == 'fifo':
+                    os.mkfifo(self.source)
+                else:
+                    self.source.mkdir()
+                info = self.source.lstat()
+                self.mapping.update(device_major=os.major(info.st_dev), device_minor=os.minor(info.st_dev), inode=info.st_ino)
+                with self.assertRaises(ValueError):
+                    self.acquire()
+                if kind == 'directory':
+                    self.source.rmdir()
+                else:
+                    self.source.unlink()
+        self.assertFalse((self.destination / 'usr').exists())
+        self.command.assert_not_called()
+
+    def test_intermediate_source_link_and_destination_escape_are_refused(self):
+        (self.root / 'usr').rename(self.root / 'real')
+        (self.root / 'usr').symlink_to('real', target_is_directory=True)
+        with self.assertRaises(OSError):
+            self.acquire()
+        (self.root / 'usr').unlink(); (self.root / 'real').rename(self.root / 'usr')
+        outside = Path(self.folder.name) / 'outside'; outside.mkdir()
+        (self.destination / 'usr').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            self.acquire()
+        self.assertEqual(list(outside.iterdir()), [])
+        with self.assertRaises(ValueError):
+            with trace.directory_fd(self.destination / '../outside', create=True):
+                self.fail('parent traversal admitted')
+
+    def test_growth_and_deadline_during_copy_preserve_only_bounded_partial_elf(self):
+        original_read = os.read
+        calls = 0
+        def grow(fd, size):
+            nonlocal calls
+            chunk = original_read(fd, size)
+            if size == 65536:
+                calls += 1
+                if calls == 2:
+                    with self.source.open('ab') as stream:
+                        stream.write(b'not admitted' * 10000)
+            return chunk
+        with patch.object(trace.os, 'read', side_effect=grow):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.acquire()
+        retained = self.destination / 'usr/lib/libfixture.so'
+        self.assertEqual(retained.read_bytes(), self.payload[:65536])
+        self.command.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'deadline'):
+            self.acquire(deadline=0)
+        with self.assertRaisesRegex(ValueError, 'cap'):
+            self.acquire(budget=dict(remaining=8, package_remaining=512 * 1024**2))
+
+    def test_deadline_is_checked_between_reads_and_destination_links_are_refused(self):
+        now = [0]
+        original_read = os.read
+        def expire(fd, size):
+            chunk = original_read(fd, size)
+            if size == 65536:
+                now[0] = 31
+            return chunk
+        with patch.object(trace.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(trace.os, 'read', side_effect=expire):
+            with self.assertRaisesRegex(ValueError, 'deadline'):
+                self.acquire(deadline=30)
+        retained = self.destination / 'usr/lib/libfixture.so'
+        self.assertEqual(retained.read_bytes(), b'')
+        retained.unlink()
+        outside = Path(self.folder.name) / 'outside'; outside.write_bytes(self.payload)
+        for kind in ('symlink', 'hardlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'symlink':
+                    retained.symlink_to(outside)
+                elif kind == 'hardlink':
+                    os.link(outside, retained)
+                else:
+                    os.mkfifo(retained)
+                with self.assertRaises(ValueError):
+                    self.acquire()
+                self.assertEqual(outside.read_bytes(), self.payload)
+                retained.unlink()
+        self.command.assert_not_called()
+
+    def test_pinned_source_cannot_be_swapped_between_magic_copy_and_hash(self):
+        original_read = os.read
+        def replace_after_magic(fd, size):
+            chunk = original_read(fd, size)
+            if size == 4:
+                self.source.unlink()
+                self.source.write_bytes(b'\x7fELFunmapped private bytes')
+            return chunk
+        with patch.object(trace.os, 'read', side_effect=replace_after_magic):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.acquire()
+        retained = self.destination / 'usr/lib/libfixture.so'
+        self.assertEqual(retained.read_bytes(), b'')
+        self.command.assert_not_called()
 
 
 class H1TeardownTests(unittest.TestCase):

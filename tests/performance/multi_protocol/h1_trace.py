@@ -4,6 +4,7 @@ Only the synthetic fixture and fixed observer/perf inventory are executable here
 The ordinary harness owns gateway/client creation, work, and shutdown.
 """
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import functools
@@ -36,8 +37,7 @@ ROOT = HERE.parents[2]
 STAGE = Path('/tmp/ferrum-h1-trace')
 TICKS = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
-PARENTS = dict(h1='ac7ff645f766597b9e4f38aa9e18272c0b3c249d',
-               h3='45dbde8ccc9575b225890afb450579213d62cb21')
+DEPENDENCY_PROVENANCE = json.loads((HERE / 'h1_profile_manifest.json').read_text())['external_trace']['dependency_provenance']
 
 
 def write(path, value):
@@ -205,11 +205,30 @@ def identity(pid):
             row['threads'].append(dict(tid=int(task.name), **parse_stat((task / 'stat').read_text(), TICKS, PAGE)))
         except FileNotFoundError:
             row.setdefault('thread_races', []).append(int(task.name))
+    # Reject mixed /proc snapshots before using any of their ownership fields.
+    if (parse_stat((proc / 'stat').read_text(), TICKS, PAGE)['start_ticks'] != row['start_ticks']
+            or (proc / 'cgroup').read_text().strip().split('0::', 1)[1] != row['cgroup']):
+        raise ValueError('process generation/cgroup changed during identity read')
     return row
 
 
 def same_generation(before, after):
     return all(before.get(k) == after.get(k) for k in ('pid', 'start_ticks', 'cgroup_id', 'executable_sha256', 'boot_id', 'namespaces'))
+
+
+def admit_runtime_target(runtime, previous=None):
+    """Bind the recorded Docker generation before any privileged attachment."""
+    from h1_trace_contract import trace_identity_issues
+    if type(runtime.get('host_pid')) is not int or runtime['host_pid'] <= 0:
+        raise ValueError('invalid recorded runtime PID')
+    owner = identity(runtime['host_pid'])
+    problems = trace_identity_issues(runtime, owner)
+    if problems:
+        raise ValueError('; '.join(problems))
+    admit(owner)
+    if previous is not None and not same_generation(previous, owner):
+        raise ValueError('target identity changed adjacent to collector attachment')
+    return owner
 
 
 def target_alive(owner):
@@ -416,7 +435,7 @@ def child_limits(file_limit=BOUNDS["raw_perf_bytes"]):
         os._exit(125)
 
 
-def launch(action, *, stdout, stderr, stdin=None, file_limit=BOUNDS["raw_perf_bytes"], **data):
+def launch(action, *, stdout, stderr, stdin=None, file_limit=BOUNDS["raw_perf_bytes"], pass_fds=(), **data):
     allowed = {'netns', 'capacity', 'fault', 'denied', 'mode', 'pid', 'out', 'symfs', 'elf'}
     if data.keys() - allowed or not 4096 <= file_limit <= BOUNDS['raw_perf_bytes']:
         raise ValueError('unknown command data/resource bound')
@@ -427,7 +446,7 @@ def launch(action, *, stdout, stderr, stdin=None, file_limit=BOUNDS["raw_perf_by
     env.update({f'H1_TRACE_{k.upper()}': str(v) for k, v in data.items()})
     return subprocess.Popen(['bash', 'tests/performance/multi_protocol/h1_trace_commands.sh'],
                             cwd=ROOT, env=env, stdin=stdin, stdout=stdout, stderr=stderr,
-                            start_new_session=True, preexec_fn=functools.partial(child_limits, file_limit))
+                            start_new_session=True, pass_fds=pass_fds, preexec_fn=functools.partial(child_limits, file_limit))
 
 
 def reap(process, command=None):
@@ -445,21 +464,91 @@ def reap(process, command=None):
     return dict(returncode=process.returncode, forced=False)
 
 
-def command(action, destination, *, limit=2 * 1024**2, timeout=30, **data):
-    """Bound each literal metadata command while it runs, not after completion."""
-    out = Path(destination)
+@contextlib.contextmanager
+def directory_fd(path, *, create=False, root=None):
+    """Walk directories without links, including the destination root's parents."""
+    path = Path(path)
+    if '..' in path.parts or (root is None and not path.is_absolute()):
+        raise ValueError('unsafe directory path')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY) if root is None else os.dup(root)
+    try:
+        for part in path.parts:
+            if part in (path.anchor, '.'):
+                continue
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def output_fd(directory, name):
+    try:
+        return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                       0o600, dir_fd=directory)
+    except FileExistsError:
+        pass
+    # Pin and inspect before opening for I/O, including nonregular destinations.
+    pin = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        info = os.fstat(pin)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError('unsafe command output')
+        fd = os.open(f'/proc/self/fd/{pin}', os.O_WRONLY)
+        try:
+            if os.fstat(fd).st_nlink != 1:
+                raise ValueError('command output gained a hard link')
+            os.ftruncate(fd, 0)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    finally:
+        os.close(pin)
+
+
+def command(action, destination, *, limit=2 * 1024**2, timeout=30, elf_fd=None, output_directory_fd=None, **data):
+    """Bound running and reaped output; pinned ELF input stays pinned in readelf."""
+    out = Path(os.path.abspath(destination))
+    if '..' in Path(destination).parts:
+        raise ValueError('unsafe command output path')
     errors = out.with_suffix(out.suffix + '.stderr')
-    with out.open('wb') as stream, errors.open('wb') as err:
-        process = launch(action, stdout=stream, stderr=err, **data)
-        deadline = time.monotonic() + timeout
-        stopped = None
-        while process.poll() is None:
-            if time.monotonic() >= deadline or out.stat().st_size + errors.stat().st_size > limit:
-                stopped = 'deadline_or_output_cap'; break
-            time.sleep(0.02)
-        status = reap(process) if stopped else dict(returncode=process.wait(), forced=False)
-    status.update(action=action, incomplete=stopped, stdout_sha256=digest(out), stderr_sha256=digest(errors))
-    write(out.with_suffix(out.suffix + '.status.json'), status)
+    if elf_fd is not None:
+        if action != 'elf' or not stat.S_ISREG(os.fstat(elf_fd).st_mode):
+            raise ValueError('pinned ELF descriptor required')
+        data['elf'] = f'/proc/self/fd/{elf_fd}'
+    with (directory_fd(out.parent) if output_directory_fd is None else
+          contextlib.nullcontext(output_directory_fd)) as directory:
+        with os.fdopen(output_fd(directory, out.name), 'wb') as stream, \
+                os.fdopen(output_fd(directory, errors.name), 'wb') as err:
+            process = launch(action, stdout=stream, stderr=err, file_limit=limit,
+                             pass_fds=() if elf_fd is None else (elf_fd,), **data)
+            deadline = time.monotonic() + timeout
+            stopped = None
+            while process.poll() is None:
+                if time.monotonic() >= deadline or os.fstat(stream.fileno()).st_size + os.fstat(err.fileno()).st_size > limit:
+                    stopped = 'deadline_or_output_cap'; break
+                time.sleep(0.02)
+            status = reap(process) if stopped else dict(returncode=process.wait(), forced=False)
+            # Check after EVERY reaping path, including already-exited children.
+            retained_bytes = os.fstat(stream.fileno()).st_size + os.fstat(err.fileno()).st_size
+            if retained_bytes > limit:
+                stopped = 'output_cap_after_reap'
+            # Hash the pinned outputs, not a later replacement at the pathname.
+            hashes = []
+            for stream_fd in (stream.fileno(), err.fileno()):
+                hashes.append(digest(f'/proc/self/fd/{stream_fd}'))
+        status.update(action=action, incomplete=stopped, retained_bytes=retained_bytes,
+                      output_limit=limit, stdout_sha256=hashes[0], stderr_sha256=hashes[1])
+        with os.fdopen(output_fd(directory, out.name + '.status.json'), 'w') as receipt:
+            json.dump(status, receipt, sort_keys=True, indent=2)
+            receipt.write('\n')
     return status
 
 
@@ -527,59 +616,196 @@ def tcp_inventory(pid):
                 joins_authoritative=False, zero_transient_close_races='unknown; never backfilled')
 
 
+@contextlib.contextmanager
+def mapped_elf_fd(root, mapping):
+    """Only a mapped regular inode, beneath the pinned target root, may be read.
+
+    O_PATH does not open devices/FIFOs for I/O. All symlinks are deliberately
+    unsupported, including intermediate and absolute links. /proc/self/fd is
+    used only to reopen our already-pinned, verified regular inode for reading.
+    """
+    path = Path(mapping['path'])
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('unsafe mapped path')
+    with directory_fd(path.parent, root=root) as parent:
+        pin = os.open(path.name, os.O_PATH | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        info = os.fstat(pin)
+        if (not stat.S_ISREG(info.st_mode) or
+                (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino) !=
+                (mapping['device_major'], mapping['device_minor'], mapping['inode'])):
+            raise ValueError('mapped inode replaced, linked or nonregular')
+        fd = os.open(f'/proc/self/fd/{pin}', os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if os.fstat(fd) != info:
+                raise ValueError('mapped inode changed before read')
+            yield fd
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pin)
+
+
+def retain_mapped_elf(root, destination, mapping, budget, deadline):
+    """Same FD for magic, copy and hash; budget charged before every write.
+
+    Read at most the admitted initial size, never read-to-EOF on a growing file.
+    Failed partial regular output is retained and cannot be certified/reused.
+    """
+    with mapped_elf_fd(root, mapping) as source:
+        initial = os.fstat(source)
+        if initial.st_size < 4 or initial.st_size > budget['remaining']:
+            raise ValueError('retained ELF package cap/size')
+        if time.monotonic() >= deadline:
+            raise ValueError('DSO acquisition deadline')
+        magic = os.read(source, 4)
+        if magic != b'\x7fELF':
+            raise ValueError('executable mapping is not ELF')
+        os.lseek(source, 0, os.SEEK_SET)
+        path = Path(mapping['path'])
+        with directory_fd(path.parent, root=destination, create=True) as parent:
+            try:
+                target = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=parent)
+                existing = False
+            except FileExistsError:
+                pin = os.open(path.name, os.O_PATH | os.O_NOFOLLOW, dir_fd=parent)
+                try:
+                    info = os.fstat(pin)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise ValueError('unsafe retained ELF destination')
+                    target = os.open(f'/proc/self/fd/{pin}', os.O_RDONLY)
+                finally:
+                    os.close(pin)
+                existing = True
+            try:
+                info = os.fstat(target)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (existing and info.st_size != initial.st_size):
+                    raise ValueError('unsafe/partial retained ELF destination')
+                metadata_reservation = 4 * 1024**2 + 4096
+                needed = (0 if existing else initial.st_size) + metadata_reservation
+                if needed > budget['package_remaining']:
+                    raise ValueError('retained ELF package reservation cap')
+                budget['package_remaining'] -= metadata_reservation
+                sha, copied = hashlib.sha256(), 0
+                def unchanged():
+                    current = os.fstat(source)
+                    if (current.st_dev, current.st_ino, current.st_nlink, current.st_size, current.st_mtime_ns, current.st_ctime_ns) != (
+                            initial.st_dev, initial.st_ino, initial.st_nlink, initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns):
+                        raise ValueError('mapped ELF changed during acquisition')
+                    if time.monotonic() >= deadline:
+                        raise ValueError('DSO acquisition deadline')
+                while copied < initial.st_size:
+                    unchanged()
+                    chunk = os.read(source, min(65536, initial.st_size - copied, budget['remaining']))
+                    if not chunk:
+                        raise ValueError('truncated ELF or package cap')
+                    unchanged()
+                    budget['remaining'] -= len(chunk)
+                    copied += len(chunk)
+                    sha.update(chunk)
+                    if existing:
+                        if os.read(target, len(chunk)) != chunk:
+                            raise ValueError('retained ELF differs from mapped inode')
+                    else:
+                        budget['package_remaining'] -= len(chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            if time.monotonic() >= deadline:
+                                raise ValueError('DSO acquisition deadline')
+                            written = os.write(target, view)
+                            if not written:
+                                raise ValueError('short retained ELF write')
+                            view = view[written:]
+                unchanged()
+                # Decode the pinned retained file; no pathname reopen of the ELF.
+                # Keep every repeat's raw metadata, including failed decoders.
+                metadata_name = path.name + '.elf-' + os.urandom(16).hex() + '.txt'
+                reserved = os.open(metadata_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                   0o600, dir_fd=parent)
+                os.close(reserved)
+                metadata = f'/proc/self/fd/{parent}/{metadata_name}'
+                with os.fdopen(os.open(f'/proc/self/fd/{target}', os.O_RDONLY), 'rb') as retained:
+                    status = command('elf', metadata, elf_fd=retained.fileno(), output_directory_fd=parent,
+                                     timeout=max(0.1, min(5, deadline - time.monotonic())))
+                with os.fdopen(os.open(metadata_name, os.O_RDONLY | os.O_NOFOLLOW,
+                                       dir_fd=parent), 'r') as text_file:
+                    text = text_file.read(2 * 1024**2 + 1)
+                return dict(mapping, sha256=sha.hexdigest(), bytes=copied,
+                    metadata_path=str(path.with_name(metadata_name)),
+                    build_id_lines=[l.strip() for l in text.splitlines() if 'Build ID:' in l],
+                    eh_frame='.eh_frame' in text, debug_frame='.debug_frame' in text, decoder=status)
+            finally:
+                os.close(target)
+
+
 def retain_dsos(pid, destination):
-    """Bounded, read-only mapped ELF metadata, never stack/env/payload scraping."""
-    destination.mkdir(parents=True, exist_ok=True)
+    """Bounded mapped ELF diagnostics; unsupported mappings never use host libc."""
+    if '..' in Path(destination).parts:
+        raise ValueError('unsafe DSO destination traversal')
     raw = read_metadata(f'/proc/{pid}/maps')
     if raw.get('truncated') or 'text' not in raw:
         return dict(complete=False, issue='maps unavailable/oversize', raw=raw)
-    records, errors = [], []
-    paths = set()
+    records, errors, mappings = [], [], {}
     for line in raw['text'].splitlines():
         fields = line.split(None, 5)
-        if len(fields) != 6 or 'x' not in fields[1]:
+        if len(fields) < 2 or 'x' not in fields[1]:
             continue
-        path = fields[5]
-        if not path.startswith('/') or path.endswith(' (deleted)'):
-            errors.append('anonymous/deleted executable mapping: ' + path); continue
-        paths.add(path)
-    if len(paths) > 128:
-        return dict(complete=False, issue='DSO count bound')
-    total = 0
-    metadata_deadline = time.monotonic() + 30
-    for path in sorted(paths):
-        if time.monotonic() >= metadata_deadline:
-            errors.append("DSO metadata deadline"); break
-        if '..' in Path(path).parts:
-            errors.append('invalid mapping path'); continue
-        source = Path(f'/proc/{pid}/root') / path.lstrip('/')
+        if len(fields) != 6 or not fields[5].startswith('/') or fields[5].endswith(' (deleted)'):
+            errors.append('anonymous/deleted executable mapping: ' + line); continue
         try:
-            size = source.stat().st_size
-            total += size
-            if total > 512 * 1024**2:
-                errors.append('retained ELF package cap'); break
-            with source.open('rb') as stream:
-                if stream.read(4) != b'\x7fELF':
-                    errors.append('executable mapping is not ELF'); continue
-            target = destination / path.lstrip('/')
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                with source.open('rb') as src, target.open('xb') as dst:
-                    while chunk := src.read(1024 * 1024):
-                        dst.write(chunk)
-            sha = digest(source)
-            if sha != digest(target):
-                errors.append('DSO changed during copy')
-            metadata = target.with_name(target.name + '.elf.txt')
-            status = command('elf', metadata, elf=target, timeout=max(0.1, min(5, metadata_deadline - time.monotonic())))
-            text = metadata.read_text(errors='replace')
-            records.append(dict(path=path, sha256=sha, build_id_lines=[l.strip() for l in text.splitlines() if 'Build ID:' in l],
-                                eh_frame='.eh_frame' in text, debug_frame='.debug_frame' in text,
-                                decoder=status))
-        except OSError as error:
-            errors.append(f'{path}:errno={error.errno}')
+            major, minor = (int(v, 16) for v in fields[3].split(':'))
+            mapping = dict(path=fields[5], device_major=major, device_minor=minor, inode=int(fields[4]))
+            if mapping['inode'] <= 0 or (mapping['path'] in mappings and mappings[mapping['path']] != mapping):
+                raise ValueError('inconsistent mapped identity')
+            mappings[mapping['path']] = mapping
+        except ValueError as error:
+            errors.append(str(error))
+    if len(mappings) > 128:
+        return dict(complete=False, issue='DSO count bound', mappings=raw)
+    budget = dict(remaining=512 * 1024**2, package_remaining=512 * 1024**2)
+    deadline = time.monotonic() + 30
+    # This one proc magic link is the admitted process's root. Subsequent source
+    # and ALL destination components are descriptor-relative and no-follow.
+    root = None
+    try:
+        root = os.open(f'/proc/{pid}/root', os.O_RDONLY | os.O_DIRECTORY)
+        with directory_fd(Path(os.path.abspath(destination)), create=True) as target:
+            # Include prior repeats and failed partial files in the shared package
+            # reservation. Never create a fresh per-repeat 512 MiB allowance.
+            entries = 0
+            for _, directories, files, directory in os.fwalk('.', dir_fd=target, follow_symlinks=False):
+                for name in directories + files:
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    entries += 1
+                    if (time.monotonic() >= deadline or entries > 4096
+                            or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                            or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)):
+                        raise ValueError('unsafe/oversize existing DSO package')
+                    if stat.S_ISREG(info.st_mode):
+                        budget['package_remaining'] -= info.st_size
+                if budget['package_remaining'] < 0:
+                    raise ValueError('existing DSO package cap')
+            for mapping in sorted(mappings.values(), key=lambda row: row['path']):
+                try:
+                    record = retain_mapped_elf(root, target, mapping, budget, deadline)
+                    records.append(record)
+                    if record['decoder']['returncode'] or record['decoder']['incomplete']:
+                        errors.append(mapping['path'] + ': ELF metadata decoder incomplete')
+                except (OSError, ValueError) as error:
+                    errors.append(f"{mapping['path']}: {type(error).__name__}: {error}")
+                if time.monotonic() >= deadline:
+                    errors.append('DSO metadata/acquisition deadline'); break
+    except (OSError, ValueError) as error:
+        errors.append(f'DSO package acquisition: {type(error).__name__}: {error}')
+    finally:
+        if root is not None:
+            os.close(root)
     return dict(complete=not errors, errors=errors, mappings=raw, dsos=records,
-                retained_package_bytes=total, source='target mount namespace, never host libc substitution')
+                acquired_elf_bytes=512 * 1024**2 - budget['remaining'],
+                retained_package_bytes=512 * 1024**2 - budget['package_remaining'],
+                package_bytes_basis='existing files plus acquired bytes plus conservative decoder output reservations',
+                source='pinned target-root mapped device/inode; symlinks unsupported; never host libc substitution')
 
 
 class Observer:
@@ -918,10 +1144,11 @@ def capabilities(out):
              '/sys/kernel/security/lockdown', '/etc/os-release', '/etc/apt/sources.list.d/ubuntu.sources',
              '/boot/config-' + platform.release()]
     result = dict(kernel=platform.uname()._asdict(), files={p: read_metadata(p) for p in paths},
-                  parents=PARENTS, clock=clock(),
+                  dependency_provenance=DEPENDENCY_PROVENANCE, clock=clock(),
                   runner={k: os.environ.get(k) for k in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'ImageOS', 'ImageVersion')},
                   namespaces={n: Path('/proc/self/ns', n).stat().st_ino for n in ('pid', 'mnt', 'net', 'time', 'user')},
                   source_hashes={p.name: digest(p) for p in list(HERE.glob('h1_trace*')) +
+                                 [HERE / 'h1_profile_manifest.json'] +
                                  [p for p in (HERE / 'h3_proof').iterdir() if p.suffix in ('.h', '.c')] if p.is_file()},
                   object_hashes={p.name: digest(p) for p in STAGE.iterdir() if p.is_file()},
                   discovered=True, loaded=False, attached=False, fixture_exercised=False, gateway_observed=False)
@@ -991,7 +1218,7 @@ def supervise(args):
     out.mkdir(parents=True, exist_ok=True)
     mode = args.mode if args.enabled else 'none'
     result = dict(schema=1, mode=mode, selected_mode=args.mode, external_enabled=args.enabled,
-                  parents=PARENTS, bounds=BOUNDS, complete=False, issues=[], timeline=[],
+                  dependency_provenance=DEPENDENCY_PROVENANCE, bounds=BOUNDS, complete=False, issues=[], timeline=[],
                   supervisor_started=clock(), supervisor_cpu_start=time.process_time(),
                   phase='waiting_for_owned_gateway', fully_profiled=False)
     observer = cpu = owner = lifecycle = None
@@ -1006,9 +1233,6 @@ def supervise(args):
         if campaign_trace_bytes(Path(args.artifact_root)) >= BOUNDS['total_artifact_bytes'] - 32 * 1024**2:
             raise RuntimeError('job trace artifact reservation already exhausted')
         capabilities(out)
-        if mode == 'syscalls':
-            observer = Observer(out)
-            result['ready'] = observer.ready
         # Supervisor exists before start_ferrum. This receipt is not collector readiness.
         write(out / 'supervisor-ready.json', dict(pid=os.getpid(), at=clock(), awaiting_binding=True))
         while not (out / 'bind.json').exists():
@@ -1017,9 +1241,13 @@ def supervise(args):
             if parse_stat(Path(f'/proc/{args.parent}/stat').read_text(), TICKS, PAGE)['start_ticks'] != parent['start_ticks']:
                 raise RuntimeError('parent generation changed')
             time.sleep(0.05)
-        binding = json.loads((out / 'bind.json').read_text())
-        runtime = json.loads(Path(binding['runtime']).read_text())
+        binding_bytes = (out / 'bind.json').read_bytes()
+        binding = json.loads(binding_bytes)
+        runtime_bytes = Path(binding['runtime']).read_bytes()
+        runtime = json.loads(runtime_bytes)
         config = Path(binding['config']).read_bytes()
+        result['input_hashes'] = dict(binding=hashlib.sha256(binding_bytes).hexdigest(),
+            runtime=hashlib.sha256(runtime_bytes).hexdigest(), config=hashlib.sha256(config).hexdigest())
         expected = (HERE / 'configs/http1_tls_e2e_perf.yaml').read_text().replace('CA_PATH', '/etc/ferrum/tls/ca.pem').encode()
         if config != expected or hashlib.sha256(config).hexdigest() != runtime['config_sha256']:
             raise ValueError('effective config does not match exact H1 TLS fixture')
@@ -1030,23 +1258,35 @@ def supervise(args):
                 raise ValueError('runtime role configuration mismatch: ' + key)
         if env.get('FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES') not in ('0', '1'):
             raise ValueError('unexpected cutoff')
-        owner = identity(runtime['host_pid']); admit(owner)
+        owner = admit_runtime_target(runtime)
         builds = Path(args.builds).resolve()
         matches = [str(p.relative_to(builds)) for p in builds.glob('*/ferrum-edge') if digest(p) == owner['executable_sha256']]
         if len(matches) != 1:
             raise ValueError('target ELF does not match exactly one retained release twin')
         result.update(identity=owner, runtime=runtime, matching_elf=matches[0], binding=binding)
         write(out / 'identity.json', owner)
+        admit_runtime_target(runtime, owner)
         result['initial_sockets'] = tcp_inventory(owner['pid'])
+        admit_runtime_target(runtime, owner)
         write(out / 'initial-sockets.json', result['initial_sockets'])
         symbol_package = builds / Path(matches[0]).parent / 'symfs'
         result['symbol_package'] = str(symbol_package)
         dsos = retain_dsos(owner['pid'], symbol_package) if mode == 'cpu' else {}
         write(out / 'build-mappings.json', dsos)
-        if observer and observer.ready.get('status') == 'supported':
-            result['binding_receipt'] = observer.bind(owner)
+        # Do not attach even the initially-unbound BPF programs before admission.
+        # Metadata acquisition can take time: check again immediately at attach,
+        # at BPF target bind, and after the attach/bind acknowledgement.
+        admit_runtime_target(runtime, owner)
+        if mode == 'syscalls':
+            observer = Observer(out)
+            admit_runtime_target(runtime, owner)
+            result['ready'] = observer.ready
+            if observer.ready.get('status') == 'supported':
+                result['binding_receipt'] = observer.bind(owner)
+            admit_runtime_target(runtime, owner)
         if mode == 'cpu':
             cpu = CPU(out, owner); result['ready'] = cpu.ready
+            admit_runtime_target(runtime, owner)
         if mode == 'none':
             result['ready'] = dict(status='off', at=clock())
         started = time.monotonic_ns()
@@ -1173,7 +1413,8 @@ def supervise(args):
             result['capture_complete'] = False
         result['artifacts'] = {str(p.relative_to(out)): dict(sha256=digest(p), bytes=p.stat().st_size)
             for p in out.rglob('*') if p.is_file() and 'symfs' not in p.relative_to(out).parts
-            and p.name not in ('trace-manifest.json', 'stopped.json')}
+            and p.name not in ('trace-manifest.json', 'stopped.json', 'supervisor.stdout', 'supervisor.stderr')}
+        result['unhashed_live_logs'] = ['supervisor.stdout', 'supervisor.stderr']
         write(out / 'trace-manifest.json', result)
         write(out / 'stopped.json', dict(at=clock(), issues=result['issues'], capture_complete=result['capture_complete']))
     return 0 if result['capture_complete'] else 1

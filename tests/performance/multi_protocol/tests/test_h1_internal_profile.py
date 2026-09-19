@@ -84,7 +84,7 @@ REVISION = "f73e1d2299ed61612bc5dd95315e3df901b150fa"
 def docker_inspect(config, gateway="ferrum", pair=1, mode="cutoff"):
     # Actual Dockerfile.release + start_ferrum shape, independently enumerated
     # so producer/consumer changes cannot silently update a mirrored fixture.
-    observer = "off" if mode == "diagnostic" or gateway == "ferrum-baseline" else "on"
+    observer = "off" if mode == "diagnostic" or (mode == "calibration" and gateway == "ferrum-baseline") else "on"
     labels = {"org.opencontainers.image.revision": REVISION, "ferrum.h1-profile": observer,
               "org.opencontainers.image.title": "Ferrum Edge"}
     environment = [
@@ -157,7 +157,7 @@ def campaign(root, mode="cutoff"):
                     json.dumps(traffic_sample(gateway, pair, size, identity["host_pid"] if identity else 31)))
                 if gateway != "direct":
                     usage = capture(duration=15, identity=identity)
-                    if gateway == "ferrum-baseline":
+                    if mode == "calibration" and gateway == "ferrum-baseline":
                         for row in usage["timeline"]:
                             row["h1_profile"].pop("counters")
                             row["h1_profile"]["error"] = "ValueError"
@@ -165,6 +165,147 @@ def campaign(root, mode="cutoff"):
                         json.dumps(usage))
     return root / "pairs/pair_001/ferrum_http1-tls_10240.json", \
         root / "pairs/pair_001/diagnostics/ferrum_10240_process_usage.json"
+
+
+def external_capture(root, pair, gateway, size=10240, selected_mode="syscalls"):
+    """Producer-shaped retained syscall/off capture, through actual receipt writers.
+
+    Kernel events are fixed data here; hosted C fixtures independently exercise
+    collection. No report/admission validator is mocked by these regressions.
+    """
+    import h1_trace as trace
+    from h1_trace_contract import BOUNDS, COUNTERS, LOSSES, syscall_coverage, fd_lifetimes
+    folder = root / 'pairs' / f'pair_{pair:03d}'
+    out = folder / 'traces' / f'{gateway}_{size}'; out.mkdir(parents=True)
+    runtime_path = folder / 'diagnostics' / f'{gateway}_runtime.json'
+    runtime = json.loads(runtime_path.read_text())
+    config = folder / 'diagnostics' / f'{gateway}_config.yaml'
+    sample_path = folder / f'{gateway}_http1-tls_{size}.json'
+    raw_path = folder / 'diagnostics' / f'{gateway}_{size}_client.raw.json'
+    exit_path = folder / 'diagnostics' / f'{gateway}_{size}_client.exit'
+    sample = json.loads(sample_path.read_text())
+    sample['phases'].update(stalled_workers=[], transport_close_timed_out=False, drain_secs=0.2,
+        drain_start_monotonic_secs=17.01, measurement_start_host_clock=dict(
+            clock='CLOCK_MONOTONIC', before_ns=2_000_000_000, after_ns=2_000_000_001))
+    trace.write(sample_path, sample)
+    trace.write(raw_path, dict(phases=sample['phases']))
+    exit_path.write_text('0\n')
+    trace.write_binding(out, runtime=str(runtime_path), config=str(config), sample=str(sample_path),
+                        raw_sample=str(raw_path), client_exit=str(exit_path), arm=gateway, pair=pair, payload=size)
+    binding = json.loads((out / 'bind.json').read_text())
+    binary = root.parent / 'builds/on/ferrum-edge'; binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b'\x7fELFsynthetic retained release twin')
+    owner = dict(pid=runtime['host_pid'], start_ticks=runtime['start_ticks'],
+                 cgroup='/system.slice/docker-' + runtime['container_id'] + '.scope', cgroup_id=42,
+                 boot_id='campaign-host', executable_sha256=trace.digest(binary),
+                 namespaces={name: 1 for name in ('pid', 'mnt', 'net', 'time', 'user')})
+    def at(ns):
+        return dict(kind='clock_receipt', clock='CLOCK_MONOTONIC', boot_id='campaign-host', time_namespace=1,
+                    before_ns=ns, after_ns=ns + 1, unix_ns=8_000_000_000 + ns)
+    enabled = gateway != 'ferrum-baseline'
+    ready = dict(status='supported' if enabled else 'off', at=at(1_000_000_000), owner=owner,
+                 session=f'{pair:016x}' + ('a' if enabled else 'b') * 16,
+                 binding_sha256=trace.digest(out / 'bind.json'), deadline_monotonic=300)
+    for name, value in (('identity.json', owner), ('ready.json', ready),
+                        ('initial-sockets.json', dict(errors=[], joins_authoritative=False)), ('build-mappings.json', {})):
+        trace.write(out / name, value)
+    request = dict(at=at(18_000_000_000), owner=owner, session=ready['session'],
+                   binding_sha256=ready['binding_sha256'], evidence=trace.completion_evidence(binding))
+    trace.write(out / 'teardown-request.json', request)
+    collector = MagicMock(ready={'status': 'supported'})
+    collector.process.poll.return_value = None
+    lifecycle = trace.CaptureLifecycle(out, owner, binding, ready, {('observer' if selected_mode == 'syscalls' else 'cpu'): collector} if enabled else {})
+    with patch.object(trace, 'clock', return_value=at(19_000_000_000)), \
+            patch.object(trace, 'identity', return_value=owner), patch.object(trace, 'target_alive', return_value=True):
+        lifecycle.authorize_teardown()
+    with patch.object(trace, 'clock', return_value=at(20_000_000_000)), \
+            patch.object(trace, 'target_alive', return_value=False):
+        lifecycle.poll()
+        if enabled:
+            lifecycle.reaped('observer' if selected_mode == 'syscalls' else 'cpu', dict(returncode=0, forced=False))
+    timeline = [dict(clock=ready['at'], ready=True), dict(clock=at(20_000_000_000), terminal=True)]
+    boundaries = trace.boundary_report(sample, timeline, 1_000_000_000, 20_000_000_000, owner)
+    claim = dict(schema=1, mode=selected_mode if enabled else 'none', selected_mode=selected_mode, external_enabled=enabled,
+                 capture_complete=True, complete=False, fully_profiled=False, issues=[], stop_requested=True, bounds=BOUNDS,
+                 identity=owner, runtime=runtime, matching_elf='on/ferrum-edge', binding=binding,
+                 input_hashes=dict(binding=trace.digest(out / 'bind.json'), runtime=trace.digest(runtime_path),
+                                   config=trace.digest(config)), ready={'status': ready['status']},
+                 timeline=timeline, boundaries=boundaries, lifecycle=lifecycle.report(),
+                 dependency_provenance=trace.DEPENDENCY_PROVENANCE)
+    capability = dict(source_hashes={name: 'd' * 64 for name in ('h1_trace.py', 'h1_trace_contract.py', 'h1_syscalls.bpf.h', 'h1_loader.h')},
+                      object_hashes={name: 'e' * 64 for name in ('observer', 'observer.bpf.o', 'perf', 'h1_trace_fixture')},
+                      runner={'GITHUB_SHA': REVISION}, dependency_provenance=trace.DEPENDENCY_PROVENANCE,
+                      capture_complete=True, discovered=True, loaded=enabled and selected_mode == 'syscalls', attached=enabled)
+    trace.write(out / 'capabilities.json', capability)
+    if enabled and selected_mode == 'syscalls':
+        total = dict.fromkeys(COUNTERS, 0)
+        total.update(id=1, attempts=2, exits=2, positive=2, offered=24, offered_known=2,
+                     accepted_bytes=24, accepted_known=2, return_sum=24, min_return=12, max_return=12)
+        rows = [dict(phase='ready', status='supported'),
+                dict(phase='bound', pid=owner['pid'], start_ticks=owner['start_ticks'], cgroup=42, netns=1, at_ns=900_000_000),
+                dict(phase='final', before_ns=21_000_000_000, after_ns=21_000_000_001, pending=0,
+                     map_read_failures=0, losses=[0] * len(LOSSES), totals=[total], census={'1': 2},
+                     rows=[dict(total, attempts=0, pid=owner['pid'], process_ns=owner['start_ticks'] * 10_000_000,
+                                cgroup=42, cookie=55, netns=1, role=1, outcome=1, direction=1)]),
+                dict(phase='termination', requested_stop=True, bound=True, at_ns=22_000_000_000,
+                     snapshot_failures=0, lifecycle_omitted=0, checkpoints_omitted=0)]
+        (out / 'syscalls.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        (out / 'loader.stderr').write_text('')
+        # The real producer consumer computes role_totals from raw kernel rows.
+        observer = object.__new__(trace.Observer)
+        observer.out, observer.offset, observer.pending, observer.rows = out, 0, b'', []
+        observer.poll()
+        claim['syscalls'] = syscall_coverage(observer.rows, owner, boundaries)
+        claim['observer_exit'] = dict(returncode=0, forced=False, partial_record=False)
+        trace.write(out / 'syscalls.json', claim['syscalls'])
+        trace.write(out / 'fd-lifetimes.json', fd_lifetimes(observer.rows))
+    elif enabled:
+        from h1_trace_contract import decode_cpu, cpu_phases
+        # Real retained evlist producer text, with a deliberately partial sample.
+        attributes = (profile.ROOT / 'tests/fixtures/h1-perf-evlist-6.8.0-139.txt').read_text()
+        stacks = (f"ferrum {owner['pid']}/{owner['pid']} 3.000000001: cpu-clock:uS:\n"
+                  "        1234 forwarding (/app/ferrum-edge)\n"
+                  "        0000 [unknown] ([unknown])\n\n")
+        statuses = {}
+        for name, text in (('perf-attributes.txt', attributes), ('stacks.txt', stacks),
+                           ('perf-buildids.txt', 'abcdef12 /app/ferrum-edge\n'), ('perf-header.txt', 'header\n')):
+            (out / name).write_text(text); (out / (name + '.stderr')).write_text('')
+            statuses[name] = dict(returncode=0, forced=False, incomplete=None,
+                                  stdout_sha256=trace.digest(out / name), stderr_sha256=trace.digest(out / (name + '.stderr')))
+            trace.write(out / (name + '.status.json'), statuses[name])
+        raw_records = ['PERF_RECORD_SAMPLE', 'PERF_RECORD_MMAP2', 'PERF_RECORD_COMM']
+        raw_status = dict(returncode=0, forced=False)
+        trace.write(out / 'perf-records.json', dict(records=raw_records, status=raw_status, incomplete=None))
+        (out / 'perf.data').write_bytes(b'synthetic raw artifact for retained-report binding tests')
+        (out / 'perf.stderr').write_text('')
+        decoded = decode_cpu(stacks, '\n'.join(raw_records), {owner['pid']})
+        attributes_check = trace.read_cpu_attributes(out / 'perf-attributes.txt', statuses['perf-attributes.txt'])
+        coverage = {k: v for k, v in decoded.items() if k not in ('callchains', 'folded')}
+        coverage.update(issues=['missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples'],
+                        samples_complete=False, unwind_complete=False, attributes_verified=attributes_check['verified'],
+                        attribute_validation=attributes_check, decoder_status=statuses['stacks.txt'],
+                        header_status=statuses['perf-header.txt'], buildid_status=statuses['perf-buildids.txt'],
+                        attributes_status=statuses['perf-attributes.txt'], raw_decoder_status=raw_status)
+        trace.write(out / 'cpu-coverage.json', coverage)
+        mapped = binary.parent / 'symfs/app/ferrum-edge'; mapped.parent.mkdir(parents=True, exist_ok=True)
+        mapped.write_bytes(binary.read_bytes())
+        metadata = mapped.with_name(mapped.name + '.elf-test.txt')
+        metadata.write_text('Build ID: abcdef12\n.eh_frame\n')
+        errors = metadata.with_name(metadata.name + '.stderr'); errors.write_text('')
+        decoder = dict(returncode=0, forced=False, incomplete=None,
+                       stdout_sha256=trace.digest(metadata), stderr_sha256=trace.digest(errors))
+        trace.write(metadata.with_name(metadata.name + '.status.json'), decoder)
+        trace.write(out / 'build-mappings.json', dict(complete=False, errors=['anonymous mapping'], dsos=[
+            dict(path='/app/ferrum-edge', device_major=0, device_minor=1, inode=123, bytes=mapped.stat().st_size,
+                 sha256=trace.digest(mapped), build_id_lines=['Build ID: abcdef12'], eh_frame=True, debug_frame=False,
+                 metadata_path='/app/ferrum-edge.elf-test.txt', decoder=decoder)]))
+        (out / 'stacks.folded').write_text(''.join(f'{key} {count}\n' for key, count in decoded['folded'].items()))
+        claim['cpu'] = dict(coverage, phases=cpu_phases(decoded['callchains'], boundaries['measurement']))
+        claim['perf_exit'] = raw_status
+    claim['artifacts'] = {str(p.relative_to(out)): dict(sha256=trace.digest(p), bytes=p.stat().st_size)
+                          for p in out.iterdir() if p.is_file()}
+    trace.write(out / 'trace-manifest.json', claim)
+    return out / 'trace-manifest.json'
 
 
 def diagnostic_state(pid):
@@ -348,6 +489,111 @@ class H1InternalProfileTests(unittest.TestCase):
                 self.assertTrue(written["runtime_complete"])
                 ids = {r["runtime"]["image_id"] for r in written["observations"] if "runtime" in r}
                 self.assertEqual(len(ids), 2 if mode == "calibration" else 1)
+
+    def trace_campaign(self, root, selected_mode="syscalls"):
+        campaign(root, 'trace-calibration')
+        manifest_path = root / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(payload_sizes=[10240], h1_trace_mode=selected_mode)
+        manifest_path.write_text(json.dumps(manifest))
+        for pair in range(1, 5):
+            for gateway in ('ferrum', 'ferrum-baseline'):
+                external_capture(root, pair, gateway, selected_mode=selected_mode)
+
+    def test_trace_calibration_full_report_accepts_same_on_image_and_bound_producer_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'campaign'; root.mkdir()
+            self.trace_campaign(root)
+            result = profile.report(root, 'trace-calibration')
+            self.assertTrue(result['internal_comparison_eligible'], result)
+            self.assertTrue(result['external_traces_complete'], result)
+            self.assertTrue(result['trace_comparison_eligible'], result)
+            self.assertFalse(result['fully_measured_comparison_eligible'])
+            self.assertEqual(len(result['observations']), 12)
+            for row in result['observations']:
+                if row['gateway'] != 'direct':
+                    self.assertTrue(row['profile']['complete'])
+                    self.assertTrue(row['external_trace']['validation_complete'], row['external_trace'])
+                    self.assertEqual(row['runtime']['image_labels'][profile.OBSERVER_LABEL], 'on')
+
+    def test_cpu_report_validates_partial_capture_without_promoting_unwind_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'campaign'; root.mkdir()
+            self.trace_campaign(root, 'cpu')
+            result = profile.report(root, 'trace-calibration')
+            self.assertTrue(result['trace_comparison_eligible'], result)
+            for row in result['observations']:
+                if row['gateway'] == 'ferrum':
+                    cpu = row['external_trace']['cpu']
+                    self.assertFalse(cpu['samples_complete'])
+                    self.assertFalse(cpu['unwind_complete'])
+            artifact = root / 'pairs/pair_001/traces/ferrum_10240/perf.data'
+            artifact.write_bytes(artifact.read_bytes() + b'changed')
+            self.assertFalse(profile.report(root, 'trace-calibration')['external_traces_complete'])
+
+    def test_trace_calibration_rejects_wrong_build_and_cross_arm_image_substitution(self):
+        for mutation in ('wrong_observer', 'cross_arm_image'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'campaign'; root.mkdir()
+                self.trace_campaign(root)
+                for path in root.glob('pairs/*/diagnostics/ferrum-baseline_runtime.json'):
+                    runtime = json.loads(path.read_text())
+                    if mutation == 'wrong_observer':
+                        for label in ('image_labels', 'container_labels'):
+                            runtime[label][profile.OBSERVER_LABEL] = 'off'
+                    else:
+                        runtime['image_id'] = 'sha256:' + 'd' * 64
+                    path.write_text(json.dumps(runtime))
+                result = profile.report(root, 'trace-calibration')
+                self.assertFalse(result['runtime_complete'])
+                self.assertFalse(result['traffic_complete'])
+                self.assertFalse(result['internal_comparison_eligible'])
+                self.assertFalse(result['trace_comparison_eligible'])
+                self.assertEqual(len(result['observations']), 12)
+
+    def test_external_report_rejects_cross_arm_pair_mutation_and_missing_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'campaign'; root.mkdir()
+            self.trace_campaign(root)
+            path = root / 'pairs/pair_001/traces/ferrum_10240/trace-manifest.json'
+            original = path.read_text()
+            variants = [json.loads((root / relative).read_text()) for relative in (
+                'pairs/pair_001/traces/ferrum-baseline_10240/trace-manifest.json',
+                'pairs/pair_002/traces/ferrum_10240/trace-manifest.json')]
+            variants.append(dict(schema=1, mode='cpu', capture_complete=True))
+            for field in ('input_hashes', 'identity', 'boundaries', 'ready', 'lifecycle', 'artifacts', 'selected_mode'):
+                claim = json.loads(original); claim.pop(field); variants.append(claim)
+            for field, value in (('pair', 2), ('pair', True), ('payload', 71680), ('arm', 'ferrum-baseline')):
+                claim = json.loads(original); claim['binding'][field] = value; variants.append(claim)
+            for field, value in (('schema', True), ('capture_complete', 1), ('external_enabled', 'true'),
+                                 ('stop_requested', 1), ('selected_mode', 'cpu')):
+                claim = json.loads(original); claim[field] = value; variants.append(claim)
+            for claim in variants:
+                path.write_text(json.dumps(claim))
+                result = profile.report(root, 'trace-calibration')
+                row = next(r for r in result['observations'] if (r['pair'], r['gateway']) == (1, 'ferrum'))
+                self.assertFalse(row['external_trace']['capture_complete'])
+                self.assertFalse(row['external_trace']['validation_complete'])
+                self.assertEqual(row['external_trace']['producer_claim'], claim)
+                self.assertFalse(result['external_traces_complete'])
+                self.assertFalse(result['trace_comparison_eligible'])
+            path.write_text(original)
+            # Actual retained bytes, including still-valid traffic JSON, bind the
+            # claim. Neither a copied filename nor capture_complete can repair it.
+            for evidence in ('pairs/pair_001/ferrum_http1-tls_10240.json',
+                             'pairs/pair_001/traces/ferrum_10240/syscalls.jsonl',
+                             'pairs/pair_001/traces/ferrum_10240/teardown-ready.json'):
+                target = root / evidence; before = target.read_bytes()
+                target.write_bytes(before + b'\n')
+                result = profile.report(root, 'trace-calibration')
+                self.assertFalse(result['external_traces_complete'], evidence)
+                target.write_bytes(before)
+            for evidence in ('syscalls.jsonl', 'ready.json', 'capabilities.json', 'bind.json'):
+                target = path.parent / evidence; before = target.read_bytes(); target.unlink()
+                result = profile.report(root, 'trace-calibration')
+                self.assertFalse(result['external_traces_complete'], evidence)
+                target.write_bytes(before)
+            self.assertTrue(profile.report(root, 'trace-calibration')['trace_comparison_eligible'])
 
     def assert_runtime_failure(self, root, mode, gateway, pair=1):
         self.assert_matrix(root, mode=mode)
@@ -791,7 +1037,7 @@ class H1InternalProfileTests(unittest.TestCase):
             config.write_text("proxies: []\n")
             for gateway in ("ferrum", "ferrum-baseline", "ferrum-exp-cutoff-one"):
                 mode = "calibration" if gateway == "ferrum-baseline" else "cutoff"
-                container, image = docker_inspect(config, gateway)
+                container, image = docker_inspect(config, gateway, mode=mode)
                 with patch.object(profile, "process_start_ticks", return_value=100), \
                         patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))) as inspect:
                     profile.retain_runtime(path, container, config, 1, gateway, "campaign-host", mode)
