@@ -98,7 +98,7 @@ impl AccessControl {
             && !allow_authenticated_identity
         {
             return Err(
-                "access_control: at least one of 'allowed_consumers', 'disallowed_consumers', 'allowed_groups', 'disallowed_groups', or 'allow_authenticated_identity=true' is required".to_string()
+                "access_control: at least one of `allowed_consumers`, `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or `allow_authenticated_identity=true` is required".to_string()
             );
         }
 
@@ -111,7 +111,7 @@ impl AccessControl {
         // config validation instead of failing open at request time.
         if has_allow_rules && allow_authenticated_identity {
             return Err(
-                "access_control: 'allow_authenticated_identity=true' cannot be combined with an allow-list ('allowed_consumers'/'allowed_groups'); the allow-list keys off mapped Consumers and is not applied to unmapped external identities, so the combination would bypass the allow-list".to_string()
+                "access_control: `allow_authenticated_identity=true` cannot be combined with an allow-list (`allowed_consumers`/`allowed_groups`); the allow-list keys off mapped Consumers and is not applied to unmapped external identities, so the combination would bypass the allow-list".to_string()
             );
         }
 
@@ -281,7 +281,7 @@ fn reject_removed_ip_keys(object: &serde_json::Map<String, Value>) -> Result<(),
     for key in ["allowed_ips", "blocked_ips"] {
         if object.contains_key(key) {
             return Err(format!(
-                "access_control: '{key}' was removed; use the ip_restriction plugin for IP rules"
+                "access_control: `{key}` was removed; use the ip_restriction plugin for IP rules"
             ));
         }
     }
@@ -303,7 +303,7 @@ fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), St
     ];
     for key in object.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("access_control: unknown config key '{key}'"));
+            return Err(format!("access_control: unknown config key {key:?}"));
         }
     }
     Ok(())
@@ -320,12 +320,12 @@ fn parse_string_set(
 
     let values = value
         .as_array()
-        .ok_or_else(|| format!("access_control: '{field}' must be an array of strings"))?;
+        .ok_or_else(|| format!("access_control: `{field}` must be an array of strings"))?;
 
     let mut parsed = HashSet::with_capacity(values.len());
     for entry in values {
         let Some(raw) = entry.as_str() else {
-            return Err(format!("access_control: '{field}' entries must be strings"));
+            return Err(format!("access_control: `{field}` entries must be strings"));
         };
         // Rules are stored byte-for-byte. Principals are never canonicalized:
         // Consumer usernames may legally carry padding and external identity
@@ -335,13 +335,13 @@ fn parse_string_set(
         // deny-list. Only whitespace-only entries are rejected.
         if raw.trim().is_empty() {
             return Err(format!(
-                "access_control: '{field}' entries must contain non-whitespace characters"
+                "access_control: `{field}` entries must contain non-whitespace characters"
             ));
         }
         let raw_length = raw.chars().count();
         if raw_length > max_length {
             return Err(format!(
-                "access_control: '{field}' entries must not exceed {max_length} characters"
+                "access_control: `{field}` entries must not exceed {max_length} characters"
             ));
         }
         parsed.insert(raw.to_string());
@@ -359,7 +359,7 @@ fn parse_bool(
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("access_control: '{field}' must be a boolean"))
+                .ok_or_else(|| format!("access_control: `{field}` must be a boolean"))
         })
         .transpose()
 }

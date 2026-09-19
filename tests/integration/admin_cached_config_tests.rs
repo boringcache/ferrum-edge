@@ -2853,8 +2853,10 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 
         assert_eq!(status, 400, "unknown jwt_auth key was admitted: {body}");
         assert!(
-            body.to_string()
-                .contains(&format!("jwt_auth: unknown config key '{unknown_key}'")),
+            body["error"]
+                .as_str()
+                .expect("admin error string")
+                .contains(&format!("jwt_auth: unknown config key {unknown_key:?}")),
             "unexpected admin validation response: {body}"
         );
     }

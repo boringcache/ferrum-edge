@@ -65,6 +65,8 @@ mod grpc_auth_iss_claim_tests;
 mod grpc_capability_probe_log_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
+#[cfg(feature = "bench-h1-profile")]
+mod h1_profile_tests;
 mod h3_cross_protocol_backend_header_tests;
 mod h3_cross_protocol_bytes_share_tests;
 mod h3_native_reject_bytes_share_tests;
@@ -189,6 +191,8 @@ mod udp_amplification_tests;
 mod udp_auth_lifetime_tests;
 mod udp_dtls_idle_activity_tests;
 mod udp_egress_isolation_tests;
+#[cfg(feature = "bench-udp-profile")]
+mod udp_profile_tests;
 mod udp_reply_stop_tests;
 mod udp_setup_failure_tests;
 mod unix_backend_pool_tests;

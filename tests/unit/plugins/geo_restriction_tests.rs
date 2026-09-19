@@ -190,6 +190,66 @@ fn test_new_invalid_db_path_succeeds_with_none_reader() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn unavailable_database_constructor_log_withholds_source_path() {
+    let directory = TempDir::new().unwrap();
+    let path = directory
+        .path()
+        .join("'GEO_CONSTRUCTOR_PATH_CANARY`-missing.mmdb");
+    let missing_error = std::fs::metadata(&path).unwrap_err();
+    assert_eq!(missing_error.kind(), std::io::ErrorKind::NotFound);
+
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["US"]
+    }))
+    .expect("missing MMDB must still admit the fallback");
+
+    let output = logs.contents();
+    let warning = output
+        .lines()
+        .find(|line| line.contains("MaxMind database file not available"))
+        .expect("unavailable database must emit its constructor warning");
+    assert!(warning.trim_start().starts_with("WARN "), "{output}");
+    for expected in [
+        "db_path=<redacted scalar>",
+        "error=MaxMind database file <redacted scalar> not accessible before open:",
+        "plugin=\"geo_restriction\"",
+        "plugin will use on_lookup_failure policy until file is present",
+    ] {
+        assert!(warning.contains(expected), "missing {expected:?}: {output}");
+    }
+    assert!(warning.contains(&missing_error.to_string()), "{output}");
+    let default_warning = output
+        .lines()
+        .find(|line| line.contains("`on_lookup_failure` is not set"))
+        .expect("omitted failure policy must still emit its default warning");
+    assert!(
+        default_warning.trim_start().starts_with("WARN "),
+        "{output}"
+    );
+    assert!(
+        default_warning.contains("defaulting to `allow` (fail-open)"),
+        "{output}"
+    );
+    assert!(
+        default_warning.contains("`on_lookup_failure` explicitly (`allow` or `deny`)"),
+        "{output}"
+    );
+    assert!(!output.contains("GEO_CONSTRUCTOR_PATH_CANARY"), "{output}");
+    assert!(!output.contains(path_text(&path)), "{output}");
+
+    let mut ctx = request_context("203.0.113.1");
+    assert!(
+        matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "the default lookup-failure policy must still allow the request"
+    );
+}
+
 #[test]
 fn test_plugin_metadata_and_protocol_flags() {
     let config = json!({
@@ -354,28 +414,72 @@ fn test_new_rejects_non_bool_inject_headers() {
     assert!(result.err().unwrap().contains("inject_headers"));
 }
 
-#[tokio::test]
-async fn test_missing_reader_uses_deny_lookup_failure_policy() {
-    let config = json!({
-        "db_path": "/nonexistent/path/to/test.mmdb",
+#[tokio::test(flavor = "current_thread")]
+async fn missing_reader_deny_hooks_withhold_source_path() {
+    let directory = TempDir::new().unwrap();
+    // Leave this hostile path unregistered with the external-secret scrubber.
+    let path = directory.path().join("'GEO_DENY_PATH_CANARY`-missing.mmdb");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
         "allow_countries": ["US"],
         "on_lookup_failure": "deny"
-    });
-    let plugin = GeoRestriction::new(&config).unwrap();
-    let mut ctx = RequestContext::new(
-        "203.0.113.1".to_string(),
-        "GET".to_string(),
-        "/test".to_string(),
-    );
+    }))
+    .expect("missing MMDB must still admit the explicit deny fallback");
 
-    let result = plugin.on_request_received(&mut ctx).await;
-    assert!(matches!(
-        result,
-        PluginResult::Reject {
-            status_code: 403,
-            ..
+    for hook in ["request", "stream"] {
+        // Capture after construction, at DEBUG so the shared WARN sampler
+        // cannot hide the runtime emission under parallel test load.
+        let (logs, _guard) = super::plugin_utils::capture_debug_logs();
+        let result = if hook == "request" {
+            let mut ctx = request_context("203.0.113.1");
+            plugin.on_request_received(&mut ctx).await
+        } else {
+            let mut ctx = geo_stream_context("203.0.113.1");
+            plugin.on_stream_connect(&mut ctx).await
+        };
+        match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 403, "{hook}");
+                assert_eq!(
+                    body, r#"{"error":"Access denied: GeoIP database not available"}"#,
+                    "{hook}"
+                );
+                assert!(headers.is_empty(), "{hook}");
+            }
+            _ => panic!("{hook} must still reject with an unavailable MMDB"),
         }
-    ));
+
+        let output = logs.contents();
+        let event = output
+            .lines()
+            .find(|line| {
+                line.trim_start().starts_with("DEBUG ")
+                    && line.contains("denying by on_lookup_failure policy")
+            })
+            .expect("the deny hook must emit its detailed event");
+        for expected in [
+            "db_path=<redacted scalar>",
+            "client_ip=203.0.113.1",
+            "plugin=\"geo_restriction\"",
+            "reason=\"db_not_loaded\"",
+            "MaxMind database not loaded, denying by on_lookup_failure policy",
+        ] {
+            assert!(
+                event.contains(expected),
+                "{hook}: missing {expected:?}: {output}"
+            );
+        }
+        assert!(!output.contains("GEO_DENY_PATH_CANARY"), "{hook}: {output}");
+        assert!(!output.contains(path_text(&path)), "{hook}: {output}");
+    }
 }
 
 #[tokio::test]
@@ -1404,4 +1508,44 @@ async fn true_ipv6_client_is_not_folded_onto_an_ipv4_country_decision() {
         native.canonical_client_ip(),
         Some("89.160.20.112".parse().unwrap())
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"db_path": "/unused.mmdb", "allow_countries": [canary]}),
+            &["`allow_countries`", "invalid ISO"],
+        ),
+        (
+            json!({"db_path": "/unused.mmdb", "allow_countries": [true]}),
+            &["`allow_countries`", "must be strings"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("geo_restriction", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }

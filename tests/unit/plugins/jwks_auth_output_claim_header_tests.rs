@@ -314,7 +314,7 @@ fn effective_claim_header_family_collisions_are_rejected() {
             Err(error) => error,
         };
         assert!(
-            error.contains("both 'claim_headers' and 'output_claim_headers'"),
+            error.contains("both `claim_headers` and `output_claim_headers`"),
             "expected a cross-family collision diagnostic, got: {error}"
         );
     }

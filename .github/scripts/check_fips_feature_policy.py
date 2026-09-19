@@ -101,6 +101,9 @@ CLAIMED_FIPS_PROFILES = (
     ("fips + acme", "fips,acme"),
     ("fips + pkcs11", "fips,pkcs11"),
     ("fips + ebpf", "fips,ebpf"),
+    ("fips + bench-h1-profile", "fips,bench-h1-profile"),
+    ("fips + bench-udp-profile", "fips,bench-udp-profile"),
+    ("fips + bench-h1-profile + bench-udp-profile", "fips,bench-h1-profile,bench-udp-profile"),
     ("fips + acme + pkcs11 + ebpf", "fips,acme,pkcs11,ebpf"),
 )
 

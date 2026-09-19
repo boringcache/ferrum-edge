@@ -1339,7 +1339,7 @@ fn test_mtls_auth_rejects_unknown_top_level_field() {
     let error = MtlsAuth::new(&json!({"cert_field": "subject_cn", "typo": true}))
         .err()
         .expect("unknown top-level fields must fail closed");
-    assert!(error.contains("unsupported field 'typo'"), "got: {error}");
+    assert!(error.contains("unsupported field \"typo\""), "got: {error}");
 }
 
 #[test]
@@ -1737,4 +1737,48 @@ async fn test_mtls_auth_supports_udp_protocol() {
         protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http),
         "mtls_auth should still support HTTP protocol"
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"allowed_issuers": [{(canary): true}]}),
+            &["`allowed_issuers[0]`", "unsupported issuer field"],
+        ),
+        (
+            json!({"allowed_ca_fingerprints_sha256": [8675309]}),
+            &["`allowed_ca_fingerprints_sha256[0]`", "must be a string"],
+        ),
+        (
+            json!({"cert_field": canary}),
+            &["`cert_field`", "supported certificate field"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("mtls_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }
