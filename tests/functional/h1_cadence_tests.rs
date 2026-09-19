@@ -458,6 +458,13 @@ impl Fixture {
         if observed {
             let identity = format!("ferrum_h1_profile_pid {pid}");
             assert!(metrics.lines().any(|line| line == identity));
+            assert!(
+                metrics
+                    .lines()
+                    .any(|line| line == "ferrum_h1_profile_allocator_installed 1")
+            );
+        } else {
+            assert!(!metrics.contains("ferrum_h1_profile_allocator_installed"));
         }
         eprintln!(
             "H1 cadence binary={} pid={pid} observer={observed} cutoff={cutoff} url={}",
