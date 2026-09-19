@@ -184,9 +184,72 @@ def snapshot(sample_id=0, processes=(), owned_gateway=None):
     return row
 
 
+def capture_bracket(usage, phases):
+    """Common timing gate, including observer-OFF capture attempts.
+
+    An expected metrics parse failure waives counters only, never the clocks,
+    process/scrape timing or continuity of the passive reader.
+    """
+    try:
+        start, duration = phases["measurement_start_unix_secs"], phases["measurement_secs"]
+        if (not finite_number(start) or start < 0 or not finite_number(duration)
+                or duration <= 0 or not finite_number(start + duration)):
+            raise ValueError("invalid measurement boundaries")
+        timeline = usage["timeline"]
+        if not isinstance(timeline, list) or not timeline:
+            raise ValueError("missing capture timeline")
+        for row in timeline:
+            p = row["h1_profile"]
+            if (not finite_number(row["unix_secs"]) or row["unix_secs"] < 0
+                    or any(not finite_number(p[key]) or p[key] < 0 for key in (
+                        "unix_secs", "monotonic_secs", "capture_secs", "sampler_cpu_secs"))
+                    or type(p["sample_id"]) is not int or p["sample_id"] < 0):
+                raise ValueError("invalid capture clocks, sample ID or sampler CPU")
+        if any(b["unix_secs"] <= a["unix_secs"] for a, b in zip(timeline, timeline[1:])):
+            raise ValueError("non-increasing process capture clock")
+        for a, b in zip(timeline, timeline[1:]):
+            if any(b["h1_profile"][key] <= a["h1_profile"][key]
+                   for key in ("sample_id", "unix_secs", "monotonic_secs")):
+                raise ValueError("non-increasing capture clock or ID")
+        before = [i for i, r in enumerate(timeline)
+                  if r["h1_profile"]["unix_secs"] + r["h1_profile"]["capture_secs"] <= start]
+        after = [i for i, r in enumerate(timeline) if r["h1_profile"]["unix_secs"] >= start + duration]
+        if not before or not after or before[-1] >= after[0]:
+            raise ValueError("missing complete capture bracket")
+        rows = timeline[before[-1]:after[0] + 1]
+        profiles = [row["h1_profile"] for row in rows]
+        issues = []
+        if usage.get("capture_complete") is not True:
+            issues.append("incomplete capture")
+        if any(not 0 <= p["unix_secs"] - r["unix_secs"] <= MAX_SAMPLE_GAP_SECS
+               for p, r in zip(profiles, rows)):
+            issues.append("stale process observation at scrape")
+        for a, b in zip(profiles, profiles[1:]):
+            if (b["sample_id"] != a["sample_id"] + 1
+                    or not 0 < b["monotonic_secs"] - a["monotonic_secs"] <= MAX_SAMPLE_GAP_SECS
+                    or b["unix_secs"] <= a["unix_secs"]
+                    or b["monotonic_secs"] < a["monotonic_secs"] + a["capture_secs"]):
+                issues.append("capture gap, clock reversal or overlap")
+        if any(abs((p["unix_secs"] - profiles[0]["unix_secs"]) -
+                   (p["monotonic_secs"] - profiles[0]["monotonic_secs"])) > CLOCK_TOLERANCE_SECS
+               for p in profiles):
+            issues.append("wall/monotonic clock discontinuity")
+        if not any(start <= p["unix_secs"] and p["unix_secs"] + p["capture_secs"] <= start + duration
+                   for p in profiles):
+            issues.append("no capture inside measurement")
+        slack = start - rows[0]["unix_secs"] + profiles[-1]["unix_secs"] + profiles[-1]["capture_secs"] - start - duration
+        if slack > MAX_BOUNDARY_SLACK_SECS:
+            issues.append("process/capture bracket exceeds two-second slack")
+        return rows, issues
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+        return [], ["missing/malformed capture timing evidence"]
+
+
 def profile_bracket(usage, phases, *, owned_gateway=None, successful_responses=0):
     result = dict(complete=False, issues=[], publication_complete=False,
                   coverage="published Rust/source-site counts only; not native or syscall coverage")
+    _, timing_issues = capture_bracket(usage, phases)
+    result["issues"].extend(timing_issues)
     if not isinstance(usage, dict) or not isinstance(phases, dict):
         result["issues"].append("malformed capture or measurement boundaries")
         return result
@@ -509,7 +572,7 @@ def runtime_issues(runtime, config_path, pair, gateway, manifest, mode):
         issues.append("container not running at capture")
     if not matches(r"sha256:[0-9a-f]{64}", runtime.get("image_id")):
         issues.append("missing or invalid immutable image ID")
-    expected_observer = "off" if gateway == "ferrum-baseline" else "on"
+    expected_observer = "off" if mode == "diagnostic" or gateway == "ferrum-baseline" else "on"
     for key in ("container_labels", "image_labels"):
         labels = runtime.get(key)
         if (not isinstance(labels, dict) or labels.keys() != {REVISION_LABEL, OBSERVER_LABEL}
@@ -557,17 +620,11 @@ def runtime_process_issues(runtime, usage, sample):
         started = datetime.datetime.fromisoformat(runtime["started_at"].replace("Z", "+00:00"))
         if started.timestamp() > start:
             raise ValueError("container started after measurement began")
-        timeline = usage["timeline"]
-        if (not isinstance(timeline, list) or not timeline
-                or any(not isinstance(row, dict) or not finite_number(row.get("unix_secs"))
-                       for row in timeline)
-                or any(b["unix_secs"] < a["unix_secs"] for a, b in zip(timeline, timeline[1:]))):
-            raise ValueError("invalid process timeline")
-        before = [i for i, row in enumerate(timeline) if row["unix_secs"] <= start]
-        after = [i for i, row in enumerate(timeline) if row["unix_secs"] >= start + duration]
-        if not before or not after or before[-1] >= after[0]:
-            raise ValueError("missing process bracket")
-        for row in timeline[before[-1]:after[0] + 1]:
+        rows, timing_issues = capture_bracket(usage, phases)
+        if timing_issues:
+            return ["missing/mismatched owned runtime process bracket"] + timing_issues
+        prior_binding = None
+        for row in rows:
             processes = row["processes"]
             if not isinstance(processes, list) or any(not isinstance(p, dict) for p in processes):
                 raise ValueError("malformed processes")
@@ -577,6 +634,22 @@ def runtime_process_issues(runtime, usage, sample):
                     or gateways[0]["pid"] != owned["host_pid"]
                     or gateways[0]["start_ticks"] != owned["start_ticks"]):
                 raise ValueError("unowned/reused gateway process")
+            profile = row["h1_profile"]
+            binding = profile["gateway_binding"]
+            endpoint = binding["before"]
+            nspids = endpoint["namespace_pids"]
+            if (profile.get("identity_error") or binding["container_id"] != owned["container_id"]
+                    or binding["endpoint"] != METRICS_ENDPOINT or endpoint != binding["after"]
+                    or any(type(endpoint[k]) is not int or endpoint[k] <= 0
+                           for k in ("host_pid", "start_ticks", "listener_inode"))
+                    or endpoint["host_pid"] != owned["host_pid"]
+                    or endpoint["start_ticks"] != owned["start_ticks"]
+                    or not isinstance(nspids, list) or not nspids
+                    or any(type(pid) is not int or pid <= 0 for pid in nspids)
+                    or nspids[0] != owned["host_pid"]
+                    or (prior_binding is not None and binding != prior_binding)):
+                raise ValueError("unowned or changed capture listener")
+            prior_binding = binding
         measured = sample["process_usage"]["measurement"]
         gateways = [p for p in measured if p["role"] == "gateway"]
         if (len(gateways) != 1 or type(gateways[0].get("pid")) is not int
@@ -762,38 +835,153 @@ def report(directory, mode):
     return report
 
 
+def read_evidence(path):
+    # The producer's pretty-printed client report is bounded below 16 MiB.
+    with Path(path).open() as stream:
+        raw = stream.read(16 * 1024 * 1024 + 1)
+    if len(raw) > 16 * 1024 * 1024:
+        raise ValueError("oversized retained evidence")
+    try:
+        return json.loads(raw)
+    except RecursionError as error:
+        raise ValueError("excessively nested retained evidence") from error
+
+
 def report_diagnostic(directory):
     from benchmark_validity import sample_issues
+    from h1_diagnostic_evidence import ARMS, diagnostic_issues, fields, number, require, uint
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     result = dict(mode="diagnostic", comparison_eligible=False,
                   cause="unproven; a clean slice does not resolve retained failures",
-                  observations=[], complete=True)
-    for gateway in ("direct", "ferrum", "ferrum-exp-cutoff-one"):
-        path = directory / "pairs/pair_001" / f"{gateway}_http1-tls_5242880.json"
-        issues = []
+                  observations=[], manifest_issues=[], complete=False)
+    try:
+        manifest = read_evidence(directory / "manifest.json")
+        expected = dict(sample_schema=2, pairs=1, gateways=ARMS, payload_sizes=[5242880],
+                        protocol="http1-tls", duration=30, offered_workers=200,
+                        h1_profile_mode="diagnostic", h1_diagnostic_enabled=True,
+                        h2_observation_enabled=False)
+        for key, value in expected.items():
+            if type(manifest.get(key)) is not type(value) or manifest[key] != value:
+                result["manifest_issues"].append("diagnostic manifest mismatch: " + key)
+        if (not isinstance(manifest.get("host_id"), str) or not manifest["host_id"].strip()
+                or not matches(r"[0-9a-f]{40}", manifest.get("h1_revision"))
+                or manifest.get("adaptive_extension", False) is not False):
+            result["manifest_issues"].append("missing host/revision or unexpected extension")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        manifest = {}
+        result["manifest_issues"].append("missing/malformed diagnostic manifest")
+    try:
+        termination = read_evidence(directory / "diagnostic_termination.json")
+        result["termination"] = termination
+        if (type(termination.get("schema")) is not int or termination["schema"] != 1
+                or termination.get("status") != "completed"
+                or type(termination.get("campaign_exit_code")) is not int or termination["campaign_exit_code"] != 0
+                or termination.get("cleanup_complete") is not True
+                or not finite_number(termination.get("elapsed_secs"))
+                or not finite_number(termination.get("budget_secs"))
+                or not 0 < termination["budget_secs"] <= 900
+                or not 0 <= termination["elapsed_secs"] <= termination["budget_secs"]):
+            result["manifest_issues"].append("campaign termination/cleanup incomplete")
+    except (OSError, ValueError, TypeError, AttributeError):
+        result["manifest_issues"].append("missing/malformed campaign termination")
+    runtimes = []
+    clients = []
+    for position, gateway in enumerate(ARMS, 1):
+        folder = directory / "pairs/pair_001"
+        path = folder / f"{gateway}_http1-tls_5242880.json"
+        row = dict(pair=1, gateway=gateway, payload=5242880, path=str(path),
+                   issues=result["manifest_issues"].copy())
+        issues = row["issues"]
         try:
-            sample = json.loads(path.read_text())
+            sample = read_evidence(path)
+            row["sample"] = sample  # partial evidence remains available on failure
             issues.extend(sample_issues(sample))
-            diagnostic = sample["phases"]["h1_diagnostic"]
-            if diagnostic["clock_domain"] != "client_process_diagnostic_session_instant_microseconds":
-                issues.append("missing named client clock domain")
-            if any(diagnostic["loss"].values()):
-                issues.append("diagnostic capture loss")
-            if len(diagnostic["snapshots"][-1]["workers"]) != 50:
-                issues.append("missing worker last state")
-            retirement = diagnostic["retirement"]
-            if retirement["timed_out"] or any(retirement[key] for key in (
-                    "completed_error", "cancelled", "panicked", "capacity_rejections",
-                    "unreaped_after_abort")):
-                issues.append("driver retirement incomplete or failed (separate from request work)")
-            if retirement["started"] < 50 or retirement["started"] != retirement["completed_ok"]:
-                issues.append("driver completion accounting incomplete")
-        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
-            issues.append("missing or malformed diagnostic sample")
-        result["observations"].append(dict(gateway=gateway, path=str(path), issues=issues))
-        result["complete"] = result["complete"] and not issues
-    (directory / "h1_diagnostic_report.json").write_text(json.dumps(result, indent=2) + "\n")
+            for key, value in dict(sample_schema=2, pair=1, gateway=gateway, payload_size=5242880,
+                                   protocol="HTTP/1.1+TLS", duration_secs=30, concurrency=50,
+                                   effective_concurrency=50, host_id=manifest.get("host_id"),
+                                   order_position=position, gateway_order=ARMS).items():
+                if type(sample.get(key)) is not type(value) or sample.get(key) != value:
+                    issues.append("diagnostic sample mismatch: " + key)
+            phases = sample["phases"]
+            if ("samples" in sample or not finite_number(phases["measurement_secs"])
+                    or phases["measurement_secs"] != 30 or phases["timed_out"] is not False
+                    or phases["preflight_bound_secs"] != 70 or phases["stalled_workers"] != []):
+                issues.append("diagnostic workload/phase mismatch")
+            diagnostic = phases["h1_diagnostic"]
+            state_issues = diagnostic_issues(diagnostic)
+            issues.extend(state_issues)
+            client = phases["client_usage"]
+            fields(client, "pid role complete_bracket cpu_seconds peak_rss_bytes rss_scope bracket_secs boundary_slack_secs")
+            uint(client["pid"], True)
+            uint(client["peak_rss_bytes"])
+            uint(sample["total_bytes"])
+            for key in ("cpu_seconds", "bracket_secs", "boundary_slack_secs"):
+                number(client[key])
+            require(client["rss_scope"] == "process lifetime high-water mark at measurement end"
+                    and 30 <= client["bracket_secs"] <= 31.5
+                    and abs(client["boundary_slack_secs"] - (client["bracket_secs"] - 30)) < 0.000001,
+                    "client boundary accounting mismatch")
+            pid = diagnostic["pid"]
+            if (type(pid) is not int or type(client["pid"]) is not int or client["pid"] != pid
+                    or client["role"] != "client" or client["complete_bracket"] is not True
+                    or [p for p in sample["process_usage"]["measurement"] if p["role"] == "client"] != [client]):
+                issues.append("diagnostic PID is not the measured client")
+            clients.append((pid, row))
+            if not state_issues:
+                completed = sum(w["completions"] for w in diagnostic["snapshots"][-1]["workers"])
+                counts = [sample[k] for k in ("warmup_requests", "total_requests", "drain_requests")]
+                if any(type(n) is not int or n < 0 for n in counts) or completed != sum(counts):
+                    issues.append("worker/useful request accounting mismatch")
+            usage = read_evidence(folder / "diagnostics" / f"{gateway}_5242880_process_usage.json")
+            # Keep raw ownership evidence for all three arms, including direct.
+            if usage.get("capture_complete") is not True:
+                issues.append("incomplete passive process capture")
+            client_ids = {(p["pid"], p["start_ticks"]) for r in usage["timeline"]
+                          for p in r["processes"] if p["role"] == "client"}
+            if (len(client_ids) != 1 or any(type(n) is not int or n <= 0 for ids in client_ids for n in ids)
+                    or next(iter(client_ids))[0] != pid):
+                issues.append("client PID/lifetime is not the owned passive-reader process")
+            start = phases["measurement_start_unix_secs"]
+            number(start)
+            interior = [r for r in usage["timeline"] if start <= r["unix_secs"] <= start + 30]
+            if not interior or any(
+                    len([p for p in r["processes"] if p["role"] == "client"]) != 1
+                    or any((p["pid"], p["start_ticks"]) not in client_ids
+                           for p in r["processes"] if p["role"] == "client") for r in interior):
+                issues.append("missing/ambiguous client lifetime inside measurement")
+            if gateway != "direct":
+                runtime = read_evidence(folder / "diagnostics" / f"{gateway}_runtime.json")
+                row["runtime"] = runtime
+                issues.extend(runtime_issues(runtime, folder / "diagnostics" / f"{gateway}_config.yaml",
+                                             1, gateway, manifest, "diagnostic"))
+                issues.extend(runtime_process_issues(runtime, usage, sample))
+                runtimes.append(row)
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, OverflowError):
+            issues.append("missing or malformed diagnostic sample/runtime evidence")
+        result["observations"].append(row)
+    # Both gateway arms deliberately use one immutable observer-OFF image.
+    if len(runtimes) == 2:
+        try:
+            a, b = [r["runtime"] for r in runtimes]
+            if (any(a[k] != b[k] for k in ("image_id", "config_sha256", "other_environment_sha256", "other_mounts_sha256"))
+                    or {k: v for k, v in a["environment"].items() if k != CUTOFF_ENV} !=
+                    {k: v for k, v in b["environment"].items() if k != CUTOFF_ENV}
+                    or a["container_id"] == b["container_id"]
+                    or (a["host_pid"], a["start_ticks"]) == (b["host_pid"], b["start_ticks"])):
+                raise ValueError("diagnostic runtime pairing mismatch or copied process")
+        except (KeyError, TypeError, ValueError) as error:
+            for row in runtimes:
+                row["issues"].append("diagnostic runtime pairing: " + str(error))
+    for pid, row in clients:
+        if sum(other == pid for other, _ in clients) != 1:
+            row["issues"].append("copied diagnostic client PID across arms")
+    result["complete"] = not result["manifest_issues"] and all(not r["issues"] for r in result["observations"])
+    # A supervisor seeds a failed report before startup. Replace it atomically
+    # only after all three rows exist, including on every validation failure.
+    temporary = directory / "h1_diagnostic_report.json.tmp"
+    temporary.write_text(json.dumps(result, indent=2) + "\n")
+    temporary.replace(directory / "h1_diagnostic_report.json")
     return result
 
 

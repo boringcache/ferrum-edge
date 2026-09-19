@@ -2,8 +2,10 @@ import copy
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -79,10 +81,10 @@ def traffic_sample(gateway, pair, size, gateway_pid=31):
 REVISION = "f73e1d2299ed61612bc5dd95315e3df901b150fa"
 
 
-def docker_inspect(config, gateway="ferrum", pair=1):
+def docker_inspect(config, gateway="ferrum", pair=1, mode="cutoff"):
     # Actual Dockerfile.release + start_ferrum shape, independently enumerated
     # so producer/consumer changes cannot silently update a mirrored fixture.
-    observer = "off" if gateway == "ferrum-baseline" else "on"
+    observer = "off" if mode == "diagnostic" or gateway == "ferrum-baseline" else "on"
     labels = {"org.opencontainers.image.revision": REVISION, "ferrum.h1-profile": observer,
               "org.opencontainers.image.title": "Ferrum Edge"}
     environment = [
@@ -125,7 +127,7 @@ def docker_inspect(config, gateway="ferrum", pair=1):
 
 
 def retain_fixture(path, config, gateway="ferrum", pair=1, mode="cutoff"):
-    container, image = docker_inspect(config, gateway, pair)
+    container, image = docker_inspect(config, gateway, pair, mode)
     with patch.object(profile, "process_start_ticks", return_value=100), \
             patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))):
         profile.retain_runtime(path, container, config, pair, gateway, "campaign-host", mode)
@@ -163,6 +165,97 @@ def campaign(root, mode="cutoff"):
                         json.dumps(usage))
     return root / "pairs/pair_001/ferrum_http1-tls_10240.json", \
         root / "pairs/pair_001/diagnostics/ferrum_10240_process_usage.json"
+
+
+def diagnostic_state(pid):
+    # Exact serialized Report/WorkerState/RequestState/ConnectionState shape.
+    # Real Rust H1/TLS output also crosses this validator in metrics_tests.
+    from h1_diagnostic_evidence import CLOCK
+
+    def at(t, phase="measurement"):
+        start = {"setup": 0, "measurement": 1_000_000, "drain": 31_000_000,
+                 "driver_retirement": 31_100_000}[phase]
+        relative = 29_999_990 + t if phase == "measurement" else t
+        return dict(session_us=start + relative, phase=phase, phase_us=relative)
+
+    workers, connections = [], []
+    for index in range(50):
+        request = dict(id=index + 101, offered=at(1), body_first_poll=at(2), body_bytes=5242880,
+                       body_last_progress=at(3), body_end=at(4), body_end_signal="end_stream_after_frame",
+                       headers=at(5), status=200, version="HTTP/1.1", content_length=5242880,
+                       content_length_present=True, transfer_encoding_present=False, chunked=False,
+                       connection_close=False, response_bytes=5242880, response_last_progress=at(6),
+                       response_end=at(7), response_end_signal="end_stream_after_frame", error_class=None,
+                       error_at=None, validated=True, completion=at(8))
+        workers.append(dict(id=index, connection_id=index + 1, stage="next_request", stage_since=at(9),
+                            lifecycle="returned", requests_offered=3, bodies_admitted=3, completions=3,
+                            errors=0, request=request))
+        connections.append(dict(id=index + 1, worker_id=index, local=f"127.0.0.1:{20000 + index}",
+                                peer="127.0.0.1:8443", socket_at=at(0, "setup"), driver="completed_ok",
+                                driver_at=at(10, "drain"), error_class=None))
+    loss = dict(workers=0, connections=0, updates=0, snapshots=0, poisoned_locks=0)
+    snapshots = [dict(clock_domain=CLOCK, pid=pid, reason=reason, at=at(t, phase),
+                      workers=copy.deepcopy(workers), connections=copy.deepcopy(connections), loss=loss.copy())
+                 for reason, t, phase in (("request_drain_complete", 11, "drain"),
+                                          ("driver_retirement_finished", 12, "driver_retirement"))]
+    return dict(schema=1, clock_domain=CLOCK, pid=pid, worker_capacity=256, connection_capacity=512,
+                snapshot_capacity=4, loss=loss, snapshots=snapshots,
+                retirement=dict(started=50, completed_ok=50, completed_error=0, cancelled=0, panicked=0,
+                                capacity_rejections=0, pending_at_request_drain=0, abort_requested=0,
+                                unreaped_after_abort=0, abort_reap_bound_secs=0.0, timed_out=False,
+                                elapsed_secs=0.001, bound_secs=5.0))
+
+
+def diagnostic_campaign(root):
+    from benchmark_plan import stamp_sample
+    from h1_diagnostic_evidence import ARMS
+    (root / "manifest.json").write_text(json.dumps(dict(
+        sample_schema=2, pairs=1, gateways=ARMS, payload_sizes=[5242880], host_id="campaign-host",
+        protocol="http1-tls", duration=30, offered_workers=200, h1_revision=REVISION,
+        h1_profile_mode="diagnostic", h1_diagnostic_enabled=True, h2_observation_enabled=False)))
+    (root / "diagnostic_termination.json").write_text(json.dumps(dict(
+        schema=1, status="completed", campaign_exit_code=0, cleanup_complete=True,
+        budget_secs=900, elapsed_secs=120)))
+    folder = root / "pairs/pair_001"
+    (folder / "diagnostics").mkdir(parents=True)
+    for position, gateway in enumerate(ARMS, 1):
+        identity = None
+        if gateway != "direct":
+            config = folder / "diagnostics" / f"{gateway}_config.yaml"
+            config.write_text((profile.ROOT / "configs/http1_tls_e2e_perf.yaml").read_text().replace(
+                "CA_PATH", "/etc/ferrum/tls/ca.pem"))
+            runtime = retain_fixture(folder / "diagnostics" / f"{gateway}_runtime.json",
+                                     config, gateway, mode="diagnostic")
+            identity = profile.gateway_identity(runtime)
+        sample = traffic_sample(gateway, 1, 5242880, identity["host_pid"] if identity else 31)
+        client = dict(pid=1000 + position, role="client", complete_bracket=True, cpu_seconds=1.0,
+                      peak_rss_bytes=1024, rss_scope="process lifetime high-water mark at measurement end",
+                      bracket_secs=30.001, boundary_slack_secs=0.001)
+        sample.update(duration_secs=30, rps=100 / 30, drain_requests=0)
+        sample["phases"].update(measurement_secs=30.0, measurement_elapsed_secs=30.001,
+                                preflight_bound_secs=70.0, stalled_workers=[], client_usage=client,
+                                h1_diagnostic=diagnostic_state(client["pid"]))
+        usage = capture(duration=30, identity=identity)
+        for row in usage["timeline"]:
+            if gateway == "direct":
+                row["processes"].clear()
+                row.pop("h1_profile")
+            else:
+                row["h1_profile"].pop("counters")
+                row["h1_profile"]["error"] = "ValueError"  # both gateways are OFF
+            row["processes"].extend([dict(pid=client["pid"], role="client", start_ticks=100),
+                                      dict(pid=2000 + position, role="backend", start_ticks=100)])
+            for process in row["processes"]:
+                process.update(cpu_seconds=row["unix_secs"], rss_bytes=1024)
+        usage["processes"] = copy.deepcopy(usage["timeline"][0]["processes"])
+        usage_path = folder / "diagnostics" / f"{gateway}_5242880_process_usage.json"
+        usage_path.write_text(json.dumps(usage))
+        path = folder / f"{gateway}_http1-tls_5242880.json"
+        path.write_text(json.dumps(sample))
+        # Exercise actual measurement_usage + stamping, including client self
+        # accounting and passive process ownership, not a hand-built admission.
+        stamp_sample(path, gateway, 5242880, 50, 1, position, "campaign-host", usage_path, " ".join(ARMS))
+    return folder / "ferrum_http1-tls_5242880.json"
 
 
 class H1InternalProfileTests(unittest.TestCase):
@@ -866,46 +959,122 @@ class H1InternalProfileTests(unittest.TestCase):
     def test_diagnostic_success_and_retained_failures_always_leave_cause_unproven(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            folder = root / "pairs/pair_001"
-            folder.mkdir(parents=True)
-            samples = {}
-            for gateway in ("direct", "ferrum", "ferrum-exp-cutoff-one"):
-                sample = traffic_sample(gateway, 1, 5242880)
-                sample["duration_secs"] = 30
-                sample["rps"] = 100 / 30
-                sample["phases"].update(measurement_secs=30.0, measurement_elapsed_secs=30.001,
-                    h1_diagnostic=dict(schema=1, pid=30, worker_capacity=256, connection_capacity=512,
-                        snapshot_capacity=4,
-                        clock_domain="client_process_diagnostic_session_instant_microseconds",
-                        loss=dict(workers=0, connections=0, updates=0, snapshots=0, poisoned_locks=0),
-                        snapshots=[dict(workers=[dict(worker_id=i) for i in range(50)])],
-                        retirement=dict(started=50, completed_ok=50, completed_error=0, cancelled=0,
-                                        panicked=0, capacity_rejections=0, unreaped_after_abort=0,
-                                        timed_out=False)))
-                path = folder / f"{gateway}_http1-tls_5242880.json"
-                path.write_text(json.dumps(sample))
-                samples[gateway] = (path, sample)
+            path = diagnostic_campaign(root)
+            original = json.loads(path.read_text())
             result = profile.report_diagnostic(root)
-            self.assertTrue(result["complete"])
+            self.assertTrue(result["complete"], result)
             self.assertFalse(result["comparison_eligible"])
             self.assertIn("unproven", result["cause"])
-            path, original = samples["ferrum"]
             for mutate in (
                     lambda s: s.update(error="retained drain failure"),
+                    lambda s: s.update(sample_schema=1),
+                    lambda s: s.update(gateway="direct"),
+                    lambda s: s.update(pair=True),
+                    lambda s: s.update(host_id="copied-host"),
+                    lambda s: s.update(payload_size=1),
+                    lambda s: s.update(duration_secs=15),
+                    lambda s: s.update(concurrency=1),
+                    lambda s: s.update(order_position=3),
+                    lambda s: s.update(samples=[]),
                     lambda s: s["phases"].update(timed_out=True),
+                    lambda s: s["phases"]["h1_diagnostic"].update(pid=30),
+                    lambda s: s["phases"]["h1_diagnostic"].update(schema=True),
+                    lambda s: s["phases"]["h1_diagnostic"]["loss"].clear(),
                     lambda s: s["phases"]["h1_diagnostic"]["loss"].update(updates=1),
+                    lambda s: s["phases"]["h1_diagnostic"]["loss"].update(workers=False),
+                    lambda s: s["phases"]["h1_diagnostic"]["retirement"].pop("elapsed_secs"),
                     lambda s: s["phases"]["h1_diagnostic"]["retirement"].update(completed_ok=49),
                     lambda s: s["phases"]["h1_diagnostic"]["retirement"].update(cancelled=1),
-                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"].clear()):
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"].clear(),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1].update(reason="request_drain_complete"),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1].update(workers=[{}] * 50),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["workers"][0].update(id=1),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["workers"][0].pop("request"),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["workers"][0].update(lifecycle="running"),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["workers"][0]["request"].update(body_end=None),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["connections"].clear(),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["connections"][0].update(worker_id=1),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"][-1]["connections"][0].update(driver="running")):
                 sample = copy.deepcopy(original)
                 mutate(sample)
                 path.write_text(json.dumps(sample))
                 result = profile.report_diagnostic(root)
-                self.assertFalse(result["complete"])
+                self.assertFalse(result["complete"], sample)
                 self.assertFalse(result["comparison_eligible"])
                 self.assertIn("unproven", result["cause"])
                 self.assertEqual(len(result["observations"]), 3)
                 self.assertTrue(result["observations"][1]["issues"])
+                self.assertEqual(result, json.loads((root / "h1_diagnostic_report.json").read_text()))
+
+    def test_diagnostic_manifest_runtime_and_copy_rejection(self):
+        for target, mutate in (
+                ("manifest.json", lambda v: v.update(h1_revision="wrong")),
+                ("manifest.json", lambda v: v.update(h1_diagnostic_enabled=False)),
+                ("manifest.json", lambda v: v.update(pairs=4)),
+                ("manifest.json", lambda v: v.update(duration=15)),
+                ("manifest.json", lambda v: v.update(offered_workers=50)),
+                ("manifest.json", lambda v: v.update(payload_sizes=[1])),
+                ("manifest.json", lambda v: v.update(gateways=["direct"])),
+                ("diagnostic_termination.json", lambda v: v.update(status="budget_exhausted")),
+                ("diagnostic_termination.json", lambda v: v.update(cleanup_complete=False)),
+                ("pairs/pair_001/diagnostics/ferrum_runtime.json", lambda v: v["image_labels"].update({profile.OBSERVER_LABEL: "on"})),
+                ("pairs/pair_001/diagnostics/ferrum_runtime.json", lambda v: v["container_labels"].update({profile.REVISION_LABEL: "d" * 40})),
+                ("pairs/pair_001/diagnostics/ferrum_runtime.json", lambda v: v.update(config_sha256="a" * 64)),
+                ("pairs/pair_001/diagnostics/ferrum-exp-cutoff-one_runtime.json", lambda v: v.update(image_id="sha256:" + "f" * 64)),
+                ("pairs/pair_001/diagnostics/ferrum_runtime.json", lambda v: v["environment"].update({profile.CUTOFF_ENV: "1"})),
+                ("pairs/pair_001/diagnostics/ferrum_5242880_process_usage.json", lambda v: v.update(h1_gateway=None))):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                diagnostic_campaign(root)
+                path = root / target
+                value = json.loads(path.read_text())
+                mutate(value)
+                path.write_text(json.dumps(value))
+                result = profile.report_diagnostic(root)
+                self.assertFalse(result["complete"])
+                self.assertEqual(len(result["observations"]), 3)
+        for absent in ("manifest.json", "diagnostic_termination.json",
+                       "pairs/pair_001/diagnostics/ferrum_runtime.json",
+                       "pairs/pair_001/diagnostics/ferrum_config.yaml"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                diagnostic_campaign(root)
+                (root / absent).unlink()
+                self.assertFalse(profile.report_diagnostic(root)["complete"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = diagnostic_campaign(root)
+            copied = path.read_text()
+            for arm in ("direct", "ferrum-exp-cutoff-one"):
+                (path.parent / f"{arm}_http1-tls_5242880.json").write_text(copied)
+            self.assertTrue(all(r["issues"] for r in profile.report_diagnostic(root)["observations"]))
+
+    def test_off_and_on_share_temporal_gate_and_preserve_partial_cpu(self):
+        for gateway in ("ferrum-baseline", "ferrum"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                campaign(root, "calibration")
+                path = root / f"pairs/pair_001/diagnostics/{gateway}_10240_process_usage.json"
+                original = json.loads(path.read_text())
+                for mutate in (
+                        lambda u: u.update(timeline=[u["timeline"][0], u["timeline"][-1]]),
+                        lambda u: u["timeline"][-1]["h1_profile"].update(unix_secs=40, monotonic_secs=140),
+                        lambda u: u["timeline"][2]["h1_profile"].update(monotonic_secs=200),
+                        lambda u: u["timeline"][2]["h1_profile"].update(capture_secs=2),
+                        lambda u: u["timeline"][2]["h1_profile"].update(sample_id=99),
+                        lambda u: u["timeline"][2].pop("h1_profile"),
+                        lambda u: u["timeline"][2]["h1_profile"].update(sampler_cpu_secs=True),
+                        lambda u: u["timeline"][2]["h1_profile"]["gateway_binding"]["after"].update(listener_inode=999)):
+                    usage = copy.deepcopy(original)
+                    mutate(usage)
+                    path.write_text(json.dumps(usage))
+                    result = profile.report(root, "calibration")
+                    self.assertFalse(result["runtime_complete"])
+                    self.assertFalse(result["fully_measured_comparison_eligible"])
+                    row = next(r for r in result["observations"] if r["gateway"] == gateway and r["pair"] == 1)
+                    self.assertTrue(row["runtime_issues"])
+                    self.assertEqual(row["sample"]["process_usage"]["measurement"][-1]["cpu_seconds"], 1)
+                    self.assertEqual(len(result["observations"]), 60)
 
     def test_h1_diagnostic_is_registered_without_changing_cadence_or_retry_policy(self):
         root = Path(__file__).resolve().parents[4]
@@ -916,8 +1085,90 @@ class H1InternalProfileTests(unittest.TestCase):
         self.assertIn("--test functional_tests h1_cadence_tests::", workflow)
         runner = (root / "tests/performance/multi_protocol/run_gateway_protocol_bench.sh").read_text()
         self.assertIn('extra_args+=(--h1-diagnostic)', runner)
-        self.assertIn('cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"', runner)
+        self.assertIn('> "$diagnostics/${gateway}_${payload}_client.raw.json"', runner)
         self.assertIn("One pass only: never pair, extend, rerun", runner)
+
+    @unittest.skipUnless(sys.platform == "linux", "hosted Linux session ownership")
+    def test_diagnostic_supervisor_bounds_actual_children_and_retains_all_rows(self):
+        import h1_diagnostic_campaign as campaign_runner
+        # Exercise the real deadline/termination/report producer. Only the
+        # expensive gateway workload and Docker cleanup dispatch are replaced;
+        # actual child sessions include a TERM-resistant, separate process group.
+        for scenario in ("completed", "startup_stall", "reader_stall", "cleanup_stall",
+                         "cleanup_timeout", "report_timeout"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stalled = scenario.endswith("stall") or scenario == "cleanup_timeout"
+                if stalled:
+                    child = subprocess.Popen(
+                        ["python3", "-c", "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); child=os.fork(); os.setpgid(0,0) if child==0 else None; time.sleep(60)"],
+                        start_new_session=True)
+                else:
+                    child = subprocess.Popen(["python3", "-c", "import time; time.sleep(0.15)"],
+                                             start_new_session=True)
+                identity = campaign_runner.process_identity(child.pid)
+                calls = []
+
+                def launch(command, **kwargs):
+                    self.assertEqual(command, ["bash", "tests/performance/multi_protocol/h1_diagnostic_campaign.sh"])
+                    self.assertTrue(kwargs["start_new_session"])
+                    self.assertTrue((root / "h1_diagnostic_report.json").exists())
+                    diagnostic_campaign(root)
+                    (root / "retained.raw.json").write_text('{"partial":')
+                    return child
+
+                def dispatch(command, **kwargs):
+                    calls.append(command[-1])
+                    self.assertGreater(kwargs["timeout"], 0)
+                    if command[-1].endswith("cleanup.sh"):
+                        if scenario == "cleanup_timeout":
+                            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                        result = campaign_runner.terminate_session(
+                            child.pid, identity["start_ticks"], time.monotonic() + 0.3)
+                        return subprocess.CompletedProcess(command, 0 if result["complete"] else 1)
+                    self.assertEqual(command, ["bash", "tests/performance/multi_protocol/h1_diagnostic_report.sh"])
+                    if scenario == "report_timeout":
+                        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                    report = profile.report_diagnostic(root)
+                    return subprocess.CompletedProcess(command, 0 if report["complete"] else 1)
+
+                try:
+                    started = time.monotonic()
+                    with patch.object(campaign_runner.subprocess, "Popen", side_effect=launch), \
+                            patch.object(campaign_runner.subprocess, "run", side_effect=dispatch):
+                        code = campaign_runner.supervise(root, 2)
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 2.5)  # scheduling tolerance, not an enlarged policy budget
+                    state = json.loads((root / "diagnostic_termination.json").read_text())
+                    report = json.loads((root / "h1_diagnostic_report.json").read_text())
+                    self.assertEqual(len(report["observations"]), 3)
+                    self.assertFalse(report["comparison_eligible"])
+                    self.assertEqual((root / "retained.raw.json").read_text(), '{"partial":')
+                    self.assertEqual(code == 0, scenario == "completed", state)
+                    self.assertEqual(report["complete"], scenario == "completed", report)
+                    self.assertTrue(any(path.endswith("cleanup.sh") for path in calls))
+                    if stalled:
+                        self.assertEqual(state["status"], "budget_exhausted")
+                    if scenario == "cleanup_timeout":
+                        self.assertFalse(state["cleanup_complete"])
+                    child.wait(timeout=1)
+                    self.assertEqual(campaign_runner.session_processes(child.pid, identity["start_ticks"]), [])
+                finally:
+                    campaign_runner.terminate_session(child.pid, identity["start_ticks"], time.monotonic() + 1)
+                    child.wait(timeout=1)
+
+    def test_diagnostic_supervisor_launch_failure_preserves_seeded_failed_report(self):
+        import h1_diagnostic_campaign as campaign_runner
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(campaign_runner.subprocess, "Popen", side_effect=OSError("startup failed")), \
+                patch.object(campaign_runner.subprocess, "run", side_effect=OSError("cleanup unavailable")):
+            root = Path(directory)
+            self.assertEqual(campaign_runner.supervise(root, 2), 1)
+            report = json.loads((root / "h1_diagnostic_report.json").read_text())
+            self.assertEqual(len(report["observations"]), 3)
+            self.assertTrue(all(row["issues"] for row in report["observations"]))
+            self.assertFalse(report["complete"])
+            self.assertFalse(report["termination"]["cleanup_complete"])
 
     def test_reports_retain_failed_and_missing_five_mib_observations(self):
         with tempfile.TemporaryDirectory() as directory:

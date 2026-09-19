@@ -14,6 +14,18 @@ use ferrum_edge::h1_profile::{
 use futures_util::task::noop_waker;
 use tokio::io::AsyncWrite;
 
+#[test]
+fn h1_profile_library_does_not_claim_global_allocator_installation() {
+    // This test executable links the library but has no forwarding global
+    // allocator. No test registers/resets process state; parallel tests that
+    // exercise local ForwardingAllocator instances cannot change this claim.
+    assert!(
+        ferrum_edge::h1_profile::render_prometheus()
+            .lines()
+            .any(|line| line == "ferrum_h1_profile_allocator_installed 0")
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn h1_profile_forwards_actual_jemalloc_and_failed_realloc() {

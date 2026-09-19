@@ -15,6 +15,35 @@ use super::proto_bench::h1_diagnostic_test_run;
 
 const ECHO: [u8; 4] = [0xab, 0xca, 0xe9, 0x08];
 
+fn assert_python_admission(report: &multi_protocol_perf::h1_diagnostic::Report, complete: bool) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Hosted producer-to-consumer regression: serialize the actual H1 worker
+    // and retirement path, not a reduced JSON fixture or source-text match.
+    let mut child = Command::new("python3")
+        .arg("h1_diagnostic_evidence.py")
+        .args(["--workers", "1", "--payload", "4"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(report).unwrap())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert_eq!(
+        result.status.success(),
+        complete,
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Reply {
     Clean,
@@ -166,6 +195,7 @@ async fn clean_plain_and_tls_echo_preserve_opt_in_off_semantics_and_retirement()
                 continue;
             }
             let report = phases.h1_diagnostic.unwrap();
+            assert_python_admission(&report, true);
             assert_eq!(report.clock_domain, CLOCK_DOMAIN);
             let snapshot = report.snapshots.last().unwrap();
             let worker = &snapshot.workers[0];
@@ -210,6 +240,7 @@ async fn truncated_and_invalid_responses_cannot_manufacture_eof_or_success() {
         assert_eq!(metrics.warmup_requests, 0);
         assert_eq!(metrics.total_errors, 1);
         let report = metrics.phases.unwrap().h1_diagnostic.unwrap();
+        assert_python_admission(&report, false);
         let worker = &report.snapshots.last().unwrap().workers[0];
         assert_eq!(worker.completions, 0);
         assert!(worker.request.response_end.is_none());
