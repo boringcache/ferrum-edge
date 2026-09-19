@@ -13,6 +13,13 @@ mod h1_profile_tests;
 #[path = "support/h2_observation_tests.rs"]
 mod h2_observation_tests;
 
+#[path = "support/grpc_connection_tests.rs"]
+mod grpc_connection_tests;
+
+#[allow(dead_code)]
+#[path = "../../../scaffolding/port_registry.rs"]
+mod port_registry;
+
 #[test]
 fn worker_transport_close_timeouts_are_ored_without_counting_errors() {
     let mut combined = BenchMetrics::new();

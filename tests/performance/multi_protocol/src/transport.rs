@@ -2,8 +2,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -111,19 +111,78 @@ impl Service<GrpcRequest> for ObservedChannel {
 pub struct CountedIo {
     stream: tokio::net::TcpStream,
     _connection: ConnectionGuard,
-    observation: Option<(Observer, usize, usize)>,
+    observation: Option<SocketObservation>,
+}
+
+struct SocketObservation {
+    observer: Observer,
+    connection_id: usize,
+    channel_id: usize,
+    identity: Arc<GrpcConnectionIdentity>,
 }
 
 impl Drop for CountedIo {
     fn drop(&mut self) {
-        if let Some((observer, connection_id, channel_id)) = &self.observation {
-            observer.record(
-                *connection_id,
+        if let Some(observation) = &self.observation {
+            // An older driver's retirement must not clear a newer socket.
+            let _ = observation.identity.current.compare_exchange(
+                observation.connection_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            observation.observer.record(
+                observation.connection_id,
                 None,
-                Some(*channel_id),
+                Some(observation.channel_id),
                 "socket_dropped",
                 None,
             );
+        }
+    }
+}
+
+/// Conservative channel-to-socket association, not a per-stream wire identity.
+/// RPC snapshots are lock-free; only connector attempts serialize publication.
+#[derive(Default)]
+pub struct GrpcConnectionIdentity {
+    current: AtomicUsize,
+    attempt: Mutex<Option<Arc<()>>>,
+}
+
+impl GrpcConnectionIdentity {
+    pub fn snapshot(&self) -> usize {
+        self.current.load(Ordering::Acquire)
+    }
+
+    /// IDs are unique within the observer. Any intervening connect attempt or
+    /// socket retirement permanently invalidates the earlier association.
+    pub fn connection_id_since(&self, before: usize) -> usize {
+        if before != 0 && self.snapshot() == before {
+            before
+        } else {
+            0
+        }
+    }
+
+    fn begin_attempt(&self) -> Arc<()> {
+        let token = Arc::new(());
+        // Invariant: these short critical sections contain no user code or
+        // awaits. The mutex protects attempt ownership and atomic publication.
+        let mut attempt = self.attempt.lock().expect("identity mutex poisoned");
+        self.current.store(0, Ordering::Release);
+        *attempt = Some(token.clone());
+        token
+    }
+
+    fn connected(&self, token: &Arc<()>, connection_id: usize) {
+        // Same non-panicking critical-section invariant as begin_attempt.
+        let attempt = self.attempt.lock().expect("identity mutex poisoned");
+        if attempt
+            .as_ref()
+            .is_some_and(|latest| Arc::ptr_eq(latest, token))
+        {
+            self.current.store(connection_id, Ordering::Release);
         }
     }
 }
@@ -135,7 +194,7 @@ pub struct GrpcConnector {
     pub connections: Connections,
     pub observer: Observer,
     pub channel_id: usize,
-    pub current_connection: Arc<AtomicUsize>,
+    pub current_connection: Arc<GrpcConnectionIdentity>,
 }
 
 impl Service<http::Uri> for GrpcConnector {
@@ -152,12 +211,21 @@ impl Service<http::Uri> for GrpcConnector {
         let observer = self.observer.clone();
         let channel_id = self.channel_id;
         let current = self.current_connection.clone();
+        // Invalidate at call, even if the returned future is never polled. A
+        // failed/cancelled attempt stays unknown; a superseded future cannot
+        // publish over a newer attempt, even if it completes successfully.
+        let attempt = current.begin_attempt();
         Box::pin(async move {
             let mut io = connections.call(uri).await?;
             let id = observer.connection_id();
-            current.store(id, Ordering::Release);
+            current.connected(&attempt, id);
             observer.record(id, None, Some(channel_id), "socket_opened", None);
-            io.inner_mut().observation = Some((observer, id, channel_id));
+            io.inner_mut().observation = Some(SocketObservation {
+                observer,
+                connection_id: id,
+                channel_id,
+                identity: current,
+            });
             Ok(io)
         })
     }
