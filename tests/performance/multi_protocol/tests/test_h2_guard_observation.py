@@ -607,7 +607,14 @@ class GuardObservationTests(unittest.TestCase):
             (root / "pairs/pair_004/ferrum_http2_71680.json").unlink()
             with self.assertRaises(ValueError):
                 verify_campaign(root, "http2")
-            self.assertEqual(len(json.loads((root / "guard-evidence-index.json").read_text())["samples"]), 11)
+            report = json.loads((root / "guard-evidence-index.json").read_text())
+            self.assertEqual(len(report["samples"]), 12)
+            missing = next(row for row in report["samples"]
+                           if row["path"] == "pairs/pair_004/ferrum_http2_71680.json")
+            self.assertFalse(missing["sample_present"])
+            self.assertIsNone(missing["sha256"])
+            self.assertTrue(missing["validation_failures"])
+            self.assertEqual(report["samples"][0]["total_errors"], 361)
 
 
 if __name__ == "__main__":

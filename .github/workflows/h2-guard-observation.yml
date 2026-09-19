@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev libcurl4-openssl-dev
           cargo metadata --locked --format-version 1 --manifest-path "$RUNNER_TEMP/h2-guard/context/Cargo.toml" > "$RUNNER_TEMP/h2-guard/evidence/metadata.json"
           python3 tests/performance/multi_protocol/h2_guard/verify.py graph "$RUNNER_TEMP/h2-guard/evidence/metadata.json" > "$RUNNER_TEMP/h2-guard/evidence/transport-chains.json"
           cargo check --manifest-path "$RUNNER_TEMP/h2-guard/context/Cargo.toml" --locked --lib --features cloud-secrets \
