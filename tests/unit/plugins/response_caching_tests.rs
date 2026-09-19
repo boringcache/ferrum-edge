@@ -9143,3 +9143,53 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_values() {
+    for value in [
+        "REPLAY_SCOPE_SECRET",
+        "'REPLAY_SCOPE_SECRET",
+        "\"REPLAY_SCOPE_SECRET",
+        "`REPLAY_SCOPE_SECRET`",
+        "'\nREPLAY_SCOPE_SECRET\\tail\"`",
+    ] {
+        let config = json!({"anonymous_caller_scope": value});
+        let error = ResponseCaching::new(&config)
+            .err()
+            .expect("unknown anonymous caller scope must reject construction");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("response_caching: unknown `anonymous_caller_scope` value"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(expected `caller_address` or `shared`)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<redacted scalar>"), "{rendered}");
+        assert!(
+            !rendered
+                .to_ascii_lowercase()
+                .contains("replay_scope_secret"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\n'), "{rendered}");
+    }
+}
+
+#[test]
+fn anonymous_scope_aliases_still_construct() {
+    for value in [
+        "caller_address",
+        "caller-address",
+        "shared",
+        " SHARED ",
+        " Caller-Address ",
+        "\u{85}SHARED\u{85}",
+    ] {
+        assert!(
+            ResponseCaching::new(&json!({"anonymous_caller_scope": value})).is_ok(),
+            "anonymous_caller_scope must accept {value:?}"
+        );
+    }
+}

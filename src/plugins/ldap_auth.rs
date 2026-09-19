@@ -1383,7 +1383,7 @@ fn is_loopback_ldap_endpoint(parsed: &Url) -> bool {
 fn ldap_url_hostname(parsed: &Url) -> Result<String, String> {
     let host = parsed
         .host()
-        .ok_or_else(|| "ldap_auth: 'ldap_url' must include a hostname".to_string())?;
+        .ok_or_else(|| "ldap_auth: `ldap_url` must include a hostname".to_string())?;
 
     Ok(match host {
         Host::Domain(hostname) => hostname.to_string(),

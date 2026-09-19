@@ -15,6 +15,9 @@ const ROOTS: &[&str] = &[
     "src/util/unknown_keys.rs",
     "src/plugins/utils/rate_limit.rs",
     "src/plugins/utils/socket_host.rs",
+    "src/plugins/utils/byte_budget.rs",
+    "src/plugins/utils/replay_partition.rs",
+    "src/plugins/utils/response_body.rs",
 ];
 
 // Exact exceptions only; adding one requires a producer/consumer justification.

@@ -44,6 +44,16 @@ paths:
   Migration/backup version diagnostics omit values even before rendering.
   Regex-library errors can reproduce patterns bare: replace them with the
   field/index and a fixed rejection reason.
+- Plugin cache construction/composition, optional omission, startup and reload
+  emissions quote supplied identities/priorities and sanitize before tracing.
+  The registered `plugin_cache_tests` captured-log matrix exercises final
+  constructor, startup, full-rebuild and delta emissions for global, proxy and
+  proxy-group scopes, including hostile identities/unknown keys, fixed spelling
+  suggestions, numeric bounds and optional omission. It checks event counts,
+  levels, retained schema/reasons and rejected-reload snapshot identity with
+  scoped subscribers and no environment mutation. Returned constructor causes
+  still depend on the producer convention above; sanitize copies at emission,
+  retaining the original causes for the eventual rendering boundary.
 - Known converted sites: mesh config validators (services/cluster IPs, workload
   identities, hosts, policy/targetRefs names, CIDRs, ext-authz and JWT headers,
   trust bundles, remote clusters/gateways); CORS origin/method/header checks;
@@ -163,6 +173,13 @@ paths:
   reasons without supplied identities.
   Registered loader, rendered-chain and captured-log regressions cover these
   surfaces; source IDs retained for internal identity are not safe log labels.
+- The #5594 residual utility audit covers shared logging byte limits (including
+  the retained-copy formula), anonymous replay scope and response-body limits.
+  Registered constructor/rendered-output tests cover all four logging callers,
+  all three replay callers and all four body-limit callers (both OPA fields).
+  WAF fixed bounds, scoring/target/stream shapes and enforcement remedies remain
+  visible; LDAP parsed-host admission retains `ldap_url` after URL normalization.
+  Supplied values stay withheld, including normalized hostile replay scope values.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
@@ -172,8 +189,9 @@ paths:
 - Scope of #5591: `src/config`, `src/modes`, `src/cli.rs`, `src/startup.rs`,
   `src/gateway_entry.rs`, `src/config_sources`, `src/grpc`, `src/capture`, and
   `src/plugins/waf`.
-  Other plugin families remain under #5594. Withholding is conditional on safe
-  producer interpolation: apostrophe-leading single-quoted values, bare values,
+  The #5594 family conversions listed above extend these diagnostics contracts.
+  Withholding is conditional on safe producer interpolation:
+  apostrophe-leading single-quoted values, bare values,
   and retained third-party parser text can still expose supplied data. Do not
   describe the renderer alone as fail-closed for arbitrary diagnostic text.
 - The mechanical producer/emitter contract is
@@ -181,8 +199,9 @@ paths:
   Its explicit `ROOTS` list covers the above roots except `src/capture`, whose
   generated shell commands also use quoted interpolation. Capture parsing has
   rendered-output and captured-log regressions. The guard scans every Rust file
-  in its roots, plus the converted shared unknown-key, rate-limit, and socket-host
-  helpers and notifications, including multiline/nested macros
+  in its roots, plus the converted shared unknown-key, rate-limit, socket-host,
+  byte-budget, replay-partition and response-body helpers and notifications,
+  including multiline/nested macros
   and raw strings, for single-quoted interpolation in diagnostic macros and for
   named error/message captures in `warn!`/`error!` without a sanitizer call in
   that statement. Its exact, commented exception list contains SQL query syntax,

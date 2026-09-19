@@ -142,7 +142,7 @@ pub(super) fn parse_stream_config(
     }
     let stream = raw
         .as_object()
-        .ok_or_else(|| "waf: 'stream' must be an object".to_string())?;
+        .ok_or_else(|| "waf: `stream` must be an object".to_string())?;
     reject_unknown_keys(
         stream,
         "config.stream",
@@ -182,56 +182,65 @@ fn compile_stream_signatures(
     if let Some(value) = stream.get("signatures").filter(|v| !v.is_null()) {
         let array = value
             .as_array()
-            .ok_or_else(|| "waf: 'stream.signatures' must be an array".to_string())?;
+            .ok_or_else(|| "waf: `stream.signatures` must be an array".to_string())?;
         let mut seen_ids = HashSet::new();
         for (idx, entry) in array.iter().enumerate() {
-            let obj = entry
-                .as_object()
-                .ok_or_else(|| format!("waf: `stream.signatures[{idx}]` must be an object"))?;
             let path = format!("config.stream.signatures[{idx}]");
-            reject_unknown_keys(
-                obj,
-                &path,
-                STREAM_SIGNATURE_KEYS,
-                &format!("waf: `{path}`: "),
-            )?;
-            let id = optional_string(obj, "id")?
-                .ok_or_else(|| format!("waf: `stream.signatures[{idx}]` requires `id`"))?;
-            if !seen_ids.insert(id.clone()) {
-                return Err(format!("waf: duplicate stream signature id {id:?}"));
-            }
-            let pattern = optional_string(obj, "pattern")?
-                .ok_or_else(|| format!("waf: stream signature {id:?} requires `pattern`"))?;
-            // Compile each pattern individually first so the error names the
-            // offending signature rather than a combined-set position.
-            regex::bytes::Regex::new(&pattern).map_err(|_| {
-                format!(
-                    "waf: `stream.signatures[{idx}].pattern` (signature {id:?}) is invalid \
-                     or too complex"
-                )
-            })?;
-            let severity = match optional_string(obj, "severity")? {
-                Some(s) => parse_severity(&s).ok_or_else(|| {
-                    format!("waf: stream signature {id:?} has invalid `severity` {s:?}")
-                })?,
-                None => Severity::Medium,
-            };
-            let action = match optional_string(obj, "action")? {
-                Some(a) => parse_rule_action(&a, "stream.signatures.action")?,
-                None => RuleAction::Enforce,
-            };
+            // Every entry failure needs its schema ordinal independently of
+            // supplied IDs and helper payloads withheld by the final renderer.
+            let (pattern, signature) = (|| {
+                let obj = entry
+                    .as_object()
+                    .ok_or_else(|| format!("waf: `stream.signatures[{idx}]` must be an object"))?;
+                reject_unknown_keys(
+                    obj,
+                    &path,
+                    STREAM_SIGNATURE_KEYS,
+                    &format!("waf: `{path}`: "),
+                )?;
+                let id = optional_string(obj, "id")?
+                    .ok_or_else(|| format!("waf: `stream.signatures[{idx}]` requires `id`"))?;
+                if !seen_ids.insert(id.clone()) {
+                    return Err(format!("waf: duplicate stream signature id {id:?}"));
+                }
+                let pattern = optional_string(obj, "pattern")?
+                    .ok_or_else(|| format!("waf: stream signature {id:?} requires `pattern`"))?;
+                // Compile each pattern individually first so the error names the
+                // offending signature rather than a combined-set position.
+                regex::bytes::Regex::new(&pattern).map_err(|_| {
+                    format!(
+                        "waf: `stream.signatures[{idx}].pattern` (signature {id:?}) is invalid \
+                         or too complex"
+                    )
+                })?;
+                let severity = match optional_string(obj, "severity")? {
+                    Some(s) => parse_severity(&s).ok_or_else(|| {
+                        format!("waf: stream signature {id:?} has invalid `severity` {s:?}")
+                    })?,
+                    None => Severity::Medium,
+                };
+                let action = match optional_string(obj, "action")? {
+                    Some(a) => parse_rule_action(&a, "stream.signatures.action")?,
+                    None => RuleAction::Enforce,
+                };
+                Ok((
+                    pattern,
+                    StreamSignatureMeta {
+                        id,
+                        severity,
+                        action,
+                    },
+                ))
+            })()
+            .map_err(|error: String| format!("waf: `{path}`: {error}"))?;
             // Drop disabled signatures from the active set (parity with HTTP WAF
             // rules) so a temporarily disabled rule produces no matches, no
             // `waf.rule_hits` metadata, and no stdout events while it is off.
-            if action == RuleAction::Disabled {
+            if signature.action == RuleAction::Disabled {
                 continue;
             }
             patterns.push(pattern);
-            meta.push(StreamSignatureMeta {
-                id,
-                severity,
-                action,
-            });
+            meta.push(signature);
         }
     }
 
