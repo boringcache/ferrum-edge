@@ -823,8 +823,14 @@ async fn test_workload_metrics_rejects_datadog_agent_url_with_empty_authority() 
     .err()
     .expect("datadog agent_url with empty authority must be rejected");
 
-    assert!(err.contains("could not construct tracing exporter"), "{err}");
-    assert!(err.contains("`tracing_providers` and exporter options"), "{err}");
+    assert!(
+        err.contains("could not construct tracing exporter"),
+        "{err}"
+    );
+    assert!(
+        err.contains("`tracing_providers` and exporter options"),
+        "{err}"
+    );
     assert!(!err.contains("https:///traces"), "{err}");
 }
 
