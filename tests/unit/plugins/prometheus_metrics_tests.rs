@@ -2976,7 +2976,7 @@ fn test_prometheus_plugin_rejects_schema_customization() {
             .err()
             .unwrap_or_else(|| panic!("expected schema customization to fail: {config}"));
         assert!(
-            err.contains("'schema' / 'schema_ref' is not supported"),
+            err.contains("`schema` / `schema_ref` is not supported"),
             "unexpected diagnostic for {config}: {err}"
         );
         assert!(

@@ -310,6 +310,49 @@ fn ipv6_authorities_are_unbracketed_only_for_socket_resolution() {
     assert!(authority_host(&"/echo".parse().unwrap()).is_err());
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn measurement_clock_brackets_the_host_monotonic_epoch() {
+    fn host_ns() -> u64 {
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: value provides writable storage for clock_gettime.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) },
+            0
+        );
+        value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
+    }
+
+    let before = host_ns();
+    let mut phases = Phases::new(Duration::from_millis(20));
+    let mut metrics = phases.worker();
+    let worker = tokio::spawn(async move {
+        while metrics.next_request().await {
+            metrics.admitted();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            metrics.record(1_000, 64);
+        }
+        Ok(metrics.finish_worker())
+    });
+    let combined = phases.finish(vec![worker]).await;
+    let after = host_ns();
+    let report = combined.phases.unwrap();
+    let serialized = serde_json::to_value(&report).unwrap();
+    let clock = report.measurement_start_host_clock.unwrap();
+    assert_eq!(clock.clock, "CLOCK_MONOTONIC");
+    assert!(before <= clock.before_ns);
+    assert!(clock.before_ns <= clock.after_ns);
+    assert!(clock.after_ns <= after);
+    assert_eq!(
+        serialized["measurement_start_host_clock"]["before_ns"],
+        clock.before_ns
+    );
+    assert!(report.measurement_start_monotonic_secs.is_some());
+}
+
 #[test]
 fn transport_close_timeout_is_diagnostic_and_preflight_scales_with_payload() {
     use multi_protocol_perf::phases::{PhaseReport, preflight_bound};

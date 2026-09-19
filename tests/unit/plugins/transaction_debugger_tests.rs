@@ -413,15 +413,15 @@ fn test_transaction_debugger_rejects_invalid_body_capture_options() {
     for (config, needle) in [
         (
             json!({"log_request_body": null}),
-            "'log_request_body' must be a boolean; null is not allowed",
+            "`log_request_body` must be a boolean; null is not allowed",
         ),
         (
             json!({"log_response_body": "true"}),
-            "'log_response_body' must be a boolean",
+            "`log_response_body` must be a boolean",
         ),
         (
             json!({"log_request_body": true, "max_request_body_bytes": 0}),
-            "'max_request_body_bytes' must be greater than zero",
+            "`max_request_body_bytes` must be greater than zero",
         ),
         (
             json!({"log_request_body": true, "max_request_body_bytes": 8193}),
@@ -429,39 +429,39 @@ fn test_transaction_debugger_rejects_invalid_body_capture_options() {
         ),
         (
             json!({"log_response_body": true, "max_response_body_bytes": -1}),
-            "'max_response_body_bytes' must be a positive integer",
+            "`max_response_body_bytes` must be a positive integer",
         ),
         (
             json!({"max_request_body_bytes": 128}),
-            "'max_request_body_bytes' requires 'log_request_body' to be true",
+            "`max_request_body_bytes` requires `log_request_body` to be true",
         ),
         (
             json!({"log_request_body": true, "max_response_body_bytes": 128}),
-            "'max_response_body_bytes' requires 'log_response_body' to be true",
+            "`max_response_body_bytes` requires `log_response_body` to be true",
         ),
         (
             json!({"redacted_body_fields": ["x"]}),
-            "'redacted_body_fields' requires 'log_request_body' or 'log_response_body' to be true",
+            "`redacted_body_fields` requires `log_request_body` or `log_response_body` to be true",
         ),
         (
             json!({"log_request_body": true, "redacted_body_fields": [""]}),
-            "'redacted_body_fields[0]' must not be empty",
+            "`redacted_body_fields[0]` must not be empty",
         ),
         (
             json!({"log_request_body": true, "redacted_body_fields": [" \t "]}),
-            "'redacted_body_fields[0]' must not be empty",
+            "`redacted_body_fields[0]` must not be empty",
         ),
         (
             json!({"log_request_body": true, "redacted_body_fields": ["x".repeat(129)]}),
-            "'redacted_body_fields[0]' must be at most 128 characters",
+            "`redacted_body_fields[0]` must be at most 128 characters",
         ),
         (
             json!({"log_request_body": true, "redacted_body_fields": [7]}),
-            "'redacted_body_fields[0]' must be a string",
+            "`redacted_body_fields[0]` must be a string",
         ),
         (
             json!({"log_request_body": true, "redacted_body_fields": "token"}),
-            "'redacted_body_fields' must be an array",
+            "`redacted_body_fields` must be an array",
         ),
     ] {
         let err = TransactionDebugger::new(&config)
@@ -476,7 +476,7 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
     for (config, expected) in [
         (
             json!({"log_respnose_body": true}),
-            "transaction_debugger: unknown configuration keys: log_respnose_body",
+            "transaction_debugger: unknown configuration keys at `config`: \"log_respnose_body\"",
         ),
         (
             json!({
@@ -484,11 +484,11 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
                 "redacted_headers": [],
                 "a_unknown": false
             }),
-            "transaction_debugger: unknown configuration keys: a_unknown, z_unknown",
+            "transaction_debugger: unknown configuration keys at `config`: \"a_unknown, z_unknown\"",
         ),
         (
             json!({"schema_reff": "debug"}),
-            "transaction_debugger: unknown configuration keys: schema_reff",
+            "transaction_debugger: unknown configuration keys at `config`: \"schema_reff\"",
         ),
     ] {
         assert_eq!(TransactionDebugger::new(&config).err().unwrap(), expected);
@@ -542,7 +542,7 @@ fn test_shared_validation_matches_transaction_debugger_config_surface() {
     .expect_err("shared validation must reject unknown keys");
     assert_eq!(
         unknown,
-        "transaction_debugger: unknown configuration keys: unknown"
+        "transaction_debugger: unknown configuration keys at `config`: \"unknown\""
     );
 }
 
@@ -2216,7 +2216,7 @@ fn test_debugger_schema_rejects_unrepresentable_shapes_with_field_diagnostics() 
     for (config, needle) in [
         (
             json!({"schema": {"omit": ["request_user_agent"]}}),
-            "schema omit references unknown field \"request_user_agent\"",
+            "schema `omit` references unknown field \"request_user_agent\"",
         ),
         (
             json!({"schema": {"rename": {"outcome": "authorization"}}}),
@@ -2224,7 +2224,7 @@ fn test_debugger_schema_rejects_unrepresentable_shapes_with_field_diagnostics() 
         ),
         (
             json!({"schema": {"static_fields": {"outcome": "x"}, "summary_type": "http"}}),
-            "duplicate output key 'outcome'",
+            "duplicate output key \"outcome\"",
         ),
         (
             json!({"schema": {"derived_fields": [{"name": "k", "kind": "not_a_kind"}]}}),
@@ -2232,12 +2232,35 @@ fn test_debugger_schema_rejects_unrepresentable_shapes_with_field_diagnostics() 
         ),
         (
             json!({"schema": {"summary_type": "sideways"}}),
-            "'summary_type' must be 'http', 'stream', or 'both'",
+            "`summary_type` must be `http`, `stream`, or `both`",
         ),
     ] {
         let err = TransactionDebugger::new(&config)
             .err()
             .unwrap_or_else(|| panic!("expected rejection for {config}"));
         assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
+}
+
+#[test]
+fn startup_diagnostics_withhold_debugger_keys_and_capture_budgets() {
+    for (config, context, hidden) in [
+        (
+            json!({"'diagnostic-secret-5594`\"\\\n": true}),
+            "unknown configuration keys at `config`",
+            "diagnostic-secret-5594",
+        ),
+        (
+            json!({"log_request_body": true, "max_request_body_bytes": 987654321}),
+            "`max_request_body_bytes` must be <=",
+            "987654321",
+        ),
+    ] {
+        let error = TransactionDebugger::new(&config)
+            .err()
+            .expect("invalid debugger configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(context), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
     }
 }
