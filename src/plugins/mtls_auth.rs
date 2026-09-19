@@ -220,13 +220,13 @@ impl IssuerFilter {
         for key in obj.keys() {
             if !matches!(key.as_str(), "cn" | "o" | "ou" | "ca_certificate_pem") {
                 return Err(format!(
-                    "mtls_auth: '{context}' contains unsupported issuer field '{key}'"
+                    "mtls_auth: `{context}` contains unsupported issuer field {key:?}"
                 ));
             }
         }
         let ca_certificate_pem = string_field(obj, "ca_certificate_pem", context)?.ok_or_else(|| {
             format!(
-                "mtls_auth: '{context}.ca_certificate_pem' is required to cryptographically pin the issuer"
+                "mtls_auth: `{context}.ca_certificate_pem` is required to cryptographically pin the issuer"
             )
         })?;
         Self::from_fields(
@@ -247,7 +247,7 @@ impl IssuerFilter {
     ) -> Result<Self, String> {
         if cn.is_none() && o.is_none() && ou.is_none() {
             return Err(format!(
-                "mtls_auth: '{context}' issuer filter must specify at least one field"
+                "mtls_auth: `{context}` issuer filter must specify at least one field"
             ));
         }
         let filter = Self {
@@ -257,11 +257,11 @@ impl IssuerFilter {
             ca_cert_der,
         };
         let (_, ca_cert) = X509Certificate::from_der(&filter.ca_cert_der).map_err(|_| {
-            format!("mtls_auth: '{context}.ca_certificate_pem' is not a valid X.509 certificate")
+            format!("mtls_auth: `{context}.ca_certificate_pem` is not a valid X.509 certificate")
         })?;
         if !filter.matches_name(ca_cert.subject()) {
             return Err(format!(
-                "mtls_auth: '{context}' DN fields do not match ca_certificate_pem subject"
+                "mtls_auth: `{context}` DN fields do not match ca_certificate_pem subject"
             ));
         }
         Ok(filter)
@@ -305,24 +305,24 @@ impl IssuerFilter {
 fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String> {
     let items = rustls_pemfile::read_all(&mut Cursor::new(pem.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| format!("mtls_auth: '{context}.ca_certificate_pem' contains malformed PEM"))?;
+        .map_err(|_| format!("mtls_auth: `{context}.ca_certificate_pem` contains malformed PEM"))?;
     let [rustls_pemfile::Item::X509Certificate(certificate)] = items.as_slice() else {
         return Err(format!(
-            "mtls_auth: '{context}.ca_certificate_pem' must contain exactly one certificate and no other PEM items"
+            "mtls_auth: `{context}.ca_certificate_pem` must contain exactly one certificate and no other PEM items"
         ));
     };
     let der = certificate.as_ref().to_vec();
     let (_, parsed) = X509Certificate::from_der(&der).map_err(|_| {
-        format!("mtls_auth: '{context}.ca_certificate_pem' is not a valid X.509 certificate")
+        format!("mtls_auth: `{context}.ca_certificate_pem` is not a valid X.509 certificate")
     })?;
     if !parsed.is_ca() {
         return Err(format!(
-            "mtls_auth: '{context}.ca_certificate_pem' must contain a CA certificate"
+            "mtls_auth: `{context}.ca_certificate_pem` must contain a CA certificate"
         ));
     }
     if !parsed.validity().is_valid() {
         return Err(format!(
-            "mtls_auth: '{context}.ca_certificate_pem' must be currently valid"
+            "mtls_auth: `{context}.ca_certificate_pem` must be currently valid"
         ));
     }
     if !parsed
@@ -332,7 +332,7 @@ fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String>
         .is_some_and(|usage| usage.value.key_cert_sign())
     {
         return Err(format!(
-            "mtls_auth: '{context}.ca_certificate_pem' keyUsage must include keyCertSign"
+            "mtls_auth: `{context}.ca_certificate_pem` keyUsage must include keyCertSign"
         ));
     }
     Ok(der)
@@ -974,7 +974,7 @@ fn validate_top_level_keys(config: &Value) -> Result<(), String> {
             "cert_field" | "allowed_issuers" | "allowed_ca_fingerprints_sha256"
         ) {
             return Err(format!(
-                "mtls_auth: config contains unsupported field '{key}'"
+                "mtls_auth: config contains unsupported field {key:?}"
             ));
         }
     }
@@ -997,7 +997,7 @@ fn string_field(
     })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(format!("mtls_auth: '{context}.{key}' must not be empty"));
+        return Err(format!("mtls_auth: `{context}.{key}` must not be empty"));
     }
     Ok(Some(trimmed.to_string()))
 }
@@ -1020,7 +1020,7 @@ fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
 
     if let Some(value) = config.get("allowed_issuers") {
         if value.is_null() {
-            return Err("mtls_auth: 'allowed_issuers' must be an array, got: null".to_string());
+            return Err("mtls_auth: `allowed_issuers` must be an array, got: null".to_string());
         }
         let arr = value.as_array().ok_or_else(|| {
             format!(
@@ -1030,7 +1030,7 @@ fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
         })?;
         if arr.is_empty() {
             return Err(
-                "mtls_auth: 'allowed_issuers' must not be empty; omit the field to disable issuer filtering"
+                "mtls_auth: `allowed_issuers` must not be empty; omit the field to disable issuer filtering"
                     .to_string(),
             );
         }
@@ -1052,7 +1052,7 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
     };
     if value.is_null() {
         return Err(
-            "mtls_auth: 'allowed_ca_fingerprints_sha256' must be an array, got: null".to_string(),
+            "mtls_auth: `allowed_ca_fingerprints_sha256` must be an array, got: null".to_string(),
         );
     }
 
@@ -1064,7 +1064,7 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
     })?;
     if arr.is_empty() {
         return Err(
-            "mtls_auth: 'allowed_ca_fingerprints_sha256' must not be empty; omit the field to disable CA fingerprint filtering"
+            "mtls_auth: `allowed_ca_fingerprints_sha256` must not be empty; omit the field to disable CA fingerprint filtering"
                 .to_string(),
         );
     }
@@ -1078,11 +1078,11 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
         })?;
         let trimmed = raw.trim();
         let decoded = hex::decode(trimmed).map_err(|_| {
-            format!("mtls_auth: 'allowed_ca_fingerprints_sha256[{idx}]' must be 64 hex characters")
+            format!("mtls_auth: `allowed_ca_fingerprints_sha256[{idx}]` must be 64 hex characters")
         })?;
         if decoded.len() != 32 {
             return Err(format!(
-                "mtls_auth: 'allowed_ca_fingerprints_sha256[{idx}]' must be 64 hex characters"
+                "mtls_auth: `allowed_ca_fingerprints_sha256[{idx}]` must be 64 hex characters"
             ));
         }
         let mut fingerprint = [0u8; 32];

@@ -49,8 +49,8 @@ impl BotDetection {
     pub fn new(config: &Value) -> Result<Self, String> {
         let config = config.as_object().ok_or_else(|| {
             format!(
-                "bot_detection: config must be a JSON object; allowed keys: {}",
-                BOT_DETECTION_CONFIG_KEYS.join(", ")
+                "bot_detection: config must be a JSON object; allowed keys: `{}`",
+                BOT_DETECTION_CONFIG_KEYS.join("`, `")
             )
         })?;
         reject_unknown_config_keys(config)?;
@@ -69,7 +69,7 @@ impl BotDetection {
         // non-empty list when the key is absent.)
         if blocked_patterns.is_empty() && allow_missing_user_agent {
             return Err(
-                "bot_detection: 'blocked_patterns' is empty and missing User-Agent headers are allowed; \
+                "bot_detection: `blocked_patterns` is empty and missing User-Agent headers are allowed; \
                  plugin would have no effect"
                     .to_string(),
             );
@@ -90,8 +90,8 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
         .find(|key| !BOT_DETECTION_CONFIG_KEYS.contains(&key.as_str()))
     {
         return Err(format!(
-            "bot_detection: unknown config key '{unknown}'; allowed keys: {}",
-            BOT_DETECTION_CONFIG_KEYS.join(", ")
+            "bot_detection: unknown config key {unknown:?}; allowed keys: `{}`",
+            BOT_DETECTION_CONFIG_KEYS.join("`, `")
         ));
     }
     Ok(())
@@ -133,7 +133,7 @@ fn parse_pattern_list(
     }
     let Value::Array(arr) = value else {
         return Err(format!(
-            "bot_detection: '{key}' must be an array of User-Agent substrings or null, got {}",
+            "bot_detection: `{key}` must be an array of User-Agent substrings or null, got {}",
             json_type_name(value)
         ));
     };
@@ -144,14 +144,14 @@ fn parse_pattern_list(
             .as_str()
             .ok_or_else(|| {
                 format!(
-                    "bot_detection: '{key}' entry at index {index} must be a string, got {}",
+                    "bot_detection: `{key}` entry at index {index} must be a string, got {}",
                     json_type_name(value)
                 )
             })?
             .trim();
         if pattern.is_empty() {
             return Err(format!(
-                "bot_detection: '{key}' entry at index {index} must contain a non-whitespace character"
+                "bot_detection: `{key}` entry at index {index} must contain a non-whitespace character"
             ));
         }
         patterns.push(pattern.to_string());
@@ -223,10 +223,10 @@ fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
                 ));
             }
             u16::try_from(code)
-                .map_err(|_| "bot_detection: 'custom_response_code' is too large".to_string())
+                .map_err(|_| "bot_detection: `custom_response_code` is too large".to_string())
         }
         Some(other) => Err(format!(
-            "bot_detection: 'custom_response_code' must be an integer from 400 to 599 or null, got {}",
+            "bot_detection: `custom_response_code` must be an integer from 400 to 599 or null, got {}",
             json_type_name(other)
         )),
     }
@@ -237,7 +237,7 @@ fn parse_bool(config: &Map<String, Value>, key: &str, default: bool) -> Result<b
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "bot_detection: '{key}' must be a boolean or null, got {}",
+            "bot_detection: `{key}` must be a boolean or null, got {}",
             json_type_name(other)
         )),
     }

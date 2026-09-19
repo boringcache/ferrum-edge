@@ -190,6 +190,66 @@ fn test_new_invalid_db_path_succeeds_with_none_reader() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn unavailable_database_constructor_log_withholds_source_path() {
+    let directory = TempDir::new().unwrap();
+    let path = directory
+        .path()
+        .join("'GEO_CONSTRUCTOR_PATH_CANARY`-missing.mmdb");
+    let missing_error = std::fs::metadata(&path).unwrap_err();
+    assert_eq!(missing_error.kind(), std::io::ErrorKind::NotFound);
+
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["US"]
+    }))
+    .expect("missing MMDB must still admit the fallback");
+
+    let output = logs.contents();
+    let warning = output
+        .lines()
+        .find(|line| line.contains("MaxMind database file not available"))
+        .expect("unavailable database must emit its constructor warning");
+    assert!(warning.trim_start().starts_with("WARN "), "{output}");
+    for expected in [
+        "db_path=<redacted scalar>",
+        "error=MaxMind database file <redacted scalar> not accessible before open:",
+        "plugin=\"geo_restriction\"",
+        "plugin will use on_lookup_failure policy until file is present",
+    ] {
+        assert!(warning.contains(expected), "missing {expected:?}: {output}");
+    }
+    assert!(warning.contains(&missing_error.to_string()), "{output}");
+    let default_warning = output
+        .lines()
+        .find(|line| line.contains("`on_lookup_failure` is not set"))
+        .expect("omitted failure policy must still emit its default warning");
+    assert!(
+        default_warning.trim_start().starts_with("WARN "),
+        "{output}"
+    );
+    assert!(
+        default_warning.contains("defaulting to `allow` (fail-open)"),
+        "{output}"
+    );
+    assert!(
+        default_warning.contains("`on_lookup_failure` explicitly (`allow` or `deny`)"),
+        "{output}"
+    );
+    assert!(!output.contains("GEO_CONSTRUCTOR_PATH_CANARY"), "{output}");
+    assert!(!output.contains(path_text(&path)), "{output}");
+
+    let mut ctx = request_context("203.0.113.1");
+    assert!(
+        matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "the default lookup-failure policy must still allow the request"
+    );
+}
+
 #[test]
 fn test_plugin_metadata_and_protocol_flags() {
     let config = json!({
@@ -1404,4 +1464,44 @@ async fn true_ipv6_client_is_not_folded_onto_an_ipv4_country_decision() {
         native.canonical_client_ip(),
         Some("89.160.20.112".parse().unwrap())
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"db_path": "/unused.mmdb", "allow_countries": [canary]}),
+            &["`allow_countries`", "invalid ISO"],
+        ),
+        (
+            json!({"db_path": "/unused.mmdb", "allow_countries": [true]}),
+            &["`allow_countries`", "must be strings"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("geo_restriction", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }

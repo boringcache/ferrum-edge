@@ -91,6 +91,13 @@ paths:
   are withheld. JSON Schema and regex admission retain fixed classifications.
   Registered constructor/rendered-output regressions cover these configuration
   paths independently of the scoped mechanical producer guard.
+- The #5594 security conversion covers authentication/authorization, IP/GeoIP,
+  JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
+  admission. Fixed schema paths and credential/operation ordinals survive
+  rendering while supplied credentials, keys, identities, paths, patterns and
+  parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor logs
+  sanitize configured paths at emission. Registered rendered/captured regressions
+  and existing rejection/reload-retention assertions cover these boundaries.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength

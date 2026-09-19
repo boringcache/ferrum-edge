@@ -115,7 +115,7 @@ impl IpRestriction {
             .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
         {
             return Err(format!(
-                "ip_restriction: unknown configuration field '{unknown}'; allowed fields: allow, deny, mode"
+                "ip_restriction: unknown configuration field {unknown:?}; allowed fields: `allow`, `deny`, `mode`"
             ));
         }
 
@@ -123,7 +123,7 @@ impl IpRestriction {
         let deny = IpRangeSet::compile(Self::parse_rule_list(object, "deny")?);
         if allow.is_empty() && deny.is_empty() {
             return Err(
-                "ip_restriction: at least one 'allow' or 'deny' rule is required".to_string(),
+                "ip_restriction: at least one `allow` or `deny` rule is required".to_string(),
             );
         }
 
@@ -198,7 +198,7 @@ impl IpRestriction {
         };
         let Value::Array(values) = value else {
             return Err(format!(
-                "ip_restriction: '{key}' must be an array of IP/CIDR strings"
+                "ip_restriction: `{key}` must be an array of IP/CIDR strings"
             ));
         };
 
@@ -206,15 +206,15 @@ impl IpRestriction {
         for value in values {
             let rule = value
                 .as_str()
-                .ok_or_else(|| format!("ip_restriction: '{key}' entries must be strings"))?
+                .ok_or_else(|| format!("ip_restriction: `{key}` entries must be strings"))?
                 .trim();
             if rule.is_empty() {
                 return Err(format!(
-                    "ip_restriction: '{key}' entries must be non-empty strings"
+                    "ip_restriction: `{key}` entries must be non-empty strings"
                 ));
             }
             rules.push(parse_rule(rule).ok_or_else(|| {
-                format!("ip_restriction: invalid {key} rule '{rule}' — expected exact IP or CIDR")
+                format!("ip_restriction: invalid `{key}` rule {rule:?} — expected exact IP or CIDR")
             })?);
         }
         Ok(rules)
