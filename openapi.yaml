@@ -1874,6 +1874,12 @@ paths:
         `ferrum_h1_profile_*` counters and completeness metadata. These are bounded
         Rust allocator, source-copy, body-poll and frontend AsyncWrite observations;
         they do not report native allocation traffic or actual syscall counts.
+        Default-off `bench-udp-profile` builds additionally emit fixed, label-free
+        `ferrum_udp_profile_*` UDP lookup, queue, poll, mmsg/GSO occupancy and
+        sampled synchronous timing fields. The literal field inventory is
+        `tests/performance/multi_protocol/udp_profile_schema.json` (version 1).
+        Slot loss, overflow and unpublished tails are explicit; these fields
+        are not hardware cache misses, scheduler wakeups or CPU contention.
         Returns gateway metrics in Prometheus exposition format. **Gated by
         default**: the caller must present a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originate from a
