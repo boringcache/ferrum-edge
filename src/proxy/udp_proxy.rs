@@ -3643,7 +3643,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     #[cfg(target_os = "linux")]
     let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size, false);
     #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
-    recv_batch.profile_direction = crate::udp_profile::Direction::Ingress;
+    {
+        recv_batch.profile_direction = crate::udp_profile::Direction::Ingress;
+    }
     #[cfg(not(target_os = "linux"))]
     let _ = recvmmsg_batch_size; // suppress unused variable warning
 
@@ -8767,13 +8769,17 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
         #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
-        send_batch.profile_direction = crate::udp_profile::Direction::Reply;
+        {
+            send_batch.profile_direction = crate::udp_profile::Direction::Reply;
+        }
         // Pre-allocate GSO batch buffer for concatenating same-size datagrams (Linux only).
         // GSO is preferred over sendmmsg when available — fewer syscalls for same-size bursts.
         #[cfg(target_os = "linux")]
         let mut gso_batch = super::udp_batch::GsoBatchBuf::new(65535);
         #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
-        gso_batch.profile_direction = crate::udp_profile::Direction::Reply;
+        {
+            gso_batch.profile_direction = crate::udp_profile::Direction::Reply;
+        }
         // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
