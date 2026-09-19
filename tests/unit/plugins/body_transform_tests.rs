@@ -331,7 +331,7 @@ fn test_body_rules_null_target_rejected() {
         ]
     });
     let err = parse_body_rules(&config).expect_err("expected error for null target");
-    assert!(err.contains("'target' must be a string"), "got: {err}");
+    assert!(err.contains("`target` must be a string"), "got: {err}");
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn test_body_rules_reject_invalid_rules_container_shapes() {
     for config in [json!({"rules": "not-array"}), json!({"rules": [42]})] {
         let err = parse_body_rules(&config).expect_err("expected invalid rules shape");
         assert!(
-            err.contains("'rules' must be an array") || err.contains("rule must be an object"),
+            err.contains("`rules` must be an array") || err.contains("rule must be an object"),
             "unexpected error for {config:?}: {err}"
         );
     }
@@ -350,23 +350,23 @@ fn test_body_rules_reject_operation_irrelevant_fields() {
     for (rule, field) in [
         (
             json!({"operation": "add", "target": "body", "key": "x", "value": "v", "new_key": "y"}),
-            "'new_key' must not be set",
+            "`new_key` must not be set",
         ),
         (
             json!({"operation": "update", "target": "body", "key": "x", "value": "v", "new_key": "y"}),
-            "'new_key' must not be set",
+            "`new_key` must not be set",
         ),
         (
             json!({"operation": "remove", "target": "body", "key": "x", "value": null}),
-            "'value' must not be set",
+            "`value` must not be set",
         ),
         (
             json!({"operation": "remove", "target": "body", "key": "x", "new_key": "y"}),
-            "'new_key' must not be set",
+            "`new_key` must not be set",
         ),
         (
             json!({"operation": "rename", "target": "body", "key": "x", "new_key": "y", "value": "ignored"}),
-            "'value' must not be set",
+            "`value` must not be set",
         ),
     ] {
         let config = json!({ "rules": [rule] });

@@ -211,14 +211,14 @@ async fn test_response_transformer_multiple_rules() {
 async fn test_response_transformer_empty_rules() {
     let result = ResponseTransformer::new(&json!({"rules": []}));
     let err = result.err().expect("expected error for empty rules");
-    assert!(err.contains("no 'rules' configured"), "got: {err}");
+    assert!(err.contains("no `rules` configured"), "got: {err}");
 }
 
 #[tokio::test]
 async fn test_response_transformer_no_config() {
     let result = ResponseTransformer::new(&json!({}));
     let err = result.err().expect("expected error for no config");
-    assert!(err.contains("no 'rules' configured"), "got: {err}");
+    assert!(err.contains("no `rules` configured"), "got: {err}");
 }
 
 #[tokio::test]
@@ -236,7 +236,7 @@ async fn test_response_transformer_rejects_non_array_rules() {
     }))
     .err()
     .expect("expected error for non-array rules");
-    assert!(err.contains("'rules' must be an array"), "got: {err}");
+    assert!(err.contains("`rules` must be an array"), "got: {err}");
 }
 
 #[tokio::test]
@@ -258,7 +258,7 @@ async fn test_response_transformer_add_without_value_rejected() {
     }))
     .err()
     .expect("expected error for add without value");
-    assert!(err.contains("requires a 'value'"), "got: {err}");
+    assert!(err.contains("requires a `value`"), "got: {err}");
 }
 
 #[tokio::test]
@@ -269,8 +269,8 @@ async fn test_response_transformer_unknown_operation_rejected() {
         ]
     }))
     .err()
-    .expect("expected error for unknown operation");
-    assert!(err.contains("unknown operation"), "got: {err}");
+    .expect("expected error for unknown `operation`");
+    assert!(err.contains("unknown `operation`"), "got: {err}");
 }
 
 #[tokio::test]
@@ -347,7 +347,7 @@ async fn test_response_transformer_rename_without_new_key_rejected() {
     }))
     .err()
     .expect("expected error for rename without new_key");
-    assert!(err.contains("requires a 'new_key'"), "got: {err}");
+    assert!(err.contains("requires a `new_key`"), "got: {err}");
 }
 
 #[tokio::test]
@@ -596,8 +596,8 @@ async fn test_response_transformer_unknown_target_rejected() {
         ]
     }))
     .err()
-    .expect("expected error for unknown target");
-    assert!(err.contains("unknown target"), "got: {err}");
+    .expect("expected error for unknown `target`");
+    assert!(err.contains("unknown `target`"), "got: {err}");
 }
 
 #[tokio::test]
@@ -624,7 +624,7 @@ async fn test_response_transformer_rejects_unknown_top_level_key() {
     .expect("expected error for unknown top-level key");
     assert!(err.contains("unknown config key"), "got: {err}");
     assert!(err.contains("runtime_overlay_scpoe"), "got: {err}");
-    assert!(err.contains("under 'config'"), "got: {err}");
+    assert!(err.contains("under `config`"), "got: {err}");
 }
 
 #[tokio::test]
@@ -678,7 +678,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "value": "blue",
                 "new_key": "X-Ignored"
             }),
-            "'new_key' must not be set for header 'add'",
+            "`new_key` must not be set for header \"add\"",
         ),
         (
             json!({
@@ -688,7 +688,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "value": "blue",
                 "new_key": "X-Ignored"
             }),
-            "'new_key' must not be set for header 'update'",
+            "`new_key` must not be set for header \"update\"",
         ),
         (
             json!({
@@ -698,7 +698,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "value": "blue",
                 "new_key": null
             }),
-            "'new_key' must not be set for header 'add'",
+            "`new_key` must not be set for header \"add\"",
         ),
         (
             json!({
@@ -708,7 +708,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "new_key": "X-New",
                 "value": "ignored"
             }),
-            "'value' must not be set for header 'rename'",
+            "`value` must not be set for header `rename`",
         ),
         (
             json!({
@@ -718,7 +718,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "new_key": "X-New",
                 "value": null
             }),
-            "'value' must not be set for header 'rename'",
+            "`value` must not be set for header `rename`",
         ),
         (
             json!({
@@ -727,7 +727,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "key": "X-Color",
                 "value": "ignored"
             }),
-            "'value' must not be set for header 'remove'",
+            "`value` must not be set for header `remove`",
         ),
         (
             json!({
@@ -736,7 +736,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "key": "X-Color",
                 "new_key": "X-Ignored"
             }),
-            "'new_key' must not be set for header 'remove'",
+            "`new_key` must not be set for header `remove`",
         ),
         (
             json!({
@@ -745,7 +745,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "key": "X-Color",
                 "value": null
             }),
-            "'value' must not be set for header 'remove'",
+            "`value` must not be set for header `remove`",
         ),
         (
             json!({
@@ -754,7 +754,7 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "key": "X-Color",
                 "new_key": null
             }),
-            "'new_key' must not be set for header 'remove'",
+            "`new_key` must not be set for header `remove`",
         ),
     ] {
         let err = ResponseTransformer::new(&json!({ "rules": [rule] }))
@@ -858,7 +858,7 @@ async fn test_response_transformer_rejects_non_string_target() {
     }))
     .err()
     .expect("expected error for non-string target");
-    assert!(err.contains("'target' must be a string"), "got: {err}");
+    assert!(err.contains("`target` must be a string"), "got: {err}");
 }
 
 #[tokio::test]
@@ -872,7 +872,7 @@ async fn test_response_transformer_rejects_null_target() {
     }))
     .err()
     .expect("expected error for null target");
-    assert!(err.contains("'target' must be a string"), "got: {err}");
+    assert!(err.contains("`target` must be a string"), "got: {err}");
 }
 
 #[tokio::test]
@@ -884,7 +884,7 @@ async fn test_response_transformer_rejects_missing_target() {
     }))
     .err()
     .expect("expected error for missing target");
-    assert!(err.contains("'target' is required"), "got: {err}");
+    assert!(err.contains("`target` is required"), "got: {err}");
 }
 
 #[tokio::test]
@@ -897,7 +897,7 @@ async fn test_response_transformer_rejects_query_target() {
     }))
     .err()
     .expect("expected error for query target");
-    assert!(err.contains("unknown target"), "got: {err}");
+    assert!(err.contains("unknown `target`"), "got: {err}");
 }
 
 #[tokio::test]
@@ -909,7 +909,7 @@ async fn test_response_transformer_rejects_non_string_operation() {
     }))
     .err()
     .expect("expected error for non-string operation");
-    assert!(err.contains("'operation' must be a string"), "got: {err}");
+    assert!(err.contains("`operation` must be a string"), "got: {err}");
 }
 
 #[tokio::test]
@@ -921,7 +921,7 @@ async fn test_response_transformer_rejects_non_string_key() {
     }))
     .err()
     .expect("expected error for non-string key");
-    assert!(err.contains("'key' must be a string"), "got: {err}");
+    assert!(err.contains("`key` must be a string"), "got: {err}");
 }
 
 #[tokio::test]
@@ -945,7 +945,7 @@ async fn test_response_transformer_rejects_non_string_value() {
     }))
     .err()
     .expect("expected error for non-string header value");
-    assert!(err.contains("'value' must be a string"), "got: {err}");
+    assert!(err.contains("`value` must be a string"), "got: {err}");
 }
 
 #[tokio::test]
@@ -957,7 +957,7 @@ async fn test_response_transformer_rejects_non_string_new_key() {
     }))
     .err()
     .expect("expected error for non-string new_key");
-    assert!(err.contains("'new_key' must be a string"), "got: {err}");
+    assert!(err.contains("`new_key` must be a string"), "got: {err}");
 }
 
 #[tokio::test]
@@ -1354,7 +1354,7 @@ async fn test_response_transformer_empty_rules_without_opt_in_still_errors() {
     }))
     .err()
     .expect("zero rules without apply_route_overrides must error");
-    assert!(err.contains("no 'rules' configured"), "got: {err}");
+    assert!(err.contains("no `rules` configured"), "got: {err}");
 }
 
 #[tokio::test]
@@ -2775,8 +2775,12 @@ fn response_body_rules_reject_explicitly_null_new_key() {
         let error = ResponseTransformer::new(&json!({"rules": [rule]}))
             .err()
             .expect("an explicit null new_key must fail admission");
-        let needle = format!("must not be set for body '{operation}'");
-        assert!(error.contains("'new_key'"), "got: {error}");
+        let needle = if operation == "remove" {
+            "must not be set for body `remove`".to_string()
+        } else {
+            format!("must not be set for body {operation:?}")
+        };
+        assert!(error.contains("`new_key`"), "got: {error}");
         assert!(error.contains(&needle), "got: {error}");
     }
 }
@@ -2801,5 +2805,51 @@ fn a_null_response_body_rename_target_is_still_missing() {
     let error = ResponseTransformer::new(&config)
         .err()
         .expect("rename without a new_key must fail");
-    assert!(error.contains("requires a 'new_key'"), "got: {error}");
+    assert!(error.contains("requires a `new_key`"), "got: {error}");
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"rules": [{"target": token}]}),
+            "`rule[0]`",
+            "unknown `target`",
+        ),
+        (
+            json!({"rules": [{"target": "header", "operation": token}]}),
+            "`operation`",
+            "unknown",
+        ),
+        (
+            json!({"rules": [{"target": "body", "operation": token}]}),
+            "`rule[0]`",
+            "unknown body `operation`",
+        ),
+        (
+            json!({"rules": [{"target": "body", "operation": "rename", "key": format!("{token}.0"), "new_key": token}]}),
+            "`key` or `new_key`",
+            "does not support array indices",
+        ),
+        (
+            json!({"rules": [{token: true}]}),
+            "`config.rules[0]`",
+            "unknown config key",
+        ),
+        (
+            json!({"rules": [{"target": true}]}),
+            "`target`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("response_transformer", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

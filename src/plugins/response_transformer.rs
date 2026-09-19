@@ -442,9 +442,9 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "response_transformer: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        "response_transformer: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
         unknown.join(", "),
-        allowed.join(", ")
+        allowed.join("`, `")
     ))
 }
 
@@ -452,8 +452,8 @@ impl ResponseTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
         let config_obj = config.as_object().ok_or_else(|| {
             format!(
-                "response_transformer: config must be an object; allowed keys: {}",
-                CONFIG_KEYS.join(", ")
+                "response_transformer: config must be an object; allowed keys: `{}`",
+                CONFIG_KEYS.join("`, `")
             )
         })?;
         reject_unknown_keys(config_obj, "config", CONFIG_KEYS)?;
@@ -463,10 +463,10 @@ impl ResponseTransformer {
         if let Some(rules) = config.get("rules") {
             let arr = rules
                 .as_array()
-                .ok_or("response_transformer: 'rules' must be an array")?;
+                .ok_or("response_transformer: `rules` must be an array")?;
             for (idx, r) in arr.iter().enumerate() {
                 let rule_obj = r.as_object().ok_or_else(|| {
-                    format!("response_transformer: rule[{idx}]: rule must be an object")
+                    format!("response_transformer: `rule[{idx}]`: rule must be an object")
                 })?;
                 let rule_path = format!("config.rules[{idx}]");
                 reject_unknown_keys(rule_obj, &rule_path, RULE_KEYS)?;
@@ -475,12 +475,12 @@ impl ResponseTransformer {
                     Some(Value::String(s)) => s.as_str(),
                     None => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'target' is required (expected header/body)"
+                            "response_transformer: `rule[{idx}]`: `target` is required (expected `header`/`body`)"
                         ));
                     }
                     Some(_) => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'target' must be a string (expected header/body)"
+                            "response_transformer: `rule[{idx}]`: `target` must be a string (expected `header`/`body`)"
                         ));
                     }
                 };
@@ -493,7 +493,7 @@ impl ResponseTransformer {
 
                 if target != "header" {
                     return Err(format!(
-                        "response_transformer: rule[{idx}]: unknown target '{target}' (expected header/body)"
+                        "response_transformer: `rule[{idx}]`: unknown `target` {target:?} (expected `header`/`body`)"
                     ));
                 }
 
@@ -501,18 +501,18 @@ impl ResponseTransformer {
                     Some(Value::String(s)) => s.as_str(),
                     None => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'operation' is required"
+                            "response_transformer: `rule[{idx}]`: `operation` is required"
                         ));
                     }
                     Some(_) => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'operation' must be a string"
+                            "response_transformer: `rule[{idx}]`: `operation` must be a string"
                         ));
                     }
                 };
                 let operation = parse_op(op_str).ok_or_else(|| {
                     format!(
-                        "response_transformer: rule[{idx}]: unknown operation '{op_str}' (expected add/update/remove/rename)"
+                        "response_transformer: `rule[{idx}]`: unknown `operation` {op_str:?} (expected `add`/`update`/`remove`/`rename`)"
                     )
                 })?;
 
@@ -520,19 +520,19 @@ impl ResponseTransformer {
                     Some(Value::String(s)) => s.clone(),
                     None => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'key' is required"
+                            "response_transformer: `rule[{idx}]`: `key` is required"
                         ));
                     }
                     Some(_) => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'key' must be a string"
+                            "response_transformer: `rule[{idx}]`: `key` must be a string"
                         ));
                     }
                 };
                 let key = HeaderName::from_bytes(raw_key.as_bytes())
                     .map_err(|_| {
                         format!(
-                            "response_transformer: rule[{idx}]: 'key' must be a valid HTTP header name"
+                            "response_transformer: `rule[{idx}]`: `key` must be a valid HTTP header name"
                         )
                     })?
                     .to_string();
@@ -542,7 +542,7 @@ impl ResponseTransformer {
                     Some(Value::Null) | None => None,
                     Some(_) => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'value' must be a string for header rules"
+                            "response_transformer: `rule[{idx}]`: `value` must be a string for header rules"
                         ));
                     }
                 };
@@ -552,7 +552,7 @@ impl ResponseTransformer {
                     Some(Value::Null) | None => None,
                     Some(_) => {
                         return Err(format!(
-                            "response_transformer: rule[{idx}]: 'new_key' must be a string"
+                            "response_transformer: `rule[{idx}]`: `new_key` must be a string"
                         ));
                     }
                 };
@@ -562,7 +562,7 @@ impl ResponseTransformer {
                         HeaderName::from_bytes(key.as_bytes())
                             .map_err(|_| {
                                 format!(
-                                    "response_transformer: rule[{idx}]: 'new_key' must be a valid HTTP header name"
+                                    "response_transformer: `rule[{idx}]`: `new_key` must be a valid HTTP header name"
                                 )
                             })
                             .map(|name| name.to_string())
@@ -576,36 +576,36 @@ impl ResponseTransformer {
                     HeaderOp::Add | HeaderOp::Update => {
                         if value.is_none() {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
+                                "response_transformer: `rule[{idx}]`: {op_str:?} operation requires a `value`"
                             ));
                         }
                         if new_key_present {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: 'new_key' must not be set for header '{op_str}' operation"
+                                "response_transformer: `rule[{idx}]`: `new_key` must not be set for header {op_str:?} operation"
                             ));
                         }
                     }
                     HeaderOp::Rename => {
                         if value_present {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: 'value' must not be set for header 'rename' operation"
+                                "response_transformer: `rule[{idx}]`: `value` must not be set for header `rename` operation"
                             ));
                         }
                         if raw_new_key.is_none() {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: 'rename' operation requires a 'new_key'"
+                                "response_transformer: `rule[{idx}]`: `rename` operation requires a `new_key`"
                             ));
                         }
                     }
                     HeaderOp::Remove => {
                         if value_present {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: 'value' must not be set for header 'remove' operation"
+                                "response_transformer: `rule[{idx}]`: `value` must not be set for header `remove` operation"
                             ));
                         }
                         if new_key_present {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: 'new_key' must not be set for header 'remove' operation"
+                                "response_transformer: `rule[{idx}]`: `new_key` must not be set for header `remove` operation"
                             ));
                         }
                     }
@@ -614,7 +614,7 @@ impl ResponseTransformer {
                 if let Some(ref v) = value {
                     HeaderValue::from_str(v).map_err(|_| {
                         format!(
-                            "response_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue"
+                            "response_transformer: `rule[{idx}]`: header `value` must be a valid HTTP HeaderValue"
                         )
                     })?;
                 }
@@ -625,8 +625,8 @@ impl ResponseTransformer {
                     && (key == "set-cookie" || new_key.as_deref() == Some("set-cookie"))
                 {
                     return Err(format!(
-                        "response_transformer: rule[{idx}]: rename source or destination \
-                         'set-cookie' is not supported; cookie values must retain their header name"
+                        "response_transformer: `rule[{idx}]`: rename source or destination \
+                         `set-cookie` is not supported; cookie values must retain their header name"
                     ));
                 }
 
@@ -641,8 +641,8 @@ impl ResponseTransformer {
                             &key,
                         ) {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: header '{op_str}' destination \
-                                 '{key}' is protocol-managed (hop-by-hop or framing) and cannot be \
+                                "response_transformer: `rule[{idx}]`: header {op_str:?} destination \
+                                 {key:?} is protocol-managed (hop-by-hop or framing) and cannot be \
                                  configured; the gateway derives Content-Length and strips \
                                  Connection/Transfer-Encoding/Trailer/Upgrade at the final \
                                  response boundary"
@@ -656,7 +656,7 @@ impl ResponseTransformer {
                             )
                         {
                             return Err(format!(
-                                "response_transformer: rule[{idx}]: rename destination '{dest}' is \
+                                "response_transformer: `rule[{idx}]`: rename destination {dest:?} is \
                                  protocol-managed (hop-by-hop or framing) and cannot be configured; \
                                  a backend-controlled source value must not become Connection, \
                                  Transfer-Encoding, Trailer, Upgrade, or Content-Length"
@@ -683,14 +683,14 @@ impl ResponseTransformer {
             Some(Value::Null) | None => false,
             Some(_) => {
                 return Err(
-                    "response_transformer: 'apply_route_overrides' must be a boolean".to_string(),
+                    "response_transformer: `apply_route_overrides` must be a boolean".to_string(),
                 );
             }
         };
 
         if header_rules.is_empty() && body_rules.is_empty() && !apply_route_overrides {
             return Err(
-                "response_transformer: no 'rules' configured — plugin will have no effect"
+                "response_transformer: no `rules` configured — plugin will have no effect"
                     .to_string(),
             );
         }
@@ -708,7 +708,7 @@ impl ResponseTransformer {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
                     return Err(
-                        "response_transformer: runtime_overlay_scope must be a non-empty string"
+                        "response_transformer: `runtime_overlay_scope` must be a non-empty string"
                             .to_string(),
                     );
                 }
@@ -717,7 +717,7 @@ impl ResponseTransformer {
             Some(Value::Null) | None => None,
             Some(_) => {
                 return Err(
-                    "response_transformer: runtime_overlay_scope must be a string".to_string(),
+                    "response_transformer: `runtime_overlay_scope` must be a string".to_string(),
                 );
             }
         };
@@ -726,7 +726,7 @@ impl ResponseTransformer {
             Some(Value::Bool(b)) => *b,
             Some(Value::Null) | None => true,
             Some(_) => {
-                return Err("response_transformer: default_enabled must be a boolean".to_string());
+                return Err("response_transformer: `default_enabled` must be a boolean".to_string());
             }
         };
 
@@ -735,7 +735,7 @@ impl ResponseTransformer {
             Some(Value::Null) | None => None,
             Some(_) => {
                 return Err(format!(
-                    "response_transformer: {} must be a boolean",
+                    "response_transformer: `{}` must be a boolean",
                     transformer_gate::RESOLVED_ENABLED_KEY
                 ));
             }

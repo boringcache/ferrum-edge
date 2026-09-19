@@ -147,3 +147,29 @@ async fn test_reassembled_message_is_not_mistaken_for_one_frame() {
             .is_none()
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [
+        (
+            json!({"max_frame_bytes": false}),
+            "`max_frame_bytes`",
+            "must be greater than zero",
+        ),
+        (
+            json!({"max_frame_bytes": 918273641, "max_message_bytes": 1}),
+            "`max_message_bytes`",
+            "must be greater than or equal",
+        ),
+    ] {
+        let error =
+            ferrum_edge::plugins::validate_plugin_config("ws_message_size_limiting", &config)
+                .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

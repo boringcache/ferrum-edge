@@ -468,24 +468,24 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
         return Ok(Vec::new());
     };
     let Some(arr) = rules_value.as_array() else {
-        return Err("'rules' must be an array".to_string());
+        return Err("`rules` must be an array".to_string());
     };
 
     let mut rules = Vec::new();
     for (idx, r) in arr.iter().enumerate() {
         let Some(rule_obj) = r.as_object() else {
-            return Err(format!("rule[{idx}]: rule must be an object"));
+            return Err(format!("`rule[{idx}]`: rule must be an object"));
         };
         let target = match r.get("target") {
             Some(Value::String(s)) => s.as_str(),
             None => {
                 return Err(format!(
-                    "rule[{idx}]: 'target' is required (expected header/query/body)"
+                    "`rule[{idx}]`: `target` is required (expected `header`/`query`/`body`)"
                 ));
             }
             Some(_) => {
                 return Err(format!(
-                    "rule[{idx}]: 'target' must be a string (expected header/query/body)"
+                    "`rule[{idx}]`: `target` must be a string (expected `header`/`query`/`body`)"
                 ));
             }
         };
@@ -497,12 +497,12 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
             Some(Value::String(s)) => s.as_str(),
             None => {
                 return Err(format!(
-                    "rule[{idx}]: 'operation' is required for body rules"
+                    "`rule[{idx}]`: `operation` is required for body rules"
                 ));
             }
             Some(_) => {
                 return Err(format!(
-                    "rule[{idx}]: 'operation' must be a string for body rules"
+                    "`rule[{idx}]`: `operation` must be a string for body rules"
                 ));
             }
         };
@@ -513,7 +513,7 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
             "rename" => BodyOperation::Rename,
             other => {
                 return Err(format!(
-                    "rule[{idx}]: unknown body operation '{other}' (expected add/update/remove/rename)"
+                    "`rule[{idx}]`: unknown body `operation` {other:?} (expected `add`/`update`/`remove`/`rename`)"
                 ));
             }
         };
@@ -521,11 +521,11 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
         let key = match r.get("key") {
             Some(Value::String(s)) => s.clone(),
             None => {
-                return Err(format!("rule[{idx}]: 'key' is required for body rules"));
+                return Err(format!("`rule[{idx}]`: `key` is required for body rules"));
             }
             Some(_) => {
                 return Err(format!(
-                    "rule[{idx}]: 'key' must be a string for body rules"
+                    "`rule[{idx}]`: `key` must be a string for body rules"
                 ));
             }
         };
@@ -555,7 +555,7 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
             Some(Value::Null) | None => None,
             Some(_) => {
                 return Err(format!(
-                    "rule[{idx}]: 'new_key' must be a string for body rules"
+                    "`rule[{idx}]`: `new_key` must be a string for body rules"
                 ));
             }
         };
@@ -567,24 +567,24 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
             BodyOperation::Add | BodyOperation::Update => {
                 if value.is_none() {
                     return Err(format!(
-                        "rule[{idx}]: body '{op_str}' operation requires a 'value'"
+                        "`rule[{idx}]`: body {op_str:?} operation requires a `value`"
                     ));
                 }
                 if new_key_present {
                     return Err(format!(
-                        "rule[{idx}]: 'new_key' must not be set for body '{op_str}' operation"
+                        "`rule[{idx}]`: `new_key` must not be set for body {op_str:?} operation"
                     ));
                 }
             }
             BodyOperation::Rename => {
                 if value.is_some() {
                     return Err(format!(
-                        "rule[{idx}]: 'value' must not be set for body 'rename' operation"
+                        "`rule[{idx}]`: `value` must not be set for body `rename` operation"
                     ));
                 }
                 if new_key.is_none() {
                     return Err(format!(
-                        "rule[{idx}]: body 'rename' operation requires a 'new_key'"
+                        "`rule[{idx}]`: body `rename` operation requires a `new_key`"
                     ));
                 }
                 // Reject array indices in rename paths. Rename semantics on
@@ -598,19 +598,19 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                     .is_some_and(|path| path.has_numeric_segment);
                 if key_path.has_numeric_segment || new_has_numeric_segment {
                     return Err(format!(
-                        "rule[{idx}]: body 'rename' does not support array indices in 'key' or 'new_key' (got key='{key}', new_key='{new_key_ref}'); use 'remove' + 'add' instead"
+                        "`rule[{idx}]`: body `rename` does not support array indices in `key` or `new_key` (got key={key:?}, new_key={new_key_ref:?}); use `remove` + `add` instead"
                     ));
                 }
             }
             BodyOperation::Remove => {
                 if value.is_some() {
                     return Err(format!(
-                        "rule[{idx}]: 'value' must not be set for body 'remove' operation"
+                        "`rule[{idx}]`: `value` must not be set for body `remove` operation"
                     ));
                 }
                 if new_key_present {
                     return Err(format!(
-                        "rule[{idx}]: 'new_key' must not be set for body 'remove' operation"
+                        "`rule[{idx}]`: `new_key` must not be set for body `remove` operation"
                     ));
                 }
             }

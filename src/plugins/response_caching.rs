@@ -955,7 +955,7 @@ impl ResponseCachingConfig {
             object,
             "config",
             RESPONSE_CACHING_CONFIG_KEYS,
-            "response_caching: ",
+            "response_caching: `config`: ",
         )?;
 
         let cacheable_methods = parse_method_list(config, "cacheable_methods")?
@@ -997,7 +997,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     match config.get(field) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("response_caching: '{field}' must be a boolean")),
+        Some(_) => Err(format!("response_caching: `{field}` must be a boolean")),
     }
 }
 
@@ -1005,7 +1005,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     match config.get(field) {
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("response_caching: '{field}' must be a string")),
+        Some(_) => Err(format!("response_caching: `{field}` must be a string")),
     }
 }
 
@@ -1013,11 +1013,11 @@ fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, Stri
     match config.get(field) {
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("response_caching: '{field}' must be an unsigned integer"))
+            .ok_or_else(|| format!("response_caching: `{field}` must be an unsigned integer"))
             .map(Some),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(format!(
-            "response_caching: '{field}' must be an unsigned integer"
+            "response_caching: `{field}` must be an unsigned integer"
         )),
     }
 }
@@ -1027,10 +1027,10 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
         return Ok(None);
     };
     let value =
-        usize::try_from(value).map_err(|_| format!("response_caching: '{field}' is too large"))?;
+        usize::try_from(value).map_err(|_| format!("response_caching: `{field}` is too large"))?;
     if value == 0 {
         return Err(format!(
-            "response_caching: '{field}' must be greater than zero"
+            "response_caching: `{field}` must be greater than zero"
         ));
     }
     Ok(Some(value))
@@ -1041,26 +1041,26 @@ fn parse_method_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("response_caching: '{field}' must be an array"));
+        return Err(format!("response_caching: `{field}` must be an array"));
     };
     if values.is_empty() {
-        return Err(format!("response_caching: '{field}' must not be empty"));
+        return Err(format!("response_caching: `{field}` must not be empty"));
     }
 
     let mut methods = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(method) = value.as_str() else {
             return Err(format!(
-                "response_caching: '{field}[{index}]' must be a string"
+                "response_caching: `{field}[{index}]` must be a string"
             ));
         };
         if method.is_empty() {
             return Err(format!(
-                "response_caching: '{field}[{index}]' must not be empty"
+                "response_caching: `{field}[{index}]` must not be empty"
             ));
         }
         Method::from_bytes(method.as_bytes()).map_err(|_| {
-            format!("response_caching: '{field}[{index}]' is not a valid HTTP method")
+            format!("response_caching: `{field}[{index}]` is not a valid HTTP method")
         })?;
         let method = method.to_ascii_uppercase();
         // A shared cache selects a stored representation by method + target +
@@ -1072,10 +1072,10 @@ fn parse_method_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
         // refused here and again at runtime.
         if !BODYLESS_CACHEABLE_METHODS.contains(&method.as_str()) {
             return Err(format!(
-                "response_caching: '{field}[{index}]' ({method}) is not a bodyless retrieval \
+                "response_caching: `{field}[{index}]` ({method:?}) is not a bodyless retrieval \
                  method — a shared cache cannot key the exact backend-visible request body at \
-                 lookup time, so only {} may be cached",
-                BODYLESS_CACHEABLE_METHODS.join(" / ")
+                 lookup time, so only `{}` may be cached",
+                BODYLESS_CACHEABLE_METHODS.join("` / `")
             ));
         }
         methods.push(method);
@@ -1088,28 +1088,28 @@ fn parse_status_code_list(config: &Value, field: &'static str) -> Result<Option<
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("response_caching: '{field}' must be an array"));
+        return Err(format!("response_caching: `{field}` must be an array"));
     };
     if values.is_empty() {
-        return Err(format!("response_caching: '{field}' must not be empty"));
+        return Err(format!("response_caching: `{field}` must not be empty"));
     }
 
     let mut status_codes = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(code) = value.as_u64() else {
             return Err(format!(
-                "response_caching: '{field}[{index}]' must be an unsigned integer"
+                "response_caching: `{field}[{index}]` must be an unsigned integer"
             ));
         };
         if !(100..=599).contains(&code) {
             return Err(format!(
-                "response_caching: '{field}[{index}]' must be an HTTP status code"
+                "response_caching: `{field}[{index}]` must be an HTTP status code"
             ));
         }
         let code = code as u16;
         if !is_supported_cacheable_status(code) {
             return Err(format!(
-                "response_caching: '{field}[{index}]' ({code}) has caching semantics this plugin \
+                "response_caching: `{field}[{index}]` (\"{code}\") has caching semantics this plugin \
                  does not implement and cannot be marked cacheable — 1xx responses are interim, \
                  206 requires range/validator/completeness tracking, and 304 is validator \
                  metadata for an existing stored representation rather than a representation"
@@ -1125,23 +1125,23 @@ fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("response_caching: '{field}' must be an array"));
+        return Err(format!("response_caching: `{field}` must be an array"));
     };
 
     let mut headers = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(header) = value.as_str() else {
             return Err(format!(
-                "response_caching: '{field}[{index}]' must be a string"
+                "response_caching: `{field}[{index}]` must be a string"
             ));
         };
         if header.is_empty() {
             return Err(format!(
-                "response_caching: '{field}[{index}]' must not be empty"
+                "response_caching: `{field}[{index}]` must not be empty"
             ));
         }
         let header_name = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
-            format!("response_caching: '{field}[{index}]' is not a valid HTTP header name")
+            format!("response_caching: `{field}[{index}]` is not a valid HTTP header name")
         })?;
         headers.push(header_name.to_string());
     }
@@ -1350,7 +1350,7 @@ impl ResponseCaching {
 
         if config.cacheable_methods.is_empty() {
             return Err(
-                "response_caching: no cacheable_methods configured — plugin will cache nothing"
+                "response_caching: no `cacheable_methods` configured — plugin will cache nothing"
                     .to_string(),
             );
         }

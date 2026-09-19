@@ -821,7 +821,7 @@ fn config_admission_normalization_is_the_published_contract() {
         Err(error) => error,
     };
     assert!(
-        null_scope.contains("'anonymous_caller_scope' must be a string"),
+        null_scope.contains("`anonymous_caller_scope` must be a string"),
         "{null_scope}"
     );
 
@@ -951,7 +951,7 @@ fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
             panic!("unknown key must be rejected");
         };
         assert!(
-            error.contains("request_deduplication: unknown configuration key(s)"),
+            error.contains("request_deduplication: `config`: unknown configuration key(s)"),
             "{error}"
         );
         assert!(error.contains(&format!("\"config.{unknown}\"")), "{error}");
@@ -1013,7 +1013,7 @@ fn redis_only_keys_outside_redis_mode_are_rejected() {
             panic!("Redis-only key outside Redis mode must be rejected");
         };
         assert!(
-            error.contains("require sync_mode='redis'"),
+            error.contains("require `sync_mode=redis`"),
             "unexpected error: {error}"
         );
     }
@@ -1032,9 +1032,9 @@ fn on_redis_unavailable_requires_a_known_policy() {
     ) else {
         panic!("unknown policy must be rejected");
     };
-    assert!(error.contains("'on_redis_unavailable'"), "{error}");
+    assert!(error.contains("`on_redis_unavailable`"), "{error}");
     assert!(
-        error.contains("'fail_closed'") && error.contains("'local_only'"),
+        error.contains("`fail_closed`") && error.contains("`local_only`"),
         "diagnostic must name accepted values: {error}"
     );
     assert!(
@@ -1084,7 +1084,7 @@ fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
         panic!("Redis-only keys outside Redis mode must be rejected");
     };
     assert!(
-        mode_error.contains("require sync_mode='redis'"),
+        mode_error.contains("require `sync_mode=redis`"),
         "expected redis-only-key diagnostic: {mode_error}"
     );
     for secret in [PASSWORD, USER, "cache.internal"] {
@@ -6803,5 +6803,89 @@ async fn dedup_config_admits_anonymous_caller_scope_key() {
             .is_ok(),
             "anonymous_caller_scope must accept {value:?}"
         );
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"header_name": true}),
+            "`header_name`",
+            "must be a string",
+        ),
+        (
+            json!({"on_redis_unavailable": token}),
+            "`config.on_redis_unavailable`",
+            "require `sync_mode=redis` (did you mean to set `sync_mode`?)",
+        ),
+        (
+            json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://redis.example.test:6379/0",
+                "on_redis_unavailable": token
+            }),
+            "`on_redis_unavailable`",
+            "must be exactly `fail_closed` or `local_only`",
+        ),
+        (
+            json!({"ttl_seconds": false}),
+            "`ttl_seconds`",
+            "must be an integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("request_deduplication", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn composition_diagnostics_withhold_proxy_and_plugin_ids() {
+    for (plugin_name, dynamic_config) in [
+        ("mcp_gateway", json!({"enabled": true})),
+        (
+            "a2a_gateway",
+            json!({"discovery": {
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }}),
+        ),
+    ] {
+        let config: ferrum_edge::config::types::GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "'\"`UNREGISTERED_PROXY_ID\\tail",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }],
+            "plugin_configs": [{
+                "id": "'\"`UNREGISTERED_DEDUP_ID\\tail",
+                "plugin_name": "request_deduplication",
+                "scope": "global",
+                "config": {}
+            }, {
+                "id": "'\"`UNREGISTERED_DYNAMIC_ID\\tail",
+                "plugin_name": plugin_name,
+                "scope": "global",
+                "config": dynamic_config
+            }]
+        }))
+        .expect("composition fixture must deserialize");
+        let errors = ferrum_edge::plugins::request_deduplication::validate_composition(&config)
+            .expect_err("dynamic presentation must remain incompatible with deduplication");
+        assert_eq!(errors.len(), 1);
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+        assert!(rendered.contains("cannot be composed with"), "{rendered}");
+        assert!(rendered.contains(&format!("`{plugin_name}`")), "{rendered}");
+        assert!(rendered.contains("replay"), "{rendered}");
+        assert!(!rendered.contains("UNREGISTERED_"), "{rendered}");
     }
 }

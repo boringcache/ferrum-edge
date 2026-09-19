@@ -103,6 +103,19 @@ paths:
   Semantic-cache successful admission DEBUG fields sanitize every scalar at
   emission, including defaults and normalized/derived selections; captured
   constructor regressions pin the structured fields and fixed event message.
+- The #5594 traffic/transform conversion covers request/response/body/header
+  transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
+  GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and
+  schema paths survive rendered failures; configured routes, method/operation
+  names, keys, regexes and numeric operands remain withheld. Existing typed
+  rejection, constructor/rendered-output and last-good reload assertions retain
+  admission and retention coverage.
+  Serverless null-field failures resolve recognized keys to schema-authored
+  allowlist entries before backtick rendering; unknown keys remain withheld.
+  Every CORS string-origin failure retains its `allowed_origins[index]` context,
+  including empty, whitespace, length, wildcard and exact-origin rejection.
+  Request-termination path-prefix guidance preserves the fixed `?` and `#`
+  delimiters through the startup renderer.
 - The #5594 mesh plugin conversion covers authorization/baggage trust, route
   dispatch, BPF/workload metrics, telemetry tag expressions and effective metric
   plans. Fixed rule, assertor and effective baggage-gate ordinals remain visible;

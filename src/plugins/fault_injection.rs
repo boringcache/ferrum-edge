@@ -203,12 +203,12 @@ impl FaultInjectionPlugin {
                     "abort",
                 )?;
                 let status_code = abort_obj.get("status_code").and_then(json_u64).ok_or(
-                    "fault_injection: abort.status_code is required and must be an integer",
+                    "fault_injection: `abort.status_code` is required and must be an integer",
                 )?;
 
                 if !(200..=599).contains(&status_code) {
                     return Err(format!(
-                        "fault_injection: abort.status_code must be 200-599, got \"{status_code}\""
+                        "fault_injection: `abort.status_code` must be 200-599, got \"{status_code}\""
                     ));
                 }
 
@@ -216,10 +216,10 @@ impl FaultInjectionPlugin {
 
                 let grpc_status = if let Some(grpc_val) = abort_obj.get("grpc_status") {
                     let code = json_u64(grpc_val)
-                        .ok_or("fault_injection: abort.grpc_status must be an integer")?;
+                        .ok_or("fault_injection: `abort.grpc_status` must be an integer")?;
                     if code > 16 {
                         return Err(format!(
-                            "fault_injection: abort.grpc_status must be 0-16, got \"{code}\""
+                            "fault_injection: `abort.grpc_status` must be 0-16, got \"{code}\""
                         ));
                     }
                     Some(code as u32)
@@ -231,7 +231,7 @@ impl FaultInjectionPlugin {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) | None => String::new(),
                     Some(_) => {
-                        return Err("fault_injection: abort.body must be a string".to_string());
+                        return Err("fault_injection: `abort.body` must be a string".to_string());
                     }
                 };
                 let content_type = abort_http_content_type(&body);
@@ -245,24 +245,24 @@ impl FaultInjectionPlugin {
                 })
             }
             Some(Value::Null) | None => None,
-            Some(_) => return Err("fault_injection: 'abort' must be an object".to_string()),
+            Some(_) => return Err("fault_injection: `abort` must be an object".to_string()),
         };
 
         let delay = match obj.get("delay") {
             Some(Value::Object(delay_obj)) => {
                 reject_unknown_keys(delay_obj.keys(), &["duration_ms", "percentage"], "delay")?;
                 let duration_ms = delay_obj.get("duration_ms").and_then(json_u64).ok_or(
-                    "fault_injection: delay.duration_ms is required and must be a positive integer",
+                    "fault_injection: `delay.duration_ms` is required and must be a positive integer",
                 )?;
 
                 if duration_ms == 0 {
                     return Err(
-                        "fault_injection: delay.duration_ms must be greater than 0".to_string()
+                        "fault_injection: `delay.duration_ms` must be greater than 0".to_string(),
                     );
                 }
                 if duration_ms > MAX_FAULT_DELAY_MS {
                     return Err(format!(
-                        "fault_injection: delay.duration_ms must be <= {MAX_FAULT_DELAY_MS}, got \"{duration_ms}\""
+                        "fault_injection: `delay.duration_ms` must be <= {MAX_FAULT_DELAY_MS}, got \"{duration_ms}\""
                     ));
                 }
 
@@ -274,12 +274,12 @@ impl FaultInjectionPlugin {
                 })
             }
             Some(Value::Null) | None => None,
-            Some(_) => return Err("fault_injection: 'delay' must be an object".to_string()),
+            Some(_) => return Err("fault_injection: `delay` must be an object".to_string()),
         };
 
         if abort.is_none() && delay.is_none() {
             return Err(
-                "fault_injection: at least one of 'abort' or 'delay' must be configured"
+                "fault_injection: at least one of `abort` or `delay` must be configured"
                     .to_string(),
             );
         }
@@ -289,14 +289,14 @@ impl FaultInjectionPlugin {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
                     return Err(
-                        "fault_injection: runtime_overlay_scope must be a non-empty string"
+                        "fault_injection: `runtime_overlay_scope` must be a non-empty string"
                             .to_string(),
                     );
                 }
             }
             Some(Value::Null) | None => {}
             Some(_) => {
-                return Err("fault_injection: runtime_overlay_scope must be a string".to_string());
+                return Err("fault_injection: `runtime_overlay_scope` must be a string".to_string());
             }
         }
 
@@ -315,7 +315,7 @@ fn reject_unknown_keys<'a>(
 ) -> Result<(), String> {
     for key in keys {
         if !allowed.contains(&key.as_str()) {
-            return Err(format!("fault_injection: unknown {scope} field '{key}'"));
+            return Err(format!("fault_injection: unknown `{scope}` field {key:?}"));
         }
     }
     Ok(())
@@ -346,23 +346,23 @@ fn parse_percentage(val: Option<&Value>, field_name: &str) -> Result<f64, String
     let pct = match val {
         Some(Value::Number(n)) => n
             .as_f64()
-            .ok_or_else(|| format!("fault_injection: {field_name} must be a number"))?,
+            .ok_or_else(|| format!("fault_injection: `{field_name}` must be a number"))?,
         Some(_) => {
-            return Err(format!("fault_injection: {field_name} must be a number"));
+            return Err(format!("fault_injection: `{field_name}` must be a number"));
         }
         None => {
-            return Err(format!("fault_injection: {field_name} is required"));
+            return Err(format!("fault_injection: `{field_name}` is required"));
         }
     };
 
     if !(0.0..=100.0).contains(&pct) {
         return Err(format!(
-            "fault_injection: {field_name} must be 0.0-100.0, got \"{pct}\""
+            "fault_injection: `{field_name}` must be 0.0-100.0, got \"{pct}\""
         ));
     }
     if pct == 0.0 {
         return Err(format!(
-            "fault_injection: {field_name} must be greater than 0.0"
+            "fault_injection: `{field_name}` must be greater than 0.0"
         ));
     }
 

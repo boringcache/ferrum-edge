@@ -201,18 +201,18 @@ impl GraphqlPlugin {
                 && GRAPHQL_CONFIG_KEYS.len()
                     == GRAPHQL_POLICY_CONFIG_KEYS.len() + RATE_LIMIT_REDIS_CONFIG_KEYS.len()
         );
-        reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: ")?;
+        reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: `config`: ")?;
 
         match config.get("sync_mode") {
             None => {}
             Some(Value::String(sync_mode)) if matches!(sync_mode.as_str(), "local" | "redis") => {}
             Some(Value::String(sync_mode)) => {
                 return Err(format!(
-                    "graphql: 'sync_mode' must be exactly 'local' or 'redis', got: {sync_mode:?}"
+                    "graphql: `sync_mode` must be exactly `local` or `redis`, got: {sync_mode:?}"
                 ));
             }
             Some(_) => {
-                return Err("graphql: 'sync_mode' must be a string".to_string());
+                return Err("graphql: `sync_mode` must be a string".to_string());
             }
         }
 
@@ -227,7 +227,7 @@ impl GraphqlPlugin {
             Some(Value::String(s)) => {
                 if !matches!(s.as_str(), "ip" | "consumer") {
                     return Err(format!(
-                        "graphql: 'limit_by' must be exactly 'ip' or 'consumer', got: {s:?}"
+                        "graphql: `limit_by` must be exactly `ip` or `consumer`, got: {s:?}"
                     ));
                 }
                 s.clone()
@@ -252,9 +252,9 @@ impl GraphqlPlugin {
 
         if !has_any_config {
             return Err(
-                "graphql: no protection rules configured — set 'max_depth', 'max_complexity', \
-                 'max_aliases', 'introspection_allowed: false', 'type_rate_limits', or \
-                 'operation_rate_limits'"
+                "graphql: no protection rules configured — set `max_depth`, `max_complexity`, \
+                 `max_aliases`, `introspection_allowed: false`, `type_rate_limits`, or \
+                 `operation_rate_limits`"
                     .to_string(),
             );
         }
@@ -296,7 +296,8 @@ impl GraphqlPlugin {
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("graphql: {error}"))?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
@@ -514,11 +515,11 @@ fn optional_u32(config: &Value, field: &'static str) -> Result<Option<u32>, Stri
         return Ok(None);
     };
     let Some(value) = value.as_u64() else {
-        return Err(format!("graphql: '{field}' must be an integer"));
+        return Err(format!("graphql: `{field}` must be an integer"));
     };
     u32::try_from(value)
         .map(Some)
-        .map_err(|_| format!("graphql: '{field}' must fit in a 32-bit unsigned integer"))
+        .map_err(|_| format!("graphql: `{field}` must fit in a 32-bit unsigned integer"))
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -528,7 +529,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("graphql: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("graphql: `{field}` must be a boolean"))
 }
 
 fn parse_type_rate_limits(config: &Value) -> Result<HashMap<String, RateSpec>, String> {
@@ -536,14 +537,14 @@ fn parse_type_rate_limits(config: &Value) -> Result<HashMap<String, RateSpec>, S
         return Ok(HashMap::new());
     };
     let Some(obj) = value.as_object() else {
-        return Err("graphql: 'type_rate_limits' must be an object".to_string());
+        return Err("graphql: `type_rate_limits` must be an object".to_string());
     };
 
     let mut limits = HashMap::new();
     for (op_type, spec) in obj {
         if !matches!(op_type.as_str(), "query" | "mutation" | "subscription") {
             return Err(format!(
-                "graphql: type_rate_limits key must be exactly 'query', 'mutation', or 'subscription', got: {op_type:?}"
+                "graphql: `type_rate_limits` key must be exactly `query`, `mutation`, or `subscription`, got: {op_type:?}"
             ));
         }
         limits.insert(
@@ -560,14 +561,14 @@ fn parse_operation_rate_limits(config: &Value) -> Result<HashMap<String, RateSpe
         return Ok(HashMap::new());
     };
     let Some(obj) = value.as_object() else {
-        return Err("graphql: 'operation_rate_limits' must be an object".to_string());
+        return Err("graphql: `operation_rate_limits` must be an object".to_string());
     };
 
     let mut limits = HashMap::new();
     for (op_name, spec) in obj {
         if !is_graphql_name(op_name) {
             return Err(format!(
-                "graphql: operation_rate_limits key must be a valid GraphQL operation name, got: {op_name:?}"
+                "graphql: `operation_rate_limits` key must be a valid GraphQL operation name, got: {op_name:?}"
             ));
         }
         limits.insert(
@@ -582,9 +583,10 @@ fn parse_operation_rate_limits(config: &Value) -> Result<HashMap<String, RateSpe
 fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, String> {
     let object = spec
         .as_object()
-        .ok_or_else(|| format!("graphql: {field}['{key}'] must be an object"))?;
+        .ok_or_else(|| format!("graphql: `{field}` entry {key:?} must be an object"))?;
     let path = format!("config.{field}[{key}]");
-    reject_unknown_keys(object, &path, RATE_SPEC_KEYS, "graphql: ")?;
+    reject_unknown_keys(object, &path, RATE_SPEC_KEYS, "graphql: ")
+        .map_err(|error| format!("`{field}`: {error}"))?;
     let max_requests = required_positive_u64(spec, field, key, "max_requests")?;
     let window_seconds = required_positive_u64(spec, field, key, "window_seconds")?;
     // Bound both axes before they reach the shared dynamic HTTP window: an
@@ -592,7 +594,7 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     // signed Redis TTL, and an extreme cap is rejected so budgets stay within
     // the shared production maxima. Local sliding-window memory itself is
     // bounded by a fixed aggregate-bucket ring, not by one timestamp per request.
-    let label = format!("graphql: {field}['{key}']");
+    let label = format!("graphql: `{field}` entry {key:?}");
     // `field` is one of the two schema-authored caller literals. Preserve it
     // outside the opaque label, which also contains the supplied operation key.
     let max_requests = validate_max_requests(&label, "max_requests", max_requests)
@@ -616,11 +618,11 @@ fn required_positive_u64(
     field: &str,
 ) -> Result<u64, String> {
     let value = spec[field].as_u64().ok_or_else(|| {
-        format!("graphql: {parent}['{key}']: '{field}' is required and must be a positive integer")
+        format!("graphql: `{parent}` entry {key:?}: `{field}` is required and must be a positive integer")
     })?;
     if value == 0 {
         return Err(format!(
-            "graphql: {parent}['{key}']: '{field}' must be greater than zero"
+            "graphql: `{parent}` entry {key:?}: `{field}` must be greater than zero"
         ));
     }
     Ok(value)

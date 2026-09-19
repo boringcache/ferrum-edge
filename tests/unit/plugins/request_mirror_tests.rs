@@ -682,27 +682,27 @@ fn test_invalid_field_types_are_error() {
     for (config, expected) in [
         (
             json!({ "mirror_host": "mirror.local", "mirror_protocol": true }),
-            "'mirror_protocol' must be a string",
+            "`mirror_protocol` must be a string",
         ),
         (
             json!({ "mirror_host": "mirror.local", "mirror_port": "8080" }),
-            "'mirror_port' must be an unsigned integer",
+            "`mirror_port` must be an unsigned integer",
         ),
         (
             json!({ "mirror_host": "mirror.local", "mirror_path": 42 }),
-            "'mirror_path' must be a string",
+            "`mirror_path` must be a string",
         ),
         (
             json!({ "mirror_host": "mirror.local", "percentage": "50" }),
-            "'percentage' must be a number",
+            "`percentage` must be a number",
         ),
         (
             json!({ "mirror_host": "mirror.local", "mirror_request_body": "true" }),
-            "'mirror_request_body' must be a boolean",
+            "`mirror_request_body` must be a boolean",
         ),
         (
             json!({ "mirror_host": "mirror.local", "max_in_flight": "10" }),
-            "'max_in_flight' must be an unsigned integer",
+            "`max_in_flight` must be an unsigned integer",
         ),
     ] {
         let err = RequestMirror::new(&config, PluginHttpClient::default())
@@ -719,7 +719,7 @@ fn test_mirror_path_must_start_with_slash() {
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
-    assert!(result.err().unwrap().contains("must start with '/'"));
+    assert!(result.err().unwrap().contains("must start with `/`"));
 }
 
 #[test]
@@ -732,7 +732,7 @@ fn test_mirror_path_rejects_query_and_fragment_syntax() {
         .err()
         .expect("query and fragment syntax must be rejected");
         assert!(
-            error.contains("'mirror_path' must not contain a query or fragment"),
+            error.contains("`mirror_path` must not contain a query or fragment"),
             "unexpected error: {error}"
         );
     }
@@ -6441,4 +6441,46 @@ async fn mirror_response_body_reset_is_still_a_drain_failure() {
     assert_eq!(m.drain_timeouts, 0, "{m:?}");
     assert_eq!(m.completed, 0, "{m:?}");
     assert_eq!(m.cancellations, 0, "{m:?}");
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"mirror_host": "example.com", "mirror_protocol": token}),
+            "`mirror_protocol`",
+            "must be `http` or `https`",
+        ),
+        (
+            json!({"mirror_host": "example.com", token: true}),
+            "allowed keys",
+            "unknown configuration key",
+        ),
+        (
+            json!({"mirror_host": "example.com", "mirror_port": 918273641}),
+            "`mirror_port`",
+            "must be 1–65535",
+        ),
+        (
+            json!({"mirror_host": "example.com", "mirror_protocol": false}),
+            "`mirror_protocol`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("request_mirror", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in [
+            "UNREGISTERED_TRAFFIC_TOKEN",
+            "unregistered_traffic_token",
+            "918273641",
+            "true",
+            "false",
+        ] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

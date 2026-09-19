@@ -579,7 +579,7 @@ fn test_unknown_limit_by_rejected() {
         }),
     );
     let err = result.err().expect("unknown limit_by must be rejected");
-    assert!(err.contains("'limit_by' must be one of"), "got: {err}");
+    assert!(err.contains("`limit_by` must be one of"), "got: {err}");
 }
 
 #[test]
@@ -743,7 +743,7 @@ fn test_missing_max_requests_rejected() {
     let err = result
         .err()
         .expect("missing max_requests should be rejected, not silently dropped");
-    assert!(err.contains("'max_requests' is required"), "got: {err}");
+    assert!(err.contains("`max_requests` is required"), "got: {err}");
 }
 
 #[test]
@@ -759,7 +759,7 @@ fn test_missing_window_seconds_rejected() {
     let err = result
         .err()
         .expect("missing window_seconds should be rejected, not silently dropped");
-    assert!(err.contains("'window_seconds' is required"), "got: {err}");
+    assert!(err.contains("`window_seconds` is required"), "got: {err}");
 }
 
 #[test]
@@ -821,7 +821,7 @@ fn test_duplicate_rate_limit_key_rejected_after_normalization() {
         .err()
         .expect("duplicate normalized rate-limit key must be rejected");
     assert!(
-        err.contains("duplicate method_rate_limits entry"),
+        err.contains("duplicate `method_rate_limits` entry"),
         "got: {err}"
     );
 }
@@ -1047,4 +1047,146 @@ async fn test_allow_list_still_permits_listed_method_after_fail_closed_fix() {
 
     let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"method_rate_limits": {token: {}}}),
+            "`method_rate_limits`",
+            "`max_requests` is required",
+        ),
+        (
+            json!({"method_rate_limits": {token: true}}),
+            "`method_rate_limits`",
+            "must be an object",
+        ),
+        (
+            json!({"allow_methods": [918273641]}),
+            "`allow_methods[0]`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn shared_method_rate_bounds_keep_the_parent_without_promoting_supplied_keys() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
+
+    // Bounds are checked before method-path normalization, so even these bare
+    // numeric and hostile keys reach the shared validators through admission.
+    for key in [
+        "/pkg.Service/MethodIdentifierCanary",
+        "918273641",
+        "'\"\\\n`GRPC_METHOD_CANARY",
+    ] {
+        for (field, maximum) in [
+            ("max_requests", MAX_RATE_LIMIT_MAX_REQUESTS),
+            ("window_seconds", MAX_RATE_LIMIT_WINDOW_SECONDS),
+        ] {
+            for value in [0, maximum + 1] {
+                let mut spec = json!({"max_requests": 10, "window_seconds": 60});
+                spec[field] = json!(value);
+                let config = json!({"method_rate_limits": {key: spec}});
+                let error =
+                    ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config)
+                        .expect_err("invalid bound must be rejected before method normalization");
+                let rendered =
+                    ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+                assert!(
+                    rendered.contains("grpc_method_router: `method_rate_limits`"),
+                    "{rendered}"
+                );
+                assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+                if value == 0 {
+                    assert!(rendered.contains("must be greater than zero"), "{rendered}");
+                    assert!(!rendered.contains('0'), "{rendered}");
+                } else {
+                    assert!(
+                        rendered.contains(&format!("must be <= {maximum}")),
+                        "{rendered}"
+                    );
+                    assert!(!rendered.contains(&value.to_string()), "{rendered}");
+                }
+                for withheld in ["MethodIdentifierCanary", "918273641", "GRPC_METHOD_CANARY"] {
+                    assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn method_rate_shape_errors_keep_schema_and_suggestions_without_supplied_content() {
+    for key in [
+        "/pkg.Service/MethodIdentifierCanary",
+        "918273641",
+        "'\"\\\n`GRPC_METHOD_CANARY",
+    ] {
+        let hostile_key = "'\"\\\n`GRPC_KEY_CANARY";
+        for (spec, reason) in [
+            (
+                json!({
+                    "window_seconds": 60,
+                    "max_requets": {"GRPC_PAYLOAD_KEY": ["GRPC_VALUE_CANARY"]},
+                    hostile_key: "GRPC_SCALAR_CANARY",
+                    "918273642": ["GRPC_ARRAY_CANARY"]
+                }),
+                "did you mean `max_requests`?",
+            ),
+            (json!({"window_seconds": 60}), "`max_requests` is required"),
+            (
+                json!({
+                    "window_seconds": 60,
+                    "max_requests": {"GRPC_PAYLOAD_KEY": ["GRPC_VALUE_CANARY"]}
+                }),
+                "`max_requests` is required and must be a positive integer",
+            ),
+        ] {
+            let config = json!({"method_rate_limits": {key: spec}});
+            let error = ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config)
+                .expect_err("invalid rate spec must fail admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.contains("grpc_method_router:"), "{rendered}");
+            assert!(rendered.contains("`method_rate_limits`"), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            if config["method_rate_limits"][key]
+                .get("max_requets")
+                .is_some()
+            {
+                assert!(
+                    rendered.contains("unknown configuration key(s)"),
+                    "{rendered}"
+                );
+            }
+            for withheld in [
+                "MethodIdentifierCanary",
+                "918273641",
+                "GRPC_METHOD_CANARY",
+                "max_requets",
+                "GRPC_KEY_CANARY",
+                "GRPC_PAYLOAD_KEY",
+                "GRPC_VALUE_CANARY",
+                "GRPC_SCALAR_CANARY",
+                "GRPC_ARRAY_CANARY",
+                "918273642",
+            ] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+        }
+    }
 }

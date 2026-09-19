@@ -92,7 +92,7 @@ impl CorrelationId {
         if !unknown_keys.is_empty() {
             unknown_keys.sort_unstable();
             return Err(format!(
-                "correlation_id: unknown config field(s): {}",
+                "correlation_id: unknown config field(s): {:?}",
                 unknown_keys.join(", ")
             ));
         }
@@ -105,15 +105,15 @@ impl CorrelationId {
             Some(Value::String(s)) => parse_configured_header_name(s)?,
             Some(other) => {
                 return Err(format!(
-                    "correlation_id: 'header_name' must be a string, got: {}",
-                    other
+                    "correlation_id: `header_name` must be a string, got: {:?}",
+                    other.to_string()
                 ));
             }
         };
 
         if real_ip_header.is_some_and(|configured| header_name.eq_ignore_ascii_case(configured)) {
             return Err(format!(
-                "correlation_id: 'header_name' conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header and cannot be used for correlation IDs: {header_name:?}"
+                "correlation_id: `header_name` conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header and cannot be used for correlation IDs: {header_name:?}"
             ));
         }
 
@@ -122,8 +122,8 @@ impl CorrelationId {
             Some(Value::Bool(b)) => *b,
             Some(other) => {
                 return Err(format!(
-                    "correlation_id: 'echo_downstream' must be a boolean, got: {}",
-                    other
+                    "correlation_id: `echo_downstream` must be a boolean, got: {:?}",
+                    other.to_string()
                 ));
             }
         };
@@ -154,11 +154,11 @@ pub(crate) fn is_reserved_header_name(name: &str) -> bool {
 fn parse_configured_header_name(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("correlation_id: 'header_name' must be a non-empty string".to_string());
+        return Err("correlation_id: `header_name` must be a non-empty string".to_string());
     }
     if trimmed.len() > MAX_HTTP_FIELD_NAME_LEN {
         return Err(
-            "correlation_id: 'header_name' exceeds the 65,535-byte HTTP field-name limit"
+            "correlation_id: `header_name` exceeds the 65,535-byte HTTP field-name limit"
                 .to_string(),
         );
     }

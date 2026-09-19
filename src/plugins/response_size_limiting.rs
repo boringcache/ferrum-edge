@@ -57,7 +57,7 @@ impl ResponseSizeLimiting {
             config_obj,
             "config",
             RESPONSE_SIZE_LIMITING_CONFIG_KEYS,
-            "response_size_limiting: ",
+            "response_size_limiting: `config`: ",
         )?;
 
         let max_bytes = required_positive_u64(config, "max_bytes", "response_size_limiting")?;
@@ -74,7 +74,7 @@ fn optional_bool(config: &Map<String, Value>, key: &str) -> Result<bool, String>
     match config.get(key) {
         None => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("response_size_limiting: '{key}' must be a boolean")),
+        Some(_) => Err(format!("response_size_limiting: `{key}` must be a boolean")),
     }
 }
 

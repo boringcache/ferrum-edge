@@ -245,7 +245,7 @@ impl SpecExpose {
         plugin_http_client: super::PluginHttpClient,
     ) -> Result<Self, String> {
         let config_object = config.as_object().ok_or_else(|| {
-            "spec_expose: configuration must be an object with a 'spec_url' field".to_string()
+            "spec_expose: configuration must be an object with a `spec_url` field".to_string()
         })?;
         let mut unknown_keys = config_object
             .keys()
@@ -256,14 +256,14 @@ impl SpecExpose {
             unknown_keys.sort_unstable();
             let unknown = unknown_keys
                 .into_iter()
-                .map(|key| format!("'{key}'"))
+                .map(|key| format!("{key:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
                 "spec_expose: unsupported configuration key(s): {unknown}; supported keys are: {}",
                 CONFIG_KEYS
                     .iter()
-                    .map(|key| format!("'{key}'"))
+                    .map(|key| format!("`{key}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -275,12 +275,12 @@ impl SpecExpose {
             .map(str::trim)
             .filter(|value| !value.is_empty() && *value != "default")
             .ok_or_else(|| {
-                "spec_expose: 'spec_url' is required and must be a non-empty URL string".to_string()
+                "spec_expose: `spec_url` is required and must be a non-empty URL string".to_string()
             })?;
 
         // Validate URL format and require a fetchable scheme.
         let mut parsed = Url::parse(spec_url)
-            .map_err(|e| format!("spec_expose: 'spec_url' is not a valid URL: {e}"))?;
+            .map_err(|_| "spec_expose: `spec_url` is not a valid URL".to_string())?;
         match parsed.scheme() {
             "http" | "https" => {}
             other => {
@@ -291,7 +291,7 @@ impl SpecExpose {
         }
         if !has_non_empty_authority(spec_url) {
             return Err(
-                "spec_expose: 'spec_url' must include a hostname or IP address".to_string(),
+                "spec_expose: `spec_url` must include a hostname or IP address".to_string(),
             );
         }
         if url_has_userinfo(spec_url)
@@ -299,7 +299,7 @@ impl SpecExpose {
             || parsed.password().is_some()
         {
             return Err(
-                "spec_expose: 'spec_url' must not contain URL userinfo; use a credential-free origin URL"
+                "spec_expose: `spec_url` must not contain URL userinfo; use a credential-free origin URL"
                     .to_string(),
             );
         }
@@ -325,12 +325,12 @@ impl SpecExpose {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
                     return Err(
-                        "spec_expose: 'content_type' must be a non-empty string when set"
+                        "spec_expose: `content_type` must be a non-empty string when set"
                             .to_string(),
                     );
                 }
                 HeaderValue::from_str(trimmed).map_err(|_| {
-                    "spec_expose: 'content_type' contains characters not permitted in HTTP header values"
+                    "spec_expose: `content_type` contains characters not permitted in HTTP header values"
                         .to_string()
                 })?;
                 Some(trimmed.to_string())
@@ -400,21 +400,21 @@ impl SpecExpose {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
             let source_id = source.redacted_source_id();
             let ca_material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(
-                |error| {
+                |_| {
                     format!(
-                        "spec_expose: configured CA bundle {source_id:?} could not be loaded; refusing to widen trust: {error}"
+                        "spec_expose: configured CA bundle {source_id:?} could not be loaded; refusing to widen trust"
                     )
                 },
             )?;
-            let certificates =
-                reqwest::Certificate::from_pem_bundle(ca_material.bytes.expose_secret()).map_err(
-                    |error| {
-                        format!(
-                            "spec_expose: configured CA bundle {:?} is invalid; refusing to widen trust: {error}",
-                            ca_material.display_source_id
-                        )
-                    },
-                )?;
+            let certificates = reqwest::Certificate::from_pem_bundle(
+                ca_material.bytes.expose_secret(),
+            )
+            .map_err(|_| {
+                format!(
+                    "spec_expose: configured CA bundle {:?} is invalid; refusing to widen trust",
+                    ca_material.display_source_id
+                )
+            })?;
             if certificates.is_empty() {
                 return Err(format!(
                     "spec_expose: configured CA bundle {:?} contains no certificates; refusing to widen trust",
@@ -428,7 +428,7 @@ impl SpecExpose {
 
         let http_client = builder
             .build()
-            .map_err(|e| format!("spec_expose: failed to build HTTP client: {e}"))?;
+            .map_err(|_| "spec_expose: failed to build HTTP client".to_string())?;
 
         Ok(Self {
             spec_url,
@@ -774,7 +774,7 @@ pub fn sanitize_upstream_content_type(raw: &str) -> String {
 
 fn spec_url_hostname(parsed: &Url) -> Result<String, String> {
     let host = parsed.host().ok_or_else(|| {
-        "spec_expose: 'spec_url' must include a hostname or IP address".to_string()
+        "spec_expose: `spec_url` must include a hostname or IP address".to_string()
     })?;
 
     Ok(match host {
