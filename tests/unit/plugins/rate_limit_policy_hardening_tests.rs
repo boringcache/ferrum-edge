@@ -128,7 +128,10 @@ fn rendered_graphql_rate_bounds_preserve_the_schema_parent_without_operation_key
                 rendered.starts_with(&format!("graphql: `{parent}`: <redacted scalar>: ")),
                 "{rendered}"
             );
-            assert!(rendered.contains(&format!("`{field}` must be <=")), "{rendered}");
+            assert!(
+                rendered.contains(&format!("`{field}` must be <=")),
+                "{rendered}"
+            );
             assert!(!rendered.contains(key), "{rendered}");
             assert!(!rendered.contains(&supplied.to_string()), "{rendered}");
         }
