@@ -1757,6 +1757,13 @@ fn startup_diagnostics_withhold_email_names_and_numeric_scalars() {
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
         assert!(!rendered.contains(hidden), "{rendered}");
+        assert!(
+            !rendered.contains("diagnostic_secret_5594"),
+            "normalized TLS-mode operand must also be withheld: {rendered}"
+        );
+        if field == "tls_mode" {
+            assert!(rendered.contains("unknown `tls_mode`"), "{rendered}");
+        }
         assert!(!rendered.contains("ops_email"), "{rendered}");
     }
 
@@ -1770,6 +1777,35 @@ fn startup_diagnostics_withhold_email_names_and_numeric_scalars() {
         "{rendered}"
     );
     assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+}
+
+#[test]
+fn startup_diagnostics_preserve_empty_credential_env_field() {
+    let channel = "'ChannelName5594`\"\\\n";
+    let env_name = "'EnvName5594`\"\\\n";
+    for (key, env_key) in [("username", "username_env"), ("password", "password_env")] {
+        let mut config = minimal_def(587);
+        config["username"] = json!(SMTP_USERNAME);
+        config["password"] = json!(SMTP_PASSWORD);
+        config.as_object_mut().unwrap().remove(key);
+        config[env_key] = json!(env_name);
+        let mut env = HashMap::from([(env_name.to_string(), "ResolvedValue5594".to_string())]);
+        ferrum_edge::_test_support::email_channel_new_with_env_for_test(channel, &config, &env)
+            .expect("non-empty injected credentials must still be admitted");
+        env.insert(env_name.to_string(), String::new());
+        let error =
+            ferrum_edge::_test_support::email_channel_new_with_env_for_test(channel, &config, &env)
+                .expect_err("empty injected credentials must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains(&format!("referenced by `{env_key}`")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("resolved to empty string"), "{rendered}");
+        for hidden in ["ChannelName5594", "EnvName5594", "ResolvedValue5594"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
 }
 
 #[test]
