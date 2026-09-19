@@ -1608,12 +1608,9 @@ fn trace_exporter_from_provider(
                     "Lightstep `access_token_env` {access_token_env:?} is not set or unreadable"
                 )
             })?;
-            let exporter = LightstepTraceExporter::new(
-                collector_url.clone(),
-                access_token,
-                options.clone(),
-            )
-            .map_err(|error| format!("`collector_url`: {error}"))?;
+            let exporter =
+                LightstepTraceExporter::new(collector_url.clone(), access_token, options.clone())
+                    .map_err(|error| format!("`collector_url`: {error}"))?;
             Ok(Arc::new(exporter))
         }
         TracingProvider::OpenTelemetry { endpoint } => Ok(Arc::new(OtlpTraceExporter::new(
@@ -1621,8 +1618,7 @@ fn trace_exporter_from_provider(
             None,
             Vec::new(),
             options.clone(),
-        )?)
-            as Arc<dyn TraceExporter>),
+        )?) as Arc<dyn TraceExporter>),
     }
 }
 

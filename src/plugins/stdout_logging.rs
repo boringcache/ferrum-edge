@@ -319,9 +319,8 @@ fn reject_unknown_errors_only_fields(value: &Value, path: &str) -> Result<(), St
 }
 
 fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
-    let failure = |field: &str, reason: &str| {
-        Some(format!("stdout_logging: `{field}` is invalid: {reason}"))
-    };
+    let failure =
+        |field: &str, reason: &str| Some(format!("stdout_logging: `{field}` is invalid: {reason}"));
     let Some(object) = value.as_object() else {
         return failure(path, "expected an expression object");
     };
@@ -337,8 +336,7 @@ fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
                 let Some(child) = object.get(field) else {
                     return failure(path, &format!("missing field `{field}`"));
                 };
-                if let Some(error) =
-                    expression_decode_diagnostic(child, &format!("{path}.{field}"))
+                if let Some(error) = expression_decode_diagnostic(child, &format!("{path}.{field}"))
                 {
                     return Some(error);
                 }

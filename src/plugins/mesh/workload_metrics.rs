@@ -1615,13 +1615,9 @@ fn validate_metric_tag_cel_expr_named(
     name: &str,
     expression: &MetricTagCelExpr,
 ) -> Result<(), String> {
-    crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(
-        |error| {
-            format!(
-                "workload_metrics: metric tag {name:?} CEL `expression` rejected: {error}"
-            )
-        },
-    )
+    crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(|error| {
+        format!("workload_metrics: metric tag {name:?} CEL `expression` rejected: {error}")
+    })
 }
 
 fn encode_metric_tag_cel_expr(expr: &MetricTagCelExpr, out: &mut String) {

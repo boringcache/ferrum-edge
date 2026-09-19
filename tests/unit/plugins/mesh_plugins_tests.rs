@@ -9325,8 +9325,14 @@ fn typed_mesh_adapters_withhold_document_keys_and_keep_schema_context() {
     ] {
         let config = json!({key: true});
         for (caller, result) in [
-            ("mesh_route_dispatch", MeshRouteDispatch::new(&config).map(|_| ())),
-            ("mesh_outbound_registry", OutboundRegistry::new(&config).map(|_| ())),
+            (
+                "mesh_route_dispatch",
+                MeshRouteDispatch::new(&config).map(|_| ()),
+            ),
+            (
+                "mesh_outbound_registry",
+                OutboundRegistry::new(&config).map(|_| ()),
+            ),
         ] {
             assert_rendered_mesh_diagnostic(
                 result.expect_err("unknown root key must still reject"),
@@ -9339,7 +9345,12 @@ fn typed_mesh_adapters_withhold_document_keys_and_keep_schema_context() {
         slice["labels"] = json!({key: true});
         assert_rendered_mesh_diagnostic(
             MeshAuthz::new(&json!({"mesh_slice": slice})).err().unwrap(),
-            &["mesh_authz", "`mesh_slice`", "labels[<redacted key>]", "expected a string"],
+            &[
+                "mesh_authz",
+                "`mesh_slice`",
+                "labels[<redacted key>]",
+                "expected a string",
+            ],
             &["UNREGISTERED_KEY_5594", "injected_schema", "true"],
         );
     }
@@ -9358,7 +9369,8 @@ fn typed_mesh_adapters_withhold_document_keys_and_keep_schema_context() {
         MeshRouteDispatch::new(&json!({"rules": [
             {"match": {"methods": ["GET"]}, "destination": {"upstream_id": "first"}},
             {"timeout_ms": true}
-        ]})).unwrap_err(),
+        ]}))
+        .unwrap_err(),
         &["rules[1].timeout_ms", "invalid type", "expected u64"],
         &["true"],
     );
@@ -9371,7 +9383,9 @@ fn typed_mesh_adapters_withhold_document_keys_and_keep_schema_context() {
         WorkloadMetrics::new(&json!({"tracing_providers": [
             {"kind": "zipkin", "config": {"url": "https://collector.example/spans"}},
             {"kind": "datadog", "config": {"agent_url": true}}
-        ]})).err().unwrap(),
+        ]}))
+        .err()
+        .unwrap(),
         &["`tracing_providers`", "[1].config", "expected a string"],
         &["collector.example", "true"],
     );

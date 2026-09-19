@@ -1657,9 +1657,10 @@ impl MeshAuthz {
         // would then treat as allow-by-default).
         let from_slice = config.get("mesh_slice").is_some();
         let mut slice = if let Some(value) = config.get("mesh_slice") {
-            super::diagnostics::from_value::<
-                crate::util::json_object::JsonObject<MeshSlice>,
-            >(value.clone(), super::diagnostics::Schema::Slice)
+            super::diagnostics::from_value::<crate::util::json_object::JsonObject<MeshSlice>>(
+                value.clone(),
+                super::diagnostics::Schema::Slice,
+            )
             .map_err(|e| format!("mesh_authz: invalid `mesh_slice`: {e}"))?
             .0
         } else if let Some(value) = config.get("mesh_policies") {

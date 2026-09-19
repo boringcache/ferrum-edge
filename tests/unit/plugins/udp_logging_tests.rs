@@ -897,7 +897,10 @@ async fn test_udp_logging_dtls_rejects_mismatched_certificate_and_key_at_admissi
         rendered.contains("`dtls_cert_path` / `dtls_key_path`"),
         "{rendered}"
     );
-    assert!(!rendered.contains(cert.path().to_str().unwrap()), "{rendered}");
+    assert!(
+        !rendered.contains(cert.path().to_str().unwrap()),
+        "{rendered}"
+    );
     assert!(
         !rendered.contains(other_key.path().to_str().unwrap()),
         "{rendered}"
@@ -928,8 +931,14 @@ async fn test_udp_logging_dtls_rejects_rsa_key_at_admission() {
         rendered.contains("`dtls_cert_path` / `dtls_key_path`"),
         "{rendered}"
     );
-    assert!(!rendered.contains(cert.path().to_str().unwrap()), "{rendered}");
-    assert!(!rendered.contains(key.path().to_str().unwrap()), "{rendered}");
+    assert!(
+        !rendered.contains(cert.path().to_str().unwrap()),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(key.path().to_str().unwrap()),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]
@@ -2032,12 +2041,16 @@ fn dtls_diagnostics_keep_source_class_material_field_and_pem_record() {
     for (field, material, expected) in [
         (
             "dtls_ca_cert_path",
-            format!("{valid_cert}-----BEGIN CERTIFICATE-----\n!PemMarker5594\n-----END CERTIFICATE-----\n"),
+            format!(
+                "{valid_cert}-----BEGIN CERTIFICATE-----\n!PemMarker5594\n-----END CERTIFICATE-----\n"
+            ),
             "certificate record #2",
         ),
         (
             "dtls_cert_path",
-            format!("{valid_cert}-----BEGIN CERTIFICATE-----\n!PemMarker5594\n-----END CERTIFICATE-----\n"),
+            format!(
+                "{valid_cert}-----BEGIN CERTIFICATE-----\n!PemMarker5594\n-----END CERTIFICATE-----\n"
+            ),
             "certificate record #2",
         ),
         (

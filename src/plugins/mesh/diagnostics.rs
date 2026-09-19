@@ -45,14 +45,17 @@ impl Schema {
             (Self::Slice, "extension_configs") => Self::Fields("name namespace type_url value"),
             (
                 Self::Slice,
-                "workloads" | "ambient_udp_source_workloads" | "node_waypoint_capture_destinations"
+                "workloads"
+                | "ambient_udp_source_workloads"
+                | "node_waypoint_capture_destinations"
                 | "local_inbound_workloads",
             ) => Self::Fields(WORKLOAD),
             (Self::Slice, "services" | "local_inbound_services") => Self::Fields(SERVICE),
             (Self::Slice, "ext_authz_providers") => Self::Fields(EXT_AUTHZ),
-            (Self::Slice, "peer_authentications" | "node_waypoint_capture_peer_authentications") => {
-                Self::Fields(PEER_AUTH)
-            }
+            (
+                Self::Slice,
+                "peer_authentications" | "node_waypoint_capture_peer_authentications",
+            ) => Self::Fields(PEER_AUTH),
             (Self::Slice, "request_authentications") => Self::Fields(REQUEST_AUTH),
             (Self::Slice, "telemetry_resources") => Self::Fields(TELEMETRY),
             (Self::Slice, "proxy_configs") => Self::Fields(PROXY_CONFIG),
@@ -78,7 +81,9 @@ impl Schema {
                 Self::Fields("kind selector namespace attachments")
             }
             (Self::Fields(PEER_AUTH), "selector")
-            | (Self::Fields(SERVICE_ENTRY), "workload_selector") => Self::Fields("namespace labels"),
+            | (Self::Fields(SERVICE_ENTRY), "workload_selector") => {
+                Self::Fields("namespace labels")
+            }
             (Self::Fields(EXT_AUTHZ), "include_additional_headers_in_check") => {
                 Self::Fields("name value")
             }
@@ -113,9 +118,7 @@ impl Schema {
             (Self::Fields(SERVICE_ENTRY), "endpoints") => {
                 Self::Fields("address ports labels network")
             }
-            (Self::Fields("local federated"), "local" | "federated") => {
-                Self::Fields(TRUST_BUNDLE)
-            }
+            (Self::Fields("local federated"), "local" | "federated") => Self::Fields(TRUST_BUNDLE),
             (Self::Fields(TRUST_BUNDLE), "jwt_authorities") => {
                 Self::Fields("key_id public_key_pem")
             }
@@ -146,7 +149,9 @@ impl Schema {
             (Self::Fields(TRAFFIC_POLICY), "connection_pool_http") => Self::Fields(
                 "max_requests_per_connection idle_timeout_ms http2_max_requests max_concurrent_streams h2_upgrade_policy max_retries http1_max_pending_requests",
             ),
-            (Self::Fields(TRAFFIC_POLICY), "load_balancer") => Self::Fields("simple consistent_hash"),
+            (Self::Fields(TRAFFIC_POLICY), "load_balancer") => {
+                Self::Fields("simple consistent_hash")
+            }
             (Self::Fields("simple consistent_hash"), "consistent_hash") => {
                 Self::Fields("http_header_name http_cookie_name use_source_ip")
             }
@@ -183,7 +188,9 @@ impl Schema {
                 "methods headers query_params source_namespace authority uri ignore_uri_case",
             ),
             (
-                Self::Fields("methods headers query_params source_namespace authority uri ignore_uri_case"),
+                Self::Fields(
+                    "methods headers query_params source_namespace authority uri ignore_uri_case",
+                ),
                 "methods" | "authority" | "uri",
             ) => Self::Fields("exact prefix regex"),
             (Self::Fields(ROUTE_RULE), "destination") => Self::Fields(DESTINATION),
@@ -203,9 +210,9 @@ impl Schema {
                 Self::Fields("status_code percentage grpc_status body")
             }
             (Self::Fields(ROUTE_RULE), "rewrite") => Self::Fields("uri authority match_prefix"),
-            (Self::Fields(ROUTE_RULE), "redirect") => Self::Fields(
-                "uri authority match_prefix port derive_port scheme redirect_code",
-            ),
+            (Self::Fields(ROUTE_RULE), "redirect") => {
+                Self::Fields("uri authority match_prefix port derive_port scheme redirect_code")
+            }
             (Self::Provider, "config") => Self::Fields(
                 "url agent_url service collector_url access_token_env accessTokenEnv endpoint",
             ),
@@ -255,7 +262,8 @@ const SERVICE_ENTRY: &str = "name namespace hosts endpoints resolution location 
     export_to workload_selector";
 const TRUST_BUNDLE: &str = "trust_domain x509_authorities jwt_authorities refresh_hint_seconds";
 const MULTI_CLUSTER: &str = "local_cluster federation_endpoint remote_clusters east_west_gateways";
-const DESTINATION_RULE: &str = "name namespace host traffic_policy port_level_settings subsets export_to";
+const DESTINATION_RULE: &str =
+    "name namespace host traffic_policy port_level_settings subsets export_to";
 const TRAFFIC_POLICY: &str = "connect_timeout_ms outlier_detection load_balancer tls \
     locality_lb_setting max_connections tcp_keepalive tcp_idle_timeout_seconds connection_pool_http";
 const LOCALITY: &str = "enabled distribute failover failover_priority";

@@ -973,8 +973,8 @@ fn build_tls_connector(
     // - No CA configured → webpki roots as default fallback
     let root_store = if let Some(ca_path) = ca_bundle_path {
         let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-        let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-            .map_err(|error| {
+        let ca_material =
+            load_material_blocking(&source, MaterialKind::CaBundle).map_err(|error| {
                 format!(
                     "ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle ({})",
                     error.failure_class()

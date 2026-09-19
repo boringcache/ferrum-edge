@@ -411,8 +411,8 @@ fn build_tls_connector(
     let custom_root_store = tls_ca_bundle_path
         .map(|ca_path| {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-                .map_err(|error| {
+            let ca_material =
+                load_material_blocking(&source, MaterialKind::CaBundle).map_err(|error| {
                     format!(
                         "TCP logging: `FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle ({})",
                         error.failure_class()
