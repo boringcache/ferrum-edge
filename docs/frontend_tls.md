@@ -1494,10 +1494,13 @@ export FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER="false"
 
 ### Verifying TLS Policy
 
-The gateway logs the active TLS policy at startup:
+The gateway logs selection counts and configuration field names at startup.
+Supplied selections, protocol versions and the cipher-order flag are withheld.
+For example, a policy selecting two versions, one cipher suite and one group
+emits:
 
 ```
-TLS policy: versions=["TLS 1.2", "TLS 1.3"], cipher_suites=["TLS13_AES_128_GCM_SHA256", ...], curves=["X25519", "SECP256R1"], prefer_server_order=true
+TLS policy: version_count=2 (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`), cipher_suite_count=1 (`FERRUM_TLS_CIPHER_SUITES`), group_count=1 (`FERRUM_TLS_CURVES`); `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` value withheld
 ```
 
 You can also verify externally:

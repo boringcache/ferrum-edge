@@ -18,6 +18,103 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Opt-in terminal diagnostics for the H2 benchmark investigation (#5588).
+/// Enable only `ferrum_h2_observe=debug`, not protocol-wide frame tracing.
+/// No peer, route, pool key, headers, payload, error text or GOAWAY debug bytes
+/// are emitted. IDs identify driver lifetimes within this process only.
+pub(super) struct H2DriverObservation {
+    identity: Option<(u64, std::time::Instant)>,
+    hop: &'static str,
+}
+
+static H2_OBSERVATION_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+
+impl H2DriverObservation {
+    pub(super) fn new(hop: &'static str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let identity = if tracing::enabled!(target: "ferrum_h2_observe", tracing::Level::DEBUG) {
+            H2_OBSERVATION_EPOCH.get_or_init(std::time::Instant::now);
+            Some((
+                NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                std::time::Instant::now(),
+            ))
+        } else {
+            None
+        };
+        Self { identity, hop }
+    }
+
+    pub(super) fn finish(self, error: Option<&(dyn std::error::Error + 'static)>) {
+        static TERMINATIONS: AtomicU64 = AtomicU64::new(0);
+        let Some((connection_id, started)) = self.identity else {
+            return;
+        };
+        // Counts continue after log suppression. Per-process, not per request.
+        let sequence = TERMINATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence > 512 {
+            return;
+        }
+        let mut kind = if error.is_some() {
+            "unclassified"
+        } else {
+            "ok"
+        };
+        let mut reason = "unavailable";
+        let mut initiator = "unknown";
+        let mut cause = error;
+        for _ in 0..8 {
+            let Some(current) = cause else { break };
+            if let Some(h2) = current.downcast_ref::<h2::Error>() {
+                kind = if h2.is_go_away() {
+                    "goaway"
+                } else if h2.is_reset() {
+                    "reset"
+                } else if h2.is_io() {
+                    "io"
+                } else {
+                    "other"
+                };
+                initiator = if h2.is_remote() {
+                    "remote"
+                } else if h2.is_library() {
+                    "local_library"
+                } else if h2.is_go_away() || h2.is_reset() {
+                    "local_user"
+                } else {
+                    "unknown"
+                };
+                reason = match h2.reason().map(u32::from) {
+                    Some(0) => "NO_ERROR",
+                    Some(1) => "PROTOCOL_ERROR",
+                    Some(2) => "INTERNAL_ERROR",
+                    Some(3) => "FLOW_CONTROL_ERROR",
+                    Some(4) => "SETTINGS_TIMEOUT",
+                    Some(5) => "STREAM_CLOSED",
+                    Some(6) => "FRAME_SIZE_ERROR",
+                    Some(7) => "REFUSED_STREAM",
+                    Some(8) => "CANCEL",
+                    Some(9) => "COMPRESSION_ERROR",
+                    Some(10) => "CONNECT_ERROR",
+                    Some(11) => "ENHANCE_YOUR_CALM",
+                    Some(12) => "INADEQUATE_SECURITY",
+                    Some(13) => "HTTP_1_1_REQUIRED",
+                    Some(_) => "unknown",
+                    None => "unavailable",
+                };
+                break;
+            }
+            cause = current.source();
+        }
+        debug!(target: "ferrum_h2_observe",
+            hop = self.hop, connection_id, sequence,
+            monotonic_ns = H2_OBSERVATION_EPOCH.get().map(|epoch| epoch.elapsed().as_nanos() as u64),
+            lifetime_ns = started.elapsed().as_nanos() as u64,
+            kind, reason, initiator, limit_reached = sequence == 512,
+            "H2 driver terminated"
+        );
+    }
+}
+
 use crate::backend_conn_limit::{PooledConnectionAdmission, SharedBackendConnectionLimiter};
 use crate::config::PoolConfig;
 use crate::config::types::{GatewayConfig, Proxy};
@@ -381,11 +478,14 @@ impl Http2PoolManager {
                 })?;
 
                 // ALPN has already proved H2 for this TLS candidate.
+                let observation = H2DriverObservation::new("backend_h2_tls");
                 tokio::spawn(async move {
                     // The `maxConnections` slot lives exactly as long as the
                     // connection driver, i.e. as long as the socket is open.
                     let _conn_slot = conn_slot;
-                    if let Err(e) = conn.await {
+                    let result = conn.await;
+                    observation.finish(result.as_ref().err().map(|e| e as &dyn std::error::Error));
+                    if let Err(e) = result {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });

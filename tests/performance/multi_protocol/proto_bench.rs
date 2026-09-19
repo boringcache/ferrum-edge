@@ -5,12 +5,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+
+use multi_protocol_perf::h2_observation::{Observer, error_chain, escaped_snippet};
 
 use bytes::Buf;
 use multi_protocol_perf::h1_profile::{Counters, ObservedTls};
@@ -85,15 +87,18 @@ struct BenchArgs {
 
     /// Path to a PEM-encoded CA certificate used to validate the server's
     /// certificate. Required for gRPC-over-TLS when targeting a self-signed
-    /// backend — tonic 0.14 does not expose an "accept invalid" toggle, so we
-    /// must explicitly trust the benchmark backend's cert. HTTP/1, HTTP/2,
-    /// HTTP/3, and WS use an in-process insecure verifier and ignore this.
+    /// backend. Also enables CA/name verification for HTTP/2; required for its
+    /// observation campaign. HTTP/1, HTTP/3 and WS ignore this option.
     #[arg(long)]
     ca_cert: Option<std::path::PathBuf>,
 
     /// Output JSON instead of text
     #[arg(long, default_value = "false")]
     json: bool,
+
+    /// Bounded H2/gRPC transport observations; identical overhead in every arm.
+    #[arg(long, default_value = "false")]
+    h2_observe: bool,
 }
 
 #[derive(Parser, Clone)]
@@ -154,6 +159,31 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Reporting helper ─────────────────────────────────────────────────────────
 
+/// Process-wide cap on transport-failure stderr lines (tracker #5588 section 3).
+///
+/// Transport failures used to be discarded (`Err(_) => metrics.record_error()`),
+/// so a sample could report 159 gRPC errors with an empty stderr file and no way
+/// to tell a backend refusal from a stream reset. Every worker retires on its
+/// first transport failure, so the natural bound is one line per worker; the
+/// response-body branch does not retire, so an explicit cap keeps a persistently
+/// failing read from flooding the artifact. Reporting happens only on the error
+/// path and cannot touch a successful request.
+static REPORTED_TRANSPORT_ERRORS: AtomicUsize = AtomicUsize::new(0);
+const MAX_REPORTED_TRANSPORT_ERRORS: usize = 512;
+
+fn report_transport_error(
+    protocol: &str,
+    operation: &str,
+    error: &(dyn std::error::Error + 'static),
+) {
+    let reported = REPORTED_TRANSPORT_ERRORS.fetch_add(1, Ordering::Relaxed);
+    if reported < MAX_REPORTED_TRANSPORT_ERRORS {
+        eprintln!("  {protocol} {operation} error: {}", error_chain(error));
+    } else if reported == MAX_REPORTED_TRANSPORT_ERRORS {
+        eprintln!("  {protocol} further transport errors suppressed");
+    }
+}
+
 fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
     if args.json {
         let report =
@@ -170,6 +200,12 @@ fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
     }
 }
 
+/// `error_body` is echoed back on an unexpected status so the gateway's own
+/// refusal is identifiable. Three distinct Ferrum 502 bodies
+/// (`Backend unavailable`, `Client disconnected`, `Invalid backend URL`) are all
+/// exactly 31 bytes, so the length alone names no cause. Pass an empty slice
+/// where the body was streamed and not retained.
+#[allow(clippy::too_many_arguments)]
 fn record_http_echo_result(
     metrics: &mut BenchMetrics,
     protocol: &str,
@@ -178,9 +214,11 @@ fn record_http_echo_result(
     expected_len: usize,
     body_matches: bool,
     latency_us: u64,
+    error_body: &[u8],
 ) -> bool {
     if status != http::StatusCode::OK {
-        eprintln!("  {protocol} unexpected status {status} (body {body_len} bytes)");
+        let snippet = escaped_snippet(error_body);
+        eprintln!("  {protocol} unexpected status {status} (body {body_len} bytes): {snippet}");
         metrics.record_error();
         return false;
     }
@@ -358,14 +396,18 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                                     payload.len(),
                                     bytes.as_ref() == payload.as_ref(),
                                     latency,
+                                    bytes.as_ref(),
                                 ) {
                                     break;
                                 }
                             }
-                            Err(_) => metrics.record_error(),
+                            Err(error) => {
+                                report_transport_error(protocol_label, "response body", &error);
+                                metrics.record_error();
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // Break out of the per-task loop on connection-level
                         // send errors (matches run_http2 / run_grpc). Without
                         // the break, a broken connection that reports fast
@@ -375,6 +417,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                         // payload sizes. Dropping the task is preferable —
                         // the other N-1 workers continue producing clean
                         // throughput data.
+                        report_transport_error(protocol_label, "send_request", &error);
                         metrics.record_error();
                         break;
                     }
@@ -401,6 +444,10 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     use http_body_util::BodyExt;
     use hyper::client::conn::http2;
     use hyper_util::rt::{TokioExecutor, TokioTimer};
+    let observer = Observer::new(args.h2_observe, "client_h2", false);
+    if args.h2_observe && args.target.starts_with("https://") && args.ca_cert.is_none() {
+        anyhow::bail!("H2 observation over TLS requires --ca-cert");
+    }
 
     let is_tls = args.target.starts_with("https://");
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
@@ -437,7 +484,18 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         // handshake then fails on the first send_request, producing the
         // classic 0 RPS / 100 errors pattern. Offering only h2 guarantees
         // we either get h2 or fail the TLS handshake cleanly.
-        let mut cfg = tls_utils::make_client_tls_config_insecure();
+        let mut cfg = if let Some(path) = &args.ca_cert {
+            let pem = std::fs::read(path).context("reading H2 CA")?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                roots.add(cert?)?;
+            }
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        } else {
+            tls_utils::make_client_tls_config_insecure()
+        };
         cfg.alpn_protocols = vec![b"h2".to_vec()];
         Some(Arc::new(cfg))
     } else {
@@ -469,8 +527,9 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         ),
     );
     let mut senders = Vec::with_capacity(num_conns);
+    let mut drivers = Vec::with_capacity(num_conns);
 
-    for _ in 0..num_conns {
+    for connection_id in 1..=num_conns {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
         tcp.set_nodelay(true)?;
         let host_str = host.to_string();
@@ -483,22 +542,39 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let (sr, conn) = make_h2_builder().handshake(io).await?;
             let connection = connections.opened();
-            tokio::spawn(async move {
+            let events = observer.clone();
+            drivers.push(tokio::spawn(async move {
                 let _connection = connection;
-                let _ = conn.await;
-            });
+                let result = conn.await;
+                events.record(
+                    connection_id,
+                    None,
+                    None,
+                    "driver_terminated",
+                    result.as_ref().err().map(|e| e as &dyn std::error::Error),
+                );
+            }));
             sr
         } else {
             let io = hyper_util::rt::TokioIo::new(tcp);
             let (sr, conn) = make_h2_builder().handshake(io).await?;
             let connection = connections.opened();
-            tokio::spawn(async move {
+            let events = observer.clone();
+            drivers.push(tokio::spawn(async move {
                 let _connection = connection;
-                let _ = conn.await;
-            });
+                let result = conn.await;
+                events.record(
+                    connection_id,
+                    None,
+                    None,
+                    "driver_terminated",
+                    result.as_ref().err().map(|e| e as &dyn std::error::Error),
+                );
+            }));
             sr
         };
         senders.push(send_req);
+        observer.record(connection_id, None, None, "connection_opened", None);
     }
 
     let payload = Bytes::from(make_payload(args.payload_size));
@@ -508,6 +584,8 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
         let mut send_req = senders[i as usize % num_conns].clone();
+        let connection_id = i as usize % num_conns + 1;
+        let events = observer.clone();
         let uri = request_uri.clone();
         let payload = payload.clone();
         let mut metrics = phases.worker();
@@ -532,14 +610,40 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                                     payload.len(),
                                     bytes.as_ref() == payload.as_ref(),
                                     latency,
+                                    bytes.as_ref(),
                                 ) {
+                                    events.record(
+                                        connection_id,
+                                        Some(i as usize),
+                                        None,
+                                        "response_validation_failed",
+                                        None,
+                                    );
                                     break;
                                 }
                             }
-                            Err(_) => metrics.record_error(),
+                            Err(error) => {
+                                report_transport_error("HTTP/2", "response body", &error);
+                                events.record(
+                                    connection_id,
+                                    Some(i as usize),
+                                    None,
+                                    "response_body_error",
+                                    Some(&error),
+                                );
+                                metrics.record_error();
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        report_transport_error("HTTP/2", "send_request", &error);
+                        events.record(
+                            connection_id,
+                            Some(i as usize),
+                            None,
+                            "send_request_error",
+                            Some(&error),
+                        );
                         metrics.record_error();
                         break;
                     }
@@ -549,7 +653,44 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = phases.finish(handles).await;
+    let mut combined = phases.finish(handles).await;
+    if args.h2_observe {
+        let close = Instant::now();
+        if let Some(phases) = &mut combined.phases {
+            phases.transport_close_start_monotonic_secs =
+                Some(multi_protocol_perf::phases::monotonic_secs());
+        }
+        observer.record(0, None, None, "senders_dropped", None);
+        drop(senders);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for (index, mut driver) in drivers.into_iter().enumerate() {
+            match tokio::time::timeout_at(deadline, &mut driver).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    observer.record(index + 1, None, None, "driver_join_failed", Some(&error));
+                    combined.record_error();
+                }
+                Err(error) => {
+                    observer.record(
+                        index + 1,
+                        None,
+                        None,
+                        "driver_observation_timeout",
+                        Some(&error),
+                    );
+                    driver.abort();
+                    let _ = driver.await;
+                    if let Some(phases) = &mut combined.phases {
+                        phases.transport_close_timed_out = true;
+                    }
+                }
+            }
+        }
+        if let Some(phases) = &mut combined.phases {
+            phases.transport_close_secs = close.elapsed().as_secs_f64();
+            observer.attach(phases);
+        }
+    }
     print_results(&combined, "HTTP/2", args);
     Ok(())
 }
@@ -729,6 +870,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                         payload.len(),
                                         body_matches,
                                         latency,
+                                        &[],
                                     ) {
                                         let _ = event_tx.send(TransportEvent::new(
                                             connection_id,
@@ -848,6 +990,10 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             .iter()
             .find(|event| event.event == "retirement_started")
             .map(|event| event.unix_secs);
+        phases.transport_close_start_monotonic_secs = events
+            .iter()
+            .find(|event| event.event == "retirement_started")
+            .and_then(|event| event.monotonic_secs);
         phases.set_transport_events(events);
     }
     print_results(&combined, "HTTP/3", args);
@@ -919,7 +1065,8 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
             while metrics.next_request().await {
                 let start = Instant::now();
                 metrics.admitted();
-                if write.send(Message::Binary(payload.clone())).await.is_err() {
+                if let Err(error) = write.send(Message::Binary(payload.clone())).await {
+                    report_transport_error("ws", "send", &error);
                     metrics.record_error();
                     break;
                 }
@@ -994,6 +1141,9 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     use bench_proto::EchoRequest;
     use bench_proto::bench_service_client::BenchServiceClient;
+    use multi_protocol_perf::transport::{GrpcConnectionIdentity, GrpcConnector};
+
+    let observer = Observer::new(args.h2_observe, "client_grpc", false);
 
     let mut phases =
         Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
@@ -1029,7 +1179,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     );
     let mut channels = Vec::with_capacity(num_conns);
 
-    for _ in 0..num_conns {
+    for channel_id in 1..=num_conns {
         let mut endpoint = tonic::transport::Channel::from_shared(args.target.clone())
             .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
             .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
@@ -1050,16 +1200,24 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target))?;
         }
 
+        let current_connection = Arc::new(GrpcConnectionIdentity::default());
         let channel = endpoint
-            .connect_with_connector(connections.clone())
+            .connect_with_connector(GrpcConnector {
+                connections: connections.clone(),
+                observer: observer.clone(),
+                channel_id,
+                current_connection: current_connection.clone(),
+            })
             .await
             .map_err(|e| anyhow::anyhow!("gRPC connect to {}: {e}", args.target))?;
-        channels.push(channel);
+        channels.push((channel, current_connection));
     }
 
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
-        let channel = channels[i as usize % num_conns].clone();
+        let (channel, current_connection) = channels[i as usize % num_conns].clone();
+        let channel_id = i as usize % num_conns + 1;
+        let events = observer.clone();
         let payload = payload.clone();
         let mut metrics = phases.worker();
         handles.push(tokio::spawn(async move {
@@ -1076,6 +1234,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
             .max_decoding_message_size(8 * 1024 * 1024)
             .max_encoding_message_size(8 * 1024 * 1024);
             while metrics.next_request().await {
+                let connection_before = current_connection.snapshot();
                 let req = tonic::Request::new(EchoRequest {
                     payload: payload.clone(),
                 });
@@ -1085,10 +1244,29 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                         let latency = start.elapsed().as_micros() as u64;
                         let response = resp.into_inner().payload;
                         if !record_echo_result(&mut metrics, "gRPC", &response, &payload, latency) {
+                            events.record(
+                                0,
+                                Some(i as usize),
+                                Some(channel_id),
+                                "response_validation_failed",
+                                None,
+                            );
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(status) => {
+                        report_transport_error("gRPC", "unary_echo", &status);
+                        // Includes failed/cancelled reconnects and retirement.
+                        // Zero means unknown, never a channel index.
+                        let connection_id =
+                            current_connection.connection_id_since(connection_before);
+                        events.record(
+                            connection_id,
+                            Some(i as usize),
+                            Some(channel_id),
+                            "unary_echo_error",
+                            Some(&status),
+                        );
                         metrics.record_error();
                         break;
                     }
@@ -1098,7 +1276,15 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = phases.finish(handles).await;
+    let mut combined = phases.finish(handles).await;
+    if args.h2_observe {
+        // Dropping a Channel does not expose tonic's detached driver result.
+        // Capture already observed socket events; do not claim graceful close.
+        drop(channels);
+        if let Some(phases) = &mut combined.phases {
+            observer.attach(phases);
+        }
+    }
     print_results(&combined, "gRPC", args);
     Ok(())
 }

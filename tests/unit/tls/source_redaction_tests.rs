@@ -12,6 +12,201 @@ use ferrum_edge::tls::source::{
     CertSource, MaterialError, MaterialKind, MaterializedMaterial, SourceScheme,
 };
 
+const HOSTILE_SOURCE: &str = "'TLS_SOURCE_MARKER\"\\\n927451 true";
+const HOSTILE_DETAIL: &str = "bare TLS_PROVIDER_MARKER '\"\\\n927451 true";
+
+fn assert_rendered(error: anyhow::Error, expected: &[&str]) {
+    let rendered = ferrum_edge::startup::render_startup_error(
+        error.context("`backend_tls_client_cert_path`: TLS configuration rejected"),
+        &[],
+    );
+    for &expected in expected {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
+    }
+    assert!(rendered.contains("`backend_tls_client_cert_path`"));
+    let rendered = rendered.to_ascii_lowercase();
+    for withheld in ["tls_source_marker", "tls_provider_marker", "927451", "true"] {
+        assert!(
+            !rendered.contains(withheld),
+            "leaked {withheld}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn material_error_rendering_withholds_source_details_and_custom_io_chains() {
+    for (error, reason) in [
+        (
+            MaterialError::Io {
+                source_id: HOSTILE_SOURCE.to_string(),
+                source: std::io::Error::other(std::io::Error::other(HOSTILE_DETAIL)),
+            },
+            "failed to read TLS material",
+        ),
+        (
+            MaterialError::Secret {
+                source_id: HOSTILE_SOURCE.to_string(),
+                details: HOSTILE_DETAIL.to_string(),
+            },
+            "failed to resolve TLS material source",
+        ),
+        (
+            MaterialError::InvalidSource {
+                source_id: HOSTILE_SOURCE.to_string(),
+                details: HOSTILE_DETAIL.to_string(),
+            },
+            "invalid TLS material source",
+        ),
+    ] {
+        assert!(std::error::Error::source(&error).is_none());
+        assert_rendered(error.into(), &[reason]);
+    }
+    assert_rendered(
+        MaterialError::Oversized {
+            kind: MaterialKind::Key,
+            max_bytes: 927451,
+        }
+        .into(),
+        &["exceeds the configured maximum"],
+    );
+}
+
+#[test]
+fn backend_error_rendering_withholds_paths_and_opaque_details() {
+    use ferrum_edge::tls::backend::TlsError;
+
+    for error in [
+        TlsError::Io {
+            kind: "backend TLS client certificate",
+            path: HOSTILE_SOURCE.into(),
+            source: std::io::Error::other(std::io::Error::other(HOSTILE_DETAIL)),
+        },
+        TlsError::Pem {
+            kind: "backend TLS client certificate",
+            path: HOSTILE_SOURCE.into(),
+            details: HOSTILE_DETAIL.to_string(),
+        },
+    ] {
+        assert!(std::error::Error::source(&error).is_none());
+        assert_rendered(
+            error.into(),
+            &["`backend TLS client certificate`", "Failed to"],
+        );
+    }
+}
+
+#[test]
+fn typed_io_fields_and_os_error_causes_remain_available() {
+    use ferrum_edge::tls::backend::TlsError;
+
+    let error = MaterialError::Io {
+        source_id: HOSTILE_SOURCE.to_string(),
+        source: std::io::Error::from_raw_os_error(2),
+    };
+    let cause = std::error::Error::source(&error).unwrap();
+    assert_eq!(
+        cause
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(2)
+    );
+    let MaterialError::Io { source_id, source } = error else {
+        unreachable!();
+    };
+    assert_eq!(source_id, HOSTILE_SOURCE);
+    let error = TlsError::Io {
+        kind: "backend TLS client certificate",
+        path: source_id.into(),
+        source,
+    };
+    assert!(std::error::Error::source(&error).is_some());
+    assert_rendered(
+        error.into(),
+        &["Failed to read", "`backend TLS client certificate`"],
+    );
+}
+
+#[test]
+fn actual_material_loaders_withhold_hostile_references_and_reader_errors() {
+    use ferrum_edge::tls::source::{load_material_blocking_with, read_bounded_material_bytes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("'TLS_SOURCE_MARKER.pem");
+    let source = CertSource::Path(missing);
+    let error = load_material_blocking_with(&source, MaterialKind::Cert, 4096).unwrap_err();
+    assert_rendered(error.into(), &["failed to read TLS material"]);
+
+    let source = CertSource::parse(
+        "file://operator:TLS_PROVIDER_MARKER@localhost/key.pem",
+        MaterialKind::Key,
+    );
+    let error = load_material_blocking_with(&source, MaterialKind::Key, 4096).unwrap_err();
+    assert_rendered(error.into(), &["invalid TLS material source"]);
+
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(HOSTILE_DETAIL))
+        }
+    }
+
+    let error = read_bounded_material_bytes(FailingReader, MaterialKind::Key, 4096).unwrap_err();
+    assert!(std::error::Error::source(&error).is_none());
+    let MaterialError::Io { source, .. } = &error else {
+        panic!("expected I/O error");
+    };
+    assert_eq!(source.kind(), std::io::ErrorKind::Other);
+    assert_eq!(source.to_string(), HOSTILE_DETAIL);
+    assert_rendered(error.into(), &["failed to read TLS material"]);
+}
+
+#[test]
+fn tls_policy_rendering_keeps_fields_and_suggestions_without_values() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::tls::TlsPolicy;
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    for value in [HOSTILE_SOURCE, "927451", "true"] {
+        let config = EnvConfig {
+            tls_cipher_suites: Some(value.to_string()),
+            ..EnvConfig::default()
+        };
+        assert_rendered(
+            TlsPolicy::from_env_config(&config).unwrap_err(),
+            &[
+                "`FERRUM_TLS_CIPHER_SUITES`",
+                "Unknown cipher suite",
+                "`TLS_AES_128_GCM_SHA256`",
+            ],
+        );
+        let config = EnvConfig {
+            tls_curves: Some(value.to_string()),
+            ..EnvConfig::default()
+        };
+        assert_rendered(
+            TlsPolicy::from_env_config(&config).unwrap_err(),
+            &["`FERRUM_TLS_CURVES`", "Unknown curve/group", "`secp256r1`"],
+        );
+        let config = EnvConfig {
+            tls_min_version: value.to_string(),
+            tls_max_version: value.to_string(),
+            ..EnvConfig::default()
+        };
+        assert_rendered(
+            TlsPolicy::from_env_config(&config).unwrap_err(),
+            &[
+                "`FERRUM_TLS_MIN_VERSION`",
+                "`FERRUM_TLS_MAX_VERSION`",
+                "No valid TLS versions",
+            ],
+        );
+    }
+}
+
 /// The four schemes whose identifier is a secret source reference, with an
 /// identifier shaped like the real thing for each.
 const PROVIDER_URIS: [&str; 4] = [
@@ -52,9 +247,8 @@ fn provider_schemes_are_classified_as_secret_sources() {
         );
     }
 
-    // Local configuration, not a secret reference: an operator needs these
-    // verbatim to act on a diagnostic, and they are already in the settings
-    // file.
+    // Local configuration, not a provider reference. Display helpers retain
+    // these identifiers; diagnostic producers must still quote/sanitize them.
     let local = [
         SourceScheme::File,
         SourceScheme::K8sSecret,
@@ -125,8 +319,8 @@ fn identity_source_id_is_unchanged_and_still_distinguishing() {
     assert_eq!(first.redacted_source_id(), second.redacted_source_id());
 }
 
-/// Non-provider sources are unaffected: a filesystem path is operator-authored
-/// local configuration and is needed verbatim to act on the diagnostic.
+/// Non-provider display helpers retain the configured identity. Configuration
+/// diagnostics withhold this supplied text at the rendering/emission boundary.
 #[test]
 fn non_provider_sources_are_reported_verbatim() {
     let path = uri_source("file:///etc/ferrum/tls/server.pem");
