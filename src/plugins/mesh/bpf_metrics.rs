@@ -357,7 +357,7 @@ fn parse_config(config: &Value) -> Result<BpfMetricsConfig, String> {
             object,
             "config",
             MESH_BPF_METRICS_CONFIG_KEYS,
-            "__mesh_bpf_metrics: ",
+            "__mesh_bpf_metrics: `config`: ",
         )?;
     }
     let mut parsed = BpfMetricsConfig::default();

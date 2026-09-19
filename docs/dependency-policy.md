@@ -787,6 +787,10 @@ Rules:
   would be an implicit FIPS support claim, which is exactly what this gate
   refuses. CI enumerates the same table through `--list-claimed-profiles`, so
   the audited set and the compiled set cannot drift apart.
+- `bench-udp-profile` is dependency-free source-site measurement. The claimed
+  FIPS inventory includes `fips,bench-udp-profile` and the combined
+  `fips,bench-h1-profile,bench-udp-profile`; neither changes provider selection
+  or the enforcing runtime boundary. Hosted enumeration audits these graphs.
 - **Each feature list must name a dependency's crypto arm exactly once.** A
   duplicate entry, or a `dep:x` beside an `x/<feature>` edge for the same
   optional dependency (the `dep/feature` edge already activates it), breaks the

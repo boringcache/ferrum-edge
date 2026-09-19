@@ -2565,3 +2565,16 @@ deployments, upgrade every data plane before the control plane: `config_json`
 is parsed with `deny_unknown_fields`, so a data plane that predates this field
 rejects a namespace snapshot as soon as any resource in it carries a non-empty
 `labels` map, and it does not converge until it is upgraded.
+
+Diagnostic builds with the default-off `bench-h1-profile` feature append fixed
+`ferrum_h1_profile_*` metrics to the existing authenticated `/metrics` response.
+See [H1 internal profiling](h1_internal_profile.md) for source coverage, allocator
+safety, publication loss and hosted-only collection.
+
+### Diagnostic UDP profiling metrics
+
+Default-off `bench-udp-profile` builds append a fixed `ferrum_udp_profile_*`
+family to the existing authenticated `/metrics` response. See
+[UDP profile contract](udp_internal_profile.md) for its literal schema, sampled
+synchronous timings, direction attribution, and explicit partial-data limits.
+Authentication and ordinary builds are unchanged.

@@ -810,3 +810,80 @@ async fn test_basic_auth_removal_is_scheme_and_name_case_insensitive() {
         "mixed-case name and scheme must still be removed: {backend_headers:?}"
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"hide_credentials": canary}),
+            &["`hide_credentials`", "must be a boolean"],
+        ),
+        (
+            json!({"hide_credentials": 8675309}),
+            &["`hide_credentials`", "must be a boolean"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("basic_auth", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_key_diagnostic_preserves_root_context_without_supplied_data() {
+    let canary = "'CALLER_QUOTED_CANARY\"`\n\\payload";
+    let config = json!({
+        "hide_credentails": {"CALLER_PAYLOAD_KEY_CANARY": [canary, 8675309]},
+        "CALLER_KEY_CANARY": "CALLER_VALUE_CANARY",
+        "975318642": ["CALLER_ARRAY_CANARY", {"CALLER_ARRAY_KEY_CANARY": canary}],
+        (canary): canary
+    });
+    let error = ferrum_edge::plugins::basic_auth::BasicAuth::new(&config)
+        .err()
+        .expect("unknown root keys must be rejected before secret admission");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in [
+        "basic_auth: `config`:",
+        "unknown configuration key(s)",
+        "did you mean `hide_credentials`?",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
+    }
+    for supplied in [
+        "hide_credentails",
+        "CALLER_",
+        "8675309",
+        "975318642",
+        "payload",
+    ] {
+        assert!(
+            !rendered.contains(supplied),
+            "leaked {supplied:?}: {rendered}"
+        );
+    }
+}

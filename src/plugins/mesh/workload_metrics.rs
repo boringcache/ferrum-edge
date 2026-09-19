@@ -217,9 +217,13 @@ struct BaggageTrustGate {
 }
 
 impl BaggageTrustGate {
-    fn from_config(config: &Value) -> Result<Self, String> {
+    fn from_config(config: &Value, effective_gate_index: Option<usize>) -> Result<Self, String> {
         Ok(Self {
-            trusted_hbone_assertors: parse_trusted_hbone_assertors(config)?,
+            trusted_hbone_assertors: parse_trusted_hbone_assertors(
+                config,
+                "workload_metrics",
+                effective_gate_index,
+            )?,
             trust_domain_aliases: parse_trust_domain_aliases(config)?,
         })
     }
@@ -251,16 +255,16 @@ impl Default for BaggageTrustPolicy {
 impl BaggageTrustPolicy {
     fn from_config(config: &Value) -> Result<Self, String> {
         match config.get(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY) {
-            None => Ok(Self::Single(BaggageTrustGate::from_config(config)?)),
+            None => Ok(Self::Single(BaggageTrustGate::from_config(config, None)?)),
             Some(Value::Array(gates)) => {
                 if gates.is_empty() {
                     return Err(format!(
-                        "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY} must contain at least one gate"
+                        "`{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}` must contain at least one gate"
                     ));
                 }
                 if gates.len() > MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES {
                     return Err(format!(
-                        "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY} exceeds \
+                        "`{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}` exceeds \
                          {MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES} gates"
                     ));
                 }
@@ -272,7 +276,7 @@ impl BaggageTrustPolicy {
                 Ok(Self::Conjunctive(compiled?.into_boxed_slice()))
             }
             Some(_) => Err(format!(
-                "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY} must be an array of objects"
+                "`{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}` must be an array of objects"
             )),
         }
     }
@@ -301,17 +305,17 @@ fn parse_effective_authz_baggage_gate(
 ) -> Result<BaggageTrustGate, String> {
     let Some(object) = gate.as_object() else {
         return Err(format!(
-            "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}] must be an object"
+            "`{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]` must be an object"
         ));
     };
     crate::util::unknown_keys::reject_unknown_keys(
         object,
         &format!("{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]"),
         EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS,
-        "workload_metrics: ",
+        &format!("workload_metrics: `{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]`: "),
     )?;
-    BaggageTrustGate::from_config(gate).map_err(|e| {
-        format!("workload_metrics: {EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]: {e}")
+    BaggageTrustGate::from_config(gate, Some(idx)).map_err(|e| {
+        format!("workload_metrics: `{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]`: {e}")
     })
 }
 
@@ -389,12 +393,12 @@ impl WorkloadMetrics {
     {
         let object = config
             .as_object()
-            .ok_or_else(|| "workload_metrics: config must be an object".to_string())?;
+            .ok_or_else(|| "workload_metrics: `config` must be an object".to_string())?;
         crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config",
             WORKLOAD_METRICS_CONFIG_KEYS,
-            "workload_metrics: ",
+            "workload_metrics: `config`: ",
         )?;
         for key in [
             "node_id",
@@ -405,7 +409,7 @@ impl WorkloadMetrics {
             "deployment_environment",
         ] {
             if config.get(key).is_some_and(|value| !value.is_string()) {
-                return Err(format!("workload_metrics: {key} must be a string"));
+                return Err(format!("workload_metrics: `{key}` must be a string"));
             }
         }
         for key in [
@@ -414,7 +418,7 @@ impl WorkloadMetrics {
             "disableSpanReporting",
         ] {
             if config.get(key).is_some_and(|value| !value.is_boolean()) {
-                return Err(format!("workload_metrics: {key} must be a boolean"));
+                return Err(format!("workload_metrics: `{key}` must be a boolean"));
             }
         }
         for key in [
@@ -430,7 +434,7 @@ impl WorkloadMetrics {
                 .is_some_and(|value| value.as_u64().is_none())
             {
                 return Err(format!(
-                    "workload_metrics: {key} must be a non-negative integer"
+                    "workload_metrics: `{key}` must be a non-negative integer"
                 ));
             }
         }
@@ -441,7 +445,9 @@ impl WorkloadMetrics {
             .filter(|value| !value.trim().is_empty())
             .map(SpiffeId::new)
             .transpose()
-            .map_err(|e| format!("workload_metrics: invalid workload_spiffe_id: {e}"))?;
+            .map_err(|_| {
+                "workload_metrics: `workload_spiffe_id` is not a valid SPIFFE id".to_string()
+            })?;
         let labels = string_map_config(config, "labels")?;
         let baggage_trust = BaggageTrustPolicy::from_config(config).map_err(|e| {
             if e.starts_with("workload_metrics:") {
@@ -454,12 +460,12 @@ impl WorkloadMetrics {
             Some(value) => {
                 let Some(percentage) = value.as_f64() else {
                     return Err(
-                        "workload_metrics: sampling_percentage must be a number".to_string()
+                        "workload_metrics: `sampling_percentage` must be a number".to_string()
                     );
                 };
                 if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
                     return Err(format!(
-                        "workload_metrics: sampling_percentage must be between 0.0 and 100.0 (got \"{percentage}\")"
+                        "workload_metrics: `sampling_percentage` must be between 0.0 and 100.0 (got \"{percentage}\")"
                     ));
                 }
                 Some(percentage)
@@ -502,7 +508,7 @@ impl WorkloadMetrics {
             Vec::new()
         } else {
             trace_exporters_from_providers(&tracing_providers, &service_name, config, http_client)
-                .map_err(|e| format!("workload_metrics: invalid tracing exporter config: {e}"))?
+                .map_err(|error| format!("workload_metrics: {error}"))?
         };
         let direction_emit = parse_direction_emit(config)?;
 
@@ -1109,7 +1115,7 @@ pub(crate) fn validate_effective_metric_tag_override_plan_budget(
             custom_tag_names.extend(marker.split(','));
             if custom_tag_names.len() > MAX_CUSTOM_TAGS {
                 return Err(format!(
-                    "proxy_id={proxy_id}: workload_metrics effective custom tags exceed {MAX_CUSTOM_TAGS} distinct names"
+                    "proxy_id={proxy_id:?}: workload_metrics effective custom tags exceed {MAX_CUSTOM_TAGS} distinct names"
                 ));
             }
         }
@@ -1127,12 +1133,12 @@ pub(crate) fn validate_effective_metric_tag_override_plan_budget(
     for plan_len in effective_plan_lengths {
         total = total.checked_add(plan_len).ok_or_else(|| {
             format!(
-                "proxy_id={proxy_id}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
+                "proxy_id={proxy_id:?}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
             )
         })?;
         if total > MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES {
             return Err(format!(
-                "proxy_id={proxy_id}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
+                "proxy_id={proxy_id:?}: workload_metrics effective metric tag override plans exceed {MAX_METRIC_TAG_OVERRIDE_PLAN_BYTES} encoded bytes across surviving families"
             ));
         }
     }
@@ -1473,14 +1479,14 @@ fn string_map_config(config: &Value, key: &str) -> Result<HashMap<String, String
     };
     let object = value
         .as_object()
-        .ok_or_else(|| format!("workload_metrics: {key} must be an object"))?;
+        .ok_or_else(|| format!("workload_metrics: `{key}` must be an object"))?;
     object
         .iter()
         .map(|(name, value)| {
             value
                 .as_str()
                 .map(|value| (name.clone(), value.to_string()))
-                .ok_or_else(|| format!("workload_metrics: {key} values must be strings"))
+                .ok_or_else(|| format!("workload_metrics: `{key}` values must be strings"))
         })
         .collect()
 }
@@ -1488,11 +1494,11 @@ fn string_map_config(config: &Value, key: &str) -> Result<HashMap<String, String
 fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
     match config.get("direction_emit") {
         None | Some(Value::Null) => Ok(DirectionEmit::server_only()),
-        Some(value) => crate::util::deserialization::from_json_value::<
+        Some(value) => super::diagnostics::from_value::<
             crate::util::json_object::JsonObject<DirectionEmit>,
-        >(value.clone())
+        >(value.clone(), super::diagnostics::Schema::Direction)
         .map(|object| object.0)
-        .map_err(|e| format!("workload_metrics: invalid direction_emit config: {e}")),
+        .map_err(|e| format!("workload_metrics: invalid `direction_emit` config: {e}")),
     }
 }
 
@@ -1501,15 +1507,21 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
         if value.is_null() {
             return Ok(Vec::new());
         }
-        return serde_json::from_value::<Vec<TracingProvider>>(value.clone())
-            .map_err(|e| format!("workload_metrics: invalid tracing_providers config: {e}"));
+        return super::diagnostics::from_value::<Vec<TracingProvider>>(
+            value.clone(),
+            super::diagnostics::Schema::Provider,
+        )
+        .map_err(|e| format!("workload_metrics: invalid `tracing_providers` config: {e}"));
     }
 
     match config.get("tracing_provider") {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(value) => Ok(vec![
-            serde_json::from_value::<TracingProvider>(value.clone())
-                .map_err(|e| format!("workload_metrics: invalid tracing_provider config: {e}"))?,
+            super::diagnostics::from_value::<TracingProvider>(
+                value.clone(),
+                super::diagnostics::Schema::Provider,
+            )
+            .map_err(|e| format!("workload_metrics: invalid `tracing_provider` config: {e}"))?,
         ]),
     }
 }
@@ -1550,18 +1562,18 @@ fn parse_tag_operation<'a>(
             .and_then(Value::as_str)
             .map(ParsedTagOperation::Rename)
             .ok_or_else(|| {
-                format!("workload_metrics: new_name is required to rename metric tag {name:?}")
+                format!("workload_metrics: `new_name` is required to rename metric tag {name:?}")
             }),
         Some("set") => {
             let value = operation
                 .get("value")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    format!("workload_metrics: value is required to set metric tag {name:?}")
+                    format!("workload_metrics: `value` is required to set metric tag {name:?}")
                 })?;
             if value.len() > MAX_METRIC_TAG_VALUE_BYTES {
                 return Err(format!(
-                    "workload_metrics: metric tag {name:?} value exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
+                    "workload_metrics: metric tag {name:?} `value` exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
                 ));
             }
             Ok(ParsedTagOperation::Set(value))
@@ -1571,7 +1583,7 @@ fn parse_tag_operation<'a>(
                 let expression: MetricTagCelExpr = serde_json::from_value(expression.clone())
                     .map_err(|_| {
                         format!(
-                            "workload_metrics: invalid compiled CEL expression for metric tag {name:?}"
+                            "workload_metrics: invalid compiled CEL `expression` for metric tag {name:?}"
                         )
                     })?;
                 validate_metric_tag_cel_expr_named(name, &expression)?;
@@ -1579,20 +1591,22 @@ fn parse_tag_operation<'a>(
             }
             let cel = operation.get("cel").and_then(Value::as_str).ok_or_else(|| {
                 format!(
-                    "workload_metrics: cel or expression is required for set_expr metric tag {name:?}"
+                    "workload_metrics: `cel` or `expression` is required for `set_expr` metric tag {name:?}"
                 )
             })?;
-            let expression = parse_metric_tag_cel_expression(cel).map_err(|message| {
-                format!("workload_metrics: metric tag {name:?} CEL expression rejected: {message}")
+            let expression = parse_metric_tag_cel_expression(cel).map_err(|error| {
+                format!(
+                    "workload_metrics: metric tag {name:?} CEL `cel` expression rejected: {error}"
+                )
             })?;
             validate_metric_tag_cel_expr_named(name, &expression)?;
             Ok(ParsedTagOperation::SetExpr(expression))
         }
         Some(operation_type) => Err(format!(
-            "workload_metrics: unsupported operation {operation_type:?} for metric tag {name:?}"
+            "workload_metrics: unsupported operation `type` {operation_type:?} for metric tag {name:?}"
         )),
         None => Err(format!(
-            "workload_metrics: operation type is required for metric tag {name:?}"
+            "workload_metrics: operation `type` is required for metric tag {name:?}"
         )),
     }
 }
@@ -1601,11 +1615,9 @@ fn validate_metric_tag_cel_expr_named(
     name: &str,
     expression: &MetricTagCelExpr,
 ) -> Result<(), String> {
-    crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(
-        |message| {
-            format!("workload_metrics: metric tag {name:?} CEL expression rejected: {message}")
-        },
-    )
+    crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(|error| {
+        format!("workload_metrics: metric tag {name:?} CEL `expression` rejected: {error}")
+    })
 }
 
 fn encode_metric_tag_cel_expr(expr: &MetricTagCelExpr, out: &mut String) {
@@ -1693,15 +1705,15 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
     };
     let object = metrics
         .as_object()
-        .ok_or_else(|| "workload_metrics: 'metrics' must be an object".to_string())?;
+        .ok_or_else(|| "workload_metrics: `metrics` must be an object".to_string())?;
     let mut disabled = BTreeSet::new();
     if let Some(value) = object.get("disabled_metrics") {
         let entries = value.as_array().ok_or_else(|| {
-            "workload_metrics: metrics.disabled_metrics must be an array".to_string()
+            "workload_metrics: `metrics.disabled_metrics` must be an array".to_string()
         })?;
-        for metric in entries {
+        for (idx, metric) in entries.iter().enumerate() {
             let name = metric.as_str().ok_or_else(|| {
-                "workload_metrics: disabled metric names must be strings".to_string()
+                format!("workload_metrics: `metrics.disabled_metrics[{idx}]` must be a string")
             })?;
             match metric_selector(name) {
                 Some(MetricSelector::All) => {
@@ -1714,7 +1726,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                 }
                 None => {
                     return Err(format!(
-                        "workload_metrics: unsupported disabled metric {name:?}"
+                        "workload_metrics: `metrics.disabled_metrics[{idx}]` unsupported disabled metric {name:?}"
                     ));
                 }
             }
@@ -1726,39 +1738,45 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
     let mut total_plan_bytes = 0usize;
     if let Some(value) = object.get("tag_overrides") {
         let overrides = value.as_array().ok_or_else(|| {
-            "workload_metrics: metrics.tag_overrides must be an array".to_string()
+            "workload_metrics: `metrics.tag_overrides` must be an array".to_string()
         })?;
         if overrides.len() > MAX_METRIC_TAG_OVERRIDES {
             return Err(format!(
-                "workload_metrics: metrics.tag_overrides exceeds {MAX_METRIC_TAG_OVERRIDES} entries"
+                "workload_metrics: `metrics.tag_overrides` exceeds {MAX_METRIC_TAG_OVERRIDES} entries"
             ));
         }
-        for entry in overrides {
+        for (idx, entry) in overrides.iter().enumerate() {
             let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
-                "workload_metrics: metric tag override name is required".to_string()
+                format!("workload_metrics: `metrics.tag_overrides[{idx}].name` is required")
             })?;
             let operation = entry
                 .get("operation")
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
-                    format!("workload_metrics: operation is required for metric tag {name:?}")
+                    format!(
+                        "workload_metrics: `metrics.tag_overrides[{idx}].operation` is required for metric tag {name:?}"
+                    )
                 })?;
-            let operation = parse_tag_operation(name, operation)?;
+            let operation = parse_tag_operation(name, operation)
+                .map_err(|error| format!("`metrics.tag_overrides[{idx}].operation`: {error}"))?;
             let selector = match entry.get("metric") {
                 None | Some(Value::Null) => MetricSelector::All,
                 Some(Value::String(metric)) => metric_selector(metric).ok_or_else(|| {
                     format!(
-                        "workload_metrics: unsupported metric {metric:?} for tag override {name:?}"
+                        "workload_metrics: `metrics.tag_overrides[{idx}].metric` unsupported metric {metric:?} for tag override {name:?}"
                     )
                 })?,
                 Some(_) => {
                     return Err(format!(
-                        "workload_metrics: metric for tag override {name:?} must be a string"
+                        "workload_metrics: `metrics.tag_overrides[{idx}].metric` for tag override {name:?} must be a string"
                     ));
                 }
             };
-            let label = MeshMetricLabel::from_config_name(name)
-                .ok_or_else(|| format!("workload_metrics: unsupported metric tag {name:?}"))?;
+            let label = MeshMetricLabel::from_config_name(name).ok_or_else(|| {
+                format!(
+                    "workload_metrics: `metrics.tag_overrides[{idx}].name` unsupported metric tag {name:?}"
+                )
+            })?;
             let operation_stamp_needs = match &operation {
                 ParsedTagOperation::SetExpr(expression) => expression.stamp_needs(),
                 _ => MetricTagCelStampNeeds::default(),
@@ -1768,7 +1786,9 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                 ParsedTagOperation::Rename(new_name) => {
                     let new_label =
                         MeshMetricLabel::from_config_name(new_name).ok_or_else(|| {
-                            format!("workload_metrics: unsupported renamed metric tag '{new_name}'")
+                            format!(
+                                "workload_metrics: `metrics.tag_overrides[{idx}].operation.new_name` unsupported renamed metric tag {new_name:?}"
+                            )
                         })?;
                     format!("n{},{};", label.index(), new_label.index())
                 }
@@ -1783,9 +1803,9 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                         MetricSelector::Emitted(family) => family.is_tcp(),
                     };
                     validate_metric_tag_cel_for_families(expression, includes_tcp).map_err(
-                        |message| {
+                        |_| {
                             format!(
-                                "workload_metrics: metric tag {name:?} CEL expression rejected: {message}"
+                                "workload_metrics: `metrics.tag_overrides[{idx}].operation` metric tag {name:?} CEL expression rejected: HTTP-only attributes are unrepresentable for TCP metric families"
                             )
                         },
                     )?;
@@ -1899,13 +1919,13 @@ pub(crate) fn validate_istio_telemetry_config(
             tracing.custom_header_tags.clone(),
             tracing.custom_env_tags.clone(),
         )?;
-        validate_trace_provider_endpoints(&tracing.providers).map_err(|error| {
-            format!("workload_metrics: invalid tracing exporter config: {error}")
-        })?;
+        validate_trace_provider_endpoints(&tracing.providers)
+            .map_err(|error| format!("workload_metrics: `tracing.providers`: {error}"))?;
     }
     if let Some(metrics) = metrics {
-        let metrics = serde_json::to_value(metrics)
-            .map_err(|error| format!("workload_metrics: invalid translated metrics: {error}"))?;
+        let metrics = serde_json::to_value(metrics).map_err(|_| {
+            "workload_metrics: could not serialize translated `metrics`".to_string()
+        })?;
         parse_metric_config(Some(&metrics))?;
     }
     Ok(())
@@ -1999,7 +2019,7 @@ where
             Ok(value) => {
                 if value.len() > MAX_CUSTOM_TAG_VALUE_BYTES {
                     return Err(format!(
-                        "workload_metrics: custom env tag '{tag}' resolved value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
+                        "workload_metrics: custom env tag {tag:?} resolved value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
                     ));
                 }
                 custom_tags.insert(tag.clone(), value);
@@ -2010,7 +2030,7 @@ where
             }
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(format!(
-                    "workload_metrics: custom env tag '{tag}' environment value is not valid UTF-8"
+                    "workload_metrics: custom env tag {tag:?} environment value is not valid UTF-8"
                 ));
             }
         }
@@ -2023,12 +2043,12 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
     // Never echo the raw name — it may be credential-bearing.
     if env_var.len() > MAX_CUSTOM_ENV_VAR_NAME_BYTES {
         return Err(format!(
-            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+            "workload_metrics: custom tag {tag:?} has invalid environment variable name"
         ));
     }
     if env_var.is_empty() {
         return Err(format!(
-            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+            "workload_metrics: custom tag {tag:?} has invalid environment variable name"
         ));
     }
     // Credential classifier before any diagnostic that could contain the raw
@@ -2036,20 +2056,20 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
     // such as `AWS_SECRET-KEY` or `myPassword`.
     if is_sensitive_environment_variable_name(env_var) {
         return Err(format!(
-            "workload_metrics: custom tag '{tag}' cannot copy a credential-bearing environment variable"
+            "workload_metrics: custom tag {tag:?} cannot copy a credential-bearing environment variable"
         ));
     }
     let mut chars = env_var.chars();
     let Some(first) = chars.next() else {
         return Err(format!(
-            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+            "workload_metrics: custom tag {tag:?} has invalid environment variable name"
         ));
     };
     if !(first.is_ascii_alphabetic() || first == '_')
         || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return Err(format!(
-            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+            "workload_metrics: custom tag {tag:?} has invalid environment variable name"
         ));
     }
     Ok(())
@@ -3465,7 +3485,7 @@ mod tests {
         .err()
         .expect("out-of-range sampling should fail");
         assert!(
-            err.contains("sampling_percentage must be between 0.0 and 100.0"),
+            err.contains("`sampling_percentage` must be between 0.0 and 100.0"),
             "{err}"
         );
 
@@ -3475,7 +3495,7 @@ mod tests {
         .err()
         .expect("non-numeric sampling should fail");
         assert!(
-            err.contains("sampling_percentage must be a number"),
+            err.contains("`sampling_percentage` must be a number"),
             "{err}"
         );
     }
@@ -3607,7 +3627,7 @@ mod tests {
         }))
         .err()
         .expect("unknown provider kind should fail");
-        assert!(err.contains("invalid tracing_provider config"), "{err}");
+        assert!(err.contains("invalid `tracing_provider` config"), "{err}");
     }
 
     #[test]

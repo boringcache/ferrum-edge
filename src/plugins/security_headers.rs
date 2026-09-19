@@ -296,10 +296,10 @@ fn parse_hsts(object: &serde_json::Map<String, Value>) -> Result<Option<String>,
             let max_age = match map.get("max_age") {
                 None | Some(Value::Null) => 31_536_000u64,
                 Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
-                    "security_headers: 'hsts.max_age' must be a non-negative integer".to_string()
+                    "security_headers: `hsts.max_age` must be a non-negative integer".to_string()
                 })?,
                 Some(_) => {
-                    return Err("security_headers: 'hsts.max_age' must be an integer".to_string());
+                    return Err("security_headers: `hsts.max_age` must be an integer".to_string());
                 }
             };
             let mut value = format!("max-age={max_age}");
@@ -348,17 +348,17 @@ fn parse_set_map(object: &serde_json::Map<String, Value>) -> Result<Vec<(String,
                 // setting without reflecting hostile config bytes.
                 if crate::proxy::headers::is_protocol_managed_plugin_response_destination(&name) {
                     return Err(format!(
-                        "security_headers: 'set.{name}' is protocol-managed (hop-by-hop or \
+                        "security_headers: `set` entry {name:?} is protocol-managed (hop-by-hop or \
                          framing) and cannot be configured; the gateway derives Content-Length \
                          from the final response body and strips \
                          Connection/Transfer-Encoding/Trailer/Upgrade at the final response \
-                         boundary. Use 'remove' if the intent is to drop the field."
+                         boundary. Use `remove` if the intent is to drop the field."
                     ));
                 }
                 let value = value.as_str().ok_or_else(|| {
-                    format!("security_headers: 'set.{name}' value must be a string")
+                    format!("security_headers: `set` entry {name:?} value must be a string")
                 })?;
-                validate_header_value(&format!("set.{name}"), value)?;
+                validate_header_value("set", value)?;
                 out.push((name, value.to_string()));
             }
             Ok(out)
@@ -378,7 +378,7 @@ fn parse_remove(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
             let mut out = Vec::with_capacity(values.len());
             for value in values {
                 let name = value.as_str().ok_or_else(|| {
-                    "security_headers: 'remove' entries must be strings".to_string()
+                    "security_headers: `remove` entries must be strings".to_string()
                 })?;
                 out.push(parse_header_name("remove", name)?);
             }
@@ -396,7 +396,7 @@ fn parse_header_name(field: &str, name: &str) -> Result<String, String> {
         .map(|name| name.as_str().to_string())
         .map_err(|_| {
             format!(
-                "security_headers: '{field}' contains invalid HTTP field name '{}'",
+                "security_headers: `{field}` contains invalid HTTP field name {:?}",
                 render_invalid_header_name(name)
             )
         })
@@ -426,7 +426,7 @@ fn render_invalid_header_name(name: &str) -> String {
 }
 
 fn validate_header_value(key: &str, value: &str) -> Result<(), String> {
-    let invalid_value = || format!("security_headers: '{key}' must be a valid HTTP field value");
+    let invalid_value = || format!("security_headers: `{key}` must be a valid HTTP field value");
     if !value
         .bytes()
         .all(|byte| byte == b'\t' || byte == b' ' || byte.is_ascii_graphic())
@@ -453,7 +453,7 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "security_headers: unknown configuration key(s) under '{path}': {}",
+        "security_headers: unknown configuration key(s) under `{path}`: {:?}",
         unknown.join(", ")
     ))
 }

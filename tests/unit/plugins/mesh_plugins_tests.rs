@@ -2880,7 +2880,7 @@ fn mesh_authz_rejects_mesh_wide_scope_for_bare_service_account_matcher() {
         Err(err) => err,
     };
     assert!(
-        err.contains("requires an exact 'spiffe://' assertor"),
+        err.contains("requires an exact `spiffe://` assertor"),
         "error should require an exact identity pin: {err}"
     );
 }
@@ -3792,10 +3792,9 @@ async fn mesh_authz_rejects_invalid_trust_domain_alias() {
         Ok(_) => panic!("invalid alias should fail construction"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("NotLowercase.Test"),
-        "error should mention bad alias, got: {err}"
-    );
+    assert!(err.contains("`trust_domain_aliases[0]`"), "{err}");
+    assert!(err.contains("not a valid trust domain"), "{err}");
+    assert!(!err.contains("NotLowercase.Test"), "{err}");
 }
 
 #[tokio::test]
@@ -4264,10 +4263,9 @@ async fn workload_metrics_rejects_invalid_trust_domain_alias() {
         Ok(_) => panic!("invalid alias should fail construction"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("Bad.Trust"),
-        "error should mention bad alias, got: {err}"
-    );
+    assert!(err.contains("`trust_domain_aliases[0]`"), "{err}");
+    assert!(err.contains("not a valid trust domain"), "{err}");
+    assert!(!err.contains("Bad.Trust"), "{err}");
 }
 
 // ── PolicyScope enforcement tests ────────────────────────────────────────────
@@ -4294,6 +4292,106 @@ fn policy_with_scope(name: &str, scope: PolicyScope, action: PolicyAction) -> Me
             action,
         }],
     }
+}
+
+fn capture_successful_mesh_constructor(construct: impl FnOnce()) -> Vec<serde_json::Value> {
+    super::plugin_utils::install_interest_floor();
+    let logs = super::plugin_utils::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(logs.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        construct();
+    });
+    logs.contents()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("captured structured event"))
+        .collect()
+}
+
+#[test]
+fn successful_mesh_wide_assertor_warnings_withhold_identity_and_keep_ordinals() {
+    let identity = "spiffe://example.org/ns/private/sa/identity_marker_5594";
+    let config = json!({"trusted_hbone_assertors": [
+        {"assertor": "waypoint", "scope": "same_namespace"},
+        {"assertor": identity, "scope": "mesh_wide"}
+    ]});
+    for (caller, gate) in [
+        ("mesh_authz", None),
+        ("workload_metrics", None),
+        ("workload_metrics", Some(1)),
+    ] {
+        let events = capture_successful_mesh_constructor(|| {
+            if caller == "mesh_authz" {
+                assert!(MeshAuthz::new(&config).is_ok());
+            } else {
+                let config = if gate.is_some() {
+                    json!({"_effective_mesh_authz_baggage_gates": [{}, config]})
+                } else {
+                    config.clone()
+                };
+                assert!(WorkloadMetrics::new(&config).is_ok());
+            }
+        });
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["field"] == "trusted_hbone_assertors")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        let fields = &warnings[0]["fields"];
+        assert_eq!(fields["caller"], caller);
+        assert_eq!(fields["assertor_index"], 1);
+        if let Some(index) = gate {
+            assert_eq!(fields["effective_gate_index"], index);
+        }
+        assert_eq!(fields["assertor"], "<redacted scalar>");
+        let message = fields["message"].as_str().unwrap();
+        for expected in ["SECURITY", "`scope` `mesh_wide`", "`asserts`"] {
+            assert!(message.contains(expected), "{message}");
+        }
+        let captured = serde_json::to_string(&events).unwrap();
+        assert!(!captured.contains("identity_marker_5594"), "{captured}");
+        assert!(!captured.contains("example.org"), "{captured}");
+    }
+}
+
+#[test]
+fn successful_audit_selector_warning_withholds_policy_and_keeps_index() {
+    let name = "'policy_marker_5594`\"\\\n";
+    let events = capture_successful_mesh_constructor(|| {
+        let config = json!({"mesh_policies": [
+            policy_with_scope("ordinary", PolicyScope::MeshWide, PolicyAction::Audit),
+            policy_with_scope(name, PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    namespace: None,
+                    labels: HashMap::from([("app".into(), "private".into())]),
+                },
+            }, PolicyAction::Audit)
+        ]});
+        assert!(MeshAuthz::new(&config).is_ok());
+    });
+    let event = events
+        .iter()
+        .find(|event| event["fields"]["field"] == "mesh_policies")
+        .expect("successful audit-only constructor must still warn");
+    let fields = &event["fields"];
+    assert_eq!(fields["policy_index"], 1);
+    assert_eq!(fields["policy"], "<redacted scalar>");
+    let message = fields["message"].as_str().unwrap();
+    for expected in [
+        "mesh_authz",
+        "not enforced here",
+        "`mesh_slice.labels`",
+        "`FERRUM_MESH_WORKLOAD_LABELS`",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    let captured = serde_json::to_string(&events).unwrap();
+    assert!(!captured.contains("policy_marker_5594"), "{captured}");
 }
 
 #[tokio::test]
@@ -8434,7 +8532,9 @@ fn mesh_outbound_registry_rejects_a_misspelled_registry_key() {
     .err()
     .expect("misspelled registry key must fail construction");
     assert!(error.contains("mesh_outbound_registry:"), "{error}");
-    assert!(error.contains("regsitry"), "{error}");
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(error.contains("`registry`"), "{error}");
+    assert!(!error.contains("regsitry"), "{error}");
 }
 
 #[test]
@@ -8578,7 +8678,7 @@ fn mesh_outbound_registry_admission_matches_openapi() {
         let error = check(json!({"registry": ["valid.example", entry]}), admitted);
         if let Some(error) = error {
             assert!(
-                error.contains("mesh_outbound_registry: registry[1]:"),
+                error.contains("mesh_outbound_registry: `registry[1]`:"),
                 "{error}"
             );
         }
@@ -8865,9 +8965,11 @@ fn mesh_authz_rejects_unknown_members_at_every_policy_nesting_level() {
             Err(err) => err,
         };
         assert!(
-            err.contains(misspelling),
-            "error should name the unknown member '{misspelling}': {err}"
+            err.contains("unknown field"),
+            "error should classify the unknown member: {err}"
         );
+        assert!(err.contains("`mesh_policies`"), "{err}");
+        assert!(!err.contains(&format!("`{misspelling}`")), "{err}");
     }
 }
 
@@ -8937,7 +9039,385 @@ fn mesh_authz_rejects_a_mesh_slice_carrying_a_misspelled_policy_member() {
         Err(err) => err,
     };
     assert!(
-        err.contains("not_path"),
-        "error should name the unknown member: {err}"
+        err.contains("mesh_policies[0].rules[0].to[0]"),
+        "error should retain the trusted matcher path: {err}"
+    );
+    assert!(err.contains("unknown field"), "{err}");
+    assert!(!err.contains("`not_path`"), "{err}");
+}
+
+fn assert_rendered_mesh_diagnostic(error: String, expected: &[&str], withheld: &[&str]) {
+    let rendered = ferrum_edge::startup::render_startup_error(
+        anyhow::Error::msg(error).context("mesh plugin configuration rejected"),
+        &[],
+    );
+    assert!(
+        rendered.contains("mesh plugin configuration rejected"),
+        "{rendered}"
+    );
+    for fragment in expected {
+        assert!(
+            rendered.contains(fragment),
+            "missing {fragment:?}: {rendered}"
+        );
+    }
+    for fragment in withheld {
+        assert!(
+            !rendered.contains(fragment),
+            "disclosed {fragment:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_rendered_scope_diagnostics_withhold_policy_and_selector_content() {
+    let hostile = "'MESH_DIAG_SECRET\"\\`\n";
+    let namespace_policy = policy_with_scope(
+        hostile,
+        PolicyScope::Namespace {
+            namespace: hostile.into(),
+        },
+        PolicyAction::Deny,
+    );
+    let selector_policy = policy_with_scope(
+        hostile,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([(hostile.into(), hostile.into())]),
+                namespace: None,
+            },
+        },
+        PolicyAction::Deny,
+    );
+    for (config, field, reason) in [
+        (
+            json!({"mesh_policies": [namespace_policy]}),
+            "`mesh_slice.namespace`",
+            "no proxy namespace",
+        ),
+        (
+            json!({"mesh_policies": [selector_policy.clone()]}),
+            "`labels`",
+            "no proxy labels",
+        ),
+        (
+            json!({"mesh_slice": {
+                "node_id": "test-node",
+                "version": "test",
+                "namespace": "default",
+                "labels_ambiguous": true,
+                "mesh_policies": [selector_policy.clone()]
+            }}),
+            "`mesh_slice.labels`",
+            "no proxy labels",
+        ),
+        (
+            json!({"mesh_slice": {
+                "node_id": "test-node",
+                "version": "test",
+                "namespace": "default",
+                "labels_ambiguous": true,
+                "labels": {"another": hostile},
+                "mesh_policies": [selector_policy]
+            }}),
+            "`mesh_slice.labels`",
+            "partial label intersection",
+        ),
+    ] {
+        let error = MeshAuthz::new(&config)
+            .err()
+            .expect("scope must still be rejected");
+        assert_rendered_mesh_diagnostic(
+            error,
+            &["mesh_authz", field, reason, "<redacted scalar>"],
+            &["MESH_DIAG_SECRET"],
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_rendered_condition_diagnostics_keep_indexes_and_reason() {
+    for (key, values, field, reason) in [
+        (
+            "'MESH_DIAG_KEY\"\\`",
+            vec!["MESH_DIAG_VALUE"],
+            "key",
+            "unsupported",
+        ),
+        (
+            "destination.port",
+            vec!["'MESH_DIAG_VALUE\"\\`"],
+            "values[0]",
+            "numeric port",
+        ),
+    ] {
+        let mut policy = allow_client_policy(PolicyAction::Deny);
+        policy.name = "'MESH_DIAG_POLICY\"\\`".into();
+        policy.namespace = "'MESH_DIAG_NAMESPACE\"\\`".into();
+        policy.rules[0].when.push(ConditionMatch {
+            key: key.into(),
+            values: values.into_iter().map(str::to_string).collect(),
+            not_values: Vec::new(),
+        });
+        let error = MeshAuthz::new(&json!({"mesh_policies": [policy]}))
+            .err()
+            .expect("condition must still be rejected");
+        assert_rendered_mesh_diagnostic(
+            error,
+            &["`rules[0].when[0]`", field, reason],
+            &["MESH_DIAG_"],
+        );
+    }
+}
+
+#[test]
+fn mesh_shared_trust_diagnostics_withhold_values_and_preserve_fields() {
+    let hostile = "'MESH_DIAG_SECRET\"\\`";
+    let cases = [
+        (
+            json!({"trust_domain_aliases": [hostile]}),
+            "trust_domain_aliases[0]",
+            "valid trust domain",
+        ),
+        (
+            json!({"trust_domain_aliases": [8675309]}),
+            "trust_domain_aliases[0]",
+            "string",
+        ),
+        (
+            json!({"trusted_hbone_assertors": ["'MESH_DIAG_SECRET://bad"]}),
+            "trusted_hbone_assertors[0]",
+            "not a `spiffe://`",
+        ),
+        (
+            json!({"trusted_hbone_assertors": ["spiffe://bad?MESH_DIAG_SECRET"]}),
+            "trusted_hbone_assertors[0]",
+            "invalid SPIFFE id",
+        ),
+        (
+            json!({"trusted_hbone_assertors": [{"assertor": hostile, "scope": hostile}]}),
+            "trusted_hbone_assertors[0]",
+            "unknown `scope`",
+        ),
+        (
+            json!({"trusted_hbone_assertors": [{"assertor": hostile, "scope": "mesh_wide"}]}),
+            "trusted_hbone_assertors[0]",
+            "requires an exact `spiffe://`",
+        ),
+        (
+            json!({"trusted_hbone_assertors": [{"assertor": hostile, "asserts": [hostile]}]}),
+            "asserts[0]",
+            "valid SPIFFE id",
+        ),
+        (
+            json!({"trusted_hbone_assertors": [{"assertor": hostile, "scope": true}]}),
+            "`scope`",
+            "must be a string",
+        ),
+    ];
+    for (config, field, reason) in cases {
+        let authz_error = MeshAuthz::new(&config)
+            .err()
+            .expect("invalid authz trust config");
+        let metrics_error = WorkloadMetrics::new(&config)
+            .err()
+            .expect("invalid telemetry trust config");
+        for error in [authz_error, metrics_error] {
+            assert_rendered_mesh_diagnostic(
+                error,
+                &[field, reason],
+                &["MESH_DIAG_SECRET", "8675309", "true"],
+            );
+        }
+    }
+}
+
+#[test]
+fn mesh_authz_rendered_label_type_errors_withhold_document_keys_and_scalars() {
+    for value in [json!(8675309), json!(true), json!(["MESH_DIAG_VALUE"])] {
+        let error = MeshAuthz::new(&json!({
+            "labels": {"'MESH_DIAG_KEY\"\\`": value}
+        }))
+        .err()
+        .expect("non-string label must still be rejected");
+        assert_rendered_mesh_diagnostic(
+            error,
+            &["`labels`", "expected an object with string values"],
+            &["MESH_DIAG_", "8675309", "true"],
+        );
+    }
+}
+
+#[test]
+fn mesh_telemetry_rendered_scalar_and_tag_errors_preserve_schema_context() {
+    let cases = [
+        (
+            json!({"sampling_percentage": 8675309}),
+            "`sampling_percentage`",
+            "between 0.0 and 100.0",
+        ),
+        (
+            json!({"sampling_percentage": true}),
+            "`sampling_percentage`",
+            "must be a number",
+        ),
+        (
+            json!({"workload_spiffe_id": "'MESH_DIAG_SECRET\"\\`"}),
+            "`workload_spiffe_id`",
+            "valid SPIFFE id",
+        ),
+        (
+            json!({"custom_tags": {"'MESH_DIAG_KEY\"\\`": "MESH_DIAG_VALUE"}}),
+            "custom tag name",
+            "invalid",
+        ),
+        (
+            json!({"custom_header_tags": {"region": "'MESH_DIAG_SECRET\"\\`"}}),
+            "custom tag",
+            "invalid header name",
+        ),
+        (
+            json!({"tracing_providers": [{"kind": "'MESH_DIAG_SECRET\"\\`", "config": {}}]}),
+            "`tracing_providers`",
+            "unknown variant",
+        ),
+        (
+            json!({"tracing_providers": [{"kind": "zipkin", "config": {"url": 8675309}}]}),
+            "`tracing_providers`",
+            "expected a string",
+        ),
+        (
+            json!({"tracing_provider": {"kind": "zipkin", "config": {"url": true}}}),
+            "`tracing_provider`",
+            "expected a string",
+        ),
+        (
+            json!({"tracing_provider": {
+                "kind": "zipkin",
+                "config": {"url": "'MESH_DIAG_SECRET://bad"}
+            }}),
+            "`tracing_provider`",
+            "could not construct tracing exporter",
+        ),
+    ];
+    for (config, field, reason) in cases {
+        let error = WorkloadMetrics::new(&config)
+            .err()
+            .expect("invalid telemetry config");
+        assert_rendered_mesh_diagnostic(
+            error,
+            &[field, reason],
+            &["MESH_DIAG_", "8675309", "true"],
+        );
+    }
+}
+
+#[test]
+fn typed_mesh_adapters_withhold_document_keys_and_keep_schema_context() {
+    use ferrum_edge::plugins::mesh::outbound_registry::OutboundRegistry;
+    use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+
+    for key in [
+        "UNREGISTERED_KEY_5594",
+        "'UNREGISTERED_KEY_5594",
+        "\"UNREGISTERED_KEY_5594\\\n",
+        "`UNREGISTERED_KEY_5594`, expected `injected_schema`",
+    ] {
+        let config = json!({key: true});
+        for (caller, result) in [
+            (
+                "mesh_route_dispatch",
+                MeshRouteDispatch::new(&config).map(|_| ()),
+            ),
+            (
+                "mesh_outbound_registry",
+                OutboundRegistry::new(&config).map(|_| ()),
+            ),
+        ] {
+            assert_rendered_mesh_diagnostic(
+                result.expect_err("unknown root key must still reject"),
+                &[caller, "config", "unknown field"],
+                &["UNREGISTERED_KEY_5594", "injected_schema", "true"],
+            );
+        }
+
+        let mut slice = serde_json::to_value(MeshSlice::default()).unwrap();
+        slice["labels"] = json!({key: true});
+        assert_rendered_mesh_diagnostic(
+            MeshAuthz::new(&json!({"mesh_slice": slice})).err().unwrap(),
+            &[
+                "mesh_authz",
+                "`mesh_slice`",
+                "labels[<redacted key>]",
+                "expected a string",
+            ],
+            &["UNREGISTERED_KEY_5594", "injected_schema", "true"],
+        );
+    }
+
+    // A document key with the spelling of a real schema field is still opaque
+    // below a map. Do not promote it with a global field-name allowlist.
+    let mut slice = serde_json::to_value(MeshSlice::default()).unwrap();
+    slice["labels"] = json!({"namespace": true});
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&json!({"mesh_slice": slice})).err().unwrap(),
+        &["labels[<redacted key>]", "expected a string"],
+        &["labels.namespace", "true"],
+    );
+
+    assert_rendered_mesh_diagnostic(
+        MeshRouteDispatch::new(&json!({"rules": [
+            {"match": {"methods": ["GET"]}, "destination": {"upstream_id": "first"}},
+            {"timeout_ms": true}
+        ]}))
+        .unwrap_err(),
+        &["rules[1].timeout_ms", "invalid type", "expected u64"],
+        &["true"],
+    );
+    assert_rendered_mesh_diagnostic(
+        OutboundRegistry::new(&json!({"registry": ["first.example", true]})).unwrap_err(),
+        &["registry[1]", "expected a string"],
+        &["first.example", "true"],
+    );
+    assert_rendered_mesh_diagnostic(
+        WorkloadMetrics::new(&json!({"tracing_providers": [
+            {"kind": "zipkin", "config": {"url": "https://collector.example/spans"}},
+            {"kind": "datadog", "config": {"agent_url": true}}
+        ]}))
+        .err()
+        .unwrap(),
+        &["`tracing_providers`", "[1].config", "expected a string"],
+        &["collector.example", "true"],
+    );
+}
+
+#[test]
+fn typed_mesh_maps_keep_trusted_fields_after_withheld_keys() {
+    let mut slice = serde_json::to_value(MeshSlice::default()).unwrap();
+    slice["destination_rules"] = json!([{
+        "name": "name-marker-5594", "namespace": "default", "host": "host-marker-5594",
+        "port_level_settings": {"8080": {"connect_timeout_ms": true}}
+    }]);
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&json!({"mesh_slice": slice})).err().unwrap(),
+        &[
+            "destination_rules[0].port_level_settings[<redacted key>].connect_timeout_ms",
+            "expected u64",
+        ],
+        &["8080", "name-marker-5594", "host-marker-5594", "true"],
+    );
+
+    let mut slice = serde_json::to_value(MeshSlice::default()).unwrap();
+    slice["telemetry_resources"] = json!([{
+        "name": "telemetry-marker-5594", "namespace": "default", "scope": {"kind": "mesh_wide"},
+        "config": {"tracing": {"custom_tags": {"'MAP_KEY_5594`\"\\\n": true}}}
+    }]);
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&json!({"mesh_slice": slice})).err().unwrap(),
+        &[
+            "telemetry_resources[0].config.tracing.custom_tags[<redacted key>]",
+            "expected a string",
+        ],
+        &["MAP_KEY_5594", "telemetry-marker-5594", "true"],
     );
 }

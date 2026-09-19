@@ -342,6 +342,16 @@ cargo test test_backend_mtls_global_config -- --nocapture
 
 ### Debug Tips
 
+TCP and WebSocket logging-sink CA failures name `FERRUM_TLS_CA_BUNDLE_PATH`
+and distinguish material-source classes such as `io`, `invalid_source` and
+`oversized`. UDP logging identifies `dtls_cert_path`, `dtls_key_path` or
+`dtls_ca_cert_path`; DTLS key mismatch (`key_mismatch`) and unsupported key
+algorithm (`unsupported_key`, requiring ECDSA P-256 or P-384) have separate
+diagnostics. Malformed certificate and CA bundles retain one-based record
+numbers, including failures after a valid first record. Rendered diagnostics
+withhold source paths, credentials and material bytes. These diagnostics do
+not relax material admission when verification is disabled.
+
 1. **Enable Debug Logging**
    ```bash
    RUST_LOG=debug ./ferrum-edge run

@@ -411,8 +411,13 @@ fn build_tls_connector(
     let custom_root_store = tls_ca_bundle_path
         .map(|ca_path| {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-                .map_err(|_| "TCP logging: failed to load CA bundle".to_string())?;
+            let ca_material =
+                load_material_blocking(&source, MaterialKind::CaBundle).map_err(|error| {
+                    format!(
+                        "TCP logging: `FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle ({})",
+                        error.failure_class()
+                    )
+                })?;
             crate::tls::root_cert_store_from_pem_bundle(
                 ca_material.bytes.expose_secret(),
                 "TCP logging CA bundle",

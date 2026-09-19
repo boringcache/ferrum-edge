@@ -1787,7 +1787,7 @@ fn new_rejects_none_client_auth_for_remote_token_endpoint() {
         Ok(_) => panic!("remote none client auth should be rejected"),
         Err(error) => error,
     };
-    assert!(error.contains("client_auth.method='none'"));
+    assert!(error.contains("`client_auth.method`=`none`"));
 }
 
 #[test]
@@ -2075,10 +2075,9 @@ fn rejects_unknown_fields_at_every_config_boundary() {
         let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown field must be rejected");
-        assert!(
-            error.contains(scope),
-            "unexpected error for {scope}: {error}"
-        );
+        let (path, field) = scope.rsplit_once('.').expect("field path");
+        assert!(error.contains(&format!("`{path}`")), "{error}");
+        assert!(error.contains(&format!("{field:?}")), "{error}");
     }
 }
 
@@ -2089,7 +2088,8 @@ fn shared_validation_entrypoint_rejects_authorization_policy_typo() {
 
     let error = validate_plugin_config("oidc_relying_party", &config)
         .expect_err("validation must reject unknown authorization fields");
-    assert!(error.contains("provider[0].required_role"));
+    assert!(error.contains("`provider[0]`"));
+    assert!(error.contains("\"required_role\""));
 }
 
 #[test]
@@ -3714,6 +3714,28 @@ fn new_rejects_cookie_names_paths_and_domains_that_are_not_cookie_syntax() {
     }
 }
 
+#[test]
+fn invalid_cookie_name_constructor_diagnostic_renders_complete_separator_examples() {
+    for name in ["bad;cookie", "bad\"cookie"] {
+        let mut config = base_config();
+        config["session"]["cookie_name"] = json!(name);
+        let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .err()
+            .expect("invalid cookie syntax must still reject construction");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert_eq!(
+            rendered,
+            concat!(
+                "oidc_relying_party: `session.cookie_name` must be an RFC 6265 ",
+                "cookie-name token (ASCII, no control characters, spaces, or ",
+                "separators such as `;` `=` `,` or double quote)"
+            )
+        );
+        assert!(!rendered.contains("<redacted"), "{rendered}");
+        assert!(!rendered.contains(name), "{rendered}");
+    }
+}
+
 /// A browser silently discards a `__Host-`/`__Secure-` cookie whose attributes
 /// violate the prefix rules, so admitting the combination produces a login loop
 /// with no gateway-side signal (issue #5027).
@@ -4415,4 +4437,51 @@ async fn an_expired_fractional_id_token_re_challenges_instead_of_riding_the_sess
         .await;
     assert_reject(result, Some(401));
     assert!(ctx.authenticated_identity.is_none());
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let mut unknown_session = base_config();
+    unknown_session["session"][canary] = json!(true);
+    let mut invalid_store = base_config();
+    invalid_store["session"]["store"] = json!(8675309);
+    let mut invalid_key = base_config();
+    invalid_key["providers"][0]["client_auth"] = json!({
+        "method": "private_key_jwt",
+        "private_key_pem": canary
+    });
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (unknown_session, &["`session`", "unknown field"]),
+        (invalid_store, &["`session.store`", "must be a string"]),
+        (
+            invalid_key,
+            &["`client_auth.private_key_pem`", "invalid RSA PEM"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("oidc_relying_party", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }

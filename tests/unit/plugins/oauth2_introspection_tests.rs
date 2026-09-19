@@ -2040,7 +2040,7 @@ fn oauth2_client_auth_rejects_a_wrong_typed_value_the_method_never_reads() {
         panic!("a non-string client_secret must be rejected");
     };
     assert!(
-        error.contains("client_auth.client_secret must be a string"),
+        error.contains("client_auth.client_secret` must be a string"),
         "unexpected error: {error}"
     );
 }
@@ -2434,4 +2434,54 @@ fn a_cached_authorization_window_is_re_evaluated_at_use_time() {
         introspection_cached_window_status_for_test(None, Some(1_001), 1_000),
         Some(401)
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"providers": [{(canary): true}]}),
+            &["provider[0]", "unknown field"],
+        ),
+        (
+            json!({"providers": [{
+                "introspection_endpoint": "https://issuer.example.com/introspect",
+                "max_cache_entries": 54321,
+                "max_cache_entry_bytes": 16384,
+                "max_cache_total_bytes": 1048576
+            }]}),
+            &[
+                "`provider[0].max_cache_total_bytes`",
+                "must be at least",
+                "`max_cache_entries`",
+                "`max_cache_entry_bytes`",
+            ],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("oauth2_introspection", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }

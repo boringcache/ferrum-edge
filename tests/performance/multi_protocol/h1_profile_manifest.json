@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "issue": 5588,
+  "dependencies": [
+    5600,
+    5602
+  ],
+  "protocol": "http1-tls",
+  "pairs": 4,
+  "duration": 15,
+  "offered_workers": 200,
+  "payload_sizes": [
+    10240,
+    71680,
+    512000,
+    1048576,
+    5242880
+  ],
+  "scaled_workers": [
+    200,
+    200,
+    200,
+    100,
+    50
+  ],
+  "campaigns": {
+    "calibration": {
+      "ferrum": "observer on cutoff 0",
+      "ferrum-baseline": "observer off cutoff 0"
+    },
+    "cutoff": {
+      "ferrum": "observer on cutoff 0",
+      "ferrum-exp-cutoff-one": "observer on cutoff 1"
+    }
+  },
+  "direct": "repeated for every pair",
+  "actual_syscalls": "not collected; separate intrusive pass remains open",
+  "sampled_cpu_stacks": "not collected",
+  "streaming_regression": "required before any optimization; this branch changes no forwarding policy"
+}

@@ -63,7 +63,7 @@ impl KeyAuth {
         unknown_fields.sort_unstable();
         if !unknown_fields.is_empty() {
             return Err(format!(
-                "key_auth: unknown configuration field(s): {}; allowed fields are 'key_location' and 'hide_credentials'",
+                "key_auth: unknown configuration field(s): {:?}; allowed fields are `key_location` and `hide_credentials`",
                 unknown_fields.join(", ")
             ));
         }
@@ -71,7 +71,7 @@ impl KeyAuth {
         let hide_credentials = match config_obj.get("hide_credentials") {
             Some(value) => value
                 .as_bool()
-                .ok_or_else(|| "key_auth: 'hide_credentials' must be a boolean".to_string())?,
+                .ok_or_else(|| "key_auth: `hide_credentials` must be a boolean".to_string())?,
             None => true,
         };
         let key_location = match config_obj.get("key_location") {
@@ -84,11 +84,11 @@ impl KeyAuth {
             None => "header:X-API-Key",
         };
         if key_location.is_empty() {
-            return Err("key_auth: 'key_location' must not be empty".to_string());
+            return Err("key_auth: `key_location` must not be empty".to_string());
         }
         if key_location.trim() != key_location {
             return Err(
-                "key_auth: 'key_location' must not have leading or trailing whitespace".to_string(),
+                "key_auth: `key_location` must not have leading or trailing whitespace".to_string(),
             );
         }
 
@@ -100,11 +100,11 @@ impl KeyAuth {
             request_headers_to_redact,
         ) = if let Some(name) = key_location.strip_prefix("header:") {
             if name.is_empty() {
-                return Err("key_auth: 'key_location' header name must not be empty".to_string());
+                return Err("key_auth: `key_location` header name must not be empty".to_string());
             }
             let normalized_name = name.to_ascii_lowercase();
             let header_name = HeaderName::from_bytes(normalized_name.as_bytes()).map_err(|_| {
-                "key_auth: 'key_location' header name is not a valid HTTP header name".to_string()
+                "key_auth: `key_location` header name is not a valid HTTP header name".to_string()
             })?;
             let canonical_name = header_name.as_str().to_string();
             (
@@ -116,11 +116,11 @@ impl KeyAuth {
             )
         } else if let Some(name) = key_location.strip_prefix("query:") {
             if name.is_empty() {
-                return Err("key_auth: 'key_location' query name must not be empty".to_string());
+                return Err("key_auth: `key_location` query name must not be empty".to_string());
             }
             if name.chars().any(char::is_whitespace) {
                 return Err(
-                    "key_auth: 'key_location' query name must not contain whitespace".to_string(),
+                    "key_auth: `key_location` query name must not contain whitespace".to_string(),
                 );
             }
             let mut strip_key =
@@ -136,7 +136,7 @@ impl KeyAuth {
             )
         } else {
             return Err(
-                "key_auth: 'key_location' must use 'header:<name>' or 'query:<name>'".to_string(),
+                "key_auth: `key_location` must use `header:<name>` or `query:<name>`".to_string(),
             );
         };
 
