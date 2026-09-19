@@ -1657,14 +1657,19 @@ impl MeshAuthz {
         // would then treat as allow-by-default).
         let from_slice = config.get("mesh_slice").is_some();
         let mut slice = if let Some(value) = config.get("mesh_slice") {
-            crate::util::deserialization::from_json_value::<
+            super::diagnostics::from_value::<
                 crate::util::json_object::JsonObject<MeshSlice>,
-            >(value.clone())
+            >(value.clone(), super::diagnostics::Schema::Slice)
             .map_err(|e| format!("mesh_authz: invalid `mesh_slice`: {e}"))?
             .0
         } else if let Some(value) = config.get("mesh_policies") {
-            let mesh_policies = crate::util::json_object::from_json_object_vec_value(value.clone())
-                .map_err(|e| format!("mesh_authz: invalid `mesh_policies`: {e}"))?;
+            let mesh_policies = super::diagnostics::from_value::<
+                Vec<crate::util::json_object::JsonObject<MeshPolicy>>,
+            >(value.clone(), super::diagnostics::Schema::Policy)
+            .map_err(|e| format!("mesh_authz: invalid `mesh_policies`: {e}"))?
+            .into_iter()
+            .map(|object| object.0)
+            .collect();
             MeshSlice {
                 mesh_policies,
                 ..MeshSlice::default()
@@ -1673,7 +1678,7 @@ impl MeshAuthz {
             MeshSlice::default()
         };
         let trust_domain_aliases = parse_trust_domain_aliases(config)?;
-        let trusted_hbone_assertors = parse_trusted_hbone_assertors(config)?;
+        let trusted_hbone_assertors = parse_trusted_hbone_assertors(config, "mesh_authz", None)?;
 
         // Allow explicit identity overrides on top of the slice-embedded
         // namespace/labels — useful when `mesh_policies` is supplied directly
@@ -2592,7 +2597,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
 
-    for policy in &slice.mesh_policies {
+    for (policy_index, policy) in slice.mesh_policies.iter().enumerate() {
         match &policy.scope {
             PolicyScope::MeshWide => {}
             PolicyScope::Namespace { .. } => {
@@ -2713,10 +2718,12 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // one binary version), that case is out of scope and is not
                     // failed closed here — set the labels to pin identity.
                     tracing::warn!(
-                        policy = %policy.name,
+                        policy = %crate::startup::sanitize_startup_scalar(&policy.name),
+                        field = "mesh_policies",
+                        policy_index,
                         "mesh_authz: workload-selector policy has selector labels but the slice \
                          resolved no proxy labels for this workload; not enforced here — set \
-                         mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS for deterministic scoping"
+                         `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` for deterministic scoping"
                     );
                 } else if slice.labels_ambiguous
                     && from_slice
@@ -4108,6 +4115,8 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
 /// request hot path consults.
 pub(crate) fn parse_trusted_hbone_assertors(
     config: &Value,
+    caller: &'static str,
+    effective_gate_index: Option<usize>,
 ) -> Result<TrustedAssertorIndex, String> {
     let items = match config.get("trusted_hbone_assertors") {
         None | Some(Value::Null) => {
@@ -4131,14 +4140,19 @@ pub(crate) fn parse_trusted_hbone_assertors(
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            parse_trusted_hbone_assertor_entry(item)
+            parse_trusted_hbone_assertor_entry(item, caller, effective_gate_index, idx)
                 .map_err(|error| format!("`trusted_hbone_assertors[{idx}]`: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(TrustedAssertorIndex::from_assertors)
 }
 
-fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, String> {
+fn parse_trusted_hbone_assertor_entry(
+    item: &Value,
+    caller: &'static str,
+    effective_gate_index: Option<usize>,
+    assertor_index: usize,
+) -> Result<TrustedAssertor, String> {
     match item {
         Value::String(raw) => Ok(TrustedAssertor {
             matcher: parse_assertor_matcher(raw)?,
@@ -4198,10 +4212,14 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                         }
                         tracing::warn!(
                             target: "mesh_authz",
-                            assertor = %trimmed,
-                            "SECURITY: trusted_hbone_assertors entry declares scope 'mesh_wide' \
+                            assertor = %crate::startup::sanitize_startup_scalar(trimmed),
+                            caller,
+                            field = "trusted_hbone_assertors",
+                            assertor_index,
+                            effective_gate_index,
+                            "SECURITY: `trusted_hbone_assertors` entry declares `scope` `mesh_wide` \
                              and may assert ANY workload identity in an accepted trust domain, \
-                             across namespaces. Prefer an explicit 'asserts' inventory."
+                             across namespaces. Prefer an explicit `asserts` inventory."
                         );
                         AssertionGrant::MeshWide
                     }

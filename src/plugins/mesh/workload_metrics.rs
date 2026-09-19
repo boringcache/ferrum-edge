@@ -217,9 +217,13 @@ struct BaggageTrustGate {
 }
 
 impl BaggageTrustGate {
-    fn from_config(config: &Value) -> Result<Self, String> {
+    fn from_config(config: &Value, effective_gate_index: Option<usize>) -> Result<Self, String> {
         Ok(Self {
-            trusted_hbone_assertors: parse_trusted_hbone_assertors(config)?,
+            trusted_hbone_assertors: parse_trusted_hbone_assertors(
+                config,
+                "workload_metrics",
+                effective_gate_index,
+            )?,
             trust_domain_aliases: parse_trust_domain_aliases(config)?,
         })
     }
@@ -251,7 +255,7 @@ impl Default for BaggageTrustPolicy {
 impl BaggageTrustPolicy {
     fn from_config(config: &Value) -> Result<Self, String> {
         match config.get(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY) {
-            None => Ok(Self::Single(BaggageTrustGate::from_config(config)?)),
+            None => Ok(Self::Single(BaggageTrustGate::from_config(config, None)?)),
             Some(Value::Array(gates)) => {
                 if gates.is_empty() {
                     return Err(format!(
@@ -310,7 +314,7 @@ fn parse_effective_authz_baggage_gate(
         EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS,
         &format!("workload_metrics: `{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]`: "),
     )?;
-    BaggageTrustGate::from_config(gate).map_err(|e| {
+    BaggageTrustGate::from_config(gate, Some(idx)).map_err(|e| {
         format!("workload_metrics: `{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]`: {e}")
     })
 }
@@ -504,11 +508,7 @@ impl WorkloadMetrics {
             Vec::new()
         } else {
             trace_exporters_from_providers(&tracing_providers, &service_name, config, http_client)
-                .map_err(|_| {
-                "workload_metrics: could not construct tracing exporter; check \
-                     `tracing_provider` / `tracing_providers` and exporter options"
-                    .to_string()
-            })?
+                .map_err(|error| format!("workload_metrics: {error}"))?
         };
         let direction_emit = parse_direction_emit(config)?;
 
@@ -1494,9 +1494,9 @@ fn string_map_config(config: &Value, key: &str) -> Result<HashMap<String, String
 fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
     match config.get("direction_emit") {
         None | Some(Value::Null) => Ok(DirectionEmit::server_only()),
-        Some(value) => crate::util::deserialization::from_json_value::<
+        Some(value) => super::diagnostics::from_value::<
             crate::util::json_object::JsonObject<DirectionEmit>,
-        >(value.clone())
+        >(value.clone(), super::diagnostics::Schema::Direction)
         .map(|object| object.0)
         .map_err(|e| format!("workload_metrics: invalid `direction_emit` config: {e}")),
     }
@@ -1507,8 +1507,9 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
         if value.is_null() {
             return Ok(Vec::new());
         }
-        return crate::util::deserialization::from_json_value::<Vec<TracingProvider>>(
+        return super::diagnostics::from_value::<Vec<TracingProvider>>(
             value.clone(),
+            super::diagnostics::Schema::Provider,
         )
         .map_err(|e| format!("workload_metrics: invalid `tracing_providers` config: {e}"));
     }
@@ -1516,8 +1517,11 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
     match config.get("tracing_provider") {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(value) => Ok(vec![
-            crate::util::deserialization::from_json_value::<TracingProvider>(value.clone())
-                .map_err(|e| format!("workload_metrics: invalid `tracing_provider` config: {e}"))?,
+            super::diagnostics::from_value::<TracingProvider>(
+                value.clone(),
+                super::diagnostics::Schema::Provider,
+            )
+            .map_err(|e| format!("workload_metrics: invalid `tracing_provider` config: {e}"))?,
         ]),
     }
 }
@@ -1590,9 +1594,9 @@ fn parse_tag_operation<'a>(
                     "workload_metrics: `cel` or `expression` is required for `set_expr` metric tag {name:?}"
                 )
             })?;
-            let expression = parse_metric_tag_cel_expression(cel).map_err(|_| {
+            let expression = parse_metric_tag_cel_expression(cel).map_err(|error| {
                 format!(
-                    "workload_metrics: metric tag {name:?} CEL `cel` expression rejected: invalid, unsupported, or too complex"
+                    "workload_metrics: metric tag {name:?} CEL `cel` expression rejected: {error}"
                 )
             })?;
             validate_metric_tag_cel_expr_named(name, &expression)?;
@@ -1612,9 +1616,9 @@ fn validate_metric_tag_cel_expr_named(
     expression: &MetricTagCelExpr,
 ) -> Result<(), String> {
     crate::modes::mesh::metric_tag_cel::validate_metric_tag_cel_expr(expression).map_err(
-        |_| {
+        |error| {
             format!(
-                "workload_metrics: metric tag {name:?} CEL `expression` rejected: invalid or too complex"
+                "workload_metrics: metric tag {name:?} CEL `expression` rejected: {error}"
             )
         },
     )
@@ -1919,10 +1923,8 @@ pub(crate) fn validate_istio_telemetry_config(
             tracing.custom_header_tags.clone(),
             tracing.custom_env_tags.clone(),
         )?;
-        validate_trace_provider_endpoints(&tracing.providers).map_err(|_| {
-            "workload_metrics: `tracing.providers` contains an invalid exporter endpoint"
-                .to_string()
-        })?;
+        validate_trace_provider_endpoints(&tracing.providers)
+            .map_err(|error| format!("workload_metrics: `tracing.providers`: {error}"))?;
     }
     if let Some(metrics) = metrics {
         let metrics = serde_json::to_value(metrics).map_err(|_| {

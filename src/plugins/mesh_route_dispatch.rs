@@ -81,6 +81,7 @@ use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
+use crate::plugins::mesh::diagnostics::{self, Schema};
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use crate::plugins::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use crate::plugins::utils::route_header_transform::{
@@ -111,8 +112,9 @@ pub struct MeshRouteDispatchConfig {
 
 impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
-        crate::util::deserialization::from_json_value::<crate::util::json_object::JsonObject<Self>>(
+        diagnostics::from_value::<crate::util::json_object::JsonObject<Self>>(
             config.clone(),
+            Schema::Route,
         )
         .map(|object| object.0)
         .map_err(|e| format!("mesh_route_dispatch config: {e}"))

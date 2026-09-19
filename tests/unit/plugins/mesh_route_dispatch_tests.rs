@@ -204,7 +204,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                 }],
                 "reject_unmtached": true
             }),
-            "reject_unmtached",
+            "config",
         ),
         (
             json!({
@@ -214,7 +214,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     "timeout_millis": 100
                 }]
             }),
-            "timeout_millis",
+            "rules[0]",
         ),
         (
             json!({
@@ -223,7 +223,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     "destination": {"upstream_id": "api"}
                 }]
             }),
-            "method",
+            "rules[0].match",
         ),
         (
             json!({
@@ -235,7 +235,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "requires_node_waypoint_auth",
+            "rules[0].destination",
         ),
         (
             json!({
@@ -248,7 +248,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "delai",
+            "rules[0].fault",
         ),
         (
             json!({
@@ -260,7 +260,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "percent",
+            "rules[0].fault.delay",
         ),
         (
             json!({
@@ -272,7 +272,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "status",
+            "rules[0].fault.abort",
         ),
         (
             json!({
@@ -282,7 +282,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     "rewrite": {"uri": "/v2", "authorit": "api.internal"}
                 }]
             }),
-            "authorit",
+            "rules[0].rewrite",
         ),
         (
             json!({
@@ -297,7 +297,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }]
                 }]
             }),
-            "new_key",
+            "rules[0].request_transform[0]",
         ),
         (
             json!({
@@ -306,7 +306,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     "redirect": {"redirect_code": 308, "redirect_cod": 307}
                 }]
             }),
-            "redirect_cod",
+            "rules[0].redirect",
         ),
         (
             json!({
@@ -316,7 +316,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     "retry": {"max_retry": 2}
                 }]
             }),
-            "max_retry",
+            "rules[0].retry",
         ),
         (
             json!({
@@ -326,7 +326,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     "retry": {"retry_on_connect_failur": false}
                 }]
             }),
-            "retry_on_connect_failur",
+            "rules[0].retry",
         ),
         (
             json!({
@@ -338,7 +338,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "delay_millis",
+            "rules[0].retry.backoff.fixed",
         ),
         (
             json!({
@@ -352,7 +352,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "max_millis",
+            "rules[0].retry.backoff.exponential",
         ),
         (
             json!({
@@ -394,7 +394,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "client_certpath",
+            "rules[0].destination.backend_tls",
         ),
         (
             json!({
@@ -407,7 +407,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "verify_server_certificate",
+            "rules[0].destination.backend_tls",
         ),
         (
             json!({
@@ -420,7 +420,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "sni_name",
+            "rules[0].destination.backend_tls",
         ),
         (
             json!({
@@ -433,7 +433,7 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                     }
                 }]
             }),
-            "san_allowlist",
+            "rules[0].destination.backend_tls",
         ),
     ];
 
@@ -443,6 +443,12 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
         assert!(
             error.contains(expected_fragment),
             "expected {expected_fragment:?} in: {error}"
+        );
+        assert!(
+            error.contains("unknown field")
+                || error.contains("unknown variant")
+                || error.contains("expected map with a single key"),
+            "missing rejection class: {error}"
         );
         assert!(
             !error.contains("exponentiall"),

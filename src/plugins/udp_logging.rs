@@ -352,9 +352,11 @@ pub(crate) fn materialize_dtls_material(
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<CachedDtlsMaterial, String> {
     let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|_| {
-            "udp_logging: DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`"
-                .to_string()
+        crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|error| {
+            format!(
+                "udp_logging: DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`: {}",
+                crate::startup::render_startup_error(error, &[])
+            )
         })?
     } else {
         crate::dtls::generate_ephemeral_cert_public()
@@ -365,8 +367,11 @@ pub(crate) fn materialize_dtls_material(
     // verification is intentionally disabled, a missing or malformed declared
     // source must not pass admission and become a latent rollout defect.
     let configured_root_store = match ca_path {
-        Some(ca_path) => Some(crate::dtls::load_root_store_from_pem(ca_path).map_err(|_| {
-            "udp_logging: DTLS CA materialization failed for `dtls_ca_cert_path`".to_string()
+        Some(ca_path) => Some(crate::dtls::load_root_store_from_pem(ca_path).map_err(|error| {
+            format!(
+                "udp_logging: DTLS CA materialization failed for `dtls_ca_cert_path`: {}",
+                crate::startup::render_startup_error(error, &[])
+            )
         })?),
         None => None,
     };

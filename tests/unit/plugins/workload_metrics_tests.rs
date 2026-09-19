@@ -564,3 +564,39 @@ fn unknown_effective_baggage_gate_keeps_index_and_withholds_supplied_key() {
         );
     }
 }
+
+#[test]
+fn exporter_diagnostics_keep_batch_bounds_and_later_provider_endpoint() {
+    let provider = json!({
+        "kind": "zipkin", "config": {"url": "https://collector-marker-5594.example/spans"}
+    });
+    let cases = [
+        (
+            json!({"tracing_provider": provider, "batch_size": 0}),
+            vec!["workload_metrics", "`batch_size`", "must be between 1 and"],
+        ),
+        (
+            json!({"tracing_providers": [provider, {
+                "kind": "datadog", "config": {"agent_url": "https:///endpoint-marker-5594"}
+            }]}),
+            vec![
+                "workload_metrics",
+                "`tracing_providers[1].config`",
+                "`agent_url`",
+                "must include a hostname",
+            ],
+        ),
+    ];
+    for (config, expected) in cases {
+        let error = WorkloadMetrics::new(&config)
+            .err()
+            .expect("invalid exporter config");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in expected {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        for hidden in ["collector-marker-5594", "endpoint-marker-5594", "got: 0"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}

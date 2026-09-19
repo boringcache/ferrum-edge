@@ -970,7 +970,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "`tracing.providers` contains an invalid exporter endpoint",
+            "`providers[0].config`: OTLP: `endpoint` must be a valid URL",
         ),
     ];
 
