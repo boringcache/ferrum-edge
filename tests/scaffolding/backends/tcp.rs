@@ -35,6 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
+use tracing::Instrument;
 
 /// A single deterministic instruction in a TCP script.
 #[derive(Debug, Clone)]
@@ -209,7 +210,7 @@ impl ScriptedTcpBackendBuilder {
                     biased;
                     _ = &mut shutdown_rx => return,
                     accept_result = listener.accept() => {
-                        let Ok((stream, _addr)) = accept_result else {
+                        let Ok((stream, addr)) = accept_result else {
                             // Accept errors are usually "listener closed" during
                             // shutdown; loop and re-check the shutdown channel.
                             continue;
@@ -218,12 +219,19 @@ impl ScriptedTcpBackendBuilder {
                             state_task.accepted.fetch_add(1, Ordering::SeqCst);
                         let state_conn = state_task.clone();
                         let script = steps.clone();
+                        let span = tracing::debug_span!(
+                            "scripted_tcp_connection",
+                            port,
+                            connection = conn_index + 1,
+                            peer = %addr,
+                        );
+                        tracing::debug!(parent: &span, "Accepted scripted TCP connection");
 
                         match mode {
                             ExecutionMode::RepeatEachConnection => {
                                 let state_err = state_conn.clone();
                                 let track = state_conn.clone();
-                                let jh = tokio::spawn(async move {
+                                let task = async move {
                                     if let Err(e) =
                                         run_script(stream, script, state_conn).await
                                     {
@@ -233,7 +241,8 @@ impl ScriptedTcpBackendBuilder {
                                             .await
                                             .push(e.to_string());
                                     }
-                                });
+                                };
+                                let jh = tokio::spawn(task.instrument(span));
                                 track.track_connection(jh.abort_handle());
                             }
                             ExecutionMode::Once => {
@@ -242,7 +251,7 @@ impl ScriptedTcpBackendBuilder {
                                 if conn_index == 0 {
                                     let state_err = state_conn.clone();
                                     let track = state_conn.clone();
-                                    let jh = tokio::spawn(async move {
+                                    let task = async move {
                                         if let Err(e) =
                                             run_script(stream, script, state_conn).await
                                         {
@@ -252,7 +261,8 @@ impl ScriptedTcpBackendBuilder {
                                                 .await
                                                 .push(e.to_string());
                                         }
-                                    });
+                                    };
+                                    let jh = tokio::spawn(task.instrument(span));
                                     track.track_connection(jh.abort_handle());
                                 } else {
                                     drop(stream);
@@ -503,7 +513,12 @@ async fn run_script(
                 let sock = socket2::Socket::from(std_stream);
                 sock.set_linger(Some(Duration::from_secs(0)))?;
                 state.resets.fetch_add(1, Ordering::SeqCst);
+                let close_started = std::time::Instant::now();
                 drop(sock);
+                tracing::debug!(
+                    close_elapsed = ?close_started.elapsed(),
+                    "Closed scripted TCP connection with SO_LINGER=0"
+                );
                 return Ok(());
             }
             TcpStep::RefuseNextConnect => {

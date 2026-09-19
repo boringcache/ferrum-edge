@@ -103,6 +103,12 @@ paths:
   Semantic-cache successful admission DEBUG fields sanitize every scalar at
   emission, including defaults and normalized/derived selections; captured
   constructor regressions pin the structured fields and fixed event message.
+- The #5594 billing conversion covers API chargeback, chargeback sinks and
+  spend-limit admission. Fixed pricing-tier and schema paths remain visible;
+  supplied rates, identities, URLs, document keys and deserializer payloads are
+  withheld. Structural serde errors use the private schema allowlist and retain
+  admission parity. Registered constructor/rendered-output regressions and
+  existing projection/billing behavior assertions cover these diagnostics.
 - The #5594 traffic/transform conversion covers request/response/body/header
   transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
   GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and

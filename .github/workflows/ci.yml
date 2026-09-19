@@ -594,6 +594,34 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Run each diagnostic capture entry point independently
+        if: matrix.shard == 'lib'
+        # Each invocation owns a fresh test process. Another helper in the
+        # ordinary parallel lib suite must not mask a missing initializer.
+        run: |
+          set -euo pipefail
+          captures=(
+            diagnostic_test_logs::capture_keeps_first_use_and_concurrent_writers
+            modes::tests::capture_keeps_first_use_and_concurrent_writers
+            modes::database::tests::capture_keeps_first_use_and_concurrent_writers
+            proxy::backend_dispatch::tests::capture_keeps_first_use_and_concurrent_writers
+            modes::mesh::diagnostic_capture::capture_keeps_first_use_and_concurrent_writers
+            modes::mesh::config_consumer::common::diagnostic_test_support::capture_regression::capture_keeps_first_use_and_concurrent_writers
+            modes::mesh::diagnostic_capture::capture_rebuilds_a_previously_disabled_callsite
+          )
+          capture_index=0
+          for capture in "${captures[@]}"; do
+            capture_index=$((capture_index + 1))
+            capture_log="$RUNNER_TEMP/unit-ci/diagnostic-capture-$capture_index.log"
+            cargo test --lib "$capture" -- --exact 2>&1 | tee "$capture_log"
+            if ! grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$capture_log"; then
+              echo "::error::diagnostic capture regression did not run exactly once: $capture"
+              exit 1
+            fi
+          done
+        env:
+          RUST_BACKTRACE: 1
+
       - name: Run cache accounting and reload safety regressions
         if: matrix.shard == 'plugins-b'
         # These tests are also part of the complete plugin suite below. Run the

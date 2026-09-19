@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+// Included once per test binary. The lib-test hook reuses this same owner;
+// integration callers compile it privately alongside their capture helper.
+#[path = "../support/diagnostic_interest.rs"]
+pub(crate) mod interest;
+
 pub fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
     struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -14,6 +19,7 @@ pub fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
         }
     }
 
+    interest::ensure_interest_floor();
     let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let output = bytes.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -26,3 +32,5 @@ pub fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
     let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
     (result, logs)
 }
+
+interest::capture_regression!(capture_logs, tracing::Level::TRACE);
