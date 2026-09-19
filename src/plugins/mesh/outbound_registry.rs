@@ -182,13 +182,13 @@ impl OutboundRegistry {
         .0;
         if !(400..=599).contains(&parsed.reject_status) {
             return Err(format!(
-                "mesh_outbound_registry: reject_status must be 4xx/5xx (got \"{}\")",
+                "mesh_outbound_registry: `reject_status` must be 4xx/5xx (got \"{}\")",
                 parsed.reject_status
             ));
         }
         if parsed.outbound_listen_ports.contains(&0) {
             return Err(
-                "mesh_outbound_registry: outbound_listen_ports entries must be >= 1 (got 0); \
+                "mesh_outbound_registry: `outbound_listen_ports` entries must be >= 1; \
                  use [] for intentional global/unscoped enforcement"
                     .to_string(),
             );
@@ -201,7 +201,7 @@ impl OutboundRegistry {
         let mut wildcard_any_port_suffixes: HashSet<String> = HashSet::new();
         for (index, entry) in parsed.registry.iter().enumerate() {
             let normalised = normalise_registry_entry(entry)
-                .map_err(|error| format!("mesh_outbound_registry: registry[{index}]: {error}"))?;
+                .map_err(|error| format!("mesh_outbound_registry: `registry[{index}]`: {error}"))?;
             let Some(normalised) = normalised else {
                 continue;
             };
@@ -652,7 +652,7 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            err.contains("outbound_listen_ports") && err.contains("0"),
+            err.contains("`outbound_listen_ports`") && err.contains("must be >= 1"),
             "got: {err}"
         );
     }

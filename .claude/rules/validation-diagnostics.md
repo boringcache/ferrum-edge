@@ -117,6 +117,12 @@ paths:
   reasons without supplied identities.
   Registered loader, rendered-chain and captured-log regressions cover these
   surfaces; source IDs retained for internal identity are not safe log labels.
+- The #5594 mesh plugin conversion covers authorization/baggage trust, route
+  dispatch, BPF/workload metrics, telemetry tag expressions and effective metric
+  plans. Fixed rule, assertor and effective baggage-gate ordinals remain visible;
+  supplied identities, label/header keys, expressions and numeric values are
+  withheld. Registered constructor/rendered-output regressions retain the
+  existing admission and composed-plan budget checks.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,

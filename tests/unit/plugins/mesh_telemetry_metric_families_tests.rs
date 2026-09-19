@@ -962,3 +962,52 @@ async fn udp_stream_finalize_records_no_tcp_series() {
         );
     }
 }
+
+#[test]
+fn rendered_effective_metric_plan_budget_withholds_proxy_identity_and_values() {
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy};
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    let proxy_id = "'MESH_DIAG_PROXY\"\\`";
+    let plugin_configs = [("count", "REQUEST_COUNT"), ("duration", "REQUEST_DURATION")]
+        .into_iter()
+        .map(|(id, metric)| {
+            // Each instance fits the existing per-instance limit; together the
+            // surviving families exceed the effective-chain admission budget.
+            let overrides: Vec<_> = (0..62)
+                .map(|_| {
+                    json!({
+                        "metric": metric,
+                        "name": "source_workload",
+                        "operation": {"type": "set", "value": "MESH_DIAG_VALUE".repeat(17)}
+                    })
+                })
+                .collect();
+            make_plugin_config_with_json(
+                id,
+                "workload_metrics",
+                json!({"metrics": {"tag_overrides": overrides}}),
+                PluginScope::Proxy,
+                Some(proxy_id),
+            )
+        })
+        .collect();
+    let config = GatewayConfig {
+        proxies: vec![make_proxy(proxy_id, "/api", vec!["count", "duration"])],
+        plugin_configs,
+        ..Default::default()
+    };
+    let error = ferrum_edge::PluginCache::new(&config)
+        .err()
+        .expect("composed metric families must still exceed the budget");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(
+        rendered.contains("proxy_id=<redacted scalar>"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("exceed 16384 encoded bytes across surviving families"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("MESH_DIAG_"), "{rendered}");
+}

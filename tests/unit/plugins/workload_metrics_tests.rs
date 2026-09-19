@@ -536,3 +536,31 @@ fn standalone_documented_configuration_is_admitted() {
     let validator = jsonschema::draft202012::options().build(&schema).unwrap();
     assert!(validator.is_valid(&config.plugin_configs[0].config));
 }
+
+#[test]
+fn unknown_effective_baggage_gate_keeps_index_and_withholds_supplied_key() {
+    let unknown = "'MESH_GATE_KEY_MARKER`\"\\\n";
+    let config = json!({
+        "_effective_mesh_authz_baggage_gates": [{}, {unknown: "MESH_GATE_VALUE_MARKER"}]
+    });
+    let error = WorkloadMetrics::new(&config)
+        .err()
+        .expect("the unknown gate key must still be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in [
+        "workload_metrics",
+        "`_effective_mesh_authz_baggage_gates[1]`",
+        "unknown configuration key(s)",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
+    }
+    for withheld in ["MESH_GATE_KEY_MARKER", "MESH_GATE_VALUE_MARKER"] {
+        assert!(
+            !rendered.contains(withheld),
+            "leaked {withheld}: {rendered}"
+        );
+    }
+}
