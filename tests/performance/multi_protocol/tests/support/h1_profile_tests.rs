@@ -26,9 +26,9 @@ fn partial_records_and_invalid_headers_do_not_manufacture_counts() {
     let counters = Arc::new(Counters::default());
     let mut parser = RecordParser::default();
     parser.observe(&[23, 3, 3, 0, 2, 7], &counters);
-    assert_eq!(Snapshot::capture(&[counters.clone()]).tls_records, 0);
+    assert_eq!(Snapshot::capture(std::slice::from_ref(&counters)).tls_records, 0);
     parser.observe(&[8], &counters);
-    let start = Snapshot::capture(&[counters.clone()]);
+    let start = Snapshot::capture(std::slice::from_ref(&counters));
     parser.observe(&[99, 3, 3, 0, 0], &counters);
     parser.observe(&[23, 3, 3, 0, 0], &counters);
     let delta = Snapshot::capture(&[counters]).delta(&start);
