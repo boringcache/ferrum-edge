@@ -219,7 +219,10 @@ pub fn render_prometheus() -> String {
         ("missing_slots", snapshot.missing_slots),
         ("unpublished_event_bound", snapshot.unpublished_event_bound),
         ("lost_events", snapshot.lost_events),
-        ("snapshot_sequence", SNAPSHOTS.fetch_add(1, Ordering::Relaxed)),
+        (
+            "snapshot_sequence",
+            SNAPSHOTS.fetch_add(1, Ordering::Relaxed),
+        ),
     ];
     for (name, value) in metadata {
         let _ = writeln!(text, "ferrum_udp_profile_{name} {value}");

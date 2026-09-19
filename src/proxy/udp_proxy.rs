@@ -1889,12 +1889,18 @@ fn try_insert_pending_session_gate(
     match pending_sessions.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             #[cfg(feature = "bench-udp-profile")]
-            crate::udp_profile::lookup_outcome(crate::udp_profile::Operation::PendingRaceGate, true);
+            crate::udp_profile::lookup_outcome(
+                crate::udp_profile::Operation::PendingRaceGate,
+                true,
+            );
             Ok(false)
         }
         dashmap::mapref::entry::Entry::Vacant(vacant) => {
             #[cfg(feature = "bench-udp-profile")]
-            crate::udp_profile::lookup_outcome(crate::udp_profile::Operation::PendingRaceGate, false);
+            crate::udp_profile::lookup_outcome(
+                crate::udp_profile::Operation::PendingRaceGate,
+                false,
+            );
             vacant.insert(PendingDatagramQueue {
                 forwarded_client,
                 ..Default::default()

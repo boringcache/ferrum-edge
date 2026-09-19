@@ -1,7 +1,10 @@
 use ferrum_edge::udp_profile::{self as profile, Direction, Operation, schema};
 
 fn index(name: &str) -> usize {
-    schema::NAMES.iter().position(|value| *value == name).unwrap()
+    schema::NAMES
+        .iter()
+        .position(|value| *value == name)
+        .unwrap()
 }
 
 fn delta(before: &[u64; schema::COUNTERS], name: &str) -> u64 {
@@ -89,7 +92,9 @@ fn pending_poll_can_migrate_without_carrying_thread_attribution() {
     .unwrap();
     let before = profile::current_thread_counters();
     assert_eq!(
-        future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(7)
     );
     assert_eq!(delta(&before, "egress_poll_ready"), 1);

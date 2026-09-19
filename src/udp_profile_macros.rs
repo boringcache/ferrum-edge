@@ -2,17 +2,20 @@
 macro_rules! udp_count {
     ($counter:ident, $amount:expr) => {{
         #[cfg(feature = "bench-udp-profile")]
-        crate::udp_profile::count(crate::udp_profile::schema::Counter::$counter, $amount as u64);
+        crate::udp_profile::count(
+            crate::udp_profile::schema::Counter::$counter,
+            $amount as u64,
+        );
     }};
 }
 
 macro_rules! udp_timed {
     ($operation:ident, $expression:expr) => {{
         #[cfg(feature = "bench-udp-profile")]
-        let result = crate::udp_profile::timed(
-            crate::udp_profile::schema::Operation::$operation,
-            || $expression,
-        );
+        let result =
+            crate::udp_profile::timed(crate::udp_profile::schema::Operation::$operation, || {
+                $expression
+            });
         #[cfg(not(feature = "bench-udp-profile"))]
         let result = $expression;
         result
