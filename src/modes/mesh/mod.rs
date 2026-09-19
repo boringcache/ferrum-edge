@@ -21373,39 +21373,13 @@ fn spawn_orig_dst_bridge_task(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/support/mesh_diagnostic_capture.rs"]
+mod diagnostic_capture;
+
+#[cfg(test)]
 mod tests {
+    use super::diagnostic_capture::capture_mesh_diagnostics;
     use super::*;
-
-    #[derive(Clone, Default)]
-    struct MeshDiagnosticWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for MeshDiagnosticWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_mesh_diagnostics<R>(f: impl FnOnce() -> R) -> (R, String) {
-        // Match the scoped capture used by the backend-dispatch tests. DEBUG
-        // matters here: materialization diagnostics also run under `-v`.
-        let writer = MeshDiagnosticWriter::default();
-        let sink = writer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_target(false)
-            .without_time()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || sink.clone())
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
-        (result, log)
-    }
 
     #[test]
     fn mesh_materialization_debug_logs_withhold_service_ports_and_identities() {
