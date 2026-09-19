@@ -414,28 +414,70 @@ fn test_new_rejects_non_bool_inject_headers() {
     assert!(result.err().unwrap().contains("inject_headers"));
 }
 
-#[tokio::test]
-async fn test_missing_reader_uses_deny_lookup_failure_policy() {
-    let config = json!({
-        "db_path": "/nonexistent/path/to/test.mmdb",
+#[tokio::test(flavor = "current_thread")]
+async fn missing_reader_deny_hooks_withhold_source_path() {
+    let directory = TempDir::new().unwrap();
+    // Leave this hostile path unregistered with the external-secret scrubber.
+    let path = directory.path().join("'GEO_DENY_PATH_CANARY`-missing.mmdb");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
         "allow_countries": ["US"],
         "on_lookup_failure": "deny"
-    });
-    let plugin = GeoRestriction::new(&config).unwrap();
-    let mut ctx = RequestContext::new(
-        "203.0.113.1".to_string(),
-        "GET".to_string(),
-        "/test".to_string(),
-    );
+    }))
+    .expect("missing MMDB must still admit the explicit deny fallback");
 
-    let result = plugin.on_request_received(&mut ctx).await;
-    assert!(matches!(
-        result,
-        PluginResult::Reject {
-            status_code: 403,
-            ..
+    for hook in ["request", "stream"] {
+        // Capture after construction, at DEBUG so the shared WARN sampler
+        // cannot hide the runtime emission under parallel test load.
+        let (logs, _guard) = super::plugin_utils::capture_debug_logs();
+        let result = if hook == "request" {
+            let mut ctx = request_context("203.0.113.1");
+            plugin.on_request_received(&mut ctx).await
+        } else {
+            let mut ctx = geo_stream_context("203.0.113.1");
+            plugin.on_stream_connect(&mut ctx).await
+        };
+        match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 403, "{hook}");
+                assert_eq!(
+                    body,
+                    r#"{"error":"Access denied: GeoIP database not available"}"#,
+                    "{hook}"
+                );
+                assert!(headers.is_empty(), "{hook}");
+            }
+            _ => panic!("{hook} must still reject with an unavailable MMDB"),
         }
-    ));
+
+        let output = logs.contents();
+        let event = output
+            .lines()
+            .find(|line| {
+                line.trim_start().starts_with("DEBUG ")
+                    && line.contains("denying by on_lookup_failure policy")
+            })
+            .expect("the deny hook must emit its detailed event");
+        for expected in [
+            "db_path=<redacted scalar>",
+            "client_ip=203.0.113.1",
+            "plugin=\"geo_restriction\"",
+            "reason=\"db_not_loaded\"",
+            "MaxMind database not loaded, denying by on_lookup_failure policy",
+        ] {
+            assert!(event.contains(expected), "{hook}: missing {expected:?}: {output}");
+        }
+        assert!(!output.contains("GEO_DENY_PATH_CANARY"), "{hook}: {output}");
+        assert!(!output.contains(path_text(&path)), "{hook}: {output}");
+    }
 }
 
 #[tokio::test]

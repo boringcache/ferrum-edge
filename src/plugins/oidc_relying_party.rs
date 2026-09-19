@@ -3815,7 +3815,7 @@ fn is_cookie_token_char(c: char) -> bool {
 fn validate_cookie_name(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().all(is_cookie_token_char) {
         return Err(
-            "oidc_relying_party: `session.cookie_name` must be an RFC 6265 cookie-name token (ASCII, no control characters, spaces, or separators such as `;` `=` `,` `\"`)"
+            "oidc_relying_party: `session.cookie_name` must be an RFC 6265 cookie-name token (ASCII, no control characters, spaces, or separators such as `;` `=` `,` or double quote)"
                 .to_string(),
         );
     }
