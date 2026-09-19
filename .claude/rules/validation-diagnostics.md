@@ -113,6 +113,25 @@ paths:
   Semantic-cache successful admission DEBUG fields sanitize every scalar at
   emission, including defaults and normalized/derived selections; captured
   constructor regressions pin the structured fields and fixed event message.
+- The #5594 billing conversion covers API chargeback, chargeback sinks and
+  spend-limit admission. Fixed pricing-tier and schema paths remain visible;
+  supplied rates, identities, URLs, document keys and deserializer payloads are
+  withheld. Structural serde errors use the private schema allowlist and retain
+  admission parity. Registered constructor/rendered-output regressions and
+  existing projection/billing behavior assertions cover these diagnostics.
+- The #5594 traffic/transform conversion covers request/response/body/header
+  transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
+  GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and
+  schema paths survive rendered failures; configured routes, method/operation
+  names, keys, regexes and numeric operands remain withheld. Existing typed
+  rejection, constructor/rendered-output and last-good reload assertions retain
+  admission and retention coverage.
+  Serverless null-field failures resolve recognized keys to schema-authored
+  allowlist entries before backtick rendering; unknown keys remain withheld.
+  Every CORS string-origin failure retains its `allowed_origins[index]` context,
+  including empty, whitespace, length, wildcard and exact-origin rejection.
+  Request-termination path-prefix guidance preserves the fixed `?` and `#`
+  delimiters through the startup renderer.
 - The #5594 mesh plugin conversion covers authorization/baggage trust, route
   dispatch, BPF/workload metrics, telemetry tag expressions and effective metric
   plans. Fixed rule, assertor and effective baggage-gate ordinals remain visible;
@@ -128,6 +147,11 @@ paths:
   document deserializer is unchanged by this scoped adapter.
   Workload exporters retain safe option bounds and provider endpoint ordinals;
   CEL failures retain fixed coercion, length, nesting and syntax remedies.
+- The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
+  configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
+  visible while supplied service/tool names, paths, tokens and parser payloads
+  are withheld. Registered real-constructor rendered regressions preserve the
+  existing admission decisions and protocol behavior assertions.
 - The #5594 security conversion covers authentication/authorization, IP/GeoIP,
   JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
   admission. Fixed schema paths and credential/operation ordinals survive
@@ -137,19 +161,6 @@ paths:
   cookie separator examples spell out double quote so the full reason survives.
   Registered rendered/captured regressions and existing rejection/reload-retention
   assertions cover these boundaries.
-- The #5594 traffic/transform conversion covers request/response/body/header
-  transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
-  GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and
-  schema paths survive rendered failures; configured routes, method/operation
-  names, keys, regexes and numeric operands remain withheld. Existing typed
-  rejection, constructor/rendered-output and last-good reload assertions retain
-  admission and retention coverage.
-  Serverless null-field failures resolve recognized keys to schema-authored
-  allowlist entries before backtick rendering; unknown keys remain withheld.
-  Every CORS string-origin failure retains its `allowed_origins[index]` context,
-  including empty, whitespace, length, wildcard and exact-origin rejection.
-  Request-termination path-prefix guidance preserves the fixed `?` and `#`
-  delimiters through the startup renderer.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength
@@ -162,17 +173,6 @@ paths:
   reasons without supplied identities.
   Registered loader, rendered-chain and captured-log regressions cover these
   surfaces; source IDs retained for internal identity are not safe log labels.
-- The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
-  configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
-  visible while supplied service/tool names, paths, tokens and parser payloads
-  are withheld. Registered real-constructor rendered regressions preserve the
-  existing admission decisions and protocol behavior assertions.
-- The #5594 billing conversion covers API chargeback, chargeback sinks and
-  spend-limit admission. Fixed pricing-tier and schema paths remain visible;
-  supplied rates, identities, URLs, document keys and deserializer payloads are
-  withheld. Structural serde errors use the private schema allowlist and retain
-  admission parity. Registered constructor/rendered-output regressions and
-  existing projection/billing behavior assertions cover these diagnostics.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
