@@ -382,9 +382,7 @@ pub(crate) fn materialize_dtls_material(
             roots
         };
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| {
-                format!("udp_logging: invalid DTLS server name for `dtls_server_name` / `host`: {host:?}")
-            })?;
+            .map_err(|_| format!("udp_logging: invalid DTLS server name for `host`: {host:?}"))?;
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|_| "udp_logging: DTLS verifier build failed".to_string())?;
         (

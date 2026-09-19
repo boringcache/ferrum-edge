@@ -716,3 +716,42 @@ fn startup_diagnostics_withhold_schema_names_keys_and_output_fields() {
     assert!(rendered.contains("did you mean `proxy_id`"), "{rendered}");
     assert!(!rendered.contains("proxy_idd"), "{rendered}");
 }
+
+#[test]
+fn startup_diagnostics_preserve_named_schema_enum_paths() {
+    let schema_name = "'SchemaName5594`\"\\\n";
+    let value = "'EnumValue5594`\"\\\n";
+    for (schema, path, reason) in [
+        (
+            json!({"summary_type": value}),
+            "`summary_type`",
+            "must be `http`, `stream`, or `both`",
+        ),
+        (
+            json!({"timestamp_format": value}),
+            "`timestamp_format`",
+            "must be `rfc3339`, `epoch_ms`, or `epoch_s`",
+        ),
+        (
+            json!({"derived_fields": [
+                {"name": "first", "kind": "outcome"},
+                {"name": "'DerivedName5594`\"\\\n", "kind": value}
+            ]}),
+            "`derived_fields[1].kind`",
+            "unknown derived kind",
+        ),
+    ] {
+        let error = validate_plugin_config(
+            "transaction_log_schema",
+            &json!({"schemas": {schema_name: schema}}),
+        )
+        .expect_err("invalid enum must reject named-schema admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for visible in ["transaction_log_schema", "`schemas` entry", path, reason] {
+            assert!(rendered.contains(visible), "{rendered}");
+        }
+        for hidden in ["SchemaName5594", "EnumValue5594", "DerivedName5594"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}
