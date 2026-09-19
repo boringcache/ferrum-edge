@@ -217,7 +217,9 @@ class PairedPlanTests(unittest.TestCase):
         self.assertEqual(throughput.count("phases.finish(handles).await"), 7)
         self.assertNotIn("Instant::now() < deadline", throughput)
         self.assertIn("endpoint.wait_idle()", throughput)
-        self.assertIn("connect_with_connector(connections.clone())", throughput)
+        self.assertIn("connect_with_connector(GrpcConnector {", throughput)
+        transport = (Path(__file__).resolve().parents[1] / "src/transport.rs").read_text()
+        self.assertIn("let mut io = connections.call(uri).await?;", transport)
 
 
 if __name__ == "__main__":
