@@ -946,7 +946,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "unknown configuration field 'alow'");
+        assert_single_rejecting_error(config, "unknown configuration field \"alow\"");
     }
 
     #[test]
@@ -976,7 +976,7 @@ mod tests {
 
         assert_single_rejecting_error(
             config,
-            "'allow_countries' must be an array of ISO country codes",
+            "`allow_countries` must be an array of ISO country codes",
         );
     }
 
