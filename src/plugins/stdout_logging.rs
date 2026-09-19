@@ -653,7 +653,7 @@ mod tests {
                         }
                     }
                 }),
-                "`filter.expression` is invalid: invalid expression shape or scalar type",
+                "`filter.expression.left` is invalid: unknown field",
             ),
         ] {
             let err = match StdoutLogging::new(&config) {

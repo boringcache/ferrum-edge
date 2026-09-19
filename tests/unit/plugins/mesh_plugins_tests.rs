@@ -9296,8 +9296,8 @@ fn mesh_telemetry_rendered_scalar_and_tag_errors_preserve_schema_context() {
                 "kind": "zipkin",
                 "config": {"url": "'MESH_DIAG_SECRET://bad"}
             }}),
-            "`tracing_provider`",
-            "could not construct tracing exporter",
+            "`tracing_provider.config` (provider index 0)",
+            "`endpoint` must be a valid URL",
         ),
     ];
     for (config, field, reason) in cases {
