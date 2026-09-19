@@ -923,6 +923,97 @@ fn test_new_custom_config() {
     assert_eq!(plugin.name(), "ai_semantic_cache");
 }
 
+fn assert_constructor_debug_fields_withheld(config: Value) {
+    // Capture the real constructor before any startup renderer or secret-aware
+    // sink. Reuse the shared interest floor so parallel tests cannot lose DEBUG.
+    let http_client = PluginHttpClient::default();
+    super::plugin_utils::install_interest_floor();
+    let writer = super::plugin_utils::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(writer.clone())
+        .finish();
+    let plugin = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        AiSemanticCache::new(&config, http_client)
+            .expect("valid cache config must still be admitted")
+    };
+    assert_eq!(plugin.name(), "ai_semantic_cache");
+
+    let logs = writer.contents();
+    let events: Vec<Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("captured event must be JSON"))
+        .collect();
+    assert_eq!(events.len(), 1, "expected one admission event: {logs}");
+    let event = &events[0];
+    assert_eq!(event["level"], "DEBUG");
+    assert_eq!(event["target"], "ferrum_edge::plugins::ai_semantic_cache");
+    // Exact field/message equality rejects raw numbers, booleans, enum aliases,
+    // normalized selections, and values moved into the message or extra fields.
+    assert_eq!(
+        event["fields"],
+        json!({
+            "message": "ai_semantic_cache: admitted with effective retention and storage posture",
+            "ttl_seconds": "<redacted scalar>",
+            "max_entries": "<redacted scalar>",
+            "max_entry_size_bytes": "<redacted scalar>",
+            "max_total_size_bytes": "<redacted scalar>",
+            "include_model_in_key": "<redacted scalar>",
+            "include_params_in_key": "<redacted scalar>",
+            "scope_by_consumer": "<redacted scalar>",
+            "cache_multimodal": "<redacted scalar>",
+            "anonymous_caller_scope": "<redacted scalar>",
+            "semantic_similarity_enabled": "<redacted scalar>",
+            "sync_mode": "<redacted scalar>"
+        }),
+        "constructor must withhold every selection at emission: {logs}"
+    );
+}
+
+#[test]
+fn test_new_debug_diagnostic_withholds_numeric_and_boolean_values() {
+    // These values are deliberately not registered as external secrets. Exercise
+    // both boolean choices, including the selection derived from semantic config.
+    for enabled in [false, true] {
+        assert_constructor_debug_fields_withheld(json!({
+            "ttl_seconds": 918273,
+            "max_entries": 817263,
+            "max_entry_size_bytes": 716253,
+            "max_total_size_bytes": 5142637,
+            "include_model_in_key": enabled,
+            "include_params_in_key": enabled,
+            "scope_by_consumer": enabled,
+            "semantic_similarity_enabled": enabled,
+            "semantic_embedding_endpoint": "http://127.0.0.1:12345/embeddings",
+            "anonymous_caller_scope": "shared",
+            "sync_mode": "local"
+        }));
+    }
+}
+
+#[test]
+fn test_new_debug_diagnostic_withholds_normalized_exact_only_alias() {
+    // No Redis or embedding endpoint is needed to reach successful admission.
+    // Neither the supplied alias nor its canonical `exact_only` may be emitted.
+    assert_constructor_debug_fields_withheld(json!({
+        "ttl_seconds": 918273,
+        "max_entries": 817263,
+        "include_model_in_key": false,
+        "cache_multimodal": "exact-only",
+        "anonymous_caller_scope": "caller-address"
+    }));
+}
+
+#[test]
+fn test_new_debug_diagnostic_withholds_default_selections() {
+    assert_constructor_debug_fields_withheld(json!({}));
+}
+
 #[test]
 fn test_new_zero_ttl_fails() {
     let config = json!({"ttl_seconds": 0});
