@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -439,9 +440,13 @@ def retain_runtime(destination, container, config_path, pair, gateway, host_id, 
     try:
         if not matches(r"sha256:[0-9a-f]{64}", result.get("image_id")):
             raise ValueError("immutable image ID required")
-        raw = subprocess.run(["docker", "image", "inspect", result["image_id"],
-                              "--format", "{{json .}}"], check=True, capture_output=True,
-                             text=True, timeout=10)
+        # Keep the executable and script literal for the trusted CI policy
+        # reader. The immutable ID is validated data, never a command operand
+        # that can select a different executable or script.
+        raw = subprocess.run(
+            ["bash", "tests/performance/multi_protocol/h1_runtime_image.sh"],
+            cwd=ROOT.parents[2], env=dict(os.environ, FERRUM_H1_IMAGE_ID=result["image_id"]),
+            check=True, capture_output=True, text=True, timeout=10)
         image = json.loads(raw.stdout)
         if image["Id"] != result["image_id"]:
             raise ValueError("image inspect identity mismatch")

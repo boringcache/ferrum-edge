@@ -703,7 +703,9 @@ class H1InternalProfileTests(unittest.TestCase):
                         patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))) as inspect:
                     profile.retain_runtime(path, container, config, 1, gateway, "campaign-host", mode)
                 inspect.assert_called_once_with(
-                    ["docker", "image", "inspect", container["Image"], "--format", "{{json .}}"],
+                    ["bash", "tests/performance/multi_protocol/h1_runtime_image.sh"],
+                    cwd=profile.ROOT.parents[2],
+                    env=dict(profile.os.environ, FERRUM_H1_IMAGE_ID=container["Image"]),
                     check=True, capture_output=True, text=True, timeout=10)
                 runtime = json.loads(path.read_text())
                 for key in ("image_labels", "container_labels"):
@@ -719,6 +721,18 @@ class H1InternalProfileTests(unittest.TestCase):
             config, path = root / "config.yaml", root / "runtime.json"
             config.write_text("proxies: []\n")
             original_container, original_image = docker_inspect(config)
+            for image_id in ("mutable:tag", "--help", "sha256:" + "a" * 63,
+                             "sha256:" + "A" * 64, "sha256:" + "a" * 64 + "\n",
+                             "$(touch do-not-retain-this)"):
+                container = copy.deepcopy(original_container)
+                container["Image"] = image_id
+                with self.subTest(image_id=image_id), \
+                        patch.object(profile, "process_start_ticks", return_value=100), \
+                        patch.object(profile.subprocess, "run") as inspect:
+                    profile.retain_runtime(path, container, config, 1, "ferrum", "campaign-host", "cutoff")
+                inspect.assert_not_called()
+                self.assertIn("immutable image/container label capture unavailable",
+                              json.loads(path.read_text())["capture_issues"])
             failures = [(None, original_image), ([], original_image), ({}, original_image),
                         (original_container, None), (original_container, []), (original_container, {})]
             for mutate in (
