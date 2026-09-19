@@ -1,7 +1,8 @@
 //! External coverage for issue #2371: node-agent eBPF startup rollback.
 //!
 //! After `load_programs` succeeds, every failure/shutdown path must invoke
-//! `cleanup_all` exactly once while preserving the original error.
+//! `cleanup_all` exactly once while preserving the original failure classification
+//! with safe diagnostics.
 
 use ferrum_edge::_test_support::{
     node_agent_cleanup_failure_preserves_original_error_probe_for_test,
@@ -23,8 +24,8 @@ fn post_load_programs_failure_calls_cleanup_all_once() {
         .error
         .expect("post-load failure must surface an error");
     assert!(
-        error.contains("capture config update failed"),
-        "original init error preserved: {error}"
+        error.contains("capture configuration map update failed"),
+        "original init operation preserved: {error}"
     );
     assert!(probe.programs_loaded, "load_programs must have succeeded");
     assert!(
@@ -45,8 +46,8 @@ fn load_programs_failure_does_not_call_cleanup_all() {
     assert!(!probe.ok, "load_programs failure must abort init");
     let error = probe.error.expect("load failure must surface an error");
     assert!(
-        error.contains("injected load_programs failure"),
-        "original load error preserved: {error}"
+        error.contains("program load failed"),
+        "original load operation preserved: {error}"
     );
     assert!(
         !probe.programs_loaded,

@@ -42,7 +42,7 @@ fn test_migrate_value_unknown_source_version_is_rejected() {
 
     assert!(
         err.to_string()
-            .contains("No config migration path from version '0'")
+            .contains("No config migration path from version (<redacted scalar>)")
     );
     assert_eq!(value, original);
 }
@@ -175,7 +175,7 @@ fn test_migrate_file_rejects_unreachable_version_without_backup_or_rewrite() {
 
     assert!(
         err.to_string()
-            .contains("No config migration path from version '0'")
+            .contains("No config migration path from version (<redacted scalar>)")
     );
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
     let backup_count = std::fs::read_dir(dir.path())
@@ -229,7 +229,7 @@ fn test_migrate_in_memory_rejects_unreachable_version_without_mutation() {
 
     assert!(
         err.to_string()
-            .contains("No config migration path from version '0'")
+            .contains("No config migration path from version (<redacted scalar>)")
     );
     assert_eq!(value, original);
 }

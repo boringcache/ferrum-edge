@@ -823,40 +823,40 @@ impl AiStreamRouter {
                 .to_string();
             if !seen_names.insert(name.clone()) {
                 return Err(format!(
-                    "ai_stream_router: duplicate provider name '{name}'"
+                    "ai_stream_router: duplicate provider name {name:?}"
                 ));
             }
 
             let provider_type_str = pv["provider_type"].as_str().ok_or(format!(
-                "ai_stream_router: provider '{name}' missing 'provider_type'"
+                "ai_stream_router: provider {name:?} missing 'provider_type'"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
 
             let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
             if priority_u64 == 0 {
                 return Err(format!(
-                    "ai_stream_router: provider '{name}' priority must be a positive integer"
+                    "ai_stream_router: provider {name:?} priority must be a positive integer"
                 ));
             }
             let priority = u32::try_from(priority_u64).map_err(|_| {
-                format!("ai_stream_router: provider '{name}' priority is too large")
+                format!("ai_stream_router: provider {name:?} priority is too large")
             })?;
 
             let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
             if model_patterns.is_empty() {
                 return Err(format!(
-                    "ai_stream_router: provider '{name}' requires a non-empty 'model_patterns' array"
+                    "ai_stream_router: provider {name:?} requires a non-empty 'model_patterns' array"
                 ));
             }
 
             let endpoint = pv["endpoint"].as_str().ok_or(format!(
-                "ai_stream_router: provider '{name}' missing 'endpoint'"
+                "ai_stream_router: provider {name:?} missing 'endpoint'"
             ))?;
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
 
             let api_key = config_or_env_str(pv, "api_key").ok_or(format!(
-                "ai_stream_router: provider '{name}' missing 'api_key'"
+                "ai_stream_router: provider {name:?} missing 'api_key'"
             ))?;
             // Header-value validity is a per-byte property, so proving the key
             // itself is sendable also proves the `Bearer {api_key}` form the
@@ -1216,7 +1216,7 @@ fn optional_string_vec(config: &Value, field: &str) -> Result<Option<Vec<String>
 fn validate_provider_header_value(provider: &str, field: &str, value: &str) -> Result<(), String> {
     if reqwest::header::HeaderValue::from_str(value).is_err() {
         return Err(format!(
-            "ai_stream_router: provider '{provider}' '{field}' is not a valid HTTP header value"
+            "ai_stream_router: provider {provider:?} '{field}' is not a valid HTTP header value"
         ));
     }
     Ok(())

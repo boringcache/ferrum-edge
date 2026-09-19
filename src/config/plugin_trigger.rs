@@ -841,7 +841,7 @@ fn compile_string_match(
         .size_limit(MAX_TRIGGER_REGEX_SIZE_BYTES)
         .dfa_size_limit(MAX_TRIGGER_REGEX_DFA_BYTES)
         .build()
-        .map_err(|error| format!("trigger: `{label}` regex is invalid or too large: {error}"))?;
+        .map_err(|_| format!("trigger: `{label}` regex is invalid or too large"))?;
     Ok(CompiledStringMatch::Regex(compiled))
 }
 

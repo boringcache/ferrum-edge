@@ -598,8 +598,7 @@ fn parse_node_waypoint_route_upstreams(
     config: &Value,
 ) -> Result<(bool, Vec<NodeWaypointRouteUpstreamConfig>), String> {
     match config.get("node_waypoint_route_upstreams") {
-        Some(value) => crate::util::json_object::deserialize_object_vec::<
-            _,
+        Some(value) => crate::util::json_object::from_json_object_vec_value::<
             NodeWaypointRouteUpstreamConfig,
         >(value.clone())
         .map(|upstreams| (true, upstreams))
@@ -1653,11 +1652,13 @@ impl MeshAuthz {
         // would then treat as allow-by-default).
         let from_slice = config.get("mesh_slice").is_some();
         let mut slice = if let Some(value) = config.get("mesh_slice") {
-            serde_json::from_value::<crate::util::json_object::JsonObject<MeshSlice>>(value.clone())
-                .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
-                .0
+            crate::util::deserialization::from_json_value::<
+                crate::util::json_object::JsonObject<MeshSlice>,
+            >(value.clone())
+            .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
+            .0
         } else if let Some(value) = config.get("mesh_policies") {
-            let mesh_policies = crate::util::json_object::deserialize_object_vec(value.clone())
+            let mesh_policies = crate::util::json_object::from_json_object_vec_value(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_policies: {e}"))?;
             MeshSlice {
                 mesh_policies,

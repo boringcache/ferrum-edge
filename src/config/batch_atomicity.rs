@@ -281,7 +281,7 @@ impl AtomicBatchFault {
 
     pub fn error(&self) -> anyhow::Error {
         anyhow::anyhow!(
-            "injected atomic batch fault at phase '{}' after {} chunk(s)",
+            "injected atomic batch fault at phase `{}` after {} chunk(s)",
             self.phase.as_str(),
             self.after_chunks
         )

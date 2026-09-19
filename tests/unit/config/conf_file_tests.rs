@@ -298,7 +298,7 @@ fn test_parse_unclosed_quotes_name_key_and_line_without_value() {
         let err = ConfFile::parse(&input).unwrap_err();
         assert_eq!(
             err,
-            "Invalid conf file syntax at line 3: unclosed quote for key 'FERRUM_ADMIN_JWT_SECRET'"
+            "Invalid conf file syntax at line 3: unclosed quote for key `FERRUM_ADMIN_JWT_SECRET`"
         );
     }
 }
@@ -312,7 +312,7 @@ fn test_parse_rejects_text_after_closing_quote() {
             assert_eq!(
                 err,
                 "Invalid conf file syntax at line 2: \
-                 unexpected text after closing quote for key 'FERRUM_MODE'"
+                 unexpected text after closing quote for key `FERRUM_MODE`"
             );
         }
     }

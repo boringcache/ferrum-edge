@@ -321,9 +321,16 @@ fn empty_mismatch_helper_distinguishes_empty_documents() {
 
 #[test]
 fn validate_prints_warning_when_empty_namespace_is_allowed() {
-    let source = include_str!("../../../src/cli.rs");
+    let source = include_str!("../../../src/cli.rs")
+        .split("fn report_empty_namespace_filter(")
+        .nth(1)
+        .unwrap()
+        .split("const HEALTH_RESPONSE_TIMEOUT")
+        .next()
+        .unwrap();
     assert!(
-        source.contains("WARNING: {diagnostic}"),
+        source.contains("WARNING: {}")
+            && source.contains("sanitize_startup_cause(diagnostic, &[])"),
         "allow-empty-namespace must print a loud warning"
     );
     assert!(

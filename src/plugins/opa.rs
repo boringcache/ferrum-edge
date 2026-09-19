@@ -703,7 +703,7 @@ fn parse_decision_endpoint(
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "opa: 'opa_host' must use http:// or https:// (got '{scheme}')"
+                "opa: `opa_host` must use http:// or https:// (got {scheme:?})"
             ));
         }
     }

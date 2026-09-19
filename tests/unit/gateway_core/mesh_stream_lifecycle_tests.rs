@@ -747,7 +747,7 @@ fn refusal_diagnostics_never_echo_the_configured_url() {
         .expect_err("plaintext with a bearer is refused");
     let rendered = refusal.to_string();
     assert!(rendered.contains("endpoint #3"), "{rendered}");
-    assert!(rendered.contains("scheme='http'"), "{rendered}");
+    assert!(rendered.contains("scheme=\"http\""), "{rendered}");
     assert!(!rendered.contains("secret-host"), "{rendered}");
     assert!(!rendered.contains("super-secret"), "{rendered}");
     assert!(!rendered.contains(url), "{rendered}");

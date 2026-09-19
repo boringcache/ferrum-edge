@@ -164,14 +164,14 @@ fn parse_configured_header_name(raw: &str) -> Result<String, String> {
     }
     let header_name = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|_| {
         format!(
-            "correlation_id: 'header_name' contains characters not permitted in HTTP header names (RFC 7230 token): {}",
+            "correlation_id: `header_name` contains characters not permitted in HTTP header names (RFC 7230 token): {:?}",
             render_header_name_for_error(trimmed)
         )
     })?;
     let lower = header_name.as_str().to_string();
     if is_reserved_header_name(&lower) {
         return Err(format!(
-            "correlation_id: 'header_name' is protocol-managed or security-sensitive and cannot be used for correlation IDs: {}",
+            "correlation_id: `header_name` is protocol-managed or security-sensitive and cannot be used for correlation IDs: {:?}",
             render_header_name_for_error(trimmed)
         ));
     }

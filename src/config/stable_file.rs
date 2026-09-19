@@ -36,6 +36,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
+use crate::startup::sanitize_startup_cause;
+
 /// Hard ceiling for ordinary file-mode gateway configuration documents.
 pub const MAX_GATEWAY_CONFIG_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
@@ -400,7 +402,10 @@ pub(crate) fn read_stable_file_with_between_probes(
                 if attempt > 1 {
                     info!(
                         attempt,
-                        path = %display_path,
+                        path = %sanitize_startup_cause(
+                            format!("{:?}", display_path.to_string()),
+                            &[]
+                        ),
                         source = options.source_name,
                         "Configuration file stabilized after retry"
                     );
@@ -412,7 +417,7 @@ pub(crate) fn read_stable_file_with_between_probes(
                 warn!(
                     attempt,
                     max_attempts = options.max_attempts,
-                    path = %display_path,
+                    path = %sanitize_startup_cause(format!("{:?}", display_path.to_string()), &[]),
                     source = options.source_name,
                     reason,
                     "Configuration file read was unstable; retrying"
@@ -438,7 +443,7 @@ pub fn format_stable_file_error(
 ) -> String {
     match error {
         StableFileError::Unstable(reason) => format!(
-            "{} {} remained unstable after {} read attempts ({}). Publish updates \
+            "{} {:?} remained unstable after {} read attempts ({}). Publish updates \
              with an atomic replace (write a temp file, fsync, rename over the \
              path) or equivalent; reload keeps the last known-good live \
              generation when this guard fails closed.",
@@ -448,7 +453,7 @@ pub fn format_stable_file_error(
             reason
         ),
         other => format!(
-            "Failed to read {} {}: {other}",
+            "Failed to read {} {:?}: {other}",
             options.source_name,
             path.display()
         ),

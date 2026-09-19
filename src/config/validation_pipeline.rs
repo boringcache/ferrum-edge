@@ -1,5 +1,6 @@
 use crate::config::BackendEgressPolicy;
 use crate::config::types::{CountryMmdbValidationGeneration, GatewayConfig};
+use crate::startup::sanitize_startup_cause;
 use tracing::{error, warn};
 
 pub(crate) enum ValidationAction<'a> {
@@ -186,7 +187,7 @@ fn collect_plugin_config_errors(
             rejected.push(RejectedPluginConfig {
                 index,
                 message: format!(
-                    "Plugin '{}' (id={}): {error}",
+                    "Plugin {:?} (`id`={:?}): {error}",
                     plugin_config.plugin_name, plugin_config.id
                 ),
             });
@@ -634,7 +635,7 @@ impl<'a> ValidationPipeline<'a> {
                                 backend_allow_ips,
                             ) {
                                 let message = format!(
-                                    "Plugin '{}' (id={}): {}",
+                                    "Plugin {:?} (id={:?}): {}",
                                     plugin_config.plugin_name, plugin_config.id, err
                                 );
                                 if !matches!(&action, ValidationAction::Collect)
@@ -644,7 +645,10 @@ impl<'a> ValidationPipeline<'a> {
                                         crate::plugins::PluginFailurePolicy::OptionalFailOpen,
                                     )
                                 {
-                                    warn!("Optional plugin config validation warning: {}", message);
+                                    warn!(
+                                        "Optional plugin config validation warning: {}",
+                                        sanitize_startup_cause(message, &[])
+                                    );
                                 } else {
                                     errors.push(message);
                                 }
@@ -660,14 +664,17 @@ impl<'a> ValidationPipeline<'a> {
                             )
                         {
                             let message = format!(
-                                "Plugin '{}' (id={}): {}",
+                                "Plugin {:?} (id={:?}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err
                             );
                             if !matches!(&action, ValidationAction::Collect)
                                 && crate::plugins::plugin_failure_policy(&plugin_config.plugin_name)
                                     == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen)
                             {
-                                warn!("Optional plugin config validation warning: {}", message);
+                                warn!(
+                                    "Optional plugin config validation warning: {}",
+                                    sanitize_startup_cause(message, &[])
+                                );
                             } else {
                                 errors.push(message);
                             }
@@ -730,7 +737,7 @@ fn handle_validation_errors(
         }
         ValidationAction::Warn => {
             for message in &errors {
-                warn!("{}", message);
+                warn!("{}", sanitize_startup_cause(message, &[]));
             }
             Ok(())
         }
@@ -740,7 +747,7 @@ fn handle_validation_errors(
                 "FatalCount template must include a '{{}}' placeholder"
             );
             for message in &errors {
-                error!("{}", message);
+                error!("{}", sanitize_startup_cause(message, &[]));
             }
             let summary = template.replacen("{}", &errors.len().to_string(), 1);
             anyhow::bail!(summary);
@@ -870,7 +877,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "Duplicate listen_path '/duplicate'");
+        assert_single_rejecting_error(config, "Duplicate `listen_path` \"/duplicate\"");
     }
 
     #[test]
@@ -892,7 +899,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "non-existent upstream_id 'missing-upstream'");
+        assert_single_rejecting_error(
+            config,
+            "Proxy \"dangling-upstream\" references non-existent upstream_id \"missing-upstream\"",
+        );
     }
 
     #[test]
@@ -906,7 +916,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "non-existent plugin_config 'missing-plugin'");
+        assert_single_rejecting_error(
+            config,
+            "Proxy \"dangling-plugin\" references non-existent plugin_config \"missing-plugin\"",
+        );
     }
 
     #[test]

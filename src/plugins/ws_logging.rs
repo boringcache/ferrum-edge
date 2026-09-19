@@ -527,7 +527,7 @@ impl WsLogging {
             "ws" | "wss" => {}
             scheme => {
                 return Err(format!(
-                    "ws_logging: 'endpoint_url' must use ws:// or wss:// (got '{scheme}')"
+                    "ws_logging: `endpoint_url` must use ws:// or wss:// (got {scheme:?})"
                 ));
             }
         }

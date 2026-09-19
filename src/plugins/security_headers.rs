@@ -250,7 +250,8 @@ fn header_value(
             Ok(Some(value.clone()))
         }
         Some(other) => Err(format!(
-            "security_headers: '{key}' must be a boolean or string, got {other}"
+            "security_headers: `{key}` must be a boolean or string, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -267,7 +268,8 @@ fn optional_header(
             Ok(Some(value.clone()))
         }
         Some(other) => Err(format!(
-            "security_headers: '{key}' must be a string, got {other}"
+            "security_headers: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -310,7 +312,8 @@ fn parse_hsts(object: &serde_json::Map<String, Value>) -> Result<Option<String>,
             Ok(Some(value))
         }
         Some(other) => Err(format!(
-            "security_headers: 'hsts' must be a boolean, string, or object, got {other}"
+            "security_headers: `hsts` must be a boolean, string, or object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -361,7 +364,8 @@ fn parse_set_map(object: &serde_json::Map<String, Value>) -> Result<Vec<(String,
             Ok(out)
         }
         Some(other) => Err(format!(
-            "security_headers: 'set' must be an object, got {other}"
+            "security_headers: `set` must be an object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -381,7 +385,8 @@ fn parse_remove(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
             Ok(out)
         }
         Some(other) => Err(format!(
-            "security_headers: 'remove' must be an array, got {other}"
+            "security_headers: `remove` must be an array, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -462,7 +467,8 @@ fn parse_bool(
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "security_headers: '{key}' must be a boolean, got {other}"
+            "security_headers: `{key}` must be a boolean, got {other:?}",
+            other = other.to_string()
         )),
     }
 }

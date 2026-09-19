@@ -433,7 +433,7 @@ fn adaptive_concurrency_validates_bounds() {
         Ok(_) => panic!("unsupported key_by should be rejected"),
         Err(err) => err,
     };
-    assert!(err.contains("unsupported key_by"));
+    assert!(err.contains("unsupported `key_by`"));
 }
 
 #[test]

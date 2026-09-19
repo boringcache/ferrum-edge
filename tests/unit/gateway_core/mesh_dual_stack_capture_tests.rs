@@ -236,6 +236,85 @@ fn malformed_capture_exclude_cidr_fails_listener_family_validation() {
 }
 
 #[test]
+fn capture_ipv6_env_errors_withhold_values_and_preserve_fields_and_recovery() {
+    use ferrum_edge::capture::capture_ipv6_enabled_from_env;
+    use ferrum_edge::startup::sanitize_startup_cause;
+
+    for (key, raw, expected) in [
+        (
+            "FERRUM_MESH_CAPTURE_IPV6_ENABLED",
+            "'capture-secret`5589`\"\nvisible-tail",
+            "Invalid FERRUM_MESH_CAPTURE_IPV6_ENABLED <redacted scalar>. Expected true, false, 1, or 0",
+        ),
+        (
+            "FERRUM_MESH_IP6TABLES_ENABLED",
+            "'capture-secret`5589`\"\nvisible-tail",
+            "Invalid FERRUM_MESH_IP6TABLES_ENABLED <redacted scalar>. Expected: auto, true, or false",
+        ),
+        (
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "'capture-secret`5589`\"\nvisible-tail",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS: CIDR <redacted scalar> must include a prefix length",
+        ),
+        (
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS",
+            "'capture-secret`5589`\"\nvisible-tail/8",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS: CIDR <redacted scalar> has invalid IP address",
+        ),
+        (
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "fd00::/'capture-secret`5589`\"\nvisible-tail",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS: CIDR <redacted scalar> has invalid prefix length",
+        ),
+        (
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "10.0.0.0/33",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS: CIDR <redacted scalar> prefix length <redacted scalar> exceeds max 32",
+        ),
+        (
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS",
+            "fd00::/129",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS: CIDR <redacted scalar> prefix length <redacted scalar> exceeds max 128",
+        ),
+    ] {
+        let guard = EnvGuard::new(MESH_ENV_KEYS);
+        guard.set("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "");
+        guard.set("FERRUM_MESH_IP6TABLES_ENABLED", "auto");
+        guard.set("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "");
+        guard.set("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS", "");
+        guard.set(key, raw);
+        let error = capture_ipv6_enabled_from_env().unwrap_err();
+        assert_eq!(sanitize_startup_cause(error, &[]), expected);
+    }
+
+    let guard = EnvGuard::new(MESH_ENV_KEYS);
+    guard.set("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "false");
+    guard.set("FERRUM_MESH_IP6TABLES_ENABLED", "auto");
+    guard.set("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "fd00::/8");
+    guard.set("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS", "");
+    let error = capture_ipv6_enabled_from_env().unwrap_err();
+    let rendered = sanitize_startup_cause(&error, &[]);
+    assert_eq!(rendered, error);
+    assert!(rendered.contains("FERRUM_MESH_CAPTURE_IPV6_ENABLED=false contradicts"));
+    assert!(rendered.contains("FERRUM_MESH_IP6TABLES_ENABLED=false (or remove the IPv6 CIDRs)"));
+    assert!(rendered.contains("leaving ip6tables REDIRECTs without a listener"));
+
+    // Recovery and explicit/derived precedence must retain the same decisions.
+    guard.set("FERRUM_MESH_IP6TABLES_ENABLED", "disabled");
+    assert!(!capture_ipv6_enabled_from_env().unwrap());
+    guard.set("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "");
+    guard.set("FERRUM_MESH_IP6TABLES_ENABLED", "auto");
+    assert!(capture_ipv6_enabled_from_env().unwrap());
+    guard.set("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "0.0.0.0/0");
+    assert!(!capture_ipv6_enabled_from_env().unwrap());
+    guard.set("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS", "fd00::/8");
+    assert!(capture_ipv6_enabled_from_env().unwrap());
+    guard.set("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "TRUE");
+    guard.set("FERRUM_MESH_IP6TABLES_ENABLED", "invalid-but-bypassed");
+    assert!(capture_ipv6_enabled_from_env().unwrap());
+}
+
+#[test]
 fn explicit_false_cannot_contradict_locally_configured_ipv6_rules() {
     let guard = EnvGuard::new(MESH_ENV_KEYS);
     for &key in MESH_ENV_KEYS {

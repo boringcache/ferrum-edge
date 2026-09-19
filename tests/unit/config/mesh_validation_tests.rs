@@ -242,11 +242,13 @@ fn mesh_ports_reject_zero_on_core_resources() {
         "expected mesh service port error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("protocol_overrides[0]")),
+        errors
+            .iter()
+            .any(|e| e.contains("protocol_overrides[\"0\"]")),
         "expected protocol override port error, got: {errors:?}"
     );
     assert!(
-        errors.iter().any(|e| e.contains("port_overrides[0]")),
+        errors.iter().any(|e| e.contains("port_overrides[\"0\"]")),
         "expected peer auth port override error, got: {errors:?}"
     );
     assert!(
@@ -262,7 +264,7 @@ fn mesh_ports_reject_zero_on_core_resources() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("endpoints[0].ports['http']")),
+            .any(|e| e.contains("endpoints[0].ports[\"http\"]")),
         "expected endpoint named port error, got: {errors:?}"
     );
 }
@@ -298,7 +300,9 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
     let errors = mesh.validate();
 
     assert!(
-        errors.iter().any(|e| e.contains("port_level_settings[0]")),
+        errors
+            .iter()
+            .any(|e| e.contains("port_level_settings[\"0\"]")),
         "expected DestinationRule port-level settings error, got: {errors:?}"
     );
     assert!(
@@ -351,11 +355,11 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
 
     for expected in [
         "MeshDestinationRule.name",
-        "MeshDestinationRule ''.namespace",
-        "MeshDestinationRule ''.host",
+        "MeshDestinationRule \"\".namespace",
+        "MeshDestinationRule \"\".host",
         "subsets[0].name",
         "MeshSidecar.name",
-        "MeshSidecar ''.namespace",
+        "MeshSidecar \"\".namespace",
         "egress[0].hosts must not be empty",
         "egress[1].hosts[0]",
         "egress[1].hosts[1]",
@@ -1007,7 +1011,7 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("port_overrides[15006]")
+            .any(|e| e.contains("port_overrides[\"15006\"]")
                 && e.contains("invalid for server-side policy")),
         "expected invalid port override mtls_mode error, got: {:?}",
         errors
@@ -2647,6 +2651,13 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
     };
 
     let errors = mesh.validate();
+    let rendered =
+        ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+    assert!(
+        rendered.contains("port_level_settings[<redacted scalar>].tls.mode"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("8080"), "{rendered}");
     assert!(
         errors
             .iter()
@@ -2656,7 +2667,7 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("port_level_settings[8080].tls.mode")),
+            .any(|e| e.contains("port_level_settings[\"8080\"].tls.mode")),
         "expected server-side mode error, got: {errors:?}"
     );
     assert!(
@@ -2741,7 +2752,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     let errors = mesh.validate();
     assert!(
         errors.iter().any(|e| {
-            e.contains("MeshTelemetryResource 'telemetry'")
+            e.contains("MeshTelemetryResource \"telemetry\"")
                 && e.contains("sampling_percentage")
                 && e.contains("0 to 100")
         }),
@@ -2749,7 +2760,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     );
     assert!(
         errors.iter().any(|e| {
-            e.contains("MeshProxyConfig 'proxy'")
+            e.contains("MeshProxyConfig \"proxy\"")
                 && e.contains("tracing_sampling")
                 && e.contains("0 to 100")
         }),

@@ -235,7 +235,7 @@ pub fn register_named(
     };
     if staging.contains_key(name) {
         return Err(format!(
-            "transaction_log_schema: named schema '{name}' registered more than once"
+            "transaction_log_schema: named schema {name:?} registered more than once"
         ));
     }
     staging.insert(name.to_string(), NamedSchema { raw, compiled });

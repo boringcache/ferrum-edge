@@ -227,7 +227,7 @@ impl McpGatewayMode {
             "transparent_proxy" => Ok(Self::TransparentProxy),
             "aggregate_router" => Ok(Self::AggregateRouter),
             other => Err(format!(
-                "mcp_gateway: 'mode' must be transparent_proxy or aggregate_router, got {other:?}"
+                "mcp_gateway: `mode` must be transparent_proxy or aggregate_router, got {other:?}"
             )),
         }
     }
@@ -254,7 +254,7 @@ impl InitializeStrategy {
             "startup" => Ok(Self::Startup),
             "passthrough" => Ok(Self::Passthrough),
             other => Err(format!(
-                "mcp_gateway: '{field}' must be lazy, startup, or passthrough, got {other:?}"
+                "mcp_gateway: `{field}` must be lazy, startup, or passthrough, got {other:?}"
             )),
         }
     }
@@ -274,7 +274,7 @@ impl PolicyAction {
             "deny" => Ok(Self::Deny),
             "hide_from_discovery" => Ok(Self::HideFromDiscovery),
             other => Err(format!(
-                "mcp_gateway: '{field}' must be allow, deny, or hide_from_discovery, got {other:?}"
+                "mcp_gateway: `{field}` must be allow, deny, or hide_from_discovery, got {other:?}"
             )),
         }
     }
@@ -300,7 +300,7 @@ impl DiscoveryBehavior {
             "allow" | "allow_immediately" | "expose" => Ok(Self::Allow),
             "hide_until_configured" => Ok(Self::HideUntilConfigured),
             other => Err(format!(
-                "mcp_gateway: '{field}' must be allow or hide_until_configured, got {other:?}"
+                "mcp_gateway: `{field}` must be allow or hide_until_configured, got {other:?}"
             )),
         }
     }
@@ -7751,7 +7751,8 @@ fn optional_object<'a>(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(value)) => Ok(Some(value)),
         Some(other) => Err(format!(
-            "mcp_gateway: '{key}' must be an object, got {other}"
+            "mcp_gateway: `{key}` must be an object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -7761,7 +7762,8 @@ fn optional_bool(object: &Map<String, Value>, key: &str) -> Result<Option<bool>,
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(other) => Err(format!(
-            "mcp_gateway: '{key}' must be a boolean, got {other}"
+            "mcp_gateway: `{key}` must be a boolean, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -7774,7 +7776,8 @@ fn optional_string<'a>(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(other) => Err(format!(
-            "mcp_gateway: '{key}' must be a string, got {other}"
+            "mcp_gateway: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -7787,7 +7790,8 @@ fn optional_string_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(format!(
-            "mcp_gateway: '{key}' must be a string, got {other}"
+            "mcp_gateway: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -7800,7 +7804,8 @@ fn optional_bool_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(other) => Err(format!(
-            "mcp_gateway: '{key}' must be a boolean, got {other}"
+            "mcp_gateway: `{key}` must be a boolean, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -7816,7 +7821,8 @@ fn optional_u64_from_object(
             .ok_or_else(|| format!("mcp_gateway: '{key}' must be a positive integer"))
             .map(Some),
         Some(other) => Err(format!(
-            "mcp_gateway: '{key}' must be a positive integer, got {other}"
+            "mcp_gateway: `{key}` must be a positive integer, got {other:?}",
+            other = other.to_string()
         )),
     }
 }

@@ -363,12 +363,12 @@ impl AiRequestGuard {
             };
             if !min.is_finite() || !max.is_finite() {
                 return Err(format!(
-                    "ai_request_guard: 'temperature_range' bounds must be finite, got [{min}, {max}]"
+                    "ai_request_guard: `temperature_range` bounds must be finite, got [\"{min}\", \"{max}\"]"
                 ));
             }
             if min > max {
                 return Err(format!(
-                    "ai_request_guard: 'temperature_range' min must be <= max, got [{min}, {max}]"
+                    "ai_request_guard: `temperature_range` min must be <= max, got [\"{min}\", \"{max}\"]"
                 ));
             }
             Some((min, max))

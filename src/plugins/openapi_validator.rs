@@ -360,8 +360,8 @@ impl ConversionPlan {
         if let Some(patterns) = schema.get("patternProperties").and_then(Value::as_object) {
             let mut compiled = Vec::with_capacity(patterns.len());
             for (pattern, child) in patterns {
-                let regex = Regex::new(pattern).map_err(|error| {
-                    format!("invalid patternProperties regex '{pattern}': {error}")
+                let regex = Regex::new(pattern).map_err(|_| {
+                    "invalid patternProperties regex or complexity limit exceeded".to_string()
                 })?;
                 let child = Arc::new(child.clone());
                 self.register_schema(child.as_ref(), schema_draft, visited, depth + 1)?;
@@ -700,8 +700,10 @@ impl OpenapiValidator {
                     .then_with(|| right.operation_label.len().cmp(&left.operation_label.len()))
             });
             let patterns = entries.iter().map(|(pattern, _)| pattern.as_str());
-            let path_regexes = RegexSet::new(patterns).map_err(|error| {
-                format!("openapi_validator: failed to compile path regex set for {method}: {error}")
+            let path_regexes = RegexSet::new(patterns).map_err(|_| {
+                format!(
+                    "openapi_validator: path regex set for {method:?} exceeds complexity limits"
+                )
             })?;
             let entries = entries.into_iter().map(|(_, entry)| entry).collect();
             ops_by_method.insert(
@@ -1612,8 +1614,8 @@ fn parse_operation(
     // alternation `a|b` becomes `^(?:a|b)$` (every branch anchored) rather than
     // `^a|b$` (only the first branch anchored).
     let path_regex_anchored = anchor_path_regex(path_regex_raw);
-    Regex::new(&path_regex_anchored).map_err(|error| {
-        format!("openapi_validator: operations[{index}].path_regex is invalid: {error}")
+    Regex::new(&path_regex_anchored).map_err(|_| {
+        format!("openapi_validator: operations[{index}].path_regex is invalid or too complex")
     })?;
     let operation_label = optional_string(object, "operation_label")?
         .map(str::to_string)
@@ -1689,7 +1691,7 @@ fn parse_request_validators(
             compile_media_validator(schema, encoding, &media_type, schema_draft).map_err(
                 |error| {
                     format!(
-                        "openapi_validator: operations[{operation_index}].request_body schema for {content_type} is invalid: {error}"
+                        "openapi_validator: operations[{operation_index}].request_body schema for {content_type:?} is invalid: {error}"
                     )
                 },
             )?,
@@ -1721,7 +1723,7 @@ fn parse_request_validators(
             compile_media_validator(schema, encoding, &media_type, schema_draft).map_err(
                 |error| {
                     format!(
-                        "openapi_validator: operations[{operation_index}].request_body schema for {content_type} is invalid: {error}"
+                        "openapi_validator: operations[{operation_index}].request_body schema for {content_type:?} is invalid: {error}"
                     )
                 },
             )?,
@@ -1811,7 +1813,7 @@ fn parse_response_validators(
                 compile_media_validator(schema, None, content_type, schema_draft).map_err(
                     |error| {
                         format!(
-                            "openapi_validator: operations[{operation_index}].responses['{status_raw}'] schema for {content_type} is invalid: {error}"
+                            "openapi_validator: operations[{operation_index}].responses['{status_raw}'] schema for {content_type:?} is invalid: {error}"
                         )
                     },
                 )?,
@@ -1915,12 +1917,13 @@ fn insert_media_validator(
 fn compile_schema(
     schema: &Value,
     schema_draft: SchemaDraft,
-) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>> {
+) -> Result<jsonschema::Validator, String> {
     match schema_draft {
         SchemaDraft::Auto => jsonschema::validator_for(schema),
         SchemaDraft::Draft7 => jsonschema::draft7::options().build(schema),
         SchemaDraft::Draft202012 => jsonschema::draft202012::options().build(schema),
     }
+    .map_err(|_| "invalid JSON Schema".to_string())
 }
 
 fn compile_media_validator(
@@ -1929,7 +1932,7 @@ fn compile_media_validator(
     media_type: &str,
     schema_draft: SchemaDraft,
 ) -> Result<MediaValidator, String> {
-    let validator = compile_schema(schema, schema_draft).map_err(|error| error.to_string())?;
+    let validator = compile_schema(schema, schema_draft)?;
     let schema = Arc::new(schema.clone());
     let conversion = ConversionPlan::compile(schema.as_ref(), schema_draft)?;
     let encoding = parse_encoding_map(encoding, media_type, schema.as_ref(), schema_draft)?;
@@ -1987,7 +1990,7 @@ fn parse_encoding_map(
         normalized == "application/x-www-form-urlencoded" || normalized == "multipart/form-data";
     if !supports_style {
         return Err(format!(
-            "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type})"
+            "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type:?})"
         ));
     }
     let mut out = AHashMap::new();
@@ -2149,7 +2152,7 @@ fn parse_property_encoding(
         "deepObject" => EncodingStyle::DeepObject,
         other => {
             return Err(format!(
-                "encoding['{property}'].style '{other}' is unsupported for request bodies (supported: form, spaceDelimited, pipeDelimited, deepObject)"
+                "encoding['{property}'].style {other:?} is unsupported for request bodies (supported: form, spaceDelimited, pipeDelimited, deepObject)"
             ));
         }
     };
@@ -2259,12 +2262,12 @@ fn parse_property_encoding(
                 "content-type" | "content-disposition" | "content-transfer-encoding"
             ) {
                 return Err(format!(
-                    "encoding['{property}'].headers must not redefine '{name}'"
+                    "encoding['{property}'].headers must not redefine {name:?}"
                 ));
             }
             if headers.contains_key(&name) {
                 return Err(format!(
-                    "encoding['{property}'].headers contains duplicate header name '{name}'"
+                    "encoding['{property}'].headers contains duplicate header name {name:?}"
                 ));
             }
             // Header Object may wrap `schema`; accept either that public OAS
@@ -4925,7 +4928,7 @@ fn normalize_configured_media_types(
         let value = normalize_media_type(&value);
         if !seen.insert(value.clone()) {
             return Err(format!(
-                "{ERROR_PREFIX}'{field}' contains duplicate media type '{value}' after normalization"
+                "{ERROR_PREFIX}'{field}' contains duplicate media type {value:?} after normalization"
             ));
         }
         normalized.push(value);
@@ -5870,9 +5873,9 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
         }
         patterns.push(pattern.to_string());
     }
-    RegexSet::new(patterns)
-        .map(Some)
-        .map_err(|error| format!("openapi_validator: failed to compile '{field}': {error}"))
+    RegexSet::new(patterns).map(Some).map_err(|_| {
+        format!("openapi_validator: `{field}` contains invalid regex or exceeds complexity limits")
+    })
 }
 
 fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<String>>, String> {

@@ -149,12 +149,12 @@ pub(crate) fn unsupported_backend_kind_message(
 ) -> String {
     if route_supports_service_import(route_kind) {
         format!(
-            "unsupported backendRef target group '{group}' kind '{kind}'; \
+            "unsupported backendRef target group {group:?} kind {kind:?}; \
              supported kinds are core Service and {SERVICE_IMPORT_GROUP}/{SERVICE_IMPORT_KIND}"
         )
     } else {
         format!(
-            "unsupported backendRef target group '{group}' kind '{kind}'; \
+            "unsupported backendRef target group {group:?} kind {kind:?}; \
              {route_kind} only supports core Service backendRefs"
         )
     }
@@ -224,7 +224,8 @@ pub(crate) fn checked_backend_namespace(
         Err(invalid_resource(
             object,
             format!(
-                "{from_kind} backendRef to {} in namespace '{backend_namespace}' requires a matching ReferenceGrant",
+                "{from_kind} backendRef to {} in namespace {backend_namespace:?} requires a \
+                 matching ReferenceGrant",
                 backend_kind.kind()
             ),
         ))
@@ -344,16 +345,18 @@ pub(crate) fn service_import_port_error_message(
 ) -> String {
     match (error, requested_port) {
         (ServiceImportPortError::UnsupportedProtocol, Some(port)) => format!(
-            "backendRef ServiceImport '{namespace}/{name}' port {port} uses an unsupported protocol"
+            "backendRef ServiceImport {namespace:?}/{name:?} port \"{port}\" uses an unsupported \
+             protocol"
         ),
         (ServiceImportPortError::UnsupportedProtocol, None) => format!(
-            "backendRef ServiceImport '{namespace}/{name}' does not expose a supported TCP port"
+            "backendRef ServiceImport {namespace:?}/{name:?} does not expose a supported TCP port"
         ),
         (ServiceImportPortError::BackendNotFound, Some(port)) => {
-            format!("backendRef ServiceImport '{namespace}/{name}' port {port} was not found")
+            format!("backendRef ServiceImport {namespace:?}/{name:?} port \"{port}\" was not found")
         }
         (ServiceImportPortError::BackendNotFound, None) => format!(
-            "backendRef ServiceImport '{namespace}/{name}' must expose exactly one TCP port when backendRefs[].port is omitted"
+            "backendRef ServiceImport {namespace:?}/{name:?} must expose exactly one TCP port \
+             when backendRefs[].port is omitted"
         ),
     }
 }

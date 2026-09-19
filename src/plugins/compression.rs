@@ -471,7 +471,7 @@ impl CompressionPlugin {
                         Some("br") | Some("brotli") => algos.push(Algorithm::Brotli),
                         Some(other) => {
                             return Err(format!(
-                                "compression: algorithms[{idx}]: unknown algorithm '{other}' (expected 'gzip' or 'br')"
+                                "compression: algorithms[{idx}]: unknown algorithm {other:?} (expected `gzip` or `br`)"
                             ));
                         }
                         None => {
@@ -1390,7 +1390,7 @@ fn resolve_max_decompressed_request_size(
     if max_request_body_size_bytes > 0 {
         if configured > max_request_body_size_bytes {
             return Err(format!(
-                "compression: 'max_decompressed_request_size' ({configured}) exceeds FERRUM_MAX_REQUEST_BODY_SIZE_BYTES ({max_request_body_size_bytes})"
+                "compression: `max_decompressed_request_size` (\"{configured}\") exceeds FERRUM_MAX_REQUEST_BODY_SIZE_BYTES (\"{max_request_body_size_bytes}\")"
             ));
         }
         limit = limit.min(max_request_body_size_bytes);

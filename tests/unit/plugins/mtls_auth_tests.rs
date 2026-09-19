@@ -1243,7 +1243,7 @@ fn test_mtls_auth_rejects_unknown_cert_field() {
     let err = MtlsAuth::new(&json!({"cert_field": "subject_serial"}))
         .err()
         .expect("unknown cert_field must be rejected");
-    assert!(err.contains("'cert_field'"), "got: {err}");
+    assert!(err.contains("`cert_field`"), "got: {err}");
 }
 
 #[test]
@@ -1251,7 +1251,7 @@ fn test_mtls_auth_rejects_non_string_cert_field() {
     let err = MtlsAuth::new(&json!({"cert_field": 42}))
         .err()
         .expect("non-string cert_field must be rejected");
-    assert!(err.contains("'cert_field' must be a string"), "got: {err}");
+    assert!(err.contains("`cert_field` must be a string"), "got: {err}");
 }
 
 #[test]
@@ -1260,7 +1260,7 @@ fn test_mtls_auth_rejects_non_array_allowed_issuers() {
         .err()
         .expect("non-array allowed_issuers must be rejected");
     assert!(
-        err.contains("'allowed_issuers' must be an array"),
+        err.contains("`allowed_issuers` must be an array"),
         "got: {err}"
     );
 }
@@ -1310,7 +1310,7 @@ fn test_mtls_auth_rejects_non_array_ca_fingerprints() {
         .err()
         .expect("non-array CA fingerprints must be rejected");
     assert!(
-        err.contains("'allowed_ca_fingerprints_sha256' must be an array"),
+        err.contains("`allowed_ca_fingerprints_sha256` must be an array"),
         "got: {err}"
     );
 }

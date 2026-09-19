@@ -363,18 +363,20 @@ pub(crate) fn validate_api_spec_proxy_plugin_association(
 ) -> Result<(), anyhow::Error> {
     match plugin.scope {
         PluginScope::Global => anyhow::bail!(
-            "API-spec restore associated plugin '{}' is global and cannot be associated explicitly with proxy '{}'",
+            "API-spec restore associated plugin {:?} is global and cannot be associated \
+             explicitly with proxy {:?}",
             plugin.id,
             proxy_id
         ),
         PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(proxy_id) => anyhow::bail!(
-            "API-spec restore associated plugin '{}' targets proxy '{}', not restored proxy '{}'",
+            "API-spec restore associated plugin {:?} targets proxy {:?}, not restored proxy {:?}",
             plugin.id,
             plugin.proxy_id.as_deref().unwrap_or("<none>"),
             proxy_id
         ),
         PluginScope::ProxyGroup if plugin.proxy_id.is_some() => anyhow::bail!(
-            "API-spec restore associated proxy-group plugin '{}' unexpectedly carries proxy_id '{}'",
+            "API-spec restore associated proxy-group plugin {:?} unexpectedly carries proxy_id \
+             {:?}",
             plugin.id,
             plugin.proxy_id.as_deref().unwrap_or("<none>")
         ),
@@ -398,7 +400,7 @@ pub(crate) fn api_spec_recovered_proxy_graph(
         .iter()
         .find(|proxy| proxy.id == proxy_id)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("API-spec restore proxy '{}' is missing", proxy_id))?;
+        .ok_or_else(|| anyhow::anyhow!("API-spec restore proxy {:?} is missing", proxy_id))?;
     let associated_plugin_ids: HashSet<&str> = restored_proxy
         .plugins
         .iter()
@@ -436,7 +438,7 @@ pub(crate) async fn validate_api_spec_recovered_plugin_graph(
             )
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "API-spec restore plugin '{}' validation failed: {}",
+                    "API-spec restore plugin {:?} validation failed: {}",
                     plugin.id,
                     error
                 )
@@ -477,30 +479,30 @@ pub(crate) fn validate_api_spec_restore_inputs(
 ) -> Result<(), anyhow::Error> {
     if bundle.proxy.id != spec.proxy_id {
         anyhow::bail!(
-            "API-spec restore proxy id '{}' does not match spec proxy_id '{}'",
+            "API-spec restore proxy id {:?} does not match spec proxy_id {:?}",
             bundle.proxy.id,
             spec.proxy_id
         );
     }
     if bundle.proxy.namespace != spec.namespace {
         anyhow::bail!(
-            "API-spec restore proxy namespace '{}' does not match spec namespace '{}'",
+            "API-spec restore proxy namespace {:?} does not match spec namespace {:?}",
             bundle.proxy.namespace,
             spec.namespace
         );
     }
     match (bundle.proxy.api_spec_id.as_deref(), compensation_restore) {
         (Some(owner), true) if owner != spec.id => anyhow::bail!(
-            "API-spec restore proxy '{}' is owned by a different API spec",
+            "API-spec restore proxy {:?} is owned by a different API spec",
             bundle.proxy.id
         ),
         (None, true) => anyhow::bail!(
-            "API-spec restore proxy '{}' is not owned by API spec '{}'",
+            "API-spec restore proxy {:?} is not owned by API spec {:?}",
             bundle.proxy.id,
             spec.id
         ),
         (Some(_), false) => anyhow::bail!(
-            "API-spec submission proxy '{}' carries server-managed API-spec ownership",
+            "API-spec submission proxy {:?} carries server-managed API-spec ownership",
             bundle.proxy.id
         ),
         (Some(_), true) | (None, false) => {}
@@ -509,7 +511,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
     if let Some(upstream) = &bundle.upstream {
         if upstream.namespace != spec.namespace {
             anyhow::bail!(
-                "API-spec restore upstream '{}' belongs to namespace '{}', not '{}'",
+                "API-spec restore upstream {:?} belongs to namespace {:?}, not {:?}",
                 upstream.id,
                 upstream.namespace,
                 spec.namespace
@@ -517,16 +519,16 @@ pub(crate) fn validate_api_spec_restore_inputs(
         }
         match (upstream.api_spec_id.as_deref(), compensation_restore) {
             (Some(owner), true) if owner != spec.id => anyhow::bail!(
-                "API-spec restore upstream '{}' is owned by a different API spec",
+                "API-spec restore upstream {:?} is owned by a different API spec",
                 upstream.id
             ),
             (None, true) => anyhow::bail!(
-                "API-spec restore upstream '{}' is not owned by API spec '{}'",
+                "API-spec restore upstream {:?} is not owned by API spec {:?}",
                 upstream.id,
                 spec.id
             ),
             (Some(_), false) => anyhow::bail!(
-                "API-spec submission upstream '{}' carries server-managed API-spec ownership",
+                "API-spec submission upstream {:?} carries server-managed API-spec ownership",
                 upstream.id
             ),
             (Some(_), true) | (None, false) => {}
@@ -546,7 +548,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
     for upstream in additional_upstreams {
         if upstream.namespace != spec.namespace {
             anyhow::bail!(
-                "API-spec restore additional upstream '{}' belongs to namespace '{}', not '{}'",
+                "API-spec restore additional upstream {:?} belongs to namespace {:?}, not {:?}",
                 upstream.id,
                 upstream.namespace,
                 spec.namespace
@@ -558,13 +560,13 @@ pub(crate) fn validate_api_spec_restore_inputs(
             .is_some_and(|owner| owner != spec.id.as_str())
         {
             anyhow::bail!(
-                "API-spec restore additional upstream '{}' is owned by a different API spec",
+                "API-spec restore additional upstream {:?} is owned by a different API spec",
                 upstream.id
             );
         }
         if !inserted_upstream_ids.insert(upstream.id.as_str()) {
             anyhow::bail!(
-                "API-spec restore contains overlapping upstream id '{}'",
+                "API-spec restore contains overlapping upstream id {:?}",
                 upstream.id
             );
         }
@@ -574,7 +576,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
     for association in &bundle.proxy.plugins {
         if !association_ids.insert(association.plugin_config_id.as_str()) {
             anyhow::bail!(
-                "API-spec restore proxy '{}' contains duplicate association to plugin '{}'",
+                "API-spec restore proxy {:?} contains duplicate association to plugin {:?}",
                 bundle.proxy.id,
                 association.plugin_config_id
             );
@@ -590,7 +592,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
     for plugin in &bundle.plugins {
         if plugin.namespace != spec.namespace {
             anyhow::bail!(
-                "API-spec restore plugin '{}' belongs to namespace '{}', not '{}'",
+                "API-spec restore plugin {:?} belongs to namespace {:?}, not {:?}",
                 plugin.id,
                 plugin.namespace,
                 spec.namespace
@@ -598,16 +600,16 @@ pub(crate) fn validate_api_spec_restore_inputs(
         }
         match (plugin.api_spec_id.as_deref(), compensation_restore) {
             (Some(owner), true) if owner != spec.id => anyhow::bail!(
-                "API-spec restore plugin '{}' is owned by a different API spec",
+                "API-spec restore plugin {:?} is owned by a different API spec",
                 plugin.id
             ),
             (None, true) => anyhow::bail!(
-                "API-spec restore plugin '{}' is not owned by API spec '{}'",
+                "API-spec restore plugin {:?} is not owned by API spec {:?}",
                 plugin.id,
                 spec.id
             ),
             (Some(_), false) => anyhow::bail!(
-                "API-spec submission plugin '{}' carries server-managed API-spec ownership",
+                "API-spec submission plugin {:?} carries server-managed API-spec ownership",
                 plugin.id
             ),
             (Some(_), true) | (None, false) => {}
@@ -615,7 +617,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
         if compensation_restore && plugin.scope == PluginScope::Global && plugin.proxy_id.is_some()
         {
             anyhow::bail!(
-                "API-spec restore global plugin '{}' unexpectedly carries proxy_id '{}'",
+                "API-spec restore global plugin {:?} unexpectedly carries proxy_id {:?}",
                 plugin.id,
                 plugin.proxy_id.as_deref().unwrap_or("<none>")
             );
@@ -628,14 +630,14 @@ pub(crate) fn validate_api_spec_restore_inputs(
             && !association_ids.contains(plugin.id.as_str());
         if !is_proxy_scoped_to_bundle && !is_unassociated_compensation_global {
             anyhow::bail!(
-                "API-spec restore plugin '{}' is not proxy-scoped to proxy '{}'",
+                "API-spec restore plugin {:?} is not proxy-scoped to proxy {:?}",
                 plugin.id,
                 bundle.proxy.id
             );
         }
         if !inserted_plugin_ids.insert(plugin.id.as_str()) {
             anyhow::bail!(
-                "API-spec restore contains duplicate plugin id '{}'",
+                "API-spec restore contains duplicate plugin id {:?}",
                 plugin.id
             );
         }
@@ -644,7 +646,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
     for plugin in additional_plugins {
         if plugin.namespace != spec.namespace {
             anyhow::bail!(
-                "API-spec restore additional plugin '{}' belongs to namespace '{}', not '{}'",
+                "API-spec restore additional plugin {:?} belongs to namespace {:?}, not {:?}",
                 plugin.id,
                 plugin.namespace,
                 spec.namespace
@@ -652,14 +654,14 @@ pub(crate) fn validate_api_spec_restore_inputs(
         }
         if plugin.api_spec_id.is_some() {
             anyhow::bail!(
-                "API-spec restore additional plugin '{}' is owned by an API spec",
+                "API-spec restore additional plugin {:?} is owned by an API spec",
                 plugin.id
             );
         }
         validate_api_spec_proxy_plugin_association(plugin, &bundle.proxy.id)?;
         if !inserted_plugin_ids.insert(plugin.id.as_str()) {
             anyhow::bail!(
-                "API-spec restore contains overlapping plugin id '{}'",
+                "API-spec restore contains overlapping plugin id {:?}",
                 plugin.id
             );
         }
@@ -681,7 +683,7 @@ pub(crate) fn validate_api_spec_retained_upstream_identity(
         || existing.created_at != expected.created_at
     {
         anyhow::bail!(
-            "API-spec restore additional upstream '{}' does not match its pre-delete identity",
+            "API-spec restore additional upstream {:?} does not match its pre-delete identity",
             expected.id
         );
     }
@@ -1420,12 +1422,14 @@ impl std::fmt::Display for IncrementalFullReloadRequired {
         match self.reason {
             IncrementalFullReloadReason::ConsumerChanges => write!(
                 f,
-                "consumer changes in namespace '{}' require an authoritative full reload to rehydrate quarantined credentials",
+                "consumer changes in namespace {:?} require an authoritative full reload to \
+                 rehydrate quarantined credentials",
                 self.namespace
             ),
             IncrementalFullReloadReason::GatewayTrustBundleChanges => write!(
                 f,
-                "gateway trust bundle changes in namespace '{}' require an authoritative full reload so configuration and trust material publish from one snapshot",
+                "gateway trust bundle changes in namespace {:?} require an authoritative full \
+                 reload so configuration and trust material publish from one snapshot",
                 self.namespace
             ),
         }
@@ -1558,7 +1562,7 @@ impl std::fmt::Display for SnapshotDataIntegrityError {
         match self.resource_id.as_deref() {
             Some(id) => write!(
                 formatter,
-                "data-integrity failure decoding {} resource '{}'",
+                "data-integrity failure decoding {} resource {:?}",
                 self.resource_type, id
             ),
             None => write!(

@@ -23,7 +23,7 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::startup_security;
 use crate::modes::tls_reload;
 use crate::proxy::{self, ProxyState};
-use crate::startup::wait_for_start_signals;
+use crate::startup::{sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls;
 
 pub async fn run(
@@ -44,8 +44,8 @@ pub async fn run(
         crate::dp_config_freshness::install(env_config.dp_config_max_stale(), stale_action);
     if config_freshness.enabled() {
         info!(
-            max_stale_seconds = config_freshness.max_stale().as_secs(),
-            stale_action = stale_action.as_str(),
+            max_stale_seconds = %sanitize_startup_scalar(config_freshness.max_stale().as_secs()),
+            stale_action = %sanitize_startup_scalar(stale_action.as_str()),
             "DP last-known-good configuration age is bounded; readiness degrades and the \
              configured stale action applies once the bound is exceeded with no CP connected"
         );
@@ -231,7 +231,7 @@ pub async fn run(
             "SECURITY: DP config sync will use PLAINTEXT gRPC for CP URL(s): {} — the DP \
              authentication JWT and gateway configuration travel unencrypted and unauthenticated \
              against MITM. Use https:// CP URLs with FERRUM_DP_GRPC_TLS_CA_CERT_PATH in production.",
-            plaintext_cp_urls.join(", ")
+            sanitize_startup_scalar(plaintext_cp_urls.join(", "))
         );
     }
 
@@ -291,7 +291,9 @@ pub async fn run(
             None
         }
         Err(e) => {
-            error!("TLS configuration validation failed: {:#}", e);
+            error!(
+                "TLS configuration validation failed: frontend certificate, key, or client trust material could not be loaded"
+            );
             return Err(e);
         }
     };
@@ -318,7 +320,7 @@ pub async fn run(
         && handles.watcher_handle.is_some()
     {
         info!(
-            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            interval_secs = %sanitize_startup_scalar(env_config.frontend_tls_watch_interval_seconds),
             "Frontend TLS live reload enabled for DP proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
@@ -389,7 +391,7 @@ pub async fn run(
         );
         dp_client_trust_watcher = Some(watcher);
         info!(
-            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            interval_secs = %sanitize_startup_scalar(env_config.frontend_tls_watch_interval_seconds),
             "Frontend client-trust live reload enabled for a DP whose frontend server certificate is control-plane delivered"
         );
         h3_pairing = Some(pairing);
@@ -541,11 +543,11 @@ pub async fn run(
         let http_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_PROXY_BIND_ADDRESS",
                     "FERRUM_PROXY_HTTP_PORT",
-                    &http_addr.to_string()
-                )
+                    &http_addr.to_string(),
+                ))
             );
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
@@ -587,11 +589,11 @@ pub async fn run(
         let https_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTPS proxy listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_PROXY_BIND_ADDRESS",
                     "FERRUM_PROXY_HTTPS_PORT",
-                    &https_addr.to_string()
-                )
+                    &https_addr.to_string(),
+                ))
             );
             if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
                 https_addr,
@@ -675,7 +677,10 @@ pub async fn run(
         let manager = gateway_listeners.clone();
         listener_handles.push(tokio::spawn(async move {
             if let Err(e) = manager.run(sh).await {
-                tracing::warn!("Gateway API listener supervisor failed: {e:#}");
+                tracing::warn!(
+                    "Gateway API listener supervisor failed: {}",
+                    crate::modes::file::listener_failure_for_log(&e)
+                );
             }
         }));
     }
@@ -719,11 +724,11 @@ pub async fn run(
             let h3_handle = tokio::spawn(async move {
                 info!(
                     "Starting HTTP/3 (QUIC) proxy listener on {}",
-                    crate::secrets::report_listener_addr(
+                    sanitize_startup_scalar(crate::secrets::report_listener_addr(
                         "FERRUM_PROXY_BIND_ADDRESS",
                         "FERRUM_PROXY_HTTPS_PORT",
-                        &h3_addr.to_string()
-                    )
+                        &h3_addr.to_string(),
+                    ))
                 );
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,
@@ -842,11 +847,11 @@ pub async fn run(
         let admin_http_handle = tokio::spawn(async move {
             info!(
                 "Starting Admin HTTP listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
-                    &admin_http_addr.to_string()
-                )
+                    &admin_http_addr.to_string(),
+                ))
             );
             // The admin listener is one of the DP's own operational inputs (its
             // port comes from env, not CP-pushed config), so a bind failure is
@@ -917,7 +922,9 @@ pub async fn run(
                 candidate
             }
             Err(e) => {
-                error!("Failed to load admin TLS configuration: {:#}", e);
+                error!(
+                    "Failed to load admin TLS configuration: certificate, key, or client trust material could not be loaded"
+                );
                 return Err(e);
             }
         };
@@ -945,11 +952,11 @@ pub async fn run(
         let admin_https_handle = tokio::spawn(async move {
             info!(
                 "Starting Admin HTTPS listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTPS_PORT",
-                    &admin_https_addr.to_string()
-                )
+                    &admin_https_addr.to_string(),
+                ))
             );
             // Bind failure is fatal at startup (start signal); a post-startup
             // serve error flips readiness to not-ready. Same rationale as the
@@ -1001,12 +1008,11 @@ pub async fn run(
     // the DP doesn't control its own config (it comes from CP), so a port
     // conflict shouldn't prevent the DP from starting.
     let failures = proxy_state.stream_listener_manager.reconcile().await;
-    for (proxy_id, port, err) in &failures {
+    for (proxy_id, port, _error) in &failures {
         error!(
-            proxy_id = %proxy_id,
-            port = port,
-            "Stream listener failed to bind at startup (non-fatal in DP mode): {}",
-            err
+            proxy_id = %sanitize_startup_scalar(proxy_id),
+            port = %sanitize_startup_scalar(port),
+            "Stream listener failed to bind at startup (non-fatal in DP mode): socket bind failed"
         );
     }
     wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
@@ -1176,10 +1182,10 @@ fn start_config_staleness_monitor(
                 // counters only.
                 tracing::warn!(
                     reason = snapshot.reason,
-                    stale_action = snapshot.stale_action,
+                    stale_action = %sanitize_startup_scalar(snapshot.stale_action),
                     new_traffic_blocked = snapshot.new_traffic_blocked,
                     snapshot_age_seconds = snapshot.snapshot_age_seconds,
-                    max_stale_seconds = snapshot.max_stale_seconds,
+                    max_stale_seconds = %sanitize_startup_scalar(snapshot.max_stale_seconds),
                     "DP configuration is stale beyond the configured bound with no \
                      authoritative control plane; readiness is degraded"
                 );
@@ -1232,6 +1238,38 @@ fn http3_startup_tls_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_monitor_withholds_configured_bound_and_action() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_, logs) = crate::modes::database::tests::capture_logs(|| {
+            runtime.block_on(async {
+                let freshness = Arc::new(crate::dp_config_freshness::DpConfigFreshness::new_at(
+                    std::time::Instant::now() - Duration::from_secs(43211),
+                    Duration::from_secs(43210),
+                    crate::dp_config_freshness::StaleAction::FailClosed,
+                ));
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let monitor = start_config_staleness_monitor(freshness.clone(), shutdown_rx);
+                tokio::task::yield_now().await;
+                shutdown_tx.send(true).unwrap();
+                monitor.await.unwrap();
+                let snapshot = freshness.evaluate();
+                assert!(snapshot.stale);
+                assert!(snapshot.new_traffic_blocked);
+            });
+        });
+
+        assert!(logs.contains("DP configuration is stale"), "{logs}");
+        assert!(logs.contains("new_traffic_blocked=true"), "{logs}");
+        assert!(logs.contains("max_stale_seconds="), "{logs}");
+        assert!(logs.contains("stale_action="), "{logs}");
+        assert!(!logs.contains("43210"), "{logs}");
+        assert!(!logs.contains("fail_closed"), "{logs}");
+    }
 
     #[test]
     fn dp_proxy_frontend_tls_slot_is_empty_without_operator_tls() {

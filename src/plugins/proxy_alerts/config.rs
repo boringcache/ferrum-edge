@@ -293,7 +293,7 @@ impl ProxyAlertsConfig {
 
         let channels_value = config
             .get("channels")
-            .ok_or_else(|| "proxy_alerts: 'channels' is required".to_string())?;
+            .ok_or_else(|| "proxy_alerts: `channels` is required".to_string())?;
         let channels = parse_channels(channels_value).map_err(|e| format!("proxy_alerts: {e}"))?;
 
         // Assign deterministic channel ids in alphabetical order so test
@@ -351,7 +351,7 @@ impl ProxyAlertsConfig {
             let name = rule.common().name.to_string();
             if !seen_rule_names.insert(name.clone()) {
                 return Err(format!(
-                    "proxy_alerts: duplicate rule name '{name}' (rule names must be unique)"
+                    "proxy_alerts: duplicate rule name {name:?} (rule names must be unique)"
                 ));
             }
             rules.push(rule);
@@ -417,11 +417,11 @@ fn parse_rule(
     let kind = match obj.get("type") {
         Some(v) => v
             .as_str()
-            .ok_or_else(|| format!("proxy_alerts: rule '{name}': 'type' must be a string"))?,
+            .ok_or_else(|| format!("proxy_alerts: rule {name:?}: `type` must be a string"))?,
         None => {
             return Err(missing_required_key_error(
                 obj,
-                &format!("proxy_alerts: rule '{name}'"),
+                &format!("proxy_alerts: rule {name:?}"),
                 "type",
             ));
         }
@@ -470,7 +470,7 @@ fn parse_rule(
             parse_grpc_status_rate(common, raw, defaults).map(Rule::GrpcStatusRate)
         }
         other => Err(format!(
-            "proxy_alerts: rule '{name}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause, grpc_status_count, grpc_status_rate)"
+            "proxy_alerts: rule {name:?}: unknown type {other:?} (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause, grpc_status_count, grpc_status_rate)"
         )),
     }
 }
@@ -507,9 +507,9 @@ fn missing_required_key_error(
 ) -> String {
     match near_miss_for_missing_key(object, required) {
         Some(typo) => format!(
-            "{context}: '{required}' is required (did you mean '{required}' instead of '{typo}'?)"
+            "{context}: `{required}` is required (did you mean `{required}` instead of {typo:?}?)"
         ),
-        None => format!("{context}: '{required}' is required"),
+        None => format!("{context}: `{required}` is required"),
     }
 }
 
@@ -524,13 +524,13 @@ fn parse_error_rate(
         .and_then(Value::as_f64)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'threshold_percent' is required",
+                "proxy_alerts: rule {:?}: `threshold_percent` is required",
                 common.name
             )
         })?;
     if !(0.0 < threshold_percent && threshold_percent <= 100.0) {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'threshold_percent' must be in (0.0, 100.0] (got {threshold_percent})",
+            "proxy_alerts: rule {:?}: `threshold_percent` must be in (0.0, 100.0] (got \"{threshold_percent}\")",
             common.name
         ));
     }
@@ -563,7 +563,7 @@ fn parse_latency_percentile(
         .and_then(Value::as_str)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'metric' is required (one of: backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms)",
+                "proxy_alerts: rule {:?}: `metric` is required (one of: backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms)",
                 common.name
             )
         })?;
@@ -574,7 +574,7 @@ fn parse_latency_percentile(
         "stream_duration_ms" => LatencyMetric::StreamDurationMs,
         other => {
             return Err(format!(
-                "proxy_alerts: rule '{}': unknown 'metric' '{other}' (expected one of: backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms)",
+                "proxy_alerts: rule {:?}: unknown `metric` {other:?} (expected one of: backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms)",
                 common.name
             ));
         }
@@ -584,13 +584,13 @@ fn parse_latency_percentile(
         .and_then(Value::as_u64)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'percentile' is required",
+                "proxy_alerts: rule {:?}: `percentile` is required",
                 common.name
             )
         })?;
     if !(1..=99).contains(&percentile) {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'percentile' must be in [1, 99] (got {percentile})",
+            "proxy_alerts: rule {:?}: `percentile` must be in [1, 99] (got \"{percentile}\")",
             common.name
         ));
     }
@@ -599,19 +599,19 @@ fn parse_latency_percentile(
         .and_then(Value::as_f64)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'threshold_ms' is required",
+                "proxy_alerts: rule {:?}: `threshold_ms` is required",
                 common.name
             )
         })?;
     if threshold_ms <= 0.0 {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'threshold_ms' must be > 0 (got {threshold_ms})",
+            "proxy_alerts: rule {:?}: `threshold_ms` must be > 0 (got \"{threshold_ms}\")",
             common.name
         ));
     }
     if threshold_ms > MAX_FINITE_LATENCY_BOUND_MS as f64 {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'threshold_ms' must be <= {} (largest finite histogram bucket; got {threshold_ms})",
+            "proxy_alerts: rule {:?}: `threshold_ms` must be <= {} (largest finite histogram bucket; got \"{threshold_ms}\")",
             common.name, MAX_FINITE_LATENCY_BOUND_MS
         ));
     }
@@ -630,13 +630,13 @@ fn read_min_request_count(raw: &Value, rule_name: &str, default: u64) -> Result<
         None => default,
         Some(v) => v.as_u64().ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{rule_name}': 'min_request_count' must be an unsigned integer"
+                "proxy_alerts: rule {rule_name:?}: `min_request_count` must be an unsigned integer"
             )
         })?,
     };
     if min_request_count == 0 {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'min_request_count' must be > 0"
+            "proxy_alerts: rule {rule_name:?}: `min_request_count` must be > 0"
         ));
     }
     Ok(min_request_count)
@@ -648,13 +648,13 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'classes' is required (array of error_class names)",
+                "proxy_alerts: rule {:?}: 'classes' is required (array of error_class names)",
                 common.name
             )
         })?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'classes' must contain at least one entry",
+            "proxy_alerts: rule {:?}: 'classes' must contain at least one entry",
             common.name
         ));
     }
@@ -662,7 +662,7 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'classes' entries must be strings",
+                "proxy_alerts: rule {:?}: 'classes' entries must be strings",
                 common.name
             )
         })?;
@@ -671,7 +671,7 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
         let class = serde_json::from_value::<ErrorClass>(Value::String(name.to_string())).map_err(
             |_| {
                 format!(
-                    "proxy_alerts: rule '{}': unknown error class '{name}'",
+                    "proxy_alerts: rule {:?}: unknown error class {name:?}",
                     common.name
                 )
             },
@@ -694,13 +694,13 @@ fn parse_stream_disconnect_cause(
 ) -> Result<StreamDisconnectCauseRule, String> {
     let arr = raw.get("causes").and_then(Value::as_array).ok_or_else(|| {
         format!(
-            "proxy_alerts: rule '{}': 'causes' is required (array of disconnect_cause names)",
+            "proxy_alerts: rule {:?}: 'causes' is required (array of disconnect_cause names)",
             common.name
         )
     })?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'causes' must contain at least one entry",
+            "proxy_alerts: rule {:?}: 'causes' must contain at least one entry",
             common.name
         ));
     }
@@ -708,13 +708,13 @@ fn parse_stream_disconnect_cause(
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'causes' entries must be strings",
+                "proxy_alerts: rule {:?}: 'causes' entries must be strings",
                 common.name
             )
         })?;
         let cause = disconnect_cause_from_str(name).ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': unknown disconnect cause '{name}'",
+                "proxy_alerts: rule {:?}: unknown disconnect cause {name:?}",
                 common.name
             )
         })?;
@@ -751,13 +751,13 @@ fn parse_grpc_status_rate(
         .and_then(Value::as_f64)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{}': 'threshold_percent' is required",
+                "proxy_alerts: rule {:?}: `threshold_percent` is required",
                 common.name
             )
         })?;
     if !(0.0 < threshold_percent && threshold_percent <= 100.0) {
         return Err(format!(
-            "proxy_alerts: rule '{}': 'threshold_percent' must be in (0.0, 100.0] (got {threshold_percent})",
+            "proxy_alerts: rule {:?}: `threshold_percent` must be in (0.0, 100.0] (got \"{threshold_percent}\")",
             common.name
         ));
     }
@@ -776,12 +776,12 @@ fn read_grpc_statuses(raw: &Value, rule_name: &str) -> Result<Vec<GrpcStatusMatc
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{rule_name}': 'grpc_statuses' is required (array of 0..=16 integers or \"OTHER\")"
+                "proxy_alerts: rule {rule_name:?}: `grpc_statuses` is required (array of 0..=16 integers or \"OTHER\")"
             )
         })?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'grpc_statuses' must contain at least one entry"
+            "proxy_alerts: rule {rule_name:?}: `grpc_statuses` must contain at least one entry"
         ));
     }
     let mut out = Vec::with_capacity(arr.len());
@@ -790,25 +790,25 @@ fn read_grpc_statuses(raw: &Value, rule_name: &str) -> Result<Vec<GrpcStatusMatc
             Value::String(s) if s == "OTHER" => GrpcStatusMatch::Other,
             Value::String(s) => {
                 return Err(format!(
-                    "proxy_alerts: rule '{rule_name}': unknown 'grpc_statuses' entry '{s}' (expected 0..=16 or \"OTHER\")"
+                    "proxy_alerts: rule {rule_name:?}: unknown `grpc_statuses` entry {s:?} (expected 0..=16 or \"OTHER\")"
                 ));
             }
             Value::Number(n) => {
                 let Some(v) = n.as_u64() else {
                     return Err(format!(
-                        "proxy_alerts: rule '{rule_name}': 'grpc_statuses' entries must be unsigned integers 0..=16 or \"OTHER\""
+                        "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entries must be unsigned integers 0..=16 or \"OTHER\""
                     ));
                 };
                 if v > 16 {
                     return Err(format!(
-                        "proxy_alerts: rule '{rule_name}': 'grpc_statuses' entry {v} is not in [0, 16] (use \"OTHER\" for out-of-range codes)"
+                        "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entry \"{v}\" is not in [0, 16] (use \"OTHER\" for out-of-range codes)"
                     ));
                 }
                 GrpcStatusMatch::Code(v as u8)
             }
             _ => {
                 return Err(format!(
-                    "proxy_alerts: rule '{rule_name}': 'grpc_statuses' entries must be unsigned integers 0..=16 or \"OTHER\""
+                    "proxy_alerts: rule {rule_name:?}: `grpc_statuses` entries must be unsigned integers 0..=16 or \"OTHER\""
                 ));
             }
         };
@@ -823,22 +823,22 @@ fn read_status_codes(raw: &Value, rule_name: &str) -> Result<Vec<u16>, String> {
     let arr = raw
         .get("status_codes")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'status_codes' is required"))?;
+        .ok_or_else(|| format!("proxy_alerts: rule {rule_name:?}: `status_codes` is required"))?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'status_codes' must contain at least one entry"
+            "proxy_alerts: rule {rule_name:?}: `status_codes` must contain at least one entry"
         ));
     }
     let mut out = Vec::with_capacity(arr.len());
     for code in arr {
         let v = code.as_u64().ok_or_else(|| {
             format!(
-                "proxy_alerts: rule '{rule_name}': 'status_codes' entries must be unsigned integers"
+                "proxy_alerts: rule {rule_name:?}: `status_codes` entries must be unsigned integers"
             )
         })?;
         if !(100..=599).contains(&v) {
             return Err(format!(
-                "proxy_alerts: rule '{rule_name}': 'status_codes' entry {v} is not in [100, 599]"
+                "proxy_alerts: rule {rule_name:?}: `status_codes` entry \"{v}\" is not in [100, 599]"
             ));
         }
         let v16 = v as u16;
@@ -854,11 +854,11 @@ fn read_threshold_count(raw: &Value, rule_name: &str) -> Result<u64, String> {
         .get("threshold_count")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            format!("proxy_alerts: rule '{rule_name}': 'threshold_count' is required")
+            format!("proxy_alerts: rule {rule_name:?}: `threshold_count` is required")
         })?;
     if v == 0 {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'threshold_count' must be > 0"
+            "proxy_alerts: rule {rule_name:?}: `threshold_count` must be > 0"
         ));
     }
     Ok(v)
@@ -868,7 +868,8 @@ fn read_window_seconds(raw: &Value, rule_name: &str, default: u32) -> Result<u32
     let v = read_rule_u32(raw, "window_seconds", rule_name)?.unwrap_or(default);
     if !(MIN_WINDOW_SECONDS..=MAX_WINDOW_SECONDS).contains(&v) {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'window_seconds' must be in [{MIN_WINDOW_SECONDS}, {MAX_WINDOW_SECONDS}] (got {v})"
+            "proxy_alerts: rule {rule_name:?}: `window_seconds` must be in [{MIN_WINDOW_SECONDS}, {MAX_WINDOW_SECONDS}] (got {v:?})",
+            v = v.to_string()
         ));
     }
     Ok(v)
@@ -878,7 +879,8 @@ fn read_cooldown_ms(raw: &Value, rule_name: &str, default: u32) -> Result<u64, S
     let v = read_rule_u32(raw, "cooldown_seconds", rule_name)?.unwrap_or(default);
     if !(MIN_COOLDOWN_SECONDS..=MAX_COOLDOWN_SECONDS).contains(&v) {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'cooldown_seconds' must be in [{MIN_COOLDOWN_SECONDS}, {MAX_COOLDOWN_SECONDS}] (got {v})"
+            "proxy_alerts: rule {rule_name:?}: `cooldown_seconds` must be in [{MIN_COOLDOWN_SECONDS}, {MAX_COOLDOWN_SECONDS}] (got {v:?})",
+            v = v.to_string()
         ));
     }
     Ok(u64::from(v) * 1000)
@@ -898,7 +900,7 @@ fn read_recovery(
     }
     let rec_obj = rec
         .as_object()
-        .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'recovery' must be an object"))?;
+        .ok_or_else(|| format!("proxy_alerts: rule {rule_name:?}: `recovery` must be an object"))?;
     reject_unknown_keys(
         rec_obj,
         &format!("rules[{rule_id}].recovery"),
@@ -912,7 +914,7 @@ fn read_recovery(
         .contains(&resolved_window_seconds)
     {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'recovery.resolved_window_seconds' must be in [{MIN_RESOLVED_WINDOW_SECONDS}, {MAX_RESOLVED_WINDOW_SECONDS}] (got {resolved_window_seconds})"
+            "proxy_alerts: rule {rule_name:?}: `recovery.resolved_window_seconds` must be in [{MIN_RESOLVED_WINDOW_SECONDS}, {MAX_RESOLVED_WINDOW_SECONDS}] (got \"{resolved_window_seconds}\")"
         ));
     }
     Ok(Some(RecoveryConfig {
@@ -925,11 +927,11 @@ fn read_rule_u32(raw: &Value, key: &str, rule_name: &str) -> Result<Option<u32>,
         return Ok(None);
     };
     let n = v.as_u64().ok_or_else(|| {
-        format!("proxy_alerts: rule '{rule_name}': '{key}' must be an unsigned integer")
+        format!("proxy_alerts: rule {rule_name:?}: `{key}` must be an unsigned integer")
     })?;
     u32::try_from(n)
         .map(Some)
-        .map_err(|_| format!("proxy_alerts: rule '{rule_name}': '{key}' is too large for u32"))
+        .map_err(|_| format!("proxy_alerts: rule {rule_name:?}: `{key}` is too large for u32"))
 }
 
 fn read_object_u32(
@@ -943,11 +945,11 @@ fn read_object_u32(
     };
     let n = v.as_u64().ok_or_else(|| {
         format!(
-            "proxy_alerts: rule '{rule_name}': '{object_name}.{key}' must be an unsigned integer"
+            "proxy_alerts: rule {rule_name:?}: `{object_name}.{key}` must be an unsigned integer"
         )
     })?;
     u32::try_from(n).map(Some).map_err(|_| {
-        format!("proxy_alerts: rule '{rule_name}': '{object_name}.{key}' is too large for u32")
+        format!("proxy_alerts: rule {rule_name:?}: `{object_name}.{key}` is too large for u32")
     })
 }
 
@@ -957,7 +959,7 @@ fn read_severity(raw: &Value, rule_name: &str) -> Result<Severity, String> {
     };
     let s = v
         .as_str()
-        .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'severity' must be a string"))?;
+        .ok_or_else(|| format!("proxy_alerts: rule {rule_name:?}: `severity` must be a string"))?;
     match s {
         "info" => Ok(Severity::Info),
         "low" => Ok(Severity::Low),
@@ -965,7 +967,7 @@ fn read_severity(raw: &Value, rule_name: &str) -> Result<Severity, String> {
         "high" => Ok(Severity::High),
         "critical" => Ok(Severity::Critical),
         other => Err(format!(
-            "proxy_alerts: rule '{rule_name}': unknown severity '{other}' (expected one of: info, low, medium, high, critical)"
+            "proxy_alerts: rule {rule_name:?}: unknown severity {other:?} (expected one of: info, low, medium, high, critical)"
         )),
     }
 }
@@ -979,26 +981,26 @@ fn read_channels(
     let arr = raw
         .get("channels")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'channels' is required"))?;
+        .ok_or_else(|| format!("proxy_alerts: rule {rule_name:?}: `channels` is required"))?;
     if arr.is_empty() {
         return Err(format!(
-            "proxy_alerts: rule '{rule_name}': 'channels' must contain at least one channel name"
+            "proxy_alerts: rule {rule_name:?}: `channels` must contain at least one channel name"
         ));
     }
     let mut ids = Vec::with_capacity(arr.len());
     let mut names: Vec<Arc<str>> = Vec::with_capacity(arr.len());
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
-            format!("proxy_alerts: rule '{rule_name}': 'channels' entries must be strings")
+            format!("proxy_alerts: rule {rule_name:?}: `channels` entries must be strings")
         })?;
         let id = channel_id_by_name.get(name).ok_or_else(|| {
-            format!("proxy_alerts: rule '{rule_name}': references unknown channel '{name}'")
+            format!("proxy_alerts: rule {rule_name:?}: references unknown channel {name:?}")
         })?;
         // Defensive: ensure the channel actually parsed (e.g., not missing
         // from the resolved table).
         if !channels.contains_key(name) {
             return Err(format!(
-                "proxy_alerts: rule '{rule_name}': channel '{name}' is registered but not in the channels table"
+                "proxy_alerts: rule {rule_name:?}: channel {name:?} is registered but not in the channels table"
             ));
         }
         if !ids.contains(id) {
@@ -1072,21 +1074,21 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
 fn parse_hh_mm(s: &str) -> Result<u32, String> {
     let (h, m) = s
         .split_once(':')
-        .ok_or_else(|| format!("expected HH:MM, got '{s}'"))?;
+        .ok_or_else(|| format!("expected HH:MM, got {s:?}"))?;
     if h.len() != 2
         || m.len() != 2
         || !h.bytes().all(|b| b.is_ascii_digit())
         || !m.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err(format!("expected HH:MM, got '{s}'"));
+        return Err(format!("expected HH:MM, got {s:?}"));
     }
-    let hour: u32 = h.parse().map_err(|_| format!("invalid hour in '{s}'"))?;
-    let minute: u32 = m.parse().map_err(|_| format!("invalid minute in '{s}'"))?;
+    let hour: u32 = h.parse().map_err(|_| format!("invalid hour in {s:?}"))?;
+    let minute: u32 = m.parse().map_err(|_| format!("invalid minute in {s:?}"))?;
     if hour > 23 {
-        return Err(format!("hour {hour} out of range 0..=23 in '{s}'"));
+        return Err(format!("hour \"{hour}\" out of range 0..=23 in {s:?}"));
     }
     if minute > 59 {
-        return Err(format!("minute {minute} out of range 0..=59 in '{s}'"));
+        return Err(format!("minute \"{minute}\" out of range 0..=59 in {s:?}"));
     }
     Ok(hour * 60 + minute)
 }
@@ -1096,8 +1098,8 @@ fn read_u32_default(config: &Value, key: &str, default: u32) -> Result<u32, Stri
         Some(v) => {
             let n = v
                 .as_u64()
-                .ok_or_else(|| format!("proxy_alerts: '{key}' must be an unsigned integer"))?;
-            u32::try_from(n).map_err(|_| format!("proxy_alerts: '{key}' is too large for u32"))
+                .ok_or_else(|| format!("proxy_alerts: `{key}` must be an unsigned integer"))?;
+            u32::try_from(n).map_err(|_| format!("proxy_alerts: `{key}` is too large for u32"))
         }
         None => Ok(default),
     }
@@ -1111,7 +1113,8 @@ fn validate_top_level_u32_range(
 ) -> Result<(), String> {
     if !(minimum..=maximum).contains(&value) {
         return Err(format!(
-            "proxy_alerts: '{key}' must be in [{minimum}, {maximum}] (got {value})"
+            "proxy_alerts: `{key}` must be in [{minimum}, {maximum}] (got {value:?})",
+            value = value.to_string()
         ));
     }
     Ok(())
@@ -1121,7 +1124,7 @@ fn read_u64_default(config: &Value, key: &str, default: u64) -> Result<u64, Stri
     match config.get(key) {
         Some(v) => v
             .as_u64()
-            .ok_or_else(|| format!("proxy_alerts: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("proxy_alerts: `{key}` must be an unsigned integer")),
         None => Ok(default),
     }
 }
@@ -1132,7 +1135,7 @@ fn read_optional_bool(config: &Value, key: &str, context: &str) -> Result<Option
         Some(v) => v
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("{context}: '{key}' must be a boolean")),
+            .ok_or_else(|| format!("{context}: `{key}` must be a boolean")),
     }
 }
 

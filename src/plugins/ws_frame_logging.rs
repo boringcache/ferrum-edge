@@ -283,7 +283,7 @@ impl WsFrameLogging {
                 Some("warn") => LogLevel::Warn,
                 Some(other) => {
                     return Err(format!(
-                        "ws_frame_logging: invalid 'log_level' value '{other}' \
+                        "ws_frame_logging: invalid `log_level` value {other:?} \
                          (expected 'trace', 'debug', 'info', or 'warn')"
                     ));
                 }
@@ -326,7 +326,7 @@ impl WsFrameLogging {
                 })?;
                 if raw > MAX_PAYLOAD_PREVIEW_BYTES {
                     return Err(format!(
-                        "ws_frame_logging: 'payload_preview_bytes' must be <= {MAX_PAYLOAD_PREVIEW_BYTES} (got {raw})"
+                        "ws_frame_logging: `payload_preview_bytes` must be <= {MAX_PAYLOAD_PREVIEW_BYTES} (got \"{raw}\")"
                     ));
                 }
                 raw as usize
