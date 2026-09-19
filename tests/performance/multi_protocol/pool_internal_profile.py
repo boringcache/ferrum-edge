@@ -251,6 +251,90 @@ def retain_runtime(destination, container, config_path):
         raise ValueError("pool runtime verification failed; evidence retained")
 
 
+def _nonnegative_finite_number(value):
+    # Reject booleans and oversized JSON integers without float-conversion overflow.
+    return type(value) in (int, float) and 0 <= value <= sys.float_info.max
+
+
+def h2_traffic_issues(sample, gateway):
+    """Require the pool campaign's H2 evidence, including on its control arms.
+
+    Keep historical sample_issues contracts unchanged. PhaseReport serializes
+    explicit transport status even when diagnostic annotation fails; inspect it
+    before the annotation so an empty/missing object cannot hide those failures.
+    """
+    issues = []
+    phases = sample.get("phases")
+    if not isinstance(phases, dict):
+        issues.append("missing/malformed H2 phase record")
+        phases = {}
+    for field in ("transport_errors_total", "transport_events_suppressed"):
+        value = phases.get(field)
+        if type(value) is not int or value < 0:
+            issues.append("missing/malformed H2 phase field: " + field)
+        elif value:
+            issues.append("H2 phase failure: " + field)
+    for field in ("transport_close_timed_out", "timed_out"):
+        value = phases.get(field)
+        if type(value) is not bool:
+            issues.append("missing/malformed H2 phase field: " + field)
+        elif value:
+            issues.append("H2 phase failure: " + field)
+
+    observation = sample.get("h2_observation")
+    if not isinstance(observation, dict):
+        issues.append("missing/malformed H2 diagnostic record")
+        return issues
+    errors = observation.get("capture_errors")
+    if not isinstance(errors, list) or any(not isinstance(error, str) for error in errors):
+        issues.append("missing/malformed H2 capture_errors")
+    elif errors:
+        issues.append("H2 diagnostic capture errors")
+    errors = observation.get("backend_errors_observed")
+    if type(errors) is not int or errors < 0:
+        issues.append("missing/malformed H2 backend_errors_observed")
+    elif errors:
+        issues.append("H2 backend errors observed")
+    # annotate() emits this marker only when the backend log limit is reached.
+    # Absence is normal; a present null/zero/string is not a boolean status.
+    if "backend_log_limit_reached" in observation:
+        limited = observation["backend_log_limit_reached"]
+        if type(limited) is not bool:
+            issues.append("malformed H2 backend_log_limit_reached")
+        elif limited:
+            issues.append("truncated H2 backend observations")
+
+    # Direct traffic has no gateway scrape (gauges_available=None, samples=[]).
+    # Observer-off calibration still has the ordinary gateway H2 gauges.
+    if gateway == "direct":
+        return issues
+    if observation.get("gauges_available") is not True:
+        issues.append("missing H2 pool/connection observations")
+    start, duration = phases.get("measurement_start_unix_secs"), phases.get("measurement_secs")
+    window_valid = (_nonnegative_finite_number(start) and _nonnegative_finite_number(duration)
+                    and duration > 0 and _nonnegative_finite_number(start + duration))
+    if not window_valid:
+        issues.append("missing/malformed H2 gauge measurement window")
+    rows = observation.get("gauge_samples")
+    if not isinstance(rows, list) or not rows:
+        issues.append("missing/malformed H2 gauge_samples")
+        return issues
+    required = {"resident_http2_pool_entries", "resident_grpc_pool_entries", "active_connections"}
+    for index, row in enumerate(rows):
+        if (not isinstance(row, dict) or "error" in row or
+                any(not _nonnegative_finite_number(row.get(field))
+                    for field in ("unix_secs", "monotonic_secs", "capture_secs"))):
+            issues.append(f"missing/malformed H2 gauge sample: {index}")
+            continue
+        if window_valid and not start <= row["unix_secs"] < start + duration:
+            issues.append(f"H2 gauge sample outside measurement: {index}")
+        gauges = row.get("gauges")
+        if (not isinstance(gauges, dict) or not required <= gauges.keys() or
+                any(not _nonnegative_finite_number(value) for value in gauges.values())):
+            issues.append(f"missing/malformed H2 gauge values: {index}")
+    return issues
+
+
 def report(directory, mode, protocol):
     if mode not in MANIFEST["campaigns"] or protocol not in MANIFEST["protocols"]:
         raise ValueError("unknown pool campaign")
@@ -307,15 +391,15 @@ def report(directory, mode, protocol):
                     sample = {"error": "missing or malformed sample"}
                 try:
                     traffic_issues = sample_issues(sample)
-                except (ValueError, KeyError, TypeError, AttributeError):
+                except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
                     traffic_issues = ["malformed sample fields"]
+                traffic_issues.extend(h2_traffic_issues(sample, gateway))
                 expected_workers = 50 if size >= 5242880 else 100 if size >= 1048576 else 200
                 if (sample.get("sample_schema") != 2 or sample.get("pair") != pair or
                         sample.get("gateway") != gateway or sample.get("payload_size") != size or
                         sample.get("duration_secs") != 15 or
-                        sample.get("effective_concurrency") != expected_workers or
-                        not isinstance(sample.get("h2_observation"), dict)):
-                    traffic_issues.append("missing/mismatched sample matrix or H2 diagnostic identity")
+                        sample.get("effective_concurrency") != expected_workers):
+                    traffic_issues.append("missing/mismatched sample matrix identity")
                 row = dict(pair=pair, gateway=gateway, payload=size, sample=sample,
                            traffic_issues=traffic_issues)
                 if (sample.get("host_id") != manifest.get("host_id") or
@@ -354,7 +438,7 @@ def report(directory, mode, protocol):
                         if failed:
                             row["profile"]["complete"] = False
                             row["profile"]["issues"].append("failed observations outside/inside bracket")
-                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
                         row["profile"] = dict(complete=False, issues=["missing/malformed capture"])
                     delta = row["profile"].get("published_delta", {})
                     family = "h2" if protocol == "http2" else "grpc"

@@ -112,9 +112,28 @@ overflow and unpublished tails reject completeness. Boundary acquisitions still
 in flight also reject completeness: an exact closed cohort is not claimed.
 Partial published deltas remain useful diagnostics, with their limitations.
 
-Traffic validity is assessed independently using the parent's strict useful-work
-validator and H2 diagnostics. Reports enumerate every expected arm/pair/size,
-including absent or malformed samples, and retain raw capture failures. They
+Traffic validity is assessed independently using the parent's useful-work
+validator plus pool-specific H2 evidence validation. Every arm, including direct
+and observer-off controls, requires explicit integer transport-error and
+suppressed-event counts, boolean phase/transport-close timeout status, a capture
+error list and an integer backend-error count. Missing, null or incorrectly typed
+required fields fail closed; nonzero errors/suppression, timeouts and capture
+errors reject traffic even when `h2_observation` is empty or absent. The existing
+producer emits `backend_log_limit_reached` only when the limit is reached: absence
+is normal, while a present value must be boolean and true rejects the sample.
+
+Non-direct arms also require `gauges_available=true` and a nonempty list of usable
+gateway gauge snapshots inside the measurement window. Each snapshot requires
+finite nonnegative wall/monotonic timestamps and capture duration, both resident
+H2/gRPC pool-entry gauges, and the active-connection gauge. Gauge values must be
+finite nonnegative numbers, never booleans or substituted configured pool widths.
+Direct controls have no gateway scrape (`gauges_available=null`, `gauge_samples=[]`);
+observer-off controls still require these ordinary H2 gauges, but no pool profile.
+The shared historical validator and H1 evidence contracts are unchanged.
+
+Reports enumerate every expected arm/pair/size, including absent or malformed
+samples, and retain raw capture failures and specific traffic rejection reasons.
+The report command exits nonzero when any traffic row fails. Reports
 verify same revision/config/environment, and same image for profile repetitions.
 `fully_measured_comparison_eligible` stays false pending root's external correctness
 disposition. No failed repetition is silently removed from a favorable average.
@@ -130,6 +149,11 @@ build, bounded publication tests, migrated/nested poll allocation and cancellati
 tests, real generic-pool coalescing/error tests, a live H2/gRPC purpose/hit/miss
 test, existing key/lifecycle contracts with observers on/off, and collector tests.
 These are **unexecuted registrations**, not passing-check claims.
+The existing hosted collector-test discovery also covers the actual report and
+CLI exit status with producer-generated H2 annotations: complete H2/gRPC matrices
+in both modes, direct/observer-off controls, absent/empty/malformed diagnostics,
+unusable gauges, typed error/suppression status and independent phase failures.
+Negative cases require the full matrix and unchanged failed samples to be retained.
 
 Root alone may dispatch `pool-internal-profile.yml` at the reviewed branch. The
 worker neither dispatches nor waits for CI. The manual matrix is explicit:
