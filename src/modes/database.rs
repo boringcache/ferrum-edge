@@ -3599,6 +3599,7 @@ pub(super) mod tests {
     // A scoped subscriber and a file writer also capture current-thread Tokio
     // tasks without installing a process-global subscriber or environment.
     pub(crate) fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let output = tempfile::NamedTempFile::new().unwrap();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -3609,6 +3610,8 @@ pub(super) mod tests {
         let result = tracing::subscriber::with_default(subscriber, run);
         (result, std::fs::read_to_string(output.path()).unwrap())
     }
+
+    crate::diagnostic_test_interest::capture_regression!(capture_logs, tracing::Level::TRACE);
 
     #[test]
     fn dns_recovery_emissions_withhold_every_endpoint_and_provider_payload() {

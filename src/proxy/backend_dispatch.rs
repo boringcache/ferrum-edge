@@ -1787,6 +1787,7 @@ mod tests {
     where
         F: FnOnce() -> R,
     {
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let writer = SharedLogWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1800,6 +1801,12 @@ mod tests {
             .expect("dispatch log must be utf-8");
         (result, log)
     }
+
+    crate::diagnostic_test_interest::capture_regression!(
+        capture_dispatch_warns,
+        tracing::Level::WARN,
+        excluded = tracing::Level::DEBUG
+    );
 
     fn target(host: &str) -> Arc<UpstreamTarget> {
         Arc::new(UpstreamTarget {
