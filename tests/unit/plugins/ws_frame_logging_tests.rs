@@ -1110,8 +1110,7 @@ async fn default_empty_config_warns_when_default_gateway_filter_hides_records() 
 fn explicit_filtered_level_is_withheld_in_constructor_warning() {
     let capture = WsLogCapture::default();
     let _guard = install_filtered_ws_log_capture("warn", &capture);
-    let plugin =
-        WsFrameLogging::new(&json!({"log_level": "debug"})).expect("valid explicit level");
+    let plugin = WsFrameLogging::new(&json!({"log_level": "debug"})).expect("valid explicit level");
     assert_eq!(plugin.configured_log_level(), "debug");
     assert!(plugin.requires_ws_frame_hooks());
 

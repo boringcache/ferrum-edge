@@ -85,7 +85,10 @@ async fn test_tcp_logging_tls_rejects_invalid_ca_bundle_at_construction() {
         "{error}"
     );
     assert!(error.contains("certificate record #1"), "{error}");
-    assert!(error.contains("malformed PEM certificate record"), "{error}");
+    assert!(
+        error.contains("malformed PEM certificate record"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

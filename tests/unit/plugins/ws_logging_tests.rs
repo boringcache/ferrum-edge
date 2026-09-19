@@ -305,7 +305,10 @@ async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
         "{error}"
     );
     assert!(error.contains("certificate record #1"), "{error}");
-    assert!(error.contains("malformed PEM certificate record"), "{error}");
+    assert!(
+        error.contains("malformed PEM certificate record"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
