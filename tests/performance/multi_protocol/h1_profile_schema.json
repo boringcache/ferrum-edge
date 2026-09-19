@@ -217,5 +217,60 @@
     "lost_events",
     "slot_capacity",
     "allocator_installed"
-  ]
+  ],
+  "external_trace_schema": {
+    "version": 1,
+    "manifest": "trace-manifest.json",
+    "dimensions": [
+      "syscall_totals",
+      "socket_roles",
+      "lifecycle",
+      "cpu_samples",
+      "unwind"
+    ],
+    "independent_validity": [
+      "useful_work",
+      "capture",
+      "profile"
+    ],
+    "required_evidence": [
+      "typed_selection_and_flags",
+      "runtime_pid_generation_and_container_cgroup",
+      "admission_binding_runtime_config_hashes",
+      "client_sample_raw_sample_exit_hashes",
+      "typed_ready_and_requested_bound_termination",
+      "clock_receipts_and_measurement_boundaries",
+      "source_object_tool_hashes",
+      "matching_release_elf",
+      "mandatory_mode_artifact_hashes",
+      "syscall_losses_reset_and_raw_record_revalidation_or_cpu_decoder_attribute_reconciliation"
+    ],
+    "unknown_is_zero": false,
+    "allocation_copy_completeness_unproven": true,
+    "report_validation": {
+      "producer_claim": "retained verbatim including failure claims",
+      "validation_complete": "true only after observation binding and retained evidence validation",
+      "capture_complete": "producer success AND consumer validation; never inferred from filename",
+      "complete": false,
+      "live_logs_unhashed": [
+        "supervisor.stdout",
+        "supervisor.stderr"
+      ]
+    },
+    "mandatory_common_artifacts": [
+      "bind.json",
+      "identity.json",
+      "ready.json",
+      "teardown-request.json",
+      "teardown-ready.json",
+      "capabilities.json",
+      "build-mappings.json",
+      "initial-sockets.json"
+    ],
+    "input_hashes": [
+      "binding",
+      "runtime",
+      "config"
+    ]
+  }
 }

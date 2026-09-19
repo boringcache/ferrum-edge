@@ -25,6 +25,11 @@ on:
         type: choice
         default: all
         options: [all, '10240', '71680', '512000', '1048576', '5242880']
+      trace_mode:
+        description: Separate intrusive trace campaign (requires diagnostic_only=false and one payload shard)
+        type: choice
+        default: none
+        options: [none, syscalls, cpu]
       diagnostic_only:
         description: Stop after the single-pass 5 MiB H1 drain diagnostic
         type: boolean
@@ -151,10 +156,66 @@ jobs:
           path: h1-cadence-evidence/
           retention-days: 14
 
+  trace-fixtures:
+    name: H1 syscall and CPU capability fixtures (hosted only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Install Ubuntu observer and software sampling tools
+        run: |
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev libelf-dev \
+            zlib1g-dev gcc libc6-dev binutils util-linux linux-tools-generic linux-tools-common python3-yaml
+      - name: Compile and lint shared observer and optimized DWARF fixture
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/h1-trace/build"
+          clang-18 -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wall -Werror \
+            -I/usr/include/x86_64-linux-gnu -c tests/performance/multi_protocol/h3_proof/observer.bpf.c \
+            -o "$RUNNER_TEMP/h1-trace/build/observer.bpf.o"
+          cc -std=gnu11 -O2 -g -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/observer.c \
+            -lbpf -lelf -lz -o "$RUNNER_TEMP/h1-trace/build/observer"
+          cc -std=gnu11 -O2 -g -fomit-frame-pointer -fasynchronous-unwind-tables -Wall -Wextra -Werror \
+            tests/performance/multi_protocol/h1_trace_fixture.c -pthread -o "$RUNNER_TEMP/h1-trace/build/h1_trace_fixture"
+          bash -n tests/performance/multi_protocol/h1_trace_commands.sh
+          bash -n tests/performance/multi_protocol/run_gateway_protocol_bench.sh
+          python3 -m py_compile tests/performance/multi_protocol/h1_trace*.py
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_h1_trace.py'
+      - name: Verify root-owned raw artifact handoff to the ordinary runner
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 -m unittest discover -v -s tests/performance/multi_protocol/tests \
+            -p 'test_h1_trace.py' -k H1ArtifactOwnershipTests
+      - name: Stage owned binaries and run actual fixtures and negative cases
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH \
+            python3 tests/performance/multi_protocol/h1_trace.py stage --build "$RUNNER_TEMP/h1-trace/build"
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
+            python3 tests/performance/multi_protocol/h1_trace.py preflight --output "$RUNNER_TEMP/h1-trace"
+      - name: Prepare fixture artifacts even after producer failure
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/h1-trace" ]; then
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+              python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output "$RUNNER_TEMP/h1-trace"
+          fi
+      - name: Retain failed and unsupported fixture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h1-trace-fixtures-${{ github.sha }}
+          path: ${{ runner.temp }}/h1-trace/
+          retention-days: 14
+
   measurement:
     name: Hosted H1 calibration then cutoff observations
     if: github.event_name == 'workflow_dispatch'
-    needs: [checks, cadence]
+    needs: [checks, cadence, trace-fixtures]
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -164,10 +225,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
+      - name: Validate explicit trace campaign selection
+        env:
+          TRACE_MODE: ${{ inputs.trace_mode }}
+          PAYLOADS: ${{ inputs.payloads }}
+          DIAGNOSTIC_ONLY: ${{ inputs.diagnostic_only }}
+        run: |
+          if [ "$TRACE_MODE" != none ] && [ "$DIAGNOSTIC_ONLY" != true ]; then
+            test "$PAYLOADS" != all
+          fi
       - name: Hosted prerequisites and memory headroom
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-tools-generic linux-tools-common
           sudo fallocate -l 12G /mnt/h1-profile-swap
           sudo chmod 600 /mnt/h1-profile-swap
           sudo mkswap /mnt/h1-profile-swap
@@ -187,9 +257,6 @@ jobs:
           lscpu > h1-profile-evidence/cpu.txt
           free -k > h1-profile-evidence/memory.txt
           cat /proc/sys/kernel/random/boot_id > h1-profile-evidence/boot-id.txt
-          printf '%s\n' 'actual_syscalls=not_collected' 'trace_permission=not_probed' 'trace_loss=unknown' \
-            'sampled_cpu_stacks=not_collected' 'separate_intrusive_diagnostic_pass_required=true' \
-            > h1-profile-evidence/open-trace-obligation.txt
       - name: Build identical-revision symbolized observer twins
         env:
           CARGO_PROFILE_RELEASE_DEBUG: '1'
@@ -210,6 +277,8 @@ jobs:
             cp target/release/ferrum-edge target/release/ferrum-cni bin/amd64/
             sha256sum bin/amd64/* > "$directory/binaries.sha256"
             readelf -n bin/amd64/ferrum-edge > "$directory/build-id.txt"
+            cp bin/amd64/ferrum-edge "$directory/ferrum-edge"
+            readelf -S bin/amd64/ferrum-edge > "$directory/elf-sections.txt"
             objcopy --only-keep-debug bin/amd64/ferrum-edge "$directory/ferrum-edge.debug"
             docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 \
               --label "org.opencontainers.image.revision=$GITHUB_SHA" \
@@ -258,6 +327,51 @@ jobs:
             http1-tls --h1-profile cutoff --gateways ferrum --skip-build \
             --duration 15 --concurrency 200 --pairs 4 --payload-sizes "$sizes" \
             --wallclock-budget-seconds 7200 --output-dir h1-profile-evidence/cutoff
+      - name: Compile and stage the same shared observer for the selected trace lane
+        if: inputs.diagnostic_only != true && inputs.trace_mode != 'none' && steps.diagnostic.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p h1-profile-evidence/trace-build
+          clang-18 -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wall -Werror \
+            -I/usr/include/x86_64-linux-gnu -c tests/performance/multi_protocol/h3_proof/observer.bpf.c \
+            -o h1-profile-evidence/trace-build/observer.bpf.o
+          cc -std=gnu11 -O2 -g -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/observer.c \
+            -lbpf -lelf -lz -o h1-profile-evidence/trace-build/observer
+          cc -std=gnu11 -O2 -g -fomit-frame-pointer -fasynchronous-unwind-tables -Wall -Wextra -Werror \
+            tests/performance/multi_protocol/h1_trace_fixture.c -pthread -o h1-profile-evidence/trace-build/h1_trace_fixture
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH \
+            python3 tests/performance/multi_protocol/h1_trace.py stage --build h1-profile-evidence/trace-build
+      - name: Actual capability and attribution preflight on this measurement VM
+        id: trace_preflight
+        if: inputs.diagnostic_only != true && inputs.trace_mode != 'none' && steps.diagnostic.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p h1-profile-evidence/trace-preflight
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
+            python3 tests/performance/multi_protocol/h1_trace.py preflight --output h1-profile-evidence/trace-preflight
+      - name: Independently calibrate external observer and repeat cutoff comparison
+        id: trace_campaign
+        if: inputs.diagnostic_only != true && inputs.trace_mode != 'none' && steps.diagnostic.outcome == 'success' && steps.trace_preflight.outcome == 'success'
+        continue-on-error: true
+        env:
+          TRACE_MODE: ${{ inputs.trace_mode }}
+          PAYLOAD: ${{ inputs.payloads }}
+        run: |
+          set -euo pipefail
+          status=0
+          for campaign in trace-calibration cutoff; do
+            baseline=()
+            if [ "$campaign" = trace-calibration ]; then baseline=(--baseline-image ferrum-h1:on); fi
+            FERRUM_IMAGE=ferrum-h1:on bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
+              http1-tls --h1-profile "$campaign" --h1-trace "$TRACE_MODE" \
+              --h1-trace-builds "$PWD/h1-profile-evidence/builds" "${baseline[@]}" \
+              --gateways ferrum --skip-build --duration 15 --concurrency 200 --pairs 4 \
+              --payload-sizes "$PAYLOAD" --wallclock-budget-seconds 7200 \
+              --output-dir "h1-profile-evidence/$TRACE_MODE-$campaign" || status=1
+            python3 tests/performance/multi_protocol/h1_internal_profile.py report \
+              "h1-profile-evidence/$TRACE_MODE-$campaign" "$campaign" || status=1
+          done
+          exit "$status"
       - name: Retain every failed observation and profile completeness
         if: always()
         env:
@@ -271,6 +385,19 @@ jobs:
           for campaign in calibration cutoff; do
             python3 tests/performance/multi_protocol/h1_internal_profile.py report \
               "h1-profile-evidence/$campaign" "$campaign" || status=1
+          done
+          exit "$status"
+      - name: Prepare only trace evidence trees after success or failure
+        if: always()
+        run: |
+          status=0
+          for directory in "$PWD/h1-profile-evidence/trace-preflight" \
+            "$PWD"/h1-profile-evidence/{cpu,syscalls}-{trace-calibration,cutoff}/pairs/pair_{001,002,003,004}/traces \
+            "$PWD"/h1-profile-evidence/builds/{off,on}/symfs; do
+            if [ -d "$directory" ]; then
+              sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+                python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output "$directory" || status=1
+            fi
           done
           exit "$status"
       - name: Upload raw evidence, including incomplete campaigns
@@ -287,8 +414,14 @@ jobs:
           DIAGNOSTIC_OUTCOME: ${{ steps.diagnostic.outcome }}
           CALIBRATION_OUTCOME: ${{ steps.calibration.outcome }}
           CUTOFF_OUTCOME: ${{ steps.cutoff.outcome }}
+          TRACE_MODE: ${{ inputs.trace_mode }}
+          TRACE_PREFLIGHT: ${{ steps.trace_preflight.outcome }}
+          TRACE_CAMPAIGN: ${{ steps.trace_campaign.outcome }}
         run: |
           test "$DIAGNOSTIC_OUTCOME" = success
           if [ "$DIAGNOSTIC_ONLY" != true ]; then
             test "$CALIBRATION_OUTCOME" = success && test "$CUTOFF_OUTCOME" = success
+            if [ "$TRACE_MODE" != none ]; then
+              test "$TRACE_PREFLIGHT" = success && test "$TRACE_CAMPAIGN" = success
+            fi
           fi
