@@ -861,7 +861,8 @@ run_bench() {
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
     if [ -n "$H1_PROFILE" ] && [ "$H1_PROFILE" != diagnostic ] && [ "$target" = gateway ]; then
-        sampler_args+=(--h1-profile)
+        sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
+                      --h1-container-id "$GATEWAY_CID")
     fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
@@ -1046,7 +1047,7 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1054,6 +1055,9 @@ with open(sys.argv[1], "w") as manifest:
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
                "h2_observation_enabled": sys.argv[6] == "1",
                **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
+               **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
+                   "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10])}
+                  if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then

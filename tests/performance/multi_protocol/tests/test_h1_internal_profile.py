@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import h1_internal_profile as profile
@@ -12,18 +13,84 @@ import h1_internal_profile as profile
 
 def values():
     result = dict.fromkeys(profile.FIELDS, 0)
-    result.update(schema=1, pid=1, allocator_installed=1, slot_capacity=128)
+    result.update(schema=1, pid=1, allocator_installed=1, slot_capacity=128, registered_slots=2)
     return result
 
 
-def capture():
+def owned_gateway():
+    return dict(container_id="a" * 64, host_pid=31, start_ticks=100,
+                network_mode="host", metrics_endpoint=profile.METRICS_ENDPOINT)
+
+
+def binding():
+    endpoint = dict(host_pid=31, start_ticks=100, namespace_pids=[31, 1], listener_inode=1234)
+    return dict(container_id="a" * 64, endpoint=profile.METRICS_ENDPOINT,
+                before=endpoint, after=copy.deepcopy(endpoint))
+
+
+def capture(duration=1, times=None):
     rows = []
-    for time in [9.9, 10.5, 11.1]:
+    times = times if times is not None else [9.75 + index * 0.5 for index in range(duration * 2 + 2)]
+    for index, time in enumerate(times):
         counters = values()
-        counters["alloc_process_alloc_calls"] = int(time * 10)
-        rows.append(dict(unix_secs=time, processes=[dict(pid=31, start_ticks=100, role="gateway")],
-                         h1_profile=dict(unix_secs=time, counters=counters)))
-    return dict(capture_complete=True, timeline=rows)
+        counters["alloc_process_alloc_calls"] = 100 + index * 10
+        # The real producer counts each DATA poll at reqwest input and ProxyBody
+        # output. Metrics rendering itself registers/publishes a thread slot.
+        for boundary in ("body_reqwest_direct", "body_proxy_output_all"):
+            counters[boundary + "_polls"] = 100 + index * 10
+            counters[boundary + "_data_frames"] = 100 + index * 10
+            counters[boundary + "_data_bytes"] = (100 + index * 10) * 10240
+            counters[boundary + "_size_1025_16384"] = 100 + index * 10
+        rows.append(dict(unix_secs=time - 0.001,
+                         processes=[dict(pid=31, start_ticks=100, role="gateway")],
+                         h1_profile=dict(sample_id=index, unix_secs=time, monotonic_secs=time + 100,
+                                         capture_secs=0.01, sampler_cpu_secs=0.001,
+                                         counters=counters, gateway_binding=binding())))
+    return dict(capture_complete=True, timeline=rows, h1_gateway=owned_gateway())
+
+
+def bracket(data, phases=None, **kwargs):
+    phases = phases if phases is not None else dict(measurement_start_unix_secs=10, measurement_secs=1)
+    return profile.profile_bracket(data, phases, owned_gateway=owned_gateway(),
+                                   successful_responses=100, **kwargs)
+
+
+def traffic_sample(gateway, pair, size):
+    workers = profile.MANIFEST["scaled_workers"][profile.MANIFEST["payload_sizes"].index(size)]
+    roles = ["client", "backend"] + ([] if gateway == "direct" else ["gateway"])
+    processes = [dict(pid={"client": 32, "backend": 30, "gateway": 31}[role],
+                      role=role, complete_bracket=True, cpu_seconds=1) for role in roles]
+    observed = {name: dict(min=0, max=workers, mean=workers / 2) for name in (
+        "active_workers", "active_connections", "active_streams", "queued_requests")}
+    observed.update(samples=1500, workers_at_barrier=workers, workers_retired_before_deadline=0)
+    return dict(sample_schema=2, gateway=gateway, pair=pair, host_id="campaign-host",
+                protocol="HTTP/1.1+TLS", duration_secs=15, concurrency=workers,
+                effective_concurrency=workers, payload_size=size, total_requests=100,
+                total_errors=0, total_bytes=size * 100, rps=100 / 15, warmup_requests=workers,
+                phases=dict(measurement_start_unix_secs=10, measurement_secs=15.0,
+                            measurement_elapsed_secs=15.001, timed_out=False),
+                observed=observed, process_usage=dict(processes=processes, measurement=processes))
+
+
+def campaign(root, mode="cutoff"):
+    gateways = ["direct"] + list(profile.MANIFEST["campaigns"][mode])
+    manifest = dict(pairs=4, gateways=gateways, payload_sizes=profile.MANIFEST["payload_sizes"],
+                    host_id="campaign-host", sample_schema=2, protocol="http1-tls", duration=15,
+                    offered_workers=200, h1_profile_mode=mode)
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    for pair in range(1, 5):
+        folder = root / "pairs" / f"pair_{pair:03d}"
+        (folder / "diagnostics").mkdir(parents=True)
+        for gateway in gateways:
+            (folder / "diagnostics" / f"{gateway}_runtime.json").write_text(json.dumps(owned_gateway()))
+            for size in profile.MANIFEST["payload_sizes"]:
+                (folder / f"{gateway}_http1-tls_{size}.json").write_text(
+                    json.dumps(traffic_sample(gateway, pair, size)))
+                if gateway not in ("direct", "ferrum-baseline"):
+                    (folder / "diagnostics" / f"{gateway}_{size}_process_usage.json").write_text(
+                        json.dumps(capture(duration=15)))
+    return root / "pairs/pair_001/ferrum_http1-tls_10240.json", \
+        root / "pairs/pair_001/diagnostics/ferrum_10240_process_usage.json"
 
 
 class H1InternalProfileTests(unittest.TestCase):
@@ -33,6 +100,9 @@ class H1InternalProfileTests(unittest.TestCase):
         names = re.findall(r'^    "([a-z0-9_]+)",$', source, re.M)
         self.assertEqual(names, profile.SCHEMA["counters"])
         self.assertEqual(len(set(names)), 206)
+        self.assertEqual(len(profile.FIELDS), 214)
+        store = (root / "src/h1_profile/store.rs").read_text()
+        self.assertIn(f"pub const THREAD_SLOTS: usize = {profile.SLOT_CAPACITY};", store)
 
     def test_metrics_require_every_fixed_field_and_integer(self):
         text = "\n".join(f"{profile.PREFIX}{key} {value}" for key, value in values().items())
@@ -44,7 +114,7 @@ class H1InternalProfileTests(unittest.TestCase):
 
     def test_missing_resets_identity_overflow_and_thread_tails_are_explicit(self):
         phases = dict(measurement_start_unix_secs=10, measurement_secs=1)
-        self.assertTrue(profile.profile_bracket(capture(), phases)["complete"])
+        self.assertTrue(bracket(capture(), phases)["complete"])
         mutations = [
             lambda c: c["timeline"][1].pop("h1_profile"),
             lambda c: c["timeline"][1]["processes"].clear(),
@@ -65,7 +135,7 @@ class H1InternalProfileTests(unittest.TestCase):
         for mutate in mutations:
             data = copy.deepcopy(capture())
             mutate(data)
-            result = profile.profile_bracket(data, phases)
+            result = bracket(data, phases)
             self.assertFalse(result["complete"])
             self.assertTrue(result["issues"])
         for invalid in (None, [], dict(measurement_start_unix_secs=float("nan"), measurement_secs=1),
@@ -83,6 +153,345 @@ class H1InternalProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 profile.validate_selection(*invalid)
 
+    def assert_matrix(self, root, *, eligible=False, mode="cutoff"):
+        result = profile.report(root, mode)
+        written = json.loads((root / "h1_profile_report.json").read_text())
+        self.assertEqual(len(written["observations"]), 60)
+        self.assertEqual(result["fully_measured_comparison_eligible"], eligible)
+        self.assertEqual(written["fully_measured_comparison_eligible"], eligible)
+        self.assertEqual({(row["pair"], row["gateway"], row["payload"]) for row in written["observations"]},
+                         {(pair, gateway, size) for pair in range(1, 5)
+                          for gateway in ["direct"] + list(profile.MANIFEST["campaigns"][mode])
+                          for size in profile.MANIFEST["payload_sizes"]})
+        return next(row for row in result["observations"]
+                    if (row["pair"], row["gateway"], row["payload"]) == (1, "ferrum", 10240))
+
+    def test_real_producer_shape_accepts_all_sizes_in_both_campaigns(self):
+        self.assertEqual(profile.MANIFEST["scaled_workers"], [200, 200, 200, 100, 50])
+        for mode in ("calibration", "cutoff"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                campaign(root, mode)
+                row = self.assert_matrix(root, eligible=True, mode=mode)
+                self.assertFalse(row["traffic_issues"])
+                self.assertTrue(row["profile"]["complete"])
+                self.assertGreater(row["profile"]["published_delta"]["body_proxy_output_all_data_bytes"], 0)
+
+    def test_campaign_rejects_legacy_and_substituted_samples_without_losing_rows(self):
+        from benchmark_validity import sample_issues
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sample_path, _ = campaign(root)
+            original = json.loads(sample_path.read_text())
+            legacy = dict(total_requests=100, total_errors=0, rps=100,
+                          payload_size=10240, total_bytes=1024000)
+            self.assertEqual(sample_issues(legacy), [])  # the inherited false positive
+            cases = [legacy]
+            for key, value in (("sample_schema", 1), ("sample_schema", 2.0), ("pair", 2),
+                               ("pair", True), ("gateway", "ferrum-exp-cutoff-one"),
+                               ("payload_size", 71680), ("host_id", "other-host"),
+                               ("host_id", ""), ("protocol", "http1-tls"), ("protocol", "HTTP/2"),
+                               ("duration_secs", 30), ("effective_concurrency", 50),
+                               ("concurrency", 50)):
+                cases.append(dict(original, **{key: value}))
+            bad_phase = copy.deepcopy(original)
+            bad_phase["phases"]["measurement_secs"] = 30
+            cases.append(bad_phase)
+            diagnostic = copy.deepcopy(original)
+            diagnostic["phases"]["h1_diagnostic"] = {}
+            cases.append(diagnostic)
+            for sample in cases:
+                with self.subTest(sample=sample.get("protocol"), fields=sample.keys()):
+                    sample_path.write_text(json.dumps(sample))
+                    row = self.assert_matrix(root)
+                    self.assertTrue(row["traffic_issues"])
+                    self.assertEqual(row["sample"], sample)
+
+    def test_manifest_requires_host_and_declared_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            campaign(root)
+            path = root / "manifest.json"
+            original = json.loads(path.read_text())
+            for key, value in (("host_id", None), ("host_id", "  "), ("sample_schema", 1),
+                               ("protocol", "http2"), ("duration", 30), ("offered_workers", 50),
+                               ("pairs", 2), ("h1_profile_mode", "diagnostic"),
+                               ("h1_diagnostic_enabled", True),
+                               ("gateways", ["direct"]), ("payload_sizes", [True])):
+                with self.subTest(key=key):
+                    path.write_text(json.dumps(dict(original, **{key: value})))
+                    self.assert_matrix(root)
+                    self.assertTrue(json.loads((root / "h1_profile_report.json").read_text())["manifest_issues"])
+            path.write_text("{}")
+            self.assert_matrix(root)
+
+    def test_time_bounds_gaps_integer_ids_and_clocks_retain_partial_deltas(self):
+        self.assertTrue(bracket(capture())["complete"])
+        oversized = capture(times=[0, 60])
+        result = bracket(oversized, dict(measurement_start_unix_secs=10, measurement_secs=15))
+        self.assertFalse(result["complete"])
+        self.assertGreater(result["boundary_slack_secs"], 2)
+        self.assertIn("published_delta", result)
+        cases = []
+        gap = capture(duration=15)
+        del gap["timeline"][5:10]
+        cases.append((gap, "gap"))
+        # Consecutive IDs cannot hide an actual scheduling pause either.
+        paused = copy.deepcopy(gap)
+        for index, row in enumerate(paused["timeline"]):
+            row["h1_profile"]["sample_id"] = index
+        cases.append((paused, "sampling gap"))
+        for key, value in (("sample_id", 1.5), ("sample_id", True), ("sample_id", -1),
+                           ("sample_id", 0), ("sample_id", float("nan")),
+                           ("monotonic_secs", None), ("monotonic_secs", 109),
+                           ("monotonic_secs", float("inf")), ("unix_secs", 10.35)):
+            data = capture(duration=15)
+            data["timeline"][1]["h1_profile"][key] = value
+            cases.append((data, key))
+        drift = capture(duration=15)
+        for index, row in enumerate(drift["timeline"]):
+            row["h1_profile"]["monotonic_secs"] += index * 0.01
+        cases.append((drift, "clock discontinuity"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, usage_path = campaign(root)
+            for data, label in cases + [(oversized, "slack")]:
+                with self.subTest(label=label):
+                    usage_path.write_text(json.dumps(data))
+                    row = self.assert_matrix(root)
+                    self.assertFalse(row["profile"]["complete"])
+                    self.assertTrue(row["profile"]["issues"])
+                    self.assertIn("published_delta", row["profile"])
+
+    def test_owned_binding_required_for_every_row_and_stable_unrelated_pids_fail(self):
+        cases = []
+        unrelated = capture(duration=15)
+        for row in unrelated["timeline"]:
+            row["h1_profile"]["counters"]["pid"] = 2
+        cases.append(unrelated)
+        for mutate in (
+                lambda p: p.pop("gateway_binding"),
+                lambda p: p.update(identity_error="unavailable"),
+                lambda p: p["gateway_binding"].update(container_id="b" * 64),
+                lambda p: p["gateway_binding"].update(endpoint="http://127.0.0.1:9001/metrics"),
+                lambda p: p["gateway_binding"]["before"].update(start_ticks=101),
+                lambda p: p["gateway_binding"]["after"].update(start_ticks=101),
+                lambda p: p["gateway_binding"]["after"].update(listener_inode=1235),
+                lambda p: p["gateway_binding"]["after"].update(namespace_pids=[31, True]),
+                lambda p: p["gateway_binding"].update(before=[], after=[])):
+            data = capture(duration=15)
+            mutate(data["timeline"][1]["h1_profile"])
+            cases.append(data)
+        for processes in ([], [dict(pid=31, start_ticks=101, role="gateway")],
+                          [dict(pid=31, start_ticks=100, role="gateway")] * 2,
+                          [dict(pid=31, start_ticks=100, role="gateway"),
+                           dict(pid=32, start_ticks=100, role="gateway")]):
+            data = capture(duration=15)
+            data["timeline"][1]["processes"] = processes
+            cases.append(data)
+        stale = capture(duration=15)
+        stale["h1_gateway"]["container_id"] = "b" * 64
+        cases.append(stale)
+        missing = capture(duration=15)
+        missing.pop("h1_gateway")
+        cases.append(missing)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, usage_path = campaign(root)
+            for index, data in enumerate(cases):
+                with self.subTest(case=index):
+                    usage_path.write_text(json.dumps(data))
+                    row = self.assert_matrix(root)
+                    self.assertFalse(row["profile"]["complete"])
+                    self.assertTrue(row["profile"]["issues"])
+                    self.assertIn("published_delta", row["profile"])
+            usage_path.write_text(json.dumps(capture(duration=15)))
+            runtime_path = usage_path.parent / "ferrum_runtime.json"
+            for runtime in (None, dict(owned_gateway(), start_ticks=101),
+                            dict(owned_gateway(), identity_error="unavailable")):
+                runtime_path.write_text(json.dumps(runtime))
+                row = self.assert_matrix(root)
+                self.assertIn("published_delta", row["profile"])
+                self.assertFalse(row["profile"]["complete"])
+
+    def test_semantic_metadata_and_guaranteed_response_work(self):
+        cases = []
+        for fields in (dict(pid=0), dict(slot_capacity=127), dict(registered_slots=0),
+                       dict(registered_slots=129)):
+            data = capture(duration=15)
+            for row in data["timeline"]:
+                row["h1_profile"]["counters"].update(fields)
+            cases.append(data)
+        decreasing = capture(duration=15)
+        decreasing["timeline"][0]["h1_profile"]["counters"]["registered_slots"] = 3
+        cases.append(decreasing)
+        for zero_all in (False, True):
+            data = capture(duration=15)
+            for row in data["timeline"]:
+                counters = row["h1_profile"]["counters"]
+                if zero_all:
+                    counters.update(dict.fromkeys(profile.SCHEMA["counters"], 0))
+                else:
+                    counters["body_proxy_output_all_data_bytes"] = 1024  # stale positive total
+            cases.append(data)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, usage_path = campaign(root)
+            for index, data in enumerate(cases):
+                with self.subTest(case=index):
+                    usage_path.write_text(json.dumps(data))
+                    row = self.assert_matrix(root)
+                    self.assertFalse(row["profile"]["complete"])
+                    self.assertTrue(row["profile"]["issues"])
+        # Optional coalescing/copy/write-vector counters may remain zero.
+        valid = capture()
+        self.assertEqual(valid["timeline"][-1]["h1_profile"]["counters"]["body_reqwest_coalesced_data_bytes"], 0)
+        self.assertTrue(bracket(valid)["complete"])
+        for index, row in enumerate(valid["timeline"]):
+            row["h1_profile"]["counters"]["registered_slots"] = 125 + index
+        self.assertTrue(bracket(valid)["complete"])
+
+    def test_cpu_malformed_values_never_abort_or_zero_fill_the_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, usage_path = campaign(root)
+            for value in (None, "0.1", [], {}, -0.1, True, float("nan"), float("inf"),
+                          float("-inf"), "missing"):
+                with self.subTest(value=value):
+                    data = capture(duration=15)
+                    row = data["timeline"][1]["h1_profile"]
+                    if value == "missing":
+                        row.pop("sampler_cpu_secs")
+                    else:
+                        row["sampler_cpu_secs"] = value
+                    usage_path.write_text(json.dumps(data))
+                    result = self.assert_matrix(root)["profile"]
+                    self.assertIn("missing/invalid sampler CPU evidence", result["issues"])
+                    self.assertIsNone(result["sampler_cpu_secs"])
+                    self.assertIn("published_delta", result)
+            for value in (0, 0.001):
+                data = capture(duration=15)
+                for row in data["timeline"]:
+                    row["h1_profile"]["sampler_cpu_secs"] = value
+                usage_path.write_text(json.dumps(data))
+                result = self.assert_matrix(root, eligible=True)["profile"]
+                self.assertAlmostEqual(result["sampler_cpu_secs"], value * len(data["timeline"]))
+
+    def test_capture_reads_namespace_start_time_and_unique_owned_listener(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = root / "31"
+            (proc / "net").mkdir(parents=True)
+            (proc / "fd").mkdir()
+            fields = ["0"] * 22
+            fields[19] = "100"
+            stat = "31 (ferrum (edge)) " + " ".join(fields)
+            status = "Name:\tferrum-edge\nNSpid:\t31\t1\n"
+            listener = "0: 0100007F:2328 00000000:0000 0A 0:0 0:0 0 0 0 1234\n"
+            (proc / "stat").write_text(stat)
+            (proc / "status").write_text(status)
+            (proc / "net/tcp").write_text("header\n" + listener)
+            (proc / "fd/7").symlink_to("socket:[1234]")
+            processes = [dict(pid=31, start_ticks=100, role="gateway")]
+            self.assertEqual(profile.gateway_binding(owned_gateway(), processes, root), binding()["before"])
+            for path, malformed in (("stat", stat.replace("100", "101")),
+                                    ("status", "NSpid:\t32\t1\n"), ("status", "Name: missing\n"),
+                                    ("status", "NSpid:\t31\t0\n"),
+                                    ("net/tcp", "header\n" + listener.replace("1234", "4321")),
+                                    ("net/tcp", "header\n" + listener * 2),
+                                    ("net/tcp", "header\n" + listener.replace("2328", "2329"))):
+                with self.subTest(path=path, malformed=malformed):
+                    original = (proc / path).read_text()
+                    (proc / path).write_text(malformed)
+                    with self.assertRaises(ValueError):
+                        profile.gateway_binding(owned_gateway(), processes, root)
+                    (proc / path).write_text(original)
+            with patch.object(profile, "process_start_ticks", side_effect=[100, 101]):
+                with self.assertRaisesRegex(ValueError, "changed during"):
+                    profile.gateway_binding(owned_gateway(), processes, root)
+            for records in ([], processes * 2, [dict(processes[0], start_ticks=101)]):
+                with self.assertRaises(ValueError):
+                    profile.gateway_binding(owned_gateway(), records, root)
+
+    def test_snapshot_retains_binding_before_and_after_actual_scrape_call(self):
+        text = "\n".join(f"{profile.PREFIX}{key} {value}" for key, value in values().items())
+        events = []
+        processes = [dict(pid=31, start_ticks=100, role="gateway")]
+
+        def bind(runtime, observed):
+            self.assertEqual(runtime, owned_gateway())
+            self.assertEqual(observed, processes)
+            events.append("binding")
+            return binding()["before"]
+
+        def read(limit):
+            self.assertEqual(limit, 2 * 1024 * 1024 + 1)
+            events.append("metrics")
+            return text.encode()
+
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.side_effect = read
+        with patch.object(profile, "gateway_binding", side_effect=bind), \
+                patch.object(profile.urllib.request, "build_opener", return_value=opener):
+            result = profile.snapshot(7, processes, owned_gateway())
+        self.assertEqual(events, ["binding", "metrics", "binding"])
+        self.assertEqual(result["gateway_binding"], binding())
+        self.assertEqual(result["counters"], values())
+        self.assertEqual(result["sample_id"], 7)
+        self.assertNotIn("identity_error", result)
+        self.assertGreaterEqual(result["capture_secs"], 0)
+        self.assertGreaterEqual(result["sampler_cpu_secs"], 0)
+        opener.open.assert_called_once_with(profile.METRICS_ENDPOINT, timeout=0.2)
+        for error in (ValueError("reused process"), OSError("unavailable")):
+            with patch.object(profile, "gateway_binding", side_effect=[binding()["before"], error]), \
+                    patch.object(profile.urllib.request, "build_opener", return_value=opener):
+                result = profile.snapshot(8, processes, owned_gateway())
+            self.assertIn("identity_error", result)
+            self.assertIn("counters", result)  # preserve partial metrics
+            self.assertNotIn("after", result["gateway_binding"])
+
+    def test_runtime_and_sampler_bind_the_selected_container_not_a_stable_foreign_pid(self):
+        from process_usage import sample_processes
+        container = dict(Id="a" * 64, Image="image-id", State=dict(Pid=31, StartedAt="time", Running=True),
+                         HostConfig=dict(NetworkMode="host"), Config=dict(Env=[
+                             "FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1", "FERRUM_ADMIN_HTTP_PORT=9000",
+                             "FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32"]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, config = root / "runtime.json", root / "config.yaml"
+            config.write_text("proxies: []\n")
+            with patch.object(profile, "process_start_ticks", return_value=100):
+                profile.retain_runtime(runtime, container, config)
+            self.assertEqual(profile.gateway_identity(json.loads(runtime.read_text())), owned_gateway())
+            stop, output = root / "stop", root / "usage.json"
+            stop.touch()
+            for selected in ("a" * 64, "b" * 64):
+                calls = []
+
+                def snap(sample_id, processes, owned):
+                    calls.append((sample_id, processes, owned))
+                    return dict(counters=values())
+
+                with patch("process_usage.signal.signal"), \
+                        patch("process_usage.os.sysconf", return_value=100), \
+                        patch("process_usage.client_pids", return_value=[]), \
+                        patch("process_usage.capture", return_value=dict(
+                            start_ticks=100, cpu_seconds=1, rss_bytes=1024)), \
+                        patch.object(profile, "snapshot", side_effect=snap):
+                    sample_processes(30, [31], output, 0.5, parent_pid=42, stop_file=stop,
+                                     h1_profile=True, h1_runtime=runtime, h1_container_id=selected)
+                result = json.loads(output.read_text())
+                self.assertEqual([call[0] for call in calls], [0, 1])
+                for _, processes, owned in calls:
+                    self.assertEqual([p["pid"] for p in processes if p["role"] == "gateway"], [31])
+                    self.assertEqual(owned, owned_gateway() if selected == "a" * 64 else None)
+                self.assertEqual(result["h1_gateway"], owned_gateway() if selected == "a" * 64 else None)
+                if selected != "a" * 64:
+                    self.assertTrue(all(row["h1_profile"]["identity_error"] for row in result["timeline"]))
+            container["HostConfig"]["NetworkMode"] = "bridge"
+            profile.retain_runtime(runtime, container, config)
+            self.assertIn("identity_error", json.loads(runtime.read_text()))
+
     def test_diagnostic_slice_cannot_change_bounds_or_enter_full_comparisons(self):
         args = ["diagnostic", "http1-tls", "1", "30", "200", "ferrum", "5242880", "", ""]
         profile.validate_selection(*args)
@@ -99,6 +508,50 @@ class H1InternalProfileTests(unittest.TestCase):
             self.assertFalse(result["complete"])
             self.assertFalse(result["comparison_eligible"])
             self.assertTrue(all(row["issues"] for row in result["observations"]))
+
+    def test_diagnostic_success_and_retained_failures_always_leave_cause_unproven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "pairs/pair_001"
+            folder.mkdir(parents=True)
+            samples = {}
+            for gateway in ("direct", "ferrum", "ferrum-exp-cutoff-one"):
+                sample = traffic_sample(gateway, 1, 5242880)
+                sample["duration_secs"] = 30
+                sample["rps"] = 100 / 30
+                sample["phases"].update(measurement_secs=30.0, measurement_elapsed_secs=30.001,
+                    h1_diagnostic=dict(schema=1, pid=30, worker_capacity=256, connection_capacity=512,
+                        snapshot_capacity=4,
+                        clock_domain="client_process_diagnostic_session_instant_microseconds",
+                        loss=dict(workers=0, connections=0, updates=0, snapshots=0, poisoned_locks=0),
+                        snapshots=[dict(workers=[dict(worker_id=i) for i in range(50)])],
+                        retirement=dict(started=50, completed_ok=50, completed_error=0, cancelled=0,
+                                        panicked=0, capacity_rejections=0, unreaped_after_abort=0,
+                                        timed_out=False)))
+                path = folder / f"{gateway}_http1-tls_5242880.json"
+                path.write_text(json.dumps(sample))
+                samples[gateway] = (path, sample)
+            result = profile.report_diagnostic(root)
+            self.assertTrue(result["complete"])
+            self.assertFalse(result["comparison_eligible"])
+            self.assertIn("unproven", result["cause"])
+            path, original = samples["ferrum"]
+            for mutate in (
+                    lambda s: s.update(error="retained drain failure"),
+                    lambda s: s["phases"].update(timed_out=True),
+                    lambda s: s["phases"]["h1_diagnostic"]["loss"].update(updates=1),
+                    lambda s: s["phases"]["h1_diagnostic"]["retirement"].update(completed_ok=49),
+                    lambda s: s["phases"]["h1_diagnostic"]["retirement"].update(cancelled=1),
+                    lambda s: s["phases"]["h1_diagnostic"]["snapshots"].clear()):
+                sample = copy.deepcopy(original)
+                mutate(sample)
+                path.write_text(json.dumps(sample))
+                result = profile.report_diagnostic(root)
+                self.assertFalse(result["complete"])
+                self.assertFalse(result["comparison_eligible"])
+                self.assertIn("unproven", result["cause"])
+                self.assertEqual(len(result["observations"]), 3)
+                self.assertTrue(result["observations"][1]["issues"])
 
     def test_h1_diagnostic_is_registered_without_changing_cadence_or_retry_policy(self):
         root = Path(__file__).resolve().parents[4]

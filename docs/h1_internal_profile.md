@@ -174,13 +174,56 @@ Shared runner/sampler edits are isolated behind `--h1-profile`; root should
 coordinate those two file overlaps with #5602. The frozen benchmark job and its
 policy verifier are untouched.
 
-`h1_internal_profile.py` retains bounded integer-only snapshots with sample IDs,
-timestamps, scrape duration/CPU, process identity and measurement boundary slack.
-It rejects missing/malformed/decreasing counters, reused process identities,
-missing slots, loss and overflow. Idle-thread tails explicitly prevent complete
-allocation coverage. Useful traffic validity is separate from profile
-completeness. Every expected arm/pair/size is retained, including missing samples
-and failed 5 MiB observations. No surviving-worker average, guessed observer
+`h1_internal_profile.py` requires schema-2 traffic samples bound to the expected
+pair, gateway, payload and nonempty campaign host ID. The runner manifest records
+the H1 mode, `http1-tls` selection, 15-second duration and base 200 workers; each
+sample must carry the producer's `HTTP/1.1+TLS` protocol, 15-second measurement
+phase and both worker fields matching the committed 200/200/200/100/50 size table.
+Legacy samples, copied rows, aggregate samples, wrong-host samples and substituted
+workloads remain failed observations. Invalid/missing manifest selections retain
+the full expected matrix; valid budgeted payload subsets retain every selected
+pair/arm/size and do not satisfy the separate all-five-size campaign obligation.
+
+Profile brackets have a **two-second total boundary-slack limit**, including the
+last scrape's duration, and a **one-second maximum start-to-start sampling gap**
+for the fixed 500 ms sampler / 200 ms HTTP timeout. They require an observation
+inside measurement, nonnegative integer sample IDs increasing consecutively,
+strictly increasing finite wall/monotonic timestamps, nonoverlapping captures,
+and wall/monotonic elapsed agreement within **50 ms of the first bracket sample**.
+Process observations must precede their scrape by at most one second. These are
+fixed acceptance limits, not bounds enlarged to rescue scheduling stalls. Excess
+slack, skipped samples and discontinuities retain available published deltas as
+partial evidence. Each accepted row needs present, finite, nonnegative numeric
+sampler CPU (booleans excluded); invalid overhead remains null with an issue,
+never silently zero. A measured zero CPU value is valid.
+
+The runner retains the owned container's full ID, host init PID/start ticks,
+host-network mode and fixed `http://127.0.0.1:9000/metrics` endpoint. The sampler
+checks that record against the selected container ID. Before **and** after each
+scrape it rereads `/proc` start ticks and `NSpid`, requires exactly one observed
+gateway, and joins the unique IPv4 loopback port-9000 LISTEN inode to that
+process's fd table. The stored namespace PID must equal the exported metrics PID
+at every accepted row; before/after and successive bindings must agree with the
+retained runtime. This distinguishes unrelated containers exporting PID 1.
+Missing permissions/ownership records, reuse, restarts, stale mappings and
+ambiguous listeners produce partial profiles. This is bounded listener ownership
+evidence, not a new syscall/connection tracing facility or a cryptographic artifact
+attestation. Older captures without the binding cannot become complete retroactively.
+
+The fixed export remains **206 counters + eight metadata fields (214 total)**.
+The consumer requires positive metrics PID, capacity 128, and 1–128 registered
+slots that never decrease. Successful traffic requires positive advancement of
+`body_proxy_output_all_data_bytes`, the guaranteed response DATA boundary for
+this H1 workload. It does not require optional coalescing, copy, vectored-write
+or EOF counters to advance, nor equate bracket bytes with measured client bytes.
+Missing/malformed/decreasing counters, missing slots, loss and overflow remain
+failures. Idle-thread tails explicitly prevent complete allocation coverage.
+Useful traffic validity is separate from profile completeness. Every expected
+arm/pair/size is retained, including missing samples and failed 5 MiB observations.
+The hosted H1 Python suite exercises complete producer-shaped campaigns and
+negative campaign, timing, identity, metadata/work and CPU cases, including
+written full-matrix reports and the capture-to-sampler ownership path.
+No surviving-worker average, guessed observer
 overhead subtraction, or gain claim is produced. Raw on/off measurements are the
 overhead calibration; shared-host process CPU is not isolated proxy cost, and RSS
 is not allocation traffic. Scrape overhead is included in the gateway process and
