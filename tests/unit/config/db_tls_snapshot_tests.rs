@@ -6,9 +6,7 @@ use ferrum_edge::config::{DbTlsMode, EnvConfig, OperatingMode};
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 
-use crate::unit::env_lock::with_env_vars;
-#[cfg(unix)]
-use crate::unit::env_lock::with_env_vars_async;
+use crate::unit::env_lock::{EnvGuard, with_env_vars};
 
 fn material_path(snapshot: &SqlTlsSnapshot, key: &str) -> PathBuf {
     url::Url::parse(snapshot.url())
@@ -261,54 +259,62 @@ fn private_paths(dir: &std::path::Path) -> Vec<PathBuf> {
 fn sql_tls_url_helpers_preserve_sources_without_io_or_secret_diagnostics() {
     // An unusable TMPDIR proves none of the public URL helpers materializes
     // even inline PEM; unavailable providers must not be fetched here either.
+    // Hold ENV_LOCK before tempfile::tempdir() so TMPDIR is the ambient root,
+    // not a sibling test's tree that will be deleted on drop.
+    let guard = EnvGuard::new(&["TMPDIR"]);
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing");
-    with_env_vars(&[("TMPDIR", missing.to_str().unwrap())], || {
-        for db_type in ["postgres", "mysql"] {
-            for source in [
-                "/missing/material & +%#?.pem",
-                "file:///missing/material%20file.pem",
-                "vault://secret/canary?poll=60s&version=2#key",
-                "aws://secret-canary?version=2&poll=5m",
-                "azure://https://vault/secrets/canary/2?version=2",
-                "gcp://projects/canary/secrets/key/versions/latest",
-                "k8s://namespace/canary?key=tls.key&poll=60s",
-                "managed://certificates/canary#key",
-                "acme://certificates/canary#key",
-                "-----BEGIN PRIVATE KEY-----\ninline+canary/=\n-----END PRIVATE KEY-----\n",
-            ] {
-                let env = source_env(db_type, source);
-                let backend = env.effective_sql_backend().unwrap();
-                let mut urls = env.effective_db_failover_urls().unwrap();
-                urls.push(env.effective_db_url().unwrap().unwrap());
-                urls.push(env.effective_db_read_replica_url().unwrap().unwrap());
-                urls.push(backend.effective_url.clone());
-                drop(env);
-                for url in urls {
-                    let parsed = url::Url::parse(&url).unwrap();
-                    let pairs: Vec<_> = parsed.query_pairs().collect();
-                    // Source delimiters must not add SQL options.
-                    assert_eq!(pairs.len(), 4);
-                    for (_, value) in &pairs[1..] {
-                        assert_eq!(value.as_ref(), source);
-                    }
-                    let redacted = ferrum_edge::config::db_backend::redact_url(&url);
-                    assert!(!redacted.contains("canary"));
-                    assert!(!redacted.contains("BEGIN"));
+    guard.set("TMPDIR", missing.to_str().unwrap());
+    for db_type in ["postgres", "mysql"] {
+        for source in [
+            "/missing/material & +%#?.pem",
+            "file:///missing/material%20file.pem",
+            "vault://secret/canary?poll=60s&version=2#key",
+            "aws://secret-canary?version=2&poll=5m",
+            "azure://https://vault/secrets/canary/2?version=2",
+            "gcp://projects/canary/secrets/key/versions/latest",
+            "k8s://namespace/canary?key=tls.key&poll=60s",
+            "managed://certificates/canary#key",
+            "acme://certificates/canary#key",
+            "-----BEGIN PRIVATE KEY-----\ninline+canary/=\n-----END PRIVATE KEY-----\n",
+        ] {
+            let env = source_env(db_type, source);
+            let backend = env.effective_sql_backend().unwrap();
+            let mut urls = env.effective_db_failover_urls().unwrap();
+            urls.push(env.effective_db_url().unwrap().unwrap());
+            urls.push(env.effective_db_read_replica_url().unwrap().unwrap());
+            urls.push(backend.effective_url.clone());
+            drop(env);
+            for url in urls {
+                let parsed = url::Url::parse(&url).unwrap();
+                let pairs: Vec<_> = parsed.query_pairs().collect();
+                // Source delimiters must not add SQL options.
+                assert_eq!(pairs.len(), 4);
+                for (_, value) in &pairs[1..] {
+                    assert_eq!(value.as_ref(), source);
                 }
-                let debug = format!("{backend:?}");
-                assert!(!debug.contains("canary"));
-                assert!(!debug.contains("BEGIN"));
+                let redacted = ferrum_edge::config::db_backend::redact_url(&url);
+                assert!(!redacted.contains("canary"));
+                assert!(!redacted.contains("BEGIN"));
             }
+            let debug = format!("{backend:?}");
+            assert!(!debug.contains("canary"));
+            assert!(!debug.contains("BEGIN"));
         }
-    });
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn sql_tls_source_generations_belong_to_pools_and_failed_builds_leave_no_files() {
+    let guard = EnvGuard::new(&["TMPDIR"]);
     let dir = tempfile::tempdir().unwrap();
-    with_env_vars_async(&[("TMPDIR", dir.path().to_str().unwrap())], || async {
+    guard.set("TMPDIR", dir.path().to_str().unwrap());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("env-isolation async test runtime");
+    rt.block_on(async {
         let foreign = dir.path().join("ferrum-db-client-key-foreign.pem");
         std::fs::write(&foreign, "foreign owner").unwrap();
         for db_type in ["postgres", "mysql"] {
@@ -370,10 +376,16 @@ fn sql_tls_source_generations_belong_to_pools_and_failed_builds_leave_no_files()
 fn sql_tls_snapshot_failure_is_fatal_except_for_offline_backup_bootstrap() {
     use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 
+    let guard = EnvGuard::new(&["TMPDIR"]);
     let dir = tempfile::tempdir().unwrap();
     let not_directory = dir.path().join("not-a-directory");
     std::fs::write(&not_directory, "foreign owner").unwrap();
-    with_env_vars_async(&[("TMPDIR", not_directory.to_str().unwrap())], || async {
+    guard.set("TMPDIR", not_directory.to_str().unwrap());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("env-isolation async test runtime");
+    rt.block_on(async {
         for db_type in ["postgres", "mysql"] {
             let backend = source_env(db_type, "-----BEGIN CERTIFICATE-----\nmaterial")
                 .effective_sql_backend()
@@ -414,6 +426,7 @@ fn sql_tls_offline_timeout_fences_abandoned_reads_without_pinning_runtime_teardo
 
     use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 
+    let guard = EnvGuard::new(&["TMPDIR"]);
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join("blocked-cert");
     let status = std::process::Command::new("mkfifo")
@@ -421,94 +434,93 @@ fn sql_tls_offline_timeout_fences_abandoned_reads_without_pinning_runtime_teardo
         .status()
         .unwrap();
     assert!(status.success());
-    with_env_vars(&[("TMPDIR", dir.path().to_str().unwrap())], || {
-        let mut env = source_env("postgres", "-----BEGIN CERTIFICATE-----\naccepted");
-        env.db_tls_client_cert_path = Some(fifo.to_str().unwrap().into());
-        let url = env.effective_db_url().unwrap().unwrap();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                // The second attempt must time out waiting for the first
-                // detached reader's permit, without spawning another reader.
-                for _ in 0..2 {
-                    let store = DatabaseStore::connect_offline_with_pool_config(
-                        "postgres",
-                        &url,
-                        &[],
-                        DbPoolConfig {
-                            connect_timeout_seconds: 1,
-                            min_connections: 0,
-                            ..DbPoolConfig::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
-                    assert_eq!(store.pool().connect_options().database_url.as_str(), url);
-                    let sqlite = ferrum_edge::config::EffectiveSqlBackend {
-                        db_type: "sqlite".into(),
-                        effective_url: "sqlite::memory:".into(),
-                    };
-                    let pool = sqlite.connect_lazy(quiet_lazy_options(), 1).await.unwrap();
-                    drop(pool);
-                }
-            });
-            // This cannot finish with a blocked spawn_blocking reader.
-            drop(runtime);
-            finished_tx.send(()).unwrap();
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut writer = loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo)
-            {
-                Ok(writer) => break writer,
-                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-                    assert!(Instant::now() < deadline, "snapshot never reached the FIFO");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("FIFO writer: {error}"),
-            }
-        };
-        // The first PEM was written before the reader reached the FIFO.
-        let partial = private_paths(dir.path());
-        assert_eq!(partial.len(), 1);
-        let observer = dir.path().join("scrub-observer");
-        std::fs::hard_link(&partial[0], &observer).unwrap();
-        let original_len = std::fs::metadata(&observer).unwrap().len();
-        finished_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("offline timeout and runtime drop must both finish while TLS read is blocked");
-        worker.join().unwrap();
-        assert_eq!(
-            private_paths(dir.path()).len(),
-            1,
-            "one permit must fence repeated attempts"
-        );
-        writer.write_all(b"candidate certificate").unwrap();
-        drop(writer);
-
-        // A successful snapshot behind that same permit is a completion
-        // barrier: the abandoned generation has been dropped and scrubbed.
+    guard.set("TMPDIR", dir.path().to_str().unwrap());
+    let mut env = source_env("postgres", "-----BEGIN CERTIFICATE-----\naccepted");
+    env.db_tls_client_cert_path = Some(fifo.to_str().unwrap().into());
+    let url = env.effective_db_url().unwrap().unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let backend = source_env("postgres", "-----BEGIN CERTIFICATE-----\nrecovered")
-                .effective_sql_backend()
+            // The second attempt must time out waiting for the first
+            // detached reader's permit, without spawning another reader.
+            for _ in 0..2 {
+                let store = DatabaseStore::connect_offline_with_pool_config(
+                    "postgres",
+                    &url,
+                    &[],
+                    DbPoolConfig {
+                        connect_timeout_seconds: 1,
+                        min_connections: 0,
+                        ..DbPoolConfig::default()
+                    },
+                )
+                .await
                 .unwrap();
-            let pool = backend.connect_lazy(quiet_lazy_options(), 5).await.unwrap();
-            drop(pool);
+                assert_eq!(store.pool().connect_options().database_url.as_str(), url);
+                let sqlite = ferrum_edge::config::EffectiveSqlBackend {
+                    db_type: "sqlite".into(),
+                    effective_url: "sqlite::memory:".into(),
+                };
+                let pool = sqlite.connect_lazy(quiet_lazy_options(), 1).await.unwrap();
+                drop(pool);
+            }
         });
-        assert!(private_paths(dir.path()).is_empty());
-        let scrubbed = std::fs::read(&observer).unwrap();
-        assert_eq!(scrubbed.len() as u64, original_len);
-        assert!(scrubbed.iter().all(|byte| *byte == 0));
+        // This cannot finish with a blocked spawn_blocking reader.
+        drop(runtime);
+        finished_tx.send(()).unwrap();
     });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut writer = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(writer) => break writer,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(Instant::now() < deadline, "snapshot never reached the FIFO");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("FIFO writer: {error}"),
+        }
+    };
+    // The first PEM was written before the reader reached the FIFO.
+    let partial = private_paths(dir.path());
+    assert_eq!(partial.len(), 1);
+    let observer = dir.path().join("scrub-observer");
+    std::fs::hard_link(&partial[0], &observer).unwrap();
+    let original_len = std::fs::metadata(&observer).unwrap().len();
+    finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("offline timeout and runtime drop must both finish while TLS read is blocked");
+    worker.join().unwrap();
+    assert_eq!(
+        private_paths(dir.path()).len(),
+        1,
+        "one permit must fence repeated attempts"
+    );
+    writer.write_all(b"candidate certificate").unwrap();
+    drop(writer);
+
+    // A successful snapshot behind that same permit is a completion
+    // barrier: the abandoned generation has been dropped and scrubbed.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let backend = source_env("postgres", "-----BEGIN CERTIFICATE-----\nrecovered")
+            .effective_sql_backend()
+            .unwrap();
+        let pool = backend.connect_lazy(quiet_lazy_options(), 5).await.unwrap();
+        drop(pool);
+    });
+    assert!(private_paths(dir.path()).is_empty());
+    let scrubbed = std::fs::read(&observer).unwrap();
+    assert_eq!(scrubbed.len() as u64, original_len);
+    assert!(scrubbed.iter().all(|byte| *byte == 0));
 }

@@ -427,9 +427,9 @@ fn test_dialect_sql_forms_use_table_name_and_correct_placeholders() {
         "retention must skip the immediate first tick"
     );
     assert!(
-        source.contains("dialect.insert_sql(chunk.len())")
-            && source.contains("dialect.retention_delete_sql()")
-            && source.contains("flush_dialect"),
+        source.contains("insert_batch(store.pool().await?, store.dialect, batch)")
+            && source.contains("dialect.insert_sql(chunk.len())")
+            && source.contains("store.dialect.retention_delete_sql()"),
         "resolved dialect must be carried into both INSERT and retention paths"
     );
     assert!(
