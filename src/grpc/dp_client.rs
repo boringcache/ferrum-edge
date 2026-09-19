@@ -1275,26 +1275,17 @@ pub async fn start_dp_client_with_stream_timings(
                 if let Some(status) = subscribe_admission_refusal(&e) {
                     // The CP answered. A `RESOURCE_EXHAUSTED` Subscribe status
                     // is a capacity/tenancy refusal by the CP gRPC stream
-                    // admission controller, and its message names the exact
-                    // saturated budget (see `CpGrpcAdmissionRejection::
-                    // into_native_status`). Reporting it as a dead CP would be
+                    // admission controller. Only exact known messages may name
+                    // a budget in logs; the classification below also accepts
+                    // untrusted peer text. Reporting it as a dead CP would be
                     // wrong twice: the operator loses the only actionable
                     // detail, and the stale fence latches on a control plane
                     // that is demonstrably alive.
-                    error!(
-                        cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
-                        cp_index = backoff.current_cp_index + 1,
-                        cp_count,
-                        status = %sanitize_startup_cause(status.message(), &[]),
-                        "CP [{}/{}] REFUSED the ConfigSync subscription for capacity/tenancy \
-                         reasons ({}): the control plane is reachable and answering, but a CP \
-                         gRPC stream admission budget is saturated. Raise the budget named in \
-                         the status message (the sizing unit is one stream per DP or per mesh \
-                         workload) or add CP replicas. Last-known-good configuration keeps \
-                         serving and this DP keeps retrying",
+                    log_subscribe_admission_refusal(
+                        status,
+                        cp_url,
                         backoff.current_cp_index + 1,
                         cp_count,
-                        sanitize_startup_cause(format!("{cp_url:?}"), &[])
                     );
                     crate::dp_config_freshness::record_cp_admission_refused();
                     // `authority_retained = true` routes to
@@ -1512,6 +1503,29 @@ pub async fn wait_optional_tls_reload(
             std::future::pending::<()>().await;
         }
     }
+}
+
+fn log_subscribe_admission_refusal(
+    status: &tonic::Status,
+    cp_url: &str,
+    cp_index: usize,
+    cp_count: usize,
+) {
+    error!(
+        cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+        cp_index,
+        cp_count,
+        status = %super::admission::admission_status_diagnostic(status),
+        "CP [{}/{}] REFUSED the ConfigSync subscription for capacity/tenancy \
+         reasons ({}): the control plane is reachable and answering, but a CP \
+         gRPC stream admission budget is saturated. Raise the budget named in \
+         the status message (the sizing unit is one stream per DP or per mesh \
+         workload) or add CP replicas. Last-known-good configuration keeps \
+         serving and this DP keeps retrying",
+        cp_index,
+        cp_count,
+        sanitize_startup_cause(format!("{cp_url:?}"), &[])
+    );
 }
 
 /// Recognise a CP gRPC stream *admission refusal* inside a Subscribe error
@@ -4220,3 +4234,7 @@ mod tests {
         assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/gateway_core/dp_admission_diagnostics_tests.rs"]
+mod diagnostic_tests;
