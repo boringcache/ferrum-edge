@@ -616,6 +616,19 @@ CFI, unresolved symbols and an 8192-byte stack truncation fraction that cannot b
 proved stay unknown. Useful multi-frame hotspots do not establish complete stacks,
 full native allocation/copy coverage or a fully profiled comparison.
 
+Each preflight case prints at most 4 KiB of verdict/error details and bounded,
+address-scrubbed stderr tails; `preflight.json` and each case's raw reports remain
+the complete evidence. Failed capability collection also writes a failed report.
+After collectors are reaped, their owned perf control/ack FIFOs are removed.
+Producer exit and an always-run workflow fallback hand only the declared trace
+trees to the ordinary sudo caller for upload, adding owner read/traversal access
+without widening group/other permissions. Regular raw data, including failed or
+capped `perf.data` and regular control receipts, is preserved byte for byte;
+verifier stderr retains its existing address redaction. The handoff does not
+follow symlinks or alter hard-linked files and fails on unexpected file types.
+Upload still runs after a failed fixture or handoff; no retention step changes
+the fixture verdict, capture limits, or measurement eligibility.
+
 One capture lasts at most 300 seconds through client setup/warmup/measurement,
 request drain and gateway removal, with 64 map/metadata snapshots. The existing
 32 MiB observer admission includes an 8 MiB conservative H1 map reservation plus

@@ -1,8 +1,12 @@
 """Consumer regressions; the workflow separately exercises the real C producers."""
 import copy
+import contextlib
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -15,6 +19,7 @@ from h1_trace_contract import (COUNTERS, LOSSES, decode_cpu, fd_lifetimes,
 from h1_trace_preflight import reconcile
 from h1_internal_profile import validate_selection
 import h1_trace as trace
+import h1_trace_preflight as preflight
 from live_contract import measurement_window
 
 
@@ -36,6 +41,211 @@ def producer_records():
                                cookie=55, netns=1, role=1, outcome=1, direction=1)]),
             dict(phase='termination', requested_stop=True, lifecycle_omitted=0,
                  checkpoints_omitted=0, snapshot_failures=0)]
+
+
+class H1ArtifactTests(unittest.TestCase):
+    def test_fixture_setup_failure_reaps_before_reporting(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(preflight, 'launch') as launched, \
+                patch.object(preflight, 'reap') as reaped, \
+                patch.object(preflight.Fixture, 'wait', side_effect=RuntimeError('fixture missing ready')):
+            with self.assertRaisesRegex(RuntimeError, 'fixture missing ready'):
+                preflight.Fixture(Path(folder), 'cpu')
+            reaped.assert_called_once_with(launched.return_value)
+
+    def test_cli_handoff_runs_without_forgiving_producer_or_retention_failures(self):
+        for producer_status, retention_status in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+            with self.subTest(producer=producer_status, retention=retention_status), \
+                    tempfile.TemporaryDirectory() as folder, \
+                    patch.object(sys, 'argv', ['h1_trace.py', 'preflight', '--output', folder]), \
+                    patch.dict(os.environ, GITHUB_ACTIONS='true', RUNNER_ENVIRONMENT='github-hosted'), \
+                    patch.object(trace.platform, 'system', return_value='Linux'), \
+                    patch.object(trace.platform, 'machine', return_value='x86_64'), \
+                    patch.object(trace.os, 'geteuid', return_value=0), \
+                    patch.object(trace, 'command'), \
+                    patch.object(preflight, 'preflight', return_value=producer_status), \
+                    patch.object(trace, 'prepare_artifacts', return_value=retention_status) as prepare:
+                self.assertEqual(trace.main(), producer_status or retention_status)
+                prepare.assert_called_once_with(folder)
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(sys, 'argv', ['h1_trace.py', 'preflight', '--output', folder]), \
+                patch.dict(os.environ, GITHUB_ACTIONS='true', RUNNER_ENVIRONMENT='github-hosted'), \
+                patch.object(trace.platform, 'system', return_value='Linux'), \
+                patch.object(trace.platform, 'machine', return_value='x86_64'), \
+                patch.object(trace.os, 'geteuid', return_value=0), \
+                patch.object(trace, 'command'), \
+                patch.object(preflight, 'preflight', side_effect=RuntimeError('preflight failed')), \
+                patch.object(trace, 'prepare_artifacts', return_value=0) as prepare, \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertEqual(trace.main(), 1)
+            prepare.assert_called_once_with(folder)
+            self.assertIn('preflight failed', log.getvalue())
+
+    def test_cpu_setup_failure_removes_only_owned_control_fifos(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            raw = out / 'perf.data'
+            raw.write_bytes(b'partial raw capture')
+            with patch.object(trace, 'launch', side_effect=OSError('perf launch failed')):
+                with self.assertRaisesRegex(OSError, 'perf launch failed'):
+                    trace.CPU(out, dict(pid=123))
+            self.assertFalse((out / 'perf.control').exists())
+            self.assertFalse((out / 'perf.ack').exists())
+            self.assertEqual(raw.read_bytes(), b'partial raw capture')
+            # A stale regular control artifact must never be unlinked as a FIFO.
+            (out / 'perf.ack').write_bytes(b'retained control receipt')
+            with self.assertRaises(FileExistsError):
+                trace.CPU(out, dict(pid=123))
+            self.assertFalse((out / 'perf.control').exists())
+            self.assertEqual((out / 'perf.ack').read_bytes(), b'retained control receipt')
+
+    def test_cpu_supported_and_unsupported_cleanup_preserve_first_exit(self):
+        for supported in (True, False):
+            with self.subTest(supported=supported), tempfile.TemporaryDirectory() as folder:
+                out = Path(folder)
+                process = Mock()
+                process.poll.return_value = None if supported else 1
+                status = dict(returncode=0 if supported else -9, forced=not supported)
+                with patch.object(trace, 'launch', return_value=process), \
+                        patch.object(trace.os, 'read', return_value=b'ack\n'), \
+                        patch.object(trace, 'reap', return_value=status) as reaped:
+                    cpu = trace.CPU(out, dict(pid=123))
+                    self.assertEqual(cpu.ready['status'], 'supported' if supported else 'unsupported')
+                    self.assertEqual(cpu.finish(), status)
+                    self.assertEqual(cpu.finish(), status)
+                    reaped.assert_called_once_with(process)
+                self.assertTrue(cpu.err.closed)
+                self.assertIsNone(cpu.control)
+                self.assertIsNone(cpu.ack)
+                self.assertFalse((out / 'perf.control').exists())
+                self.assertFalse((out / 'perf.ack').exists())
+
+    def test_preflight_log_is_bounded_scrubbed_and_does_not_open_fifo(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            (out / 'loader.stderr').write_text('verifier rejected\n0xffffffff81234567\n')
+            (out / 'perf.stderr').write_text('x' * 10000 + '\nperf attach failed\n')
+            os.mkfifo(out / 'fixture.stderr')
+            result = dict(status='error', errors=['fixture failed\n0xffffffff81234567'],
+                          ready=dict(status='unsupported', reason='no perf enable acknowledgement'))
+            original = copy.deepcopy(result)
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                preflight.print_result('cpu', out, result)
+            output = log.getvalue()
+            self.assertLessEqual(len(output), 4096)
+            self.assertEqual(len(output.splitlines()), 1)
+            self.assertIn('verifier rejected', output)
+            self.assertIn('perf attach failed', output)
+            self.assertIn('not a regular file', output)
+            self.assertIn('[address-redacted]', output)
+            self.assertNotIn('ffffffff81234567', output)
+            self.assertEqual(result, original)
+            result['errors'] = ['long error' * 10000]
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                preflight.print_result('cpu', out, result)
+            self.assertLessEqual(len(log.getvalue()), 4096)
+            self.assertIn('[truncated;', log.getvalue())
+
+    def test_preflight_retains_failure_and_verdict_on_all_normal_outcomes(self):
+        for status, expected in [('error', 1), ('unsupported', 0), ('supported', 0)]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder:
+                def run(out, results):
+                    results['cpu'] = dict(status=status, errors=['actual failure'] if expected else [])
+                with patch.object(preflight, 'run_fixtures', side_effect=run), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(preflight.preflight(Path(folder)), expected)
+                report = json.loads((Path(folder) / 'preflight.json').read_text())
+                self.assertEqual(report['results']['cpu']['status'], status)
+                self.assertFalse(report['gateway_coverage'])
+        with tempfile.TemporaryDirectory() as folder:
+            log = io.StringIO()
+            with patch.object(preflight, 'capabilities', side_effect=RuntimeError('capability collection failed')), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(preflight.preflight(Path(folder)), 1)
+            self.assertIn('capability collection failed', log.getvalue())
+            report = json.loads((Path(folder) / 'preflight.json').read_text())
+            self.assertEqual(report['status'], 'error')
+            self.assertIn('capability collection failed', report['results']['preflight']['error'])
+
+    def test_interrupted_preflight_never_records_success(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(preflight, 'run_fixtures', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                preflight.preflight(Path(folder))
+            self.assertEqual(json.loads((Path(folder) / 'preflight.json').read_text())['status'], 'error')
+
+
+@unittest.skipUnless(os.geteuid() == 0 and os.environ.get('GITHUB_ACTIONS') == 'true'
+                     and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted',
+                     'requires the dedicated hosted sudo artifact regression step')
+class H1ArtifactOwnershipTests(unittest.TestCase):
+    def test_root_owned_raw_and_control_artifacts_are_runner_readable(self):
+        uid, gid = int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID'])
+        self.assertGreater(uid, 0)
+        self.assertGreater(gid, 0)
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            cpu = out / 'cpu'; cpu.mkdir(mode=0o700)
+            raw = cpu / 'perf.data'
+            payload = b'\x00raw perf\xff\n0xffffffff81234567\n'
+            raw.write_bytes(payload); raw.chmod(0o600)
+            self.assertEqual(raw.stat().st_uid, 0)
+            before = trace.digest(raw)
+            for name in ('perf.control', 'perf.ack'):
+                os.mkfifo(cpu / name, 0o600)
+            # Only FIFO controls are disposable; regular control evidence stays.
+            regular = out / 'perf.control'; regular.write_bytes(b'control receipt')
+            (cpu / 'loader.stderr').write_text('verifier failed\n0xffffffff81234567\n')
+            (out / 'preflight.json').write_text('{"status":"error"}\n')
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(trace.prepare_artifacts(out), 0)
+                self.assertEqual(trace.prepare_artifacts(out), 0)
+            self.assertEqual(trace.digest(raw), before)
+            self.assertEqual((raw.stat().st_uid, raw.stat().st_gid), (uid, gid))
+            self.assertEqual(stat.S_IMODE(raw.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(cpu.stat().st_mode), 0o700)
+            self.assertFalse((cpu / 'perf.control').exists())
+            self.assertFalse((cpu / 'perf.ack').exists())
+            self.assertEqual(regular.read_bytes(), b'control receipt')
+            self.assertEqual((cpu / 'loader.stderr').read_text(), 'verifier failed\n[address-redacted]\n')
+            # Exercise the uploader's actual ordinary identity, not root's access.
+            child = os.fork()
+            if child == 0:
+                try:
+                    os.setgroups([]); os.setgid(gid); os.setuid(uid)
+                    assert raw.read_bytes() == payload
+                    assert (out / 'preflight.json').read_text() == '{"status":"error"}\n'
+                    assert regular.read_bytes() == b'control receipt'
+                except BaseException:
+                    os._exit(1)
+                os._exit(0)
+            self.assertEqual(os.waitpid(child, 0)[1], 0)
+
+    def test_links_and_unknown_fifos_fail_without_touching_external_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder)
+            out = parent / 'capture'; out.mkdir()
+            external = parent / 'outside'; external.mkdir(mode=0o700)
+            target = external / 'data'; target.write_bytes(b'private sibling data'); target.chmod(0o600)
+            before = target.stat()
+            (out / 'file-link').symlink_to(target)
+            (out / 'directory-link').symlink_to(external, target_is_directory=True)
+            os.link(target, out / 'hard-link')
+            os.mkfifo(out / 'unknown-control')
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                self.assertEqual(trace.prepare_artifacts(out), 1)
+            self.assertIn('"error_count": 4', log.getvalue())
+            after = target.stat()
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode),
+                             (before.st_uid, before.st_gid, before.st_mode))
+            self.assertEqual(target.read_bytes(), b'private sibling data')
+            self.assertTrue(stat.S_ISFIFO((out / 'unknown-control').lstat().st_mode))
+            link = parent / 'root-link'; link.symlink_to(out, target_is_directory=True)
+            with self.assertRaises(OSError):
+                trace.prepare_artifacts(link)
 
 
 class H1TraceTests(unittest.TestCase):

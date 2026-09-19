@@ -1,11 +1,13 @@
 """Actual hosted fixtures for the H1 producer/consumer boundary, never gateway proof."""
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import time
 
 from h1_trace import (Observer, CPU, launch, reap, identity, admit, same_generation,
-                      tcp_inventory, retain_dsos, cpu_decode, capabilities, write, clock, CaptureLifecycle)
+                      tcp_inventory, retain_dsos, cpu_decode, capabilities, write, clock, CaptureLifecycle, scrub)
 from h1_trace_contract import LOSSES, SYSCALLS, fd_lifetimes, syscall_coverage, nested_fixture_proof
 
 
@@ -19,9 +21,12 @@ class Fixture:
         self.rows = []
         self.offset = 0
         self.pending = b''
-        self.wait('ready')
-        self.owner = identity(self.process.pid)
-        admit(self.owner)
+        try:
+            self.wait('ready')
+            self.owner = identity(self.process.pid)
+            admit(self.owner)
+        except BaseException:
+            self.finish(); raise
 
     def poll(self):
         with (self.out / 'fixture.jsonl').open('rb') as stream:
@@ -51,9 +56,55 @@ class Fixture:
 
     def finish(self):
         status = reap(self.process)
-        self.poll()
-        self.stdout.close(); self.stderr.close()
+        try:
+            self.poll()
+        finally:
+            self.stdout.close(); self.stderr.close()
         return status
+
+
+def print_result(name, out, result):
+    """At most 4 KiB per case; the complete, unchanged verdict stays on disk.
+
+    Fixed stderr tails only: never dump raw perf, stacks, or FIFO contents into
+    the Actions log. JSON escaping prevents diagnostic newlines becoming runner
+    commands; the existing verifier scrub also applies to errors and excerpts.
+    """
+    details = {key: result[key] for key in ('status', 'error', 'errors', 'ready',
+               'fixture_exit', 'observer_exit', 'perf_exit', 'capture_exit') if key in result}
+    if result.get('status') != 'supported':
+        excerpts = {}
+        for filename in ('loader.stderr', 'perf.stderr', 'fixture.stderr'):
+            try:
+                info = (out / filename).lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError('diagnostic is not a regular file')
+                fd = os.open(out / filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, 'rb') as stream:
+                    current = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                        raise ValueError('diagnostic changed while opening')
+                    stream.seek(max(0, current.st_size - 768))
+                    excerpts[filename] = stream.read(768).decode(errors='replace')
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                excerpts[filename] = type(error).__name__ + ': ' + str(error)
+        details['stderr_tails'] = excerpts
+
+    def redacted(value):
+        if isinstance(value, str):
+            return scrub(value)
+        if isinstance(value, dict):
+            return {key: redacted(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redacted(item) for item in value]
+        return value
+
+    message = json.dumps(redacted(details), ensure_ascii=True)
+    if len(message) > 4000:
+        message = message[:4000] + ' [truncated; see preflight.json and case result.json]'
+    print('H1 preflight ' + name + ': ' + message, flush=True)
 
 
 def reconcile(calls, events):
@@ -284,17 +335,16 @@ def cpu_cap_fixture(out):
     return result
 
 
-def preflight(out):
-    out.mkdir(parents=True, exist_ok=True)
+def run_fixtures(out, results):
     capabilities(out)
-    results = {}
     for name, kwargs in [('syscalls', {}), ('map-capacity', {'capacity': '1'}),
                          ('generation-rejection', {'generation_fault': True})]:
         folder = out / name; folder.mkdir()
         try:
             results[name] = syscall_fixture(folder, **kwargs)
         except (OSError, ValueError, RuntimeError, KeyError) as error:
-            results[name] = dict(status='error', error=str(error))
+            results[name] = dict(status='error', error=type(error).__name__ + ': ' + str(error))
+        print_result(name, folder, results[name])
     for name, kwargs in [('missing-btf', {'fault': 'missing-btf'}),
                          ('missing-symbol', {'fault': 'missing-symbol'}),
                          ('permission', {'denied': 'true'})]:
@@ -305,22 +355,39 @@ def preflight(out):
             results[name] = dict(ready=observer.ready,
                                  status='supported' if observer.ready['status'] != 'supported' else 'error')
         except (OSError, ValueError, RuntimeError) as error:
-            results[name] = dict(status='error', error=str(error))
+            results[name] = dict(status='error', error=type(error).__name__ + ': ' + str(error))
         finally:
             if observer:
                 results[name]['exit'] = observer.finish()
+        print_result(name, folder, results[name])
     folder = out / 'cpu'; folder.mkdir()
     try:
         results['cpu'] = cpu_fixture(folder)
     except (OSError, ValueError, RuntimeError, KeyError) as error:
-        results['cpu'] = dict(status='error', error=str(error))
+        results['cpu'] = dict(status='error', error=type(error).__name__ + ': ' + str(error))
+    print_result('cpu', folder, results['cpu'])
     folder = out / 'cpu-cap'; folder.mkdir()
     try:
         results['cpu-cap'] = cpu_cap_fixture(folder)
     except (OSError, ValueError, RuntimeError, KeyError) as error:
-        results['cpu-cap'] = dict(status='error', error=str(error))
-    result = dict(schema=1, fixture_only=True, results=results,
-                  gateway_coverage=False, issue_5588_closed=False,
-                  status='error' if any(r['status'] == 'error' for r in results.values()) else 'supported_or_explicitly_unsupported')
-    write(out / 'preflight.json', result)
+        results['cpu-cap'] = dict(status='error', error=type(error).__name__ + ': ' + str(error))
+    print_result('cpu-cap', folder, results['cpu-cap'])
+
+
+def preflight(out):
+    out.mkdir(parents=True, exist_ok=True)
+    results = {}
+    finished = False
+    try:
+        run_fixtures(out, results)
+        finished = True
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired) as error:
+        results['preflight'] = dict(status='error', error=type(error).__name__ + ': ' + str(error))
+        print_result('preflight', out, results['preflight'])
+    finally:
+        result = dict(schema=1, fixture_only=True, results=results,
+                      gateway_coverage=False, issue_5588_closed=False,
+                      status='error' if not finished or any(r['status'] == 'error' for r in results.values()) else 'supported_or_explicitly_unsupported')
+        write(out / 'preflight.json', result)
+    print('H1 preflight verdict: ' + result['status'] + '; full report: ' + str(out / 'preflight.json'), flush=True)
     return int(result['status'] == 'error')

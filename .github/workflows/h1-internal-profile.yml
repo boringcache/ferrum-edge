@@ -185,6 +185,11 @@ jobs:
           bash -n tests/performance/multi_protocol/run_gateway_protocol_bench.sh
           python3 -m py_compile tests/performance/multi_protocol/h1_trace*.py
           python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_h1_trace.py'
+      - name: Verify root-owned raw artifact handoff to the ordinary runner
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 -m unittest discover -v -s tests/performance/multi_protocol/tests \
+            -p 'test_h1_trace.py' -k H1ArtifactOwnershipTests
       - name: Stage owned binaries and run actual fixtures and negative cases
         run: |
           set -euo pipefail
@@ -192,6 +197,13 @@ jobs:
             python3 tests/performance/multi_protocol/h1_trace.py stage --build "$RUNNER_TEMP/h1-trace/build"
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
             python3 tests/performance/multi_protocol/h1_trace.py preflight --output "$RUNNER_TEMP/h1-trace"
+      - name: Prepare fixture artifacts even after producer failure
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/h1-trace" ]; then
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+              python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output "$RUNNER_TEMP/h1-trace"
+          fi
       - name: Retain failed and unsupported fixture evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -373,6 +385,19 @@ jobs:
           for campaign in calibration cutoff; do
             python3 tests/performance/multi_protocol/h1_internal_profile.py report \
               "h1-profile-evidence/$campaign" "$campaign" || status=1
+          done
+          exit "$status"
+      - name: Prepare only trace evidence trees after success or failure
+        if: always()
+        run: |
+          status=0
+          for directory in "$PWD/h1-profile-evidence/trace-preflight" \
+            "$PWD"/h1-profile-evidence/{cpu,syscalls}-{trace-calibration,cutoff}/pairs/pair_{001,002,003,004}/traces \
+            "$PWD"/h1-profile-evidence/builds/{off,on}/symfs; do
+            if [ -d "$directory" ]; then
+              sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+                python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output "$directory" || status=1
+            fi
           done
           exit "$status"
       - name: Upload raw evidence, including incomplete campaigns

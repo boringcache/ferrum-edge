@@ -17,6 +17,7 @@ import re
 import selectors
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -61,6 +62,95 @@ def read_metadata(path, limit=256 * 1024):
         return dict(text=data[:limit].decode(errors='replace'), truncated=len(data) > limit)
     except OSError as error:
         return dict(errno=error.errno)
+
+
+def prepare_artifacts(out):
+    """Hand off only this stopped capture tree to the invoking runner.
+
+    Never follow symlinks (including in the root path), modify hard-linked
+    files, or broaden group/other permissions. Raw regular data stays intact;
+    only verifier stderr uses the existing address scrub policy. Known perf
+    control FIFOs carry no retained evidence and are removed without opening.
+    This is also the workflow's always-run fallback after interrupted cleanup.
+    """
+    uid, gid = int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID'])
+    if uid <= 0 or gid <= 0:
+        raise ValueError('artifact recipient must be the ordinary sudo caller')
+    if '..' in Path(out).parts:
+        raise ValueError('artifact root must not contain parent traversal')
+    out = Path(os.path.abspath(out))
+    if out == Path('/'):
+        raise ValueError('artifact root must be a capture directory')
+    report = dict(files=0, directories=0, control_fifos_removed=0, errors=[], error_count=0)
+
+    def failed(path, error):
+        report['error_count'] += 1
+        if len(report['errors']) < 8:
+            report['errors'].append(scrub(f'{path}: {type(error).__name__}: {error}')[:512])
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root = os.open('/', directory_flags)
+    try:
+        for part in out.parts[1:]:
+            child = os.open(part, directory_flags, dir_fd=root)
+            os.close(root)
+            root = child
+        device = os.fstat(root).st_dev
+        for path, directories, files, directory in os.fwalk('.', topdown=True,
+                follow_symlinks=False, dir_fd=root, onerror=lambda e: failed('walk', e)):
+            # Prune foreign mounts and directory links before fwalk descends.
+            for name in directories[:]:
+                try:
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if not stat.S_ISDIR(info.st_mode) or info.st_dev != device:
+                        raise ValueError('linked/foreign artifact directory')
+                except (OSError, ValueError) as error:
+                    directories.remove(name)
+                    failed(f'{path}/{name}', error)
+            for name in files:
+                try:
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if stat.S_ISFIFO(info.st_mode) and name in ('perf.control', 'perf.ack'):
+                        os.unlink(name, dir_fd=directory)
+                        report['control_fifos_removed'] += 1
+                        continue
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != device:
+                        raise ValueError('nonregular, linked or foreign artifact file')
+                    flags = os.O_RDWR if name == 'loader.stderr' else os.O_RDONLY
+                    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                    try:
+                        current = os.fstat(fd)
+                        if (current.st_dev, current.st_ino, current.st_nlink) != (info.st_dev, info.st_ino, 1):
+                            raise ValueError('artifact changed during handoff')
+                        if name == 'loader.stderr':
+                            if current.st_size > BOUNDS['raw_perf_bytes']:
+                                raise ValueError('verifier stderr exceeds existing file cap')
+                            with os.fdopen(os.dup(fd), 'r+b') as stream:
+                                raw = stream.read(BOUNDS['raw_perf_bytes'] + 1)
+                                if len(raw) > BOUNDS['raw_perf_bytes']:
+                                    raise ValueError('verifier stderr grew past file cap')
+                                redacted = scrub(raw.decode(errors='replace')).encode()
+                                if redacted != raw:
+                                    stream.seek(0); stream.write(redacted); stream.truncate()
+                        os.fchown(fd, uid, gid)
+                        os.fchmod(fd, (stat.S_IMODE(current.st_mode) & 0o777) | stat.S_IRUSR)
+                        report['files'] += 1
+                    finally:
+                        os.close(fd)
+                except (OSError, ValueError) as error:
+                    failed(f'{path}/{name}', error)
+            try:
+                info = os.fstat(directory)
+                os.fchown(directory, uid, gid)
+                os.fchmod(directory, (stat.S_IMODE(info.st_mode) & 0o777) | stat.S_IRUSR | stat.S_IXUSR)
+                report['directories'] += 1
+            except OSError as error:
+                failed(path, error)
+    finally:
+        os.close(root)
+    report['status'] = 'error' if report['error_count'] else 'ready'
+    print('H1 artifact retention ' + json.dumps(report, sort_keys=True), flush=True)
+    return int(bool(report['error_count']))
 
 
 def clock():
@@ -568,15 +658,19 @@ class Observer:
 class CPU:
     def __init__(self, out, owner, *, file_limit=BOUNDS["raw_perf_bytes"]):
         self.out = out
-        for name in ('perf.control', 'perf.ack'):
-            os.mkfifo(out / name, 0o600)
-        self.control = os.open(out / 'perf.control', os.O_RDWR | os.O_NONBLOCK)
-        self.ack = os.open(out / 'perf.ack', os.O_RDWR | os.O_NONBLOCK)
-        self.err = (out / 'perf.stderr').open('wb')
-        self.process = launch('perf-record', stdout=subprocess.DEVNULL, stderr=self.err,
-                              pid=owner['pid'], out=out, file_limit=file_limit)
+        self.process = self.err = self.control = self.ack = None
+        self.fifos = {}
+        self.finished = None
         self.ready = None
         try:
+            for name in ('perf.control', 'perf.ack'):
+                os.mkfifo(out / name, 0o600)
+                self.fifos[name] = (out / name).lstat().st_ino
+            self.control = os.open(out / 'perf.control', os.O_RDWR | os.O_NONBLOCK)
+            self.ack = os.open(out / 'perf.ack', os.O_RDWR | os.O_NONBLOCK)
+            self.err = (out / 'perf.stderr').open('wb')
+            self.process = launch('perf-record', stdout=subprocess.DEVNULL, stderr=self.err,
+                                  pid=owner['pid'], out=out, file_limit=file_limit)
             os.write(self.control, b'enable\n')
             deadline = time.monotonic() + 10
             receipt = b''
@@ -597,12 +691,22 @@ class CPU:
             self.finish(); raise
 
     def finish(self):
-        status = reap(self.process)
-        self.err.close()
+        if self.finished is not None:
+            return self.finished
+        status = reap(self.process) if self.process else dict(returncode=None, forced=False)
+        if self.err:
+            self.err.close()
         for name in ('control', 'ack'):
             fd = getattr(self, name, None)
             if fd is not None:
                 os.close(fd); setattr(self, name, None)
+        for name, inode in self.fifos.items():
+            path = self.out / name
+            info = path.lstat()
+            if not stat.S_ISFIFO(info.st_mode) or info.st_ino != inode:
+                raise ValueError('perf control FIFO changed before cleanup')
+            path.unlink()
+        self.finished = status
         return status
 
 
@@ -1000,6 +1104,7 @@ def main():
     s.add_argument('--mode', choices=('syscalls', 'cpu'), required=True)
     s.add_argument('--enabled', action='store_true'); s.add_argument('--parent', type=int, required=True)
     s = sub.add_parser('preflight'); s.add_argument('--output', required=True)
+    s = sub.add_parser('prepare-artifacts'); s.add_argument('--output', required=True)
     s = sub.add_parser('request-teardown'); s.add_argument('--output', required=True)
     s = sub.add_parser('bind')
     for field in ('output', 'runtime', 'config', 'sample', 'raw-sample', 'client-exit', 'arm'):
@@ -1020,12 +1125,24 @@ def main():
         raise SystemExit('hosted passive supervisor requires root')
     if args.action == 'stage':
         stage(args.build); return 0
-    if not Path('/sys/kernel/tracing/events').exists():
-        command('tracefs', Path(args.output) / 'tracefs.txt')
-    if args.action == 'supervise':
-        return supervise(args)
-    from h1_trace_preflight import preflight
-    return preflight(Path(args.output))
+    if args.action == 'prepare-artifacts':
+        return prepare_artifacts(args.output)
+    try:
+        Path(args.output).mkdir(parents=True, exist_ok=True)
+        if not Path('/sys/kernel/tracing/events').exists():
+            command('tracefs', Path(args.output) / 'tracefs.txt')
+        if args.action == 'supervise':
+            status = supervise(args)
+        else:
+            from h1_trace_preflight import preflight
+            status = preflight(Path(args.output))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print('H1 trace failure ' + json.dumps(dict(action=args.action,
+            error=scrub(f'{type(error).__name__}: {error}')[:2048])), flush=True)
+        status = 1
+    finally:
+        retention_status = prepare_artifacts(args.output)
+    return status or retention_status
 
 
 if __name__ == '__main__':
