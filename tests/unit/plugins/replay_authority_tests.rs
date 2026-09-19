@@ -1000,6 +1000,41 @@ fn scope_and_backend_must_agree() {
     assert!(unused_backend.contains("shared"));
 }
 
+#[test]
+fn replay_scope_diagnostics_preserve_schema_and_suggestions_when_rendered() {
+    for value in [
+        "'REPLAY_VALUE_MARKER",
+        "\"REPLAY_VALUE_MARKER\\\n",
+        "927451",
+        "true",
+    ] {
+        let error =
+            ReplayScope::parse("jwks_auth", "provider[3].dpop_replay_scope", value).unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        for expected in [
+            "`provider[3].dpop_replay_scope`",
+            "must be exactly `process` or `shared`",
+            "`sync_mode: redis`",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        for withheld in ["REPLAY_VALUE_MARKER", "927451", "true"] {
+            assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+    for (scope, redis_configured, reason) in [
+        (ReplayScope::Shared, false, "requires"),
+        (ReplayScope::Process, true, "is only meaningful"),
+    ] {
+        let error = validate_scope_backend("hmac_auth", "replay_scope", scope, redis_configured)
+            .unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        for expected in ["`replay_scope`", "`shared`", "`sync_mode: redis`", reason] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+    }
+}
+
 // ── observability ───────────────────────────────────────────────────
 
 /// Counters move on the paths they claim to describe. They are process-global
