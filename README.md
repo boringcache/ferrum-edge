@@ -116,8 +116,15 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 
 ### Docker
 
-Choose a published version, not a source tag or chart `appVersion` that is still
-in release preparation. Historical `latest` images are not refreshed by main CI.
+Choose a completed published version, not a source tag or chart `appVersion`
+that is still in release preparation. The container tag `latest` is retired:
+neither main CI nor versioned releases advance it. Any existing `latest` image
+is a historical artifact and does not receive subsequent fixes. Omitting a tag
+also selects `latest`, so always specify a published version or image digest.
+
+Versioned releases publish `vX.Y.Z`, `X.Y.Z`, and the moving `X.Y` series alias
+(for example, `0.9`). Pin the full version or digest for reproducible deployments;
+the series alias can change when another release in that series is published.
 
 Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
 pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the

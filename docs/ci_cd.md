@@ -2820,7 +2820,12 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2.3
 docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
 
-Main no longer updates `latest` or `main-<sha>` registry tags. Existing tags remain historical artifacts; use a versioned production tag.
+The `latest` container tag is retired: neither main CI nor versioned releases
+update it. Existing `latest` and `main-<sha>` tags remain historical artifacts,
+not supported channels for subsequent fixes. An image reference without a tag
+implicitly selects `latest`; specify a completed published full version or digest.
+The `X.Y` alias is published by the version-tag workflow and moves within that
+release series, so use `vX.Y.Z`, `X.Y.Z`, or a digest when reproducibility matters.
 
 The `anonymous-pull-smoke` job now runs in `release.yml` after the standard
 version manifest is published, with an empty Docker configuration. Docker Hub
