@@ -2402,7 +2402,7 @@ mod tests {
         let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(false, f.path().to_str(), &[]).unwrap_err();
         assert!(
-            err.contains("no valid PEM certificates"),
+            err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"),
             "unexpected error: {err}"
         );
     }
@@ -2413,7 +2413,7 @@ mod tests {
         let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(true, f.path().to_str(), &[]).unwrap_err();
         assert!(
-            err.contains("no valid PEM certificates"),
+            err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"),
             "unexpected error: {err}"
         );
     }
@@ -2422,7 +2422,11 @@ mod tests {
     fn missing_ca_bundle_file_rejected() {
         ensure_crypto_provider();
         let err = build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem"), &[]).unwrap_err();
-        assert!(err.contains("failed to read"), "unexpected error: {err}");
+        assert!(
+            err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle"),
+            "unexpected error: {err}"
+        );
+        assert!(!err.contains("/nonexistent/path/ca.pem"), "{err}");
     }
 
     /// Proves CA exclusivity: a config built with CA-A successfully completes a
