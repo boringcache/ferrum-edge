@@ -476,8 +476,8 @@ impl AiPromptShield {
             .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
         {
             return Err(format!(
-                "ai_prompt_shield: unknown config field {unknown:?}; allowed fields: {}",
-                ALLOWED_CONFIG_KEYS.join(", ")
+                "ai_prompt_shield: unknown config field {unknown:?}; allowed fields: `{}`",
+                ALLOWED_CONFIG_KEYS.join("`, `")
             ));
         }
 
@@ -487,7 +487,7 @@ impl AiPromptShield {
             "warn" => ShieldAction::Warn,
             other => {
                 return Err(format!(
-                    "ai_prompt_shield: 'action' must be one of 'reject', 'redact', or 'warn', got: {other:?}"
+                    "ai_prompt_shield: `action` must be one of `reject`, `redact`, or `warn`, got: {other:?}"
                 ));
             }
         };
@@ -497,7 +497,7 @@ impl AiPromptShield {
             "all" => ScanMode::All,
             other => {
                 return Err(format!(
-                    "ai_prompt_shield: 'scan_fields' must be one of 'content' or 'all', got: {other:?}"
+                    "ai_prompt_shield: `scan_fields` must be one of `content` or `all`, got: {other:?}"
                 ));
             }
         };
@@ -538,16 +538,15 @@ impl AiPromptShield {
                             placeholder,
                         });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         return Err(format!(
-                            "ai_prompt_shield: failed to compile built-in pattern '{}': {}",
-                            name, e,
+                            "ai_prompt_shield: `patterns` built-in pattern {name:?} is invalid or too complex"
                         ));
                     }
                 }
             } else {
                 return Err(format!(
-                    "ai_prompt_shield: unknown built-in pattern '{}'",
+                    "ai_prompt_shield: `patterns` unknown built-in pattern {:?}",
                     name,
                 ));
             }
@@ -561,7 +560,7 @@ impl AiPromptShield {
                 // instead of being read as `name`/`regex` and dropped.
                 let Some(entry_object) = entry.as_object() else {
                     return Err(format!(
-                        "ai_prompt_shield: 'custom_patterns[{index}]' must be an object"
+                        "ai_prompt_shield: `custom_patterns[{index}]` must be an object"
                     ));
                 };
                 if let Some(unknown) = entry_object
@@ -569,23 +568,23 @@ impl AiPromptShield {
                     .find(|key| !ALLOWED_CUSTOM_PATTERN_KEYS.contains(&key.as_str()))
                 {
                     return Err(format!(
-                        "ai_prompt_shield: unknown config field 'custom_patterns[{index}].{unknown}'; allowed fields: {}",
-                        ALLOWED_CUSTOM_PATTERN_KEYS.join(", ")
+                        "ai_prompt_shield: unknown config field `custom_patterns[{index}]` key {unknown:?}; allowed fields: `{}`",
+                        ALLOWED_CUSTOM_PATTERN_KEYS.join("`, `")
                     ));
                 }
                 let name = entry_object
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or("ai_prompt_shield: custom_patterns entries require string 'name'")?;
+                    .ok_or("ai_prompt_shield: `custom_patterns` entries require string `name`")?;
                 if name.chars().count() > MAX_CUSTOM_PATTERN_NAME_CHARS {
                     return Err(format!(
-                        "ai_prompt_shield: 'custom_patterns[{index}].name' must be at most {MAX_CUSTOM_PATTERN_NAME_CHARS} characters"
+                        "ai_prompt_shield: `custom_patterns[{index}].name` must be at most {MAX_CUSTOM_PATTERN_NAME_CHARS} characters"
                     ));
                 }
                 let regex_str = entry_object
                     .get("regex")
                     .and_then(Value::as_str)
-                    .ok_or("ai_prompt_shield: custom_patterns entries require string 'regex'")?;
+                    .ok_or("ai_prompt_shield: `custom_patterns` entries require string `regex`")?;
                 match Regex::new(regex_str) {
                     Ok(regex) => {
                         // A pattern that matches the empty string inserts its
@@ -594,7 +593,7 @@ impl AiPromptShield {
                         // rather than discovering it per request.
                         if regex.is_match("") {
                             return Err(format!(
-                                "ai_prompt_shield: 'custom_patterns[{index}].regex' must not match the empty string (zero-width redaction is rejected)"
+                                "ai_prompt_shield: `custom_patterns[{index}].regex` must not match the empty string (zero-width redaction is rejected)"
                             ));
                         }
                         let placeholder = render_placeholder(redaction_template, name)?;
@@ -628,11 +627,9 @@ impl AiPromptShield {
         // RegexSet construction will not fail for pattern syntax — but we
         // propagate any error defensively.
         let detection_set =
-            RegexSet::new(patterns.iter().map(|p| p.regex.as_str())).map_err(|e| {
-                format!(
-                    "ai_prompt_shield: failed to build detection RegexSet: {}",
-                    e
-                )
+            RegexSet::new(patterns.iter().map(|p| p.regex.as_str())).map_err(|_| {
+                "ai_prompt_shield: `patterns` / `custom_patterns` detection set is invalid or too complex"
+                    .to_string()
             })?;
         let marker_id = DEFERRED_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
         let deferred_compressed_marker = format!("{DEFERRED_COMPRESSED_MARKER_PREFIX}{marker_id}");
@@ -2082,7 +2079,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ai_prompt_shield: '{field}' must be a string"))
+        .ok_or_else(|| format!("ai_prompt_shield: `{field}` must be a string"))
 }
 
 fn optional_array<'a>(
@@ -2095,7 +2092,7 @@ fn optional_array<'a>(
     value
         .as_array()
         .map(Some)
-        .ok_or_else(|| format!("ai_prompt_shield: '{field}' must be an array"))
+        .ok_or_else(|| format!("ai_prompt_shield: `{field}` must be an array"))
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -2106,7 +2103,7 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
     for value in values {
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "ai_prompt_shield: '{field}' must contain only strings"
+                "ai_prompt_shield: `{field}` must contain only strings"
             ));
         };
         out.push(value.to_string());
@@ -2130,7 +2127,7 @@ fn render_placeholder(template: &str, name: &str) -> Result<String, String> {
     let placeholder = template.replace("{type}", name);
     if placeholder.len() > MAX_REDACTION_PLACEHOLDER_BYTES {
         return Err(format!(
-            "ai_prompt_shield: 'redaction_placeholder' rendered for pattern {name:?} must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
+            "ai_prompt_shield: `redaction_placeholder` rendered for pattern {name:?} must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
         ));
     }
     Ok(placeholder)
@@ -2162,7 +2159,7 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
         return Ok(None);
     };
     let type_error = format!(
-        "ai_prompt_shield: '{field}' must be an integer between 1 and {MAX_CONFIG_INTEGER}"
+        "ai_prompt_shield: `{field}` must be an integer between 1 and {MAX_CONFIG_INTEGER}"
     );
     let Value::Number(number) = value else {
         return Err(type_error);
@@ -2189,7 +2186,7 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     };
     if value == 0 {
         return Err(format!(
-            "ai_prompt_shield: '{field}' must be greater than zero"
+            "ai_prompt_shield: `{field}` must be greater than zero"
         ));
     }
     if value > MAX_CONFIG_INTEGER {
@@ -2197,7 +2194,7 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     }
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("ai_prompt_shield: '{field}' is too large for this platform"))
+        .map_err(|_| format!("ai_prompt_shield: `{field}` is too large for this platform"))
 }
 
 /// Collect every decoded JSON token for `ScanMode::All` detection so the

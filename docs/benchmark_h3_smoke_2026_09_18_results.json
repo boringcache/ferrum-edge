@@ -1,0 +1,492 @@
+{
+  "schema": 1,
+  "run_id": 35410602485,
+  "job_id": 105816411525,
+  "artifact_id": 10573924412,
+  "source_revision": "d19abaa3c4fbb40af6136cb577a1ed7e82bf8529",
+  "retained_file_count": 219,
+  "analysis": "stdlib JSON/text/hash analysis only; no repository code executed",
+  "status": "retained_failed_smoke",
+  "no_performance_claim": true,
+  "repair_validation": "pending hosted execution",
+  "arms": {
+    "direct": {
+      "client_returncode": 0,
+      "duration_secs": 2,
+      "concurrency": 200,
+      "total_requests": 95870,
+      "total_errors": 0,
+      "total_bytes": 981708800,
+      "useful_traffic_valid": false,
+      "smoke_issues": [
+        "smoke_missing_lifecycle_role:backend",
+        "smoke_missing_lifecycle_role:client"
+      ],
+      "operation_coverage": {
+        "backend": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "client": [
+          1,
+          2,
+          5,
+          6
+        ]
+      },
+      "lifecycle_by_role": {
+        "backend": {
+          "cookies": 1,
+          "births": 1,
+          "retirements": 0
+        },
+        "client": {
+          "cookies": 21,
+          "births": 21,
+          "retirements": 0
+        }
+      },
+      "streams": {
+        "tx": {
+          "lifecycle_rows": 4096,
+          "kinds": {
+            "21": 4096
+          },
+          "lifecycle_omitted": 71722,
+          "ring_drops": 3941,
+          "nonzero_loss_counters": {
+            "attempts": 225718,
+            "recorded": 225718,
+            "ring_full": 3941,
+            "witness_full": 225590
+          },
+          "first_event_ns": 56275786983,
+          "last_event_ns": 57179955703,
+          "backend_3445_rows": 4075,
+          "backend_cookies": [
+            4097
+          ],
+          "backend_distinct_nonzero_peer_ports": 21
+        },
+        "destroy": {
+          "lifecycle_rows": 4096,
+          "kinds": {
+            "21": 4096
+          },
+          "lifecycle_omitted": 71701,
+          "ring_drops": 4021,
+          "nonzero_loss_counters": {
+            "ring_full": 4021
+          },
+          "first_event_ns": 56275781198,
+          "last_event_ns": 57179922435,
+          "backend_3445_rows": 4075,
+          "backend_cookies": [
+            4097
+          ],
+          "backend_distinct_nonzero_peer_ports": 21
+        },
+        "lifetime": {
+          "lifecycle_rows": 48,
+          "kinds": {
+            "18": 24,
+            "19": 24
+          },
+          "lifecycle_omitted": 0,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 55629044889,
+          "last_event_ns": 56292464119,
+          "backend_3445_rows": 1,
+          "backend_cookies": [
+            4097
+          ],
+          "backend_distinct_nonzero_peer_ports": 0
+        }
+      },
+      "source_sha256": {
+        "sample.json": "055b28da595451c3884f1cf835639cab06a1f686d558b55c5c44a048567dcb29",
+        "benchmark.raw.json": "15715e37ff80250b44b8fa3d51b8ff03162d55cfea8ab6e65897cee31ee08701",
+        "proof.json": "b614c92d9a5d3a9512cba72ad1955c148063165cec8a4f4844180961bc872c4e",
+        "tx.jsonl": "a161a20f773b4e036db4e64081a920cfffc85d10a42c276c7dbf275d822294f9",
+        "destroy.jsonl": "ae11b94c4f5e0ef4b183eccb4e3054ea0a188f91be520a581da0ac1e036899d0",
+        "lifetime.jsonl": "86d24c00ba8c6603f279e36062dca89173c8907aebeef7ff5562bedf4c6fb133"
+      }
+    },
+    "ferrum": {
+      "client_returncode": 0,
+      "duration_secs": 2,
+      "concurrency": 200,
+      "total_requests": 34309,
+      "total_errors": 0,
+      "total_bytes": 351324160,
+      "useful_traffic_valid": true,
+      "smoke_issues": [],
+      "operation_coverage": {
+        "backend": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "client": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "gateway_frontend": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "gateway_upstream": [
+          1,
+          2,
+          5,
+          6
+        ]
+      },
+      "lifecycle_by_role": {
+        "backend": {
+          "cookies": 1,
+          "births": 1,
+          "retirements": 1
+        },
+        "client": {
+          "cookies": 21,
+          "births": 21,
+          "retirements": 21
+        },
+        "gateway_frontend": {
+          "cookies": 1,
+          "births": 1,
+          "retirements": 1
+        },
+        "gateway_upstream": {
+          "cookies": 1,
+          "births": 1,
+          "retirements": 1
+        }
+      },
+      "streams": {
+        "tx": {
+          "lifecycle_rows": 24,
+          "kinds": {
+            "21": 24
+          },
+          "lifecycle_omitted": 0,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {
+            "attempts": 175646,
+            "recorded": 175646,
+            "witness_full": 175518
+          },
+          "first_event_ns": 63615045309,
+          "last_event_ns": 66613238443,
+          "backend_3445_rows": 1,
+          "backend_cookies": [
+            8200
+          ],
+          "backend_distinct_nonzero_peer_ports": 1
+        },
+        "destroy": {
+          "lifecycle_rows": 54,
+          "kinds": {
+            "20": 29,
+            "21": 25
+          },
+          "lifecycle_omitted": 0,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 63613193314,
+          "last_event_ns": 70445970689,
+          "backend_3445_rows": 3,
+          "backend_cookies": [
+            8200
+          ],
+          "backend_distinct_nonzero_peer_ports": 1
+        },
+        "lifetime": {
+          "lifecycle_rows": 55,
+          "kinds": {
+            "18": 29,
+            "19": 26
+          },
+          "lifecycle_omitted": 0,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 61984490372,
+          "last_event_ns": 66612981720,
+          "backend_3445_rows": 1,
+          "backend_cookies": [
+            8200
+          ],
+          "backend_distinct_nonzero_peer_ports": 0
+        }
+      },
+      "source_sha256": {
+        "sample.json": "8612825037955e377a3af75d29ec733b3e620ff5235155dc317349f51f9793f5",
+        "benchmark.raw.json": "1fcf903a86ea8f6037fce14595f0661c61e82f338e8b5860f3c99ce93794c940",
+        "proof.json": "be9e15c59ed7b36852d4d0f13d3d5b96c77e1d407f259c5c7189c662f3d37206",
+        "tx.jsonl": "f7060b2b5d666d7355aa0b7acee8f06e9fa029f5511dfad4119860080336bff4",
+        "destroy.jsonl": "3366e4e69ce45d947f1eb37b9beedc10105681f13759d81f025876dba4d2afe0",
+        "lifetime.jsonl": "0b2017d0fe69a276adcb59d09ba3a34111f60449bc2846ff6fbeb8d6dd46c0b1"
+      }
+    },
+    "envoy": {
+      "client_returncode": 0,
+      "duration_secs": 2,
+      "concurrency": 200,
+      "total_requests": 9251,
+      "total_errors": 0,
+      "total_bytes": 94730240,
+      "useful_traffic_valid": false,
+      "smoke_issues": [
+        "smoke_missing_lifecycle_role:backend",
+        "smoke_missing_lifecycle_role:client",
+        "smoke_missing_lifecycle_role:gateway_frontend",
+        "smoke_missing_lifecycle_role:gateway_upstream"
+      ],
+      "operation_coverage": {
+        "backend": [
+          1,
+          2,
+          6
+        ],
+        "client": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "gateway_frontend": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "gateway_upstream": [
+          2,
+          5,
+          6
+        ]
+      },
+      "lifecycle_by_role": {
+        "backend": {
+          "cookies": 1,
+          "births": 1,
+          "retirements": 0
+        },
+        "client": {
+          "cookies": 21,
+          "births": 21,
+          "retirements": 0
+        },
+        "gateway_frontend": {
+          "cookies": 4,
+          "births": 4,
+          "retirements": 0
+        },
+        "gateway_upstream": {
+          "cookies": 4,
+          "births": 4,
+          "retirements": 0
+        }
+      },
+      "streams": {
+        "tx": {
+          "lifecycle_rows": 4096,
+          "kinds": {
+            "21": 4096
+          },
+          "lifecycle_omitted": 13773,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {
+            "attempts": 263377,
+            "recorded": 263377,
+            "witness_full": 263249
+          },
+          "first_event_ns": 77213623126,
+          "last_event_ns": 78590014877,
+          "backend_3445_rows": 4067,
+          "backend_cookies": [
+            12302
+          ],
+          "backend_distinct_nonzero_peer_ports": 4
+        },
+        "destroy": {
+          "lifecycle_rows": 4096,
+          "kinds": {
+            "20": 2,
+            "21": 4094
+          },
+          "lifecycle_omitted": 13811,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 74185517282,
+          "last_event_ns": 78589949563,
+          "backend_3445_rows": 4065,
+          "backend_cookies": [
+            12302
+          ],
+          "backend_distinct_nonzero_peer_ports": 4
+        },
+        "lifetime": {
+          "lifecycle_rows": 62,
+          "kinds": {
+            "18": 34,
+            "19": 28
+          },
+          "lifecycle_omitted": 0,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 72673314681,
+          "last_event_ns": 77265936948,
+          "backend_3445_rows": 1,
+          "backend_cookies": [
+            12302
+          ],
+          "backend_distinct_nonzero_peer_ports": 0
+        }
+      },
+      "source_sha256": {
+        "sample.json": "6be665f8e73ee0490ef1b5e11680c6a1da19f6dd0c6e0b4043ebb31e7dfc8ee4",
+        "benchmark.raw.json": "f75c8bee62dd1b081735c96a54fd398d41fd1b35e27c5e76470650eb91ed8c1f",
+        "proof.json": "5cae51f835cb315e3d21c43e79d06515fe7bda1aad08e6d72824817bdaaa19fa",
+        "tx.jsonl": "464861e63929b73e34f3dd97f699f69bc9ca3221c8361319fac5a2853a1efac1",
+        "destroy.jsonl": "8fee3299fddad3ed42ca6bd1702aac624ec254d89301e962e13beebd72286b4c",
+        "lifetime.jsonl": "4fca5da74566b57c4c7d4edacf5807ced77cdfa2fd4bb73db593dbb68f035a4b"
+      }
+    },
+    "envoy-limit-4": {
+      "client_returncode": 0,
+      "duration_secs": 2,
+      "concurrency": 200,
+      "total_requests": 9447,
+      "total_errors": 0,
+      "total_bytes": 96737280,
+      "useful_traffic_valid": false,
+      "smoke_issues": [
+        "smoke_missing_lifecycle_role:backend",
+        "smoke_missing_lifecycle_role:client",
+        "smoke_missing_lifecycle_role:gateway_frontend",
+        "smoke_missing_lifecycle_role:gateway_upstream"
+      ],
+      "operation_coverage": {
+        "backend": [
+          1,
+          2,
+          6
+        ],
+        "client": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "gateway_frontend": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "gateway_upstream": [
+          2,
+          5,
+          6
+        ]
+      },
+      "lifecycle_by_role": {
+        "backend": {
+          "cookies": 1,
+          "births": 1,
+          "retirements": 0
+        },
+        "client": {
+          "cookies": 21,
+          "births": 21,
+          "retirements": 0
+        },
+        "gateway_frontend": {
+          "cookies": 4,
+          "births": 4,
+          "retirements": 0
+        },
+        "gateway_upstream": {
+          "cookies": 26,
+          "births": 26,
+          "retirements": 0
+        }
+      },
+      "streams": {
+        "tx": {
+          "lifecycle_rows": 4096,
+          "kinds": {
+            "21": 4096
+          },
+          "lifecycle_omitted": 13998,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {
+            "attempts": 267299,
+            "recorded": 267299,
+            "witness_full": 267171
+          },
+          "first_event_ns": 87062706512,
+          "last_event_ns": 88425832766,
+          "backend_3445_rows": 4045,
+          "backend_cookies": [
+            8212
+          ],
+          "backend_distinct_nonzero_peer_ports": 26
+        },
+        "destroy": {
+          "lifecycle_rows": 4096,
+          "kinds": {
+            "20": 2,
+            "21": 4094
+          },
+          "lifecycle_omitted": 14066,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 84023115968,
+          "last_event_ns": 88425578299,
+          "backend_3445_rows": 4043,
+          "backend_cookies": [
+            8212
+          ],
+          "backend_distinct_nonzero_peer_ports": 26
+        },
+        "lifetime": {
+          "lifecycle_rows": 84,
+          "kinds": {
+            "18": 56,
+            "19": 28
+          },
+          "lifecycle_omitted": 0,
+          "ring_drops": 0,
+          "nonzero_loss_counters": {},
+          "first_event_ns": 83147391116,
+          "last_event_ns": 87129683034,
+          "backend_3445_rows": 1,
+          "backend_cookies": [
+            8212
+          ],
+          "backend_distinct_nonzero_peer_ports": 0
+        }
+      },
+      "source_sha256": {
+        "sample.json": "5f1127ff88c20a30bb78974a56d7d240f756eb239b335c73b68a1f75f65805b9",
+        "benchmark.raw.json": "3b1501d5ca6cf281cf1a9a7352bbe7b5303c84057b59a673ee0af95c98b1caca",
+        "proof.json": "d6465967ddd2de17f5651e3b1db2d22a30f65bec701966d751fce90c3a616ed3",
+        "tx.jsonl": "6332ba1638a852fff3886a71ffc7484ac29a5e024328c5c7b73eef111572528a",
+        "destroy.jsonl": "470459959b87cd07fbb955385246a7e8abffb0e51d1f3c5a7364b1c9fe14c394",
+        "lifetime.jsonl": "f9b9bce57c99c9b6be7ef6cc3a82b63706ddec2f6b5962aa38e604e0566154c6"
+      }
+    }
+  },
+  "summary_sha256": "d11f7b24685ef77b62a00862b6a0e28dd55b6e33060c22e5c008541260a9f8c8"
+}

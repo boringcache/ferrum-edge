@@ -1168,7 +1168,7 @@ fn test_invalid_config_shapes_rejected() {
 fn test_shared_validation_rejects_invalid_ai_token_metrics_config() {
     let err = validate_plugin_config("ai_token_metrics", &json!({"include_model": "yes"}))
         .expect_err("shared plugin validation must reject a non-boolean include_model");
-    assert_eq!(err, "ai_token_metrics: 'include_model' must be a boolean");
+    assert_eq!(err, "ai_token_metrics: `include_model` must be a boolean");
 }
 
 // ─── Synthetic short-circuit accounting guard ───────────────────────────────
