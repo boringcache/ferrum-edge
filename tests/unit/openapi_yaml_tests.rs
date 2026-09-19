@@ -4801,18 +4801,26 @@ fn ai_model_pattern_admission_matches_both_published_schemas() {
         (json!(["gpt-é"]), false),
         (json!(["gpt-*", 123]), false),
     ];
+    // The router requires an explicit `endpoint`; federation providers derive
+    // the URL from `provider_type` (optional `base_url`) and reject unknown
+    // keys, so each plugin gets its own minimal valid provider shape.
+    let provider_for = |name: &str| {
+        let mut provider = json!({
+            "name": "p", "provider_type": "openai", "api_key": "fixture-key"
+        });
+        if name == "ai_stream_router" {
+            provider["endpoint"] = json!("https://api.example.com/v1/chat/completions");
+        }
+        provider
+    };
     for (name, schema) in [
         ("ai_stream_router", "AiStreamRouterConfig"),
         ("ai_federation", "AiFederationConfig"),
     ] {
         for (patterns, valid) in &cases {
-            let config = json!({
-                "providers": [{
-                    "name": "p", "provider_type": "openai",
-                    "endpoint": "https://api.example.com/v1/chat/completions",
-                    "api_key": "fixture-key", "model_patterns": patterns
-                }]
-            });
+            let mut provider = provider_for(name);
+            provider["model_patterns"] = patterns.clone();
+            let config = json!({"providers": [provider]});
             assert_component_validity(&spec, schema, &config, *valid);
             let result = validate_plugin_config(name, &config);
             assert_eq!(result.is_ok(), *valid, "{name}: {patterns}: {result:?}");
@@ -4824,11 +4832,7 @@ fn ai_model_pattern_admission_matches_both_published_schemas() {
         // Federation keeps its omitted/empty catch-all; the router requires a
         // nonempty array even though the individual glob contract is shared.
         for patterns in [None, Some(json!([]))] {
-            let mut provider = json!({
-                "name": "p", "provider_type": "openai",
-                "endpoint": "https://api.example.com/v1/chat/completions",
-                "api_key": "fixture-key"
-            });
+            let mut provider = provider_for(name);
             if let Some(patterns) = patterns {
                 provider["model_patterns"] = patterns;
             }
