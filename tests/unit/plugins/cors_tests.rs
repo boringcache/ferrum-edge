@@ -2573,7 +2573,9 @@ fn cors_strict_origin_without_ws_allowlist_logs_composition_warning() {
         output.contains("allowed_ws_origins is empty"),
         "expected CORS/WebSocket composition warning, got: {output}"
     );
-    assert!(output.contains("ws-api"));
+    assert!(output.contains("proxy=<redacted scalar>"), "{output}");
+    assert!(output.contains("namespace=<redacted scalar>"), "{output}");
+    assert!(!output.contains("ws-api"), "{output}");
 }
 
 #[test]
