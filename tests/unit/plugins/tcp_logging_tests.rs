@@ -815,3 +815,46 @@ fn startup_diagnostics_preserve_socket_sink_context_and_egress_remediation() {
         }
     }
 }
+
+#[test]
+fn tls_source_diagnostics_distinguish_io_invalid_source_and_size() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("MissingSourceMarker5594.pem");
+    let oversized = dir.path().join("OversizedSourceMarker5594.pem");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(ferrum_edge::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES as u64 + 1)
+        .unwrap();
+    for (source, class) in [
+        (missing.to_str().unwrap(), "io"),
+        (
+            "file://SourceUserMarker5594:SourceSecretMarker5594@localhost/private",
+            "invalid_source",
+        ),
+        (oversized.to_str().unwrap(), "oversized"),
+    ] {
+        let error = TcpLogging::new(
+            &json!({"host": "localhost", "port": 5141, "tls": true}),
+            client_with_ca(source),
+        )
+        .err()
+        .expect("declared invalid CA source must reject construction");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for expected in [
+            "TCP logging",
+            "`FERRUM_TLS_CA_BUNDLE_PATH`",
+            &format!("({class})"),
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        for hidden in [
+            source,
+            "SourceMarker5594",
+            "SourceUserMarker5594",
+            "SourceSecretMarker5594",
+        ] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}
