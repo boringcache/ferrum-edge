@@ -1870,6 +1870,10 @@ paths:
       operationId: getPrometheusMetrics
       summary: Prometheus metrics (gated)
       description: |
+        Default-off `bench-h1-profile` diagnostic builds additionally emit fixed
+        `ferrum_h1_profile_*` counters and completeness metadata. These are bounded
+        Rust allocator, source-copy, body-poll and frontend AsyncWrite observations;
+        they do not report native allocation traffic or actual syscall counts.
         Returns gateway metrics in Prometheus exposition format. **Gated by
         default**: the caller must present a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originate from a
