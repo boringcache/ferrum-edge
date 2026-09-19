@@ -127,7 +127,7 @@ def client_pids(parent, proc_root=Path("/proc")):
 
 
 def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, stop_file=None,
-                     *, http3=False, envoy=False):
+                     *, http3=False, envoy=False, h2_gauges=False):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("sampling interval must be positive and finite")
@@ -170,6 +170,9 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
                                    for pid, role in roles.items() if role != "client"
                                    for thread in thread_snapshot(pid, ticks, parse_stat)]
             snapshot["transport"] = transport_snapshot(envoy)
+        if h2_gauges:
+            from h2_diagnostics import snapshot as h2_snapshot
+            snapshot["h2_gauges"] = h2_snapshot()
         timeline.append(snapshot)
 
     try:
@@ -212,9 +215,11 @@ if __name__ == "__main__":
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--http3", action="store_true")
     parser.add_argument("--envoy", action="store_true")
+    parser.add_argument("--h2-gauges", action="store_true")
     parser.add_argument("--parent-pid", type=int)
     parser.add_argument("--stop-file")
     args = parser.parse_args()
     sample_processes(args.backend, [int(pid) for pid in args.gateway_pids.split()],
                      args.output, args.interval, parent_pid=args.parent_pid,
-                     stop_file=args.stop_file, http3=args.http3, envoy=args.envoy)
+                     stop_file=args.stop_file, http3=args.http3, envoy=args.envoy,
+                     h2_gauges=args.h2_gauges)

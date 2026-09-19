@@ -83,6 +83,17 @@ def sample_issues(sample):
                     issues.append(f"incomplete {role} measurement bracket")
     if sample.get("error"):
         issues.append(str(sample["error"]))
+    if sample.get("h2_observation"):
+        observation = sample["h2_observation"]
+        phases = sample.get("phases") or {}
+        if sample.get("gateway") != "direct" and observation.get("gauges_available") is not True:
+            issues.append("missing H2 pool/connection observations")
+        if phases.get("transport_errors_total", 0) or phases.get("transport_close_timed_out"):
+            issues.append("H2 transport errors or incomplete driver observation")
+        if observation.get("capture_errors") or observation.get("backend_errors_observed"):
+            issues.append("H2 backend errors or incomplete diagnostic capture")
+        if phases.get("transport_events_suppressed", 0) or observation.get("backend_log_limit_reached"):
+            issues.append("truncated H2 transport observations")
     if sample.get("h3_experiment"):
         transport = sample.get("transport_diagnostics") or {}
         if transport.get("complete_bracket") is not True:
