@@ -111,9 +111,11 @@ paths:
   JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
   admission. Fixed schema paths and credential/operation ordinals survive
   rendering while supplied credentials, keys, identities, paths, patterns and
-  parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor logs
-  sanitize configured paths at emission. Registered rendered/captured regressions
-  and existing rejection/reload-retention assertions cover these boundaries.
+  parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor and
+  request/stream deny logs sanitize configured paths at emission. Fixed OIDC
+  cookie separator examples spell out double quote so the full reason survives.
+  Registered rendered/captured regressions and existing rejection/reload-retention
+  assertions cover these boundaries.
 - The #5594 traffic/transform conversion covers request/response/body/header
   transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
   GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and

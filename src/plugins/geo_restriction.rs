@@ -309,7 +309,7 @@ impl GeoRestriction {
                 LookupFailureAction::Deny => {
                     warn_sampled!(
                         client_ip = %client_ip,
-                        db_path = %self.db_path,
+                        db_path = %crate::startup::sanitize_startup_scalar(&self.db_path),
                         plugin = "geo_restriction",
                         reason = "db_not_loaded",
                         "MaxMind database not loaded, denying by on_lookup_failure policy"

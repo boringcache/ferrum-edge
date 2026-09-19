@@ -3714,6 +3714,28 @@ fn new_rejects_cookie_names_paths_and_domains_that_are_not_cookie_syntax() {
     }
 }
 
+#[test]
+fn invalid_cookie_name_constructor_diagnostic_renders_complete_separator_examples() {
+    for name in ["bad;cookie", "bad\"cookie"] {
+        let mut config = base_config();
+        config["session"]["cookie_name"] = json!(name);
+        let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .err()
+            .expect("invalid cookie syntax must still reject construction");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert_eq!(
+            rendered,
+            concat!(
+                "oidc_relying_party: `session.cookie_name` must be an RFC 6265 ",
+                "cookie-name token (ASCII, no control characters, spaces, or ",
+                "separators such as `;` `=` `,` or double quote)"
+            )
+        );
+        assert!(!rendered.contains("<redacted"), "{rendered}");
+        assert!(!rendered.contains(name), "{rendered}");
+    }
+}
+
 /// A browser silently discards a `__Host-`/`__Secure-` cookie whose attributes
 /// violate the prefix rules, so admitting the combination produces a login loop
 /// with no gateway-side signal (issue #5027).
