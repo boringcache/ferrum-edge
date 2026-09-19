@@ -43,7 +43,7 @@ jobs:
             -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3 \
             2>&1 | tee "$RUNNER_TEMP/h3-proof/apt-update.log"
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev \
-            libelf-dev zlib1g-dev gcc libc6-dev binutils iproute2 util-linux \
+            libelf-dev zlib1g-dev gcc libc6-dev binutils iproute2 util-linux python3-yaml \
             2>&1 | tee "$RUNNER_TEMP/h3-proof/apt-install.log"
           dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' \
             > "$RUNNER_TEMP/h3-proof/resolved-packages.tsv"
@@ -68,6 +68,8 @@ jobs:
       - name: Static syntax and evidence contract self-tests
         run: |
           set -euo pipefail
+          cc -std=gnu11 -O2 -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/decoder_test.c -o "$RUNNER_TEMP/h3-proof/build/decoder_test"
+          "$RUNNER_TEMP/h3-proof/build/decoder_test"
           bash -n tests/performance/multi_protocol/h3_proof/commands.sh
           python3 -m py_compile tests/performance/multi_protocol/h3_proof/*.py
           python3 -m unittest discover -v -s tests/performance/multi_protocol/h3_proof \

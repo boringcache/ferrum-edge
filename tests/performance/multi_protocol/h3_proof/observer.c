@@ -4,6 +4,8 @@
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/prctl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -19,6 +21,11 @@
 
 _Static_assert(sizeof(void *) == 8 && sizeof(struct msghdr) == 56, "native amd64 ABI");
 _Static_assert(offsetof(struct msghdr, msg_flags) == 48, "native msg_flags");
+_Static_assert(sizeof(struct mmsghdr) == 64 && offsetof(struct mmsghdr, msg_len) == 56, "native mmsghdr");
+_Static_assert(sizeof(struct cmsghdr) == 16 && CMSG_ALIGN(1) == 8, "native cmsg");
+static bool live;
+static unsigned int lifecycle_rows, lifecycle_omitted;
+static int rx_argc;
 static volatile sig_atomic_t stopping;
 static char verifier[256 * 1024];
 static size_t log_bytes;
@@ -85,13 +92,33 @@ static const struct site rx_sites[] = {
     // Only the first argument is consumed; accept four/five-argument variants.
     {"udp_recvmsg", -1, {"sock", "msghdr", "8", "4"}, "4"},
 };
+static const struct site attach_sites[] = {
+    {"reuseport_attach_prog", 2, {"sock", "bpf_prog"}, "4"},
+};
+static const struct site lifetime_sites[] = {
+    {"inet_create", 4, {"net", "socket", "4", "4"}, "4"},
+    {"inet_bind", 3, {"socket", "sockaddr", "4"}, "4"},
+};
+static const struct site destroy_sites[] = {
+    {"udp_destroy_sock", 1, {"sock"}, "void"},
+    {"udp_sendmsg", 3, {"sock", "msghdr", "8"}, "4"},
+    {"udp_recvmsg", -1, {"sock", "msghdr", "8", "4"}, "4"},
+};
+static const struct site group_sites[] = {
+    {"reuseport_alloc", 2, {"sock", "1"}, "4"},
+    {"reuseport_add_sock", 3, {"sock", "sock", "1"}, "4"},
+    {"reuseport_detach_sock", 1, {"sock"}, "void"},
+    {"reuseport_detach_prog", 1, {"sock"}, "4"},
+};
 static const struct site classic_sites[] = {
     {"reuseport_select_sock", 4, {"sock", "4", "sk_buff", "4"}, "sock"},
     {"run_bpf_filter", 5, {"sock_reuseport", "2", "bpf_prog", "sk_buff", "4"}, "sock"},
     {"reuseport_attach_prog", 2, {"sock", "bpf_prog"}, "4"},
+    {"inet_bind", 3, {"socket", "sockaddr", "4"}, "4"},
 };
 static bool matches(const struct btf *btf, __u32 type, const char *spec)
 {
+    if (!strcmp(spec, "void")) return type == 0;
     if (spec[0] >= '0' && spec[0] <= '9') return integer(btf, type, (unsigned int)atoi(spec));
     return pointer_to(btf, type, spec);
 }
@@ -103,6 +130,7 @@ static int check_site(const struct btf *b, const struct site *s)
     const struct btf_type *p = btf__type_by_id(b, f->type);
     if (!p || !btf_is_func_proto(p)) return EPROTO;
     int count = btf_vlen(p), checked = s->argc;
+    if (!strcmp(s->name, "udp_recvmsg")) rx_argc = count;
     fprintf(stderr, "BTF function %s id=%d argc=%d\n", s->name, id, count);
     if (checked < 0) {
         if (count != 4 && count != 5) return EPROTO;
@@ -118,7 +146,7 @@ static int check_ftrace(const struct site *sites, size_t count)
 {
     FILE *file = fopen("/sys/kernel/tracing/available_filter_functions", "r");
     if (!file) return errno;
-    bool found[3] = {};
+    bool found[8] = {};
     char line[512], name[256];
     unsigned int lines = 0;
     while (lines++ < 200000 && fgets(line, sizeof(line), file)) {
@@ -161,15 +189,20 @@ static int check_recvmsg_abi(void)
     int err = check_format("/sys/kernel/tracing/events/syscalls/sys_enter_recvmsg/format",
                            entry, input_offsets, 4);
     if (err) return err;
-    return check_format("/sys/kernel/tracing/events/syscalls/sys_exit_recvmsg/format",
-                         leave, output_offsets, 2);
+    err = check_format("/sys/kernel/tracing/events/syscalls/sys_exit_recvmsg/format", leave, output_offsets, 2);
+    if (err) return err;
+    const char *batch[] = {"__syscall_nr;", " fd;", " mmsg;", " vlen;", " flags;", " timeout;"};
+    const int batch_offsets[] = {8, 16, 24, 32, 40, 48};
+    err = check_format("/sys/kernel/tracing/events/syscalls/sys_enter_recvmmsg/format", batch, batch_offsets, 6);
+    if (err) return err;
+    return check_format("/sys/kernel/tracing/events/syscalls/sys_exit_recvmmsg/format", leave, output_offsets, 2);
 }
 static unsigned int pending_count(int fd, unsigned int *failures)
 {
     __u64 key, next;
     unsigned int n = 0;
     int result = bpf_map_get_next_key(fd, NULL, &next);
-    while (!result && n < 64) {
+    while (!result && n < 256) {
         n++; key = next;
         result = bpf_map_get_next_key(fd, &key, &next);
     }
@@ -189,6 +222,49 @@ static unsigned int pending_selection(int fd, unsigned int *failures)
     free(states);
     return active;
 }
+static int event(void *ctx, void *data, size_t size)
+{
+    (void)ctx;
+    if (size != sizeof(struct identity_event)) return -EPROTO;
+    if (lifecycle_rows++ >= 4096) { lifecycle_omitted++; return 0; }
+    const struct identity_event *e = data;
+    printf("{\"phase\":\"lifecycle\",\"cookie\":%llu,\"at_ns\":%llu,"
+           "\"cgroup\":%llu,\"pid\":%u,\"tid\":%u,\"process_start_ns\":%llu,"
+           "\"thread_start_ns\":%llu,\"kind\":%u,\"netns\":%u,\"family\":%u,"
+           "\"local_ipv4\":%u,\"local_port\":%u,\"peer_ipv4\":%u,\"peer_port\":%u,"
+           "\"so_rcvbuf\":%u,\"so_sndbuf\":%u,\"drops\":%u,\"result\":%d,"
+           "\"peer_cookie\":%llu,\"instruction_digest_fnv1a64\":%llu,\"attachment_generation\":%llu,"
+           "\"program_type\":%u,\"instruction_count\":%u,\"digest_valid\":%u}\n",
+           (unsigned long long)e->cookie, (unsigned long long)e->at_ns,
+           (unsigned long long)e->cgroup, (unsigned int)(e->pid_tgid >> 32), (unsigned int)e->pid_tgid,
+           (unsigned long long)e->process_start_ns, (unsigned long long)e->thread_start_ns,
+           e->kind, e->netns, e->local.family, e->local.address, e->local.port,
+           e->peer.address, e->peer.port, e->rcvbuf, e->sndbuf, e->drops, e->result,
+           (unsigned long long)e->peer_cookie, (unsigned long long)e->instruction_digest,
+           (unsigned long long)e->attachment_generation, e->program_type, e->instruction_count, e->digest_valid);
+    return 0;
+}
+static int emit_witnesses(struct bpf_object *obj)
+{
+    int fd = bpf_object__find_map_fd_by_name(obj, "witnesses");
+    __u64 key, next;
+    unsigned int rows = 0;
+    int result = bpf_map_get_next_key(fd, NULL, &next);
+    while (!result && rows++ < 4096) {
+        key = next;
+        struct witness w;
+        if (bpf_map_lookup_elem(fd, &key, &w)) return 1;
+        printf("{\"phase\":\"witness\",\"at_ns\":%llu,\"cookie\":%llu,"
+               "\"kind\":%u,\"length\":%u,\"segment\":%u,\"result\":%lld,"
+               "\"pid\":%u,\"tid\":%u,\"process_start_ns\":%llu,\"thread_start_ns\":%llu}\n",
+               (unsigned long long)w.at_ns, (unsigned long long)w.key.cookie,
+               w.key.kind, w.key.length, w.key.segment, (long long)w.key.result,
+               (unsigned int)(w.pid_tgid >> 32), (unsigned int)w.pid_tgid,
+               (unsigned long long)w.process_start_ns, (unsigned long long)w.thread_start_ns);
+        result = bpf_map_get_next_key(fd, &key, &next);
+    }
+    return result && errno != ENOENT;
+}
 static int snapshot(struct bpf_object *obj, const char *phase, unsigned long long start)
 {
     int fd = bpf_object__find_map_fd_by_name(obj, "counts");
@@ -201,11 +277,12 @@ static int snapshot(struct bpf_object *obj, const char *phase, unsigned long lon
         if (bpf_map_lookup_elem(lfd, &i, &losses[i])) failures++;
     unsigned int tx = pending_count(bpf_object__find_map_fd_by_name(obj, "tx_pending"), &failures);
     unsigned int rx = pending_count(bpf_object__find_map_fd_by_name(obj, "rx_pending"), &failures);
+    unsigned int detached = pending_count(bpf_object__find_map_fd_by_name(obj, "detach_pending"), &failures);
     unsigned int selector = pending_selection(bpf_object__find_map_fd_by_name(obj, "selection"), &failures);
     printf("{\"phase\":\"%s\",\"start_ns\":%llu,\"end_ns\":%llu,\"rows\":[",
            phase, start, now_ns());
     int result = bpf_map_get_next_key(fd, NULL, &next);
-    while (!result && rows < 512) {
+    while (!result && rows < 4096) {
         key = next;
         if (bpf_map_lookup_elem(fd, &key, &v)) { failures++; break; }
         if (rows++) printf(",");
@@ -223,15 +300,16 @@ static int snapshot(struct bpf_object *obj, const char *phase, unsigned long lon
     for (int i = 0; i < LOSS_MAX; i++) printf("%s%llu", i ? "," : "", (unsigned long long)losses[i]);
     printf("],\"map_read_failures\":%u,\"pending_tx\":%u,\"pending_rx\":%u,"
            "\"pending_selector\":%u,\"verifier_log_truncated\":%s,\"stream_sequence_gaps\":null,"
-           "\"ring_drops\":null,\"stream_reason\":\"count_maps_no_event_stream\"}\n", failures, tx, rx, selector,
-           log_truncated ? "true" : "false");
+           "\"ring_drops\":%llu,\"pending_detach\":%u,"
+           "\"stream_reason\":\"count_maps_and_bounded_unsequenced_lifecycle_ring\"}\n", failures, tx, rx, selector,
+           log_truncated ? "true" : "false", (unsigned long long)losses[RING_FULL], detached);
     fflush(stdout);
     return failures ? 1 : 0;
 }
 int main(int argc, char **argv)
 {
-    if (argc != 6) {
-        fprintf(stderr, "usage: observer OBJECT {tx|rx|classic} NETNS {512|1} {normal|missing-btf|missing-symbol}\n");
+    if (argc != 6 && argc != 7) {
+        fprintf(stderr, "usage: observer OBJECT {tx|rx|classic|attach|lifetime|destroy|group|process} NETNS {4096|512|1} {normal|missing-btf|missing-symbol} [OWNED_CGROUP]\n");
         return 2;
     }
     const struct site *sites;
@@ -239,9 +317,19 @@ int main(int argc, char **argv)
     char prefix;
     if (!strcmp(argv[2], "tx")) { sites = tx_sites; nsites = 2; prefix = 't'; }
     else if (!strcmp(argv[2], "rx")) { sites = rx_sites; nsites = 1; prefix = 'r'; }
-    else if (!strcmp(argv[2], "classic")) { sites = classic_sites; nsites = 3; prefix = 'c'; }
+    else if (!strcmp(argv[2], "classic")) { sites = classic_sites; nsites = 4; prefix = 'c'; }
+    else if (!strcmp(argv[2], "attach")) { sites = attach_sites; nsites = 1; prefix = 'a'; }
+    else if (!strcmp(argv[2], "lifetime")) { sites = lifetime_sites; nsites = 2; prefix = 'l'; }
+    else if (!strcmp(argv[2], "destroy")) { sites = destroy_sites; nsites = 3; prefix = 'd'; }
+    else if (!strcmp(argv[2], "group")) { sites = group_sites; nsites = 4; prefix = 'g'; }
+    else if (!strcmp(argv[2], "process")) { sites = NULL; nsites = 0; prefix = 'p'; }
     else return 2;
-    if (strcmp(argv[4], "512") && strcmp(argv[4], "1")) return 2;
+    live = argc == 7;
+    pid_t parent = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM)) return unavailable("error", "parent_death_signal", errno);
+    signal(SIGTERM, stop_signal); signal(SIGINT, stop_signal);
+    if (getppid() != parent) stopping = 1;
+    if (strcmp(argv[4], "512") && strcmp(argv[4], "1") && strcmp(argv[4], "4096")) return 2;
     if (strcmp(argv[5], "normal") && strcmp(argv[5], "missing-btf") && strcmp(argv[5], "missing-symbol")) return 2;
     libbpf_set_print(logger);
     const char *btf_path = !strcmp(argv[5], "missing-btf") ? "/nonexistent/h3-proof-btf" : "/sys/kernel/btf/vmlinux";
@@ -250,7 +338,11 @@ int main(int argc, char **argv)
     if (!btf || berr) return unavailable("unsupported", "btf_read", berr ? (int)-berr : errno);
     for (size_t i = 0; i < nsites; i++) {
         int err = check_site(btf, &sites[i]);
-        if (err) { btf__free(btf); return unavailable("unsupported", "btf_symbol_or_prototype", err); }
+        if (err) {
+            btf__free(btf);
+            return unavailable("unsupported", !strcmp(sites[i].name, "run_bpf_filter") && err == ENOENT
+                ? "missing_run_bpf_filter_execution_site" : "btf_symbol_or_prototype", err);
+        }
     }
     if (!strcmp(argv[5], "missing-symbol")) {
         struct site absent = {"h3_proof_deliberately_absent", 0, {NULL}, "4"};
@@ -259,7 +351,7 @@ int main(int argc, char **argv)
         return unavailable(err ? "unsupported" : "error", "injected_missing_symbol", err);
     }
     btf__free(btf);
-    int surface_error = check_ftrace(sites, nsites);
+    int surface_error = nsites ? check_ftrace(sites, nsites) : 0;
     if (surface_error) return unavailable("unsupported", "ftrace_function_visibility", surface_error);
     if (prefix == 'r' && (surface_error = check_recvmsg_abi()))
         return unavailable("unsupported", "native_recvmsg_tracepoint_abi", surface_error);
@@ -270,23 +362,37 @@ int main(int argc, char **argv)
     struct bpf_program *prog;
     bpf_object__for_each_program(prog, obj) {
         const char *name = bpf_program__name(prog);
-        bpf_program__set_autoload(prog, name[0] == prefix && name[1] == '_');
+        bool enabled = (name[0] == prefix && name[1] == '_') || (prefix == 'c' && !strcmp(name, "a_attach"));
+        if ((!strcmp(name, "r_inner4") && rx_argc != 4) ||
+            (!strcmp(name, "r_inner5") && rx_argc != 5)) enabled = false;
+        bpf_program__set_autoload(prog, enabled);
     }
     struct bpf_map *map = bpf_object__find_map_by_name(obj, "counts");
     if (!map || bpf_map__set_max_entries(map, (__u32)atoi(argv[4]))) return unavailable("error", "map_config", errno);
+    // Eight independently qualified families share a total 4 MiB ring budget.
+    if (live && bpf_map__set_max_entries(bpf_object__find_map_by_name(obj, "lifecycle"), 512 * 1024))
+        return unavailable("error", "ring_budget", errno);
     int err = bpf_object__load(obj);
     if (err) {
         fwrite(verifier, 1, strnlen(verifier, sizeof(verifier)), stderr);
         bpf_object__close(obj);
-        return unavailable(err == -EPERM || err == -EACCES || err == -EOPNOTSUPP ? "unsupported" : "error", "load", -err);
+        return unavailable(err == -EOPNOTSUPP ? "unsupported" : "error", "load", -err);
     }
     __u32 zero = 0;
     char *end = NULL;
-    struct config cfg = {.netns = strtoull(argv[3], &end, 10)};
+    struct config cfg = {.netns = strtoull(argv[3], &end, 10), .live = live, .start_ns = now_ns()};
     if (!end || *end || !cfg.netns) return unavailable("error", "netns_argument", EINVAL);
     if (bpf_map_update_elem(bpf_object__find_map_fd_by_name(obj, "config"), &zero, &cfg, BPF_ANY))
         return unavailable("error", "configure", errno);
-    struct bpf_link *links[8] = {};
+    if (live) {
+        int cfd = open(argv[6], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (cfd < 0 || bpf_map_update_elem(bpf_object__find_map_fd_by_name(obj, "owned"), &zero, &cfd, BPF_ANY))
+            return unavailable("error", "owned_cgroup", errno);
+        close(cfd);
+    }
+    struct ring_buffer *ring = ring_buffer__new(bpf_object__find_map_fd_by_name(obj, "lifecycle"), event, NULL, NULL);
+    if (!ring) return unavailable("error", "ring_create", errno);
+    struct bpf_link *links[16] = {};
     int nlinks = 0;
     bpf_object__for_each_program(prog, obj) {
         if (!bpf_program__autoload(prog)) continue;
@@ -308,18 +414,36 @@ int main(int argc, char **argv)
            "\"netns\":%llu,\"start_ns\":%llu,\"links\":%d,\"exercise_verified\":false}\n",
            argv[2], (unsigned long long)cfg.netns, start, nlinks);
     fflush(stdout);
-    // Hard 30-second lifetime, bounded protocol (one-byte commands).
-    int status = 0, snapshots = 0;
-    while (!stopping && now_ns() - start < 30000000000ULL) {
+    // One session through retirement; fixed hard cap, explicit parent/timeout outcome.
+    int status = 0, snapshots = 0, checkpoints_omitted = 0;
+    unsigned long long checkpoint = start;
+    bool requested_stop = false;
+    while (!stopping && now_ns() - start < (live ? 300000000000ULL : 30000000000ULL)) {
+        int consumed = ring_buffer__consume(ring);
+        if (consumed < 0) { status = 1; break; }
+        if (live && now_ns() - checkpoint >= 10000000000ULL && snapshots < 63) {
+            status |= snapshot(obj, "checkpoint", start); snapshots++; checkpoint = now_ns();
+        }
         struct pollfd p = {.fd = STDIN_FILENO, .events = POLLIN};
         if (poll(&p, 1, 100) <= 0) continue;
         char c;
-        if (read(STDIN_FILENO, &c, 1) != 1 || c == 'q') break;
-        if (c == 's' && snapshots++ < 4) status |= snapshot(obj, "snapshot", start);
+        if (read(STDIN_FILENO, &c, 1) != 1) break;
+        if (c == 'q') { requested_stop = true; break; }
+        if (c == 's') {
+            if (snapshots < (live ? 63 : 4)) { snapshots++; status |= snapshot(obj, "snapshot", start); }
+            else checkpoints_omitted++;
+        }
     }
     // Detach before final reads: final map iteration has no concurrent writers.
     for (int i = 0; i < nlinks; i++) bpf_link__destroy(links[i]);
+    if (ring_buffer__consume(ring) < 0) status = 1;
+    if (live) status |= emit_witnesses(obj);
     status |= snapshot(obj, "final", start);
+    printf("{\"phase\":\"termination\",\"requested_stop\":%s,\"signal\":%s,"
+           "\"forced_or_parent_death\":%s,\"lifecycle_omitted\":%u,\"snapshot_failures\":%d,\"checkpoints_omitted\":%d}\n",
+           requested_stop ? "true" : "false", stopping ? "true" : "false",
+           requested_stop ? "false" : "true", lifecycle_omitted, status, checkpoints_omitted);
+    ring_buffer__free(ring);
     bpf_object__close(obj);
     return status;
 }

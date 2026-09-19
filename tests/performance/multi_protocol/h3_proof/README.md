@@ -1,253 +1,172 @@
-# H3 observer capability prerequisite (#5588)
+# Hosted H3 proof and corrected-image comparison
 
-This independent hosted lane asks what the runner and a bounded observer can
-actually observe. It launches only synthetic IPv4 UDP fixtures. It does not run
-Ferrum, Envoy, an HTTP/3 client, a benchmark, or a release build. It neither proves
-gateway behavior nor closes #5588. Dependency PR #5602 and the existing H3 1.33.5
-observations retain their original limits. Shared harness and production files
-are deliberately outside this directory's integration contract.
+This directory implements the finite `corrected-v1` follow-up for #5588 in draft
+PR #5615. It changes the benchmark/observer, not production forwarding. Committing
+it does not assert a passing verifier, workload result, performance gain or issue
+closure. Execute this code only on GitHub-hosted Linux amd64 runners.
 
-The first repaired run's [retained capability results](../../../../docs/benchmark_h3_preflight_2026_09_18.md)
-show positive fixture GSO/GRO evidence and explicit partial/unsupported paths.
-They do not establish gateway behavior.
+The original `16a981d5` capability evidence is retained **unchanged** in
+[the preflight report](../../../../docs/benchmark_h3_preflight_2026_09_18.md) and
+[its extraction](../../../../docs/benchmark_h3_preflight_2026_09_18_results.json).
+That report describes its original source, including preassigned fixture cookies,
+excluded recvmmsg, both earlier failures, and absent classic execution helper.
+The new implementation must acquire its own hosted evidence. Do not relabel the
+old observations with these new capabilities.
 
-## Hosted registration and root commands
+## Fixed comparison
 
-`.github/workflows/h3-proof-preflight.yml` registers **H3 observer compile and
-hosted self-tests** on `pull_request` when this directory or that workflow changes.
-It compiles the standalone C/libbpf observer, runs Python syntax/contract tests,
-then runs the real fixtures. This does not depend on a newly added manual
-workflow already being registered on the default branch. It does not add a
-branch-protection requirement or modify the immutable existing workflows.
+`live_campaign.json` declares all experimental inputs before dispatch:
 
-Root can later explicitly dispatch the registered workflow (this implementer
-does not dispatch it):
+- Official Envoy Linux amd64 image
+  `docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb`,
+  source `d7809ba2b07fd869d49bfb122b27f6a7977b4d94`, as approved in root's plan.
+  No Envoy compilation or source-build comparison occurs.
+- Direct, Ferrum, Envoy upstream 100 and **the same** Envoy upstream 4; actual
+  downstream listener admission and HCM settings stay at 100. A parsed semantic
+  config comparison requires exactly one changed upstream admission field.
+- Payloads 10240/71680/512000/1048576/5242880, workers 200/200/200/100/50,
+  client connections 21/21/21/11/6, 30 seconds, four counterbalanced pairs:
+  **80 main samples** across five shards, one payload and one boot per shard.
+- Effective kernel receive/send buffers 4194304. Envoy requests half that value
+  because Linux doubles explicit requests. Cookie-joined readback of actual
+  owned sockets is required for comparison acceptance. Missing brackets remain
+  incomplete. SNI `localhost`, upstream CA validation, both H3 hops, strict
+  HTTP 200/exact body, no retry/fallback, phase and endpoint-drain contracts stay
+  in force. Existing client frontend TLS verification remains explicitly insecure.
 
-```sh
-gh workflow run h3-proof-preflight.yml \
-  --ref codex/20260918-5588-h3-proof-preflight -f suite=capability-v1
-```
+The new `.github/workflows/h3-live-comparison.yml` has read-only permissions and
+pinned actions. PR checks compile features, run semantic contracts and real
+fixtures, then a short real four-arm gateway smoke. Its manual job reuses that
+same workflow's compiled and hashed Ferrum/harness/observer artifacts after the
+smoke. Ferrum is packaged once as an image; its image configuration ID, source
+revision, binary/build ID and artifact hashes are retained. The local packaged
+image ID is not represented as a registry manifest digest. The approved Envoy
+manifest/config IDs, actual binary SHA/build ID, generated config and effective
+runtime response are retained separately.
 
-The only input is the fixed choice `suite=capability-v1`; PR and manual execution
-use identical committed inputs. Runner: `ubuntu-24.04`, Linux amd64, maximum
-15 minutes. No shell input, image override, arbitrary PID, arbitrary script,
-gateway privilege flag or campaign input exists. Permissions are `contents: read`;
-checkout and artifact actions use full commit pins, checkout credentials are not
-persisted. No action publishes a build or changes a PR/issue.
-
-All compile commands are in the new workflow. Ubuntu packages are resolved at
-install time; the lane retains the full binary/source package/version inventory,
-APT origins and exact-version package records (including archive SHA256 when
-available), install logs, compiler versions and hashes. This is resolved package
-provenance, **not** a claim that a moving hosted image is reproducible. There is
-no downloaded source build or unpinned executable action. Repository SHA, source
-and object SHA256, ELF build IDs, runner ImageOS/ImageVersion, kernel release,
-GNU kernel build ID, BTF hash, kernel config availability, capability/LSM/lockdown/
-seccomp/sysctl/memlock evidence accompany every completed capability attempt.
-
-Hosted-only driver, after the workflow's compile commands:
-
-```sh
-sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
-  python3 tests/performance/multi_protocol/h3_proof/hosted.py \
-  --suite capability-v1 --output "$RUNNER_TEMP/h3-proof"
-```
-
-Never run these commands locally under this assignment. No hosted result is
-asserted by committing this implementation. Root must inspect exact-head CI
-and artifacts before relying on any capability.
-
-The driver requires `GITHUB_ACTIONS=true`, `RUNNER_ENVIRONMENT=github-hosted`,
-Linux/X64 runner metadata and the native Linux x86_64 platform. Sudo preserves
-the hosted-environment variable, and the nested driver checks it again.
-`commands.sh` lists every process command explicitly. Python invokes that fixed
-repository-relative shell path with literal argv and passes command-specific
-inputs as named environment data, validated against finite choices or data formats.
-There is no computed executable, forwarded argv, evaluated shell text or policy
-exemption. Command records retain the launcher argv, action, data and working
-directory alongside output, truncation, return code and timing.
-The initial head's [trusted policy job](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35402162742/job/105784199719)
-rejected `hosted.py` for an opaque process command. The policy's Python reader
-requires literal argv elements (apart from its unrelated, exact Git-diff
-exception); it does not infer a bound from callers of a generic argv wrapper.
-Both Python process sites now expose the shell file for normal source scanning.
-
-Before isolation, the privileged driver creates a fresh root-owned
-`/tmp/ferrum-h3-proof` tree. It retains the same repository-relative script paths
-and installs the compiled observer/PMU at fixed absolute paths. Directories are
-0755, source/object files 0644 and binaries 0755; UID 65534 can read/execute them
-but cannot modify them. Existing staging paths are rejected. Staged source and
-object hashes must equal their checkout/build counterparts, and both inventories
-are retained. The disposable runner owns cleanup; checkout permissions are not
-changed. This also avoids traversing private runner checkout ancestors after
-dropping privilege.
-
-The first hosted attempt at `ee7a0cc3`
-([job 105784199368](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35402162913/job/105784199368))
-compiled all three C outputs and passed the evidence tests, then failed at runtime:
-the fixture's absolute checkout path returned `EACCES`, and TX/RX CO-RE loading
-failed on `sock.sk_cookie.counter`. Staging repairs fixture access; the cookie
-declaration/read now names `__sk_common.skc_cookie.counter`, the actual member
-behind [Linux's `sk_cookie` macro](https://github.com/torvalds/linux/blob/v6.17/include/net/sock.h).
-The same run lacked `run_bpf_filter` in BTF, which remains explicitly unsupported.
-The repaired capability lane passed at `16a981d5`; its results are retained in
-the report above. Final integration still requires all exact-head hosted gates.
-
-## What the probes establish
-
-| Family | Attach sites | Positive criterion and scope |
-|---|---|---|
-| IPv4 TX | `fentry/udp_sendmsg`, `fentry/udp_send_skb`, `fexit/udp_sendmsg` | Exactly one submission, effective `inet_cork.gso_size`, payload length greater than segment size, and successful full `udp_sendmsg` return. Includes per-message paths inside `sendmmsg`; syscall batch count is never treated as bytes. |
-| Native IPv4 RX | `sys_enter_recvmsg`, `fentry/udp_recvmsg`, `sys_exit_recvmsg` | Actual socket cookie plus successful **outer syscall** return, returned native-int `SOL_UDP/UDP_GRO`, and returned bytes greater than stride. No `MSG_TRUNC`, `MSG_CTRUNC`, `MSG_PEEK`, failed header read or failed copyout qualifies. |
-| Classic reuseport | `fexit/reuseport_attach_prog`, `fentry/fexit/reuseport_select_sock`, `fexit/run_bpf_filter` | Fixture successfully attaches `SO_ATTACH_REUSEPORT_CBPF`; non-null inner classic-helper return proves selection through that branch, joined to the selected socket's cookie and actual fixture receipt. An outer selector hit alone is never positive execution evidence. |
-
-The loader checks the **running** BTF function prototypes and exact ftrace
-function availability before loading each family. CO-RE relocates the small
-named-field declarations against that kernel's BTF; declarations are not hardcoded
-kernel offsets. RX also checks the exposed syscall tracepoint field offsets and
-sizes against its native amd64 ABI. Missing/inlined/renamed functions, unsupported
-prototypes, unavailable tracepoint metadata, missing BTF or denied permission
-produce an explicit unavailable path with stage, errno, and diagnostics. There
-is no guessed instruction offset, assumed 6.8 binary layout, kprobe search
-framework or outer-selector substitution. A relocation/verifier rejection is
-an **error** needing root investigation, not automatically an unsupported pass.
-
-The code's semantic reference is the upstream
-[reuseport helper](https://github.com/torvalds/linux/blob/v6.8/net/core/sock_reuseport.c),
-[IPv4 UDP path](https://github.com/torvalds/linux/blob/v6.8/net/ipv4/udp.c),
-[returned GRO integer](https://github.com/torvalds/linux/blob/v6.8/include/linux/udp.h),
-[outer recvmsg copyout](https://github.com/torvalds/linux/blob/v6.8/net/socket.c), and
-[syscall tracepoint metadata](https://github.com/torvalds/linux/blob/v6.8/kernel/trace/trace_syscalls.c).
-These links explain the selected sites; the hosted BTF/attach checks and actual
-fixtures determine whether that runner supports them. TX ancillary is **u16**;
-RX ancillary is **native int**. The TX probe reads the effective kernel value
-after socket-default/cmsg resolution, not an arbitrary userspace control value.
-
-The fallback fixture installs a constant out-of-range classic return and receives
-the resulting packet on one group member. An observed inner null followed by
-outer non-null confirms the fallback path. **Inner null alone does not prove the
-classic instructions ran** (the helper has earlier failure exits). Its assessment
-therefore remains partial; the separate valid-selection fixture supplies the
-positive execution witness. Classic filters need not appear in `bpftool prog show`.
-
-## Synthetic runtime tests and identity
-
-The driver enters disposable network and mount namespaces, enables only their
-loopback interface and attempts to expose tracefs in that private mount namespace.
-The observer runs privileged. Fixtures run separately under UID/GID 65534 with
-empty supplementary groups, no capabilities in any set, and `no_new_privs`.
-Their effective capability/seccomp state is retained. No gateway is launched
-under observer privilege; later integration must preserve this separation.
-
-Runtime cases assert socket/path attribution, not just source text:
-
-- Classic constant selection of slot 1, separate invalid-index/hash fallback,
-  successful userspace and kernel attachment, selected-cookie/receive agreement.
-- Real 4096/1024 socket-default and 2048/512 cmsg-override GSO sends and returned
-  multi-segment GRO; ordinary 256-byte sends with explicit cmsg override to zero.
-- Invalid four-byte TX cmsg rejection, empty-receiver EAGAIN, data/control
-  truncation, peek versus consumed receive, shared FD and real FD reuse.
-- A real partial `sendmmsg` (one valid message then invalid control) and partial
-  `recvmmsg`. TX observes each kernel send; RX records excluded API coverage and
-  makes no `recvmmsg` GRO claim.
-- Unreadable recvmsg header and successful kernel receive followed by failed
-  sockaddr copyout, preventing a false positive from kernel return alone.
-- A real count-map capacity of **one**, forcing map-update overflow after the
-  first positive example. Loss must be reported and that example must survive.
-- Missing-BTF path, absent-symbol lookup and a capability-stripped observer
-  attempt. Actual host restrictions are retained, even if they block testing a
-  later failure stage; these injection cases are labelled in their filenames.
-
-Every fixture assigns `SO_COOKIE` **before** bind, attachment or traffic. Evidence
-identity is boot ID + network namespace inode + socket cookie within the recorded
-fixture lifetime. Socket rows retain PID/start ticks and FD generation, opening
-and descriptor-close times. Duplicate descriptors share a cookie; reused FDs get
-a fresh cookie. The observer exports no FD, port-only identity, packet address,
-raw pointer or decoded program instructions. Softirq matching uses the actual
-socket/netns; classic state is per CPU, with nesting failures recorded. `cpu`
-means CPU, never gateway worker PID. Kernel destruction and arbitrary-process
-FD/lineage tracking are **not implemented**; descriptor close is not presented as
-a kernel destruction timestamp. A zero/unassigned cookie is unknown and counted
-as lost identity, never joined by port or substituted with a published pointer.
-
-## Bounds, lifecycle and results
-
-Root's later integration can own stdin/stdout of the compiled observer:
+Root must merge/register the new workflow before dispatching it. The ordinary
+`experiment.json` stays disabled; frozen workflows, gates, policies and the
+existing H1/H2 paths are unchanged. The runner's only new selector is:
 
 ```text
-observer OBJECT {tx|rx|classic} NETNS {512|1} {normal|missing-btf|missing-symbol}
-stdout: one JSON ready record after every required link is attached
-stdin:  s = snapshot (at most four), q = stop
-stdout: final JSON snapshot after detach; SIGTERM also requests orderly stop
+run_gateway_protocol_bench.sh http3 --h3-live corrected-v1 {smoke|10240|71680|512000|1048576|5242880} --output-dir PATH
 ```
 
-Start the observer before fixture sockets exist, wait for `ready`, retain it
-through descriptor closure, then stop and read `final`. Each family has its own
-readiness and coverage; no failed family invalidates another working family's
-positive evidence. The current 30-second observer limit is deliberately too
-small for a campaign and must be reviewed before harness integration. In-flight
-operations at detach remain pending and invalidate complete interval coverage.
+The privileged entrypoint admits only hosted Linux amd64. All launches resolve
+through literal `live_commands.sh` commands; user data never supplies executable
+text. Fresh root-owned staging rejects reuse and checks source/object hash parity.
+Native workloads run as UID/GID 65534 without capabilities and with no-new-privs;
+both Docker gateways additionally use the same default seccomp, read-only root
+and host network. They have no Docker socket or writable observer maps. Only the
+provisioner/observer is privileged. Process privilege records are retained and
+checked. Socket budgets are set on the disposable runner before workload birth.
 
-The maps have 512 distinct metadata keys and 64 pending operations per direction,
-plus one selector state per possible CPU. There is no eviction, packet stream,
-ring buffer or unbounded per-packet log. Rows aggregate counts and first/last
-monotonic timestamps for cookie/selected cookie/kind/length/stride/return/CPU.
-They serve as bounded positive examples. Control parsing is limited to eight
-headers and 256 bytes; only the allowlisted GRO integer is decoded. Overflow,
-unknown cookies, failed reads, nesting, unmatched contexts, excluded RX APIs,
-record attempts, successful records, map read failures and outstanding operations
-are retained. Ring loss and event-sequence gaps are inapplicable to count maps
-and represented as null/reason, never invented zeros. Unobservable kernel tracing
-recursion/misses are not quantified, so even apparently clean fixture snapshots
-do not authorize global absence, exact totals or complete routing distribution.
+## Calibration and raw retention
 
-Verifier diagnostics are capped at 768 KiB per case and address-like diagnostics
-are redacted. Command output has explicit truncation flags. The artifact budget
-is 64 MiB; exceeding it fails the lane. No packet payload/header, QUIC key,
-arbitrary ancillary value, socket address or runtime kernel pointer is retained.
-Source code, objects and fixture classic-instruction hashes are retained as
-provenance, not as captured traffic. Incomplete evidence keeps positive witnesses
-while refusing absence/totals claims.
+For each payload/arm, two paired off/on pilots reverse treatment order. Both
+retain the same passive sampler. Predeclared tolerances are 2% useful RPS and 5%
+p99; paired log-ratio Student-t intervals (df=1) retain the very large uncertainty
+possible with two pairs. Every arm must resolve within both tolerances to use
+active observation in the main comparison. Missing metrics, invalid traffic or
+failed observers never pass calibration.
 
-`summary.json` indexes individual case JSON/log files. Status meanings:
+Otherwise all four main pairs run without the active observer, followed after
+each pair by a matched traced diagnostic pair. Proof belongs to those diagnostic
+samples only. No observer overhead is subtracted. Every raw failed/malformed
+benchmark output, stderr, readiness record and partial snapshot remains in its
+original file; derived metadata is separate. Failure metadata exists before
+startup and workflows always upload results. A timeout is never replaced with
+an `rps: 0` benchmark. Useful-traffic validity and proof completeness are separate.
 
-| Status | Meaning / CI behavior |
-|---|---|
-| `supported` | A case's declared limited surface ran and its runtime assertions passed. Not universal H3 proof. |
-| `unsupported` | Exact unavailable capability/stage/errno, or missing positive loopback GRO delivery, with available fixture/provenance evidence retained. Does not fail CI by itself. |
-| `partial_coverage` | Positive evidence can survive a gap, excluded API, forced overflow or fallback execution ambiguity. No exact totals/absence/distribution claim. |
-| `error` | Compile, verifier, attach implementation error, attribution/assertion failure, timeout, broken protocol, map read failure or artifact-budget failure. CI fails. |
+## Observer contract
 
-The aggregate is at best `partial_coverage` because the implementation deliberately
-excludes other surfaces. The injected unavailable cases never zero-fill counters.
-Software CPU-clock and hardware-cycle `perf_event_open` attempts run independently
-at observer and fixture privilege levels, recording open/read errors and actual
-enabled/running time. Unavailable PMUs have `value: null`; they do not invalidate
-working socket probes and never become zero cycles or a contention diagnosis.
+- Native amd64 IPv4 recvmsg and recvmmsg only. Runtime syscall formats and
+  msghdr/mmsghdr/cmsghdr sizes/offsets are checked. Native syscall numbers reject
+  compat/x32 decoding. Recvmmsg vectors are bounded at 32 in map values, never
+  a 32-entry BPF stack array. Larger vectors are explicitly excluded.
+- Entry captures original control pointer/capacity per slot and syscall
+  generation. UDP entries associate one consistent actual cookie; matching
+  inner errors and abandoned/nested/mismatched calls remain counted.
+- Only the outer syscall's successful returned prefix is decoded. Per-message
+  `msg_len` is separate from the batch count (`RX_BATCH` stores requested vlen
+  in `length`, kernel entries in `segment`, returned message count in `result`).
+  Zero/error/restart returns never decode stale slots. Read failures in later
+  slots do not erase earlier valid deliveries. Timeout-copyout EFAULT is an
+  error even when the kernel consumed a datagram.
+- The returned ancillary decoder reads at most 256 bytes/eight headers, and only
+  UDP_GRO's native four-byte integer. Pointer/capacity/length/alignment/duplicate
+  checks, truncation, peek, error queue and zero datagrams are explicit.
+  A positive witness requires returned bytes greater than positive stride and
+  successful delivery. No packet payload or CID is read.
+- Typed tracing contexts and direct BTF field access supply
+  `bpf_get_socket_cookie(sk)`. A scalar reconstructed by probe-read is not used
+  as a helper argument. Fixtures leave cookies unassigned before first observed
+  bind/attachment/traffic, then compare actual observer cookies with SO_COOKIE
+  and sock-diag. Verifier rejections are errors, not unsupported successes.
+- Birth/bind, TX/RX, retirement, process fork/exec/exit, reuseport attachment,
+  membership and classic execution load independently. The attach family does
+  not require `run_bpf_filter`. Exact classic execution remains unavailable on
+  the retained Azure kernel; an outer selector hit is insufficient. No guessed
+  JIT offsets, steering replacement or alternate kernel is introduced.
+- Successful attachment retains a bounded original-classic instruction FNV-1a
+  digest (at most 64 instructions; explicitly noncryptographic), type and an
+  observer generation. Missing original instructions leave an invalid digest,
+  not invented bytes. Actual group add/alloc/detach operations carry member
+  cookies; postprocessing does not infer groups from common ports. Replacement
+  and detach remain separate from instruction execution.
+- An owned cgroup subtree exists and every family reports readiness/capability
+  before backend/gateway/client creation. Process start generation, host PID/TID,
+  cgroup, boot and held netns lifetime accompany cookies. Frontend requires the
+  owned process and successful full-endpoint bind. Upstream requires actual
+  connected/sendmsg destination and owned backend connection peer evidence.
+  First-send autobind updates the tuple without changing identity. A cookie can
+  carry multiple QUIC connections. Softirq CPU is never labelled as a worker.
+- `udp_destroy_sock` retains final buffers/drop metadata where observed. A closed
+  alias, process exit or disappearance from a diagnostic dump is not retirement.
+  Missing birth uses first-observed time; missing retirement/end counters stay
+  null. Descriptor numbers remain annotations, not socket identity.
 
-## Remaining root-owned work
+The upstream references for these contracts are Linux v6.17
+[returned-prefix and copyout logic](https://github.com/torvalds/linux/blob/v6.17/net/socket.c),
+[typed cookie helper](https://github.com/torvalds/linux/blob/v6.17/net/core/filter.c),
+and [reuseport lifecycle](https://github.com/torvalds/linux/blob/v6.17/net/core/sock_reuseport.c).
+The running hosted BTF/verifier/fixtures, rather than a source version assumption,
+determine availability.
 
-IPv6, compat syscalls, `recvmmsg`/read/recvfrom RX proof, arbitrary socket lifecycle,
-process/container lineage, group replacement/membership churn and per-operation
-gateway peer/role attribution are unsupported by this initial observer. Userspace
-control metadata also assumes the fixture's single thread owns its receive buffer;
-concurrent mutation of another process's returned control buffer is not addressed.
-TX evidence is kernel acceptance, not delivery, physical NIC segmentation or a
-successful outer `sendmmsg` result-buffer copyout. Batches retain independent
-fixture returns. Loopback GRO/GSO is software transport evidence, not NIC offload.
+## Bounds and remaining evidence limits
 
-After root reviews actual hosted capabilities, integrate only supported paths,
-calibrate observer-off/on overhead on the same host, and implement gateway
-identity/coverage before claiming workload exercise. Envoy upstream's non-GSO
-writer remains an explicit implementation disposition. Ferrum single/shared Quinn
-endpoints do not require Envoy reuseport steering. Do not change either gateway
-to manufacture positive events.
+A live arm is limited to 300 seconds, at most 64 snapshots including final, and
+10-second checkpoints plus explicit phase boundaries. Stop detaches writers
+before final stable map iteration; signals/parent death, missing final, forced
+stop and snapshot failure are explicit. Each independently loaded family has
+bounded maps (1024 identities, 256 pending operations, 4096 bucket rows/witnesses).
+Eight 512 KiB lifecycle rings share a 4 MiB ring reservation. Exact witnesses are
+limited to 128 per 10-second window, so startup cannot consume every later window.
+Fixed outcome/segment-count buckets exclude exact lengths and CPU from live keys.
+Sampling omissions, map/ring/read loss and unknown identity are retained.
 
-The later approved comparison uses corrected official Envoy **1.34.0 Linux amd64**
-`docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb`,
-as verified in root's static plan, with cap100/cap4 on identical image, config
-and budget across all five payloads and four pairs. This lane neither downloads
-nor re-verifies that image. No source-build twins, counter-fix throughput
-attribution, expensive campaign or reinterpretation of historical 1.33 results
-is part of this prerequisite. Root owns integration, PRs, dispatch, exact-head
-review and all conclusions for #5588 / dependency PR #5602.
+The 64 MiB arm artifact cap is enforced after collection and each observer stream
+has a 10 MiB cap. Observer RSS is sampled against a 32 MiB reservation, with the
+other half of the proposed 64 MiB budget reserved for bounded kernel maps. This
+is a conservative allocation design to validate on hosted load, not a measured
+kernel allocator capacity claim. Kernel allocation overhead is not directly
+measured. Concurrent checkpoints are non-atomic; only final snapshots are stable.
+No absence or exact-total claim follows even from zero reported map loss.
+
+Real fixtures include mixed and partial 32-entry recvmmsg, EAGAIN/EINTR/EBADF,
+zero datagrams, WAITFORONE, peek then consumption, data/control truncation,
+protected header/control/sockaddr/flags/controllen/msg_len/timeout copyout faults,
+a fault after a successful prefix, attachment replacement/detach, surviving dup,
+real FD reuse, count-map saturation, missing-BTF/symbol and denied-privilege paths.
+Process/netns generations and final socket lifetimes are also retained in the
+live smoke. This does not implement a general FD emulator or certify every
+close_range/namespace/restart interleaving. Short process/FD lifetimes between
+passive samples and unobserved retirement remain partial coverage; supported
+hooks with missing records are not relabelled as host capability failures.
+
+Both off/on treatments retain process/thread CPU/RSS, capture cost, host CPU and
+softirq snapshots. PMU opening in the original preflight is only event availability;
+no sampled CPU stacks or hardware contention claim is made here. Envoy's corrected
+cumulative counter semantics stay separate from kernel/socket drop deltas. Root
+owns hosted result review, final integration of #5602, workflow dispatch and the
+artifact audit. #5588 remains open.

@@ -111,7 +111,7 @@ def stage_runtime(out):
     build = RUNTIME / "build"
     build.mkdir(mode=0o755)
     build.chmod(0o755)
-    for name in ["observer", "observer.bpf.o", "pmu"]:
+    for name in ["observer", "observer.bpf.o", "pmu", "decoder_test"]:
         destination = build / name
         destination.write_bytes((out / "build" / name).read_bytes())
         destination.chmod(0o644 if name.endswith(".o") else 0o755)
@@ -282,7 +282,7 @@ def isolated(out):
         functions["text"] = "\n".join(line for line in functions["text"].splitlines()
                                         if line.split() and line.split()[0] in targets)
     formats = {name: read_file(tracefs / f"events/syscalls/{name}/format")
-               for name in ["sys_enter_recvmsg", "sys_exit_recvmsg"]}
+               for name in ["sys_enter_recvmsg", "sys_exit_recvmsg", "sys_enter_recvmmsg", "sys_exit_recvmmsg"]}
     write(out / "namespace.json", {"netns": os.stat("/proc/self/ns/net").st_ino,
                                     "setup": setup, "attachable_functions": functions,
                                     "tracepoint_formats": formats,
@@ -293,7 +293,8 @@ def isolated(out):
     cases = []
     for family, mode in [("tx", "offload"), ("rx", "offload"),
                          ("classic", "classic-select"), ("classic", "classic-fallback"),
-                         ("tx", "batches"), ("rx", "batches"), ("rx", "read-failure")]:
+                         ("tx", "batches"), ("rx", "batches"), ("rx", "read-failure"),
+                         ("rx", "recvmmsg-cases"), ("attach", "classic-select"), ("group", "classic-select")]:
         cases.append(observer_case(out, family, mode))
     cases.append(observer_case(out, "rx", "offload", capacity=1))
     cases.append(observer_case(out, "rx", "offload", fault="missing-btf"))
@@ -308,7 +309,7 @@ def isolated(out):
         "unsupported" if all(s == "unsupported" for s in statuses) else "partial_coverage")
     return {"schema": 1, "status": status, "cases": [{"name": c["name"], "status": c["status"]} for c in cases],
             "fixture_only": True, "issue_5588_closed": False,
-            "unimplemented": ["IPv6", "recvmmsg_read_recvfrom_RX_attribution", "compat_syscalls",
+            "unimplemented": ["IPv6", "read_recvfrom_RX_attribution", "compat_syscalls",
                               "gateway_process_lineage_and_socket_retirement", "gateway_role_peer_join",
                               "observer_overhead_calibration", "five_payload_four_pair_campaign"],
             "pmu_independent_of_socket_probe_status": True}

@@ -30,6 +30,14 @@
 
 set -eo pipefail
 
+# Finite opt-in live lane; all ordinary H1/H2 and historical H3 inputs stay intact.
+if [[ ${1:-} == http3 && ${2:-} == --h3-live ]]; then
+    [[ $# == 6 && $3 == corrected-v1 && $5 == --output-dir ]] || exit 2
+    case "$4" in smoke|10240|71680|512000|1048576|5242880) ;; *) exit 2 ;; esac
+    exec python3 tests/performance/multi_protocol/h3_proof/live.py \
+        --campaign corrected-v1 --payload "$4" --output "$6"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 

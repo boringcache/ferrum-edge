@@ -1,0 +1,216 @@
+name: H3 Live Comparison
+
+on:
+  pull_request:
+    paths:
+      - tests/performance/multi_protocol/h3_proof/**
+      - tests/performance/multi_protocol/h3_experiment.py
+      - tests/performance/multi_protocol/transport_diagnostics.py
+      - tests/performance/multi_protocol/run_gateway_protocol_bench.sh
+      - tests/performance/multi_protocol/proto_bench.rs
+      - tests/performance/multi_protocol/proto_backend.rs
+      - tests/performance/multi_protocol/src/**
+      - tests/performance/multi_protocol/configs/http3_perf.yaml
+      - tests/performance/multi_protocol/configs/envoy/http3.yaml
+      - .github/workflows/h3-live-comparison.yml
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: Fixed corrected-image five-payload campaign (80 main samples plus calibration/diagnostics)
+        required: true
+        type: choice
+        default: corrected-v1
+        options: [corrected-v1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: h3-live-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: H3 feature compile, contracts and real observer fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Precreate failure artifacts
+        run: |
+          mkdir -p "$RUNNER_TEMP/h3-build" "$RUNNER_TEMP/h3-proof/build"
+          printf '%s\n' '{"status":"error","reason":"prepare_not_completed"}' > "$RUNNER_TEMP/h3-proof/summary.json"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Hosted toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev gcc libc6-dev binutils iproute2 util-linux protobuf-compiler libcurl4-openssl-dev mold python3-yaml
+          dpkg-query -W > "$RUNNER_TEMP/h3-build/packages.txt"
+          rustc --version --verbose > "$RUNNER_TEMP/h3-build/rustc.txt"
+          cargo --version > "$RUNNER_TEMP/h3-build/cargo.txt"
+      - name: Compile observer once
+        working-directory: tests/performance/multi_protocol/h3_proof
+        run: |
+          set -euo pipefail
+          clang-18 -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu -c observer.bpf.c -o "$RUNNER_TEMP/h3-build/observer.bpf.o"
+          cc -std=gnu11 -O2 -g -Wall -Wextra -Werror observer.c -lbpf -lelf -lz -o "$RUNNER_TEMP/h3-build/observer"
+          cc -std=gnu11 -O2 -g -Wall -Wextra -Werror pmu.c -o "$RUNNER_TEMP/h3-build/pmu"
+          cp "$RUNNER_TEMP/h3-build/observer" "$RUNNER_TEMP/h3-build/observer.bpf.o" "$RUNNER_TEMP/h3-build/pmu" "$RUNNER_TEMP/h3-proof/build/"
+      - name: Required syntax and semantic contracts
+        run: |
+          set -euo pipefail
+          cc -std=gnu11 -O2 -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/decoder_test.c -o "$RUNNER_TEMP/h3-build/decoder_test"
+          "$RUNNER_TEMP/h3-build/decoder_test"
+          cp "$RUNNER_TEMP/h3-build/decoder_test" "$RUNNER_TEMP/h3-proof/build/decoder_test"
+          bash -n tests/performance/multi_protocol/h3_proof/commands.sh
+          bash -n tests/performance/multi_protocol/h3_proof/live_commands.sh
+          bash -n tests/performance/multi_protocol/run_gateway_protocol_bench.sh
+          python3 -m py_compile tests/performance/multi_protocol/h3_proof/*.py tests/performance/multi_protocol/h3_experiment.py tests/performance/multi_protocol/transport_diagnostics.py
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/h3_proof -p 'test_*.py'
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_transport_diagnostics.py'
+      - name: Required real returned-prefix, cookie and attachment fixtures
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+            python3 tests/performance/multi_protocol/h3_proof/hosted.py --suite capability-v1 --output "$RUNNER_TEMP/h3-proof"
+      - name: Compile Ferrum and harness at the same checkout once
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin ferrum-edge
+          cargo build --release --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --bin proto_backend --bin proto_bench
+          cargo test --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --lib
+          cp target/release/ferrum-edge "$RUNNER_TEMP/h3-build/"
+          cp tests/performance/multi_protocol/target/release/proto_backend tests/performance/multi_protocol/target/release/proto_bench "$RUNNER_TEMP/h3-build/"
+      - name: Package compiled Ferrum and retain immutable build provenance
+        run: |
+          set -euo pipefail
+          docker build -f tests/performance/multi_protocol/h3_proof/Dockerfile.live --build-arg "REVISION=$GITHUB_SHA" -t ferrum-h3-live:qualified "$RUNNER_TEMP/h3-build"
+          docker save ferrum-h3-live:qualified -o "$RUNNER_TEMP/h3-build/ferrum-image.tar"
+          docker image inspect ferrum-h3-live:qualified > "$RUNNER_TEMP/h3-build/ferrum-image.json"
+          git rev-parse HEAD > "$RUNNER_TEMP/h3-build/source.txt"
+          git rev-parse HEAD^{tree} > "$RUNNER_TEMP/h3-build/tree.txt"
+          git status --porcelain --untracked-files=no > "$RUNNER_TEMP/h3-build/dirty.txt"
+          readelf -n "$RUNNER_TEMP/h3-build/ferrum-edge" > "$RUNNER_TEMP/h3-build/ferrum-build-id.txt"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'h3-build'
+          def sha(path):
+              h = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for block in iter(lambda: stream.read(1048576), b''): h.update(block)
+              return h.hexdigest()
+          source = (root / 'source.txt').read_text().strip()
+          assert source == os.environ['GITHUB_SHA']
+          assert not (root / 'dirty.txt').read_text().strip()
+          names = ['observer', 'observer.bpf.o', 'pmu', 'ferrum-edge', 'proto_backend', 'proto_bench', 'ferrum-image.tar']
+          value = dict(source=source, tree=(root / 'tree.txt').read_text().strip(), dirty=False,
+                       sha256={name: sha(root / name) for name in names},
+                       lockfiles={name: sha(Path(name)) for name in ['Cargo.lock', 'tests/performance/multi_protocol/Cargo.lock']},
+                       run_id=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          (root / 'build.json').write_text(json.dumps(value, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h3-live-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-build/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain prepare failures and real fixture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h3-live-prepare-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/h3-proof/
+            ${{ runner.temp }}/h3-build/*.txt
+            ${{ runner.temp }}/h3-build/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: H3 short four-arm gateway smoke
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: h3-live-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-build/
+      - name: Precreate failure record and install runtime dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/h3-live"
+          printf '%s\n' '{"status":"error","reason":"smoke_not_completed"}' > "$RUNNER_TEMP/h3-live/summary.json"
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
+          sudo apt-get install -y --no-install-recommends libbpf1 python3-yaml binutils
+          docker load -i "$RUNNER_TEMP/h3-build/ferrum-image.tar"
+          docker pull docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb
+      - name: Required short real gateway syscall and role smoke
+        env:
+          H3_LIVE_BUILD: ${{ runner.temp }}/h3-build
+        run: |
+          sudo --preserve-env=H3_LIVE_BUILD,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+            bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh http3 --h3-live corrected-v1 smoke --output-dir "$RUNNER_TEMP/h3-live"
+      - name: Always retain raw smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h3-live-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-live/
+          if-no-files-found: error
+          retention-days: 14
+
+  campaign:
+    name: H3 calibrated payload ${{ matrix.payload }}
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        payload: ['10240', '71680', '512000', '1048576', '5242880']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: h3-live-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-build/
+      - name: Precreate failure record and prepare the qualified artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/h3-live"
+          printf '%s\n' '{"status":"error","reason":"campaign_not_completed"}' > "$RUNNER_TEMP/h3-live/summary.json"
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
+          sudo apt-get install -y --no-install-recommends libbpf1 python3-yaml binutils
+          docker load -i "$RUNNER_TEMP/h3-build/ferrum-image.tar"
+          docker pull docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb
+      - name: Calibrate and collect all four comparison pairs on one boot
+        env:
+          H3_LIVE_BUILD: ${{ runner.temp }}/h3-build
+          H3_LIVE_PAYLOAD_INPUT: ${{ matrix.payload }}
+        run: |
+          sudo --preserve-env=H3_LIVE_BUILD,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+            bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh http3 --h3-live corrected-v1 "$H3_LIVE_PAYLOAD_INPUT" --output-dir "$RUNNER_TEMP/h3-live"
+      - name: Always retain raw and failed observations
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h3-live-${{ matrix.payload }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-live/
+          if-no-files-found: error
+          retention-days: 14

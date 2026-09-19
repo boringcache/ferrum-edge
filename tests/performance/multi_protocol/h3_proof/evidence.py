@@ -4,10 +4,12 @@ KINDS = {
     1: "tx_gso", 2: "tx_ordinary", 3: "tx_error", 4: "tx_uncovered",
     5: "rx_gro", 6: "rx_ordinary", 7: "rx_error", 8: "rx_truncated", 9: "rx_peek",
     10: "classic_selected", 11: "classic_null", 12: "selector_selected",
-    13: "selector_fallback", 14: "attach_ok", 15: "attach_error",
+    13: "selector_fallback", 14: "attach_ok", 15: "attach_error", 16: "rx_zero", 17: "rx_batch",
+    18: "socket_birth", 19: "socket_bind", 20: "socket_retire", 21: "socket_observed", 22: "process_exit", 23: "group_alloc", 24: "group_add", 25: "group_detach", 26: "program_detach", 27: "process_fork", 28: "process_exec", 29: "process_death",
 }
 LOSSES = ["map_full", "read_failed", "unknown_cookie", "nested", "unmatched",
-          "attempts", "recorded", "excluded_api"]
+          "attempts", "recorded", "excluded_api", "abandoned", "ring_full", "witness_full",
+          "identity_full", "batch_partial", "inner_error"]
 
 
 def assess(ready, final, fixture, family, forced_overflow=False):
@@ -39,7 +41,7 @@ def assess(ready, final, fixture, family, forced_overflow=False):
     loss = dict(zip(LOSSES, final["losses"]))
     result["loss"] = loss
     incomplete = (any(loss[key] for key in LOSSES if key not in ("attempts", "recorded"))
-                  or final["map_read_failures"] or final["pending_tx"] or final["pending_rx"] or final["pending_selector"]
+                  or final["map_read_failures"] or final["pending_tx"] or final["pending_rx"] or final["pending_selector"] or final.get("pending_detach", 0)
                   or any(row["kind"] == 4 for row in rows))
     result["status"] = "partial_coverage" if incomplete else "supported"
     # Global totals/distribution stay unclaimed even with a complete fixture interval.
@@ -69,7 +71,16 @@ def assess(ready, final, fixture, family, forced_overflow=False):
         if family == "tx":
             assert {1, 3} <= by_kind, "partial sendmmsg lost its successful message or error"
         else:
-            assert loss["excluded_api"] > 0 and 5 not in by_kind
+            assert {5, 17} <= by_kind, "successful returned recvmmsg prefix missing"
+            assert loss["batch_partial"] > 0
+    elif fixture["mode"] == "recvmmsg-cases":
+        assert {5, 6, 7, 8, 9, 16, 17} <= by_kind
+        assert loss["batch_partial"] > 0 and loss["read_failed"] > 0
+    elif family == "group":
+        assert {23, 24, 25, 26} <= by_kind, "missing real reuseport membership/detach"
+    elif family == "attach":
+        assert 14 in by_kind, "attachment evidence must not depend on classic execution"
+        assert 10 not in by_kind
     elif fixture["mode"] == "read-failure":
         assert loss["read_failed"] > 0 and 7 in by_kind and 5 not in by_kind
     else:

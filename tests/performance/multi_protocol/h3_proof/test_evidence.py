@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from evidence import assess
+from evidence import assess, LOSSES
 
 
 class EvidenceTests(unittest.TestCase):
@@ -11,7 +11,7 @@ class EvidenceTests(unittest.TestCase):
                         "end_ns": 20, "sockets": [{"cookie": 7}]}
         self.final = {"phase": "final", "start_ns": 1, "end_ns": 30,
                       "rows": [self.row(1), self.row(3)],
-                      "losses": [0, 0, 0, 0, 0, 2, 2, 0],
+                      "losses": [0, 0, 0, 0, 0, 2, 2, 0] + [0] * (len(LOSSES) - 8),
                       "map_read_failures": 0, "pending_tx": 0, "pending_rx": 0, "pending_selector": 0}
 
     def row(self, kind):

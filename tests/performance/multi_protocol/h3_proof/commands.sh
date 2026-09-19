@@ -39,7 +39,7 @@ case "${H3_PROOF_ACTION:?}" in
       --suite capability-v1 --output "$H3_PROOF_OUTPUT" --isolated
     ;;
   observer)
-    case "${H3_PROOF_FAMILY:?}" in tx|rx|classic) ;; *) exit 2 ;; esac
+    case "${H3_PROOF_FAMILY:?}" in tx|rx|classic|attach|lifetime|destroy|group|process) ;; *) exit 2 ;; esac
     [[ ${H3_PROOF_NETNS:?} =~ ^[1-9][0-9]{0,19}$ ]]
     case "${H3_PROOF_CAPACITY:?}" in 1|512) ;; *) exit 2 ;; esac
     case "${H3_PROOF_FAULT:?}" in normal|missing-btf|missing-symbol) ;; *) exit 2 ;; esac
@@ -59,7 +59,7 @@ case "${H3_PROOF_ACTION:?}" in
     ;;
   fixture)
     case "${H3_PROOF_MODE:?}" in
-      offload|batches|read-failure|classic-select|classic-fallback) ;;
+      offload|batches|read-failure|classic-select|classic-fallback|recvmmsg-cases) ;;
       *) exit 2 ;;
     esac
     exec setpriv --reuid=65534 --regid=65534 --clear-groups \
