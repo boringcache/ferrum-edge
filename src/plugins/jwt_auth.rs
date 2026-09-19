@@ -55,9 +55,12 @@ enum TokenLookup {
 
 impl JwtAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let config_obj = config
-            .as_object()
-            .ok_or_else(|| format!("jwt_auth: config must be an object, got: {config}"))?;
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "jwt_auth: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         reject_unknown_keys(config_obj)?;
         let token_lookup = parse_token_lookup(config_obj.get("token_lookup"))?;
         let consumer_claim_field = parse_non_empty_string(
@@ -324,9 +327,12 @@ auth_flow::impl_auth_plugin!(
 /// name, and a query name contains no whitespace.
 fn parse_token_lookup(value: Option<&Value>) -> Result<TokenLookup, String> {
     let raw = match value {
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| format!("jwt_auth: 'token_lookup' must be a string, got: {value}"))?,
+        Some(value) => value.as_str().ok_or_else(|| {
+            format!(
+                "jwt_auth: `token_lookup` must be a string, got: {value:?}",
+                value = value.to_string()
+            )
+        })?,
         None => "header:Authorization",
     };
     if raw.is_empty() {
@@ -374,9 +380,12 @@ fn parse_non_empty_string(
     let Some(value) = value else {
         return Ok(default_value.to_string());
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("jwt_auth: '{field}' must be a string, got: {value}"))?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "jwt_auth: `{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let value = raw.trim();
     if value.is_empty() {
         return Err(format!("jwt_auth: '{field}' must not be empty"));
@@ -387,9 +396,12 @@ fn parse_non_empty_string(
 fn parse_optional_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>, String> {
     value
         .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| format!("jwt_auth: '{field}' must be a boolean, got: {value}"))
+            value.as_bool().ok_or_else(|| {
+                format!(
+                    "jwt_auth: `{field}` must be a boolean, got: {value:?}",
+                    value = value.to_string()
+                )
+            })
         })
         .transpose()
 }
@@ -414,9 +426,12 @@ fn parse_string_array(value: Option<&Value>, field: &str) -> Result<Vec<String>,
     let Some(value) = value else {
         return Ok(Vec::new());
     };
-    let arr = value
-        .as_array()
-        .ok_or_else(|| format!("jwt_auth: '{field}' must be an array of strings, got: {value}"))?;
+    let arr = value.as_array().ok_or_else(|| {
+        format!(
+            "jwt_auth: `{field}` must be an array of strings, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let mut values = Vec::with_capacity(arr.len());
     for (idx, item) in arr.iter().enumerate() {
         let parsed = parse_required_string(item, &format!("{field}[{idx}]"))?;
@@ -426,9 +441,12 @@ fn parse_string_array(value: Option<&Value>, field: &str) -> Result<Vec<String>,
 }
 
 fn parse_required_string(value: &Value, field: &str) -> Result<String, String> {
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("jwt_auth: '{field}' must be a string, got: {value}"))?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "jwt_auth: `{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("jwt_auth: '{field}' must not be empty"));
@@ -440,7 +458,10 @@ fn parse_optional_u64(value: Option<&Value>, field: &str, default: u64) -> Resul
     let Some(value) = value else {
         return Ok(default);
     };
-    value
-        .as_u64()
-        .ok_or_else(|| format!("jwt_auth: '{field}' must be an unsigned integer, got: {value}"))
+    value.as_u64().ok_or_else(|| {
+        format!(
+            "jwt_auth: `{field}` must be an unsigned integer, got: {value:?}",
+            value = value.to_string()
+        )
+    })
 }

@@ -276,8 +276,7 @@ fn authz_unsupported_when_key_rejects_policy() {
 
     let message = err.to_string();
     assert!(
-        message.contains("rules[].when[0].key 'destination.labels[app]'")
-            && message.contains("unsupported"),
+        message.contains("rules[].when[0].key \"destination.labels[app]\" is unsupported"),
         "error should identify unsupported when key, got: {message}"
     );
 }

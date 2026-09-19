@@ -111,12 +111,12 @@ impl PiiRedactor {
         for name in builtins {
             let Some(regex_str) = builtin_pii_pattern(name) else {
                 return Err(format!(
-                    "{plugin_name}: unknown built-in redaction pattern '{name}'"
+                    "{plugin_name}: unknown built-in redaction pattern {name:?}"
                 ));
             };
-            let regex = Regex::new(regex_str).map_err(|error| {
+            let regex = Regex::new(regex_str).map_err(|_| {
                 format!(
-                    "{plugin_name}: failed to compile built-in redaction pattern '{name}': {error}"
+                    "{plugin_name}: failed to compile built-in redaction pattern {name:?} (invalid regex or complexity limit exceeded)"
                 )
             })?;
             patterns.push(CompiledPattern {
@@ -127,9 +127,9 @@ impl PiiRedactor {
         }
 
         for (name, regex_str) in custom {
-            let regex = Regex::new(regex_str).map_err(|error| {
+            let regex = Regex::new(regex_str).map_err(|_| {
                 format!(
-                    "{plugin_name}: failed to compile custom redaction pattern '{name}': {error}"
+                    "{plugin_name}: failed to compile custom redaction pattern {name:?} (invalid regex or complexity limit exceeded)"
                 )
             })?;
             patterns.push(CompiledPattern {

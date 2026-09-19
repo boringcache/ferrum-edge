@@ -135,7 +135,7 @@ impl TcpLogging {
             .ok_or_else(|| "tcp_logging: 'port' is required and must be an integer".to_string())?;
         if port == 0 || port > 65535 {
             return Err(format!(
-                "tcp_logging: 'port' must be between 1 and 65535 (got {port})"
+                "tcp_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
             ));
         }
         let port = port as u16;
@@ -242,7 +242,7 @@ fn bounded_timeout_ms(config: &Value, key: &str, default_ms: u64) -> Result<u64,
     let value = optional_u64(config, key)?.unwrap_or(default_ms);
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&value) {
         return Err(format!(
-            "tcp_logging: '{key}' must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds (got {value})"
+            "tcp_logging: '{key}' must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds (got \"{value}\")"
         ));
     }
     Ok(value)

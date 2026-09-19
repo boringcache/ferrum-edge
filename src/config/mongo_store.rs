@@ -54,7 +54,6 @@ mod inner {
         ConfigChangeWakeWatcherParams, ConfigChangeWatchDegradedReason,
         ConfigChangeWatcherStopGuard, classify_mongo_change_stream_failure,
         config_change_watch_backoff_after_session, next_config_change_watch_backoff_secs,
-        truncate_watch_error,
     };
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
@@ -608,7 +607,7 @@ mod inner {
         ) -> Result<(String, MongoAdmissionConnectionPin), anyhow::Error> {
             let generation_guard = self.connection_generation_guard.take().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "MongoDB {} guard '{}' has no connection-generation pin",
+                    "MongoDB {} guard {:?} has no connection-generation pin",
                     self.label,
                     self.lock_id
                 )
@@ -648,8 +647,10 @@ mod inner {
             // locks additionally require majority acknowledgement so an
             // election cannot revive stale ownership.
             debug!(
-                "Releasing MongoDB {} lease '{}' (mode={:?})",
-                self.label, self.lock_id, self.mode
+                "Releasing MongoDB {} lease {} (mode={:?})",
+                self.label,
+                crate::startup::sanitize_startup_scalar(&self.lock_id),
+                self.mode
             );
             let delete = self.collection.delete_one(doc! {
                 "_id": &self.lock_id,
@@ -663,14 +664,15 @@ mod inner {
             };
             let result = match result {
                 Ok(result) => result,
-                Err(error) if self.mode == MongoLockMode::UntilExplicitRelease => {
+                Err(_error) if self.mode == MongoLockMode::UntilExplicitRelease => {
                     // The protected mutation is already committed at every
                     // admission call site. Report cleanup trouble loudly and
                     // let Drop retry, but do not turn durable success into a
                     // false failed response that suppresses hooks/audit.
                     error!(
-                        "MongoDB {} lock '{}' cleanup failed after a committed operation: {}",
-                        self.label, self.lock_id, error
+                        "MongoDB {} lock {} cleanup failed after a committed operation: database error (details withheld)",
+                        self.label,
+                        crate::startup::sanitize_startup_scalar(&self.lock_id)
                     );
                     return Ok(());
                 }
@@ -679,7 +681,7 @@ mod inner {
             self.released = true;
             if !self.valid.load(Ordering::Acquire) {
                 anyhow::bail!(
-                    "MongoDB {} lease '{}' expired or was lost while the operation ran",
+                    "MongoDB {} lease {:?} expired or was lost while the operation ran",
                     self.label,
                     self.lock_id
                 );
@@ -687,13 +689,15 @@ mod inner {
             if result.deleted_count != 1 {
                 if self.mode == MongoLockMode::UntilExplicitRelease {
                     error!(
-                        "MongoDB {} lock '{}' cleanup did not match its owner after a committed operation",
-                        self.label, self.lock_id
+                        "MongoDB {} lock {} cleanup did not match its owner after a committed \
+                         operation",
+                        self.label,
+                        crate::startup::sanitize_startup_scalar(&self.lock_id)
                     );
                     return Ok(());
                 }
                 anyhow::bail!(
-                    "MongoDB {} lease '{}' release did not match the owning document",
+                    "MongoDB {} lease {:?} release did not match the owning document",
                     self.label,
                     self.lock_id
                 );
@@ -713,8 +717,10 @@ mod inner {
                 {
                     uncertain.store(true, Ordering::Release);
                     error!(
-                        "Retaining outer MongoDB {} guard '{}' because a borrowed mutation outcome is uncertain",
-                        self.label, self.lock_id
+                        "Retaining outer MongoDB {} guard {} because a borrowed mutation \
+                         outcome is uncertain",
+                        self.label,
+                        crate::startup::sanitize_startup_scalar(&self.lock_id)
                     );
                 }
                 return;
@@ -731,8 +737,11 @@ mod inner {
                     );
                 }
                 error!(
-                    "Retaining MongoDB {} lock '{}' and its connection generation because the protected mutation outcome is uncertain; verify the write outcome and restart this admin process before manually removing the owner-qualified lock",
-                    self.label, self.lock_id
+                    "Retaining MongoDB {} lock {} and its connection generation because the \
+                     protected mutation outcome is uncertain; verify the write outcome and \
+                     restart this admin process before manually removing the owner-qualified lock",
+                    self.label,
+                    crate::startup::sanitize_startup_scalar(&self.lock_id)
                 );
                 return;
             }
@@ -1209,7 +1218,7 @@ mod inner {
                     .credential
                     .get_or_insert_with(Default::default)
                     .mechanism = Some(mechanism.parse().map_err(|e| {
-                    anyhow::anyhow!("Invalid MongoDB auth mechanism '{}': {}", mechanism, e)
+                    anyhow::anyhow!("Invalid MongoDB auth mechanism {:?}: {}", mechanism, e)
                 })?);
             }
             apply_mongo_timeout_overrides(
@@ -1269,15 +1278,20 @@ mod inner {
                     "MongoDB TLS enabled (ca={}, client_cert={}, insecure={})",
                     tls_ca_cert_path
                         .map(|value| {
-                            CertSource::parse(value, MaterialKind::CaBundle).redacted_source_id()
+                            crate::startup::sanitize_startup_scalar(
+                                CertSource::parse(value, MaterialKind::CaBundle)
+                                    .redacted_source_id(),
+                            )
                         })
                         .unwrap_or_else(|| "system-roots".to_string()),
                     tls_client_cert_path
                         .map(|value| {
-                            CertSource::parse(value, MaterialKind::Cert).redacted_source_id()
+                            crate::startup::sanitize_startup_scalar(
+                                CertSource::parse(value, MaterialKind::Cert).redacted_source_id(),
+                            )
                         })
                         .unwrap_or_else(|| "none".to_string()),
-                    tls_insecure
+                    crate::startup::sanitize_startup_scalar(tls_insecure)
                 );
             }
 
@@ -1298,17 +1312,19 @@ mod inner {
             // Verify connectivity
             db.run_command(doc! { "ping": 1 }).await.map_err(|e| {
                 anyhow::anyhow!(
-                    "MongoDB connectivity check failed (database='{}'): {}",
+                    "MongoDB connectivity check failed (database={:?}): {}",
                     settings.database_name,
                     e
                 )
             })?;
 
             info!(
-                "MongoDB connected (database='{}', url={}, replica_set={})",
-                settings.database_name,
-                crate::config::db_backend::redact_url(mongo_url),
-                replica_set_configured
+                "MongoDB connected (database={}, url={}, replica_set={})",
+                crate::startup::sanitize_startup_scalar(&settings.database_name),
+                crate::startup::sanitize_startup_scalar(crate::config::db_backend::redact_url(
+                    mongo_url
+                )),
+                crate::startup::sanitize_startup_scalar(replica_set_configured)
             );
 
             Ok((
@@ -1354,7 +1370,8 @@ mod inner {
 
             info!(
                 "Combined MongoDB client cert ({}) + key ({}) into owned temporary PEM",
-                cert_material.display_source_id, key_material.display_source_id
+                crate::startup::sanitize_startup_scalar(&cert_material.display_source_id),
+                crate::startup::sanitize_startup_scalar(&key_material.display_source_id)
             );
             Ok(materialized)
         }
@@ -1382,7 +1399,7 @@ mod inner {
 
             info!(
                 "Materialized MongoDB TLS source {} into owned temporary PEM",
-                material.display_source_id
+                crate::startup::sanitize_startup_scalar(&material.display_source_id)
             );
             Ok(materialized)
         }
@@ -1399,13 +1416,13 @@ mod inner {
                 .map_err(|e| anyhow::anyhow!("Failed to create temporary {label}: {e}"))?;
             temp_file.as_file_mut().write_all(contents).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to write temporary {label} '{}': {e}",
+                    "Failed to write temporary {label} {:?}: {e}",
                     temp_file.path().display()
                 )
             })?;
             temp_file.as_file_mut().flush().map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to flush temporary {label} '{}': {e}",
+                    "Failed to flush temporary {label} {:?}: {e}",
                     temp_file.path().display()
                 )
             })?;
@@ -1425,7 +1442,7 @@ mod inner {
             let mut permissions = std::fs::metadata(path)
                 .map_err(|e| {
                     anyhow::anyhow!(
-                        "Failed to inspect permissions for temporary {label} '{}': {e}",
+                        "Failed to inspect permissions for temporary {label} {:?}: {e}",
                         path.display()
                     )
                 })?
@@ -1433,7 +1450,7 @@ mod inner {
             permissions.set_mode(0o600);
             std::fs::set_permissions(path, permissions).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to set private permissions on temporary {label} '{}': {e}",
+                    "Failed to set private permissions on temporary {label} {:?}: {e}",
                     path.display()
                 )
             })
@@ -1527,8 +1544,7 @@ mod inner {
                         return Err(primary_err);
                     }
                     warn!(
-                        "Primary MongoDB connection failed: {}. Trying {} failover URL(s)...",
-                        primary_err,
+                        "Primary MongoDB connection failed (details withheld). Trying {} failover URL(s)...",
                         failover_urls.len()
                     );
                     for (i, url) in failover_urls.iter().enumerate() {
@@ -1552,7 +1568,7 @@ mod inner {
                                 info!(
                                     "Connected to failover MongoDB #{} ({})",
                                     i + 1,
-                                    crate::config::db_backend::redact_url(url)
+                                    crate::startup::sanitize_startup_scalar(url)
                                 );
                                 store.failover_urls = failover_urls.to_vec();
                                 store
@@ -1560,12 +1576,11 @@ mod inner {
                                     .mark_failover(&crate::config::db_backend::redact_url(url));
                                 return Ok(store);
                             }
-                            Err(e) => {
+                            Err(_error) => {
                                 warn!(
-                                    "Failover MongoDB #{} ({}) failed: {}",
+                                    "Failover MongoDB #{} ({}) connection failed (details withheld)",
                                     i + 1,
-                                    crate::config::db_backend::redact_url(url),
-                                    e
+                                    crate::startup::sanitize_startup_scalar(url)
                                 );
                             }
                         }
@@ -2009,7 +2024,7 @@ mod inner {
                 Err(err) if is_namespace_not_found(&err) => return Ok(Vec::new()),
                 Err(err) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to list indexes on MongoDB collection '{collection_name}': {err}"
+                        "Failed to list indexes on MongoDB collection `{collection_name}`: {err}"
                     ));
                 }
             };
@@ -2017,7 +2032,7 @@ mod inner {
             while cursor.advance().await? {
                 let model = cursor.deserialize_current().map_err(|err| {
                     anyhow::anyhow!(
-                        "Failed to decode index on MongoDB collection '{collection_name}': {err}"
+                        "Failed to decode index on MongoDB collection `{collection_name}`: {err}"
                     )
                 })?;
                 indexes.push(model);
@@ -2286,10 +2301,10 @@ mod inner {
         /// still performs owner-qualified majority cleanup and releases the
         /// local generation pin.
         async fn release_mtls_dns_admission_leases_after_commit(leases: &mut Vec<MongoLockGuard>) {
-            if let Err(error) = Self::release_mtls_dns_admission_leases(leases).await {
+            if let Err(_error) = Self::release_mtls_dns_admission_leases(leases).await {
                 error!(
-                    "MongoDB mTLS DNS admission lease cleanup failed after a committed write; \
-                     the durable result stands and is reported as success: {error}"
+                    "MongoDB mTLS DNS admission lease cleanup failed after a committed \
+                     write; the durable result stands and is reported as success (details withheld)"
                 );
             }
         }
@@ -2502,12 +2517,11 @@ mod inner {
             let lock_id = lock_id.to_string();
             let (connection, connection_generation_guard, persistent_outcome_uncertain) =
                 if guard_owner.is_some() {
-                    let persistent_pin = self
-                        .persistent_admission_pins
-                        .get(&owner)
-                        .ok_or_else(|| {
+                    let persistent_pin =
+                        self.persistent_admission_pins.get(&owner).ok_or_else(|| {
                             anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                                "MongoDB {label} guard '{lock_id}' is not active in this admin process"
+                                "MongoDB {label} guard {lock_id:?} is not active in this admin \
+                                 process"
                             ))
                         })?;
                     if persistent_pin.namespace != lock_id {
@@ -2615,7 +2629,7 @@ mod inner {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(
                         anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                            "MongoDB {label} lock '{lock_id}' remained held for {} seconds; \
+                            "MongoDB {label} lock {lock_id:?} remained held for {} seconds; \
                          admission locks do not expire because reclaiming one could permit a \
                          stale writer, so verify the prior owner is stopped before removing the \
                          lock document",
@@ -2703,7 +2717,7 @@ mod inner {
                         warn!(
                             "MongoDB rejected the aggregation-pipeline {}-lease update \
                              (AWS DocumentDB-compatible backend); falling back to the classic \
-                             client-time lease for this operation: {error}",
+                             client-time lease for this operation (provider details withheld)",
                             label
                         );
                         mode = RenewableLeaseMode::ClientTimeClassic;
@@ -2777,21 +2791,21 @@ mod inner {
                                 );
                                 return;
                             }
-                            Err(error) => {
+                            Err(_error) => {
                                 if tokio::time::Instant::now()
                                     + MONGO_MIGRATION_LEASE_RETRY_INTERVAL
                                     >= valid_until
                                 {
                                     renew_valid.store(false, Ordering::Release);
                                     error!(
-                                        "MongoDB {} lease expired after renewal failures: {}",
-                                        renew_label, error
+                                        "MongoDB {} lease expired after renewal failures: database error (details withheld)",
+                                        renew_label
                                     );
                                     return;
                                 }
                                 debug!(
-                                    "MongoDB {} lease renewal failed; retrying before expiry: {}",
-                                    renew_label, error
+                                    "MongoDB {} lease renewal failed; retrying before expiry: database error (details withheld)",
+                                    renew_label
                                 );
                                 tokio::select! {
                                     changed = stop_rx.changed() => {
@@ -2966,14 +2980,13 @@ mod inner {
                 health,
                 settings,
                 mut shutdown,
-                redact_urls,
+                redact_urls: _,
             } = params;
             health.mark_enabled();
             // Flips the watcher to `stopped` on every exit path, including a
             // panic or a shutdown abort, so health can never keep advertising a
             // connected watcher that is gone.
             let _stop_guard = ConfigChangeWatcherStopGuard::new(health.clone());
-            let redact_refs: Vec<&str> = redact_urls.iter().map(String::as_str).collect();
             let initial_backoff_secs = settings.initial_backoff.as_secs().max(1);
             let max_backoff_secs = settings.max_backoff.as_secs().max(1);
             let mut backoff_secs: u64 = 0;
@@ -3048,8 +3061,7 @@ mod inner {
                         warn!(
                             reason = reason.as_str(),
                             "MongoDB config-change watcher could not open a change stream; \
-                             periodic polling remains authoritative: {}",
-                            redacted_watch_error(&e, &redact_refs)
+                             periodic polling remains authoritative (provider details withheld)"
                         );
                         // Whatever we could not observe is still in
                         // `config_changes`; let the cursor poll pick it up now.
@@ -3118,8 +3130,7 @@ mod inner {
                             warn!(
                                 reason = reason.as_str(),
                                 "MongoDB config-change stream failed; periodic polling remains \
-                                 authoritative and the watcher will reconnect: {}",
-                                redacted_watch_error(&e, &redact_refs)
+                                 authoritative and the watcher will reconnect (provider details withheld)"
                             );
                             break reason;
                         }
@@ -3194,7 +3205,9 @@ mod inner {
                 if elapsed_ms > threshold_ms {
                     warn!(
                         "Slow MongoDB query: {} took {}ms (threshold: {}ms)",
-                        operation, elapsed_ms, threshold_ms
+                        operation,
+                        elapsed_ms,
+                        crate::startup::sanitize_startup_scalar(threshold_ms)
                     );
                 }
             }
@@ -3578,9 +3591,15 @@ mod inner {
                         },
                     )
                     .await;
-                if let Err(error) = result {
+                if let Err(_error) = result {
                     warn!(
-                        "standalone plugin-config write failed after attaching the proxy association and the compensating detach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxy_id={attach}): {error}; repair the proxy's `plugins` array by hand"
+                        "standalone plugin-config write failed after attaching the proxy \
+                         association and the compensating detach also failed \
+                         (namespace={} plugin_config_id={} proxy_id={}): database error \
+                         (details withheld); repair the proxy's `plugins` array by hand",
+                        crate::startup::sanitize_startup_scalar(namespace),
+                        crate::startup::sanitize_startup_scalar(plugin_config_id),
+                        crate::startup::sanitize_startup_scalar(attach)
                     );
                 }
             }
@@ -3598,10 +3617,15 @@ mod inner {
                         },
                     )
                     .await;
-                if let Err(error) = result {
+                if let Err(_error) = result {
                     warn!(
-                        "standalone plugin-config write failed after detaching proxy associations and the compensating re-attach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxies={:?}): {error}; repair those proxies' `plugins` arrays by hand",
-                        plan.detach
+                        "standalone plugin-config write failed after detaching proxy \
+                         associations and the compensating re-attach also failed \
+                         (namespace={} plugin_config_id={} proxies={}): database error \
+                         (details withheld); repair those proxies' `plugins` arrays by hand",
+                        crate::startup::sanitize_startup_scalar(namespace),
+                        crate::startup::sanitize_startup_scalar(plugin_config_id),
+                        crate::startup::sanitize_startup_scalar(format!("{:?}", plan.detach))
                     );
                 }
             }
@@ -3652,10 +3676,10 @@ mod inner {
         }
 
         async fn compact_config_changes_best_effort(&self, namespace: &str) {
-            if let Err(e) = self.compact_config_changes(namespace).await {
+            if let Err(_error) = self.compact_config_changes(namespace).await {
                 warn!(
-                    "MongoDB config change compaction failed for namespace '{}': {}",
-                    namespace, e
+                    "MongoDB config change compaction failed for namespace {}: database error (details withheld)",
+                    crate::startup::sanitize_startup_scalar(namespace)
                 );
             }
         }
@@ -3669,7 +3693,7 @@ mod inner {
             namespace: &str,
             resource_type: &str,
             resource_id: &str,
-            change_error: &anyhow::Error,
+            _change_error: &anyhow::Error,
         ) -> bool {
             match self
                 .collection(collection_name)
@@ -3678,22 +3702,32 @@ mod inner {
             {
                 Ok(result) if result.deleted_count > 0 => {
                     warn!(
-                        "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
-                        resource_type, resource_id, namespace, change_error
+                        "Rolled back MongoDB standalone {} create for id {} in namespace {} \
+                         after config_changes write failed (details withheld)",
+                        resource_type,
+                        crate::startup::sanitize_startup_scalar(resource_id),
+                        crate::startup::sanitize_startup_scalar(namespace)
                     );
                     true
                 }
                 Ok(_) => {
                     warn!(
-                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback confirmed no inserted document remains: {}",
-                        resource_type, resource_id, namespace, change_error
+                        "MongoDB standalone {} create for id {} in namespace {} failed to \
+                         record config_changes, but rollback confirmed no inserted document \
+                         remains (details withheld)",
+                        resource_type,
+                        crate::startup::sanitize_startup_scalar(resource_id),
+                        crate::startup::sanitize_startup_scalar(namespace)
                     );
                     true
                 }
-                Err(rollback_err) => {
+                Err(_rollback_err) => {
                     warn!(
-                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
-                        resource_type, resource_id, namespace, rollback_err, change_error
+                        "MongoDB standalone {} create for id {} in namespace {} failed to \
+                         record config_changes and rollback failed (details withheld)",
+                        resource_type,
+                        crate::startup::sanitize_startup_scalar(resource_id),
+                        crate::startup::sanitize_startup_scalar(namespace)
                     );
                     false
                 }
@@ -3705,7 +3739,7 @@ mod inner {
             collection_name: &str,
             resource_type: &str,
             resource_ids: &[&str],
-            change_error: &anyhow::Error,
+            _change_error: &anyhow::Error,
         ) -> HashSet<String> {
             if resource_ids.is_empty() {
                 return HashSet::new();
@@ -3735,14 +3769,12 @@ mod inner {
                             chunk.len()
                         );
                     }
-                    Err(rollback_err) => {
+                    Err(_rollback_err) => {
                         warn!(
-                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after confirming {} of {} inserted documents absent: {}; original error: {}",
+                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after confirming {} of {} inserted documents absent (details withheld)",
                             resource_type,
                             confirmed_absent.len(),
-                            resource_ids.len(),
-                            rollback_err,
-                            change_error
+                            resource_ids.len()
                         );
                         return confirmed_absent;
                     }
@@ -3750,11 +3782,10 @@ mod inner {
             }
 
             warn!(
-                "Rolled back MongoDB standalone {} batch create after config_changes write failed; confirmed {} of {} inserted documents absent: {}",
+                "Rolled back MongoDB standalone {} batch create after config_changes write failed; confirmed {} of {} inserted documents absent (details withheld)",
                 resource_type,
                 confirmed_absent.len(),
-                resource_ids.len(),
-                change_error
+                resource_ids.len()
             );
             confirmed_absent
         }
@@ -3802,13 +3833,14 @@ mod inner {
             resource_type: &str,
             resource_id: &str,
             previous_doc: Option<Document>,
-            change_error: &anyhow::Error,
+            _change_error: &anyhow::Error,
         ) -> bool {
             let Some(previous_doc) = previous_doc else {
                 warn!(
-                    "MongoDB standalone {} update for id '{}' failed to record config_changes, \
-                     but no previous document was available to restore: {}",
-                    resource_type, resource_id, change_error
+                    "MongoDB standalone {} update for id {} failed to record config_changes, \
+                     but no previous document was available to restore (details withheld)",
+                    resource_type,
+                    crate::startup::sanitize_startup_scalar(resource_id)
                 );
                 return false;
             };
@@ -3822,22 +3854,28 @@ mod inner {
             {
                 Ok(result) if result.matched_count > 0 => {
                     warn!(
-                        "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
-                        resource_type, resource_id, change_error
+                        "Restored MongoDB standalone {} update for id {} after config_changes \
+                         write failed (details withheld)",
+                        resource_type,
+                        crate::startup::sanitize_startup_scalar(resource_id)
                     );
                     true
                 }
                 Ok(_) => {
                     warn!(
-                        "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
-                        resource_type, resource_id, change_error
+                        "MongoDB standalone {} update for id {} failed to record \
+                         config_changes, but rollback found no document to restore (details withheld)",
+                        resource_type,
+                        crate::startup::sanitize_startup_scalar(resource_id)
                     );
                     false
                 }
-                Err(rollback_err) => {
+                Err(_rollback_err) => {
                     warn!(
-                        "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
-                        resource_type, resource_id, rollback_err, change_error
+                        "MongoDB standalone {} update for id {} failed to record config_changes \
+                         and rollback failed (details withheld)",
+                        resource_type,
+                        crate::startup::sanitize_startup_scalar(resource_id)
                     );
                     false
                 }
@@ -3867,12 +3905,14 @@ mod inner {
                     let sequence = mongo_change_sequence_from_bson(Some(value), "sequence")?;
                     let sequence = i64::try_from(sequence).map_err(|_| {
                         anyhow::anyhow!(
-                            "MongoDB config_changes row has invalid 'sequence': expected a positive integral number"
+                            "MongoDB config_changes row has invalid `sequence`: expected a \
+                             positive integral number"
                         )
                     })?;
                     if sequence <= 0 {
                         anyhow::bail!(
-                            "MongoDB config_changes row has invalid 'sequence': expected a positive integral number"
+                            "MongoDB config_changes row has invalid `sequence`: expected a \
+                             positive integral number"
                         );
                     }
                     Some(sequence)
@@ -3920,7 +3960,7 @@ mod inner {
                 };
                 if after_sequence < retained_sequence {
                     anyhow::bail!(
-                        "config change cursor {} for namespace '{}' is behind retained sequence {}",
+                        "config change cursor {} for namespace {:?} is behind retained sequence {}",
                         after_sequence,
                         namespace,
                         retained_sequence
@@ -4045,7 +4085,10 @@ mod inner {
                         .session(&mut *s)
                         .await?;
                     if count == 0 {
-                        info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+                        info!(
+                            "Cascade-deleting orphaned proxy_group plugin config {}",
+                            crate::startup::sanitize_startup_scalar(id)
+                        );
                         let result = self
                             .plugin_configs()
                             .delete_one(doc! {
@@ -4093,7 +4136,10 @@ mod inner {
                     })
                     .await?;
                 if count == 0 {
-                    info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+                    info!(
+                        "Cascade-deleting orphaned proxy_group plugin config {}",
+                        crate::startup::sanitize_startup_scalar(id)
+                    );
                     let result = self
                         .plugin_configs()
                         .delete_one(doc! {
@@ -4345,7 +4391,7 @@ mod inner {
                     .is_some();
                 if !exists {
                     return Err(mongodb::error::Error::custom(format!(
-                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        "referenced upstream {:?} does not exist in namespace {:?}",
                         upstream_id, params.namespace
                     )));
                 }
@@ -4556,7 +4602,7 @@ mod inner {
                         if owner.as_str() != consumer_id {
                             return Err(mongodb::error::Error::custom(format!(
                                 "E11000 duplicate key error: consumer identity reservation \
-                                 '{doc_id}' is reserved by consumer '{owner}'"
+                                 {doc_id:?} is reserved by consumer {owner:?}"
                             )));
                         }
                         // Same owner ⇒ adopt the existing reservation.
@@ -4660,11 +4706,13 @@ mod inner {
                                     .to_vec();
                             if inserted_prefix.is_none() {
                                 warn!(
-                                    "Retaining MongoDB consumer identity reservations for '{}' in \
-                                     namespace '{}' that may have been inserted by a failed ordered \
+                                    "Retaining MongoDB consumer identity reservations for {} in \
+                                     namespace {} that may have been inserted by a failed \
+                                     ordered \
                                      insert without a verifiable write-error index; rollback will \
                                      only release values newly inserted during same-owner adoption",
-                                    consumer_id, namespace
+                                    crate::startup::sanitize_startup_scalar(consumer_id),
+                                    crate::startup::sanitize_startup_scalar(namespace)
                                 );
                             }
                             for value in ensured_new {
@@ -4678,11 +4726,13 @@ mod inner {
                             let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
                             if inserted_prefix.is_none() {
                                 warn!(
-                                    "Retaining MongoDB consumer identity reservations for '{}' in \
-                                     namespace '{}' because the failed ordered insert did not report \
+                                    "Retaining MongoDB consumer identity reservations for {} in \
+                                     namespace {} because the failed ordered insert did not \
+                                     report \
                                      a verifiable write-error index; still releasing vacant \
                                      reservations inserted during this adoption attempt",
-                                    consumer_id, namespace
+                                    crate::startup::sanitize_startup_scalar(consumer_id),
+                                    crate::startup::sanitize_startup_scalar(namespace)
                                 );
                             }
                             let to_release = consumer_identity_adoption_failure_release_values(
@@ -4709,10 +4759,11 @@ mod inner {
                     .await;
                 } else {
                     warn!(
-                        "Retaining MongoDB consumer identity reservations for '{}' in namespace \
-                         '{}' because the failed ordered insert did not report a verifiable \
+                        "Retaining MongoDB consumer identity reservations for {} in namespace \
+                         {} because the failed ordered insert did not report a verifiable \
                          write-error index",
-                        consumer_id, namespace
+                        crate::startup::sanitize_startup_scalar(consumer_id),
+                        crate::startup::sanitize_startup_scalar(namespace)
                     );
                 }
                 return Err(err.into());
@@ -4761,7 +4812,7 @@ mod inner {
                                 return Err(ConsumerIdentityEnsureOwnedError::new(
                                     newly_inserted,
                                     anyhow::anyhow!(
-                                        "consumer_identity_index doc '{}' missing consumer_id: {}",
+                                        "consumer_identity_index doc {:?} missing consumer_id: {}",
                                         doc_id,
                                         e
                                     ),
@@ -4776,8 +4827,8 @@ mod inner {
                             return Err(ConsumerIdentityEnsureOwnedError::new(
                                 newly_inserted,
                                 anyhow::anyhow!(
-                                    "E11000 duplicate key error: identity value '{}' in \
-                                     namespace '{}' is reserved by consumer '{}'",
+                                    "E11000 duplicate key error: identity value {:?} in \
+                                     namespace {:?} is reserved by consumer {:?}",
                                     value,
                                     namespace,
                                     owner
@@ -4819,7 +4870,7 @@ mod inner {
                                     return Err(ConsumerIdentityEnsureOwnedError::new(
                                         newly_inserted,
                                         anyhow::anyhow!(
-                                            "consumer_identity_index doc '{}' missing \
+                                            "consumer_identity_index doc {:?} missing \
                                              consumer_id: {}",
                                             doc_id,
                                             e
@@ -4831,8 +4882,8 @@ mod inner {
                                 return Err(ConsumerIdentityEnsureOwnedError::new(
                                     newly_inserted,
                                     anyhow::anyhow!(
-                                        "E11000 duplicate key error: identity value '{}' in \
-                                         namespace '{}' is reserved by consumer '{}'",
+                                        "E11000 duplicate key error: identity value {:?} in \
+                                         namespace {:?} is reserved by consumer {:?}",
                                         value,
                                         namespace,
                                         owner
@@ -4880,15 +4931,16 @@ mod inner {
                 .iter()
                 .map(|value| Bson::String(consumer_identity_doc_id(namespace, value)))
                 .collect();
-            if let Err(err) = self
+            if let Err(_error) = self
                 .consumer_identity_index()
                 .delete_many(doc! { "_id": { "$in": ids }, "consumer_id": consumer_id })
                 .await
             {
                 warn!(
                     "MongoDB best-effort consumer identity reservation rollback failed for \
-                     consumer '{}' in namespace '{}': {}",
-                    consumer_id, namespace, err
+                     consumer {} in namespace {}: database error (details withheld)",
+                    crate::startup::sanitize_startup_scalar(consumer_id),
+                    crate::startup::sanitize_startup_scalar(namespace)
                 );
             }
         }
@@ -4937,15 +4989,14 @@ mod inner {
                 if clauses.is_empty() {
                     continue;
                 }
-                if let Err(err) = self
+                if let Err(_error) = self
                     .consumer_identity_index()
                     .delete_many(doc! { "$or": clauses })
                     .await
                 {
                     warn!(
                         "MongoDB best-effort batch consumer identity reservation rollback \
-                         failed: {}",
-                        err
+                         failed: database error (details withheld)"
                     );
                     return;
                 }
@@ -5144,7 +5195,7 @@ mod inner {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
                     anyhow::bail!(
-                        "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
                          detach it before replacing or deleting the API spec",
                         proxy_id,
                         upstream_id,
@@ -5171,7 +5222,8 @@ mod inner {
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
                         anyhow::bail!(
-                            "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
+                             upstream {:?} from api_spec {:?}; \
                              detach it before replacing or deleting the API spec",
                             plugin.id,
                             upstream_id,
@@ -5220,7 +5272,7 @@ mod inner {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
                     anyhow::bail!(
-                        "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
                          detach it before replacing or deleting the API spec",
                         proxy_id,
                         upstream_id,
@@ -5246,7 +5298,8 @@ mod inner {
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
                         anyhow::bail!(
-                            "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
+                             upstream {:?} from api_spec {:?}; \
                              detach it before replacing or deleting the API spec",
                             plugin.id,
                             upstream_id,
@@ -6069,7 +6122,7 @@ mod inner {
             };
             let id = document.get_str("id").map_err(|_| {
                 mongodb::error::Error::custom(format!(
-                    "gateway trust bundle for namespace '{namespace}' is missing its string id"
+                    "gateway trust bundle for namespace {namespace:?} is missing its string id"
                 ))
             })?;
             Ok(Some(id.to_string()))
@@ -6919,8 +6972,18 @@ mod inner {
     /// `doc_to_*` helper strips MongoDB's `_id` before deserialization.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
-        let proxy: Proxy = mongodb::bson::from_document(doc)?;
+        let proxy: Proxy = deserialize_config_document(doc)?;
         Ok(proxy)
+    }
+
+    /// Keep BSON field paths separate from the bare serde error just like the
+    /// JSON/YAML value adapters. Never classify a composed BSON diagnostic.
+    fn deserialize_config_document<T: serde::de::DeserializeOwned>(
+        doc: Document,
+    ) -> Result<T, mongodb::bson::de::Error> {
+        let deserializer = mongodb::bson::Deserializer::new(Bson::Document(doc));
+        serde_path_to_error::deserialize(deserializer)
+            .map_err(crate::util::deserialization::sanitize_value_error)
     }
 
     /// Composite MongoDB `_id` for every namespaced resource document:
@@ -7005,7 +7068,7 @@ mod inner {
         let existing = store.get_consumer(namespace, owner_id).await?;
         let Some(existing) = existing else {
             return Ok(format!(
-                "Consumer identity '{}' conflicts with consumer '{}'",
+                "Consumer identity {:?} conflicts with consumer {:?}",
                 identity_value, owner_id
             ));
         };
@@ -7027,7 +7090,7 @@ mod inner {
             }
         }
         Ok(format!(
-            "Consumer identity '{}' conflicts with consumer '{}'",
+            "Consumer identity {:?} conflicts with consumer {:?}",
             identity_value, owner_id
         ))
     }
@@ -7042,7 +7105,7 @@ mod inner {
     ) -> mongodb::error::Result<&'a str> {
         doc.get_str(field).map_err(|_| {
             mongodb::error::Error::custom(format!(
-                "consumer_identity_index reservation doc missing field '{field}'"
+                "consumer_identity_index reservation doc missing field `{field}`"
             ))
         })
     }
@@ -7158,7 +7221,7 @@ mod inner {
     fn doc_to_consumer(mut doc: Document) -> Result<Consumer, anyhow::Error> {
         doc.remove("_id");
         doc.remove(HMAC_SECRET_HASHES_FIELD);
-        Ok(mongodb::bson::from_document(doc)?)
+        Ok(deserialize_config_document(doc)?)
     }
 
     /// Convert a domain `PluginConfig` into a BSON `Document`.
@@ -7171,7 +7234,7 @@ mod inner {
 
     fn doc_to_plugin_config(mut doc: Document) -> Result<PluginConfig, anyhow::Error> {
         doc.remove("_id");
-        Ok(mongodb::bson::from_document(doc)?)
+        Ok(deserialize_config_document(doc)?)
     }
 
     /// Convert a domain `Upstream` into a BSON `Document`.
@@ -7188,7 +7251,7 @@ mod inner {
 
     fn doc_to_upstream(mut doc: Document) -> Result<Upstream, anyhow::Error> {
         doc.remove("_id");
-        Ok(mongodb::bson::from_document(doc)?)
+        Ok(deserialize_config_document(doc)?)
     }
 
     /// Encode a gateway trust-bundle record (issue #3727).
@@ -7785,11 +7848,6 @@ mod inner {
         }
     }
 
-    /// URL-redact and length-bound a driver error before it reaches a log line.
-    fn redacted_watch_error(error: &mongodb::error::Error, urls: &[&str]) -> String {
-        truncate_watch_error(&crate::config::db_backend::redact_error_text(error, urls))
-    }
-
     /// Map a driver error onto the bounded watcher degraded-reason label.
     ///
     /// Only the server command code and the authentication-failure shape are
@@ -7845,8 +7903,8 @@ mod inner {
     ) -> Result<&'a str, anyhow::Error> {
         match doc.get(field) {
             Some(Bson::String(value)) => Ok(value.as_str()),
-            Some(_) => anyhow::bail!("MongoDB config_changes row has non-string field '{field}'"),
-            None => anyhow::bail!("MongoDB config_changes row is missing field '{field}'"),
+            Some(_) => anyhow::bail!("MongoDB config_changes row has non-string field `{field}`"),
+            None => anyhow::bail!("MongoDB config_changes row is missing field `{field}`"),
         }
     }
 
@@ -7881,7 +7939,8 @@ mod inner {
                 Ok(*value as u64)
             }
             _ => anyhow::bail!(
-                "MongoDB config_changes row has invalid '{field}': expected a non-negative integral number"
+                "MongoDB config_changes row has invalid `{field}`: expected a non-negative \
+                 integral number"
             ),
         }
     }
@@ -8123,8 +8182,9 @@ mod inner {
             self.check_slow_query("load_full_config", start);
 
             info!(
-                "MongoDB loaded config (namespace='{}'): {} proxies, {} consumers, {} plugins, {} upstreams",
-                namespace,
+                "MongoDB loaded config (namespace={}): {} proxies, {} consumers, {} plugins, {} \
+                 upstreams",
+                crate::startup::sanitize_startup_scalar(namespace),
                 proxies.len(),
                 consumers.len(),
                 plugin_configs.len(),
@@ -8155,7 +8215,10 @@ mod inner {
                 .collect();
             if !trust_errors.is_empty() {
                 for message in &trust_errors {
-                    error!("MongoDB gateway trust bundle rejected — {}", message);
+                    error!(
+                        "MongoDB gateway trust bundle rejected — {}",
+                        crate::startup::sanitize_startup_cause(message, &[])
+                    );
                 }
                 crate::config::gateway_trust::record_trust_load_rejection(
                     crate::config::gateway_trust::GatewayTrustFailureReason::InvalidMaterial,
@@ -8179,7 +8242,10 @@ mod inner {
             // `consumer_identity_index` collection prevents NEW collisions
             // from being committed, this guard covers pre-existing rows.
             for message in config.quarantine_colliding_consumer_identities() {
-                error!("MongoDB config: {}", message);
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
             }
 
             // Fail-closed hmac_auth secret policy: strip pre-existing or
@@ -8188,7 +8254,10 @@ mod inner {
             // write-time validation rejects new violations; this guard covers
             // stored rows.
             for message in config.quarantine_invalid_hmac_credentials() {
-                error!("MongoDB config: {}", message);
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
             }
 
             // Serving-mode repairability (issue #4526), parity with the SQL
@@ -8204,7 +8273,7 @@ mod inner {
                 for message in &quarantined {
                     error!(
                         "MongoDB config: quarantined unconstructible plugin config — {}",
-                        message
+                        crate::startup::sanitize_startup_cause(message, &[])
                     );
                 }
                 if !quarantined.is_empty() {
@@ -8227,7 +8296,10 @@ mod inner {
             let validation_errors = collect_rejecting_runtime_config_errors(&config);
             if !validation_errors.is_empty() {
                 for msg in &validation_errors {
-                    error!("MongoDB config rejected — {}", msg);
+                    error!(
+                        "MongoDB config rejected — {}",
+                        crate::startup::sanitize_startup_cause(msg, &[])
+                    );
                 }
                 // Return a typed, downcast-discoverable rejection (not a bare
                 // `bail!`) so the database-mode poll loop can tell this apart
@@ -8556,7 +8628,8 @@ mod inner {
                 .await?;
             if change_count >= CHANGE_LOG_BATCH_LIMIT as usize {
                 anyhow::bail!(
-                    "MongoDB config change batch for namespace '{}' reached limit {}; forcing full reload",
+                    "MongoDB config change batch for namespace {:?} reached limit {}; forcing \
+                     full reload",
                     namespace,
                     CHANGE_LOG_BATCH_LIMIT
                 );
@@ -8812,7 +8885,7 @@ mod inner {
                         .await?
                 {
                     anyhow::bail!(
-                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        "referenced upstream {:?} does not exist in namespace {:?}",
                         upstream_id,
                         proxy.namespace
                     );
@@ -8834,7 +8907,7 @@ mod inner {
                         &proxy.hosts,
                         &candidates,
                     ) {
-                        if let Err(err) = self
+                        if let Err(_error) = self
                             .proxies()
                             .delete_one(doc! {
                                 "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
@@ -8844,8 +8917,8 @@ mod inner {
                         {
                             warn!(
                                 "MongoDB standalone proxy route-conflict self-revert failed \
-                                 for '{}': {}",
-                                proxy.id, err
+                                 for {}: database error (details withheld)",
+                                crate::startup::sanitize_startup_scalar(&proxy.id)
                             );
                         }
                         anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
@@ -8856,7 +8929,7 @@ mod inner {
                         .upstream_exists_in_namespace(&proxy.namespace, upstream_id)
                         .await?
                 {
-                    if let Err(err) = self
+                    if let Err(_error) = self
                         .proxies()
                         .delete_one(doc! {
                             "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
@@ -8866,12 +8939,12 @@ mod inner {
                     {
                         warn!(
                             "MongoDB standalone proxy upstream-vanished self-revert failed \
-                             for '{}': {}",
-                            proxy.id, err
+                             for {}: database error (details withheld)",
+                            crate::startup::sanitize_startup_scalar(&proxy.id)
                         );
                     }
                     anyhow::bail!(
-                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        "referenced upstream {:?} does not exist in namespace {:?}",
                         upstream_id,
                         proxy.namespace
                     );
@@ -9067,7 +9140,7 @@ mod inner {
                     .await?
             {
                 anyhow::bail!(
-                    "referenced upstream '{}' does not exist in namespace '{}'",
+                    "referenced upstream {:?} does not exist in namespace {:?}",
                     upstream_id,
                     proxy.namespace
                 );
@@ -9106,7 +9179,7 @@ mod inner {
                     .await?;
                 if Self::standalone_route_update_has_conflict(&proxy.id, &proxy.hosts, &candidates)
                 {
-                    if let Err(err) = self
+                    if let Err(_error) = self
                         .proxies()
                         .replace_one(
                             doc! {
@@ -9118,8 +9191,8 @@ mod inner {
                         .await
                     {
                         warn!(
-                            "MongoDB standalone proxy route-conflict restore failed for '{}': {}",
-                            proxy.id, err
+                            "MongoDB standalone proxy route-conflict restore failed for {}: database error (details withheld)",
+                            crate::startup::sanitize_startup_scalar(&proxy.id)
                         );
                     }
                     anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
@@ -9131,7 +9204,7 @@ mod inner {
                     .upstream_exists_in_namespace(&proxy.namespace, upstream_id)
                     .await?
             {
-                if let Err(err) = self
+                if let Err(_error) = self
                     .proxies()
                     .replace_one(
                         doc! {
@@ -9143,12 +9216,12 @@ mod inner {
                     .await
                 {
                     warn!(
-                        "MongoDB standalone proxy upstream-vanished restore failed for '{}': {}",
-                        proxy.id, err
+                        "MongoDB standalone proxy upstream-vanished restore failed for {}: database error (details withheld)",
+                        crate::startup::sanitize_startup_scalar(&proxy.id)
                     );
                 }
                 anyhow::bail!(
-                    "referenced upstream '{}' does not exist in namespace '{}'",
+                    "referenced upstream {:?} does not exist in namespace {:?}",
                     upstream_id,
                     proxy.namespace
                 );
@@ -9578,7 +9651,10 @@ mod inner {
                             None
                         };
                         if !still_referenced && dispatch_ref.is_none() {
-                            info!("Cascade-deleting orphaned upstream {}", uid);
+                            info!(
+                                "Cascade-deleting orphaned upstream {}",
+                                crate::startup::sanitize_startup_scalar(uid)
+                            );
                             match self
                                 .upstreams()
                                 .delete_one(doc! {
@@ -9592,9 +9668,9 @@ mod inner {
                                         Some(uid.clone());
                                 }
                                 Ok(_) => {}
-                                Err(e) => warn!(
-                                    "MongoDB best-effort orphan upstream delete failed for {}: {}",
-                                    uid, e
+                                Err(_error) => warn!(
+                                    "MongoDB best-effort orphan upstream delete failed for {}: database error (details withheld)",
+                                    crate::startup::sanitize_startup_scalar(uid)
                                 ),
                             }
                         }
@@ -9732,109 +9808,116 @@ mod inner {
             let identity_values = consumer_identity_values(consumer);
             mtls_lease
                 .run_mutation(async {
-            if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                session
-                    .start_transaction()
-                    .and_run(
-                        (
-                            self,
-                            doc,
-                            consumer.namespace.clone(),
-                            consumer.id.clone(),
-                            identity_values,
-                        ),
-                        |s, (this, doc, namespace, id, identity_values)| {
-                            Box::pin(async move {
-                                // Reserve the merged identity keyspace
-                                // (id ∪ username ∪ custom_id) in the same
-                                // transaction — a duplicate key means another
-                                // consumer owns one of the values (409).
-                                this.insert_consumer_identity_docs_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    id.as_str(),
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        session
+                            .start_transaction()
+                            .and_run(
+                                (
+                                    self,
+                                    doc,
+                                    consumer.namespace.clone(),
+                                    consumer.id.clone(),
                                     identity_values,
-                                )
-                                .await?;
-                                this.consumers()
-                                    .insert_one(doc.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "consumer",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                                Ok(())
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("create_consumer transaction failed")?;
-                self.compact_config_changes_best_effort(&consumer.namespace)
-                    .await;
-            } else {
-                // Standalone: RESERVE FIRST. Inserting the identity docs
-                // before the consumer makes the identity-index `_id` the
-                // atomic admission guard — a duplicate key error (E11000,
-                // "duplicate key") bails before the consumer is written.
-                // Rollback releases only values this attempt newly inserted
-                // (never adopted same-owner reservations of unknown provenance).
-                let newly_inserted_identity_values = self
-                    .reserve_consumer_identity_docs_standalone(
-                        &consumer.namespace,
-                        &consumer.id,
-                        &identity_values,
-                    )
-                    .await?;
-                // Release only values this attempt newly inserted — never adopted
-                // same-owner reservations, whose provenance is unknown.
-                let rollback_identity_values: &[String] = &newly_inserted_identity_values;
-                if let Err(err) = self.consumers().insert_one(doc).await {
-                    self.release_consumer_identity_values_best_effort(
-                        &consumer.namespace,
-                        &consumer.id,
-                        rollback_identity_values,
-                    )
-                    .await;
-                    return Err(err.into());
-                }
-                if let Err(err) = self
-                    .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
-                    .await
-                {
-                    let rollback_confirmed = self
-                        .rollback_standalone_created_document(
-                            "consumers",
-                            &consumer.namespace,
-                            "consumer",
-                            &consumer.id,
-                            &err,
-                        )
-                        .await;
-                    if rollback_confirmed {
-                        self.release_consumer_identity_values_best_effort(
-                            &consumer.namespace,
-                            &consumer.id,
-                            rollback_identity_values,
-                        )
-                        .await;
+                                ),
+                                |s, (this, doc, namespace, id, identity_values)| {
+                                    Box::pin(async move {
+                                        // Reserve the merged identity keyspace
+                                        // (id ∪ username ∪ custom_id) in the same
+                                        // transaction — a duplicate key means another
+                                        // consumer owns one of the values (409).
+                                        this.insert_consumer_identity_docs_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            identity_values,
+                                        )
+                                        .await?;
+                                        this.consumers()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "consumer",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        Ok(())
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("create_consumer transaction failed")?;
+                        self.compact_config_changes_best_effort(&consumer.namespace)
+                            .await;
                     } else {
-                        warn!(
-                            "Retaining MongoDB consumer identity reservations for '{}' in namespace '{}' because create rollback could not be verified",
-                            consumer.id, consumer.namespace
-                        );
+                        // Standalone: RESERVE FIRST. Inserting the identity docs
+                        // before the consumer makes the identity-index `_id` the
+                        // atomic admission guard — a duplicate key error (E11000,
+                        // "duplicate key") bails before the consumer is written.
+                        // Rollback releases only values this attempt newly inserted
+                        // (never adopted same-owner reservations of unknown provenance).
+                        let newly_inserted_identity_values = self
+                            .reserve_consumer_identity_docs_standalone(
+                                &consumer.namespace,
+                                &consumer.id,
+                                &identity_values,
+                            )
+                            .await?;
+                        // Release only values this attempt newly inserted — never adopted
+                        // same-owner reservations, whose provenance is unknown.
+                        let rollback_identity_values: &[String] = &newly_inserted_identity_values;
+                        if let Err(err) = self.consumers().insert_one(doc).await {
+                            self.release_consumer_identity_values_best_effort(
+                                &consumer.namespace,
+                                &consumer.id,
+                                rollback_identity_values,
+                            )
+                            .await;
+                            return Err(err.into());
+                        }
+                        if let Err(err) = self
+                            .record_config_change(
+                                &consumer.namespace,
+                                "consumer",
+                                &consumer.id,
+                                "upsert",
+                            )
+                            .await
+                        {
+                            let rollback_confirmed = self
+                                .rollback_standalone_created_document(
+                                    "consumers",
+                                    &consumer.namespace,
+                                    "consumer",
+                                    &consumer.id,
+                                    &err,
+                                )
+                                .await;
+                            if rollback_confirmed {
+                                self.release_consumer_identity_values_best_effort(
+                                    &consumer.namespace,
+                                    &consumer.id,
+                                    rollback_identity_values,
+                                )
+                                .await;
+                            } else {
+                                warn!(
+                                    "Retaining MongoDB consumer identity reservations for {} in \
+                                     namespace {} because create rollback could not be verified",
+                                    crate::startup::sanitize_startup_scalar(&consumer.id),
+                                    crate::startup::sanitize_startup_scalar(&consumer.namespace)
+                                );
+                            }
+                            return Err(err);
+                        }
                     }
-                    return Err(err);
-                }
-            }
-            Ok(())
+                    Ok(())
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -10109,7 +10192,7 @@ mod inner {
                                             .get_str("username")
                                             .map_err(|error| {
                                                 mongodb::error::Error::custom(format!(
-                                                    "consumer '{}' is missing username: {}",
+                                                    "consumer {:?} is missing username: {}",
                                                     id, error
                                                 ))
                                             })?
@@ -10126,9 +10209,9 @@ mod inner {
                                             })?
                                         {
                                             return Err(mongodb::error::Error::custom(format!(
-                                                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
-                                                id,
-                                                plugin.id
+                                                "Consumer {:?} is referenced by access_control \
+                                                 plugin_config {:?} and cannot be deleted",
+                                                id, plugin.id
                                             )));
                                         }
                                         let result = this
@@ -10176,18 +10259,15 @@ mod inner {
                             return Ok(false);
                         };
                         let username = existing.get_str("username").map_err(|error| {
-                            anyhow::anyhow!("consumer '{}' is missing username: {}", id, error)
+                            anyhow::anyhow!("consumer {:?} is missing username: {}", id, error)
                         })?;
                         if let Some(plugin) = self
-                            .find_access_control_consumer_ref_opt_session(
-                                None,
-                                namespace,
-                                username,
-                            )
+                            .find_access_control_consumer_ref_opt_session(None, namespace, username)
                             .await?
                         {
                             anyhow::bail!(
-                                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                                "Consumer {:?} is referenced by access_control plugin_config {:?} \
+                                 and cannot be deleted",
                                 id,
                                 plugin.id
                             );
@@ -10202,7 +10282,7 @@ mod inner {
                             // orphaned reservations that 409 future claims of the
                             // same values until repaired, but the consumer delete
                             // itself already succeeded.
-                            if let Err(err) = self
+                            if let Err(_error) = self
                                 .consumer_identity_index()
                                 .delete_many(doc! {
                                     "namespace": namespace,
@@ -10212,8 +10292,9 @@ mod inner {
                             {
                                 warn!(
                                     "MongoDB standalone consumer identity index cleanup failed for \
-                             consumer '{}' in namespace '{}': {}",
-                                    id, namespace, err
+                                     consumer {} in namespace {}: database error (details withheld)",
+                                    crate::startup::sanitize_startup_scalar(id),
+                                    crate::startup::sanitize_startup_scalar(namespace)
                                 );
                             }
                             self.record_config_change(namespace, "consumer", id, "delete")
@@ -11057,7 +11138,8 @@ mod inner {
                                     .await?;
                                 if proxy_refs > 0 {
                                     return Err(mongodb::error::Error::custom(format!(
-                                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                                        "Upstream {:?} is referenced by one or more proxies and \
+                                         cannot be deleted",
                                         id
                                     )));
                                 }
@@ -11071,7 +11153,8 @@ mod inner {
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
                                 {
                                     return Err(mongodb::error::Error::custom(format!(
-                                        "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                                        "Upstream {:?} is referenced by mesh_route_dispatch \
+                                         plugin_config {:?} and cannot be deleted",
                                         id, plugin.id
                                     )));
                                 }
@@ -11137,7 +11220,7 @@ mod inner {
                     .await?;
                 if proxy_refs > 0 {
                     anyhow::bail!(
-                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                        "Upstream {:?} is referenced by one or more proxies and cannot be deleted",
                         id
                     );
                 }
@@ -11146,7 +11229,8 @@ mod inner {
                     .await?
                 {
                     anyhow::bail!(
-                        "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                        "Upstream {:?} is referenced by mesh_route_dispatch plugin_config {:?} \
+                         and cannot be deleted",
                         id,
                         plugin.id
                     );
@@ -11178,12 +11262,13 @@ mod inner {
                 if proxy_refs_after > 0 {
                     if let Err(err) = self.upstreams().insert_one(existing).await {
                         return Err(anyhow::Error::new(err).context(format!(
-                            "MongoDB standalone delete_upstream could not restore '{}' after a late proxy reference",
+                            "MongoDB standalone delete_upstream could not restore {:?} after a \
+                             late proxy reference",
                             id
                         )));
                     }
                     anyhow::bail!(
-                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                        "Upstream {:?} is referenced by one or more proxies and cannot be deleted",
                         id
                     );
                 }
@@ -11335,7 +11420,10 @@ mod inner {
                 if self.replica_set_configured() {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
-                debug!("Cleaned up orphaned upstream: {}", upstream_id);
+                debug!(
+                    "Cleaned up orphaned upstream: {}",
+                    crate::startup::sanitize_startup_scalar(upstream_id)
+                );
             }
             self.check_slow_query("cleanup_orphaned_upstream", start);
             Ok(())
@@ -11975,7 +12063,7 @@ mod inner {
                 let doc_namespace = doc.get_str("namespace").unwrap_or("");
                 if doc_namespace != namespace {
                     return Ok(Some(format!(
-                        "Consumer identity '{}' conflicts with consumer '{}'",
+                        "Consumer identity {:?} conflicts with consumer {:?}",
                         value,
                         doc.get_str("consumer_id").unwrap_or("unknown")
                     )));
@@ -11984,7 +12072,7 @@ mod inner {
                     Ok(id) => id.to_string(),
                     Err(_) => {
                         return Ok(Some(format!(
-                            "Consumer identity '{}' conflicts with an existing consumer",
+                            "Consumer identity {:?} conflicts with an existing consumer",
                             value
                         )));
                     }
@@ -12552,7 +12640,7 @@ mod inner {
                             let Ok(consumer_id) = doc.get_str("consumer_id") else {
                                 adopt_ok = false;
                                 adopt_err = Some(anyhow::anyhow!(
-                                    "batch consumer identity reservation '{}' missing consumer_id",
+                                    "batch consumer identity reservation {:?} missing consumer_id",
                                     doc_id
                                 ));
                                 break;
@@ -12560,7 +12648,7 @@ mod inner {
                             let Ok(namespace) = doc.get_str("namespace") else {
                                 adopt_ok = false;
                                 adopt_err = Some(anyhow::anyhow!(
-                                    "batch consumer identity reservation '{}' missing namespace",
+                                    "batch consumer identity reservation {:?} missing namespace",
                                     doc_id
                                 ));
                                 break;
@@ -12568,7 +12656,8 @@ mod inner {
                             let Ok(identity_value) = doc.get_str("identity_value") else {
                                 adopt_ok = false;
                                 adopt_err = Some(anyhow::anyhow!(
-                                    "batch consumer identity reservation '{}' missing identity_value",
+                                    "batch consumer identity reservation {:?} missing \
+                                     identity_value",
                                     doc_id
                                 ));
                                 break;
@@ -13087,7 +13176,10 @@ mod inner {
             };
             let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             mtls_lease.release().await.map_err(&delete_error)?;
-            info!("All MongoDB resources deleted (namespace='{}')", namespace);
+            info!(
+                "All MongoDB resources deleted (namespace={})",
+                crate::startup::sanitize_startup_scalar(namespace)
+            );
             Ok(mode)
         }
 
@@ -13114,22 +13206,24 @@ mod inner {
             guard_owner: &str,
         ) -> Result<(), anyhow::Error> {
             let connection = {
-                let persistent_pin = self
-                    .persistent_admission_pins
-                    .get(guard_owner)
-                    .ok_or_else(|| {
+                let persistent_pin = self.persistent_admission_pins.get(guard_owner).ok_or_else(
+                    || {
                         anyhow::anyhow!(
-                            "MongoDB mTLS DNS admission guard is not active in this admin process for namespace '{namespace}'"
+                            "MongoDB mTLS DNS admission guard is not active in this admin process \
+                             for namespace {namespace:?}"
                         )
-                    })?;
+                    },
+                )?;
                 if persistent_pin.namespace != namespace {
                     anyhow::bail!(
-                        "MongoDB mTLS DNS admission guard belongs to a different namespace than '{namespace}'"
+                        "MongoDB mTLS DNS admission guard belongs to a different namespace than \
+                         {namespace:?}"
                     );
                 }
                 if persistent_pin.uncertain_outcome.load(Ordering::Acquire) {
                     anyhow::bail!(
-                        "MongoDB mTLS DNS admission guard for namespace '{namespace}' retained because a protected mutation outcome is uncertain"
+                        "MongoDB mTLS DNS admission guard for namespace {namespace:?} retained \
+                         because a protected mutation outcome is uncertain"
                     );
                 }
                 persistent_pin.pin.connection.clone()
@@ -13148,14 +13242,14 @@ mod inner {
             let _ = self.persistent_admission_pins.remove(guard_owner);
             let result = match result {
                 Ok(result) => result,
-                Err(error) => {
+                Err(_error) => {
                     // Every borrowed mutation explicitly settled before this
                     // cleanup. Preserve its known response, surface cleanup
                     // status in the error log, and leave any durable fence for
                     // owner-qualified operator cleanup.
                     error!(
-                        namespace = %namespace,
-                        error = %error,
+                        namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                        error = "database error (details withheld)",
                         "MongoDB mTLS DNS admission guard cleanup failed after a settled operation"
                     );
                     return Ok(());
@@ -13163,7 +13257,7 @@ mod inner {
             };
             if result.deleted_count != 1 {
                 error!(
-                    namespace = %namespace,
+                    namespace = %crate::startup::sanitize_startup_scalar(namespace),
                     "MongoDB mTLS DNS admission guard cleanup did not match its owner after a settled operation"
                 );
                 return Ok(());
@@ -13214,8 +13308,8 @@ mod inner {
 
             info!(
                 "MongoDB client reconnected to {} (replica_set={})",
-                crate::config::db_backend::redact_url(db_url),
-                replica_set_configured
+                crate::startup::sanitize_startup_scalar(db_url),
+                crate::startup::sanitize_startup_scalar(replica_set_configured)
             );
             Ok(())
         }
@@ -13237,15 +13331,12 @@ mod inner {
                 Ok(()) => {
                     info!(
                         "Reconnected to primary MongoDB ({})",
-                        crate::config::db_backend::redact_url(primary_url)
+                        crate::startup::sanitize_startup_scalar(primary_url)
                     );
                     return Ok(primary_url.to_string());
                 }
-                Err(error) => {
-                    warn!(
-                        "Primary MongoDB reconnect failed: {}",
-                        crate::config::db_backend::redact_error_text(&error, &[primary_url])
-                    );
+                Err(_error) => {
+                    warn!("Primary MongoDB reconnect failed (details withheld)");
                 }
             }
 
@@ -13258,16 +13349,15 @@ mod inner {
                         info!(
                             "Reconnected to failover MongoDB #{} ({})",
                             i + 1,
-                            crate::config::db_backend::redact_url(url)
+                            crate::startup::sanitize_startup_scalar(url)
                         );
                         return Ok(url.clone());
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         warn!(
-                            "Failover MongoDB #{} ({}) reconnect failed: {}",
+                            "Failover MongoDB #{} ({}) reconnect failed (details withheld)",
                             i + 1,
-                            crate::config::db_backend::redact_url(url),
-                            crate::config::db_backend::redact_error_text(&error, &[url])
+                            crate::startup::sanitize_startup_scalar(url)
                         );
                     }
                 }
@@ -14189,7 +14279,7 @@ mod inner {
                     // and this guarded write — never report that as a success.
                     if replace_result.matched_count != 1 {
                         anyhow::bail!(
-                            "API spec document not found for id '{}' in namespace '{}' during \
+                            "API spec document not found for id {:?} in namespace {:?} during \
                              metadata-only replace (matched_count={})",
                             spec.id,
                             spec.namespace,
@@ -14541,31 +14631,31 @@ mod inner {
                     )));
                 }
 
-                if let Err(e) = self
+                if let Err(_error) = self
                     .plugin_configs()
                     .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .await
                 {
                     warn!(
                         "replace_api_spec_bundle: failed to delete spec-owned plugin_configs for \
-                         spec {}: {}",
-                        spec.id, e
+                         spec {}: database error (details withheld)",
+                        crate::startup::sanitize_startup_scalar(&spec.id)
                     );
                     old_plugin_configs_deleted_for_changes = false;
                 }
-                if let Err(e) = self
+                if let Err(_error) = self
                     .upstreams()
                     .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .await
                 {
                     warn!(
                         "replace_api_spec_bundle: failed to delete spec-owned upstreams for \
-                         spec {}: {}",
-                        spec.id, e
+                         spec {}: database error (details withheld)",
+                        crate::startup::sanitize_startup_scalar(&spec.id)
                     );
                     old_upstreams_deleted_for_changes = false;
                 }
-                if let Err(e) = self
+                if let Err(_error) = self
                     .api_specs()
                     .delete_one(doc! {
                         "_id": namespaced_doc_id(&spec.namespace, &spec.id),
@@ -14574,8 +14664,8 @@ mod inner {
                     .await
                 {
                     warn!(
-                        "replace_api_spec_bundle: failed to delete api_spec row {}: {}",
-                        spec.id, e
+                        "replace_api_spec_bundle: failed to delete api_spec row {}: database error (details withheld)",
+                        crate::startup::sanitize_startup_scalar(&spec.id)
                     );
                 }
 
@@ -14612,8 +14702,8 @@ mod inner {
                     warn!(
                         "replace_api_spec_bundle: re-insert failed for spec {}; \
                          attempting compensating rollback of partial inserts. \
-                         Re-submit the spec to restore it. Error: {}",
-                        spec.id, e
+                         Re-submit the spec to restore it. Error details withheld",
+                        crate::startup::sanitize_startup_scalar(&spec.id)
                     );
                     self.compensate_bundle_insert(
                         &spec.namespace,
@@ -14949,7 +15039,7 @@ mod inner {
                 let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
                 if bson_bytes.len() > 15 * 1024 * 1024 {
                     anyhow::bail!(
-                        "MongoDB document limit exceeded restoring api_spec '{}': \
+                        "MongoDB document limit exceeded restoring api_spec {:?}: \
                          serialized size is {} bytes (limit ~15 MiB)",
                         spec.id,
                         bson_bytes.len()
@@ -14976,7 +15066,7 @@ mod inner {
                         .await?;
                     if proxy_doc.is_none() {
                         anyhow::bail!(
-                            "cannot restore api_spec '{}': owning proxy '{}' is missing",
+                            "cannot restore api_spec {:?}: owning proxy {:?} is missing",
                             spec.id,
                             spec.proxy_id
                         );
@@ -15214,10 +15304,10 @@ mod inner {
                         // paths strip via strip_api_spec_id_from_runtime_config.
                         configs.push(pc);
                     }
-                    Err(e) => {
+                    Err(decode_error) => {
                         tracing::warn!(
                             "list_spec_owned_plugin_configs: skipping malformed doc: {}",
-                            e
+                            crate::startup::sanitize_startup_cause(decode_error, &[])
                         );
                     }
                 }
@@ -15245,8 +15335,11 @@ mod inner {
                 let doc = cursor.deserialize_current()?;
                 match doc_to_upstream(doc) {
                     Ok(upstream) => upstreams.push(upstream),
-                    Err(e) => {
-                        tracing::warn!("list_spec_owned_upstreams: skipping malformed doc: {}", e);
+                    Err(decode_error) => {
+                        tracing::warn!(
+                            "list_spec_owned_upstreams: skipping malformed doc: {}",
+                            crate::startup::sanitize_startup_cause(decode_error, &[])
+                        );
                     }
                 }
             }
@@ -15546,11 +15639,11 @@ mod inner {
                         deleted_plugin_config_ids_for_changes
                             .extend(spec_plugin_config_ids.iter().cloned());
                     }
-                    Err(e) => {
+                    Err(_error) => {
                         warn!(
                             "delete_api_spec: failed to delete spec-owned plugin_configs for \
-                             spec {}: {}",
-                            id, e
+                             spec {}: database error (details withheld)",
+                            crate::startup::sanitize_startup_scalar(id)
                         );
                     }
                 }
@@ -15559,11 +15652,11 @@ mod inner {
                         .plugin_configs()
                         .delete_many(doc! { "proxy_id": pid, "namespace": namespace })
                         .await;
-                    if let Err(e) = cleanup_result {
+                    if let Err(_error) = cleanup_result {
                         warn!(
                             "delete_api_spec: failed to delete proxy-scoped plugin_configs for \
-                             proxy {}: {}",
-                            pid, e
+                             proxy {}: database error (details withheld)",
+                            crate::startup::sanitize_startup_scalar(pid)
                         );
                     } else {
                         deleted_plugin_config_ids_for_changes
@@ -15572,22 +15665,22 @@ mod inner {
                 }
                 match self.cleanup_orphaned_proxy_group_plugins(namespace).await {
                     Ok(deleted) => orphaned_proxy_group_plugin_deletes = deleted,
-                    Err(e) => {
+                    Err(_error) => {
                         warn!(
                             "delete_api_spec: failed to cleanup orphaned proxy_group plugins \
-                             after deleting spec {}: {}",
-                            id, e
+                             after deleting spec {}: database error (details withheld)",
+                            crate::startup::sanitize_startup_scalar(id)
                         );
                     }
                 }
-                if let Err(e) = self
+                if let Err(_error) = self
                     .upstreams()
                     .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
                     .await
                 {
                     warn!(
-                        "delete_api_spec: failed to delete spec-owned upstreams for spec {}: {}",
-                        id, e
+                        "delete_api_spec: failed to delete spec-owned upstreams for spec {}: database error (details withheld)",
+                        crate::startup::sanitize_startup_scalar(id)
                     );
                     deleted_upstream_ids.clear();
                 }
@@ -15649,13 +15742,13 @@ mod inner {
             }
             self.check_slow_query("insert_audit_event", start);
             if self.audit_retention.is_enabled()
-                && let Err(error) = self
+                && let Err(_error) = self
                     .prune_audit_events_with_mode(&event.namespace, /* force_max_rows */ false)
                     .await
             {
                 warn!(
-                    namespace = %event.namespace,
-                    error = %error,
+                    namespace = %crate::startup::sanitize_startup_scalar(&event.namespace),
+                    error = "database error (details withheld)",
                     "Failed to prune audit_events after insert; retention will retry on later writes"
                 );
             }
@@ -16331,7 +16424,8 @@ mod inner {
             for (plugin_id, _) in &prepared.plugins {
                 if !seen_plugin_ids.insert(plugin_id.as_str()) {
                     anyhow::bail!(
-                        "duplicate key preflight: plugin_config id '{}' appears more than once in api_spec '{}' replacement bundle",
+                        "duplicate key preflight: plugin_config id {:?} appears more than once in \
+                         api_spec {:?} replacement bundle",
                         plugin_id,
                         spec.id
                     );
@@ -16371,7 +16465,8 @@ mod inner {
                     let owner = doc.get_str("api_spec_id").unwrap_or("<none>");
                     let owner_namespace = doc.get_str("namespace").unwrap_or("<unknown>");
                     anyhow::bail!(
-                        "duplicate key preflight: {} id '{}' already exists in namespace '{}' owned by api_spec '{}'; cannot replace api_spec '{}'",
+                        "duplicate key preflight: {} id {:?} already exists in namespace {:?} \
+                         owned by api_spec {:?}; cannot replace api_spec {:?}",
                         resource_type,
                         id,
                         owner_namespace,
@@ -16395,18 +16490,18 @@ mod inner {
             spec_id: Option<&str>,
         ) {
             if let Some(sid) = spec_id
-                && let Err(e) = self
+                && let Err(_error) = self
                     .api_specs()
                     .delete_one(doc! { "_id": namespaced_doc_id(namespace, sid) })
                     .await
             {
                 warn!(
-                    "compensate_bundle_insert: failed to delete api_spec {}: {}",
-                    sid, e
+                    "compensate_bundle_insert: failed to delete api_spec {}: database error (details withheld)",
+                    crate::startup::sanitize_startup_scalar(sid)
                 );
             }
             if let Some(pid) = proxy_id
-                && let Err(e) = self
+                && let Err(_error) = self
                     .proxies()
                     .delete_one(doc! { "_id": namespaced_doc_id(namespace, pid) })
                     .await
@@ -16414,32 +16509,32 @@ mod inner {
                 warn!(
                     "compensate_bundle_insert: failed to delete proxy {}; \
                      leaving inserted dependencies in place to avoid a live proxy \
-                     with dangling references: {}",
-                    pid, e
+                     with dangling references: database error (details withheld)",
+                    crate::startup::sanitize_startup_scalar(pid)
                 );
                 return;
             }
             for pid in plugin_ids {
-                if let Err(e) = self
+                if let Err(_error) = self
                     .plugin_configs()
                     .delete_one(doc! { "_id": namespaced_doc_id(namespace, pid) })
                     .await
                 {
                     warn!(
-                        "compensate_bundle_insert: failed to delete plugin_config {}: {}",
-                        pid, e
+                        "compensate_bundle_insert: failed to delete plugin_config {}: database error (details withheld)",
+                        crate::startup::sanitize_startup_scalar(pid)
                     );
                 }
             }
             if let Some(uid) = upstream_id
-                && let Err(e) = self
+                && let Err(_error) = self
                     .upstreams()
                     .delete_one(doc! { "_id": namespaced_doc_id(namespace, uid) })
                     .await
             {
                 warn!(
-                    "compensate_bundle_insert: failed to delete upstream {}: {}",
-                    uid, e
+                    "compensate_bundle_insert: failed to delete upstream {}: database error (details withheld)",
+                    crate::startup::sanitize_startup_scalar(uid)
                 );
             }
         }

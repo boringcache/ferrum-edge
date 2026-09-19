@@ -484,7 +484,7 @@ impl LoadTesting {
             .ok_or_else(|| "load_testing: 'concurrent_clients' is required".to_string())?;
         if concurrent_clients == 0 || concurrent_clients > 10_000 {
             return Err(format!(
-                "load_testing: 'concurrent_clients' must be 1–10000 (got {})",
+                "load_testing: `concurrent_clients` must be 1–10000 (got \"{}\")",
                 concurrent_clients
             ));
         }
@@ -493,7 +493,7 @@ impl LoadTesting {
             .ok_or_else(|| "load_testing: 'duration_seconds' is required".to_string())?;
         if duration_seconds == 0 || duration_seconds > 3600 {
             return Err(format!(
-                "load_testing: 'duration_seconds' must be 1–3600 (got {})",
+                "load_testing: `duration_seconds` must be 1–3600 (got \"{}\")",
                 duration_seconds
             ));
         }
@@ -506,7 +506,7 @@ impl LoadTesting {
         }
         if request_timeout_ms > MAX_REQUEST_TIMEOUT_MS {
             return Err(format!(
-                "load_testing: 'request_timeout_ms' must be <= {MAX_REQUEST_TIMEOUT_MS} (got {request_timeout_ms})"
+                "load_testing: `request_timeout_ms` must be <= {MAX_REQUEST_TIMEOUT_MS} (got \"{request_timeout_ms}\")"
             ));
         }
 
@@ -538,7 +538,7 @@ impl LoadTesting {
             .map(|p| {
                 if p == 0 || p > 65535 {
                     Err(format!(
-                        "load_testing: 'gateway_port' must be 1–65535 (got {})",
+                        "load_testing: `gateway_port` must be 1–65535 (got \"{}\")",
                         p
                     ))
                 } else {
@@ -732,12 +732,12 @@ fn parse_gateway_addresses(
                 let label = sanitize_gateway_label(&normalized);
                 if is_local_loopback_alias(&parsed, &local) {
                     return Err(format!(
-                        "load_testing: 'gateway_addresses' must not include this node's local loopback target ({label})"
+                        "load_testing: `gateway_addresses` must not include this node's local loopback target ({label:?})"
                     ));
                 }
                 if !seen.insert(label.clone()) {
                     return Err(format!(
-                        "load_testing: duplicate 'gateway_addresses' entry for {label}"
+                        "load_testing: duplicate `gateway_addresses` entry for {label:?}"
                     ));
                 }
                 urls.push(normalized);
@@ -763,13 +763,13 @@ fn validate_gateway_address(url: &str) -> Result<Url, String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         let label = sanitize_gateway_label(url);
         return Err(format!(
-            "load_testing: gateway address must not include URL userinfo (credentials); got {label}"
+            "load_testing: gateway address must not include URL userinfo (credentials); got {label:?}"
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         let label = sanitize_gateway_label(url);
         return Err(format!(
-            "load_testing: gateway address must not include a query or fragment ({label})"
+            "load_testing: gateway address must not include a query or fragment ({label:?})"
         ));
     }
     Ok(parsed)

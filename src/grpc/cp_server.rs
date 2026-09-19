@@ -187,7 +187,7 @@ impl CpScope {
     /// Human-readable scope description for startup logs.
     pub fn describe(&self) -> String {
         match self {
-            CpScope::Single(ns) => format!("single namespace '{ns}'"),
+            CpScope::Single(ns) => format!("single namespace {ns:?}"),
             CpScope::Set(set) => {
                 let mut v: Vec<&String> = set.iter().collect();
                 v.sort();
@@ -401,7 +401,13 @@ impl<S> Drop for TrackedStream<S> {
     fn drop(&mut self) {
         self.registry
             .remove_if_stale(&self.node_id, self.connected_at);
-        info!("DP node '{}' disconnected (stream dropped)", self.node_id);
+        info!(
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!("DP node {:?} disconnected (stream dropped)", self.node_id),
+                &[]
+            )
+        );
     }
 }
 
@@ -660,18 +666,18 @@ impl CpGrpcServer {
         if allowed.effective_namespaces().is_some() && !allowed.allows(namespace) {
             if allowed.is_present() {
                 return Err(Status::permission_denied(format!(
-                    "JWT `ns` claim does not authorise namespace '{namespace}'; \
+                    "JWT `ns` claim does not authorise namespace {namespace:?}; \
                      the bearer can only subscribe to the namespaces listed in its token"
                 )));
             }
             return Err(Status::permission_denied(format!(
-                "Presented credential is not authorised for namespace '{namespace}'"
+                "Presented credential is not authorised for namespace {namespace:?}"
             )));
         }
 
         if !scope.includes(namespace) {
             return Err(Status::failed_precondition(format!(
-                "CP scope ({}) does not include DP namespace '{namespace}'. \
+                "CP scope ({}) does not include DP namespace {namespace:?}. \
                  Add it to FERRUM_CP_NAMESPACES (or use `*` for cluster-wide).",
                 scope.describe()
             )));
@@ -803,7 +809,8 @@ impl CpGrpcServer {
         {
             info!(
                 "DP v{} connected to CP v{} (patch/prerelease difference OK)",
-                dp_version, FERRUM_VERSION
+                crate::startup::sanitize_startup_cause(format!("{dp_version:?}"), &[]),
+                FERRUM_VERSION
             );
         }
 
@@ -893,7 +900,10 @@ impl CpGrpcServer {
             crate::config::gateway_trust::NamespaceTrustProjection::KeepPrevious
         ) {
             error!(
-                namespace = %namespace,
+                namespace = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", namespace),
+                    &[]
+                ),
                 "{}",
                 crate::config::gateway_trust::AMBIGUOUS_TRUST_AUTHORITY_MESSAGE
             );
@@ -1676,7 +1686,10 @@ impl CpGrpcServer {
             Ok(publication) => publication,
             Err(failure_class) => {
                 error!(
-                    namespace = %namespace,
+                    namespace = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", namespace),
+                        &[]
+                    ),
                     failure_class,
                     "Refusing namespace configuration publication because gateway trust is unusable"
                 );
@@ -1707,7 +1720,10 @@ impl CpGrpcServer {
             && crate::config::gateway_trust::validate_trust_bundle_set(bundle).is_err()
         {
             error!(
-                namespace = %namespace,
+                namespace = %crate::startup::sanitize_startup_cause(
+                    format!("{:?}", namespace),
+                    &[]
+                ),
                 failure_class = "gateway_trust_validation_failed",
                 "Refusing namespace delta publication because gateway trust is unusable"
             );
@@ -1771,8 +1787,15 @@ impl CpGrpcServer {
             Ok(json) => json,
             Err(e) => {
                 error!(
-                    "Failed to serialize gateway trust bundles for broadcast; skipping update: {}",
-                    e
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!(
+                            "Failed to serialize gateway trust bundles for broadcast; skipping \
+                             update: {}",
+                            e
+                        ),
+                        &[]
+                    )
                 );
                 return false;
             }
@@ -1797,7 +1820,13 @@ impl CpGrpcServer {
         let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
-                error!("Refusing to publish configuration to data planes: {}", e);
+                error!(
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!("Refusing to publish configuration to data planes: {}", e),
+                        &[]
+                    )
+                );
                 return false;
             }
         };
@@ -1876,8 +1905,15 @@ impl CpGrpcServer {
             Ok(json) => json,
             Err(e) => {
                 error!(
-                    "Failed to serialize gateway trust bundles for delta broadcast; skipping update: {}",
-                    e
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!(
+                            "Failed to serialize gateway trust bundles for delta broadcast; \
+                             skipping update: {}",
+                            e
+                        ),
+                        &[]
+                    )
                 );
                 return false;
             }
@@ -1901,7 +1937,13 @@ impl CpGrpcServer {
         let config_json = match serde_json::to_string(result) {
             Ok(json) => json,
             Err(e) => {
-                error!("Failed to serialize delta for broadcast: {}", e);
+                error!(
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!("Failed to serialize delta for broadcast: {}", e),
+                        &[]
+                    )
+                );
                 return false;
             }
         };
@@ -2250,14 +2292,23 @@ impl ConfigSync for CpGrpcServer {
             Self::filter_config_and_trust_for_scope(config.as_ref(), &dp_namespace, &self.scope)
                 .map_err(|failure_class| {
                     error!(
-                        namespace = %dp_namespace,
+                        namespace = %crate::startup::sanitize_startup_cause(
+                            format!("{:?}", dp_namespace),
+                            &[]
+                        ),
                         failure_class,
                         "Refusing initial ConfigSync snapshot because gateway trust is unusable"
                     );
                     Status::internal("Failed to prepare configuration snapshot")
                 })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
-            error!("Refusing to publish configuration in subscribe: {}", e);
+            error!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!("Refusing to publish configuration in subscribe: {}", e),
+                    &[]
+                )
+            );
             Status::internal("Failed to serialize configuration")
         })?;
         let initial = ConfigUpdate {
@@ -2288,11 +2339,18 @@ impl ConfigSync for CpGrpcServer {
             "",
         );
         info!(
-            "DP node '{}' (v{}) subscribed for config updates (namespace='{}', scope={})",
-            node_id,
-            dp_version,
-            dp_namespace,
-            self.scope.describe()
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "DP node {:?} (v{:?}) subscribed for config updates (namespace={:?}, \
+                     scope={:?})",
+                    node_id,
+                    dp_version,
+                    dp_namespace,
+                    self.scope.describe()
+                ),
+                &[]
+            )
         );
         let now = Utc::now();
         self.registry.insert(DpNodeInfo {
@@ -2326,7 +2384,9 @@ impl ConfigSync for CpGrpcServer {
                         Ok(publication) => publication,
                         Err(failure_class) => {
                             error!(
-                                namespace = %recovery_namespace,
+                                namespace = %crate::startup::sanitize_startup_scalar(
+                                    recovery_namespace.to_string()
+                                ),
                                 failure_class,
                                 "Terminating ConfigSync recovery because gateway trust is unusable"
                             );
@@ -2349,7 +2409,15 @@ impl ConfigSync for CpGrpcServer {
                         }))
                     }
                     Err(e) => {
-                        error!("Failed to serialize recovery snapshot: {}", e);
+                        error!(
+                            "{}",
+                            crate::startup::sanitize_startup_cause(
+                                format!(
+                                    "Failed to serialize recovery snapshot: {}", e
+                                ),
+                                &[]
+                            )
+                        );
                         Some(Err(Status::internal(
                             "Failed to serialize ConfigSync recovery snapshot",
                         )))
@@ -2463,7 +2531,10 @@ impl ConfigSync for CpGrpcServer {
             Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope)
                 .map_err(|failure_class| {
                 error!(
-                    namespace = %req.namespace,
+                    namespace = %crate::startup::sanitize_startup_cause(
+                        format!("{:?}", req.namespace),
+                        &[]
+                    ),
                     failure_class,
                     "Refusing GetFullConfig snapshot because gateway trust is unusable"
                 );
@@ -2471,8 +2542,14 @@ impl ConfigSync for CpGrpcServer {
             })?;
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
             error!(
-                "Refusing to publish configuration in get_full_config: {}",
-                e
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!(
+                        "Refusing to publish configuration in get_full_config: {}",
+                        e
+                    ),
+                    &[]
+                )
             );
             Status::internal("Failed to serialize configuration")
         })?;
@@ -2491,8 +2568,14 @@ impl ConfigSync for CpGrpcServer {
             "",
         );
         info!(
-            "DP '{}' (v{}) requested full config (namespace='{}')",
-            req.node_id, dp_version, req.namespace
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "DP {:?} (v{:?}) requested full config (namespace={:?})",
+                    req.node_id, dp_version, req.namespace
+                ),
+                &[]
+            )
         );
 
         Ok(Response::new(response))

@@ -3,6 +3,22 @@ use ferrum_edge::config::types::CURRENT_CONFIG_VERSION;
 use serde_json::json;
 use std::io::Write;
 
+#[test]
+fn backup_version_rejection_never_retains_the_document_value() {
+    let secret = "UNREGISTERED_BACKUP_VERSION_5589";
+    let (_tmp, path) = write_tmp_file(&json!({"version": secret}).to_string());
+    let error = load_config_backup(&path, "ferrum").unwrap_err();
+    for rendered in [
+        error.to_string(),
+        format!("{error:#}"),
+        format!("{error:?}"),
+    ] {
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(rendered.contains("version migration"), "{rendered}");
+        assert!(rendered.contains("No config migration path"), "{rendered}");
+    }
+}
+
 fn administrative_backup() -> serde_json::Value {
     json!({
         "version": CURRENT_CONFIG_VERSION,
@@ -891,4 +907,13 @@ fn backup_bootstrap_projects_the_namespace_before_it_validates() {
         source.contains("fn load_config_backup(\n    path: &str,\n    namespace: &str,\n)"),
         "the backup loader must require a serving namespace argument"
     );
+}
+
+#[test]
+fn backup_wrong_type_version_keeps_the_schema_name_when_rendered() {
+    let (_tmp, path) = write_tmp_file(&json!({"version": false}).to_string());
+    let error = load_config_backup(&path, "ferrum").unwrap_err();
+    let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+    assert!(rendered.contains("field `version` must be a string or non-negative integer"));
+    assert!(rendered.contains("got boolean"), "{rendered}");
 }

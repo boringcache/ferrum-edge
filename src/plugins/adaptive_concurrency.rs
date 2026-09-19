@@ -60,9 +60,12 @@ impl AdaptiveConcurrency {
 }
 
 pub(crate) fn parse_config_value(config: &Value) -> Result<AdaptiveConcurrencyConfig, String> {
-    let object = config
-        .as_object()
-        .ok_or_else(|| format!("adaptive_concurrency: config must be an object, got: {config}"))?;
+    let object = config.as_object().ok_or_else(|| {
+        format!(
+            "adaptive_concurrency: config must be an object, got: {config:?}",
+            config = config.to_string()
+        )
+    })?;
     parse_config(object)
 }
 
@@ -249,7 +252,7 @@ fn parse_key_by(raw: &str) -> Result<AdaptiveConcurrencyKeyBy, String> {
         "upstream_target" => Ok(AdaptiveConcurrencyKeyBy::Upstream),
         "backend_target" => Ok(AdaptiveConcurrencyKeyBy::Backend),
         other => Err(format!(
-            "adaptive_concurrency: unsupported key_by '{other}' (expected proxy_target, upstream_target, or backend_target)"
+            "adaptive_concurrency: unsupported `key_by` {other:?} (expected proxy_target, upstream_target, or backend_target)"
         )),
     }
 }

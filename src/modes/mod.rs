@@ -49,6 +49,23 @@ use crate::config::env_config::EnvConfig;
 
 pub(crate) type AdminReadReplicaDnsWatermark = Arc<Mutex<Option<Vec<IpAddr>>>>;
 
+fn log_admin_read_replica_reconnect_failure(replica_url: &str, reason: &str) {
+    warn!(
+        reason = reason,
+        "Admin-read replica reconnect failed for {}: replica provider reconnect failed",
+        crate::startup::sanitize_startup_scalar(replica_url)
+    );
+}
+
+fn log_admin_read_replica_dns_change(hostname: &str, previous: &[IpAddr], current: &[IpAddr]) {
+    info!(
+        "Read replica DNS changed for {:?}: {:?} -> {:?}, scheduling admin-read replica reconnect",
+        crate::startup::sanitize_startup_scalar(hostname),
+        crate::startup::sanitize_startup_scalar(format_args!("{previous:?}")),
+        crate::startup::sanitize_startup_scalar(format_args!("{current:?}"))
+    );
+}
+
 /// Schedule an admin-read replica reconnect without blocking authoritative config polling.
 pub(crate) fn spawn_admin_read_replica_reconnect(
     db: Arc<dyn DatabaseBackend>,
@@ -71,15 +88,8 @@ pub(crate) fn spawn_admin_read_replica_reconnect(
                     *last_replica_ips.lock().await = Some(ips);
                 }
             }
-            Err(error) => {
-                let safe_error =
-                    crate::config::db_backend::redact_error_text(&error, &[&replica_url]);
-                warn!(
-                    reason = reason,
-                    "Admin-read replica reconnect failed for {}: {}",
-                    crate::config::db_backend::redact_url(&replica_url),
-                    safe_error
-                );
+            Err(_) => {
+                log_admin_read_replica_reconnect_failure(&replica_url, reason);
             }
         }
         in_flight.store(false, Ordering::Release);
@@ -141,10 +151,7 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
         prev_sorted != cur_sorted
     };
     if needs_reconnect {
-        info!(
-            "Read replica DNS changed for '{}': {:?} -> {:?}, scheduling admin-read replica reconnect",
-            replica_hostname, previous_ips, ips
-        );
+        log_admin_read_replica_dns_change(replica_hostname, &previous_ips, &ips);
         let _scheduled = spawn_admin_read_replica_reconnect(
             db,
             replica_url.to_string(),
@@ -230,7 +237,7 @@ pub(crate) fn start_acme_renewal_scheduler(
             &env_config.acme_renew_challenge_type,
         ) else {
             warn!(
-                value = %env_config.acme_renew_challenge_type,
+                value = %crate::startup::sanitize_startup_scalar(&env_config.acme_renew_challenge_type),
                 "invalid FERRUM_ACME_RENEW_CHALLENGE_TYPE; ACME renewal scheduler disabled"
             );
             return None;
@@ -288,7 +295,7 @@ async fn handle_startup_plugin_migrations_with_list(
                 "Could not determine pending custom-plugin migrations ({}). \
                  Run FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up to verify \
                  schema if you have plugins with bundled migrations.",
-                e
+                "plugin migration provider probe failed"
             );
             return Ok(());
         }
@@ -317,7 +324,7 @@ async fn handle_startup_plugin_migrations_with_list(
             "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true and {} pending custom-plugin migration(s) \
              detected ({}). Applying now (mode={}).",
             pending.len(),
-            pending_description,
+            crate::startup::sanitize_startup_scalar(&pending_description),
             mode
         );
         let applied = db.apply_plugin_migrations(plugin_migrations).await?;
@@ -341,7 +348,7 @@ async fn handle_startup_plugin_migrations_with_list(
         info!(
             "Applied {} custom-plugin migration(s) at startup: {}",
             applied.len(),
-            applied_description
+            crate::startup::sanitize_startup_scalar(&applied_description)
         );
     } else {
         warn!(
@@ -351,7 +358,7 @@ async fn handle_startup_plugin_migrations_with_list(
              traffic that depends on the new schema, or set \
              FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true to auto-apply at startup.",
             pending.len(),
-            pending_description
+            crate::startup::sanitize_startup_scalar(&pending_description)
         );
     }
 
@@ -409,21 +416,24 @@ pub(crate) fn apply_config_validation_rejection(
                 "Full config load rejected by validation or row decode ({}); backend is reachable \
                  so KEEPING admin API writable to repair the offending resource in-band, serving \
                  last known-good runtime config: {}",
-                context, err
+                context,
+                crate::startup::sanitize_startup_cause(err, &[])
             );
         } else {
             error!(
                 "Full config load rejected by validation or row decode ({}); backend is reachable \
                  but deferred migrations are still pending, so admin writes stay BLOCKED until \
                  the schema is applied; serving last known-good runtime config: {}",
-                context, err
+                context,
+                crate::startup::sanitize_startup_cause(err, &[])
             );
         }
     } else {
         debug!(
             "Full config load still rejected by validation or row decode ({}); serving \
              last known-good runtime config: {}",
-            context, err
+            context,
+            crate::startup::sanitize_startup_cause(err, &[])
         );
     }
 }
@@ -447,11 +457,11 @@ pub(crate) async fn record_config_validation_rejection(
 ) {
     let writes_enabled = match db.maybe_apply_deferred_migrations().await {
         Ok(_) => true,
-        Err(migration_err) => {
+        Err(_) => {
             warn!(
                 "Deferred migrations failed while handling a reachable-backend config rejection \
                  ({}): {}. Admin writes remain blocked until the schema is applied.",
-                context, migration_err
+                context, "deferred migration provider failed"
             );
             false
         }
@@ -489,6 +499,88 @@ mod tests {
     use crate::config::db_backend::DatabaseBackend;
     use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
     use crate::config::migrations::CustomPluginMigration;
+
+    pub(super) fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = bytes.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || Writer(output.clone()))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, action);
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    #[test]
+    fn config_rejection_logs_withhold_values_on_first_and_repeated_failures() {
+        let supplied = "'UNREGISTERED_config\"\\\nvalue";
+        let error = anyhow::anyhow!(
+            "`mesh.services[0].name` {supplied:?}: unknown reference; \
+             `port` \"49387\" is out of range; `enabled` \"true\" is invalid"
+        );
+        let available = AtomicBool::new(false);
+        let rejected = AtomicBool::new(false);
+        let ((), logs) = capture_logs(|| {
+            apply_config_validation_rejection(&available, &rejected, true, &error, "full poll");
+            apply_config_validation_rejection(&available, &rejected, true, &error, "full poll");
+            rejected.store(false, Ordering::Relaxed);
+            apply_config_validation_rejection(&available, &rejected, false, &error, "full poll");
+        });
+        assert_eq!(logs.matches("unknown reference").count(), 3, "{logs}");
+        assert!(logs.contains("mesh.services[0].name"), "{logs}");
+        assert!(logs.contains("out of range"), "{logs}");
+        assert!(logs.contains("still rejected"), "{logs}");
+        for value in ["UNREGISTERED_config", "49387", "true"] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+        assert!(rejected.load(Ordering::Relaxed));
+        assert!(!available.load(Ordering::Relaxed));
+        assert!(error.to_string().contains("UNREGISTERED_config"));
+    }
+
+    #[test]
+    fn replica_repair_logs_withhold_entire_urls_hosts_and_addresses() {
+        let ((), logs) = capture_logs(|| {
+            log_admin_read_replica_reconnect_failure(
+                "postgres://user:p'ass\"word@private-replica.invalid/db?token=UNREGISTERED",
+                "replica unavailable",
+            );
+            log_admin_read_replica_dns_change(
+                "'UNREGISTERED\"\\\nreplica.invalid",
+                &["192.0.2.211".parse().unwrap()],
+                &["2001:db8::321".parse().unwrap()],
+            );
+        });
+        assert!(logs.contains("replica unavailable"), "{logs}");
+        assert!(logs.contains("replica provider reconnect failed"), "{logs}");
+        assert!(logs.contains("DNS changed"), "{logs}");
+        for value in [
+            "postgres://",
+            "private-replica",
+            "UNREGISTERED",
+            "replica.invalid",
+            "192.0.2.211",
+            "2001:db8::321",
+        ] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+    }
 
     async fn fresh_database_store() -> (Arc<DatabaseStore>, tempfile::TempDir) {
         // File-backed (not `::memory:`) so the multi-connection pool sees

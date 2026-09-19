@@ -173,7 +173,7 @@ impl std::fmt::Display for StockXdsTransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "stock xDS endpoint #{} (scheme='{}', host={}) refused: {} — {}",
+            "stock xDS endpoint #{} (scheme={:?}, host={}) refused: {} — {}",
             self.index,
             self.scheme,
             self.host_class,

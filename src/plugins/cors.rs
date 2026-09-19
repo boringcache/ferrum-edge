@@ -649,11 +649,11 @@ impl CorsPlugin {
             .ok_or_else(|| "cors: configuration must be a JSON object".to_string())?;
         for (key, value) in object {
             if !CORS_CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!("cors: unknown configuration key '{key}'"));
+                return Err(format!("cors: unknown configuration key {key:?}"));
             }
             if value.is_null() {
                 return Err(format!(
-                    "cors: '{key}' must not be null; omit the field to use its default"
+                    "cors: `{key}` must not be null; omit the field to use its default"
                 ));
             }
         }
@@ -664,12 +664,13 @@ impl CorsPlugin {
             Some(Value::String(value)) if value == "ignore" => UnmatchedPreflights::Ignore,
             Some(Value::String(value)) => {
                 return Err(format!(
-                    "cors: 'unmatched_preflights' must be 'forward' or 'ignore', got: {value}"
+                    "cors: `unmatched_preflights` must be `forward` or `ignore`, got: {value:?}"
                 ));
             }
             Some(other) => {
                 return Err(format!(
-                    "cors: 'unmatched_preflights' must be a string, got: {other}"
+                    "cors: `unmatched_preflights` must be a string, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };
@@ -702,7 +703,7 @@ impl CorsPlugin {
         let preflight_continue = bool_config(config, "preflight_continue", false)?;
         if istio_semantics && object.contains_key("preflight_continue") {
             return Err(
-                "cors: 'preflight_continue' cannot be combined with Istio 'unmatched_preflights' semantics"
+                "cors: `preflight_continue` cannot be combined with Istio `unmatched_preflights` semantics"
                     .to_string(),
             );
         }
@@ -726,7 +727,7 @@ impl CorsPlugin {
                 OriginPolicyBreadth::EffectivelyUniversal => {
                     return Err(
                         "cors: allow_credentials=true is incompatible with an effectively \
-                         universal origin matcher (the opaque exact 'null' origin, a prefix \
+                         universal origin matcher (the opaque exact `null` origin, a prefix \
                          that does not terminate at an origin boundary — only a \
                          'scheme://host:' prefix pins the host, because prefix matching is an \
                          unbounded starts_with — or a regex that admits every origin of a \
@@ -793,13 +794,13 @@ impl CorsPlugin {
     fn parse_origins(config: &Value) -> Result<AllowedOrigins, String> {
         match config.get("allowed_origins") {
             None => Err(
-                "cors: 'allowed_origins' is required; use ['*'] for intentional allow-all"
+                "cors: `allowed_origins` is required; use ['*'] for intentional allow-all"
                     .to_string(),
             ),
             Some(Value::Array(arr)) => {
                 if arr.is_empty() {
                     return Err(
-                        "cors: 'allowed_origins' must contain at least one origin or '*'"
+                        "cors: `allowed_origins` must contain at least one origin or '*'"
                             .to_string(),
                     );
                 }
@@ -807,7 +808,7 @@ impl CorsPlugin {
 
                 let mut patterns = Vec::with_capacity(arr.len());
                 let mut wildcard = false;
-                for value in arr {
+                for (index, value) in arr.iter().enumerate() {
                     match value {
                         Value::String(_) => {
                             // Safe: matched `Value::String`.
@@ -815,13 +816,13 @@ impl CorsPlugin {
                             let origin = raw_origin.trim();
                             if origin.is_empty() {
                                 return Err(
-                                    "cors: 'allowed_origins' entries must be non-empty strings"
+                                    "cors: `allowed_origins` entries must be non-empty strings"
                                         .to_string(),
                                 );
                             }
                             if origin.len() != raw_origin.len() {
                                 return Err(
-                                    "cors: 'allowed_origins' string entries must not have leading or trailing whitespace"
+                                    "cors: `allowed_origins` string entries must not have leading or trailing whitespace"
                                         .to_string(),
                                 );
                             }
@@ -829,7 +830,7 @@ impl CorsPlugin {
                                 wildcard = true;
                                 continue;
                             }
-                            validate_origin_matcher_len("'allowed_origins' string entry", origin)?;
+                            validate_origin_matcher_len("`allowed_origins` string entry", origin)?;
                             if origin.starts_with('*') {
                                 patterns.push(OriginPattern::WildcardSubdomain(
                                     validate_wildcard_origin(origin)?,
@@ -839,14 +840,19 @@ impl CorsPlugin {
                                     .push(OriginPattern::Exact(canonicalize_exact_origin(origin)?));
                             }
                         }
-                        Value::Object(_) => match Self::parse_origin_matcher(value)? {
-                            Some(pattern) => patterns.push(pattern),
-                            None => wildcard = true,
-                        },
+                        Value::Object(_) => {
+                            match Self::parse_origin_matcher(value).map_err(|error| {
+                                format!("cors.allowed_origins[{index}]: {error}")
+                            })? {
+                                Some(pattern) => patterns.push(pattern),
+                                None => wildcard = true,
+                            }
+                        }
                         other => {
                             return Err(format!(
-                                "cors: 'allowed_origins' entries must be strings or \
-                                 {{exact|prefix|regex}} objects, got: {other}"
+                                "cors: `allowed_origins` entries must be strings or \
+                                 {{exact|prefix|regex}} objects, got: {other:?}",
+                                other = other.to_string()
                             ));
                         }
                     }
@@ -859,8 +865,9 @@ impl CorsPlugin {
                 }
             }
             Some(other) => Err(format!(
-                "cors: 'allowed_origins' must be an array of strings or \
-                 {{exact|prefix|regex}} objects, got: {other}"
+                "cors: `allowed_origins` must be an array of strings or \
+                 {{exact|prefix|regex}} objects, got: {other:?}",
+                other = other.to_string()
             )),
         }
     }
@@ -888,14 +895,14 @@ impl CorsPlugin {
         // matcher, dropping the invalid second key.
         const MATCHER_KEYS: [&str; 3] = ["exact", "prefix", "regex"];
         let obj = value.as_object().ok_or_else(|| {
-            "cors: 'allowed_origins' object matcher must be a JSON object with one of \
-             'exact', 'prefix', or 'regex'"
+            "cors: `allowed_origins` object matcher must be a JSON object with one of \
+             `exact`, `prefix`, or `regex`"
                 .to_string()
         })?;
         if obj.len() != 1 || !obj.keys().all(|key| MATCHER_KEYS.contains(&key.as_str())) {
             return Err(
-                "cors: 'allowed_origins' object matcher must specify exactly one of \
-                 'exact', 'prefix', or 'regex' (no extra or unknown keys)"
+                "cors: `allowed_origins` object matcher must specify exactly one of \
+                 `exact`, `prefix`, or `regex` (no extra or unknown keys)"
                     .to_string(),
             );
         }
@@ -927,13 +934,13 @@ impl CorsPlugin {
                 Ok(Some(OriginPattern::Regex(compile_origin_regex(regex)?)))
             }
             (None, None, None) => Err(
-                "cors: 'allowed_origins' object matcher must specify one of \
-                 'exact', 'prefix', or 'regex'"
+                "cors: `allowed_origins` object matcher must specify one of \
+                 `exact`, `prefix`, or `regex`"
                     .to_string(),
             ),
             _ => Err(
-                "cors: 'allowed_origins' object matcher must specify exactly one of \
-                 'exact', 'prefix', or 'regex'"
+                "cors: `allowed_origins` object matcher must specify exactly one of \
+                 `exact`, `prefix`, or `regex`"
                     .to_string(),
             ),
         }
@@ -957,20 +964,23 @@ impl CorsPlugin {
             }
             Some(Value::Array(arr)) => {
                 if arr.is_empty() && !allow_empty {
-                    return Err(format!("cors: '{key}' must contain at least one value"));
+                    return Err(format!("cors: `{key}` must contain at least one value"));
                 }
                 let mut values = Vec::with_capacity(arr.len());
                 for value in arr {
                     let value = value.as_str().ok_or_else(|| {
-                        format!("cors: '{key}' entries must be strings, got: {value}")
+                        format!(
+                            "cors: `{key}` entries must be strings, got: {value:?}",
+                            value = value.to_string()
+                        )
                     })?;
                     let trimmed = value.trim();
                     if trimmed.is_empty() {
-                        return Err(format!("cors: '{key}' entries must be non-empty strings"));
+                        return Err(format!("cors: `{key}` entries must be non-empty strings"));
                     }
                     if trimmed.len() != value.len() {
                         return Err(format!(
-                            "cors: '{key}' entries must not have leading or trailing whitespace"
+                            "cors: `{key}` entries must not have leading or trailing whitespace"
                         ));
                     }
                     validate(key, value)?;
@@ -979,7 +989,8 @@ impl CorsPlugin {
                 Ok(values)
             }
             Some(other) => Err(format!(
-                "cors: '{key}' must be an array of strings, got: {other}"
+                "cors: `{key}` must be an array of strings, got: {other:?}",
+                other = other.to_string()
             )),
         }
     }
@@ -1488,7 +1499,7 @@ fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
 pub(crate) fn validate_method(key: &str, value: &str) -> Result<(), String> {
     Method::from_bytes(value.as_bytes())
         .map(|_| ())
-        .map_err(|_| format!("cors: '{key}' contains an invalid HTTP method: {value}"))
+        .map_err(|_| format!("cors: `{key}` contains an invalid HTTP method: {value:?}"))
 }
 
 /// Shared bound on how many `allowed_origins` entries one policy may carry.
@@ -1500,7 +1511,7 @@ pub(crate) fn validate_method(key: &str, value: &str) -> Result<(), String> {
 pub(crate) fn validate_origin_matcher_count(count: usize) -> Result<(), String> {
     if count > MAX_ALLOWED_ORIGIN_ENTRIES {
         return Err(format!(
-            "cors: 'allowed_origins' must contain at most {MAX_ALLOWED_ORIGIN_ENTRIES} entries, got: {count}"
+            "cors: `allowed_origins` must contain at most {MAX_ALLOWED_ORIGIN_ENTRIES} entries, got: {count}"
         ));
     }
     Ok(())
@@ -1533,11 +1544,11 @@ pub(crate) fn validate_origin_matcher_len(label: &str, value: &str) -> Result<()
 pub(crate) fn validate_literal_exact_origin(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(
-            "cors: 'allowed_origins' exact matcher must be a non-empty, non-whitespace string"
+            "cors: `allowed_origins` exact matcher must be a non-empty, non-whitespace string"
                 .to_string(),
         );
     }
-    validate_origin_matcher_len("'allowed_origins' exact matcher", value)
+    validate_origin_matcher_len("`allowed_origins` exact matcher", value)
 }
 
 /// Admission for an Istio `StringMatch.prefix` origin matcher — see
@@ -1549,12 +1560,12 @@ pub(crate) fn validate_literal_exact_origin(value: &str) -> Result<(), String> {
 pub(crate) fn validate_origin_prefix(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(
-            "cors: 'allowed_origins' prefix matcher must be a non-empty string \
+            "cors: `allowed_origins` prefix matcher must be a non-empty string \
              (an empty prefix would match every origin)"
                 .to_string(),
         );
     }
-    validate_origin_matcher_len("'allowed_origins' prefix matcher", value)
+    validate_origin_matcher_len("`allowed_origins` prefix matcher", value)
 }
 
 /// Compile one Istio `StringMatch.regex` origin matcher under the explicit
@@ -1580,21 +1591,21 @@ pub(crate) fn validate_origin_prefix(value: &str) -> Result<(), String> {
 /// field-specific message — never a dropped or approximated matcher.
 pub(crate) fn compile_origin_regex(pattern: &str) -> Result<Regex, String> {
     if pattern.is_empty() {
-        return Err("cors: 'allowed_origins' regex matcher must be a non-empty string".to_string());
+        return Err("cors: `allowed_origins` regex matcher must be a non-empty string".to_string());
     }
-    validate_origin_matcher_len("'allowed_origins' regex matcher", pattern)?;
+    validate_origin_matcher_len("`allowed_origins` regex matcher", pattern)?;
     let anchored = crate::config::types::anchor_regex_pattern(pattern);
     RegexBuilder::new(&anchored)
         .size_limit(ORIGIN_REGEX_SIZE_LIMIT)
         .dfa_size_limit(ORIGIN_REGEX_DFA_SIZE_LIMIT)
         .nest_limit(ORIGIN_REGEX_NEST_LIMIT)
         .build()
-        .map_err(|e| {
+        .map_err(|_| {
             format!(
-                "cors: 'allowed_origins' regex matcher '{pattern}' is invalid or exceeds the \
+                "cors: `allowed_origins` regex matcher is invalid or exceeds the \
                  configured complexity bounds (size limit {ORIGIN_REGEX_SIZE_LIMIT} bytes, \
                  DFA limit {ORIGIN_REGEX_DFA_SIZE_LIMIT} bytes, nest limit \
-                 {ORIGIN_REGEX_NEST_LIMIT}): {e}"
+                 {ORIGIN_REGEX_NEST_LIMIT})"
             )
         })
 }
@@ -1603,13 +1614,13 @@ pub(crate) fn compile_origin_regex(pattern: &str) -> Result<Regex, String> {
 pub(crate) fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
     HeaderName::from_bytes(value.as_bytes())
         .map(|_| ())
-        .map_err(|_| format!("cors: '{key}' contains an invalid HTTP header name: {value}"))
+        .map_err(|_| format!("cors: `{key}` contains an invalid HTTP header name: {value:?}"))
 }
 
 fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     let Some(suffix) = origin.strip_prefix("*.") else {
         return Err(format!(
-            "cors: wildcard origins must use the '*.example.com' form, got: {origin}"
+            "cors: wildcard origins must use the '*.example.com' form, got: {origin:?}"
         ));
     };
     if suffix.is_empty()
@@ -1617,7 +1628,7 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
         || suffix.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(format!(
-            "cors: wildcard origin must be a hostname suffix without URL delimiters, percent-encoding, or whitespace: {origin}"
+            "cors: wildcard origin must be a hostname suffix without URL delimiters, percent-encoding, or whitespace: {origin:?}"
         ));
     }
     // WHATWG host parsing applies IDNA once on the cold path, matching the
@@ -1625,7 +1636,7 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     // hostname, never an IP literal; validate labels after normalization.
     let Ok(Host::Domain(domain)) = Host::parse(suffix) else {
         return Err(format!(
-            "cors: wildcard origin must contain a valid DNS hostname suffix: {origin}"
+            "cors: wildcard origin must contain a valid DNS hostname suffix: {origin:?}"
         ));
     };
     let hostname = domain.strip_suffix('.').unwrap_or(&domain);
@@ -1641,7 +1652,7 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
         })
     {
         return Err(format!(
-            "cors: wildcard origin must contain valid DNS hostname labels: {origin}"
+            "cors: wildcard origin must contain valid DNS hostname labels: {origin:?}"
         ));
     }
     Ok(format!(".{domain}"))
@@ -1674,25 +1685,25 @@ pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> 
         && !post_authority.is_empty()
     {
         return Err(format!(
-            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
+            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin:?}"
         ));
     }
 
-    let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin '{origin}': {e}"))?;
+    let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin {origin:?}: {e}"))?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "cors: origin scheme must be http or https, got: {scheme}"
+                "cors: origin scheme must be http or https, got: {scheme:?}"
             ));
         }
     }
     if !has_non_empty_authority(origin) || url.host_str().is_none() {
-        return Err(format!("cors: origin must include a hostname: {origin}"));
+        return Err(format!("cors: origin must include a hostname: {origin:?}"));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(format!(
-            "cors: origin must not include credentials: {origin}"
+            "cors: origin must not include credentials: {origin:?}"
         ));
     }
     if url.query().is_some()
@@ -1701,7 +1712,7 @@ pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> 
         || origin.ends_with('/')
     {
         return Err(format!(
-            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
+            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin:?}"
         ));
     }
     Ok(url.origin().ascii_serialization())
@@ -1725,7 +1736,10 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
     match config.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
-        Some(other) => Err(format!("cors: '{key}' must be a boolean, got: {other}")),
+        Some(other) => Err(format!(
+            "cors: `{key}` must be a boolean, got: {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1734,9 +1748,10 @@ fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
         None | Some(Value::Null) => Ok(default),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("cors: '{key}' must be a non-negative integer")),
+            .ok_or_else(|| format!("cors: `{key}` must be a non-negative integer")),
         Some(other) => Err(format!(
-            "cors: '{key}' must be a non-negative integer, got: {other}"
+            "cors: `{key}` must be a non-negative integer, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }

@@ -129,7 +129,10 @@ impl GrpcMethodRouter {
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config.as_object().ok_or_else(|| {
-            format!("grpc_method_router: config must be an object, got: {config}")
+            format!(
+                "grpc_method_router: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
         })?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
@@ -164,7 +167,8 @@ impl GrpcMethodRouter {
             }
             Some(other) => {
                 return Err(format!(
-                    "grpc_method_router: 'limit_by' must be a string, got: {other}"
+                    "grpc_method_router: `limit_by` must be a string, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };
@@ -174,7 +178,10 @@ impl GrpcMethodRouter {
             && !value.is_null()
         {
             let obj = value.as_object().ok_or_else(|| {
-                format!("grpc_method_router: 'method_rate_limits' must be an object, got: {value}")
+                format!(
+                    "grpc_method_router: `method_rate_limits` must be an object, got: {value:?}",
+                    value = value.to_string()
+                )
             })?;
             for (method, spec) in obj {
                 let spec_obj = spec.as_object().ok_or_else(|| {
@@ -470,13 +477,19 @@ fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet
         return Ok(None);
     }
 
-    let entries = value
-        .as_array()
-        .ok_or_else(|| format!("grpc_method_router: '{key}' must be an array, got: {value}"))?;
+    let entries = value.as_array().ok_or_else(|| {
+        format!(
+            "grpc_method_router: `{key}` must be an array, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let mut methods = HashSet::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         let method = entry.as_str().ok_or_else(|| {
-            format!("grpc_method_router: '{key}[{idx}]' must be a string, got: {entry}")
+            format!(
+                "grpc_method_router: `{key}[{idx}]` must be a string, got: {entry:?}",
+                entry = entry.to_string()
+            )
         })?;
         let normalized = normalize_config_method_path(method, key)?;
         if !methods.insert(normalized.clone()) {

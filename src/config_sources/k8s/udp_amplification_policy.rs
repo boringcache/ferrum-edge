@@ -286,7 +286,7 @@ fn collect_one(
     if let Some(error) = resolved_error {
         record_policy_invalid();
         acc.warnings.push(format!(
-            "Gateway API UDPResponseAmplificationPolicy {}/{} is invalid: {}",
+            "Gateway API UDPResponseAmplificationPolicy {:?}/{:?} is invalid: {}",
             object.metadata.namespace, object.metadata.name, error.message
         ));
         acc.record_udp_amplification_policy_status(GatewayApiUdpAmplificationPolicyStatus {

@@ -2245,7 +2245,7 @@ fn incremental_poll_rejects_missing_fields() {
             // Issue #4530: the shared decoder names the field in quotes and
             // states the expected shape, never the payload.
             assert!(
-                message.contains("invalid 'sequence'")
+                message.contains("invalid `sequence`")
                     && message.contains("expected a non-negative integral number"),
                 "missing sequence must fail closed, got: {message}"
             );
@@ -2297,7 +2297,7 @@ fn malformed_change_does_not_advance_cursor_past_later_well_formed_record() {
     let later = well_formed_change_doc(6, "later-proxy", "upsert");
     let error = incremental_cursor_after(0, &[malformed, later])
         .expect_err("typed decode failure must abort before the cursor can skip the record");
-    assert!(error.to_string().contains("non-string field 'resource_id'"));
+    assert!(error.to_string().contains("non-string field `resource_id`"));
     assert_decode_error_is_opaque(&error, &["secret-resource-id", "later-proxy", "42"]);
 }
 

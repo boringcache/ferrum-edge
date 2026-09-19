@@ -290,8 +290,8 @@ impl AiPromptCompressor {
                 })?;
                 if !(ratio > 0.0 && ratio < 1.0) {
                     return Err(format!(
-                        "ai_prompt_compressor: 'target_ratio' must be between 0 and 1 \
-                         (exclusive), got {ratio}"
+                        "ai_prompt_compressor: `target_ratio` must be between 0 and 1 \
+                         (exclusive), got \"{ratio}\""
                     ));
                 }
                 ratio
@@ -317,8 +317,8 @@ impl AiPromptCompressor {
             Some(bytes) if bytes <= HARD_MAX_SCAN_BYTES => bytes,
             Some(bytes) => {
                 return Err(format!(
-                    "ai_prompt_compressor: 'max_scan_bytes' must not exceed the hard limit of \
-                     {HARD_MAX_SCAN_BYTES}, got {bytes}"
+                    "ai_prompt_compressor: `max_scan_bytes` must not exceed the hard limit of \
+                     {HARD_MAX_SCAN_BYTES}, got \"{bytes}\""
                 ));
             }
             None => DEFAULT_MAX_SCAN_BYTES,

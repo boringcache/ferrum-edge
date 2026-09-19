@@ -19,6 +19,7 @@ use crate::modes::mesh::config::{
     virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
+use crate::startup::sanitize_startup_cause;
 
 /// Node/workload selector used by both ADS and native `MeshSubscribe`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2464,9 +2465,18 @@ fn narrow_workload_identities(
         .collect();
     if !admitted_services.is_empty() && reachable_workloads.is_empty() {
         warn!(
-            node_id = request.node_id.as_str(),
-            namespace = request.namespace.as_str(),
-            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            node_id = %sanitize_startup_cause(
+                format!("{:?}", (request.node_id.as_str()).to_string()),
+                &[]
+            ),
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", (request.namespace.as_str()).to_string()),
+                &[]
+            ),
+            workload_spiffe_id = %sanitize_startup_cause(
+                format!("{:?}", (request.workload_spiffe_id.as_deref().unwrap_or("")).to_string()),
+                &[]
+            ),
             admitted_services = admitted_services.len(),
             "Sidecar workload identity narrowing found no reachable identities; admitted MeshService.workloads lists are empty"
         );
@@ -2506,9 +2516,15 @@ fn inferred_workload_label_sets_for_request(
         .collect();
     if matches.len() > 1 {
         warn!(
-            node_id = %request.node_id,
-            namespace = %request.namespace,
-            workload_spiffe_id = %spiffe_id,
+            node_id = %sanitize_startup_cause(format!("{:?}", request.node_id.to_string()), &[]),
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", request.namespace.to_string()),
+                &[]
+            ),
+            workload_spiffe_id = %sanitize_startup_cause(
+                format!("{:?}", spiffe_id.to_string()),
+                &[]
+            ),
             matched_workloads = matches.len(),
             "Mesh slice request matched multiple workloads with the same SPIFFE ID; explicit workload labels are required for deterministic selector scoping"
         );
@@ -2901,8 +2917,8 @@ fn serialize_virtual_service_l4_proxies<'a>(
             Ok(value) => Some(value),
             Err(error) => {
                 warn!(
-                    proxy_id = %proxy.id,
-                    error = %error,
+                    proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                    error = %sanitize_startup_cause(&error, &[]),
                     "Failed to serialize a VirtualService L4 proxy into the mesh slice; \
                      dropping the route fail-closed"
                 );
@@ -2921,8 +2937,11 @@ fn serialize_virtual_service_l4_upstreams<'a>(
             Ok(value) => Some(value),
             Err(error) => {
                 warn!(
-                    upstream_id = %upstream.id,
-                    error = %error,
+                    upstream_id = %sanitize_startup_cause(
+                        format!("{:?}", upstream.id.to_string()),
+                        &[]
+                    ),
+                    error = %sanitize_startup_cause(&error, &[]),
                     "Failed to serialize a VirtualService L4 upstream into the mesh slice; \
                      dropping the upstream fail-closed"
                 );
@@ -3080,7 +3099,10 @@ where
         && record_destination_rule_ambiguity(scope.client_namespace, ambiguous_groups)
     {
         warn!(
-            client_namespace = %scope.client_namespace,
+            client_namespace = %sanitize_startup_cause(
+                format!("{:?}", scope.client_namespace.to_string()),
+                &[]
+            ),
             ambiguous_destinations = ambiguous_groups,
             "Multiple DestinationRules from the same namespace target one destination; \
              they merge in deterministic (namespace, name, normalized host) order"
@@ -3786,7 +3808,10 @@ fn resolve_applicable_sidecar_outbound_policy(
         );
     } else {
         warn!(
-            namespace = %workload_namespace,
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", workload_namespace.to_string()),
+                &[]
+            ),
             candidates = ambiguous_candidate_labels.len(),
             intersection_policy = ?selected_policy,
             resolved_policy = ?resolved,
@@ -3876,18 +3901,33 @@ fn resolve_selected_sidecar_ingress(
                     resolved.push(listener);
                 } else {
                     warn!(
-                        sidecar = %sidecar.name,
-                        namespace = %sidecar.namespace,
-                        port = listener.port,
+                        sidecar = %sanitize_startup_cause(
+                            format!("{:?}", sidecar.name.to_string()),
+                            &[]
+                        ),
+                        namespace = %sanitize_startup_cause(
+                            format!("{:?}", sidecar.namespace.to_string()),
+                            &[]
+                        ),
+                        port = %sanitize_startup_cause(
+                            format!("{:?}", listener.port.to_string()),
+                            &[]
+                        ),
                         "Duplicate Sidecar ingress[] listener port; keeping the first entry"
                     );
                 }
             }
             Err(reason) => {
                 warn!(
-                    sidecar = %sidecar.name,
-                    namespace = %sidecar.namespace,
-                    port = entry.port,
+                    sidecar = %sanitize_startup_cause(
+                        format!("{:?}", sidecar.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", sidecar.namespace.to_string()),
+                        &[]
+                    ),
+                    port = %sanitize_startup_cause(format!("{:?}", entry.port.to_string()), &[]),
                     reason = ?reason,
                     "Skipping unsupported Sidecar ingress[] listener (kept in deferred_fields)"
                 );
@@ -3995,7 +4035,7 @@ pub(crate) fn resolve_local_workloads<'a>(
         .collect();
     if distinct_services.len() > 1 && !matched_workloads_are_same_pod(&matched) {
         warn!(
-            local_spiffe,
+            local_spiffe = %sanitize_startup_cause(format!("{:?}", local_spiffe.to_string()), &[]),
             distinct_services = distinct_services.len(),
             "Ambiguous local workload: a shared service-account SPIFFE backs multiple \
              services that the sidecar's labels do not disambiguate; skipping inbound \

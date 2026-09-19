@@ -75,7 +75,7 @@ impl SplitDialect {
             "postgres" => Ok(Self::Postgres),
             "mysql" => Ok(Self::Mysql),
             other => Err(SqlStatementSplitError::new(
-                format!("unsupported database type for custom-plugin SQL splitting: {other}"),
+                format!("unsupported database type for custom-plugin SQL splitting: {other:?}"),
                 None,
             )),
         }
@@ -757,7 +757,7 @@ fn try_scan_dollar_quoted(
         i += 1;
     }
     Err(SqlStatementSplitError::new(
-        format!("unclosed PostgreSQL dollar-quoted string starting with {closer}"),
+        format!("unclosed PostgreSQL dollar-quoted string starting with {closer:?}"),
         Some(start),
     ))
 }

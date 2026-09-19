@@ -226,7 +226,10 @@ enum CredentialSource {
 impl Oauth2Introspection {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let config_obj = config.as_object().ok_or_else(|| {
-            format!("oauth2_introspection: config must be an object, got: {config}")
+            format!(
+                "oauth2_introspection: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
         })?;
         reject_unknown_keys(
             config_obj,
@@ -277,7 +280,10 @@ impl Oauth2Introspection {
         let mut providers = Vec::with_capacity(providers_arr.len());
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
-                format!("oauth2_introspection: provider[{idx}] must be an object, got: {prov_cfg}")
+                format!(
+                    "oauth2_introspection: provider[{idx}] must be an object, got: {prov_cfg:?}",
+                    prov_cfg = prov_cfg.to_string()
+                )
             })?;
             reject_unknown_keys(
                 prov_obj,
@@ -2011,7 +2017,8 @@ fn optional_non_empty_string(
     };
     let raw = value.as_str().ok_or_else(|| {
         format!(
-            "oauth2_introspection: 'provider[{provider_idx}].{field}' must be a string, got: {value}"
+            "oauth2_introspection: `provider[{provider_idx}].{field}` must be a string, got: {value:?}",
+            value = value.to_string()
         )
     })?;
     let trimmed = raw.trim();
@@ -2170,7 +2177,7 @@ fn parse_url_field(
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "oauth2_introspection: 'provider[{provider_idx}].{field}' must use http or https, got: {scheme}"
+                "oauth2_introspection: `provider[{provider_idx}].{field}` must use http or https, got: {scheme:?}"
             ));
         }
     }
@@ -2421,7 +2428,7 @@ fn validate_discovered_endpoint(
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "discovery {field} must use http or https, got: {scheme}"
+                "discovery {field} must use http or https, got: {scheme:?}"
             ));
         }
     }

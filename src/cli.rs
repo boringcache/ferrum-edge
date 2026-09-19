@@ -546,29 +546,22 @@ pub struct AmbientUdpPreflightArgs {
 pub fn validate_host_proc_root(root: &std::path::Path) -> Result<PathBuf, String> {
     if !root.is_absolute() {
         return Err(format!(
-            "--host-proc-root must be an absolute path, got {}",
-            root.display()
+            "--host-proc-root must be an absolute path, got {:?}",
+            root
         ));
     }
-    let metadata = std::fs::metadata(root).map_err(|error| {
-        format!(
-            "--host-proc-root {} is not readable: {error}",
-            root.display()
-        )
-    })?;
+    let metadata = std::fs::metadata(root)
+        .map_err(|error| format!("--host-proc-root {:?} is not readable: {error}", root))?;
     if !metadata.is_dir() {
-        return Err(format!(
-            "--host-proc-root {} is not a directory",
-            root.display()
-        ));
+        return Err(format!("--host-proc-root {:?} is not a directory", root));
     }
     // `self/ns/net` exists in every procfs instance, including one bind-mounted
     // from another PID namespace, so it distinguishes a real procfs from an
     // empty mount point that would resolve nothing.
     if cfg!(target_os = "linux") && !root.join("self").join("ns").join("net").exists() {
         return Err(format!(
-            "--host-proc-root {} does not look like a mounted procfs (no self/ns/net)",
-            root.display()
+            "--host-proc-root {:?} does not look like a mounted procfs (no self/ns/net)",
+            root
         ));
     }
     Ok(root.to_path_buf())
@@ -666,7 +659,12 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("could not build the preflight runtime: {error}"))?;
+        .map_err(|error| {
+            crate::startup::render_startup_error(
+                anyhow::anyhow!(error).context("could not build the preflight runtime"),
+                &[],
+            )
+        })?;
     let timeout_seconds = args.timeout_seconds.clamp(1, 3600);
     let std_deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     let outcome = runtime.block_on(async move {
@@ -703,7 +701,7 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
             Ok(()) => {}
             Err(error) if error.is_deadline_elapsed() => {
                 if let Some(reason) = error.deadline_operator_reason() {
-                    tracing::warn!("{reason}");
+                    tracing::warn!("{}", crate::startup::sanitize_startup_cause(reason, &[]));
                 }
                 return Ok(
                     crate::proxy::udp_placement_cleanup::UdpCleanupOutcome::DeadlineElapsed,
@@ -939,11 +937,16 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     use crate::config::{EnvConfig, OperatingMode, file_loader};
     use crate::modes::mesh::MeshConfigProtocol;
     use crate::modes::startup_security::{StartupSecurityScope, load_startup_security};
+    use crate::startup::render_startup_error;
 
     crate::modes::mesh::validate::prepare_validate_file_source()?;
 
-    let env_config =
-        EnvConfig::from_env().map_err(|e| format!("Settings validation failed: {}", e))?;
+    let env_config = EnvConfig::from_env().map_err(|e| {
+        format!(
+            "Settings validation failed: {}",
+            render_startup_error(anyhow::anyhow!(e), &[])
+        )
+    })?;
     println!("Settings (ferrum.conf): OK");
     println!(
         "  Mode: {}",
@@ -966,14 +969,18 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
             &env_config.backend_allow_ips,
             &env_config.namespace,
         )
-        .map_err(|e| format!("Spec validation failed: {}", e))?;
+        .map_err(|e| format!("Spec validation failed: {}", render_startup_error(e, &[])))?;
 
         // FIPS gateway-document admission, evaluated with exactly the policy
         // that startup, SIGHUP reload, database poll apply, CP publication, and
         // DP apply use, so `validate` cannot pass a document the gateway would
         // then refuse. Inert when FIPS mode is off.
-        crate::fips::policy::check_gateway_config(&config)
-            .map_err(|e| format!("FIPS policy validation failed: {e}"))?;
+        crate::fips::policy::check_gateway_config(&config).map_err(|e| {
+            format!(
+                "FIPS policy validation failed: {}",
+                render_startup_error(anyhow::anyhow!(e), &[])
+            )
+        })?;
 
         // File-mode run still loads existing `"*"` rows (warn-only). Validate
         // is the operator admission gate and must reject the CORS footgun.
@@ -1023,13 +1030,32 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
         )?;
     }
 
+    // Check the configured fallback document without connecting to a database.
+    // Run uses this same loader when database startup falls back to the backup.
+    if env_config.mode == OperatingMode::Database
+        && let Some(path) = env_config.db_config_backup_path.as_deref()
+    {
+        crate::config::config_backup::load_config_backup(path, &env_config.namespace).map_err(
+            |error| {
+                format!(
+                    "Config backup validation failed: {}",
+                    render_startup_error(error, &[])
+                )
+            },
+        )?;
+    }
+
     // Env-level TLS/security surfaces that `run` hard-fails on must also fail
     // `validate`. Shared loaders in `modes::startup_security` are side-effect
     // free (no binds, no servers, no store mutation, no random JWT mint).
     let security_scope = StartupSecurityScope::for_mode(&env_config.mode);
     if !security_scope.is_empty() {
-        load_startup_security(&env_config)
-            .map_err(|e| format!("Startup security validation failed: {}", e))?;
+        load_startup_security(&env_config).map_err(|e| {
+            format!(
+                "Startup security validation failed: {}",
+                render_startup_error(e, &[])
+            )
+        })?;
         println!("Startup security (env TLS/CIDRs/metrics): OK");
     }
 
@@ -1038,8 +1064,13 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     // `run` fail-closes on before dialing. Validate must exercise the same
     // gate so a production plaintext ADS URL cannot report success.
     if env_config.mode == OperatingMode::Mesh {
-        let runtime = crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config)
-            .map_err(|e| format!("Mesh runtime validation failed: {e}"))?;
+        let runtime =
+            crate::modes::mesh::MeshRuntimeConfig::from_env_config(&env_config).map_err(|e| {
+                format!(
+                    "Mesh runtime validation failed: {}",
+                    render_startup_error(anyhow::anyhow!(e), &[])
+                )
+            })?;
         if runtime.config_protocol.requires_local_policy_document() {
             let path = runtime.file_config_path.as_deref().ok_or_else(|| {
                 format!(
@@ -1055,7 +1086,12 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
                             std::path::Path::new(path),
                             runtime.mesh_slice_request(),
                         )
-                        .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                        .map_err(|e| {
+                            format!(
+                                "Mesh spec validation failed: {}",
+                                render_startup_error(e, &[])
+                            )
+                        })?;
                     let surviving =
                         crate::modes::mesh::validate::MeshValidateInventory::from_slice(&slice);
                     let had_namespaced = document.document_resource_count > 0;
@@ -1084,7 +1120,9 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
                     crate::modes::mesh::config_consumer::stock_xds_client::load_stock_policy_baseline(
                         std::path::Path::new(path),
                     )
-                    .map_err(|e| format!("Mesh spec validation failed: {e}"))?;
+                    .map_err(|e| {
+                        format!("Mesh spec validation failed: {}", render_startup_error(e, &[]))
+                    })?;
                     println!(
                         "Mesh spec ({}): OK",
                         report_field("FERRUM_MESH_FILE_CONFIG_PATH", path)
@@ -1102,13 +1140,23 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     // and file loaders without starting listeners, kernel capture, or migrations.
     match env_config.mode {
         OperatingMode::Injector => {
-            crate::modes::injector::load_startup_config(&env_config)
-                .map_err(|e| format!("Injector runtime validation failed: {e}"))?;
+            crate::modes::injector::load_startup_config(&env_config).map_err(|e| {
+                format!(
+                    "Injector runtime validation failed: {}",
+                    render_startup_error(anyhow::anyhow!(e), &[])
+                )
+            })?;
             println!("Injector runtime and serving TLS: OK");
         }
         OperatingMode::NodeAgent => {
-            crate::modes::node_agent::NodeAgentConfig::from_env_config(&env_config)
-                .map_err(|e| format!("Node-agent runtime validation failed: {e}"))?;
+            crate::modes::node_agent::NodeAgentConfig::from_env_config(&env_config).map_err(
+                |e| {
+                    format!(
+                        "Node-agent runtime validation failed: {}",
+                        render_startup_error(anyhow::anyhow!(e), &[])
+                    )
+                },
+            )?;
             println!("Node-agent runtime: OK");
         }
         OperatingMode::Migrate if env_config.migrate_action == "config" => {
@@ -1116,8 +1164,12 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
                 .file_config_path
                 .as_deref()
                 .ok_or("FERRUM_FILE_CONFIG_PATH is required for config migration")?;
-            crate::config::config_migration::ConfigMigrator::detect_version(path)
-                .map_err(|e| format!("Migration config validation failed: {e}"))?;
+            crate::config::config_migration::ConfigMigrator::detect_version(path).map_err(|e| {
+                format!(
+                    "Migration config validation failed: {}",
+                    render_startup_error(e, &[])
+                )
+            })?;
             println!("Migration config file and version: OK");
         }
         _ => {}
@@ -1167,8 +1219,8 @@ impl ValidateNamespaceFilter {
             self.document_namespaces.join(", ")
         };
         format!(
-            "namespace filter mismatch: active namespace '{}' left 0 surviving resources \
-             ({counts}); document namespaces: {namespaces}",
+            "namespace filter mismatch: active namespace {:?} left 0 surviving resources \
+             ({counts}); document namespaces: {namespaces:?}",
             report_field("FERRUM_NAMESPACE", &self.active_namespace)
         )
     }
@@ -1183,7 +1235,10 @@ fn report_empty_namespace_filter(
     }
     let diagnostic = report.diagnostic();
     if allow_empty {
-        println!("WARNING: {diagnostic}");
+        println!(
+            "WARNING: {}",
+            crate::startup::sanitize_startup_cause(diagnostic, &[])
+        );
         println!("  Continuing because --allow-empty-namespace was set.");
         Ok(())
     } else {

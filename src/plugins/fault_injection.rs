@@ -208,7 +208,7 @@ impl FaultInjectionPlugin {
 
                 if !(200..=599).contains(&status_code) {
                     return Err(format!(
-                        "fault_injection: abort.status_code must be 200-599, got {status_code}"
+                        "fault_injection: abort.status_code must be 200-599, got \"{status_code}\""
                     ));
                 }
 
@@ -219,7 +219,7 @@ impl FaultInjectionPlugin {
                         .ok_or("fault_injection: abort.grpc_status must be an integer")?;
                     if code > 16 {
                         return Err(format!(
-                            "fault_injection: abort.grpc_status must be 0-16, got {code}"
+                            "fault_injection: abort.grpc_status must be 0-16, got \"{code}\""
                         ));
                     }
                     Some(code as u32)
@@ -262,7 +262,7 @@ impl FaultInjectionPlugin {
                 }
                 if duration_ms > MAX_FAULT_DELAY_MS {
                     return Err(format!(
-                        "fault_injection: delay.duration_ms must be <= {MAX_FAULT_DELAY_MS}, got {duration_ms}"
+                        "fault_injection: delay.duration_ms must be <= {MAX_FAULT_DELAY_MS}, got \"{duration_ms}\""
                     ));
                 }
 
@@ -357,7 +357,7 @@ fn parse_percentage(val: Option<&Value>, field_name: &str) -> Result<f64, String
 
     if !(0.0..=100.0).contains(&pct) {
         return Err(format!(
-            "fault_injection: {field_name} must be 0.0-100.0, got {pct}"
+            "fault_injection: {field_name} must be 0.0-100.0, got \"{pct}\""
         ));
     }
     if pct == 0.0 {

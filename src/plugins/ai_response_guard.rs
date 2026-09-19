@@ -362,10 +362,9 @@ impl AiResponseGuard {
                             placeholder,
                         });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         return Err(format!(
-                            "ai_response_guard: failed to compile custom PII pattern '{}': {}",
-                            name, e,
+                            "ai_response_guard: `custom_pii_patterns[{idx}].regex` is invalid or too complex"
                         ));
                     }
                 }
@@ -432,10 +431,9 @@ impl AiResponseGuard {
                             placeholder,
                         });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         return Err(format!(
-                            "ai_response_guard: failed to compile blocked pattern '{}': {}",
-                            name, e,
+                            "ai_response_guard: `blocked_patterns[{idx}].regex` is invalid or too complex"
                         ));
                     }
                 }

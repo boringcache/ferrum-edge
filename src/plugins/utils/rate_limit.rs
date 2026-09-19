@@ -212,7 +212,7 @@ pub fn validate_window_seconds(label: &str, field: &str, value: u64) -> Result<u
     }
     if value > MAX_RATE_LIMIT_WINDOW_SECONDS {
         return Err(format!(
-            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds, got: {value}"
+            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds, got: \"{value}\""
         ));
     }
     Ok(value)
@@ -226,7 +226,7 @@ pub fn validate_max_requests(label: &str, field: &str, value: u64) -> Result<u64
     }
     if value > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
-            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {value}"
+            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{value}\""
         ));
     }
     Ok(value)
@@ -3501,12 +3501,12 @@ pub fn validate_ws_frame_rate_params(
     }
     if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
-            "ws_rate_limiting: 'frames_per_second' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {frames_per_second}"
+            "ws_rate_limiting: `frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{frames_per_second}\""
         ));
     }
     if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
-            "ws_rate_limiting: 'burst_size' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {burst_size}"
+            "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
         ));
     }
     if burst_size < frames_per_second {

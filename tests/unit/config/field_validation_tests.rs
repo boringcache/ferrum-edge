@@ -593,7 +593,7 @@ fn test_proxy_circuit_breaker_validated() {
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("circuit_breaker.failure_threshold"))
+            .any(|e| e.contains("`circuit_breaker.failure_threshold`"))
     );
 }
 
@@ -608,7 +608,7 @@ fn test_proxy_retry_validated() {
         retry_on_connect_failure: true,
     });
     let errs = proxy.validate_fields().unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("retry.max_retries")));
+    assert!(errs.iter().any(|e| e.contains("`retry.max_retries`")));
 }
 
 #[test]
@@ -1466,7 +1466,7 @@ fn test_upstream_health_check_validated() {
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("health_checks.active.interval_seconds"))
+            .any(|e| e.contains("`health_checks.active.interval_seconds`"))
     );
 }
 
@@ -1576,7 +1576,7 @@ fn test_mesh_sd_namespace_must_match_upstream_namespace() {
     let errs = upstream.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("must match the upstream's namespace")),
+            .any(|e| e.contains("must match the upstream namespace")),
         "cross-namespace mesh SD should be rejected: {:?}",
         errs
     );
@@ -1668,11 +1668,74 @@ fn test_plugin_config_proxy_scope_requires_proxy_id() {
     let errs = pc.validate_fields().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("scope 'proxy' requires proxy_id"))
+            .any(|e| e.contains("scope `proxy` requires proxy_id"))
     );
 }
 
 // ---- GatewayConfig.validate_all_fields() tests ----
+
+#[test]
+fn test_validate_all_fields_escapes_resource_ids_and_numeric_values() {
+    for id in [
+        "unregistered-token",
+        "unregistered'token",
+        "unregistered\"token\\tail\n",
+    ] {
+        let mut proxy = make_proxy(id, "/api");
+        proxy.backend_connect_timeout_ms = u64::MAX;
+        let mut upstream = make_upstream(id);
+        upstream.targets[0].port = 0;
+        let mut plugin = make_plugin_config(id);
+        plugin.scope = PluginScope::Proxy;
+        plugin.proxy_id = None;
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            consumers: vec![make_consumer(id, "")],
+            upstreams: vec![upstream],
+            plugin_configs: vec![plugin],
+            ..Default::default()
+        };
+
+        let errors = config.validate_all_fields(30).unwrap_err();
+        for (kind, field) in [
+            ("Proxy", "backend_connect_timeout_ms"),
+            ("Consumer", "username"),
+            ("Upstream", "targets[0].port"),
+            ("PluginConfig", "proxy_id"),
+        ] {
+            let prefix = format!("{kind} {id:?}:");
+            let error = errors
+                .iter()
+                .find(|error| error.starts_with(&prefix) && error.contains(field))
+                .unwrap_or_else(|| panic!("missing escaped {kind} diagnostic: {errors:?}"));
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error.clone()), &[]);
+            assert!(rendered.contains(field), "{rendered}");
+            assert!(!rendered.contains("unregistered"), "{rendered}");
+            assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn test_upstream_field_values_are_debug_escaped() {
+    let value = "unregistered'\"token\\tail";
+    let mut upstream = make_upstream("upstream");
+    // An empty region is the rejection case: `LocalityPreference::parse`
+    // tolerates empty zone/sub-zone segments.
+    let locality = format!("/{value}");
+    upstream.targets[0].locality = Some(locality.clone());
+    let errors = upstream.validate_fields().unwrap_err();
+    let error = errors
+        .iter()
+        .find(|error| error.contains("locality") && error.contains("not a valid"))
+        .unwrap();
+    assert!(error.contains(&format!("{locality:?}")), "{error}");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error.clone()), &[]);
+    assert!(rendered.contains("locality"), "{rendered}");
+    assert!(rendered.contains("not a valid"), "{rendered}");
+    assert!(!rendered.contains("unregistered"), "{rendered}");
+}
 
 #[test]
 fn test_validate_all_fields_catches_proxy_errors() {
@@ -1690,7 +1753,7 @@ fn test_validate_all_fields_catches_proxy_errors() {
     let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("Proxy 'test'") && e.contains("backend_connect_timeout_ms"))
+            .any(|e| e.contains("Proxy \"test\"") && e.contains("backend_connect_timeout_ms"))
     );
 }
 
@@ -1706,7 +1769,7 @@ fn test_validate_all_fields_catches_consumer_errors() {
     let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("Consumer 'test'") && e.contains("username"))
+            .any(|e| e.contains("Consumer \"test\"") && e.contains("username"))
     );
 }
 
@@ -1726,7 +1789,7 @@ fn test_validate_all_fields_catches_upstream_errors() {
     let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("Upstream 'test'") && e.contains("targets[0].port"))
+            .any(|e| e.contains("Upstream \"test\"") && e.contains("targets[0].port"))
     );
 }
 
@@ -2416,12 +2479,17 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
         .validate_all_fields(30)
         .expect("legacy star must not fail load validation");
     let output = logs.contents();
-    let warn_count = output.matches("allowed_ws_origins contains '*'").count();
+    let warn_count = output.matches("`allowed_ws_origins` contains `*`").count();
     assert_eq!(
         warn_count, 1,
         "exactly one warning per proxy, got: {output}"
     );
-    assert!(output.contains("star-proxy"), "warning must name the proxy");
+    // The warning is emitted through the diagnostic sanitizer, so the proxy id
+    // (a document value) is withheld at emission; the field name survives.
+    assert!(
+        !output.contains("star-proxy") && output.contains("Proxy <redacted scalar>"),
+        "warning must withhold the proxy id at emission: {output}"
+    );
     assert!(
         output.contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
         "warning must carry the admission guidance: {output}"
@@ -3011,8 +3079,8 @@ fn test_proxy_dns_override_rejects_different_direct_literal_target() {
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter().any(|e| {
-            e.contains("dns_override IP 127.0.0.2")
-                && e.contains("literal backend_host IP 127.0.0.1")
+            e.contains("`dns_override` IP \"127.0.0.2\"")
+                && e.contains("literal `backend_host` IP \"127.0.0.1\"")
         }),
         "unexpected validation errors: {errs:?}"
     );
@@ -3417,4 +3485,29 @@ fn test_proxy_effective_websocket_idle_timeout_resolution() {
     proxy.websocket_idle_timeout_seconds = Some(45);
     assert_eq!(proxy.effective_websocket_idle_timeout_seconds(300), 45);
     assert_eq!(proxy.effective_websocket_idle_timeout_seconds(0), 45);
+}
+
+#[test]
+fn malformed_credentials_keep_schema_names_when_rendered() {
+    for (kind, fields) in [
+        ("mtls_auth", vec!["identity"]),
+        ("hmac_auth", vec!["secret"]),
+        ("jwt", vec!["secret"]),
+        ("basicauth", vec!["password", "password_hash"]),
+    ] {
+        let mut consumer = make_consumer("schema-fixture", "schema-fixture");
+        consumer
+            .credentials
+            .insert(kind.into(), serde_json::json!([{}]));
+        let errors = consumer.validate_fields().unwrap_err();
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+        assert!(
+            rendered.contains(&format!("credentials.{kind}[0]")),
+            "{rendered}"
+        );
+        for field in fields {
+            assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+        }
+    }
 }

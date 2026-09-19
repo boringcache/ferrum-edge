@@ -488,7 +488,7 @@ fn mesh_policy_target_refs_require_referenced_service() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("Service 'default/missing' was not found")),
+            .any(|error| error.contains("Service \"default\"/\"missing\" was not found")),
         "expected missing Service error, got {errors:?}"
     );
 }
@@ -505,7 +505,7 @@ fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
     assert!(
         with_binding
             .iter()
-            .all(|error| !error.contains("Gateway 'default/waypoint-a'")),
+            .all(|error| !error.contains("Gateway \"default\"/\"waypoint-a\"")),
         "present binding must validate: {with_binding:?}"
     );
 
@@ -519,7 +519,7 @@ fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
     assert!(
         empty_inventory
             .iter()
-            .all(|error| !error.contains("Gateway 'default/waypoint-a' was not found")),
+            .all(|error| !error.contains("Gateway \"default\"/\"waypoint-a\" was not found")),
         "empty bindings inventory must not invent a missing-Gateway rejection: {empty_inventory:?}"
     );
 
@@ -532,7 +532,7 @@ fn mesh_policy_gateway_target_refs_require_waypoint_binding() {
     assert!(
         missing
             .iter()
-            .any(|error| error.contains("Gateway 'default/waypoint-a' was not found")),
+            .any(|error| error.contains("Gateway \"default\"/\"waypoint-a\" was not found")),
         "expected missing Gateway error against a real bindings inventory, got {missing:?}"
     );
 }
@@ -631,8 +631,8 @@ fn all_invalid_target_refs_fail_closed_without_broadening() {
     .validate();
     assert!(
         missing_only.iter().any(|error| {
-            error.contains("Gateway 'default/waypoint-a' was not found")
-                || error.contains("Service 'default/missing' was not found")
+            error.contains("Gateway \"default\"/\"waypoint-a\" was not found")
+                || error.contains("Service \"default\"/\"missing\" was not found")
         }),
         "all-unresolved attachments must fail closed: {missing_only:?}"
     );
@@ -683,15 +683,15 @@ fn cross_namespace_target_refs_fail_closed_at_config_boundary() {
     .validate();
 
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("Service 'other/payments'") && e.contains("same-namespace only")),
+        errors.iter().any(|e| {
+            e.contains("Service \"other\"/\"payments\"") && e.contains("same-namespace only")
+        }),
         "cross-namespace Service attachment must reject: {errors:?}"
     );
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("Gateway 'other/waypoint-a'") && e.contains("same-namespace only")),
+        errors.iter().any(|e| {
+            e.contains("Gateway \"other\"/\"waypoint-a\"") && e.contains("same-namespace only")
+        }),
         "cross-namespace Gateway attachment must reject: {errors:?}"
     );
 }
@@ -748,7 +748,7 @@ fn unsupported_gateway_class_name_fails_closed() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("GatewayClass 'some-other-class' is unsupported")),
+            .any(|e| e.contains("GatewayClass \"some-other-class\" is unsupported")),
         "expected unsupported-class error, got {errors:?}"
     );
 }

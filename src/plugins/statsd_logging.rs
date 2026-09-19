@@ -611,7 +611,7 @@ impl StatsdLogging {
         };
         if port == 0 || port > 65535 {
             return Err(format!(
-                "statsd_logging: 'port' must be between 1 and 65535 (got {port})"
+                "statsd_logging: 'port' must be between 1 and 65535 (got \"{port}\")"
             ));
         }
 
@@ -1173,7 +1173,7 @@ fn validate_minimum_record_budget(
     let required = minimum_ordinary_record_bytes(prefix, global_tags, schema);
     if required > max_entry_bytes {
         return Err(format!(
-            "statsd_logging: 'max_entry_bytes' must fit at least the smallest ordinary record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix, tags, and schema (requires at least {required} bytes, configured {max_entry_bytes})"
+            "statsd_logging: `max_entry_bytes` must fit at least the smallest ordinary record (HTTP, gRPC, stream, or WebSocket) with the resolved prefix, tags, and schema (requires at least {required} bytes, configured \"{max_entry_bytes}\")"
         ));
     }
     Ok(())

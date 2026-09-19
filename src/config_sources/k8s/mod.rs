@@ -77,6 +77,7 @@ use crate::config::types::{
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::{MeshConfig, WorkloadSelector};
 use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
+use crate::startup::sanitize_startup_cause;
 
 /// Marker phrase carried by a translation error for an object that is **valid**
 /// under the pinned Gateway API CRD schema but names a shape Ferrum does not
@@ -390,7 +391,7 @@ impl std::fmt::Display for K8sTranslateError {
         match self {
             Self::Unsupported(resource) => write!(
                 f,
-                "unsupported Kubernetes resource {}/{} {}: {}",
+                "unsupported Kubernetes resource {:?}/{:?} {:?}: {}",
                 resource.namespace, resource.name, resource.kind, resource.reason
             ),
             Self::InvalidResource {
@@ -400,7 +401,7 @@ impl std::fmt::Display for K8sTranslateError {
                 message,
             } => write!(
                 f,
-                "invalid Kubernetes resource {}/{} {}: {}",
+                "invalid Kubernetes resource {:?}/{:?} {:?}: {}",
                 namespace, name, kind, message
             ),
         }
@@ -1313,7 +1314,7 @@ impl K8sAccumulator {
 
     fn note_unresolved_gateway_class(&mut self, class_name: &str) {
         let warning = format!(
-            "GatewayClass '{class_name}' is not present in the current snapshot; \
+            "GatewayClass {class_name:?} is not present in the current snapshot; \
              Gateways that reference it are not Ferrum-managed until an owned GatewayClass is observed"
         );
         if !self.warnings.iter().any(|existing| existing == &warning) {
@@ -1384,7 +1385,7 @@ impl K8sAccumulator {
     pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) {
         let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
             self.warnings.push(format!(
-                "proxy with empty namespace or id was ignored (namespace='{}', id='{}')",
+                "proxy with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 proxy.namespace, proxy.id
             ));
             return;
@@ -1399,7 +1400,7 @@ impl K8sAccumulator {
 
             if gateway_loses {
                 self.warnings.push(format!(
-                    "Gateway API proxy '{}/{}' ignored because Istio resource has precedence",
+                    "Gateway API proxy {:?}/{:?} ignored because Istio resource has precedence",
                     proxy.namespace, proxy.id
                 ));
                 return;
@@ -1451,7 +1452,7 @@ impl K8sAccumulator {
     pub(crate) fn upsert_upstream(&mut self, upstream: Upstream) {
         if namespaced_resource_key(&upstream.namespace, &upstream.id).is_none() {
             self.warnings.push(format!(
-                "upstream with empty namespace or id was ignored (namespace='{}', id='{}')",
+                "upstream with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 upstream.namespace, upstream.id
             ));
             return;
@@ -1974,7 +1975,8 @@ where
              merging HTTPRoute and GRPCRoute rules on a shared listener"
         };
         acc.warnings.push(format!(
-            "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and {}; winner is {}/{}",
+            "Gateway API {} {:?}/{:?} conflicted on parent={:?} host={:?} path={:?} match={:?} \
+             and {}; winner is {:?}/{:?}",
             conflict.loser.kind,
             conflict.loser.namespace,
             conflict.loser.name,
@@ -2039,7 +2041,7 @@ where
         }
 
         acc.warnings.push(format!(
-            "Ignoring unsupported Kubernetes resource kind '{}' in {}/{}",
+            "Ignoring unsupported Kubernetes resource kind {:?} in {:?}/{:?}",
             object.kind, object.metadata.namespace, object.metadata.name
         ));
     }
@@ -2329,9 +2331,10 @@ pub(crate) fn resolve_workload_entry_service_attachment(
         return Err(invalid_resource(
             object,
             format!(
-                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
-                 (cross-namespace); a ReferenceGrant in namespace '{}' must permit from \
-                 WorkloadEntry in '{}' to Service '{}'",
+                "WorkloadEntry.service {service_raw:?} references Service {:?}/{:?} across \
+                 namespaces \
+                 (cross-namespace); a ReferenceGrant in namespace {:?} must permit from \
+                 WorkloadEntry in {:?} to Service {:?}",
                 key.namespace, key.name, key.namespace, object.metadata.namespace, key.name
             ),
         ));
@@ -2341,7 +2344,8 @@ pub(crate) fn resolve_workload_entry_service_attachment(
         return Err(invalid_resource(
             object,
             format!(
-                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
+                "WorkloadEntry.service {service_raw:?} references Service {:?}/{:?} across \
+                 namespaces \
                  (cross-namespace) but that Service is not present in the translated inventory; \
                  cross-namespace WorkloadEntry attachments require an authoritative target Service",
                 key.namespace, key.name
@@ -2474,7 +2478,7 @@ pub(crate) fn port_from_u64(
     if raw == 0 || raw > u16::MAX as u64 {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 1 and 65535 (got {raw})"),
+            format!("{field} must be between 1 and 65535 (got \"{raw}\")"),
         ));
     }
     Ok(raw as u16)
@@ -2511,13 +2515,13 @@ pub(crate) fn target_weight_from_value(
     let Some(weight) = value.as_u64() else {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT} (got {value})"),
+            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT}"),
         ));
     };
     if weight > u64::from(MAX_TARGET_WEIGHT) {
         return Err(invalid_resource(
             object,
-            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT} (got {weight})"),
+            format!("{field} must be between 0 and {MAX_TARGET_WEIGHT}"),
         ));
     }
     Ok(weight as u32)
@@ -3479,7 +3483,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
             if !value.is_string() {
                 tracing::warn!(
                     direction = direction,
-                    header = %key,
+                    header = %sanitize_startup_cause(format!("{:?}", key.to_string()), &[]),
                     value_kind = json_value_kind(value),
                     "VirtualService headers.{}.set entry has non-string value; entry will be dropped",
                     direction,
@@ -3492,7 +3496,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
             if !value.is_string() {
                 tracing::warn!(
                     direction = direction,
-                    header = %key,
+                    header = %sanitize_startup_cause(format!("{:?}", key.to_string()), &[]),
                     value_kind = json_value_kind(value),
                     "VirtualService headers.{}.add entry has non-string value; entry will be dropped",
                     direction,

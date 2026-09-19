@@ -175,12 +175,14 @@ impl OutboundRegistry {
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
-        let parsed = serde_json::from_value::<JsonObject<OutboundRegistryConfig>>(config.clone())
-            .map_err(|e| format!("mesh_outbound_registry: {e}"))?
-            .0;
+        let parsed = crate::util::deserialization::from_json_value::<
+            JsonObject<OutboundRegistryConfig>,
+        >(config.clone())
+        .map_err(|e| format!("mesh_outbound_registry: {e}"))?
+        .0;
         if !(400..=599).contains(&parsed.reject_status) {
             return Err(format!(
-                "mesh_outbound_registry: reject_status must be 4xx/5xx (got {})",
+                "mesh_outbound_registry: reject_status must be 4xx/5xx (got \"{}\")",
                 parsed.reject_status
             ));
         }

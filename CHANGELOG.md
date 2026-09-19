@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Withhold supplied configuration values in early startup and reload diagnostics
+  (#5591), including SQL/Mongo quarantine, mesh consumers and revisions, capture
+  settings, CP trust identifiers, and listener conflicts. WAF regex failures keep
+  the field and rejection reason without exposing the pattern. Remaining plugin
+  families are tracked in #5594.
+
+- Startup failures now print the full cause chain (#5589), including mesh field
+  paths and YAML/JSON positions, without requiring `-v`. Configuration parsers
+  classify serde families from the bare inner error, separately from document
+  paths, and withhold offending scalars before retaining errors. A second layer
+  sanitizes every cause independently at render time for both `run` and `validate`,
+  withholding double/single-quoted spans (including unterminated tails) while
+  keeping backticked schema names and the following cause. Validators must omit
+  document values or quote strings with Debug escaping; bare interpolation is a
+  defect. Converted mesh IP/host/name/target-reference/CIDR/header diagnostics,
+  gateway host/reference checks, plugin names and bounds follow this convention.
+  Audited plugin type errors quote the complete JSON rendering, including
+  numbers and containers. CORS and sibling regex validators omit pattern-reproducing
+  library errors; OpenAPI and AI tool JSON Schema errors use fixed reasons.
+  YAML duplicate keys retain their field names. Paths and unknown-field messages
+  echo document keys. Mesh, gateway migration (warnings and errors), and backup
+  version rejections withhold the supplied value. Database-mode `validate` also
+  checks the configured JSON backup without connecting to the database. Diagnostics
+  also redact credentials in exact configured database URLs and registered external
+  secret values. The URL inventory reads only raw settings, without fetching
+  dormant database TLS sources or creating PEM files. Owning loaders remain
+  responsible for derived URLs and other provider/driver error payloads.
+  Credential scrubbers now run on each original cause before quoted-span
+  withholding, including URLs and registered secrets containing quotes. If the
+  scrubbers change quote/escape syntax, the affected cause is withheld in full
+  without consuming the next cause. Backup,
+  SQL/Mongo validation and unknown-plugin warnings sanitize before emission.
+  WAF stream/rule IDs, exemption regexes, Basic-auth consumer IDs, gRPC-Web
+  header elements and remaining constructor scalar/type diagnostics follow the
+  same withholding convention. Version and credential schema names remain
+  visible in backticks. Real-binary regressions inspect both output streams.
+
 ### Security
 
 - **Outbound registry reuse now follows CONNECT enforcement context** (PR #5595).

@@ -20,6 +20,7 @@
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
+#   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
@@ -69,9 +70,11 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
+H2_GUARD_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --experiment-manifest) EXPERIMENT_MANIFEST="$2"; shift 2 ;;
         --gateways) GATEWAYS="$2"; shift 2 ;;
         --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
@@ -979,6 +982,10 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
             "$diagnostics/${gateway}_${payload}_backend.log"
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_observation.py" "$out" "$usage" \
+            "$diagnostics/${gateway}_${payload}.log"
+    fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
@@ -1032,6 +1039,12 @@ main() {
                 "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
             if [ -n "$campaign" ]; then
                 H2_OBSERVE=1
+                H2_GUARD_OBSERVE=$(python3 "$SCRIPT_DIR/experiment_arms.py" guard \
+                    "$EXPERIMENT_MANIFEST" "$PROTOCOL")
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && { [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; }; then
+                    echo "[experiment] guard observation is hosted-only" >&2
+                    exit 2
+                fi
                 PAIRS="${campaign%% *}"
                 PAYLOAD_SIZES="${campaign#* }"
                 if [ "$PROCESS_USAGE" != true ]; then
@@ -1081,6 +1094,14 @@ PYEOF
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
     if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            local source_identity
+            source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
+            if [ "$source_identity" != "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16" ]; then
+                echo "[experiment] image is not the pinned guard diagnostic build" >&2
+                exit 2
+            fi
+        fi
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
         if [ -n "$BASELINE_IMAGE" ]; then
