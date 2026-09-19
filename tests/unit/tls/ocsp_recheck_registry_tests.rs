@@ -197,7 +197,10 @@ fn concurrent_registration_recheck_and_inventory_stay_bounded_and_retire_every_r
         thread.join().unwrap();
     }
     assert_eq!(registry.lock().tracked.len(), MAX_TRACKED_STAPLES);
-    assert_eq!(registry.lock().recheck(200, None).dropped, MAX_TRACKED_STAPLES);
+    assert_eq!(
+        registry.lock().recheck(200, None).dropped,
+        MAX_TRACKED_STAPLES
+    );
     assert!(retained.iter().all(|resolver| !has_staple(resolver)));
     assert!(registry.lock().tracked.is_empty());
     assert_eq!(registry.lock().dropped.len(), MAX_TRACKED_STAPLES);

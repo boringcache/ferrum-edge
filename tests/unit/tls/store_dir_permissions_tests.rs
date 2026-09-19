@@ -125,7 +125,11 @@ const STORE_KINDS: &[&str] = &[
 
 fn mode(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 #[test]
@@ -189,7 +193,10 @@ fn all_stores_preserve_existing_permissive_directories_and_foreign_files() {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         let foreign = directory.join("foreign");
         std::fs::write(&foreign, b"keep").unwrap();
-        assert!(open_store(kind, &directory), "{kind} warning-only directory");
+        assert!(
+            open_store(kind, &directory),
+            "{kind} warning-only directory"
+        );
         assert_eq!(mode(&directory), 0o755);
         assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
     }

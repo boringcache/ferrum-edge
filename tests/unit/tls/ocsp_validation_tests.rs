@@ -3213,7 +3213,10 @@ fn retiring_a_pinned_older_resolver_preserves_the_refreshed_source_inventory() {
         .find(|entry| entry.material_kind == "ocsp")
         .unwrap();
     assert_eq!(entry.state, TlsInventoryState::Loaded);
-    assert_eq!(entry.next_update.map(|at| at.timestamp()), Some(new_deadline));
+    assert_eq!(
+        entry.next_update.map(|at| at.timestamp()),
+        Some(new_deadline)
+    );
 
     let outcome =
         ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(new_deadline, Some(&ocsp_path));

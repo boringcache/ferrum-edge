@@ -343,7 +343,8 @@ enum RetirementReason {
 
 impl RegistryState {
     fn register(&mut self, entry: TrackedStaple) {
-        self.tracked.retain(|entry| entry.resolver.strong_count() > 0);
+        self.tracked
+            .retain(|entry| entry.resolver.strong_count() > 0);
         if self.tracked.len() >= MAX_TRACKED_STAPLES {
             // Retire the actual serving resolver BEFORE removing its only
             // tracking entry. Even a pinned old ServerConfig must stop stapling.
