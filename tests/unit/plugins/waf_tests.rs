@@ -2185,11 +2185,7 @@ fn assert_rendered_waf_unknown_keys(
     }
 }
 
-fn assert_rendered_waf_rejection(
-    config: &serde_json::Value,
-    expected: &str,
-    withheld: &[&str],
-) {
+fn assert_rendered_waf_rejection(config: &serde_json::Value, expected: &str, withheld: &[&str]) {
     let error = Waf::new(config).expect_err("invalid configuration must reject construction");
     let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
     assert!(rendered.contains(expected), "{rendered}");

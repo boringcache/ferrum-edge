@@ -6910,8 +6910,7 @@ fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_valu
         let error = RequestDeduplication::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown anonymous caller scope must reject construction");
-        let rendered =
-            ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         assert!(
             rendered.contains("request_deduplication: unknown `anonymous_caller_scope` value"),
             "{rendered}"
@@ -6922,7 +6921,9 @@ fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_valu
         );
         assert!(rendered.contains("<redacted scalar>"), "{rendered}");
         assert!(
-            !rendered.to_ascii_lowercase().contains("replay_scope_secret"),
+            !rendered
+                .to_ascii_lowercase()
+                .contains("replay_scope_secret"),
             "{rendered}"
         );
         assert!(!rendered.contains('\n'), "{rendered}");

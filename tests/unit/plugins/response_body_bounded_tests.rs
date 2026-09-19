@@ -65,7 +65,10 @@ fn test_parse_max_response_body_bytes_defaults_and_validates() {
             "overflow message must not echo the offending value: {err}"
         );
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
-        assert_eq!(rendered, "test_plugin: `limit` is too large for this platform");
+        assert_eq!(
+            rendered,
+            "test_plugin: `limit` is too large for this platform"
+        );
     }
 }
 

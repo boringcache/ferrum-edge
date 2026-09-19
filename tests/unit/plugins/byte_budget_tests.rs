@@ -65,7 +65,12 @@ fn admit_byte_limits_defaults_and_bounds() {
 #[tokio::test]
 async fn logging_byte_limit_rejections_retain_rendered_fields_and_fixed_bounds() {
     let token = "'BYTE_BUDGET_SECRET\"`\\\n";
-    for plugin in ["http_logging", "tcp_logging", "udp_logging", "statsd_logging"] {
+    for plugin in [
+        "http_logging",
+        "tcp_logging",
+        "udp_logging",
+        "statsd_logging",
+    ] {
         for (limits, expected) in [
             (
                 json!({"max_entry_bytes": token}),
