@@ -739,29 +739,17 @@ impl TlsPolicy {
             default_kx_groups(&base_provider)?
         };
 
-        // Log the TLS policy
-        let version_names: Vec<&str> = versions
-            .iter()
-            .map(|v| {
-                if std::ptr::eq(*v, &rustls::version::TLS12) {
-                    "TLS 1.2"
-                } else {
-                    "TLS 1.3"
-                }
-            })
-            .collect();
-        let suite_names: Vec<String> = cipher_suites
-            .iter()
-            .map(|s| format!("{:?}", s.suite()))
-            .collect();
-        let group_names: Vec<String> = kx_groups
-            .iter()
-            .map(|g: &&'static dyn rustls::crypto::SupportedKxGroup| format!("{:?}", g.name()))
-            .collect();
-
+        // This event bypasses startup error rendering. Omit supplied selections
+        // and scalars, including normalized aliases the secret sink cannot match.
+        // Counts describe the policy without disclosing its configured values.
         info!(
-            "TLS policy: versions={:?}, cipher_suites={:?}, curves={:?}, prefer_server_order={}",
-            version_names, suite_names, group_names, env_config.tls_prefer_server_cipher_order
+            "TLS policy: version_count={} (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`), \
+             cipher_suite_count={} (`FERRUM_TLS_CIPHER_SUITES`), \
+             group_count={} (`FERRUM_TLS_CURVES`); \
+             `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` value withheld",
+            versions.len(),
+            cipher_suites.len(),
+            kx_groups.len()
         );
 
         // Build custom CryptoProvider
