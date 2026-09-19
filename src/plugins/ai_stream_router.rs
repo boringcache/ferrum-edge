@@ -303,7 +303,7 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// The plugin never switches providers, so storing a fallback policy could only
 /// ever be runtime-inert. See the module docs for why pre-first-byte fallback
 /// cannot be expressed at this layer.
-pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsupported field 'fallback'; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the 'fallback' block.";
+pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsupported field `fallback`; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the `fallback` block.";
 
 // ---------------------------------------------------------------------------
 // Metadata keys
@@ -410,7 +410,7 @@ impl ProviderType {
             "anthropic" => Ok(Self::Anthropic),
             "google_gemini" => Ok(Self::GoogleGemini),
             other => Err(format!(
-                "ai_stream_router: unknown provider_type '{other}' (expected openai, openai_compatible, anthropic, google_gemini)"
+                "ai_stream_router: unknown `provider_type` {other:?} (expected `openai`, `openai_compatible`, `anthropic`, `google_gemini`)"
             )),
         }
     }
@@ -776,7 +776,7 @@ impl AiStreamRouter {
             config_object,
             "config",
             AI_STREAM_ROUTER_CONFIG_KEYS,
-            "ai_stream_router: ",
+            "ai_stream_router: `config`: ",
         )?;
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
@@ -790,9 +790,9 @@ impl AiStreamRouter {
         let providers_val = config
             .get("providers")
             .and_then(|v| v.as_array())
-            .ok_or("ai_stream_router: 'providers' must be a non-empty array")?;
+            .ok_or("ai_stream_router: `providers` must be a non-empty array")?;
         if providers_val.is_empty() {
-            return Err("ai_stream_router: 'providers' array must not be empty".to_string());
+            return Err("ai_stream_router: `providers` array must not be empty".to_string());
         }
 
         // Honor the gateway IP allowlist policy (CLI/env/conf/default precedence)
@@ -805,20 +805,20 @@ impl AiStreamRouter {
         for (i, pv) in providers_val.iter().enumerate() {
             let provider_object = pv
                 .as_object()
-                .ok_or_else(|| format!("ai_stream_router: provider[{i}] must be an object"))?;
+                .ok_or_else(|| format!("ai_stream_router: `providers[{i}]` must be an object"))?;
             let provider_path = format!("config.providers[{i}]");
             reject_unknown_keys(
                 provider_object,
                 &provider_path,
                 AI_STREAM_ROUTER_PROVIDER_KEYS,
-                "ai_stream_router: ",
+                &format!("ai_stream_router: `{provider_path}`: "),
             )?;
 
             let name = pv["name"]
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or(format!(
-                    "ai_stream_router: provider[{i}] missing non-empty 'name'"
+                    "ai_stream_router: `providers[{i}]` missing non-empty `name`"
                 ))?
                 .to_string();
             if !seen_names.insert(name.clone()) {
@@ -828,35 +828,35 @@ impl AiStreamRouter {
             }
 
             let provider_type_str = pv["provider_type"].as_str().ok_or(format!(
-                "ai_stream_router: provider {name:?} missing 'provider_type'"
+                "ai_stream_router: provider {name:?} missing `provider_type`"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
 
             let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
             if priority_u64 == 0 {
                 return Err(format!(
-                    "ai_stream_router: provider {name:?} priority must be a positive integer"
+                    "ai_stream_router: provider {name:?} `priority` must be a positive integer"
                 ));
             }
             let priority = u32::try_from(priority_u64).map_err(|_| {
-                format!("ai_stream_router: provider {name:?} priority is too large")
+                format!("ai_stream_router: provider {name:?} `priority` is too large")
             })?;
 
             let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
             if model_patterns.is_empty() {
                 return Err(format!(
-                    "ai_stream_router: provider {name:?} requires a non-empty 'model_patterns' array"
+                    "ai_stream_router: provider {name:?} requires a non-empty `model_patterns` array"
                 ));
             }
 
             let endpoint = pv["endpoint"].as_str().ok_or(format!(
-                "ai_stream_router: provider {name:?} missing 'endpoint'"
+                "ai_stream_router: provider {name:?} missing `endpoint`"
             ))?;
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
 
             let api_key = config_or_env_str(pv, "api_key").ok_or(format!(
-                "ai_stream_router: provider {name:?} missing 'api_key'"
+                "ai_stream_router: provider {name:?} missing `api_key`"
             ))?;
             // Header-value validity is a per-byte property, so proving the key
             // itself is sendable also proves the `Bearer {api_key}` form the
@@ -980,7 +980,7 @@ fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     for field in AMBIGUOUS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and does not implement provider fallback"
+                "ai_stream_router: unsupported field `{field}`; ai_stream_router always claims `stream: true` requests and does not implement provider fallback"
             ));
         }
     }
@@ -1044,8 +1044,10 @@ fn parse_endpoint(
     let has_model_placeholder = endpoint.contains("{model}");
     let parse_src = endpoint.replace("{model}", "__FERRUM_MODEL__");
 
-    let parsed = Url::parse(&parse_src).map_err(|e| {
-        format!("ai_stream_router: provider '{provider_name}' invalid endpoint '{endpoint}': {e}")
+    let parsed = Url::parse(&parse_src).map_err(|_| {
+        format!(
+            "ai_stream_router: provider {provider_name:?} invalid `endpoint` {endpoint:?}: invalid URL"
+        )
     })?;
 
     let scheme = match parsed.scheme() {
@@ -1053,14 +1055,14 @@ fn parse_endpoint(
         "http" => {
             if !allow_plaintext {
                 return Err(format!(
-                    "ai_stream_router: provider '{provider_name}' endpoint uses 'http://' which is rejected by default; set 'allow_plaintext: true' on the provider to override"
+                    "ai_stream_router: provider {provider_name:?} `endpoint` uses `http://` which is rejected by default; set `allow_plaintext: true` on the provider to override"
                 ));
             }
             BackendScheme::Http
         }
         other => {
             return Err(format!(
-                "ai_stream_router: provider '{provider_name}' endpoint has unsupported scheme '{other}' (expected 'https' or 'http' with allow_plaintext)"
+                "ai_stream_router: provider {provider_name:?} `endpoint` has unsupported scheme {other:?} (expected `https` or `http` with `allow_plaintext`)"
             ));
         }
     };
@@ -1071,7 +1073,7 @@ fn parse_endpoint(
         Some(Host::Ipv6(h)) => (h.to_string(), true),
         _ => {
             return Err(format!(
-                "ai_stream_router: provider '{provider_name}' endpoint '{endpoint}' has no host"
+                "ai_stream_router: provider {provider_name:?} `endpoint` {endpoint:?} has no host"
             ));
         }
     };
@@ -1080,7 +1082,7 @@ fn parse_endpoint(
         && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_stream_router: provider '{provider_name}' endpoint IP {ip} denied by backend egress policy ({backend_allow_ips})"
+            "ai_stream_router: provider {provider_name:?} `endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
     }
 
@@ -1095,7 +1097,7 @@ fn parse_endpoint(
     // (issue #5302).
     if parsed.port() == Some(0) {
         return Err(format!(
-            "ai_stream_router: provider '{provider_name}' endpoint '{endpoint}' must not use port 0; port 0 disables a listener and cannot be dialed as a provider destination"
+            "ai_stream_router: provider {provider_name:?} `endpoint` {endpoint:?} must not use port 0; port 0 disables a listener and cannot be dialed as a provider destination"
         ));
     }
     let port = parsed.port().unwrap_or(default_port);
@@ -1148,7 +1150,7 @@ fn optional_bool(config: &Value, field: &str) -> Result<Option<bool>, String> {
         Some(v) => v
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("ai_stream_router: '{field}' must be a boolean")),
+            .ok_or_else(|| format!("ai_stream_router: `{field}` must be a boolean")),
     }
 }
 
@@ -1158,7 +1160,7 @@ fn optional_u64(config: &Value, field: &str) -> Result<Option<u64>, String> {
         Some(v) => v
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("ai_stream_router: '{field}' must be an unsigned integer")),
+            .ok_or_else(|| format!("ai_stream_router: `{field}` must be an unsigned integer")),
     }
 }
 
@@ -1175,7 +1177,7 @@ fn optional_str(config: &Value, field: &str) -> Result<Option<String>, String> {
         Some(v) => v
             .as_str()
             .map(|s| Some(s.to_string()))
-            .ok_or_else(|| format!("ai_stream_router: '{field}' must be a string")),
+            .ok_or_else(|| format!("ai_stream_router: `{field}` must be a string")),
     }
 }
 
@@ -1184,18 +1186,18 @@ fn optional_string_vec(config: &Value, field: &str) -> Result<Option<Vec<String>
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("ai_stream_router: '{field}' must be an array"));
+        return Err(format!("ai_stream_router: `{field}` must be an array"));
     };
     let mut out = Vec::with_capacity(values.len());
     for v in values {
         let Some(s) = v.as_str() else {
             return Err(format!(
-                "ai_stream_router: '{field}' must contain only strings"
+                "ai_stream_router: `{field}` must contain only strings"
             ));
         };
         if s.is_empty() {
             return Err(format!(
-                "ai_stream_router: '{field}' must not contain empty strings"
+                "ai_stream_router: `{field}` must not contain empty strings"
             ));
         }
         out.push(s.to_string());
@@ -1216,7 +1218,7 @@ fn optional_string_vec(config: &Value, field: &str) -> Result<Option<Vec<String>
 fn validate_provider_header_value(provider: &str, field: &str, value: &str) -> Result<(), String> {
     if reqwest::header::HeaderValue::from_str(value).is_err() {
         return Err(format!(
-            "ai_stream_router: provider {provider:?} '{field}' is not a valid HTTP header value"
+            "ai_stream_router: provider {provider:?} `{field}` is not a valid HTTP header value"
         ));
     }
     Ok(())

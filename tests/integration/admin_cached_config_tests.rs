@@ -3402,9 +3402,10 @@ async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
         let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
 
         assert_eq!(status, 400, "unknown compressor key was admitted: {body}");
+        let error = body["error"].as_str().expect("admin error string");
         assert!(
-            body.to_string().contains(&format!(
-                "ai_prompt_compressor: unknown config field(s): {unknown_key}"
+            error.contains(&format!(
+                "ai_prompt_compressor: unknown config field(s): {unknown_key:?}"
             )),
             "unexpected admin validation response: {body}"
         );
@@ -3463,7 +3464,7 @@ async fn test_admin_create_rejects_invalid_ai_stream_router_policy_config() {
                 "fallback": {"max_attempts": 3}
             }),
             &[
-                "unsupported field 'fallback'",
+                "unsupported field `fallback`",
                 "provider fallback is not implemented",
             ][..],
         ),

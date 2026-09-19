@@ -88,16 +88,16 @@ impl AiTokenMetrics {
             .collect::<Vec<_>>();
         if !unknown.is_empty() {
             return Err(format!(
-                "ai_token_metrics: unknown config key(s): {}; allowed keys: {}",
+                "ai_token_metrics: unknown config key(s): {:?}; allowed keys: `{}`",
                 unknown.join(", "),
-                ALLOWED_CONFIG_KEYS.join(", ")
+                ALLOWED_CONFIG_KEYS.join("`, `")
             ));
         }
 
         let provider = match optional_string(config, "provider")? {
             Some(raw) => {
                 if raw.is_empty() {
-                    return Err("ai_token_metrics: 'provider' must not be empty".to_string());
+                    return Err("ai_token_metrics: `provider` must not be empty".to_string());
                 }
                 raw.to_string()
             }
@@ -105,7 +105,7 @@ impl AiTokenMetrics {
         };
         if provider != "auto" && parse_ai_provider(&provider).is_none() {
             return Err(format!(
-                "ai_token_metrics: unknown `provider` value {:?} (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
+                "ai_token_metrics: unknown `provider` value {:?} (expected `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock`, or `tgi`)",
                 provider
             ));
         }
@@ -115,7 +115,7 @@ impl AiTokenMetrics {
         let metadata_prefix = match optional_string(config, "metadata_prefix")? {
             Some(raw) => {
                 if raw.is_empty() {
-                    return Err("ai_token_metrics: 'metadata_prefix' must not be empty".to_string());
+                    return Err("ai_token_metrics: `metadata_prefix` must not be empty".to_string());
                 }
                 if raw.len() > MAX_METADATA_PREFIX_LEN
                     || !raw.bytes().all(|byte| {
@@ -123,7 +123,7 @@ impl AiTokenMetrics {
                     })
                 {
                     return Err(format!(
-                        "ai_token_metrics: 'metadata_prefix' must be 1-{MAX_METADATA_PREFIX_LEN} ASCII letters, digits, '.', '_' or '-'"
+                        "ai_token_metrics: `metadata_prefix` must be 1-{MAX_METADATA_PREFIX_LEN} ASCII letters, digits, `.`, `_` or `-`"
                     ));
                 }
                 raw.to_string()
@@ -434,7 +434,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a string"))
+        .ok_or_else(|| format!("ai_token_metrics: `{field}` must be a string"))
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -444,7 +444,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("ai_token_metrics: `{field}` must be a boolean"))
 }
 
 fn optional_f64(config: &Value, field: &'static str) -> Result<Option<f64>, String> {
@@ -457,7 +457,7 @@ fn optional_f64(config: &Value, field: &'static str) -> Result<Option<f64>, Stri
     value
         .as_f64()
         .map(Some)
-        .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a number"))
+        .ok_or_else(|| format!("ai_token_metrics: `{field}` must be a number"))
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
