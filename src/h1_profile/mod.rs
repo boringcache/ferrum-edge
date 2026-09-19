@@ -6,6 +6,7 @@ mod store;
 
 use std::fmt::Write;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -13,6 +14,15 @@ use http_body::Frame;
 
 pub use allocator::{ForwardingAllocator, Scope, in_scope};
 pub use store::{Snapshot, current_thread_counters, publish_current_thread, snapshot};
+
+static ALLOCATOR_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Register the process allocator only from a binary that declares
+/// `ForwardingAllocator` as its global allocator. Linking the library or using
+/// a forwarding allocator locally does not establish process-wide coverage.
+pub fn register_global_allocator() {
+    ALLOCATOR_INSTALLED.store(true, Ordering::Relaxed);
+}
 
 pub fn count(counter: usize, amount: usize) {
     store::with_local(|local| local.add(counter, amount as u64));
@@ -90,7 +100,10 @@ pub fn render_prometheus() -> String {
         ("unpublished_events", snapshot.unpublished_events),
         ("lost_events", snapshot.lost_events),
         ("slot_capacity", store::THREAD_SLOTS as u64),
-        ("allocator_installed", u64::from(!cfg!(windows))),
+        (
+            "allocator_installed",
+            u64::from(ALLOCATOR_INSTALLED.load(Ordering::Relaxed)),
+        ),
     ];
     for (name, value) in metadata {
         let _ = writeln!(text, "ferrum_h1_profile_{name} {value}");

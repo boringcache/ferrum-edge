@@ -136,6 +136,16 @@ if [ -n "$UDP_PROFILE" ]; then
         "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
 fi
 
+if [ "$H1_PROFILE" = diagnostic ] && [ -z "${H1_DIAGNOSTIC_WORK_DEADLINE:-}" ]; then
+    # Independent parent owns startup, reader waits, docker and cleanup under
+    # one deadline. Re-entry uses a literal, fixed-workload child script.
+    exec python3 "$SCRIPT_DIR/h1_diagnostic_campaign.py" \
+        --output-dir "$OUTPUT_DIR" --budget "$WALLCLOCK_BUDGET"
+fi
+if [ "$H1_PROFILE" = diagnostic ]; then
+    [ "$PPID" = "${H1_DIAGNOSTIC_SUPERVISOR_PID:-}" ] || exit 2
+fi
+
 # UDP protocols are fixed to 1 KB regardless of caller.
 case "$PROTOCOL" in
     udp|udp-dtls) PAYLOAD_SIZES="1024" ;;
@@ -287,7 +297,11 @@ cleanup() {
         lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     done
 }
-trap cleanup EXIT
+if [ "$H1_PROFILE" != diagnostic ]; then
+    trap cleanup EXIT
+fi
+# Diagnostic cleanup is unconditional in the independent supervisor. In
+# particular it does not inherit cleanup()'s unbounded waits or port-wide kill.
 
 # ── Build ────────────────────────────────────────────────────────────────────
 build_binaries() {
@@ -310,6 +324,11 @@ build_binaries() {
 # ── Backend ──────────────────────────────────────────────────────────────────
 start_backend() {
     echo "[backend] starting proto_backend..."
+    local backend_log="$SCRIPT_DIR/backend.log"
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        backend_log="$OUTPUT_DIR/diagnostics/${gw}_backend.raw.log"
+    fi
     # proto_backend writes self-signed certs to ./certs relative to its CWD
     # (see tests/performance/multi_protocol/proto_backend.rs — uses
     # std::env::current_dir().join("certs")). We must cd into $SCRIPT_DIR so
@@ -322,7 +341,7 @@ start_backend() {
     saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
     BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
-        ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
+        ./target/release/proto_backend > "$backend_log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
@@ -339,7 +358,7 @@ start_backend() {
         sleep 0.5
     done
     echo "[backend] failed to start" >&2
-    tail -30 "$SCRIPT_DIR/backend.log" >&2
+    tail -30 "$backend_log" >&2
     exit 1
 }
 
@@ -397,6 +416,10 @@ start_ferrum() {
         extra_env+=(-e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1
                     -e FERRUM_ADMIN_HTTP_PORT=9000
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
+    fi
+
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        extra_env+=(--name "$H1_DIAGNOSTIC_CONTAINER_PREFIX-$gw")
     fi
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
@@ -897,7 +920,7 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
-    if [ -n "$H1_PROFILE" ] && [ "$H1_PROFILE" != diagnostic ] && [ "$target" = gateway ]; then
+    if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
         sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
                       --h1-container-id "$GATEWAY_CID")
     fi
@@ -919,10 +942,22 @@ run_bench() {
         if sudo -n true 2>/dev/null; then
             sampler_stop_file="$usage.stop"
             rm -f "$sampler_stop_file"
-            sudo -n python3 "$SCRIPT_DIR/process_usage.py" \
-                --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
-                --output "$usage" --interval 0.5 --parent-pid "$$" \
-                --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            if [ "$H1_PROFILE" = diagnostic ]; then
+                # The privileged reader also self-terminates even if sudo
+                # changes process groups or the runner is forcibly killed.
+                local reader_bound
+                reader_bound=$(python3 -c 'import os,time; print(max(0.001, float(os.environ["H1_DIAGNOSTIC_WORK_DEADLINE"])-time.monotonic()-1))')
+                sudo -n timeout --signal=TERM --kill-after=1s "${reader_bound}s" \
+                    python3 "$SCRIPT_DIR/process_usage.py" \
+                    --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                    --output "$usage" --interval 0.5 --parent-pid "$$" \
+                    --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            else
+                sudo -n python3 "$SCRIPT_DIR/process_usage.py" \
+                    --backend "$BACKEND_PID" --gateway-pids "$gateway_pids" \
+                    --output "$usage" --interval 0.5 --parent-pid "$$" \
+                    --stop-file "$sampler_stop_file" "${sampler_args[@]}" &
+            fi
             sampler_pid=$!
         else
             sampler_stop_file=""
@@ -950,7 +985,18 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
-    if [ -n "$TIMEOUT_CMD" ]; then
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        # Write directly to retained raw stdout so campaign termination during
+        # the client/readers/logging cannot lose the original partial output.
+        timeout "${bench_wallclock}s" \
+            "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
+            --target "$bench_target" --duration "$DURATION" \
+            --concurrency "$effective_concurrency" --payload-size "$payload" \
+            --json "${extra_args[@]}" > "$diagnostics/${gateway}_${payload}_client.raw.json" \
+            2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" || rc=$?
+        printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
+        cp "$diagnostics/${gateway}_${payload}_client.raw.json" "$out"
+    elif [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "${bench_wallclock}s" \
             "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
             --target "$bench_target" \
@@ -984,7 +1030,11 @@ run_bench() {
     mkdir -p "$diagnostics"
     # `set -e` is on: a best-effort capture must never abort the matrix that
     # the capture exists to diagnose.
-    cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        cp "$diagnostics/${gateway}_backend.raw.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
+    else
+        cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
+    fi
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
@@ -994,11 +1044,6 @@ run_bench() {
         fi
     fi
 
-    if [ "$H1_PROFILE" = diagnostic ]; then
-        # Preserve even partial stdout before error placeholders or stamping.
-        cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"
-        printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
-    fi
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"
@@ -1261,9 +1306,8 @@ plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
 with open(path, "w") as f:
     json.dump(plan, f, indent=2)
 PYEOF
-    if [ "$H1_PROFILE" = diagnostic ]; then
-        python3 "$SCRIPT_DIR/h1_internal_profile.py" report-diagnostic "$OUTPUT_DIR"
-    fi
+    # The diagnostic supervisor reports only AFTER bounded cleanup and records
+    # truthful termination status even if this runner never reaches this point.
     echo "[main] done. results in $OUTPUT_DIR"
 }
 

@@ -4,9 +4,11 @@
 hosted regression fixtures. It does not change coalescing, Content-Length, body limits,
 timeouts, retries, offered load, TLS verification, release optimization settings,
 or forwarding policy. #5600's client frame/chunk/TLS observations and `/proc/io`
-remain distinct sources. This branch starts at #5602 head
-`5e32b808af5631978cedc525d0dff7a29aedbb4c`; root must settle that dependency and
-preserve its error campaign. There are no new performance results here. The prior
+remain distinct sources. Historically this branch started at #5602 development
+head `5e32b808af5631978cedc525d0dff7a29aedbb4c`. #5602 landed at reviewed head
+`3ba46fcd73d22304dca4ddd20b14c8ecadd6c814`, merge
+`61c68cb0e73504f389a2fdf065bf5297d6baf3ba`; it is no longer an outstanding
+dependency. Preserve its error campaign. There are no new performance results here. The prior
 cutoff campaign demonstrated no gain; its failed 5 MiB observations remain valid
 failure evidence and are not replaced by this foundation.
 
@@ -21,7 +23,12 @@ functional build coverage, not a separate cryptographic certification claim.
 platforms only when the feature is enabled. The default allocator declaration is
 otherwise unchanged. Windows does not install this observer and exports
 `allocator_installed=0`; the hosted collector rejects that as missing coverage.
-The library alone does not replace an embedding application's allocator.
+The library alone does not replace an embedding application's allocator and
+exports `allocator_installed=0`, including on non-Windows. Only a binary that
+declares the forwarding global allocator explicitly calls
+`register_global_allocator()` at entry. The hosted library test never mutates
+this registration; the separate cadence child checks `1` with the feature and
+absence of the metric without it, avoiding process-global test resets/races.
 
 `src/h1_profile/allocator.rs::ForwardingAllocator` forwards alloc, alloc_zeroed,
 realloc and dealloc exactly once with unchanged pointer/layout/size. The return
@@ -136,7 +143,7 @@ trailer gates, and H1 schema/completeness tests. The independent Benchmark Harne
 Tests discovery also runs the new Python tests. These are registrations, not
 claims of passing execution.
 
-Root dispatches after reviewing this branch and settling dependencies (worker
+Root dispatches after reviewing this branch (#5602 is already landed; worker
 does not dispatch). Once the workflow is available to GitHub Actions:
 
 ```sh
@@ -215,7 +222,14 @@ as canonical hashes and must also agree. Only Docker's generated short-ID
 For observer-off controls, the raw process timeline must continuously bracket
 measurement with the runtime's owned host PID/start ticks, and its retained
 `h1_gateway` and embedded measurement PID must agree. Missing observer counters
-in that build are expected; missing runtime/process ownership is not. Runtime
+in that build are expected; missing runtime/process ownership is not. The same
+capture timing validator runs for OFF and ON: it requires interior capture,
+consecutive integer IDs, finite increasing clocks, nonoverlapping captures,
+one-second maximum sampling gaps and process-to-scrape lag, two-second total
+process/capture boundary slack, and 50 ms wall/monotonic agreement. The OFF
+metrics parse failure does not waive before/after listener ownership or timing.
+Sparse or excessively wide brackets retain their partial CPU observations but
+cannot calibrate observer overhead. Runtime
 failures appear in each affected observation's `runtime_issues` and make
 `runtime_complete`, `traffic_complete`, `profiles_complete`, and comparison
 eligibility false. Available profile deltas and the entire declared matrix are
@@ -365,7 +379,49 @@ image and diagnostic-on client. Each arm uses 5 MiB, 50 workers (the unchanged
 200-base scaling), one full-payload warmup, 30-second measurement, 30-second
 request drain, and unchanged timeout/guard/TLS policies. Preflight remains
 70 seconds and the runner's existing outer bound remains 190 seconds per arm;
-the selected campaign budget is 900 seconds. No optional 1 MiB control, automatic
+the complete campaign budget is **900 seconds**, enforced by the independent
+`h1_diagnostic_campaign.py` supervisor, including startup, Docker operations,
+passive readers, between-arm cleanup and final cleanup/reporting. Builds remain
+separate workflow prerequisites. Its monotonic deadline starts before campaign
+artifact initialization. At most **870 seconds** are available for the entire
+runner; **30 seconds are reserved within the 900**, not added afterwards. The
+cleanup helper gets at most 20 seconds (less if less time remains), and reporting
+gets the remaining time minus a two-second final bookkeeping reserve. An early
+runner exit enters cleanup immediately. Smaller explicit budgets scale the
+reserve down; budgets above 900 are refused in diagnostic mode.
+
+The runner owns a new Linux session. Cleanup checks PID/start-tick/session
+identity and sends TERM then KILL to its remaining processes, including nested
+timeout process groups, without an unbounded wait. The privileged passive reader
+also has its own TERM/KILL deadline before the work limit, so it cannot rely on
+the blocked runner to stop it. Container names are unique per campaign and are
+known before creation. Bounded cleanup captures remaining container logs,
+removes only those names and checks their absence. Helper commands each receive
+a fraction of the remaining cleanup time, including force-kill grace. The
+diagnostic path does not use the general runner's port-wide cleanup. No request
+timeout, request-drain allowance, concurrency, retry or measurement duration
+changes; exhausting the campaign budget fails the slice.
+
+`diagnostic_termination.json` distinguishes runner exit, exhausted budget,
+interruption, supervisor failure and incomplete cleanup. It records observed
+exit/reap codes, survivors, cleanup/report outcome and elapsed time. Missing
+permissions, an unavailable Docker daemon, an unkillable process or unsuccessful
+reaping cannot become successful cleanup. This is a hosted userspace deadline,
+not a guarantee against kernel uninterruptible I/O, host suspension or loss of
+the runner/filesystem. Such failures remain incomplete and need root attention;
+no successful termination is inferred from missing evidence.
+
+Before starting the child, the supervisor atomically retains a failed report
+with all three rows. Raw client stdout and backend output go directly into the
+artifact directory from process launch. Partial client output survives a kill
+during the invocation or reader join; an absent client exit file is unobserved,
+not a fabricated timeout return. Final reporting is a separately bounded process;
+a failed/killed report leaves the seed, and the existing workflow `always()`
+step can regenerate it from retained evidence. Existing output directories are
+not overwritten by a second campaign. The existing unconditional artifact upload
+and job timeout are unchanged.
+
+No optional 1 MiB control, automatic
 retry or adaptive extension is added. Failed diagnostics block full profiles on
 that dispatch. The runner retains original/partial client stdout as
 `diagnostics/<arm>_5242880_client.raw.json` and exit status before writing any
@@ -374,6 +430,38 @@ usage, image identity, gateway/backend logs, and the diagnostic report are all
 retained in `h1-profile-evidence/diagnostic/`. Upload remains unconditional,
 14 days, in `h1-internal-profile-<sha>-<payloads>`. The three-arm report includes
 missing/failed arms and always sets `comparison_eligible=false`.
+
+Admission requires the schema-2 manifest and each sample's exact 30-second,
+5 MiB, 50-worker, host, pair, arm and order identity. Legacy/aggregate samples
+and copied arms fail. Both gateway arms must carry the same immutable
+**observer-OFF** image and revision, equal retained config/environment hashes
+apart from the declared cutoff, distinct owned container/process lifetimes and
+complete process capture. Client diagnostic PID, self-measured resource PID and
+passive-reader lifetime must agree. The versioned Rust diagnostic schema is
+checked field by field, including all five loss counters, unique worker/request/
+connection IDs, typed request state/timestamps, final worker lifecycles,
+connection ownership, ordered snapshots ending in `driver_retirement_finished`,
+and complete driver retirement accounting. No missing field is supplied a
+successful default. These joins validate retained evidence, not cryptographic
+provenance. All three rows and available partial evidence survive rejection.
+
+The review repairs add producer-to-consumer hosted regressions: real Rust plain
+and TLS H1 reports cross the Python typed validator (clean and failed responses),
+the actual runtime capture and sample-stamping paths feed diagnostic reports,
+and the real supervisor terminates TERM-resistant child sessions with nested
+process groups under short test deadlines. Docker/expensive campaign dispatches
+are substituted in those supervisor tests; they do not validate live Docker
+cleanup or the 5 MiB workload. The existing discovery gates select these tests
+without workflow dispatch or command-policy changes. All new Python process
+calls use literal executable/script argument lists; variable paths, deadlines
+and owned identities are data in the environment. The immutable-base CI policy
+checker remains the hosted authority and was not executed or weakened locally.
+
+Manual run **35419342312** is pinned to old head
+`ac7ff645f766597b9e4f38aa9e18272c0b3c249d`. It remains raw prior-revision evidence
+and does not validate these repairs. New hosted formatting, lint, compilation,
+regressions and any root-owned manual slice must use the repair revision. No
+passing result, 5 MiB stall repair, performance gain or issue closure is asserted.
 
 Hosted registration: `metrics_tests::h1_diagnostic_tests` exercises actual plain
 and rustls H1 worker paths, opt-in/off useful-work parity, clean responses,
