@@ -1,5 +1,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::future::{Future, poll_fn};
+use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +27,129 @@ fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 
 fn event_count(event: Event) -> u64 {
     profile::current_thread_counters()[event as usize]
+}
+
+#[test]
+fn pool_profile_nested_future_storage_has_only_fixed_overhead() {
+    std::thread::spawn(|| {
+        let before = profile::current_thread_counters();
+        // Model the inline state of a connection future. Small ready/pending
+        // futures cannot expose duplication of F in an async observer wrapper.
+        let future = std::future::ready(Ok::<_, ()>([0u8; 16 * 1024]));
+        let inner_bytes = std::mem::size_of_val(&future);
+        let creation = profile::phase_future(Phase::CreationPoll, future);
+        let creation_bytes = std::mem::size_of_val(&creation);
+        assert!(
+            creation_bytes <= inner_bytes + 64,
+            "creation observer duplicated inner state: {inner_bytes} -> {creation_bytes}"
+        );
+        let fallback = profile::phase_future(Phase::FallbackPoll, creation);
+        let fallback_bytes = std::mem::size_of_val(&fallback);
+        assert!(
+            fallback_bytes <= creation_bytes + 64,
+            "fallback observer duplicated inner state: {creation_bytes} -> {fallback_bytes}"
+        );
+        let acquisition = profile::acquisition(Family::H2, Purpose::Request, fallback);
+        let acquisition_bytes = std::mem::size_of_val(&acquisition);
+        assert!(
+            acquisition_bytes <= fallback_bytes + 128,
+            "acquisition observer duplicated inner state: {fallback_bytes} -> {acquisition_bytes}"
+        );
+        // Construction and unpolled cancellation remain inert, including the
+        // first-poll sampling sequence. No allocation is needed by the wrappers.
+        assert_eq!(profile::current_thread_counters(), before);
+        drop(acquisition);
+        assert_eq!(profile::current_thread_counters(), before);
+    })
+    .join()
+    .unwrap();
+}
+
+struct PinnedPendingThenError {
+    address: Cell<Option<usize>>,
+    polls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+    _pinned: PhantomPinned,
+}
+
+impl Future for PinnedPendingThenError {
+    type Output = Result<(), u8>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_ref().get_ref();
+        let address = std::ptr::from_ref(this) as usize;
+        if let Some(previous) = this.address.replace(Some(address)) {
+            assert_eq!(address, previous, "observer moved a pinned inner future");
+        }
+        if this.polls.fetch_add(1, Ordering::Relaxed) == 0 {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(17))
+        }
+    }
+}
+
+impl Drop for PinnedPendingThenError {
+    fn drop(&mut self) {
+        if let Some(address) = self.address.get() {
+            assert_eq!(std::ptr::from_ref(self) as usize, address);
+        }
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn pool_profile_projected_futures_preserve_pinning_and_terminal_drop() {
+    for complete in [false, true] {
+        std::thread::spawn(move || {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let inner = PinnedPendingThenError {
+                address: Cell::new(None),
+                polls: polls.clone(),
+                drops: drops.clone(),
+                _pinned: PhantomPinned,
+            };
+            let mut future = Box::pin(profile::acquisition(
+                Family::H2,
+                Purpose::Request,
+                profile::phase_future(
+                    Phase::FallbackPoll,
+                    profile::phase_future(Phase::CreationPoll, inner),
+                ),
+            ));
+            assert!(poll(future.as_mut()).is_pending());
+            assert_eq!(polls.load(Ordering::Relaxed), 1);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            let before = profile::current_thread_counters();
+            profile::event(Event::WarmHit);
+            assert_eq!(profile::current_thread_counters(), before);
+            if complete {
+                assert_eq!(poll(future.as_mut()), Poll::Ready(Err(17)));
+                assert_eq!(polls.load(Ordering::Relaxed), 2);
+                // The wrapper is still alive: Ready must already have dropped
+                // its inner future and recorded completion, including errors.
+                assert_eq!(drops.load(Ordering::Relaxed), 1);
+                assert_eq!(event_count(Event::Completed), 1);
+                assert_eq!(event_count(Event::Errors), 1);
+                assert_eq!(event_count(Event::Cancelled), 0);
+                let before = profile::current_thread_counters();
+                profile::event(Event::WarmHit);
+                assert_eq!(profile::current_thread_counters(), before);
+                drop(future);
+                assert_eq!(profile::current_thread_counters(), before);
+            } else {
+                drop(future);
+                assert_eq!(event_count(Event::Cancelled), 1);
+                assert_eq!(event_count(Event::Completed), 0);
+                assert_eq!(polls.load(Ordering::Relaxed), 1);
+            }
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        })
+        .join()
+        .unwrap();
+    }
 }
 
 #[test]

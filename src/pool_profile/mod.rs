@@ -5,11 +5,14 @@ mod store;
 
 use std::cell::Cell;
 use std::fmt::Write;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::pin;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 use std::time::Instant;
+
+use pin_project_lite::pin_project;
 
 pub use schema::{Event, Family, Phase, Purpose};
 pub use store::{current_thread_counters, publish_current_thread, snapshot};
@@ -119,9 +122,41 @@ pub fn readiness<T, E>(operation: impl FnOnce() -> Option<Result<T, E>>) -> Opti
 }
 
 /// Wrap an existing future without adding a readiness poll, wait or wakeup.
-pub async fn phase_future<F: Future>(phase: Phase, future: F) -> F::Output {
-    let mut future = pin!(future);
-    poll_fn(|cx| measure(phase, || future.as_mut().poll(cx))).await
+pub fn phase_future<F: Future>(phase: Phase, future: F) -> impl Future<Output = F::Output> {
+    PhaseFuture {
+        future: Some(future),
+        phase,
+    }
+}
+
+pin_project! {
+    // An async fn taking F and then pin!(F) retains both the argument and the
+    // pinned local in its state. Nested creation/fallback/acquisition wrappers
+    // multiply large connection futures in unoptimized builds. Project one F
+    // in place instead: each observer adds only fixed-size metadata, no heap.
+    struct PhaseFuture<F> {
+        #[pin]
+        future: Option<F>,
+        phase: Phase,
+    }
+}
+
+impl<F: Future> Future for PhaseFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let Some(future) = this.future.as_mut().as_pin_mut() else {
+            return Poll::Pending;
+        };
+        let result = measure(*this.phase, || future.poll(cx));
+        if result.is_ready() {
+            // Match async completion: drop the inner future now, even if the
+            // caller keeps this completed wrapper alive. Pin::set drops in place.
+            this.future.set(None);
+        }
+        result
+    }
 }
 
 struct Acquisition {
@@ -129,6 +164,28 @@ struct Acquisition {
     start: Option<Instant>,
     complete: bool,
     probes: u64,
+}
+
+impl Acquisition {
+    fn new(group: usize) -> Self {
+        let mut sampled = false;
+        store::with_local(|local| {
+            let sequence = local.selections[group];
+            sampled = sequence.is_multiple_of(schema::SAMPLE_EVERY);
+            local.selections[group] = sequence.wrapping_add(1);
+            local.add(group * schema::STRIDE + Event::Acquisitions as usize, 1);
+        });
+        let acquisition = Self {
+            group,
+            start: sampled.then(Instant::now),
+            complete: false,
+            probes: 0,
+        };
+        if sampled {
+            add(group, Event::Sampled as usize, 1);
+        }
+        acquisition
+    }
 }
 
 impl Drop for Acquisition {
@@ -151,52 +208,72 @@ impl Drop for Acquisition {
     }
 }
 
-pub async fn acquisition<T, E>(
+pub fn acquisition<T, E>(
     family: Family,
     purpose: Purpose,
     future: impl Future<Output = Result<T, E>>,
-) -> Result<T, E> {
-    let group = family as usize * 2 + purpose as usize;
-    let mut sampled = false;
-    store::with_local(|local| {
-        let sequence = local.selections[group];
-        sampled = sequence.is_multiple_of(schema::SAMPLE_EVERY);
-        local.selections[group] = sequence.wrapping_add(1);
-        local.add(group * schema::STRIDE + Event::Acquisitions as usize, 1);
-    });
-    let mut acquisition = Acquisition {
-        group,
-        start: sampled.then(Instant::now),
-        complete: false,
-        probes: 0,
-    };
-    if sampled {
-        add(group, Event::Sampled as usize, 1);
+) -> impl Future<Output = Result<T, E>> {
+    AcquisitionFuture {
+        future: Some(future),
+        group: family as usize * 2 + purpose as usize,
+        acquisition: None,
     }
-    let mut future = pin!(future);
-    let result = poll_fn(|cx| {
-        let _scope = PollScope::enter(sampled.then_some(group));
-        if sampled {
-            measure(Phase::EmptyBracket, || ());
+}
+
+pin_project! {
+    struct AcquisitionFuture<F> {
+        // Field order also preserves cancellation: drop the inner future
+        // before recording the acquisition's wall time and cancellation.
+        #[pin]
+        future: Option<F>,
+        group: usize,
+        acquisition: Option<Acquisition>,
+    }
+}
+
+impl<T, E, F: Future<Output = Result<T, E>>> Future for AcquisitionFuture<F> {
+    type Output = Result<T, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let Some(future) = this.future.as_mut().as_pin_mut() else {
+            return Poll::Pending;
+        };
+        // Selection belongs to the first poll's thread, not construction.
+        // Dropping an unpolled acquisition must not consume a sample or count.
+        let acquisition = this
+            .acquisition
+            .get_or_insert_with(|| Acquisition::new(*this.group));
+        let sampled = acquisition.start.is_some();
+        let result = {
+            let _scope = PollScope::enter(sampled.then_some(*this.group));
+            if sampled {
+                measure(Phase::EmptyBracket, || ());
+            }
+            let result = measure(Phase::Poll, || future.poll(cx));
+            event(if result.is_ready() {
+                Event::PollReady
+            } else {
+                Event::PollPending
+            });
+            acquisition.probes = acquisition.probes.saturating_add(PROBES.with(Cell::get));
+            result
+        };
+        if let Poll::Ready(result) = &result {
+            acquisition.complete = true;
+            if sampled {
+                add(*this.group, Event::Completed as usize, 1);
+                if result.is_err() {
+                    add(*this.group, Event::Errors as usize, 1);
+                }
+            }
+            // PollScope has already restored the caller's TLS context. Keep
+            // inner destruction and terminal accounting outside that scope.
+            this.future.set(None);
+            drop(this.acquisition.take());
         }
-        let result = measure(Phase::Poll, || future.as_mut().poll(cx));
-        event(if result.is_ready() {
-            Event::PollReady
-        } else {
-            Event::PollPending
-        });
-        acquisition.probes = acquisition.probes.saturating_add(PROBES.with(Cell::get));
         result
-    })
-    .await;
-    acquisition.complete = true;
-    if sampled {
-        add(group, Event::Completed as usize, 1);
-        if result.is_err() {
-            add(group, Event::Errors as usize, 1);
-        }
     }
-    result
 }
 
 /// Fixed integer-only fields appended to the existing authenticated /metrics.
