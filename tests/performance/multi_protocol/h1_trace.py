@@ -8,6 +8,7 @@ import ctypes
 import hashlib
 import functools
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -95,6 +96,189 @@ def identity(pid):
 
 def same_generation(before, after):
     return all(before.get(k) == after.get(k) for k in ('pid', 'start_ticks', 'cgroup_id', 'executable_sha256', 'boot_id', 'namespaces'))
+
+
+def target_alive(owner):
+    try:
+        raw = Path(f'/proc/{owner["pid"]}/stat').read_text()
+    except FileNotFoundError:
+        return False
+    if parse_stat(raw, TICKS, PAGE)['start_ticks'] != owner['start_ticks']:
+        raise RuntimeError('gateway PID generation changed')
+    return raw[raw.rfind(')') + 2:].split()[0] not in ('Z', 'X', 'x')
+
+
+def completion_evidence(binding):
+    """Read retained client output, never infer drain from elapsed wall time.
+
+    H1 prints this report only after Phases::finish joins all request workers.
+    Aborted/timed-out drains cannot authorize teardown, even with exit code 0.
+    Useful-work validity remains the independent benchmark validity contract.
+    """
+    paths = {key: Path(binding[key]) for key in ('sample', 'raw_sample', 'client_exit')}
+    data = {key: path.read_bytes() for key, path in paths.items()}
+    if data['client_exit'].strip() != b'0':
+        raise ValueError('client exit failed/missing before teardown')
+    sample, raw = (json.loads(data[key]) for key in ('sample', 'raw_sample'))
+    phases = raw['phases']
+    if (not isinstance(phases, dict) or sample['phases'] != phases or
+            phases.get('timed_out') is not False or phases.get('stalled_workers') != [] or
+            phases.get('transport_close_timed_out') is not False):
+        raise ValueError('client request drain incomplete')
+    for key in ('measurement_secs', 'measurement_elapsed_secs', 'drain_secs', 'drain_start_monotonic_secs'):
+        value = phases.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError('missing/invalid client drain phase: ' + key)
+    if not 0 < phases['measurement_secs'] <= phases['measurement_elapsed_secs']:
+        raise ValueError('client measurement incomplete before drain')
+    if (sample.get('gateway') != binding['arm'] or sample.get('pair') != binding['pair'] or
+            sample.get('payload_size') != binding['payload']):
+        raise ValueError('client completion binding mismatch')
+    return dict(files={key: dict(path=str(paths[key]), sha256=hashlib.sha256(value).hexdigest())
+                       for key, value in data.items()}, phases=phases)
+
+
+class CaptureLifecycle:
+    """Runner requests closure; only this live supervisor authorizes teardown."""
+    def __init__(self, out, owner, binding, ready, collectors):
+        self.out, self.owner, self.binding, self.ready = out, owner, binding, ready
+        self.collectors = {name: c for name, c in collectors.items()
+                           if c and c.ready.get('status') == 'supported'}
+        self.teardown = None
+        self.observations = {}
+        self.target_gone = None
+
+    def poll(self):
+        before = clock()
+        alive = target_alive(self.owner)
+        if not alive:
+            if self.teardown is None:
+                raise RuntimeError('gateway exited before verified workload closure')
+            if self.target_gone is None:
+                self.target_gone = dict(observed_at=clock(), exact_exit_ns=None)
+        for name, collector in self.collectors.items():
+            row = self.observations.setdefault(name, {})
+            status = collector.process.poll()
+            after = clock()
+            if status is None:
+                row['last_alive'] = before
+            else:
+                row.setdefault('exit', dict(returncode=status, observed_at=after,
+                    bounds_ns=[row.get('last_alive', before)['before_ns'], after['after_ns']],
+                    exact_exit_ns=None))
+                # The target can die between the initial /proc read and poll.
+                if name == 'cpu' and status == 0 and self.teardown is not None and alive:
+                    alive = target_alive(self.owner)
+                    if not alive and self.target_gone is None:
+                        self.target_gone = dict(observed_at=clock(), exact_exit_ns=None)
+                if name != 'cpu' or status != 0 or self.teardown is None or alive:
+                    raise RuntimeError('collector exited before workload closure or outside verified target teardown')
+                row['exit']['expected_target_teardown'] = True
+        return alive
+
+    def authorize_teardown(self):
+        if self.teardown is not None or not (self.out / 'teardown-request.json').exists():
+            return
+        request = json.loads((self.out / 'teardown-request.json').read_text())
+        now = clock()
+        at = request['at']
+        if (request.get('session') != self.ready['session'] or
+                request.get('binding_sha256') != self.ready['binding_sha256'] or
+                request.get('owner') != self.owner or
+                digest(self.out / 'bind.json') != self.ready['binding_sha256'] or
+                not all(type(at.get(k)) is int for k in ('before_ns', 'after_ns', 'unix_ns')) or
+                not self.ready['at']['after_ns'] <= at['before_ns'] <= at['after_ns'] <= now['before_ns']):
+            raise ValueError('stale/mismatched teardown request')
+        evidence = completion_evidence(self.binding)
+        if request.get('evidence') != evidence:
+            raise ValueError('client completion changed after retention')
+        window = measurement_window(evidence['phases'], [dict(clock=self.ready['at']), dict(clock=at)])
+        if not window.get('valid'):
+            raise ValueError('completion does not bracket this capture measurement')
+        self.acknowledge_teardown(request, dict(kind='retained_client_report', measurement=window))
+
+    def acknowledge_teardown(self, request, completion):
+        """Live transition shared with the hosted fixture's joined-work receipt."""
+        if self.teardown is not None:
+            raise RuntimeError('duplicate teardown transition')
+        current = identity(self.owner['pid'])
+        if not same_generation(self.owner, current):
+            raise RuntimeError('gateway generation changed before teardown')
+        # Poll AFTER reads: a queued marker must never forgive an already-dead
+        # collector/target. No teardown state is installed until both are live.
+        self.poll()
+        self.teardown = dict(session=self.ready['session'], binding_sha256=self.ready['binding_sha256'],
+            owner=current, request=request, at=clock(), phase='verified_teardown', completion=completion,
+            collector_observations=json.loads(json.dumps(self.observations)))
+        write(self.out / 'teardown-ready.json', self.teardown)
+
+    def coverage_end(self, fallback):
+        # Conservative lower bound on collector end, never supervisor/decode end.
+        return min([fallback] + [r['last_alive']['before_ns'] for r in self.observations.values()
+                                  if 'last_alive' in r])
+
+    def usage(self):
+        values = []
+        for name, collector in self.collectors.items():
+            if collector.process.poll() is not None:
+                continue
+            value = capture(collector.process.pid, TICKS, PAGE)
+            if value is None:
+                # perf can exit between poll and /proc read during removal.
+                # Recheck the strict lifecycle; never forgive a live read failure.
+                self.poll()
+                if name != 'cpu' or collector.process.poll() is None:
+                    raise RuntimeError('observer resource capture missing')
+                self.observations[name]['resource_read_exit_race'] = dict(at=clock(), usage_unknown=True)
+            else:
+                values.append(value)
+        return values
+
+    def verify_stop(self):
+        if self.teardown is None:
+            raise RuntimeError('stop without verified client completion and request drain')
+        if self.target_gone is None:
+            raise RuntimeError('stop before owned gateway removal')
+        if (digest(self.out / 'bind.json') != self.ready['binding_sha256'] or
+                completion_evidence(self.binding) != self.teardown['request']['evidence']):
+            raise ValueError('client completion/binding changed during teardown')
+
+    def reaped(self, name, status):
+        row = self.observations.setdefault(name, {})
+        at = clock()
+        row['reaped_at'] = at
+        row.setdefault('exit', dict(returncode=status['returncode'], observed_at=at,
+            bounds_ns=[row.get('last_alive', self.ready['at'])['before_ns'], at['after_ns']],
+            exact_exit_ns=None, supervisor_stop=True))
+
+    def report(self):
+        return dict(teardown=self.teardown, collectors=self.observations, target_gone=self.target_gone,
+                    exact_collector_end=False, gateway_removal_fully_observed=False,
+                    limits='poll bounds, not exact exit clocks; no samples promised after target exit')
+
+
+def request_teardown(out):
+    """Unprivileged runner call only after client return, retention and stamping."""
+    out = Path(out)
+    ready = json.loads((out / 'ready.json').read_text())
+    binding = json.loads((out / 'bind.json').read_text())
+    request = dict(session=ready['session'], binding_sha256=digest(out / 'bind.json'),
+                   owner=ready['owner'], evidence=completion_evidence(binding), at=clock())
+    if (out / 'teardown-request.json').exists() or (out / 'teardown-ready.json').exists():
+        raise ValueError('teardown handshake already exists')
+    write(out / 'teardown-request.json', request)
+    # Existing readiness wait budget, also capped by the original capture deadline.
+    deadline = min(time.monotonic() + 30, ready['deadline_monotonic'])
+    while time.monotonic() < deadline:
+        if (out / 'stopped.json').exists():
+            raise RuntimeError('supervisor stopped before teardown acknowledgement')
+        if (out / 'teardown-ready.json').exists():
+            ack = json.loads((out / 'teardown-ready.json').read_text())
+            if ack.get('session') != ready['session'] or ack.get('request') != request:
+                raise ValueError('stale teardown acknowledgement')
+            return
+        time.sleep(0.05)
+    raise RuntimeError('teardown acknowledgement deadline')
 
 
 def admit(row):
@@ -555,7 +739,7 @@ def boundary_report(sample, timeline, start, end):
     if window.get('valid') and (start > window['start_bounds_ns'][0] or end < window['end_bounds_ns'][1]):
         window = dict(valid=False, reason='capture does not cover full measurement')
     return dict(measurement=window, capture_start_ns=start, capture_end_ns=end,
-                setup_warmup_drain='capture brackets whole client invocation and gateway removal',
+                setup_warmup_drain='client completion verified before teardown; collector end conservatively bounded',
                 exact_warmup_drain_boundaries=False,
                 boundary_gap='existing phase report lacks absolute warmup/drain clocks; measurement is host-bracketed',
                 cumulative_deltas='snapshot read intervals, not instantaneous phase counts')
@@ -569,12 +753,15 @@ def supervise(args):
                   parents=PARENTS, bounds=BOUNDS, complete=False, issues=[], timeline=[],
                   supervisor_started=clock(), supervisor_cpu_start=time.process_time(),
                   phase='waiting_for_owned_gateway', fully_profiled=False)
-    observer = cpu = owner = None
+    observer = cpu = owner = lifecycle = None
     ended = result['supervisor_started']['after_ns']
     stop_requested = False
     parent = identity(args.parent)
     deadline = time.monotonic() + BOUNDS['seconds']
     try:
+        if any((out / name).exists() for name in ('bind.json', 'ready.json', 'stop', 'stopped.json',
+                'teardown-request.json', 'teardown-ready.json', 'trace-manifest.json')):
+            raise RuntimeError('stale capture directory; lifecycle evidence must be fresh')
         if campaign_trace_bytes(Path(args.artifact_root)) >= BOUNDS['total_artifact_bytes'] - 32 * 1024**2:
             raise RuntimeError('job trace artifact reservation already exhausted')
         capabilities(out)
@@ -622,23 +809,28 @@ def supervise(args):
         if mode == 'none':
             result['ready'] = dict(status='off', at=clock())
         started = time.monotonic_ns()
-        write(out / 'ready.json', dict(status=result['ready']['status'], at=clock(), owner=owner,
-                                      cookie_priming_errors=result['initial_sockets']['errors']))
+        ready = dict(status=result['ready']['status'], at=clock(), owner=owner,
+                     session=os.urandom(16).hex(), binding_sha256=digest(out / 'bind.json'),
+                     deadline_monotonic=deadline, cookie_priming_errors=result['initial_sockets']['errors'])
+        lifecycle = CaptureLifecycle(out, owner, binding, ready, dict(cpu=cpu, observer=observer))
+        lifecycle.poll()
+        write(out / 'ready.json', ready)
         next_snapshot = 0
         while time.monotonic() < deadline:
             if observer:
                 observer.poll()
+            lifecycle.poll()
+            lifecycle.authorize_teardown()
             if (out / 'stop').exists():
-                stop_requested = True; break
+                stop_requested = True
+                lifecycle.verify_stop()
+                break
             if campaign_trace_bytes(Path(args.artifact_root)) >= BOUNDS['total_artifact_bytes'] - 32 * 1024**2:
                 raise RuntimeError('trace artifact reservation exhausted')
             raw = out / 'perf.data'
             if raw.exists() and raw.stat().st_size >= BOUNDS['raw_perf_bytes']:
                 raise RuntimeError('raw perf artifact cap reached')
-            children = [p for p in (observer, cpu) if p and p.process.poll() is None]
-            usage = [capture(p.process.pid, TICKS, PAGE) for p in children]
-            if any(value is None for value in usage):
-                raise RuntimeError('observer resource capture missing')
+            usage = lifecycle.usage()
             rss = sum(p['rss_bytes'] for p in usage if p)
             result['observer_peak_rss_bytes'] = max(result.get('observer_peak_rss_bytes', 0), rss)
             if rss + (BOUNDS['map_reservation_bytes'] if observer else 0) > BOUNDS['observer_rss_and_map_bytes']:
@@ -655,14 +847,13 @@ def supervise(args):
                     sample['identity'] = current
                     sample['tcp'] = tcp_inventory(owner['pid'])
                 except FileNotFoundError:
-                    # The harness removes the gateway before requesting stop.
+                    if lifecycle.teardown is None:
+                        raise RuntimeError('gateway vanished before verified teardown')
                     sample['gateway_gone'] = True
                 result['timeline'].append(sample)
             if (not Path(f'/proc/{args.parent}').exists() or
                 parse_stat(Path(f'/proc/{args.parent}/stat').read_text(), TICKS, PAGE)['start_ticks'] != parent['start_ticks']):
                 raise RuntimeError('owned harness vanished/reused')
-            if any(p.process.poll() is not None for p in (observer, cpu) if p and (p.ready or {}).get('status') == 'supported'):
-                raise RuntimeError('collector exited before workload closure')
             time.sleep(0.05)
         if not stop_requested:
             raise RuntimeError('capture deadline: measurement/warmup/drain may be incomplete')
@@ -673,30 +864,45 @@ def supervise(args):
             sample = json.loads(Path(binding['sample']).read_text())
         except (OSError, ValueError):
             result['issues'].append('missing/failed raw traffic sample')
-        result['boundaries'] = boundary_report(sample, result['timeline'], started, ended)
+        result['boundaries'] = boundary_report(sample, result['timeline'], started, lifecycle.coverage_end(ended))
+        if not result['boundaries']['measurement'].get('valid'):
+            result['issues'].append('capture measurement clock/coverage incomplete')
         result['useful_work'] = dict(sample=str(binding['sample']), validity='independent existing benchmark_validity contract')
-    except (OSError, ValueError, KeyError, RuntimeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as error:
         result['issues'].append(type(error).__name__ + ': ' + str(error))
     finally:
         if observer:
             result['observer_exit'] = observer.finish()
+            if lifecycle:
+                lifecycle.reaped('observer', result['observer_exit'])
             result['syscalls'] = syscall_coverage(observer.rows, owner or {}, result.get('boundaries', {}))
             if result['observer_exit']['forced'] or result['observer_exit']['returncode'] or result['observer_exit']['partial_record']:
                 result['issues'].append('observer exit incomplete')
+            if not result['syscalls'].get('complete'):
+                result['issues'].append('syscall coverage incomplete')
             write(out / 'syscalls.json', result['syscalls'])
             write(out / 'fd-lifetimes.json', fd_lifetimes(observer.rows))
         if cpu:
             result['perf_exit'] = cpu.finish()
+            if lifecycle:
+                lifecycle.reaped('cpu', result['perf_exit'])
             if (out / 'perf.data').exists():
                 try:
                     decoded_cpu = cpu_decode(out, [owner['pid']] if owner else [], dsos, symfs=symbol_package)
                     from h1_trace_contract import cpu_phases
                     result['cpu'] = {k: v for k, v in decoded_cpu.items() if k not in ('callchains', 'folded')}
                     result['cpu']['phases'] = cpu_phases(decoded_cpu['callchains'], result.get('boundaries', {}).get('measurement', {}))
+                    result['issues'].extend('CPU capture: ' + issue for issue in decoded_cpu['issues'] if issue not in (
+                        'missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples'))
                 except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
                     result['issues'].append('CPU decoder failed: ' + str(error))
             if result['perf_exit']['forced'] or result['perf_exit']['returncode']:
                 result['issues'].append('perf exit incomplete')
+            if not (out / 'perf.data').exists():
+                result['issues'].append('missing perf data')
+        if lifecycle:
+            result['lifecycle'] = lifecycle.report()
+            result['lifecycle']['collectors_reaped_at'] = clock()
         result.update(stop_requested=stop_requested, ended=clock(), artifact_bytes=trace_bytes(out),
                       supervisor_cpu_seconds=time.process_time() - result['supervisor_cpu_start'])
         if result.get('ready', {}).get('status') not in ('supported', 'off'):
@@ -763,10 +969,15 @@ def main():
     s.add_argument('--mode', choices=('syscalls', 'cpu'), required=True)
     s.add_argument('--enabled', action='store_true'); s.add_argument('--parent', type=int, required=True)
     s = sub.add_parser('preflight'); s.add_argument('--output', required=True)
+    s = sub.add_parser('request-teardown'); s.add_argument('--output', required=True)
     args = parser.parse_args()
     if (os.environ.get('GITHUB_ACTIONS'), os.environ.get('RUNNER_ENVIRONMENT'), platform.system(), platform.machine()) != (
-            'true', 'github-hosted', 'Linux', 'x86_64') or os.geteuid() != 0:
+            'true', 'github-hosted', 'Linux', 'x86_64'):
         raise SystemExit('hosted native amd64 passive supervisor only')
+    if args.action == 'request-teardown':
+        request_teardown(args.output); return 0
+    if os.geteuid() != 0:
+        raise SystemExit('hosted passive supervisor requires root')
     if args.action == 'stage':
         stage(args.build); return 0
     if not Path('/sys/kernel/tracing/events').exists():

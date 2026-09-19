@@ -514,9 +514,16 @@ package ceiling; repeat artifacts reference that package.
 
 The optimized CPU fixture contains noinline nested functions, sibling threads,
 a post-attach child and a separate busy control. The gate requires actual samples,
-thread/child coverage and reconstructed nested names in callchains; symbol names
-or a PMU count alone cannot pass. Corrupt perf data and an actual 64 KiB negative
-capture cap test decoder/capture failure. Kernel/permission/tool failures retain
+thread/child coverage and **one admitted leaf-to-caller callchain containing
+`fixture_leaf`, then `fixture_middle`, then `fixture_outer`**. The preflight and
+consumer regressions call the same nested-proof helper. Three unrelated flat
+samples or a reversed chain fail; compiler clone/offset suffixes and intervening
+inline/unknown frames are allowed. Whole matching chains, PID/TID, sample times
+and matched frame indices remain in `nested_proof.witnesses`; unknown frames and
+unresolved sample counts are not erased by a successful nested witness. Symbol
+names pooled across samples or a PMU count alone cannot pass. Corrupt perf data
+and an actual 64 KiB negative capture cap test decoder/capture failure.
+Kernel/permission/tool failures retain
 explicit unsupported status. Optimized-away/tail/inlined/async frames, incomplete
 CFI, unresolved symbols and an 8192-byte stack truncation fraction that cannot be
 proved stay unknown. Useful multi-frame hotspots do not establish complete stacks,
@@ -539,11 +546,64 @@ stop/reap owned children and mark capture incomplete. Parent-death signals close
 observer/perf children; bounded decoder teardown does not extend measured work.
 No gateway runs privileged and no host perf/security sysctl is changed.
 
+### Workload completion and collector teardown
+
+The runner retains raw client stdout/exit and stamps the sample before requesting
+teardown, after the synchronous client has returned. H1 emits its phase report
+only after `Phases::finish` has joined all request workers. The supervisor rejects
+nonzero exit, absent/malformed/changed results, incomplete or timed-out drain,
+stalled workers, stale capture/session/binding/target evidence, and a measurement
+that is not inside this capture's host clock bracket. Error-free useful work is
+still assessed independently; a teardown receipt cannot turn failed requests
+into useful throughput. Request drain is not a claim that every idle gateway
+socket or transport has closed.
+
+The supervisor rechecks the live target generation and live collectors **before**
+publishing `teardown-ready.json`. The receipt retains the request, result hashes,
+binding hash, identity, host clocks and collector observations. The runner waits
+for that receipt before its existing owned `docker rm -f`, then signals `stop`.
+The acknowledgement wait uses the existing 30-second readiness budget capped by
+the original 300-second capture deadline. Failed startup/abort cleanup has no
+verified transition and remains incomplete. Client work, request timeouts, drain,
+retries, sample cadence and measured RPS are unchanged; this wait is postwork.
+
+This ordering addresses perf's normal target-exit behavior. Linux
+[`is_event_hup`/`perf_poll`](https://github.com/torvalds/linux/blob/v6.8/kernel/events/core.c#L5297)
+reports hangup after an event has exited and its inherited child events are gone.
+The [`perf record` drain loop](https://github.com/torvalds/linux/blob/v6.8/tools/perf/builtin-record.c#L2535)
+drains and ends after its event descriptors disappear. The previous runner
+removed the gateway before touching `stop`, while the 50 ms supervisor loop
+rejected any intervening collector exit. Thus a normal target teardown could be
+misclassified as premature loss. These upstream sources explain the race; actual
+hosted kernel/tool versions and fixture results remain authoritative.
+
+Capture stays enabled through removal where possible. Only perf's zero exit
+after an acknowledged transition and observed target exit is permitted; exit
+while the target is still live, pre-acknowledgement loss, early target death,
+nonzero/forced exit, syscall observer exit, missing/partial decoder output,
+loss/attribute failures and failed evidence reads remain incomplete. A stop
+marker alone cannot authorize closure. Final client evidence is checked again.
+Collector last-live/first-exited host clock bounds and reap clocks are retained
+separately from supervisor/decoder end. Coverage uses the conservative last-live
+bound. Exact exit time and full gateway-removal coverage are **not** certified;
+post-target-exit samples are not promised, and unwind gaps remain separate.
+
+The hosted CPU fixture now joins its worker threads/child, emits and retains a
+`workload_done` receipt, and waits for the same live transition helper before
+exiting. The supervisor observes real perf autoexit without first signaling it,
+under a bounded fixture deadline. This proves only synthetic fixture behavior,
+not gateway drain or RPS. Mocked consumer regressions exercise the real runner
+request and supervisor acknowledgement, stale/missing/partial evidence, bad event
+ordering, and the target-exit/resource-read race. These new checks have not been
+executed locally; hosted results must be inspected before calling the repair
+verified.
+
 The merged H3 host CLOCK_MONOTONIC measurement bracket and time-namespace checks
 are reused. `process_usage.py` also retains paired realtime/monotonic brackets.
 No client process-local Instant epoch is compared with kernel ktime. Capture
-starts before client invocation and stops after gateway removal; measurement
-coverage requires actual bracketing samples. Exact absolute warmup/drain boundaries
+starts before client invocation and remains enabled during gateway removal;
+measurement coverage requires actual bracketing observations and the conservative
+collector end bound. Exact absolute warmup/drain boundaries
 are an explicit gap in the existing phase report; cumulative snapshots are not
 instantaneous phase counts. A capture cap can never imply full measurement.
 

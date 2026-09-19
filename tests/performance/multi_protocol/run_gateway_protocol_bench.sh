@@ -455,11 +455,12 @@ start_ferrum() {
     fi
     if [ "$H1_TRACE" != none ]; then
         python3 - "$h1_trace_output/bind.json" "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
-            "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" "$gw" "$PAIR" "$PAYLOAD_SIZES" <<'PYTRACE'
+            "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" "$gw" "$PAIR" "$PAYLOAD_SIZES" \
+            "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit" <<'PYTRACE'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 value = dict(runtime=sys.argv[2], config=sys.argv[3], sample=sys.argv[4], arm=sys.argv[5],
-             pair=int(sys.argv[6]), payload=int(sys.argv[7]))
+             pair=int(sys.argv[6]), payload=int(sys.argv[7]), raw_sample=sys.argv[8], client_exit=sys.argv[9])
 tmp = path.with_suffix('.tmp')
 tmp.write_text(json.dumps(value))
 tmp.replace(path)
@@ -862,6 +863,8 @@ h1_trace_stop() {
 }
 
 stop_gateway() {
+    # Successful run_bench already obtained the supervisor's teardown receipt.
+    # Startup/abort cleanup has no receipt and must remain an incomplete capture.
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
     h1_trace_stop
@@ -1062,6 +1065,14 @@ run_bench() {
         err_lines=$(wc -l < "$err_file")
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
         head -10 "$err_file" | sed 's/^/[bench]     /'
+    fi
+    if [ -n "$h1_trace_pid" ]; then
+        # The synchronous client has returned and its raw result/exit and stamped
+        # sample are retained. The supervisor validates full request drain and
+        # live target/collectors before acknowledging; capture stays enabled.
+        # A failed handshake never changes client work or certifies abort cleanup.
+        python3 "$SCRIPT_DIR/h1_trace.py" request-teardown --output "$h1_trace_output" \
+            || echo '[trace] teardown not verified; capture remains incomplete' >&2
     fi
 }
 

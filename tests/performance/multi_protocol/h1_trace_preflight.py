@@ -5,8 +5,8 @@ import subprocess
 import time
 
 from h1_trace import (Observer, CPU, launch, reap, identity, admit, same_generation,
-                      tcp_inventory, retain_dsos, cpu_decode, capabilities, write, clock)
-from h1_trace_contract import LOSSES, SYSCALLS, fd_lifetimes, syscall_coverage
+                      tcp_inventory, retain_dsos, cpu_decode, capabilities, write, clock, CaptureLifecycle)
+from h1_trace_contract import LOSSES, SYSCALLS, fd_lifetimes, syscall_coverage, nested_fixture_proof
 
 
 class Fixture:
@@ -153,10 +153,10 @@ def syscall_fixture(out, *, capacity='8192', generation_fault=False):
 
 
 def cpu_fixture(out):
-    fixture = unrelated = cpu = None
+    fixture = unrelated = cpu = lifecycle = None
     result = dict(fixture_only=True, status='error', errors=[])
     try:
-        fixture = Fixture(out, 'cpu')
+        fixture = Fixture(out, 'cpu-teardown')
         other = out / 'unrelated'; other.mkdir()
         unrelated = Fixture(other, 'cpu')
         dsos = retain_dsos(fixture.owner['pid'], out / 'symfs')
@@ -168,10 +168,14 @@ def cpu_fixture(out):
         result['owner'] = fixture.owner
         owners = {fixture.owner['pid']: fixture.owner}
         cpu_start = clock()
+        lifecycle = CaptureLifecycle(out, fixture.owner, {},
+            dict(session='hosted-cpu-fixture', binding_sha256=None, at=cpu_start), dict(cpu=cpu))
+        lifecycle.poll()
         fixture.release(); unrelated.release()
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline and fixture.process.poll() is None:
             fixture.poll()
+            lifecycle.poll()
             for row in fixture.rows:
                 if row['phase'] == 'child' and row['pid'] not in owners:
                     try:
@@ -181,17 +185,40 @@ def cpu_fixture(out):
                         owners[row['pid']] = child
                     except FileNotFoundError:
                         result['errors'].append('missed child generation')
+            if any(row['phase'] == 'workload_done' for row in fixture.rows):
+                receipt = next(row for row in fixture.rows if row['phase'] == 'workload_done')
+                lifecycle.acknowledge_teardown(dict(fixture_only=True, receipt=receipt, retained_at=clock()),
+                                               dict(kind='fixture_joined_threads_and_child', gateway_coverage=False))
+                result['teardown_release'] = clock()
+                fixture.release()
+                break
             time.sleep(0.02)
+        if lifecycle.teardown is None:
+            raise RuntimeError('fixture work did not finish before teardown deadline')
+        # Observe the real perf autoexit without SIGINT; this exercises the
+        # same consumer as gateway removal. No added delay guesses correctness.
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            lifecycle.poll()
+            if 'exit' in lifecycle.observations['cpu']:
+                break
+            time.sleep(0.02)
+        else:
+            result['errors'].append('perf did not autoexit after fixture teardown')
         result['fixture_exit'] = fixture.process.poll()
         result['capture_start'] = cpu_start
         result['perf_exit'] = cpu.finish()
+        lifecycle.reaped('cpu', result['perf_exit'])
+        result['lifecycle'] = lifecycle.report()
+        if result['perf_exit']['returncode'] or result['perf_exit']['forced']:
+            result['errors'].append('perf exit incomplete')
         result['owners'] = list(owners.values())
         result['cpu'] = cpu_decode(out, owners, dsos)
         result['partial_unwind_issues'] = result['cpu']['issues']
         result['errors'].extend(i for i in result['cpu']['issues'] if i not in (
             'missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples'))
-        names = {f['symbol'] for sample in result['cpu']['callchains'] for f in sample['frames']}
-        if not all(any(name.startswith(expected) for name in names) for expected in ('fixture_leaf', 'fixture_middle', 'fixture_outer')):
+        result['nested_proof'] = nested_fixture_proof(result['cpu']['callchains'])
+        if not result['nested_proof']['proven']:
             result['errors'].append('known nested fixture chain not reconstructed')
         child_pids = set(owners) - {fixture.owner['pid']}
         seen_pids = {s['pid'] for s in result['cpu']['callchains']}
@@ -220,6 +247,8 @@ def cpu_fixture(out):
     finally:
         if cpu:
             result['perf_cleanup'] = cpu.finish()
+        if lifecycle:
+            result['lifecycle'] = lifecycle.report()
         for process in (fixture, unrelated):
             if process:
                 result.setdefault('fixture_cleanup', []).append(process.finish())

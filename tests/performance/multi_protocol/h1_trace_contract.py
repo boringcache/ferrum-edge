@@ -245,6 +245,29 @@ def cpu_phases(chains, window):
                 uncertainty_ns=window.get('uncertainty_ns'))
 
 
+def nested_fixture_proof(chains):
+    """Require one admitted perf leaf-to-caller chain, not a union of symbols.
+
+    Decoder admission already excludes foreign PIDs. Compiler clones/offsets
+    and intervening inline/unknown frames do not change the required order.
+    Retain whole witnesses (including unknown frames) and PID/TID attribution.
+    """
+    expected = ('fixture_leaf', 'fixture_middle', 'fixture_outer')
+    witnesses = []
+    for sample in chains:
+        positions = []
+        for index, frame in enumerate(sample['frames']):
+            if (frame['dso'] != '[unknown]' and
+                    re.fullmatch(re.escape(expected[len(positions)]) +
+                                 r'(?:\.[A-Za-z0-9_.]+)?(?:\+0x[0-9a-fA-F]+)?', frame['symbol'])):
+                positions.append(index)
+                if len(positions) == len(expected):
+                    witnesses.append(dict(sample, matched_frame_indices=positions))
+                    break
+    return dict(proven=bool(witnesses), order='leaf_to_caller', expected=list(expected),
+                witnesses=witnesses, complete_unwinding=False)
+
+
 def load_trace(path):
     try:
         result = json.loads(Path(path).read_text())

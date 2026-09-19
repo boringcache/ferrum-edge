@@ -17,7 +17,7 @@ case "${H1_TRACE_ACTION:?}" in
     exec /tmp/ferrum-h1-trace/observer /tmp/ferrum-h1-trace/observer.bpf.o \
       h1 "$H1_TRACE_NETNS" "$H1_TRACE_CAPACITY" "$H1_TRACE_FAULT" ;;
   fixture)
-    case "${H1_TRACE_MODE:?}" in syscalls|cpu) ;; *) exit 2 ;; esac
+    case "${H1_TRACE_MODE:?}" in syscalls|cpu|cpu-teardown) ;; *) exit 2 ;; esac
     exec setpriv --reuid=65534 --regid=65534 --clear-groups --bounding-set=-all \
       --inh-caps=-all --ambient-caps=-all --no-new-privs \
       /tmp/ferrum-h1-trace/h1_trace_fixture "$H1_TRACE_MODE" ;;

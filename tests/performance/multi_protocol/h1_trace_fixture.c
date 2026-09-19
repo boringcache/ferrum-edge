@@ -137,7 +137,7 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("{\"phase\":\"ready\",\"pid\":%d,\"uid\":%d}\n", getpid(), getuid());
     byte(); // supervisor binds/attaches before any fixture work
-    if (!strcmp(argv[1], "cpu")) {
+    if (!strcmp(argv[1], "cpu") || !strcmp(argv[1], "cpu-teardown")) {
         pthread_t a, b;
         if (pthread_create(&a, NULL, cpu_thread, NULL) || pthread_create(&b, NULL, cpu_thread, NULL)) return 11;
         pid_t child = fork();
@@ -147,6 +147,12 @@ int main(int argc, char **argv)
         fixture_outer(); pthread_join(a, NULL); pthread_join(b, NULL);
         int status;
         if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 13;
+        if (!strcmp(argv[1], "cpu-teardown")) {
+            // All work/threads/child joined; remain alive until the supervisor
+            // acknowledges teardown. The fixture never fabricates client RPS.
+            puts("{\"phase\":\"workload_done\"}");
+            byte();
+        }
     } else if (!strcmp(argv[1], "syscalls")) {
         int accepted;
         int client = connected(8443, &accepted);
