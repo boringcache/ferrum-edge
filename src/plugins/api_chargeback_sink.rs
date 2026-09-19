@@ -5283,19 +5283,29 @@ fn config_decode_error(error: serde_path_to_error::Error<serde_json::Error>) -> 
         // error suffix: a document key can itself contain serde delimiters.
         // Keep these diagnostic-only sets in sync with all seven config structs.
         let fields = match field {
-            "config" => "mode clickhouse batch retry spool snapshot pricing_version currency \
+            "config" => {
+                "mode clickhouse batch retry spool snapshot pricing_version currency \
                 include_request_id include_trace_id pricing_tiers bandwidth_pricing \
-                stream_connection_pricing schema schema_ref",
-            "clickhouse" => "url database table username password_ref tls insert_query_params \
-                allow_lossy_async_insert timeout_ms",
-            "clickhouse.tls" => "ca_file client_cert_file client_key_file verify_hostname \
-                insecure_skip_verify",
+                stream_connection_pricing schema schema_ref"
+            }
+            "clickhouse" => {
+                "url database table username password_ref tls insert_query_params \
+                allow_lossy_async_insert timeout_ms"
+            }
+            "clickhouse.tls" => {
+                "ca_file client_cert_file client_key_file verify_hostname \
+                insecure_skip_verify"
+            }
             "batch" => "size flush_interval_ms buffer_capacity buffer_max_bytes",
             "retry" => "max_attempts initial_delay_ms max_delay_ms jitter",
-            "spool" => "enabled dir max_bytes replay_interval_secs delivery_queue_capacity \
-                compression",
-            "snapshot" => "interval_secs emit_zero_deltas cleanup_interval_secs \
-                stale_entry_ttl_secs max_entries max_retained_bytes",
+            "spool" => {
+                "enabled dir max_bytes replay_interval_secs delivery_queue_capacity \
+                compression"
+            }
+            "snapshot" => {
+                "interval_secs emit_zero_deltas cleanup_interval_secs \
+                stale_entry_ttl_secs max_entries max_retained_bytes"
+            }
             _ => "",
         };
         let choices = fields

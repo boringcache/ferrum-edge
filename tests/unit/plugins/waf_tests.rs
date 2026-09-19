@@ -2240,7 +2240,11 @@ fn rendered_stream_signature_failures_keep_each_source_ordinal() {
                 "`id` must be a string",
             ),
             ("id", Some(json!("")), "`id` must be non-empty"),
-            ("pattern", Some(json!([token])), "`pattern` must be a string"),
+            (
+                "pattern",
+                Some(json!([token])),
+                "`pattern` must be a string",
+            ),
             ("pattern", Some(json!("")), "`pattern` must be non-empty"),
             (
                 "severity",
@@ -2304,14 +2308,22 @@ fn rendered_custom_rule_parse_failures_keep_each_source_ordinal() {
             Some(json!(918273641)),
             "`category` must be a string",
         ),
-        ("severity", Some(json!([token])), "`severity` must be a string"),
+        (
+            "severity",
+            Some(json!([token])),
+            "`severity` must be a string",
+        ),
         ("action", Some(json!([token])), "`action` must be a string"),
         (
             "match_kind",
             Some(json!([token])),
             "`match_kind` must be a string",
         ),
-        ("pattern", Some(json!([token])), "`pattern` must be a string"),
+        (
+            "pattern",
+            Some(json!([token])),
+            "`pattern` must be a string",
+        ),
         (
             "target",
             Some(json!([token])),
@@ -2385,12 +2397,18 @@ fn rendered_custom_rule_compile_failures_keep_source_ordinals_before_filtering()
             for (overlay, reason) in [
                 (json!({"id": token}), "duplicate rule id"),
                 (json!({"pattern": null}), "pattern must be non-empty"),
-                (json!({"paranoia_min": 5}), "paranoia_min must be from 1 to 4"),
+                (
+                    json!({"paranoia_min": 5}),
+                    "paranoia_min must be from 1 to 4",
+                ),
                 (
                     json!({"fp_filters": ["[WAF_ENTRY_FILTER"]}),
                     "is invalid or too complex",
                 ),
-                (json!({"match_kind": "cidr", "pattern": token}), "invalid CIDR"),
+                (
+                    json!({"match_kind": "cidr", "pattern": token}),
+                    "invalid CIDR",
+                ),
                 (
                     json!({"conditions": {"paths": ["~[WAF_ENTRY_CONDITION"]}}),
                     "invalid conditions.paths regex",

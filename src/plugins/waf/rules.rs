@@ -516,7 +516,10 @@ pub(super) fn compile_rules(
         };
         validate_rule(&rule).map_err(with_rule_context)?;
         if !seen.insert(rule.id.clone()) {
-            return Err(with_rule_context(format!("waf: duplicate rule id {:?}", rule.id)));
+            return Err(with_rule_context(format!(
+                "waf: duplicate rule id {:?}",
+                rule.id
+            )));
         }
         if is_default {
             seen_default.insert(rule.id.clone());
