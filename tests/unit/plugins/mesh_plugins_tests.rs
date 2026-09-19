@@ -3792,10 +3792,9 @@ async fn mesh_authz_rejects_invalid_trust_domain_alias() {
         Ok(_) => panic!("invalid alias should fail construction"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("NotLowercase.Test"),
-        "error should mention bad alias, got: {err}"
-    );
+    assert!(err.contains("`trust_domain_aliases[0]`"), "{err}");
+    assert!(err.contains("not a valid trust domain"), "{err}");
+    assert!(!err.contains("NotLowercase.Test"), "{err}");
 }
 
 #[tokio::test]
@@ -4264,10 +4263,9 @@ async fn workload_metrics_rejects_invalid_trust_domain_alias() {
         Ok(_) => panic!("invalid alias should fail construction"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("Bad.Trust"),
-        "error should mention bad alias, got: {err}"
-    );
+    assert!(err.contains("`trust_domain_aliases[0]`"), "{err}");
+    assert!(err.contains("not a valid trust domain"), "{err}");
+    assert!(!err.contains("Bad.Trust"), "{err}");
 }
 
 // ── PolicyScope enforcement tests ────────────────────────────────────────────
@@ -8998,6 +8996,8 @@ fn mesh_authz_rendered_scope_diagnostics_withhold_policy_and_selector_content() 
         ),
         (
             json!({"mesh_slice": {
+                "node_id": "test-node",
+                "version": "test",
                 "namespace": "default",
                 "labels_ambiguous": true,
                 "mesh_policies": [selector_policy.clone()]
@@ -9007,6 +9007,8 @@ fn mesh_authz_rendered_scope_diagnostics_withhold_policy_and_selector_content() 
         ),
         (
             json!({"mesh_slice": {
+                "node_id": "test-node",
+                "version": "test",
                 "namespace": "default",
                 "labels_ambiguous": true,
                 "labels": {"another": hostile},
