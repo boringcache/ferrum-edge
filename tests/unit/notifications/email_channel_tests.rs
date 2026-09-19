@@ -157,7 +157,14 @@ fn email_literal_egress_admission_uses_the_resolved_policy() {
         (Both, "", "", true, "10.1.2.3", true),
         (Public, "", "", true, "8.8.8.8", true),
         (Public, "10.0.0.0/8", "", true, "10.1.2.3", true),
-        (Both, "169.254.169.254/32", "", true, "169.254.169.254", true),
+        (
+            Both,
+            "169.254.169.254/32",
+            "",
+            true,
+            "169.254.169.254",
+            true,
+        ),
         (Both, "", "", false, "169.254.169.254", true),
         // Construction must not resolve DNS, even with every address denied.
         (Both, "", "0.0.0.0/0,::/0", true, "smtp.invalid", true),

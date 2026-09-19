@@ -264,9 +264,7 @@ impl EmailChannel {
         value: &Value,
         backend_allow_ips: &BackendEgressPolicy,
     ) -> Result<Self, String> {
-        Self::new_with_env_lookup(name, value, backend_allow_ips, &|name| {
-            std::env::var(name)
-        })
+        Self::new_with_env_lookup(name, value, backend_allow_ips, &|name| std::env::var(name))
     }
 
     pub(crate) fn new_with_env_lookup(

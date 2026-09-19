@@ -283,7 +283,9 @@ fn build_channel(
         "email" => {
             reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Email(Box::new(EmailChannel::new(
-                name, def, backend_allow_ips,
+                name,
+                def,
+                backend_allow_ips,
             )?)))
         }
         other => Err(format!(
