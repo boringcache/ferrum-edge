@@ -170,10 +170,10 @@ struct PrivatePemFile {
 impl Drop for PrivatePemFile {
     /// Overwrite each private PEM copy before `NamedTempFile` unlinks it.
     ///
-    /// The in-memory material is already zeroizing
-    /// (`tls::source::SecretBytes`), so the temp file is the only remaining
-    /// plaintext copy of the database client key, and an unlink alone leaves
-    /// its blocks readable until the filesystem reuses them. Best effort: a
+    /// The loaded material buffer is zeroizing (`tls::source::SecretBytes`).
+    /// Scrub this file too: unlink alone leaves its blocks readable until the
+    /// filesystem reuses them. Configured inline sources may still be retained
+    /// in the caller's source URL. Best effort: a
     /// read-only or already-removed file simply skips, and the unlink still
     /// happens.
     fn drop(&mut self) {

@@ -406,7 +406,6 @@ async fn vault_timeout_errors() {
     );
 }
 
-
 /// Provider material is resolved directly into pool-owned files. Rotations,
 /// rejected partial generations, and the last pool clone all exercise the
 /// same ownership path as file and inline sources in the ordinary unit lane.
