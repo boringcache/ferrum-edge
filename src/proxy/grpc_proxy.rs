@@ -1461,11 +1461,14 @@ impl GrpcPoolManager {
             ));
         }
 
+        let observation = super::http2_pool::H2DriverObservation::new("backend_grpc_h2c");
         tokio::spawn(async move {
             // The `maxConnections` slot lives exactly as long as the connection
             // driver, i.e. as long as the socket is open.
             let _conn_slot = conn_slot;
-            if let Err(e) = conn.await {
+            let result = conn.await;
+            observation.finish(result.as_ref().err().map(|e| e as &dyn std::error::Error));
+            if let Err(e) = result {
                 debug!("gRPC h2c connection closed: {}", e);
             }
         });
@@ -1509,11 +1512,14 @@ impl GrpcPoolManager {
         })?;
 
         // TLS negotiation already proved H2 via ALPN.
+        let observation = super::http2_pool::H2DriverObservation::new("backend_grpc_tls");
         tokio::spawn(async move {
             // The `maxConnections` slot lives exactly as long as the connection
             // driver, i.e. as long as the socket is open.
             let _conn_slot = conn_slot;
-            if let Err(e) = conn.await {
+            let result = conn.await;
+            observation.finish(result.as_ref().err().map(|e| e as &dyn std::error::Error));
+            if let Err(e) = result {
                 debug!("gRPC h2 TLS connection closed: {}", e);
             }
         });
