@@ -477,8 +477,8 @@ coverage before interpreting measurements. #5588 is not closed by instrumentatio
 ## Hosted syscall and CPU follow-up (issue #5588)
 
 The follow-up integrates H1 parent
-`a798c0bac68151fbe860e3cb48843cbd434c0f84` and the reviewed H3 foundation
-`d19abaa3c4fbb40af6136cb577a1ed7e82bf8529` by normal merge. It adds no production
+`2491d44b1149bf33dece351595244351d2dbc322` and the reviewed H3 foundation
+`e00f0a91cb5ae2b0686392f504471283e6f52b4c` by normal merge. It adds no production
 forwarding change, Cargo dependency, tuning, competitor arm, pool/UDP profiling,
 frame-pointer rebuild or measurement claim. The H3 probes, fixture commands,
 calibration and campaign remain separate. The H1 cadence and fixed 5 MiB drain
@@ -699,6 +699,7 @@ identity, initial/periodic TCP inventories, readiness/termination, raw syscall
 snapshots/lifetimes or raw perf/decoded stacks, build mapping inventory and
 `trace-manifest.json`. Failed raw client stdout/exit, including 5 MiB failures,
 remain alongside it. The report separates useful-work, internal-profile, syscall,
-socket/lifetime, CPU-sample and unwind validity. `fully_measured_comparison_eligible`
-remains false with missing dimensions. Root must review actual hosted compiler,
+socket/lifetime, CPU-sample and unwind validity. `internal_comparison_eligible`
+requires valid traffic, complete internal profiles and complete runtime pairing;
+`fully_measured_comparison_eligible` remains false with missing dimensions. Root must review actual hosted compiler,
 fixture and capture evidence before any interpretation; #5588 remains open.
