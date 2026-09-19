@@ -18,6 +18,9 @@ static GLOBAL: h1_profile::ForwardingAllocator<tikv_jemallocator::Jemalloc> =
     h1_profile::ForwardingAllocator(tikv_jemallocator::Jemalloc);
 
 fn main() {
+    #[cfg(all(not(windows), feature = "bench-h1-profile"))]
+    h1_profile::register_global_allocator();
+
     // SAFETY: this is the process entry point. No application worker or runtime
     // has started; the shared pipeline owns initialization and thread startup.
     unsafe {
