@@ -2570,7 +2570,7 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let dir = tempfile::tempdir().expect("tempdir");
-    let ca_path = dir.path().join("ws-ca.pem");
+    let ca_path = dir.path().join("'ReloadCaPath5594`.pem");
     let valid_ca = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
     std::fs::write(&ca_path, &valid_ca).expect("write valid CA");
 
@@ -2604,10 +2604,25 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let error = cache
         .rebuild(&replacement)
         .expect_err("malformed replacement CA must reject cache publication");
-    assert!(
-        error.contains("ws_logging: invalid CA bundle"),
-        "got: {error}"
-    );
+    let visible = [
+        "ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`",
+        "certificate record #2",
+        "malformed PEM certificate record",
+    ];
+    for fragment in visible {
+        assert!(error.contains(fragment), "{error}");
+    }
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for fragment in visible {
+        assert!(rendered.contains(fragment), "{rendered}");
+    }
+    for hidden in [
+        "ReloadCaPath5594",
+        ca_path.to_str().unwrap(),
+        valid_ca.as_str(),
+    ] {
+        assert!(!rendered.contains(hidden), "{rendered}");
+    }
 
     let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);

@@ -980,7 +980,8 @@ fn build_tls_connector(
             "ws_logging CA bundle",
             &ca_material.display_source_id,
         )
-        .map_err(|_| "ws_logging: invalid CA bundle".to_string())?
+        // The shared parser returns safe classifications and record ordinals.
+        .map_err(|error| format!("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`: {error}"))?
     } else {
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };

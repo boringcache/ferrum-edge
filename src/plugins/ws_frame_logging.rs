@@ -372,7 +372,7 @@ impl WsFrameLogging {
         if !log_level.is_admitted_by_active_dispatcher() {
             warn!(
                 target: "ws_frame_log",
-                configured_level = log_level.as_str(),
+                configured_level = %crate::startup::sanitize_startup_scalar(log_level.as_str()),
                 "ws_frame_logging is enabled but its configured log_level is filtered by the active tracing EnvFilter \
                  (gateway default FERRUM_LOG_LEVEL=warn). Frame parsing, plugin selection, and on_ws_frame / \
                  delivery-observation dispatch still occur; fingerprint/event construction is skipped. Raise \
@@ -551,9 +551,8 @@ fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
     }
     unknown.sort_unstable();
     Err(format!(
-        "ws_frame_logging: unknown configuration key(s): {}; allowed keys: {}",
-        unknown.join(", "),
-        WS_FRAME_LOGGING_CONFIG_KEYS.join(", ")
+        "ws_frame_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
+        WS_FRAME_LOGGING_CONFIG_KEYS.join("`, `")
     ))
 }
 
