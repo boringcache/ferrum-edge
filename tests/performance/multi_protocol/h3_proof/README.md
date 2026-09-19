@@ -84,14 +84,31 @@ and is a dependency of the manual campaign. `fairness.py` runs exactly:
 | Envoy-4 idle lifetime | Both actually used and actually unused backend connections must close and join to owned kernel socket retirements before teardown, with final buffers/drops. Retain actual idle-timeout and local-destroy counters, raw backend closes and all sockets. Absence fails; there is no retry-until-reproduced loop. |
 | Evidence negatives from that new invocation | Copies of real evidence inject a missing capture, wrong buffer, inode/cookie reuse, namespace change, missing initial boundary, missing final drops, missing client role, foreign invocation, and trace-off evidence. Each must reject for its precise reason. A copied client observation with an early retired worker must also reject. These are labelled evidence fault injections, not additional live kernel retirements. |
 
+A backend connection close and a kernel socket destruction are joined only on an
+exact owned `127.0.0.1:<port>` endpoint with exactly one admitted retirement, and
+only inside bounds the run itself recorded. The backend samples each connection
+on a fixed interval and reports a close on the sample *after* it happened, so its
+rows bracket the close rather than date it: the first row is an instant the peer
+socket demonstrably existed, the last row still short of the final counters is an
+instant it demonstrably still carried work, and the closing row is an upper bound
+quantized by that connection's own widest observed sampling gap. No fixed
+correlation allowance is used and no close timestamp is invented. The hosted
+Envoy arms destroy the upstream socket one to two sampling intervals before the
+backend reports the close, so a fixed one-second allowance discarded almost every
+real retirement and made the used/unused verdict depend on where that constant
+fell.
+
 Ferrum shares UDP endpoints across upstream QUIC connections. Its actual socket
 teardown is required, but a QUIC idle close is never called a socket retirement
 unless the kernel event exists. The fixture records zero or absent idle events
 without fabricating an Envoy-shaped Ferrum pool.
 
 The TLS helper is a dedicated harness binary under this directory; it uses the
-existing pinned Rust dependencies, generates two real leaves under one CA, and
-exports only public certificates plus raw request/handshake logs. It performs
+existing pinned Rust dependencies, generates two real leaves under one named CA,
+and exports only public certificates plus raw request/handshake logs. The CA's
+common name is load-bearing: rcgen leaves a subject empty by default, and an
+unnamed CA signing an unnamed leaf produces a chain whose leaf issuer equals its
+own subject, which BoringSSL rejects at depth 0 as self signed. It performs
 one request per identity, no retry or fallback. Its backend has a 120-second cap
 and requests a 20-second cap. Startup TCP capability probes remain visible;
 TCP attempts during the behavioral request cases fail. The whole fairness driver

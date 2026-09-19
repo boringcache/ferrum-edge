@@ -163,7 +163,13 @@ def retirement_evidence(out, result):
               and r['at_ns'] < record['workload_teardown_ns']]
     roles = {r['cookie'] for r in json.loads((out / 'proof.json').read_text())['roles'] if r['role'] == 'gateway_upstream'}
     usage = json.loads((out / 'process-transport.raw.json').read_text())
-    sockets = []
+
+    def unix_bounds(at_ns):
+        anchor = min(usage['timeline'], key=lambda r: abs(r['clock']['before_ns'] - at_ns))['clock']
+        return ((anchor['unix_ns'] + at_ns - anchor['after_ns']) / 1e9,
+                (anchor['unix_ns'] + at_ns - anchor['before_ns']) / 1e9)
+
+    sockets, born = [], {}
     births = [r for r in log_rows(out / 'lifetime.jsonl') if r.get('kind') == 18]
     for event in events:
         if event['cookie'] not in roles:
@@ -177,6 +183,7 @@ def retirement_evidence(out, result):
                 or not natural(event.get('drops')) or event.get('so_rcvbuf') != 4194304
                 or event.get('so_sndbuf') != 4194304):
             raise ValueError('idle retirement identity/final counter incomplete')
+        born[event['cookie']] = birth[0]
         sockets.append(event)
     joined, claimed = [], set()
     for rows in backend.values():
@@ -185,18 +192,32 @@ def retirement_evidence(out, result):
             continue
         if final['accepted'] != final['completed'] or final['bytes'] != final['completed'] * 10240:
             raise ValueError('idle retirement concealed incomplete backend work')
+        # The backend samples each connection on a fixed interval and only reports
+        # a close on the sample after it happened, so its rows bracket the close
+        # instead of dating it. Three recorded instants bound the join, and none
+        # of them invents a close timestamp: the first row is an instant the peer
+        # socket demonstrably existed, the last row still short of the final
+        # counters is an instant it demonstrably still carried work, and the
+        # closing row is an upper bound on the close, quantized by that
+        # connection's own widest observed sampling gap. A fixed correlation
+        # allowance is not evidence and is not used.
+        quantum = max((b['unix_secs'] - a['unix_secs'] for a, b in zip(rows, rows[1:])), default=0.0)
+        alive_secs = rows[0]['unix_secs']
+        for row in rows[:-1]:
+            if row['completed'] < final['completed'] or row['bytes'] < final['bytes']:
+                alive_secs = row['unix_secs']
         address, port = final['peer'].rsplit(':', 1)
         matches = []
         for event in sockets:
             if (ipv4(event['local_ipv4']), event['local_port']) != (address, int(port)):
                 continue
-            anchor = min(usage['timeline'], key=lambda r: abs(r['clock']['before_ns'] - event['at_ns']))['clock']
-            lo = (anchor['unix_ns'] + event['at_ns'] - anchor['after_ns']) / 1e9
-            hi = (anchor['unix_ns'] + event['at_ns'] - anchor['before_ns']) / 1e9
-            # Backend close polling is 500 ms. Retain a conservative 1 s
-            # correlation allowance, never invent an exact close timestamp.
-            if lo <= final['unix_secs'] + 1 and hi >= final['unix_secs'] - 1:
-                matches.append(dict(event, unix_bounds_secs=[lo, hi]))
+            lo, hi = unix_bounds(event['at_ns'])
+            if (unix_bounds(born[event['cookie']]['at_ns'])[1] > rows[0]['unix_secs']
+                    or lo < alive_secs or lo > final['unix_secs'] + quantum):
+                continue
+            matches.append(dict(event, unix_bounds_secs=[lo, hi], backend_alive_secs=alive_secs,
+                                backend_close_sample_secs=final['unix_secs'],
+                                backend_sample_quantum_secs=quantum))
         if len(matches) > 1 or any(e['cookie'] in claimed for e in matches):
             raise ValueError('ambiguous reused endpoint in backend/socket retirement join')
         claimed.update(e['cookie'] for e in matches)

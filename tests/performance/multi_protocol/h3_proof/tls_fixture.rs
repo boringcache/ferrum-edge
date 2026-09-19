@@ -13,6 +13,15 @@ fn certificates() -> anyhow::Result<()> {
     let key = rcgen::KeyPair::generate()?;
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    // A distinct issuer name is load-bearing, not cosmetic. rcgen leaves the
+    // subject empty by default, so an unnamed CA signing an unnamed leaf yields
+    // a chain whose leaf issuer equals its own subject; BoringSSL then rejects
+    // it as `depth 0: self signed certificate` and Envoy answers 503 before the
+    // identity case can run. Mirrors the benchmark CA in `tls_utils`.
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "h3 identity fixture CA");
     let ca = params.self_signed(&key)?;
     std::fs::write(dir.join("ca.pem"), ca.pem())?;
     for (name, dns) in [("valid", "localhost"), ("wrong", "wrong.invalid")] {
