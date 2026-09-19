@@ -69,7 +69,7 @@ impl SummaryType {
             "stream" => Ok(Self::Stream),
             "both" => Ok(Self::Both),
             other => Err(format!(
-                "schema: 'summary_type' must be 'http', 'stream', or 'both' (got {other:?})"
+                "schema: `summary_type` must be `http`, `stream`, or `both` (got {other:?})"
             )),
         }
     }
@@ -180,7 +180,7 @@ impl DerivedKind {
             "summary_kind" => Ok(Self::SummaryKind),
             "outcome" => Ok(Self::Outcome),
             other => Err(format!(
-                "schema: unknown derived kind {other:?} (valid: status_class, backend_host, summary_kind, outcome)"
+                "schema: unknown derived kind {other:?} (valid: `status_class`, `backend_host`, `summary_kind`, `outcome`)"
             )),
         }
     }
@@ -226,7 +226,7 @@ impl TimestampFormat {
             "epoch_ms" => Ok(Self::EpochMs),
             "epoch_s" => Ok(Self::EpochS),
             other => Err(format!(
-                "schema: 'timestamp_format' must be 'rfc3339', 'epoch_ms', or 'epoch_s' (got {other:?})"
+                "schema: `timestamp_format` must be `rfc3339`, `epoch_ms`, or `epoch_s` (got {other:?})"
             )),
         }
     }
@@ -252,7 +252,7 @@ impl SummarySchema {
         caps: SchemaCapabilities,
     ) -> Result<Arc<Self>, String> {
         if !raw.is_object() {
-            return Err(format!("{plugin_name}: 'schema' must be an object"));
+            return Err(format!("{plugin_name}: `schema` must be an object"));
         }
 
         // Reject unknown top-level keys so typos surface immediately.
@@ -260,8 +260,8 @@ impl SummarySchema {
             for key in obj.keys() {
                 if !SUMMARY_LOG_SCHEMA_KEYS.contains(&key.as_str()) {
                     return Err(format!(
-                        "{plugin_name}: unknown schema key '{key}' (valid keys: {})",
-                        SUMMARY_LOG_SCHEMA_KEYS.join(", ")
+                        "{plugin_name}: unknown schema key {key:?} (valid keys: `{}`)",
+                        SUMMARY_LOG_SCHEMA_KEYS.join("`, `")
                     ));
                 }
             }
@@ -270,16 +270,18 @@ impl SummarySchema {
         let summary_type = match raw.get("summary_type") {
             Some(_) if !caps.family.uses_summary_type() => {
                 return Err(format!(
-                    "{plugin_name}: schema 'summary_type' is not supported for this plugin \
+                    "{plugin_name}: schema `summary_type` is not supported for this plugin \
                      (its records are a {}, not an HTTP/stream transaction summary); remove the key",
                     caps.family.label()
                 ));
             }
-            Some(Value::String(s)) => SummaryType::parse(s)?,
+            Some(Value::String(s)) => {
+                SummaryType::parse(s).map_err(|error| format!("{plugin_name}: {error}"))?
+            }
             None => SummaryType::default(),
             Some(_) => {
                 return Err(format!(
-                    "{plugin_name}: schema 'summary_type' must be a string"
+                    "{plugin_name}: schema `summary_type` must be a string"
                 ));
             }
         };
@@ -310,12 +312,12 @@ impl SummarySchema {
             }
             if omit.contains(source) {
                 return Err(format!(
-                    "{plugin_name}: schema field '{source}' is both omitted and renamed (rename target '{target}')"
+                    "{plugin_name}: schema field {source:?} is both omitted and renamed (rename target {target:?})"
                 ));
             }
             if target.is_empty() {
                 return Err(format!(
-                    "{plugin_name}: schema rename target for '{source}' must be a non-empty string"
+                    "{plugin_name}: schema rename target for {source:?} must be a non-empty string"
                 ));
             }
             // The rename target is the operator-visible JSON key. If it
@@ -326,7 +328,7 @@ impl SummarySchema {
             // check.
             if is_sensitive_metadata_key(target) {
                 return Err(format!(
-                    "{plugin_name}: schema rename target '{target}' (for source '{source}') matches a sensitive-data substring; pick a different name"
+                    "{plugin_name}: schema rename target {target:?} (for source {source:?}) matches a sensitive-data substring; pick a different name"
                 ));
             }
         }
@@ -337,7 +339,7 @@ impl SummarySchema {
         for (name, kind) in &derived_fields {
             if !caps.family.supports_derived(*kind) {
                 return Err(format!(
-                    "{plugin_name}: schema derived field {name:?} uses kind '{}', which is not \
+                    "{plugin_name}: schema `derived_fields.kind` for field {name:?} uses kind {:?}, which is not \
                      representable from a {} (no source field); remove it or pick a supported kind",
                     kind.label(),
                     caps.family.label()
@@ -347,7 +349,7 @@ impl SummarySchema {
 
         if raw.get("metadata").is_some() && !caps.family.has_metadata() {
             return Err(format!(
-                "{plugin_name}: schema 'metadata' policy is not supported for this plugin \
+                "{plugin_name}: schema `metadata` policy is not supported for this plugin \
                  (a {} carries no metadata map); remove the key",
                 caps.family.label()
             ));
@@ -357,16 +359,18 @@ impl SummarySchema {
         let timestamp_format = match raw.get("timestamp_format") {
             Some(_) if !caps.family.supports_timestamp_format() => {
                 return Err(format!(
-                    "{plugin_name}: schema 'timestamp_format' is not supported for this plugin \
+                    "{plugin_name}: schema `timestamp_format` is not supported for this plugin \
                      (a {} carries no RFC3339 timestamp field); remove the key",
                     caps.family.label()
                 ));
             }
-            Some(Value::String(s)) => TimestampFormat::parse(s)?,
+            Some(Value::String(s)) => {
+                TimestampFormat::parse(s).map_err(|error| format!("{plugin_name}: {error}"))?
+            }
             None => TimestampFormat::default(),
             Some(_) => {
                 return Err(format!(
-                    "{plugin_name}: schema 'timestamp_format' must be a string"
+                    "{plugin_name}: schema `timestamp_format` must be a string"
                 ));
             }
         };
@@ -442,7 +446,7 @@ impl SummarySchema {
             let (out, kind) = spec_out_key_and_kind(spec);
             if let Some(prev_kind) = seen.insert(out, kind) {
                 return Err(format!(
-                    "{plugin_name}: duplicate output key '{out}' produced by {prev_kind} and {kind}"
+                    "{plugin_name}: duplicate output key {out:?} produced by {prev_kind} and {kind}"
                 ));
             }
         }
@@ -454,9 +458,9 @@ impl SummarySchema {
         let fields = match raw.get("order") {
             Some(_) if !caps.family.supports_order() => {
                 return Err(format!(
-                    "{plugin_name}: schema 'order' is not supported for this plugin (a {} is \
+                    "{plugin_name}: schema `order` is not supported for this plugin (a {} is \
                      emitted as a member of a sorted JSON document, so explicit member order \
-                     cannot be honored); use 'rename' / 'omit' instead",
+                     cannot be honored); use `rename` / `omit` instead",
                     caps.family.label()
                 ));
             }
@@ -592,9 +596,9 @@ fn unknown_field_error(
     let suggestion = fields::levenshtein_suggest(summary_type, caps, name);
     match suggestion {
         Some(s) => format!(
-            "{plugin_name}: schema {section} references unknown field {name:?} (did you mean '{s}'?)"
+            "{plugin_name}: schema `{section}` references unknown field {name:?} (did you mean `{s}`?)"
         ),
-        None => format!("{plugin_name}: schema {section} references unknown field {name:?}"),
+        None => format!("{plugin_name}: schema `{section}` references unknown field {name:?}"),
     }
 }
 
@@ -608,15 +612,15 @@ fn parse_string_array(
     };
     let arr = v
         .as_array()
-        .ok_or_else(|| format!("{plugin_name}: schema '{key}' must be an array of strings"))?;
+        .ok_or_else(|| format!("{plugin_name}: schema `{key}` must be an array of strings"))?;
     let mut out = Vec::with_capacity(arr.len());
     for entry in arr {
         let s = entry
             .as_str()
-            .ok_or_else(|| format!("{plugin_name}: schema '{key}' entries must be strings"))?;
+            .ok_or_else(|| format!("{plugin_name}: schema `{key}` entries must be strings"))?;
         if s.is_empty() {
             return Err(format!(
-                "{plugin_name}: schema '{key}' entries must be non-empty"
+                "{plugin_name}: schema `{key}` entries must be non-empty"
             ));
         }
         out.push(s.to_string());
@@ -634,11 +638,11 @@ fn parse_string_map(
     };
     let obj = v
         .as_object()
-        .ok_or_else(|| format!("{plugin_name}: schema '{key}' must be an object"))?;
+        .ok_or_else(|| format!("{plugin_name}: schema `{key}` must be an object"))?;
     let mut out = HashMap::with_capacity(obj.len());
     for (k, val) in obj {
         let s = val.as_str().ok_or_else(|| {
-            format!("{plugin_name}: schema '{key}' value for '{k}' must be a string")
+            format!("{plugin_name}: schema `{key}` value for {k:?} must be a string")
         })?;
         out.insert(k.clone(), s.to_string());
     }
@@ -654,22 +658,22 @@ fn parse_static_fields(
     };
     let obj = v
         .as_object()
-        .ok_or_else(|| format!("{plugin_name}: schema 'static_fields' must be an object"))?;
+        .ok_or_else(|| format!("{plugin_name}: schema `static_fields` must be an object"))?;
     let mut out = Vec::with_capacity(obj.len());
     for (k, val) in obj {
         if k.is_empty() {
             return Err(format!(
-                "{plugin_name}: schema 'static_fields' keys must be non-empty"
+                "{plugin_name}: schema `static_fields` keys must be non-empty"
             ));
         }
         if val.is_null() {
             return Err(format!(
-                "{plugin_name}: schema 'static_fields' value for '{k}' must not be null (use 'omit' instead)"
+                "{plugin_name}: schema `static_fields` value for {k:?} must not be null (use `omit` instead)"
             ));
         }
         if is_sensitive_metadata_key(k) {
             return Err(format!(
-                "{plugin_name}: schema 'static_fields' key '{k}' matches a sensitive-data substring and would always be redacted; pick a different name"
+                "{plugin_name}: schema `static_fields` key {k:?} matches a sensitive-data substring and would always be redacted; pick a different name"
             ));
         }
         // Defense in depth: walk nested structures, reject sensitive keys.
@@ -685,7 +689,7 @@ fn reject_sensitive_in_value(value: &Value, plugin_name: &str, parent: &str) -> 
             for (k, v) in obj {
                 if is_sensitive_metadata_key(k) {
                     return Err(format!(
-                        "{plugin_name}: schema 'static_fields' value for '{parent}' contains nested key '{k}' that matches a sensitive-data substring"
+                        "{plugin_name}: schema `static_fields` value for {parent:?} contains nested key {k:?} that matches a sensitive-data substring"
                     ));
                 }
                 reject_sensitive_in_value(v, plugin_name, parent)?;
@@ -699,7 +703,7 @@ fn reject_sensitive_in_value(value: &Value, plugin_name: &str, parent: &str) -> 
         Value::String(s) => {
             if let Some(scheme) = detect_credential_scheme(s) {
                 return Err(format!(
-                    "{plugin_name}: schema 'static_fields' value for '{parent}' looks like an HTTP {scheme} credential — refusing to ship a literal token through the log pipeline; pass a placeholder or non-secret descriptor instead"
+                    "{plugin_name}: schema `static_fields` value for {parent:?} looks like an HTTP {scheme} credential — refusing to ship a literal token through the log pipeline; pass a placeholder or non-secret descriptor instead"
                 ));
             }
         }
@@ -803,17 +807,17 @@ fn parse_derived_fields(
     };
     let arr = v
         .as_array()
-        .ok_or_else(|| format!("{plugin_name}: schema 'derived_fields' must be an array"))?;
+        .ok_or_else(|| format!("{plugin_name}: schema `derived_fields` must be an array"))?;
     let mut out = Vec::with_capacity(arr.len());
     for (index, entry) in arr.iter().enumerate() {
         let obj = entry.as_object().ok_or_else(|| {
-            format!("{plugin_name}: schema 'derived_fields[{index}]' entry must be an object")
+            format!("{plugin_name}: schema `derived_fields[{index}]` entry must be an object")
         })?;
         for key in obj.keys() {
             if !DERIVED_FIELD_KEYS.contains(&key.as_str()) {
                 return Err(format!(
-                    "{plugin_name}: unknown schema key 'derived_fields[{index}].{key}' (valid entry keys: {})",
-                    DERIVED_FIELD_KEYS.join(", ")
+                    "{plugin_name}: unknown schema key {key:?} at `derived_fields[{index}]` (valid entry keys: `{}`)",
+                    DERIVED_FIELD_KEYS.join("`, `")
                 ));
             }
         }
@@ -823,16 +827,18 @@ fn parse_derived_fields(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 format!(
-                    "{plugin_name}: schema 'derived_fields[{index}]' entry missing non-empty 'name'"
+                    "{plugin_name}: schema `derived_fields[{index}]` entry missing non-empty `name`"
                 )
             })?;
         let kind_str = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
-            format!("{plugin_name}: schema 'derived_fields[{index}]' entry {name:?} missing 'kind'")
+            format!("{plugin_name}: schema `derived_fields[{index}]` entry {name:?} missing `kind`")
         })?;
-        let kind = DerivedKind::parse(kind_str)?;
+        let kind = DerivedKind::parse(kind_str).map_err(|error| {
+            format!("{plugin_name}: schema `derived_fields[{index}].kind`: {error}")
+        })?;
         if is_sensitive_metadata_key(name) {
             return Err(format!(
-                "{plugin_name}: schema 'derived_fields' name {name:?} matches a sensitive-data substring and would always be redacted; pick a different name"
+                "{plugin_name}: schema `derived_fields` name {name:?} matches a sensitive-data substring and would always be redacted; pick a different name"
             ));
         }
         out.push((name.to_string(), kind));
@@ -849,12 +855,12 @@ fn parse_metadata_policy(
     };
     let obj = v
         .as_object()
-        .ok_or_else(|| format!("{plugin_name}: schema 'metadata' must be an object"))?;
+        .ok_or_else(|| format!("{plugin_name}: schema `metadata` must be an object"))?;
     for key in obj.keys() {
         if !METADATA_POLICY_KEYS.contains(&key.as_str()) {
             return Err(format!(
-                "{plugin_name}: unknown schema key 'metadata.{key}' (valid metadata keys: {})",
-                METADATA_POLICY_KEYS.join(", ")
+                "{plugin_name}: unknown schema key {key:?} at `metadata` (valid metadata keys: `{}`)",
+                METADATA_POLICY_KEYS.join("`, `")
             ));
         }
     }
@@ -863,7 +869,7 @@ fn parse_metadata_policy(
         None => "nested",
         Some(_) => {
             return Err(format!(
-                "{plugin_name}: schema 'metadata.mode' must be a string"
+                "{plugin_name}: schema `metadata.mode` must be a string"
             ));
         }
     };
@@ -871,7 +877,7 @@ fn parse_metadata_policy(
     // still names the offending mode rather than a value it would never read.
     if !matches!(mode, "nested" | "omit" | "flatten") {
         return Err(format!(
-            "{plugin_name}: schema 'metadata.mode' must be 'nested', 'omit', or 'flatten' (got '{mode}')"
+            "{plugin_name}: schema `metadata.mode` must be `nested`, `omit`, or `flatten` (got {mode:?})"
         ));
     }
 
@@ -887,7 +893,7 @@ fn parse_metadata_policy(
         Some(Value::String(s)) => {
             if s.chars().any(|c| c.is_control()) {
                 return Err(format!(
-                    "{plugin_name}: schema 'metadata.prefix' must not contain control characters"
+                    "{plugin_name}: schema `metadata.prefix` must not contain control characters"
                 ));
             }
             Some(s.clone())
@@ -895,7 +901,7 @@ fn parse_metadata_policy(
         None => None,
         Some(_) => {
             return Err(format!(
-                "{plugin_name}: schema 'metadata.prefix' must be a string"
+                "{plugin_name}: schema `metadata.prefix` must be a string"
             ));
         }
     };
@@ -905,14 +911,14 @@ fn parse_metadata_policy(
             "overwrite" => CollisionMode::Overwrite,
             other => {
                 return Err(format!(
-                    "{plugin_name}: schema 'metadata.on_collision' must be 'skip' or 'overwrite' (got {other:?})"
+                    "{plugin_name}: schema `metadata.on_collision` must be `skip` or `overwrite` (got {other:?})"
                 ));
             }
         },
         None => CollisionMode::default(),
         Some(_) => {
             return Err(format!(
-                "{plugin_name}: schema 'metadata.on_collision' must be a string"
+                "{plugin_name}: schema `metadata.on_collision` must be a string"
             ));
         }
     };
@@ -959,7 +965,7 @@ fn apply_order(
         if entry == "*" {
             if wildcard_seen {
                 return Err(format!(
-                    "{plugin_name}: schema 'order' may only contain '*' once"
+                    "{plugin_name}: schema `order` may only contain `*` once"
                 ));
             }
             wildcard_seen = true;
@@ -968,12 +974,12 @@ fn apply_order(
         }
         let idx = index.get(entry).ok_or_else(|| {
             format!(
-                "{plugin_name}: schema 'order' references unknown output key '{entry}' (must match a renamed/native/static/derived out_key, or use '*')"
+                "{plugin_name}: schema `order` references unknown output key {entry:?} (must match a renamed/native/static/derived out_key, or use `*`)"
             )
         })?;
         if listed[*idx] {
             return Err(format!(
-                "{plugin_name}: schema 'order' lists '{entry}' more than once"
+                "{plugin_name}: schema `order` lists {entry:?} more than once"
             ));
         }
         listed[*idx] = true;
@@ -993,7 +999,7 @@ fn apply_order(
             .collect();
         if !missing.is_empty() {
             return Err(format!(
-                "{plugin_name}: schema 'order' missing entries: {} (add them, or use '*' to catch the rest)",
+                "{plugin_name}: schema `order` missing entries: {:?} (add them, or use `*` to catch the rest)",
                 missing.join(", ")
             ));
         }
@@ -1082,20 +1088,20 @@ pub fn resolve_schema(
 
     if inline.is_some() && by_ref.is_some() {
         return Err(format!(
-            "{plugin_name}: 'schema' and 'schema_ref' are mutually exclusive"
+            "{plugin_name}: `schema` and `schema_ref` are mutually exclusive"
         ));
     }
 
     if let Some(name) = by_ref {
         let name = name
             .as_str()
-            .ok_or_else(|| format!("{plugin_name}: 'schema_ref' must be a string"))?;
+            .ok_or_else(|| format!("{plugin_name}: `schema_ref` must be a string"))?;
         // BASE callers share the single compiled `Arc` registered by
         // `transaction_log_schema` — zero recompile, identical to before.
         if caps == SchemaCapabilities::BASE {
             return registry::lookup_named(name).map(Some).ok_or_else(|| {
                 format!(
-                    "{plugin_name}: 'schema_ref' references unknown schema {name:?} (define it in a 'transaction_log_schema' plugin)"
+                    "{plugin_name}: `schema_ref` references unknown schema {name:?} (define it in a `transaction_log_schema` plugin)"
                 )
             });
         }
@@ -1105,7 +1111,7 @@ pub fn resolve_schema(
         // hot path.
         let raw = registry::lookup_named_raw(name).ok_or_else(|| {
             format!(
-                "{plugin_name}: 'schema_ref' references unknown schema {name:?} (define it in a 'transaction_log_schema' plugin)"
+                "{plugin_name}: `schema_ref` references unknown schema {name:?} (define it in a `transaction_log_schema` plugin)"
             )
         })?;
         return SummarySchema::compile(&raw, plugin_name, caps).map(Some);
@@ -1205,7 +1211,7 @@ mod tests {
     fn unknown_field_in_omit_rejected() {
         let e = err(json!({ "omit": ["typo"] }));
         assert!(
-            e.contains("schema omit references unknown field \"typo\""),
+            e.contains("schema `omit` references unknown field \"typo\""),
             "got: {e}"
         );
     }
@@ -1213,7 +1219,7 @@ mod tests {
     #[test]
     fn unknown_field_offers_suggestion() {
         let e = err(json!({ "omit": ["proxy_idd"] }));
-        assert!(e.contains("did you mean 'proxy_id'"), "got: {e}");
+        assert!(e.contains("did you mean `proxy_id`"), "got: {e}");
     }
 
     #[test]
@@ -1230,7 +1236,7 @@ mod tests {
         let e = err(json!({
             "rename": { "proxy_id": "namespace" }
         }));
-        assert!(e.contains("duplicate output key 'namespace'"), "got: {e}");
+        assert!(e.contains("duplicate output key \"namespace\""), "got: {e}");
     }
 
     #[test]
@@ -1243,7 +1249,7 @@ mod tests {
             "omit": ["protocol"]
         }));
         assert!(
-            e.contains("schema omit references unknown field \"protocol\""),
+            e.contains("schema `omit` references unknown field \"protocol\""),
             "got: {e}"
         );
     }
@@ -1264,7 +1270,7 @@ mod tests {
                 "omit": [field],
             }));
             assert!(
-                e.contains(&format!("schema omit references unknown field {field:?}")),
+                e.contains(&format!("schema `omit` references unknown field {field:?}")),
                 "got: {e}"
             );
         }
@@ -1332,7 +1338,7 @@ mod tests {
             "summary_type": "http",
             "static_fields": { "event": "access" },
         }));
-        assert!(e.contains("duplicate output key 'event'"), "got: {e}");
+        assert!(e.contains("duplicate output key \"event\""), "got: {e}");
     }
 
     #[test]
@@ -1344,7 +1350,7 @@ mod tests {
             "omit": ["frames_client_to_backend"],
         }));
         assert!(
-            e.contains("schema omit references unknown field \"frames_client_to_backend\""),
+            e.contains("schema `omit` references unknown field \"frames_client_to_backend\""),
             "got: {e}"
         );
     }
@@ -1492,8 +1498,8 @@ mod tests {
         let cfg = json!({ "schema_ref": "with_event" });
         assert!(resolve_schema(&cfg, "http_logging", SchemaCapabilities::BASE).is_ok());
         let e = resolve_schema(&cfg, "ws_logging", SchemaCapabilities::WS_LOGGING)
-            .expect_err("ws recompile collides on reserved 'event'");
-        assert!(e.contains("duplicate output key 'event'"), "got: {e}");
+            .expect_err("ws recompile collides on reserved `event`");
+        assert!(e.contains("duplicate output key \"event\""), "got: {e}");
     }
 
     #[test]
@@ -1503,7 +1509,7 @@ mod tests {
             "rename": { "request_path": "path" }
         }));
         assert!(
-            e.contains("schema rename references unknown field \"request_path\""),
+            e.contains("schema `rename` references unknown field \"request_path\""),
             "got: {e}"
         );
     }
@@ -1622,7 +1628,7 @@ mod tests {
         let e = err(json!({
             "order": ["not_a_field", "*"]
         }));
-        assert!(e.contains("unknown output key 'not_a_field'"), "got: {e}");
+        assert!(e.contains("unknown output key \"not_a_field\""), "got: {e}");
     }
 
     #[test]
@@ -1630,7 +1636,7 @@ mod tests {
         let e = err(json!({
             "order": ["*", "*"]
         }));
-        assert!(e.contains("'*' once"), "got: {e}");
+        assert!(e.contains("`*` once"), "got: {e}");
     }
 
     #[test]
@@ -1741,7 +1747,7 @@ mod tests {
     #[test]
     fn unknown_top_level_key_rejected() {
         let e = err(json!({ "renaime": { "x": "y" } }));
-        assert!(e.contains("unknown schema key 'renaime'"), "got: {e}");
+        assert!(e.contains("unknown schema key \"renaime\""), "got: {e}");
     }
 
     #[test]

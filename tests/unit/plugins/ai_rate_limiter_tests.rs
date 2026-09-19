@@ -22,6 +22,147 @@ use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 /// with the source constant (a drift would surface as a failing skip assertion).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+#[test]
+fn rendered_unknown_config_retains_context_and_suggestion_without_supplied_data() {
+    for (key, payload) in [
+        ("suppliedKey918273", json!("payloadValue918273")),
+        ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+        (
+            "'suppliedKey918273\"\\\n`suppliedTail918273`",
+            json!([918273]),
+        ),
+    ] {
+        let error = AiRateLimiter::new(
+            &json!({"token_limit": 100, "expose_headerz": payload, (key): payload}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("unknown keys must reject admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("ai_rate_limiter: `config`:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("did you mean `expose_headers`?"),
+            "{rendered}"
+        );
+        for supplied in ["918273", "expose_headerz", "payloadKey", "payloadValue"] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn rendered_window_bound_retains_plugin_field_reason_and_declared_maximum() {
+    use ferrum_edge::plugins::utils::rate_limit::MAX_RATE_LIMIT_WINDOW_SECONDS;
+
+    let error = AiRateLimiter::new(
+        &json!({"token_limit": 100, "window_seconds": 987654321}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("over-limit window must reject admission");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.starts_with("ai_rate_limiter:"), "{rendered}");
+    assert!(
+        rendered.contains(&format!(
+            "`window_seconds` must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds"
+        )),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("987654321"), "{rendered}");
+}
+
+#[test]
+fn rendered_backend_policy_errors_retain_plugin_field_reason_and_choices() {
+    for (policy, reason) in [
+        (json!("suppliedPolicy918273"), "must be exactly"),
+        (json!("918273"), "must be exactly"),
+        (
+            json!("'suppliedPolicy918273\"\\\n`suppliedTail918273`"),
+            "must be exactly",
+        ),
+        (
+            json!({"payloadKey918273": "payloadValue918273"}),
+            "must be a string",
+        ),
+        (json!([918273]), "must be a string"),
+        (json!(918273), "must be a string"),
+    ] {
+        let error = AiRateLimiter::new(
+            &json!({"token_limit": 100, "redis_failure_policy": policy}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("invalid Redis policy must reject admission even in local mode");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for expected in [
+            "ai_rate_limiter:",
+            "`redis_failure_policy`",
+            reason,
+            "`fail_closed`",
+            "`local_fallback`",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        assert!(!rendered.contains("918273"), "{rendered}");
+    }
+}
+
+#[test]
+fn rendered_backend_identity_errors_retain_plugin_category_without_ids_or_namespaces() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    for supplied in [
+        "suppliedIdentity918273/",
+        "918273/",
+        "'suppliedIdentity918273\"\\\n`suppliedTail918273`",
+    ] {
+        let client = PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            None,
+            Arc::new(Vec::new()),
+            supplied,
+            BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
+            Arc::new(Vec::new()),
+            0,
+        );
+        for (http_client, config_id, category) in [
+            (
+                PluginHttpClient::default(),
+                supplied,
+                "invalid plugin config id",
+            ),
+            (client, "valid-policy", "invalid Redis namespace"),
+        ] {
+            let error = AiRateLimiter::new_with_config_id(
+                &json!({"token_limit": 100}),
+                http_client,
+                config_id,
+            )
+            .err()
+            .expect("malformed backend identity must reject admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(rendered.starts_with("ai_rate_limiter:"), "{rendered}");
+            assert!(rendered.contains(category), "{rendered}");
+            assert!(rendered.contains("must start with"), "{rendered}");
+            assert!(!rendered.contains("918273"), "{rendered}");
+        }
+    }
+}
+
 /// Every reservation-lifecycle metadata key `ai_rate_limiter` writes is scoped
 /// to the limiter INSTANCE (`<base>#<instance id>`) so two composed budgets on
 /// one proxy cannot overwrite or suppress each other (GHSA-wh4p-pmxm-3784).

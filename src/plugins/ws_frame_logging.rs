@@ -272,7 +272,7 @@ impl WsFrameLogging {
         let log_level = match object.get("log_level") {
             Some(Value::Null) => {
                 return Err(
-                    "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', 'info', or 'warn'); null is not allowed"
+                    "ws_frame_logging: `log_level` must be a string (`trace`, `debug`, `info`, or `warn`); null is not allowed"
                         .to_string(),
                 );
             }
@@ -284,12 +284,12 @@ impl WsFrameLogging {
                 Some(other) => {
                     return Err(format!(
                         "ws_frame_logging: invalid `log_level` value {other:?} \
-                         (expected 'trace', 'debug', 'info', or 'warn')"
+                         (expected `trace`, `debug`, `info`, or `warn`)"
                     ));
                 }
                 None => {
                     return Err(
-                        "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', 'info', or 'warn')"
+                        "ws_frame_logging: `log_level` must be a string (`trace`, `debug`, `info`, or `warn`)"
                             .to_string(),
                     );
                 }
@@ -300,12 +300,12 @@ impl WsFrameLogging {
         let include_payload_preview = match object.get("include_payload_preview") {
             Some(Value::Null) => {
                 return Err(
-                    "ws_frame_logging: 'include_payload_preview' must be a boolean; null is not allowed"
+                    "ws_frame_logging: `include_payload_preview` must be a boolean; null is not allowed"
                         .to_string(),
                 );
             }
             Some(v) => v.as_bool().ok_or_else(|| {
-                "ws_frame_logging: 'include_payload_preview' must be a boolean".to_string()
+                "ws_frame_logging: `include_payload_preview` must be a boolean".to_string()
             })?,
             None => false,
         };
@@ -315,13 +315,13 @@ impl WsFrameLogging {
         let payload_preview_bytes = match object.get("payload_preview_bytes") {
             Some(Value::Null) => {
                 return Err(
-                    "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer; null is not allowed"
+                    "ws_frame_logging: `payload_preview_bytes` must be a non-negative integer; null is not allowed"
                         .to_string(),
                 );
             }
             Some(v) => {
                 let raw = v.as_u64().ok_or_else(|| {
-                    "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer"
+                    "ws_frame_logging: `payload_preview_bytes` must be a non-negative integer"
                         .to_string()
                 })?;
                 if raw > MAX_PAYLOAD_PREVIEW_BYTES {
@@ -335,7 +335,7 @@ impl WsFrameLogging {
         };
         if include_payload_preview && payload_preview_bytes == 0 {
             return Err(
-                "ws_frame_logging: 'payload_preview_bytes' must be greater than zero when payload previews are enabled"
+                "ws_frame_logging: `payload_preview_bytes` must be greater than zero when payload previews are enabled"
                     .to_string(),
             );
         }
@@ -354,13 +354,13 @@ impl WsFrameLogging {
         let log_ping_pong = match object.get("log_ping_pong") {
             Some(Value::Null) => {
                 return Err(
-                    "ws_frame_logging: 'log_ping_pong' must be a boolean; null is not allowed"
+                    "ws_frame_logging: `log_ping_pong` must be a boolean; null is not allowed"
                         .to_string(),
                 );
             }
             Some(v) => v
                 .as_bool()
-                .ok_or_else(|| "ws_frame_logging: 'log_ping_pong' must be a boolean".to_string())?,
+                .ok_or_else(|| "ws_frame_logging: `log_ping_pong` must be a boolean".to_string())?,
             None => false,
         };
 
@@ -372,7 +372,7 @@ impl WsFrameLogging {
         if !log_level.is_admitted_by_active_dispatcher() {
             warn!(
                 target: "ws_frame_log",
-                configured_level = log_level.as_str(),
+                configured_level = %crate::startup::sanitize_startup_scalar(log_level.as_str()),
                 "ws_frame_logging is enabled but its configured log_level is filtered by the active tracing EnvFilter \
                  (gateway default FERRUM_LOG_LEVEL=warn). Frame parsing, plugin selection, and on_ws_frame / \
                  delivery-observation dispatch still occur; fingerprint/event construction is skipped. Raise \
@@ -551,9 +551,8 @@ fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
     }
     unknown.sort_unstable();
     Err(format!(
-        "ws_frame_logging: unknown configuration key(s): {}; allowed keys: {}",
-        unknown.join(", "),
-        WS_FRAME_LOGGING_CONFIG_KEYS.join(", ")
+        "ws_frame_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
+        WS_FRAME_LOGGING_CONFIG_KEYS.join("`, `")
     ))
 }
 

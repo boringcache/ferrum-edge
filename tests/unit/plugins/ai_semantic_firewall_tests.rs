@@ -362,7 +362,9 @@ fn unknown_config_properties_are_rejected_with_qualified_paths() {
         let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown property must reject configuration");
-        assert!(error.contains(path), "expected {path:?} in {error:?}");
+        let (scope, key) = path.rsplit_once('.').unwrap();
+        assert!(error.contains(&format!("`{scope}`")), "{error}");
+        assert!(error.contains(&format!("{key:?}")), "{error}");
     }
 }
 
@@ -469,7 +471,7 @@ fn deny_topics_reject_allow_action() {
     };
     assert_eq!(
         error,
-        "ai_semantic_firewall: deny_topics[0].action must be 'reject' or 'warn', got \"allow\""
+        "ai_semantic_firewall: `deny_topics[0].action` must be `reject` or `warn`, got \"allow\""
     );
 }
 
@@ -502,7 +504,7 @@ fn provider_endpoint_rejects_embedded_credentials() {
         panic!("credential-bearing provider endpoint should be rejected");
     };
     assert!(
-        error.contains("provider.endpoint must not include username or password"),
+        error.contains("`provider.endpoint` must not include username or password"),
         "unexpected error: {error}"
     );
 }
@@ -3750,31 +3752,31 @@ fn token_window_config_admission_is_field_specific() {
     let cases: Vec<(Value, &str)> = vec![
         (
             json!({"window": "tokens"}),
-            "streaming.tokenizer is required when streaming.window is 'tokens'",
+            "`streaming.tokenizer` is required when `streaming.window` is `tokens`",
         ),
         (
             json!({"window": "tokens", "tokenizer": "cl100k"}),
-            "streaming.tokenizer must be one of 'chars4', 'whitespace', or 'unicode_words'",
+            "`streaming.tokenizer` must be one of `chars4`, `whitespace`, or `unicode_words`",
         ),
         (
             json!({"window": "sentence", "tokenizer": "chars4"}),
-            "streaming.tokenizer is only valid when streaming.window is 'tokens'",
+            "`streaming.tokenizer` is only valid when `streaming.window` is `tokens`",
         ),
         (
             json!({"window": "bytes", "max_window_tokens": 16}),
-            "streaming.max_window_tokens is only valid when streaming.window is 'tokens'",
+            "`streaming.max_window_tokens` is only valid when `streaming.window` is `tokens`",
         ),
         (
             json!({"window": "paragraph", "overlap_tokens": 2}),
-            "streaming.overlap_tokens is only valid when streaming.window is 'tokens'",
+            "`streaming.overlap_tokens` is only valid when `streaming.window` is `tokens`",
         ),
         (
             json!({"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 0}),
-            "streaming.max_window_tokens must be greater than 0",
+            "`streaming.max_window_tokens` must be greater than 0",
         ),
         (
             json!({"window": "tokens", "tokenizer": "chars4", "max_window_tokens": 65_537u64}),
-            "streaming.max_window_tokens must be less than or equal to 65536",
+            "`streaming.max_window_tokens` must be less than or equal to 65536",
         ),
         (
             json!({
@@ -3783,11 +3785,11 @@ fn token_window_config_admission_is_field_specific() {
                 "max_window_tokens": 8,
                 "overlap_tokens": 8
             }),
-            "streaming.overlap_tokens must be less than streaming.max_window_tokens",
+            "`streaming.overlap_tokens` must be less than `streaming.max_window_tokens`",
         ),
         (
             json!({"window": "tokens", "tokenizer": "chars4", "token_encoding": "x"}),
-            "unknown property config.streaming.token_encoding",
+            "unknown property in `config.streaming`: \"token_encoding\"",
         ),
     ];
 
@@ -5944,43 +5946,43 @@ fn max_hold_ms_bounded_admission_is_field_specific() {
     let cases: Vec<(Value, &str)> = vec![
         (
             json!({"max_hold_ms": 0}),
-            "streaming.max_hold_ms must be greater than 0",
+            "`streaming.max_hold_ms` must be greater than 0",
         ),
         (
             json!({"max_hold_ms": 300_001u64}),
-            "streaming.max_hold_ms must be less than or equal to 300000",
+            "`streaming.max_hold_ms` must be less than or equal to 300000",
         ),
         (
             json!({"max_hold_ms": -1}),
-            "streaming.max_hold_ms must be a non-negative integer",
+            "`streaming.max_hold_ms` must be a non-negative integer",
         ),
         (
             json!({"max_hold_ms": 1.5}),
-            "streaming.max_hold_ms must be a non-negative integer",
+            "`streaming.max_hold_ms` must be a non-negative integer",
         ),
         (
             json!({"max_hold_ms": "500"}),
-            "streaming.max_hold_ms must be a non-negative integer",
+            "`streaming.max_hold_ms` must be a non-negative integer",
         ),
         (
             json!({"max_hold_ms": 1e30}),
-            "streaming.max_hold_ms must be a non-negative integer",
+            "`streaming.max_hold_ms` must be a non-negative integer",
         ),
         (
             json!({"on_hold_timeout": "forward"}),
-            "streaming.on_hold_timeout requires streaming.max_hold_ms",
+            "`streaming.on_hold_timeout` requires `streaming.max_hold_ms`",
         ),
         (
             json!({"max_hold_ms": 100, "on_hold_timeout": "explode"}),
-            "streaming.on_hold_timeout must be 'on_error', 'cut', or 'forward'",
+            "`streaming.on_hold_timeout` must be `on_error`, `cut`, or `forward`",
         ),
         (
             json!({"max_hold_ms": 100, "on_hold_timeout": "cut", "enforcement": "detect"}),
-            "streaming.on_hold_timeout 'cut' is invalid with streaming.enforcement 'detect'",
+            "`streaming.on_hold_timeout` `cut` is invalid with `streaming.enforcement` `detect`",
         ),
         (
             json!({"max_hold_seconds": 5}),
-            "unknown property config.streaming.max_hold_seconds",
+            "unknown property in `config.streaming`: \"max_hold_seconds\"",
         ),
     ];
 

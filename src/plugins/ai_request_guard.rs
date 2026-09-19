@@ -282,8 +282,8 @@ impl AiRequestGuard {
             .find(|field| !CONFIG_FIELDS.contains(&field.as_str()))
         {
             return Err(format!(
-                "ai_request_guard: unknown config field '{unknown}'; allowed fields: {}",
-                CONFIG_FIELDS.join(", ")
+                "ai_request_guard: unknown config field {unknown:?}; allowed fields: `{}`",
+                CONFIG_FIELDS.join("`, `")
             ));
         }
 
@@ -295,7 +295,7 @@ impl AiRequestGuard {
             "clamp" => MaxTokensAction::Clamp,
             other => {
                 return Err(format!(
-                    "ai_request_guard: 'enforce_max_tokens' must be one of 'reject' or 'clamp', got: {other:?}"
+                    "ai_request_guard: `enforce_max_tokens` must be one of `reject` or `clamp`, got: {other:?}"
                 ));
             }
         };
@@ -308,7 +308,7 @@ impl AiRequestGuard {
             "auto" => SupportedSchema::Auto,
             other => {
                 return Err(format!(
-                    "ai_request_guard: 'supported_schema' must be one of 'chat_completions', 'responses', 'provider_native', or 'auto', got: {other:?}"
+                    "ai_request_guard: `supported_schema` must be one of `chat_completions`, `responses`, `provider_native`, or `auto`, got: {other:?}"
                 ));
             }
         };
@@ -324,7 +324,7 @@ impl AiRequestGuard {
             && default > limit
         {
             return Err(format!(
-                "ai_request_guard: 'default_max_tokens' ({default}) must be <= 'max_tokens_limit' ({limit})"
+                "ai_request_guard: `default_max_tokens` (\"{default}\") must be <= `max_tokens_limit` (\"{limit}\")"
             ));
         }
 
@@ -345,21 +345,21 @@ impl AiRequestGuard {
         let temperature_range = if let Some(arr) = config.get("temperature_range") {
             let Some(arr) = arr.as_array() else {
                 return Err(
-                    "ai_request_guard: 'temperature_range' must be an array of two numbers"
+                    "ai_request_guard: `temperature_range` must be an array of two numbers"
                         .to_string(),
                 );
             };
             if arr.len() != 2 {
                 return Err(format!(
-                    "ai_request_guard: 'temperature_range' must have exactly 2 elements, got {}",
+                    "ai_request_guard: `temperature_range` must have exactly 2 elements, got {}",
                     arr.len()
                 ));
             }
             let Some(min) = arr[0].as_f64() else {
-                return Err("ai_request_guard: 'temperature_range[0]' must be a number".to_string());
+                return Err("ai_request_guard: `temperature_range[0]` must be a number".to_string());
             };
             let Some(max) = arr[1].as_f64() else {
-                return Err("ai_request_guard: 'temperature_range[1]' must be a number".to_string());
+                return Err("ai_request_guard: `temperature_range[1]` must be a number".to_string());
             };
             if !min.is_finite() || !max.is_finite() {
                 return Err(format!(
@@ -2187,7 +2187,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ai_request_guard: '{field}' must be a string"))
+        .ok_or_else(|| format!("ai_request_guard: `{field}` must be a string"))
 }
 
 fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
@@ -2197,7 +2197,7 @@ fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, Stri
     value
         .as_u64()
         .map(Some)
-        .ok_or_else(|| format!("ai_request_guard: '{field}' must be an unsigned integer"))
+        .ok_or_else(|| format!("ai_request_guard: `{field}` must be an unsigned integer"))
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -2207,7 +2207,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("ai_request_guard: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("ai_request_guard: `{field}` must be a boolean"))
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -2215,13 +2215,13 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("ai_request_guard: '{field}' must be an array"));
+        return Err(format!("ai_request_guard: `{field}` must be an array"));
     };
     let mut out = Vec::with_capacity(values.len());
     for value in values {
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "ai_request_guard: '{field}' must contain only strings"
+                "ai_request_guard: `{field}` must contain only strings"
             ));
         };
         out.push(value.to_string());

@@ -1867,7 +1867,7 @@ impl AiTranscriptAudit {
             config_obj,
             "config",
             AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
-            ERROR_PREFIX,
+            "ai_transcript_audit: `config`: ",
         )?;
         let empty = Value::Object(serde_json::Map::new());
 
@@ -1879,16 +1879,16 @@ impl AiTranscriptAudit {
             "hash_only" => AuditMode::HashOnly,
             other => {
                 return Err(format!(
-                    "ai_transcript_audit: 'mode' must be one of metadata_only, redacted_body, \
-                     full_body, hash_only (got {other:?})"
+                    "ai_transcript_audit: `mode` must be one of `metadata_only`, `redacted_body`, \
+                     `full_body`, `hash_only` (got {other:?})"
                 ));
             }
         };
         let allow_full_body = cfg_bool(config, "allow_full_body", false, "config")?;
         if mode == AuditMode::FullBody && !allow_full_body {
             return Err(
-                "ai_transcript_audit: mode 'full_body' captures unredacted payloads and \
-                 requires 'allow_full_body: true' to prevent accidental rollout"
+                "ai_transcript_audit: mode `full_body` captures unredacted payloads and \
+                 requires `allow_full_body: true` to prevent accidental rollout"
                     .to_string(),
             );
         }
@@ -1908,7 +1908,7 @@ impl AiTranscriptAudit {
             "full" => StreamHashScope::Full,
             other => {
                 return Err(format!(
-                    "ai_transcript_audit: 'capture.stream_hash' must be 'capped' or 'full' \
+                    "ai_transcript_audit: `capture.stream_hash` must be `capped` or `full` \
                      (got {other:?})"
                 ));
             }
@@ -1923,8 +1923,8 @@ impl AiTranscriptAudit {
         };
         if !capture.request && !capture.response && streaming == StreamingCapture::Off {
             return Err(
-                "ai_transcript_audit: at least one of capture.request, capture.response, \
-                 or capture.streaming_response must be enabled"
+                "ai_transcript_audit: at least one of `capture.request`, `capture.response`, \
+                 or `capture.streaming_response` must be enabled"
                     .to_string(),
             );
         }
@@ -1940,7 +1940,7 @@ impl AiTranscriptAudit {
         let rate = cfg_f64(sampling_obj, "rate", 1.0, "sampling")?;
         if !(0.0..=1.0).contains(&rate) {
             return Err(
-                "ai_transcript_audit: 'sampling.rate' must be between 0.0 and 1.0".to_string(),
+                "ai_transcript_audit: `sampling.rate` must be between 0.0 and 1.0".to_string(),
             );
         }
         let sampling = SamplingConfig {
@@ -1979,10 +1979,10 @@ impl AiTranscriptAudit {
             // `hash_only` exports no request-derived strings (envelope +
             // keyed hashes only), so it is exempt.
             return Err(format!(
-                "ai_transcript_audit: mode '{}' with 'redaction.builtins: []' and no \
-                 'redaction.custom_patterns' would export unredacted request-derived data; \
-                 configure at least one pattern, or use mode 'full_body' with \
-                 'allow_full_body: true' for deliberate raw capture",
+                "ai_transcript_audit: `mode` {:?} with `redaction.builtins: []` and no \
+                 `redaction.custom_patterns` would export unredacted request-derived data; \
+                 configure at least one pattern, or use mode `full_body` with \
+                 `allow_full_body: true` for deliberate raw capture",
                 mode.as_str()
             ));
         }
@@ -2000,7 +2000,7 @@ impl AiTranscriptAudit {
             && secret.chars().count() < 16
         {
             return Err(
-                "ai_transcript_audit: 'redaction.hash_secret' must be at least 16 characters"
+                "ai_transcript_audit: `redaction.hash_secret` must be at least 16 characters"
                     .to_string(),
             );
         }
@@ -2039,8 +2039,8 @@ impl AiTranscriptAudit {
             Some("raw") => PathMode::Raw,
             Some(other) => {
                 return Err(format!(
-                    "ai_transcript_audit: 'privacy.path_mode' must be one of omit, template, \
-                     redact, hash, raw (got {other:?})"
+                    "ai_transcript_audit: `privacy.path_mode` must be one of `omit`, `template`, \
+                     `redact`, `hash`, `raw` (got {other:?})"
                 ));
             }
             None => default_path_mode(mode),
@@ -2051,9 +2051,9 @@ impl AiTranscriptAudit {
         // are exempt from that body guard, so re-check here for the path.
         if path_mode == PathMode::Redact && builtins.is_empty() && custom.is_empty() {
             return Err(
-                "ai_transcript_audit: 'privacy.path_mode: redact' requires at least one \
-                 'redaction.builtins' or 'redaction.custom_patterns' pattern; otherwise the \
-                 literal path would be exported unredacted — use 'omit', 'template', or 'hash'"
+                "ai_transcript_audit: `privacy.path_mode: redact` requires at least one \
+                 `redaction.builtins` or `redaction.custom_patterns` pattern; otherwise the \
+                 literal path would be exported unredacted — use `omit`, `template`, or `hash`"
                     .to_string(),
             );
         }
@@ -2072,12 +2072,12 @@ impl AiTranscriptAudit {
         // ---- sink ----
         reject_nested_unknown_keys(config, "sink", "config.sink", AI_TRANSCRIPT_AUDIT_SINK_KEYS)?;
         let sink_obj = cfg_object(config, "sink", "sink")?
-            .ok_or("ai_transcript_audit: 'sink' configuration is required")?;
+            .ok_or("ai_transcript_audit: `sink` configuration is required")?;
         if let Some(sink_type) = cfg_str(sink_obj, "type", "sink")?
             && sink_type != "http"
         {
             return Err(format!(
-                "ai_transcript_audit: only sink.type 'http' is supported in this version \
+                "ai_transcript_audit: only `sink.type` `http` is supported in this version \
                  (got {sink_type:?})"
             ));
         }
@@ -2092,9 +2092,11 @@ impl AiTranscriptAudit {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
         {
             if !allow_insecure_loopback {
-                return Err("ai_transcript_audit: sink.endpoint_url must use https://; \
-                     local cleartext collectors require sink.allow_insecure_loopback: true"
-                    .to_string());
+                return Err(
+                    "ai_transcript_audit: `sink.endpoint_url` must use https://; \
+                     local cleartext collectors require `sink.allow_insecure_loopback`: true"
+                        .to_string(),
+                );
             }
             let loopback = endpoint_hostname.eq_ignore_ascii_case("localhost")
                 || endpoint_hostname
@@ -2102,7 +2104,7 @@ impl AiTranscriptAudit {
                     .is_ok_and(|address| address.is_loopback());
             if !loopback {
                 return Err(
-                    "ai_transcript_audit: sink.allow_insecure_loopback permits http:// only \
+                    "ai_transcript_audit: `sink.allow_insecure_loopback` permits http:// only \
                      for localhost or a loopback IP address"
                         .to_string(),
                 );
@@ -2125,7 +2127,7 @@ impl AiTranscriptAudit {
             "reject" => BufferFullPolicy::Reject,
             other => {
                 return Err(format!(
-                    "ai_transcript_audit: 'sink.on_buffer_full' must be 'drop' or 'reject' \
+                    "ai_transcript_audit: `sink.on_buffer_full` must be `drop` or `reject` \
                      (got {other:?})"
                 ));
             }
@@ -2135,7 +2137,7 @@ impl AiTranscriptAudit {
             "reject" => SinkErrorPolicy::Reject,
             other => {
                 return Err(format!(
-                    "ai_transcript_audit: 'sink.on_sink_error' must be 'warn' or 'reject' \
+                    "ai_transcript_audit: `sink.on_sink_error` must be `warn` or `reject` \
                      (got {other:?})"
                 ));
             }
@@ -2152,7 +2154,7 @@ impl AiTranscriptAudit {
             "json" => AckPolicy::Json,
             other => {
                 return Err(format!(
-                    "ai_transcript_audit: 'sink.ack_policy' must be 'drain' or 'json' \
+                    "ai_transcript_audit: `sink.ack_policy` must be `drain` or `json` \
                      (got {other:?})"
                 ));
             }
@@ -2166,13 +2168,13 @@ impl AiTranscriptAudit {
         )?;
         if ack_max_bytes < MIN_ACK_BYTES {
             return Err(format!(
-                "ai_transcript_audit: 'sink.ack_max_bytes' must be >= {MIN_ACK_BYTES}"
+                "ai_transcript_audit: `sink.ack_max_bytes` must be >= {MIN_ACK_BYTES}"
             ));
         }
         let ack_timeout_ms = cfg_u64(sink_obj, "ack_timeout_ms", DEFAULT_ACK_TIMEOUT_MS, "sink")?;
         if !(MIN_ACK_TIMEOUT_MS..=MAX_ACK_TIMEOUT_MS).contains(&ack_timeout_ms) {
             return Err(format!(
-                "ai_transcript_audit: 'sink.ack_timeout_ms' must be between \
+                "ai_transcript_audit: `sink.ack_timeout_ms` must be between \
                  {MIN_ACK_TIMEOUT_MS} and {MAX_ACK_TIMEOUT_MS}"
             ));
         }
@@ -7265,9 +7267,9 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
         .saturating_add(max_stream_capture_bytes);
     if aggregate > HARD_MAX_CAPTURE_BYTES_AGGREGATE {
         return Err(format!(
-            "ai_transcript_audit: sum of 'limits.max_request_bytes' + \
-             'limits.max_response_bytes' + 'limits.max_stream_capture_bytes' \
-             ({aggregate}) must be <= {HARD_MAX_CAPTURE_BYTES_AGGREGATE}"
+            "ai_transcript_audit: sum of `limits.max_request_bytes` + \
+             `limits.max_response_bytes` + `limits.max_stream_capture_bytes` \
+             (\"{aggregate}\") must be <= {HARD_MAX_CAPTURE_BYTES_AGGREGATE}"
         ));
     }
     let max_redaction_scan_bytes = cfg_positive_usize_capped(
@@ -7279,7 +7281,7 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
     )?;
     if max_redaction_scan_bytes < MIN_REDACTION_SCAN_BYTES {
         return Err(format!(
-            "ai_transcript_audit: 'limits.max_redaction_scan_bytes' must be >= \
+            "ai_transcript_audit: `limits.max_redaction_scan_bytes` must be >= \
              {MIN_REDACTION_SCAN_BYTES}"
         ));
     }
@@ -7293,7 +7295,7 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
         .contains(&max_stream_reservation_secs)
     {
         return Err(format!(
-            "ai_transcript_audit: 'limits.max_stream_reservation_secs' must be between \
+            "ai_transcript_audit: `limits.max_stream_reservation_secs` must be between \
              {MIN_STREAM_RESERVATION_SECS} and {HARD_MAX_STREAM_RESERVATION_SECS}"
         ));
     }
@@ -7322,8 +7324,8 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
     )?;
     if max_entry_bytes < min_entry_bytes {
         return Err(format!(
-            "ai_transcript_audit: 'limits.max_entry_bytes' ({max_entry_bytes}) must be >= \
-             {min_entry_bytes}, the worst-case serialized JSON contract implied by the configured \
+            "ai_transcript_audit: `limits.max_entry_bytes` (\"{max_entry_bytes}\") must be >= \
+             \"{min_entry_bytes}\", the worst-case serialized JSON contract implied by the configured \
              capture limits; a smaller value could make a record within that contract \
              inadmissible"
         ));
@@ -7337,15 +7339,15 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
     )?;
     if buffer_max_bytes < MIN_RETAINED_BUFFER_BYTES {
         return Err(format!(
-            "ai_transcript_audit: 'limits.buffer_max_bytes' must be >= {MIN_RETAINED_BUFFER_BYTES}"
+            "ai_transcript_audit: `limits.buffer_max_bytes` must be >= {MIN_RETAINED_BUFFER_BYTES}"
         ));
     }
     let max_entry_retained_bytes = accounted_record_bytes(max_entry_bytes);
     if buffer_max_bytes < max_entry_retained_bytes {
         return Err(format!(
-            "ai_transcript_audit: 'limits.buffer_max_bytes' ({buffer_max_bytes}) must be >= \
-             the maximum retained charge for 'limits.max_entry_bytes' \
-             ({max_entry_retained_bytes}); otherwise no record could ever be admitted"
+            "ai_transcript_audit: `limits.buffer_max_bytes` (\"{buffer_max_bytes}\") must be >= \
+             the maximum retained charge for `limits.max_entry_bytes` \
+             (\"{max_entry_retained_bytes}\"); otherwise no record could ever be admitted"
         ));
     }
     limits.max_entry_bytes = max_entry_bytes;
@@ -7363,7 +7365,7 @@ fn cfg_positive_usize_capped(
     let value = cfg_positive_usize(obj, key, default, ctx)?;
     if value > hard_max {
         return Err(format!(
-            "ai_transcript_audit: '{ctx}.{key}' must be <= {hard_max} (deployment hard maximum)"
+            "ai_transcript_audit: `{ctx}.{key}` must be <= {hard_max} (deployment hard maximum)"
         ));
     }
     Ok(value)
@@ -7484,7 +7486,7 @@ fn push_literal_segment(
     }
     if !is_header_value_safe(text) {
         return Err(format!(
-            "ai_transcript_audit: sink.custom_headers['{display_name}'] value contains bytes \
+            "ai_transcript_audit: `sink.custom_headers` key {display_name:?} value contains bytes \
              that are invalid in an HTTP header value"
         ));
     }
@@ -7508,24 +7510,24 @@ fn parse_header_template(template: &str, display_name: &str) -> Result<Vec<Heade
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
             return Err(format!(
-                "ai_transcript_audit: sink.custom_headers['{display_name}'] has an unterminated \
-                 '${{...}}' reference; only '${{secret:NAME}}' references are supported"
+                "ai_transcript_audit: `sink.custom_headers` key {display_name:?} has an unterminated \
+                 `${{...}}` reference; only `${{secret:NAME}}` references are supported"
             ));
         };
         let inner = &after[..end];
         let Some(suffix) = inner.strip_prefix("secret:") else {
             return Err(format!(
-                "ai_transcript_audit: sink.custom_headers['{display_name}'] uses an unsupported \
-                 reference '${{{inner}}}'; only '${{secret:NAME}}' is permitted (it resolves \
+                "ai_transcript_audit: `sink.custom_headers` key {display_name:?} uses an unsupported \
+                 reference {inner:?}; only `${{secret:NAME}}` is permitted (it resolves \
                  the {SINK_SECRET_ENV_PREFIX}NAME environment variable and cannot read any other \
                  process environment variable)"
             ));
         };
         if !is_valid_secret_suffix(suffix) {
             return Err(format!(
-                "ai_transcript_audit: sink.custom_headers['{display_name}'] secret reference name \
-                 '{suffix}' must be uppercase [A-Z_][A-Z0-9_]* (it resolves \
-                 {SINK_SECRET_ENV_PREFIX}{suffix})"
+                "ai_transcript_audit: `sink.custom_headers` key {display_name:?} secret reference name \
+                 {suffix:?} must be uppercase [A-Z_][A-Z0-9_]* (it resolves \
+                 `{SINK_SECRET_ENV_PREFIX}NAME`)"
             ));
         }
         segments.push(HeaderSegment::Secret(format!(
@@ -7536,7 +7538,7 @@ fn parse_header_template(template: &str, display_name: &str) -> Result<Vec<Heade
     push_literal_segment(&mut segments, rest, display_name)?;
     if segments.is_empty() {
         return Err(format!(
-            "ai_transcript_audit: sink.custom_headers['{display_name}'] value must not be empty"
+            "ai_transcript_audit: `sink.custom_headers` key {display_name:?} value must not be empty"
         ));
     }
     Ok(segments)
@@ -7573,15 +7575,15 @@ fn materialize_sink_headers(
                 HeaderSegment::Secret(env_name) => {
                     let resolved = std::env::var(env_name).map_err(|_| {
                         format!(
-                            "ai_transcript_audit: sink.custom_headers['{}'] requires environment \
-                             variable {env_name}, which is not set",
+                            "ai_transcript_audit: `sink.custom_headers` key {:?} requires environment \
+                             variable {env_name:?}, which is not set",
                             spec.display_name
                         )
                     })?;
                     if resolved.is_empty() {
                         return Err(format!(
-                            "ai_transcript_audit: sink.custom_headers['{}'] environment variable \
-                             {env_name} is set but empty",
+                            "ai_transcript_audit: `sink.custom_headers` key {:?} environment variable \
+                             {env_name:?} is set but empty",
                             spec.display_name
                         ));
                     }
@@ -7593,13 +7595,13 @@ fn materialize_sink_headers(
         // case where every segment resolved but combined to empty.
         if value.is_empty() {
             return Err(format!(
-                "ai_transcript_audit: sink.custom_headers['{}'] materialized to an empty value",
+                "ai_transcript_audit: `sink.custom_headers` key {:?} materialized to an empty value",
                 spec.display_name
             ));
         }
         let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
             format!(
-                "ai_transcript_audit: sink.custom_headers['{}'] materialized to a value that is \
+                "ai_transcript_audit: `sink.custom_headers` key {:?} materialized to a value that is \
                  not a valid HTTP header",
                 spec.display_name
             )
@@ -7612,6 +7614,7 @@ fn materialize_sink_headers(
 
 // ---- config parsing helpers ----
 
+// Callers supply only fixed schema paths; document keys must not enter the prefix.
 fn reject_nested_unknown_keys(
     parent: &Value,
     key: &str,
@@ -7619,7 +7622,7 @@ fn reject_nested_unknown_keys(
     allowed: &[&str],
 ) -> Result<(), String> {
     if let Some(Value::Object(map)) = parent.get(key) {
-        reject_unknown_keys(map, path, allowed, ERROR_PREFIX)?;
+        reject_unknown_keys(map, path, allowed, &format!("{ERROR_PREFIX}`{path}`: "))?;
     }
     Ok(())
 }
@@ -7645,25 +7648,25 @@ fn parse_custom_patterns(obj: &Value) -> Result<Vec<(String, String)>, String> {
     };
     let entries = value
         .as_array()
-        .ok_or("ai_transcript_audit: 'redaction.custom_patterns' must be an array")?;
+        .ok_or("ai_transcript_audit: `redaction.custom_patterns` must be an array")?;
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let path = format!("config.redaction.custom_patterns[{index}]");
         let map = entry
             .as_object()
-            .ok_or_else(|| format!("ai_transcript_audit: '{path}' must be an object"))?;
+            .ok_or_else(|| format!("ai_transcript_audit: `{path}` must be an object"))?;
         reject_unknown_keys(
             map,
             &path,
             AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS,
-            ERROR_PREFIX,
+            &format!("{ERROR_PREFIX}`{path}`: "),
         )?;
         let name = entry.get("name").and_then(|value| value.as_str()).ok_or_else(|| {
-            format!("ai_transcript_audit: redaction.custom_patterns[{index}] requires a string 'name'")
+            format!("ai_transcript_audit: `redaction.custom_patterns[{index}]` requires a string `name`")
         })?;
         let regex = entry.get("regex").and_then(|value| value.as_str()).ok_or_else(|| {
             format!(
-                "ai_transcript_audit: redaction.custom_patterns[{index}] requires a string 'regex'"
+                "ai_transcript_audit: `redaction.custom_patterns[{index}]` requires a string `regex`"
             )
         })?;
         out.push((name.to_string(), regex.to_string()));
@@ -7682,13 +7685,15 @@ fn parse_sink_headers(obj: &Value) -> Result<Vec<CustomHeaderSpec>, String> {
     };
     let map = value
         .as_object()
-        .ok_or("ai_transcript_audit: 'sink.custom_headers' must be an object")?;
+        .ok_or("ai_transcript_audit: `sink.custom_headers` must be an object")?;
     for (key, value) in map {
         let value = value.as_str().ok_or_else(|| {
-            format!("ai_transcript_audit: sink.custom_headers['{key}'] must be a string")
+            format!("ai_transcript_audit: `sink.custom_headers` key {key:?} must be a string")
         })?;
-        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
-            format!("ai_transcript_audit: invalid sink.custom_headers name '{key}': {error}")
+        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+            format!(
+                "ai_transcript_audit: invalid `sink.custom_headers` name {key:?}: invalid HTTP header name"
+            )
         })?;
         let segments = parse_header_template(value, key)?;
         out.retain(|spec| spec.name != name);
@@ -7705,7 +7710,7 @@ fn cfg_object<'a>(config: &'a Value, key: &str, ctx: &str) -> Result<Option<&'a 
     match config.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) if value.is_object() => Ok(Some(value)),
-        Some(_) => Err(format!("ai_transcript_audit: '{ctx}' must be an object")),
+        Some(_) => Err(format!("ai_transcript_audit: `{ctx}` must be an object")),
     }
 }
 
@@ -7714,7 +7719,7 @@ fn cfg_bool(obj: &Value, key: &str, default: bool, ctx: &str) -> Result<bool, St
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(_) => Err(format!(
-            "ai_transcript_audit: '{ctx}.{key}' must be a boolean"
+            "ai_transcript_audit: `{ctx}.{key}` must be a boolean"
         )),
     }
 }
@@ -7724,7 +7729,7 @@ fn cfg_str<'a>(obj: &'a Value, key: &str, ctx: &str) -> Result<Option<&'a str>, 
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(_) => Err(format!(
-            "ai_transcript_audit: '{ctx}.{key}' must be a string"
+            "ai_transcript_audit: `{ctx}.{key}` must be a string"
         )),
     }
 }
@@ -7733,7 +7738,7 @@ fn cfg_u64(obj: &Value, key: &str, default: u64, ctx: &str) -> Result<u64, Strin
     match obj.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(value) => value.as_u64().ok_or_else(|| {
-            format!("ai_transcript_audit: '{ctx}.{key}' must be a non-negative integer")
+            format!("ai_transcript_audit: `{ctx}.{key}` must be a non-negative integer")
         }),
     }
 }
@@ -7743,7 +7748,7 @@ fn cfg_f64(obj: &Value, key: &str, default: f64, ctx: &str) -> Result<f64, Strin
         None | Some(Value::Null) => Ok(default),
         Some(value) => value
             .as_f64()
-            .ok_or_else(|| format!("ai_transcript_audit: '{ctx}.{key}' must be a number")),
+            .ok_or_else(|| format!("ai_transcript_audit: `{ctx}.{key}` must be a number")),
     }
 }
 
@@ -7752,11 +7757,11 @@ fn cfg_positive_usize(obj: &Value, key: &str, default: usize, ctx: &str) -> Resu
         None | Some(Value::Null) => Ok(default),
         Some(value) => {
             let number = value.as_u64().ok_or_else(|| {
-                format!("ai_transcript_audit: '{ctx}.{key}' must be a positive integer")
+                format!("ai_transcript_audit: `{ctx}.{key}` must be a positive integer")
             })?;
             if number == 0 {
                 return Err(format!(
-                    "ai_transcript_audit: '{ctx}.{key}' must be greater than 0"
+                    "ai_transcript_audit: `{ctx}.{key}` must be greater than 0"
                 ));
             }
             Ok(usize::try_from(number).unwrap_or(usize::MAX))
@@ -7774,7 +7779,7 @@ fn cfg_string_array(obj: &Value, key: &str, ctx: &str) -> Result<Option<Vec<Stri
                     item.as_str()
                         .ok_or_else(|| {
                             format!(
-                                "ai_transcript_audit: '{ctx}.{key}' must be an array of strings"
+                                "ai_transcript_audit: `{ctx}.{key}` must be an array of strings"
                             )
                         })?
                         .to_string(),
@@ -7783,7 +7788,7 @@ fn cfg_string_array(obj: &Value, key: &str, ctx: &str) -> Result<Option<Vec<Stri
             Ok(Some(out))
         }
         Some(_) => Err(format!(
-            "ai_transcript_audit: '{ctx}.{key}' must be an array of strings"
+            "ai_transcript_audit: `{ctx}.{key}` must be an array of strings"
         )),
     }
 }
@@ -7798,11 +7803,11 @@ fn cfg_streaming(obj: &Value, key: &str) -> Result<StreamingCapture, String> {
             "false" => Ok(StreamingCapture::Off),
             "sampled" => Ok(StreamingCapture::Sampled),
             other => Err(format!(
-                "ai_transcript_audit: 'capture.{key}' must be false, true, or 'sampled' (got {other:?})"
+                "ai_transcript_audit: `capture.{key}` must be false, true, or `sampled` (got {other:?})"
             )),
         },
         Some(_) => Err(format!(
-            "ai_transcript_audit: 'capture.{key}' must be a boolean or 'sampled'"
+            "ai_transcript_audit: `capture.{key}` must be a boolean or `sampled`"
         )),
     }
 }
@@ -8349,20 +8354,20 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         return Ok(None);
     };
     let Some(grpc_obj) = grpc.as_object() else {
-        return Err("ai_transcript_audit: 'grpc' must be an object".to_string());
+        return Err("ai_transcript_audit: `grpc` must be an object".to_string());
     };
     reject_unknown_keys(
         grpc_obj,
         "grpc",
         AI_TRANSCRIPT_AUDIT_GRPC_CONFIG_KEYS,
-        ERROR_PREFIX,
+        "ai_transcript_audit: `grpc`: ",
     )?;
 
     let descriptor_path = cfg_str(grpc, "descriptor_path", "grpc")?
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .ok_or_else(|| {
-            "ai_transcript_audit: 'grpc.descriptor_path' is required and must be a \
+            "ai_transcript_audit: `grpc.descriptor_path` is required and must be a \
              non-empty string"
                 .to_string()
         })?
@@ -8389,12 +8394,12 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
 
     let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
         return Err(
-            "ai_transcript_audit: 'grpc.methods' is required and must be an object".to_string(),
+            "ai_transcript_audit: `grpc.methods` is required and must be an object".to_string(),
         );
     };
     if method_configs.is_empty() {
         return Err(
-            "ai_transcript_audit: 'grpc.methods' must configure at least one method".to_string(),
+            "ai_transcript_audit: `grpc.methods` must configure at least one method".to_string(),
         );
     }
 
@@ -8403,14 +8408,14 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         let normalized = normalize_grpc_method_path(method_path)?;
         let Some(method_obj) = method_config.as_object() else {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' entry must be an object".to_string(),
+                "ai_transcript_audit: a `grpc.methods` entry must be an object".to_string(),
             );
         };
         reject_unknown_keys(
             method_obj,
             "grpc.methods",
             AI_TRANSCRIPT_AUDIT_GRPC_METHOD_KEYS,
-            ERROR_PREFIX,
+            "ai_transcript_audit: `grpc.methods`: ",
         )?;
         let request_type = cfg_str(method_config, "request_type", "grpc.methods")?
             .map(str::trim)
@@ -8422,8 +8427,8 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
             .map(str::to_string);
         if request_type.is_none() && response_type.is_none() {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' entry requires 'request_type' \
-                 and/or 'response_type'"
+                "ai_transcript_audit: a `grpc.methods` entry requires `request_type` \
+                 and/or `response_type`"
                     .to_string(),
             );
         }
@@ -8435,7 +8440,7 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         };
         if methods.insert(normalized, shape).is_some() {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' method path is configured more than once"
+                "ai_transcript_audit: a `grpc.methods` method path is configured more than once"
                     .to_string(),
             );
         }
@@ -8453,7 +8458,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     let trimmed = method_path.trim();
     if trimmed.is_empty() {
         return Err(
-            "ai_transcript_audit: a 'grpc.methods' key must be a non-empty method path".to_string(),
+            "ai_transcript_audit: a `grpc.methods` key must be a non-empty method path".to_string(),
         );
     }
     if trimmed
@@ -8461,7 +8466,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
         .any(|ch| ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';'))
     {
         return Err(
-            "ai_transcript_audit: a 'grpc.methods' key must be a '/package.Service/Method' path"
+            "ai_transcript_audit: a `grpc.methods` key must be a `/package.Service/Method` path"
                 .to_string(),
         );
     }
@@ -8473,7 +8478,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     let rest = &normalized[1..];
     let Some((service, method_name)) = rest.split_once('/') else {
         return Err(
-            "ai_transcript_audit: a 'grpc.methods' key must be a '/package.Service/Method' path"
+            "ai_transcript_audit: a `grpc.methods` key must be a `/package.Service/Method` path"
                 .to_string(),
         );
     };
@@ -8484,7 +8489,7 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
         || !is_valid_grpc_identifier(method_name)
     {
         return Err(
-            "ai_transcript_audit: a 'grpc.methods' key must be a '/package.Service/Method' path"
+            "ai_transcript_audit: a `grpc.methods` key must be a `/package.Service/Method` path"
                 .to_string(),
         );
     }
@@ -8514,7 +8519,7 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
     };
     if fields.is_empty() {
         return Err(
-            "ai_transcript_audit: 'grpc.methods' 'text_fields' must not be empty".to_string(),
+            "ai_transcript_audit: `grpc.methods` `text_fields` must not be empty".to_string(),
         );
     }
     let mut parsed = Vec::with_capacity(fields.len());
@@ -8526,14 +8531,14 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
             .collect();
         if segments.iter().any(String::is_empty) {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' 'text_fields' entry must be a dotted \
+                "ai_transcript_audit: a `grpc.methods` `text_fields` entry must be a dotted \
                  field path with non-empty segments"
                     .to_string(),
             );
         }
         if segments.len() > GRPC_MAX_MESSAGE_DEPTH {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path exceeds the maximum \
+                "ai_transcript_audit: a `grpc.methods` `text_fields` path exceeds the maximum \
                  nesting depth"
                     .to_string(),
             );
@@ -8541,7 +8546,7 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
         let normalized = segments.join(".");
         if !seen.insert(normalized) {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path is configured more \
+                "ai_transcript_audit: a `grpc.methods` `text_fields` path is configured more \
                  than once"
                     .to_string(),
             );
@@ -8576,14 +8581,14 @@ fn resolve_text_field_path(root: &MessageDescriptor, path: &[String]) -> Result<
     for (index, segment) in path.iter().enumerate() {
         let Some(field) = current.get_field_by_name(segment) else {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path names a field that \
+                "ai_transcript_audit: a `grpc.methods` `text_fields` path names a field that \
                  is not in the descriptor"
                     .to_string(),
             );
         };
         if field.is_map() {
             return Err(
-                "ai_transcript_audit: a 'grpc.methods' 'text_fields' path may not traverse a \
+                "ai_transcript_audit: a `grpc.methods` `text_fields` path may not traverse a \
                  map field"
                     .to_string(),
             );
@@ -8594,14 +8599,14 @@ fn resolve_text_field_path(root: &MessageDescriptor, path: &[String]) -> Result<
             Kind::Message(next) if !last => current = next,
             _ => {
                 return Err(
-                    "ai_transcript_audit: a 'grpc.methods' 'text_fields' path must end at a \
+                    "ai_transcript_audit: a `grpc.methods` `text_fields` path must end at a \
                      string field"
                         .to_string(),
                 );
             }
         }
     }
-    Err("ai_transcript_audit: a 'grpc.methods' 'text_fields' path must not be empty".to_string())
+    Err("ai_transcript_audit: a `grpc.methods` `text_fields` path must not be empty".to_string())
 }
 
 fn resolve_grpc_shape(
@@ -8612,7 +8617,7 @@ fn resolve_grpc_shape(
     for (method_path, method) in &shape.methods {
         let request = match method.request_type.as_deref() {
             Some(name) => Some(pool.get_message_by_name(name).ok_or_else(|| {
-                "ai_transcript_audit: a 'grpc.methods' 'request_type' was not found in the \
+                "ai_transcript_audit: a `grpc.methods` `request_type` was not found in the \
                  descriptor"
                     .to_string()
             })?),
@@ -8620,7 +8625,7 @@ fn resolve_grpc_shape(
         };
         let response = match method.response_type.as_deref() {
             Some(name) => Some(pool.get_message_by_name(name).ok_or_else(|| {
-                "ai_transcript_audit: a 'grpc.methods' 'response_type' was not found in the \
+                "ai_transcript_audit: a `grpc.methods` `response_type` was not found in the \
                  descriptor"
                     .to_string()
             })?),
@@ -8645,7 +8650,7 @@ fn resolve_grpc_shape(
                         resolve_text_field_path(root, path)?;
                     } else {
                         return Err(
-                            "ai_transcript_audit: a 'grpc.methods' 'text_fields' path could \
+                            "ai_transcript_audit: a `grpc.methods` `text_fields` path could \
                              not be resolved"
                                 .to_string(),
                         );

@@ -6189,7 +6189,7 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
     match config.get(key) {
         Some(value) => value
             .as_u64()
-            .ok_or_else(|| format!("prometheus_metrics: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("prometheus_metrics: `{key}` must be an unsigned integer")),
         None => Ok(default),
     }
 }
@@ -6207,7 +6207,7 @@ fn optional_mesh_series_budget_per_family(config: &Value) -> Result<usize, Strin
     let max = MAX_MESH_SERIES_BUDGET_PER_FAMILY as u64;
     if !(min..=max).contains(&value) {
         return Err(format!(
-            "prometheus_metrics: 'mesh_series_budget_per_family' must be between \
+            "prometheus_metrics: `mesh_series_budget_per_family` must be between \
              {min} and {max} (inclusive); 0 is rejected because the mesh series \
              budget has no unlimited mode"
         ));
@@ -6235,12 +6235,12 @@ impl PrometheusMetrics {
                 config_obj,
                 "config",
                 PROMETHEUS_METRICS_CONFIG_KEYS,
-                "prometheus_metrics: ",
+                "prometheus_metrics: `config`: ",
             )?;
         }
         if config.get("schema").is_some() || config.get("schema_ref").is_some() {
             return Err(
-                "prometheus_metrics: 'schema' / 'schema_ref' is not supported \
+                "prometheus_metrics: `schema` / `schema_ref` is not supported \
                  (transaction-log schema customization applies only to log-shipping plugins; \
                  see docs/plugins.md)"
                     .to_string(),
