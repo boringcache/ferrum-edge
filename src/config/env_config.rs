@@ -7655,7 +7655,7 @@ impl EnvConfig {
             // Only values under `QUIC_INITIAL_MTU_MIN` (1200) can reach here in
             // practice, so the leaked rendering is always 1-4 digits.
             return Err(format!(
-                "FERRUM_HTTP3_INITIAL_MTU ({}) is outside quinn's legal range [{}, {}]",
+                "FERRUM_HTTP3_INITIAL_MTU ({}) is outside the legal QUIC range [{}, {}]",
                 crate::startup::quoted_config_value(
                     "FERRUM_HTTP3_INITIAL_MTU",
                     &self.http3_initial_mtu.to_string()
@@ -8330,17 +8330,17 @@ impl EnvConfig {
          FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH. File-based gateway SVID material overrides \
          automatic CA-backed issuance, so Ferrum would have no certificate authority to issue \
          SVIDs for attested downstream workloads. Remove the FERRUM_GATEWAY_SVID_* override and \
-         use FERRUM_MESH_CA_BACKEND=internal, or disable Ferrum's Workload API";
+         use FERRUM_MESH_CA_BACKEND=internal, or disable the Ferrum Workload API";
 
     /// Enabling the Workload API surface on the SPIRE backend, which can only
     /// ever issue Ferrum's own identity (issue #3617).
     const WORKLOAD_API_SPIRE_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported with \
-         FERRUM_MESH_CA_BACKEND=spire. A SPIRE agent issues only the calling process's own \
-         identity, so Ferrum cannot mint an X.509-SVID or a JWT-SVID for an attested downstream \
+         FERRUM_MESH_CA_BACKEND=spire. A SPIRE agent issues only the identity of the calling \
+         process, so Ferrum cannot mint an X.509-SVID or a JWT-SVID for an attested downstream \
          workload through it — serving the surface would either fail every request or substitute \
-         Ferrum's own SPIFFE ID. Point workloads at their local SPIRE agent socket \
+         the Ferrum SPIFFE ID. Point workloads at their local SPIRE agent socket \
          (FERRUM_MESH_SPIRE_AGENT_SOCKET) instead, or use FERRUM_MESH_CA_BACKEND=internal with \
-         FERRUM_MESH_JWT_SIGNING_KEY_PEM. Ferrum still consumes SPIRE's X.509 SVID and trust \
+         FERRUM_MESH_JWT_SIGNING_KEY_PEM. Ferrum still consumes the SPIRE X.509 SVID and trust \
          bundles for peer verification under FERRUM_MESH_CA_BACKEND=spire; only serving a \
          Workload API is refused";
 

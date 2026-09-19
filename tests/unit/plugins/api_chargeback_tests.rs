@@ -4452,19 +4452,19 @@ fn test_charges_schema_rejects_unrepresentable_shapes() {
     for (schema, needle) in [
         (
             json!({ "summary_type": "http" }),
-            "'summary_type' is not supported",
+            "`summary_type` is not supported",
         ),
         (
             json!({ "metadata": { "mode": "flatten" } }),
-            "'metadata' policy is not supported",
+            "`metadata` policy is not supported",
         ),
         (
             json!({ "order": ["proxy_id", "*"] }),
-            "'order' is not supported",
+            "`order` is not supported",
         ),
         (
             json!({ "timestamp_format": "epoch_ms" }),
-            "'timestamp_format' is not supported",
+            "`timestamp_format` is not supported",
         ),
         (
             json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
@@ -4472,7 +4472,7 @@ fn test_charges_schema_rejects_unrepresentable_shapes() {
         ),
         (
             json!({ "omit": ["latency_total_ms"] }),
-            "schema omit references unknown field \"latency_total_ms\"",
+            "schema `omit` references unknown field \"latency_total_ms\"",
         ),
         (
             json!({ "static_fields": { "api_secret": "x" } }),
@@ -4480,7 +4480,7 @@ fn test_charges_schema_rejects_unrepresentable_shapes() {
         ),
         (
             json!({ "rename": { "proxy_id": "namespace" } }),
-            "duplicate output key 'namespace'",
+            "duplicate output key \"namespace\"",
         ),
     ] {
         let err = ApiChargeback::new(&priced_config(json!({ "schema": schema })), "ferrum")

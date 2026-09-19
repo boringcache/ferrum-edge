@@ -283,9 +283,9 @@ fn prospective_graph_is_namespace_scoped_across_multiple_instances() {
     ])
     .expect_err("a referrer must not resolve a definition from another namespace");
     assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("namespace=tenant-b") && error.contains("unknown schema")),
+        errors.iter().any(|error| {
+            error.contains("namespace=\"tenant-b\"") && error.contains("unknown schema")
+        }),
         "unexpected cross-namespace errors: {errors:?}"
     );
 }
@@ -512,7 +512,7 @@ fn transaction_debugger_schema_rejects_unknown_field_with_diagnostic() {
     );
     assert!(
         err.contains(
-            "transaction_debugger: schema omit references unknown field \"request_user_agent\""
+            "transaction_debugger: schema `omit` references unknown field \"request_user_agent\""
         ),
         "got: {err}"
     );
@@ -565,15 +565,15 @@ fn api_chargeback_schema_rejects_summary_type_metadata_and_order() {
     for (schema, needle) in [
         (
             json!({ "summary_type": "http" }),
-            "'summary_type' is not supported",
+            "`summary_type` is not supported",
         ),
         (
             json!({ "metadata": { "mode": "omit" } }),
-            "'metadata' policy is not supported",
+            "`metadata` policy is not supported",
         ),
         (
             json!({ "order": ["proxy_id", "*"] }),
-            "'order' is not supported",
+            "`order` is not supported",
         ),
         (
             json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
@@ -910,7 +910,7 @@ fn non_summary_families_reject_a_named_schema_they_cannot_represent() {
         json!({ "schema_ref": "summary_only" }),
     );
     assert!(
-        err.contains("schema omit references unknown field \"request_user_agent\""),
+        err.contains("schema `omit` references unknown field \"request_user_agent\""),
         "got: {err}"
     );
 }
@@ -1007,7 +1007,7 @@ fn charge_event_family_resolves_schema_ref_and_rejects_a_colliding_definition() 
         sink_config(json!({ "schema_ref": "summary_only_target" })),
     );
     assert!(
-        err.contains("duplicate output key 'route_id' produced by native and native"),
+        err.contains("duplicate output key \"route_id\" produced by native and native"),
         "got: {err}"
     );
 

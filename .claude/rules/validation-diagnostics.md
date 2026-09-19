@@ -64,14 +64,45 @@ paths:
   federation/remote clusters, probe/injector names, node-agent addresses/paths,
   and revision identities; capture boolean/port/mark/UID/CIDR parsing and
   annotation overrides; shared unknown-key suggestions, rate-window/request/frame
-  bounds, and socket-host/egress errors. Shared helper context that may contain
-  document keys is Debug-escaped as a whole; callers must supply a separate fixed
-  schema field when one is available. WAF rule/signature ordinals and API-spec
-  extension request/response/bypass paths preserve this separate fixed context;
-  supplied override IDs and extension keys never enter the visible prefix.
-  SQL literals, fixed migration/listener/fault labels,
+  bounds, socket-host/egress errors, and notification channel/SMTP/template
+  admission. Notification unknown-key failures retain the fixed `channels`
+  schema context separately from supplied channel names and keys. Shared helper
+  context that may contain document keys is Debug-escaped as a whole; callers
+  must supply a separate fixed schema field when one is available. HTTP rate-rule
+  ordinals and GraphQL rate collection names stay in a separate schema-authored
+  prefix; supplied operation keys stay in the opaque label. WAF rule/signature
+  ordinals and API-spec extension request/response/bypass paths preserve this
+  separate fixed context; supplied override IDs and extension keys never enter
+  the visible prefix. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
+- The #5594 logging/observability conversion covers HTTP/TCP/UDP/WebSocket,
+  Kafka, file/stdout/syslog/StatsD logging, OpenTelemetry, Prometheus, transaction
+  log schemas/exporters and proxy alerts. Alert rules, recovery settings and
+  quiet-hour entries preserve fixed ordinals independently of supplied names;
+  log-schema paths and socket diagnostics retain fixed fields and reasons.
+  Registered rendered-output and captured-log tests cover constructor and
+  configuration-admission messages. Runtime transport logs outside this
+  configuration scope are not certified by the mechanical producer guard.
+- The #5594 AI conversion covers prompt/response/PII filters, provider routing,
+  semantic caching, token limits, tool governance and transcript audit admission.
+  Provider/custom-pattern ordinals and fixed tool-pattern paths survive rendering;
+  supplied tool/provider/method names, patterns, schema payloads and numeric values
+  are withheld. JSON Schema and regex admission retain fixed classifications.
+  Registered constructor/rendered-output regressions cover these configuration
+  paths independently of the scoped mechanical producer guard.
+- Shared TLS and plugin-client configuration diagnostics quote material paths,
+  source identifiers, cipher/group selections and opaque provider detail.
+  Fixed material labels, PEM/CRL record indexes and measured public-key strength
+  remain available. Custom I/O causes stay in typed fields but are omitted from
+  generic error-chain traversal; native OS causes remain chained. TLS constructor
+  logs sanitize source/proxy scalars at emission. Successful TLS policy INFO
+  events omit supplied selections (including normalized cipher/group aliases),
+  protocol versions and ordering scalars; retain fixed field names and counts.
+  Shared Redis/replay admission preserves schema fields and fixed rejection
+  reasons without supplied identities.
+  Registered loader, rendered-chain and captured-log regressions cover these
+  surfaces; source IDs retained for internal identity are not safe log labels.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
@@ -91,7 +122,7 @@ paths:
   generated shell commands also use quoted interpolation. Capture parsing has
   rendered-output and captured-log regressions. The guard scans every Rust file
   in its roots, plus the converted shared unknown-key, rate-limit, and socket-host
-  helpers, including multiline/nested macros
+  helpers and notifications, including multiline/nested macros
   and raw strings, for single-quoted interpolation in diagnostic macros and for
   named error/message captures in `warn!`/`error!` without a sanitizer call in
   that statement. Its exact, commented exception list contains SQL query syntax,

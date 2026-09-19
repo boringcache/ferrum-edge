@@ -5056,7 +5056,7 @@ fn virtual_service_routes(
             {
                 let warning = format!(
                     "VirtualService {:?}/{:?} http[{index}].fault.delay.fixedDelay is \"{}\" ms; \
-                     clamping to Ferrum's {} ms fault-delay cap",
+                     clamping to the Ferrum {} ms fault-delay cap",
                     object.metadata.namespace,
                     object.metadata.name,
                     delay.requested_ms,

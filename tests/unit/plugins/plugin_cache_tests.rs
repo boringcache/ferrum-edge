@@ -3003,7 +3003,10 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let error = cache
         .rebuild(&replacement)
         .expect_err("malformed replacement CA must reject cache publication");
-    assert!(error.contains("record #2"), "got: {error}");
+    assert!(
+        error.contains("ws_logging: invalid CA bundle"),
+        "got: {error}"
+    );
 
     let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
@@ -6143,7 +6146,7 @@ fn test_apply_delta_rejects_invalid_ai_stream_router_config_and_keeps_last_known
                 "fallback": {"on_connect_error": true}
             }),
             &[
-                "unsupported field 'fallback'",
+                "unsupported field `fallback`",
                 "provider fallback is not implemented",
             ][..],
         ),
@@ -12203,7 +12206,7 @@ async fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good()
             )
             .expect_err("unknown ai_semantic_cache key must reject reload");
         assert!(
-            error.contains("ai_semantic_cache: unknown configuration key(s):"),
+            error.contains("ai_semantic_cache: `config`: unknown configuration key(s):"),
             "unexpected reload error for {bad_config}: {error}"
         );
         let after_reject = cache.get_plugins("ferrum", "p1");

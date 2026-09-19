@@ -3550,6 +3550,41 @@ async fn test_different_seed_no_cache_hit() {
 }
 
 #[test]
+fn rendered_unknown_config_retains_context_and_suggestion_without_supplied_data() {
+    for (key, payload) in [
+        ("suppliedKey918273", json!("payloadValue918273")),
+        ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+        (
+            "'suppliedKey918273\"\\\n`suppliedTail918273`",
+            json!([918273]),
+        ),
+    ] {
+        let error = AiSemanticCache::new(
+            &json!({"ttl_secondz": payload, (key): payload}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("unknown keys must reject admission");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("ai_semantic_cache: `config`:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("did you mean `ttl_seconds`?"),
+            "{rendered}"
+        );
+        for supplied in ["918273", "ttl_secondz", "payloadKey", "payloadValue"] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
 fn unknown_retention_multimodal_isolation_size_semantic_and_redis_typos_are_rejected() {
     for (typo, suggestion) in [
         ("ttl_second", "ttl_seconds"),
@@ -3573,7 +3608,7 @@ fn unknown_retention_multimodal_isolation_size_semantic_and_redis_typos_are_reje
             "spelling suggestion missing for {typo}: {err}"
         );
         assert!(
-            err.starts_with("ai_semantic_cache: unknown configuration key(s):"),
+            err.starts_with("ai_semantic_cache: `config`: unknown configuration key(s):"),
             "unexpected prefix for {typo}: {err}"
         );
     }
@@ -3593,7 +3628,7 @@ fn multiple_unknown_keys_are_reported_deterministically_with_suggestions() {
     .expect("multiple typos must fail closed");
     assert_eq!(
         err,
-        "ai_semantic_cache: unknown configuration key(s): \
+        "ai_semantic_cache: `config`: unknown configuration key(s): \
          \"config.cache_multimoda\" (did you mean `cache_multimodal`?), \
          \"config.sync_mod\" (did you mean `sync_mode`?), \
          \"config.ttl_second\" (did you mean `ttl_seconds`?)"

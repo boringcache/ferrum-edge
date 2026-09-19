@@ -1141,10 +1141,6 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     };
     let translation = status_reuse.translation.as_ref();
 
-    for warning in &translation.warnings {
-        warn!(warning, "K8s translation warning");
-    }
-
     let managed_namespaces = managed_k8s_namespaces(
         &ctx.namespace,
         &ctx.watch_namespaces,
@@ -1952,7 +1948,15 @@ fn translate_with_skip_retries(
     std::collections::HashMap<crate::config_sources::k8s::K8sResourceKey, K8sTranslateError>,
 )> {
     let outcome = translate_k8s_objects_collecting_skips(objects, options);
-    if let Some((_, ref errors)) = outcome {
+    if let Some((ref translation, ref errors)) = outcome {
+        // Retained diagnostics also feed structured status. Sanitize only at
+        // this logging boundary, without changing the translation or status.
+        for warning in &translation.warnings {
+            warn!(
+                warning = %crate::startup::sanitize_startup_cause(warning, &[]),
+                "K8s translation warning"
+            );
+        }
         let skipped = errors.len() as u64;
         if skipped > 0 {
             metrics
@@ -1975,10 +1979,10 @@ fn log_skipped_resource(error: &K8sTranslateError) {
     match error {
         K8sTranslateError::Unsupported(resource) => {
             warn!(
-                kind = resource.kind,
-                namespace = resource.namespace,
-                name = resource.name,
-                reason = resource.reason,
+                kind = %crate::startup::sanitize_startup_scalar(&resource.kind),
+                namespace = %crate::startup::sanitize_startup_scalar(&resource.namespace),
+                name = %crate::startup::sanitize_startup_scalar(&resource.name),
+                reason = %crate::startup::sanitize_startup_cause(&resource.reason, &[]),
                 "Unsupported K8s resource skipped"
             );
         }
@@ -1989,8 +1993,11 @@ fn log_skipped_resource(error: &K8sTranslateError) {
             message,
         } => {
             warn!(
-                kind,
-                namespace, name, message, "Invalid K8s resource, skipping"
+                kind = %crate::startup::sanitize_startup_scalar(kind),
+                namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                name = %crate::startup::sanitize_startup_scalar(name),
+                message = %crate::startup::sanitize_startup_cause(message, &[]),
+                "Invalid K8s resource, skipping"
             );
         }
     }
@@ -3162,3 +3169,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/gateway_core/k8s_controller_diagnostics_tests.rs"]
+mod diagnostic_tests;

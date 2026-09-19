@@ -13361,15 +13361,15 @@ fn charge_event_schema_rejects_unrepresentable_shapes() {
     for (schema, needle) in [
         (
             json!({ "summary_type": "http" }),
-            "'summary_type' is not supported",
+            "`summary_type` is not supported",
         ),
         (
             json!({ "timestamp_format": "epoch_ms" }),
-            "'timestamp_format' is not supported",
+            "`timestamp_format` is not supported",
         ),
         (
             json!({ "metadata": { "mode": "flatten" } }),
-            "'metadata' policy is not supported",
+            "`metadata` policy is not supported",
         ),
         (
             json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
@@ -13377,7 +13377,7 @@ fn charge_event_schema_rejects_unrepresentable_shapes() {
         ),
         (
             json!({ "omit": ["latency_total_ms"] }),
-            "schema omit references unknown field \"latency_total_ms\"",
+            "schema `omit` references unknown field \"latency_total_ms\"",
         ),
         (
             json!({ "rename": { "consumer_id": "api_secret" } }),
@@ -13385,13 +13385,19 @@ fn charge_event_schema_rejects_unrepresentable_shapes() {
         ),
         (
             json!({ "rename": { "proxy_id": "namespace" } }),
-            "duplicate output key 'namespace'",
+            "duplicate output key \"namespace\"",
         ),
     ] {
         let err = compile_charge_event_projection(&sink_config_with(json!({ "schema": schema })))
             .err()
             .unwrap_or_else(|| panic!("expected rejection for {schema}"));
         assert!(err.contains(needle), "needle={needle}, got: {err}");
+        if schema.get("derived_fields").is_some() {
+            let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+            assert!(rendered.contains("`derived_fields.kind`"), "{rendered}");
+            assert!(rendered.contains("not representable"), "{rendered}");
+            assert!(!rendered.contains("backend_host"), "{rendered}");
+        }
     }
 }
 
@@ -13435,7 +13441,7 @@ fn sink_constructor_accepts_and_rejects_schemas_at_construction() {
     .err()
     .expect("unrepresentable schema is rejected at construction");
     assert!(
-        err.contains("'summary_type' is not supported"),
+        err.contains("`summary_type` is not supported"),
         "got: {err}"
     );
 }

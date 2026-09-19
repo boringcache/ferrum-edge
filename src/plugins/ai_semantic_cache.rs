@@ -465,8 +465,8 @@ impl MultimodalCacheMode {
             "exact_only" | "exact-only" => Ok(Self::ExactOnly),
             "include_fingerprints" | "include-fingerprints" => Ok(Self::IncludeFingerprints),
             other => Err(format!(
-                "ai_semantic_cache: unknown 'cache_multimodal' value '{other}' \
-                 (expected reject, exact_only, or include_fingerprints)"
+                "ai_semantic_cache: unknown `cache_multimodal` value {other:?} \
+                 (expected `reject`, `exact_only`, or `include_fingerprints`)"
             )),
         }
     }
@@ -512,9 +512,9 @@ impl EmbeddingProvider {
                 Ok(Self::BedrockCohere)
             }
             other => Err(format!(
-                "ai_semantic_cache: unknown 'semantic_embedding_provider' value '{other}' \
-                 (expected openai, azure_openai, mistral, voyage, cohere, google_gemini, \
-                 google_vertex, bedrock_titan, or bedrock_cohere)"
+                "ai_semantic_cache: unknown `semantic_embedding_provider` value {other:?} \
+                 (expected `openai`, `azure_openai`, `mistral`, `voyage`, `cohere`, `google_gemini`, \
+                 `google_vertex`, `bedrock_titan`, or `bedrock_cohere`)"
             )),
         }
     }
@@ -1120,7 +1120,7 @@ impl AiSemanticCache {
             object,
             "config",
             AI_SEMANTIC_CACHE_CONFIG_KEYS,
-            "ai_semantic_cache: ",
+            "ai_semantic_cache: `config`: ",
         )?;
 
         let ttl_seconds = optional_positive_u64(config, "ttl_seconds")?.unwrap_or(300);
@@ -1133,17 +1133,17 @@ impl AiSemanticCache {
             optional_positive_usize(config, "max_total_size_bytes")?.unwrap_or(104_857_600); // 100 MiB default
         if max_entry_size_bytes > MAX_ENTRY_SIZE_BYTES_HARD_CAP {
             return Err(format!(
-                "ai_semantic_cache: 'max_entry_size_bytes' must be <= {MAX_ENTRY_SIZE_BYTES_HARD_CAP} (deployment hard cap)"
+                "ai_semantic_cache: `max_entry_size_bytes` must be <= {MAX_ENTRY_SIZE_BYTES_HARD_CAP} (deployment hard cap)"
             ));
         }
         if max_total_size_bytes > MAX_TOTAL_SIZE_BYTES_HARD_CAP {
             return Err(format!(
-                "ai_semantic_cache: 'max_total_size_bytes' must be <= {MAX_TOTAL_SIZE_BYTES_HARD_CAP} (deployment hard cap)"
+                "ai_semantic_cache: `max_total_size_bytes` must be <= {MAX_TOTAL_SIZE_BYTES_HARD_CAP} (deployment hard cap)"
             ));
         }
         if max_entry_size_bytes > max_total_size_bytes {
             return Err(
-                "ai_semantic_cache: 'max_entry_size_bytes' must be <= 'max_total_size_bytes'"
+                "ai_semantic_cache: `max_entry_size_bytes` must be <= `max_total_size_bytes`"
                     .to_string(),
             );
         }
@@ -1194,7 +1194,7 @@ impl AiSemanticCache {
                 let key = raw.into_bytes();
                 if key.len() < MIN_REDIS_INTEGRITY_KEY_BYTES {
                     return Err(format!(
-                        "ai_semantic_cache: 'redis_integrity_key' must be at least {MIN_REDIS_INTEGRITY_KEY_BYTES} bytes"
+                        "ai_semantic_cache: `redis_integrity_key` must be at least {MIN_REDIS_INTEGRITY_KEY_BYTES} bytes"
                     ));
                 }
                 Some(Arc::<[u8]>::from(key))
@@ -1203,7 +1203,7 @@ impl AiSemanticCache {
         };
         if redis_client.is_some() && redis_integrity_key.is_none() {
             return Err(
-                "ai_semantic_cache: 'redis_integrity_key' is required when sync_mode is redis"
+                "ai_semantic_cache: `redis_integrity_key` is required when `sync_mode` is `redis`"
                     .to_string(),
             );
         }
@@ -5459,12 +5459,12 @@ fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "ai_semantic_cache: '{field}' must be an integer greater than zero"
+            "ai_semantic_cache: `{field}` must be an integer greater than zero"
         ));
     };
     if value == 0 {
         return Err(format!(
-            "ai_semantic_cache: '{field}' must be greater than zero"
+            "ai_semantic_cache: `{field}` must be greater than zero"
         ));
     }
     Ok(Some(value))
@@ -5476,7 +5476,7 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     };
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("ai_semantic_cache: '{field}' is too large for this platform"))
+        .map_err(|_| format!("ai_semantic_cache: `{field}` is too large for this platform"))
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -5486,7 +5486,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("ai_semantic_cache: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("ai_semantic_cache: `{field}` must be a boolean"))
 }
 
 fn optional_string(config: &Value, field: &'static str) -> Result<Option<String>, String> {
@@ -5496,7 +5496,7 @@ fn optional_string(config: &Value, field: &'static str) -> Result<Option<String>
     value
         .as_str()
         .map(|value| Some(value.to_string()))
-        .ok_or_else(|| format!("ai_semantic_cache: '{field}' must be a string"))
+        .ok_or_else(|| format!("ai_semantic_cache: `{field}` must be a string"))
 }
 
 fn optional_non_empty_string(
@@ -5507,7 +5507,7 @@ fn optional_non_empty_string(
         return Ok(None);
     };
     if value.trim().is_empty() {
-        return Err(format!("ai_semantic_cache: '{field}' must not be empty"));
+        return Err(format!("ai_semantic_cache: `{field}` must not be empty"));
     }
     Ok(Some(value))
 }
@@ -5526,12 +5526,12 @@ fn optional_threshold(config: &Value, field: &'static str) -> Result<Option<f32>
     };
     let Some(number) = value.as_f64() else {
         return Err(format!(
-            "ai_semantic_cache: '{field}' must be a number greater than 0 and at most 1"
+            "ai_semantic_cache: `{field}` must be a number greater than 0 and at most 1"
         ));
     };
     if !number.is_finite() || number <= 0.0 || number > 1.0 {
         return Err(format!(
-            "ai_semantic_cache: '{field}' must be greater than 0 and at most 1"
+            "ai_semantic_cache: `{field}` must be greater than 0 and at most 1"
         ));
     }
     Ok(Some(number as f32))
@@ -5560,7 +5560,7 @@ fn parse_semantic_config(
         && dimension > MAX_EMBEDDING_DIMENSIONS
     {
         return Err(format!(
-            "ai_semantic_cache: 'semantic_embedding_output_dimension' must be <= {MAX_EMBEDDING_DIMENSIONS}"
+            "ai_semantic_cache: `semantic_embedding_output_dimension` must be <= {MAX_EMBEDDING_DIMENSIONS}"
         ));
     }
     let similarity_threshold =
@@ -5569,7 +5569,7 @@ fn parse_semantic_config(
         optional_positive_usize(config, "semantic_vector_max_candidates")?.unwrap_or(16);
     if max_candidates > MAX_SEMANTIC_VECTOR_CANDIDATES_HARD_CAP {
         return Err(format!(
-            "ai_semantic_cache: 'semantic_vector_max_candidates' must be <= {MAX_SEMANTIC_VECTOR_CANDIDATES_HARD_CAP} (deployment hard cap)"
+            "ai_semantic_cache: `semantic_vector_max_candidates` must be <= {MAX_SEMANTIC_VECTOR_CANDIDATES_HARD_CAP} (deployment hard cap)"
         ));
     }
     let timeout_ms =
@@ -5577,11 +5577,11 @@ fn parse_semantic_config(
 
     let auth_header =
         reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
-            "ai_semantic_cache: 'semantic_embedding_auth_header' must be a valid HTTP header name"
+            "ai_semantic_cache: `semantic_embedding_auth_header` must be a valid HTTP header name"
                 .to_string()
         })?;
     reqwest::header::HeaderValue::from_str(&auth_scheme).map_err(|_| {
-        "ai_semantic_cache: 'semantic_embedding_auth_scheme' must be a valid HTTP header value"
+        "ai_semantic_cache: `semantic_embedding_auth_scheme` must be a valid HTTP header value"
             .to_string()
     })?;
     let auth_value = api_key
@@ -5592,7 +5592,7 @@ fn parse_semantic_config(
                 format!("{auth_scheme} {api_key}")
             };
             let mut value = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
-                "ai_semantic_cache: 'semantic_embedding_api_key' must form a valid HTTP header value"
+                "ai_semantic_cache: `semantic_embedding_api_key` must form a valid HTTP header value"
                     .to_string()
             })?;
             value.set_sensitive(true);
@@ -5605,7 +5605,7 @@ fn parse_semantic_config(
     }
 
     let endpoint = endpoint.ok_or_else(|| {
-        "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
+        "ai_semantic_cache: `semantic_embedding_endpoint` is required when `semantic_similarity_enabled=true`"
             .to_string()
     })?;
     let validated_endpoint = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
@@ -5636,10 +5636,11 @@ fn validate_semantic_embedding_endpoint(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<ValidatedSemanticEmbeddingEndpoint, String> {
     let parsed_endpoint = Url::parse(endpoint)
-        .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
+        .map_err(|_| "ai_semantic_cache: `semantic_embedding_endpoint` must be a valid URL")?;
     if !matches!(parsed_endpoint.scheme(), "http" | "https") {
         return Err(
-            "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
+            "ai_semantic_cache: `semantic_embedding_endpoint` must use `http` or `https`"
+                .to_string(),
         );
     }
     let authority_start = parsed_endpoint.scheme().len() + "://".len();
@@ -5652,13 +5653,13 @@ fn validate_semantic_embedding_endpoint(
         || parsed_endpoint.password().is_some()
     {
         return Err(
-            "ai_semantic_cache: 'semantic_embedding_endpoint' must not include username or password; use semantic_embedding_api_key for credentials"
+            "ai_semantic_cache: `semantic_embedding_endpoint` must not include username or password; use `semantic_embedding_api_key` for credentials"
                 .to_string(),
         );
     }
 
     let host = parsed_endpoint.host().ok_or_else(|| {
-        "ai_semantic_cache: 'semantic_embedding_endpoint' must include a host".to_string()
+        "ai_semantic_cache: `semantic_embedding_endpoint` must include a host".to_string()
     })?;
 
     let (literal_ip, warmup_hostname) = match host {
@@ -5671,7 +5672,7 @@ fn validate_semantic_embedding_endpoint(
         && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_semantic_cache: 'semantic_embedding_endpoint' IP {ip} denied by backend egress policy ({backend_allow_ips})"
+            "ai_semantic_cache: `semantic_embedding_endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
     }
 

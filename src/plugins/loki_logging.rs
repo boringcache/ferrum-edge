@@ -376,7 +376,7 @@ impl LokiLogging {
 
         if config_object.contains_key("include_listen_path_label") {
             return Err(
-                "loki_logging: 'include_listen_path_label' was removed; use 'include_proxy_id_label'"
+                "loki_logging: `include_listen_path_label` was removed; use `include_proxy_id_label`"
                     .to_string(),
             );
         }
@@ -385,10 +385,10 @@ impl LokiLogging {
         let (endpoint_url, endpoint_hostname) =
             parse_http_endpoint(config, "loki_logging", http_client.backend_allow_ips())?;
         let parsed_endpoint = url::Url::parse(&endpoint_url)
-            .map_err(|_| "loki_logging: invalid 'endpoint_url'".to_string())?;
+            .map_err(|_| "loki_logging: invalid `endpoint_url`".to_string())?;
         if !parsed_endpoint.username().is_empty() || parsed_endpoint.password().is_some() {
             return Err(
-                "loki_logging: 'endpoint_url' must not contain user information; use authorization_header or custom_headers"
+                "loki_logging: `endpoint_url` must not contain user information; use authorization_header or custom_headers"
                     .to_string(),
             );
         }
@@ -400,15 +400,15 @@ impl LokiLogging {
         if let Some(labels) = config.get("labels") {
             let labels_obj = labels
                 .as_object()
-                .ok_or_else(|| "loki_logging: 'labels' must be an object".to_string())?;
+                .ok_or_else(|| "loki_logging: `labels` must be an object".to_string())?;
             for (key, value) in labels_obj {
                 validate_loki_label_name(key)?;
-                let label = value
-                    .as_str()
-                    .ok_or_else(|| format!("loki_logging: 'labels.{key}' must be a string"))?;
+                let label = value.as_str().ok_or_else(|| {
+                    format!("loki_logging: `labels` key {key:?} must be a string")
+                })?;
                 if label.chars().count() > LOKI_MAX_LABEL_VALUE_CHARS {
                     return Err(format!(
-                        "loki_logging: 'labels.{key}' must be at most {LOKI_MAX_LABEL_VALUE_CHARS} characters"
+                        "loki_logging: `labels` key {key:?} must be at most {LOKI_MAX_LABEL_VALUE_CHARS} characters"
                     ));
                 }
                 static_labels.insert(key.clone(), label.to_string());
@@ -434,8 +434,9 @@ impl LokiLogging {
 
         let authorization_header = match optional_non_empty_string(config, "authorization_header")?
         {
-            Some(value) => Some(HeaderValue::from_str(&value).map_err(|error| {
-                format!("loki_logging: invalid authorization_header value: {error}")
+            Some(value) => Some(HeaderValue::from_str(&value).map_err(|_| {
+                "loki_logging: invalid `authorization_header`: invalid HTTP header value"
+                    .to_string()
             })?),
             None => None,
         };
@@ -531,7 +532,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
         Some(value) => value
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("loki_logging: '{key}' must be a boolean")),
+            .ok_or_else(|| format!("loki_logging: `{key}` must be a boolean")),
         None => Ok(None),
     }
 }
@@ -541,13 +542,13 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("loki_logging: '{key}' must be a string"))?;
+                .ok_or_else(|| format!("loki_logging: `{key}` must be a string"))?;
             if value.trim().is_empty() {
-                return Err(format!("loki_logging: '{key}' must not be empty"));
+                return Err(format!("loki_logging: `{key}` must not be empty"));
             }
             if value.trim() != value {
                 return Err(format!(
-                    "loki_logging: '{key}' must not have leading or trailing whitespace"
+                    "loki_logging: `{key}` must not have leading or trailing whitespace"
                 ));
             }
             Ok(Some(value.to_string()))
@@ -562,13 +563,13 @@ fn validate_custom_header_name_lengths(config: &Value) -> Result<(), String> {
     };
     let headers = headers
         .as_object()
-        .ok_or_else(|| "loki_logging: 'custom_headers' must be an object".to_string())?;
+        .ok_or_else(|| "loki_logging: `custom_headers` must be an object".to_string())?;
     if let Some(name) = headers
         .keys()
         .find(|name| name.len() > LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
     {
         return Err(format!(
-            "loki_logging: custom_headers name is {} bytes; maximum is {LOKI_MAX_CUSTOM_HEADER_NAME_BYTES}",
+            "loki_logging: custom_headers name is \"{}\" bytes; maximum is {LOKI_MAX_CUSTOM_HEADER_NAME_BYTES}",
             name.len()
         ));
     }
@@ -583,7 +584,7 @@ fn validate_known_config_fields(config: &serde_json::Map<String, Value>) -> Resu
     unknown.sort_unstable();
     if let Some(key) = unknown.first() {
         return Err(format!(
-            "loki_logging: unknown configuration field 'config.{key}'"
+            "loki_logging: unknown configuration field {key:?} at `config`"
         ));
     }
     Ok(())
@@ -600,11 +601,11 @@ fn bounded_u64(
         None => default,
         Some(value) => value
             .as_u64()
-            .ok_or_else(|| format!("loki_logging: '{key}' must be an integer"))?,
+            .ok_or_else(|| format!("loki_logging: `{key}` must be an integer"))?,
     };
     if !(minimum..=maximum).contains(&value) {
         return Err(format!(
-            "loki_logging: '{key}' must be between {minimum} and {maximum}"
+            "loki_logging: `{key}` must be between {minimum} and {maximum}"
         ));
     }
     Ok(value)
@@ -641,7 +642,7 @@ fn validate_loki_resource_config(
     )? as usize;
     if buffer_max_bytes < max_entry_bytes {
         return Err(
-            "loki_logging: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+            "loki_logging: `buffer_max_bytes` must be greater than or equal to `max_entry_bytes`"
                 .to_string(),
         );
     }
@@ -871,7 +872,7 @@ fn validate_minimum_entry_budget(
         })?;
     if minimum_retained_bytes > max_entry_bytes {
         return Err(format!(
-            "loki_logging: `max_entry_bytes` must fit a minimum serialized HTTP and stream entry plus configured, reserved, and worst-case dynamic label values (requires at least {minimum_retained_bytes} bytes, configured \"{max_entry_bytes}\")"
+            "loki_logging: `max_entry_bytes` must fit a minimum serialized HTTP and stream entry plus configured, reserved, and worst-case dynamic label values (requires at least \"{minimum_retained_bytes}\" bytes, configured \"{max_entry_bytes}\")"
         ));
     }
     Ok(())

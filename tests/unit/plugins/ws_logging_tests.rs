@@ -254,8 +254,7 @@ async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
     )
     .err()
     .expect("a malformed later CA record must reject plugin construction");
-    assert!(error.contains("ws_logging CA bundle"), "got: {error}");
-    assert!(error.contains("record #2"), "got: {error}");
+    assert_eq!(error, "ws_logging: invalid CA bundle");
 }
 
 #[tokio::test]
@@ -276,7 +275,7 @@ async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
     )
     .err()
     .expect("an all-malformed CA bundle must reject plugin construction");
-    assert!(error.contains("record #1"), "got: {error}");
+    assert_eq!(error, "ws_logging: invalid CA bundle");
 }
 
 #[tokio::test]
@@ -293,7 +292,7 @@ async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
     )
     .err()
     .expect("an empty custom CA store must reject plugin construction");
-    assert!(error.contains("no valid PEM certificates"), "got: {error}");
+    assert!(error.contains("invalid CA bundle"), "got: {error}");
 }
 
 #[tokio::test]
@@ -354,7 +353,7 @@ async fn test_ws_logging_rejects_malformed_endpoint_url() {
         default_client(),
     );
     match result {
-        Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
+        Err(e) => assert!(e.contains("invalid `endpoint_url`")),
         Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
     }
 }

@@ -104,8 +104,8 @@ fn test_missing_schemas_key_rejected() {
     let _g = registry_lock();
     registry::reset_for_tests();
     let err =
-        TransactionLogSchema::new(&json!({})).expect_err("missing 'schemas' must be rejected");
-    assert!(err.contains("'schemas' is required"), "got: {err}");
+        TransactionLogSchema::new(&json!({})).expect_err("missing `schemas` must be rejected");
+    assert!(err.contains("`schemas` is required"), "got: {err}");
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_empty_schemas_object_rejected() {
     let _g = registry_lock();
     registry::reset_for_tests();
     let err = TransactionLogSchema::new(&json!({ "schemas": {} }))
-        .expect_err("empty 'schemas' object must be rejected");
+        .expect_err("empty `schemas` object must be rejected");
     assert!(err.contains("at least one"), "got: {err}");
 }
 
@@ -132,7 +132,7 @@ fn test_schemas_not_object_rejected() {
     let _g = registry_lock();
     registry::reset_for_tests();
     let err = TransactionLogSchema::new(&json!({ "schemas": [] }))
-        .expect_err("array-typed 'schemas' must be rejected");
+        .expect_err("array-typed `schemas` must be rejected");
     assert!(err.contains("must be an object"), "got: {err}");
 }
 
@@ -145,8 +145,8 @@ fn test_unknown_outer_config_key_rejected_with_path() {
         "strict": true
     }))
     .expect_err("unknown outer config keys must be rejected");
-    assert!(err.contains("unknown config key 'strict'"), "got: {err}");
-    assert!(err.contains("config.strict"), "got: {err}");
+    assert!(err.contains("unknown config key \"strict\""), "got: {err}");
+    assert!(err.contains("`config`"), "got: {err}");
 }
 
 // ── Empty schema name ───────────────────────────────────────────────
@@ -175,7 +175,7 @@ fn test_invalid_inner_schema_unknown_field_rejected() {
     }))
     .expect_err("schema with unknown field must be rejected");
     // The compile error is prefixed with the schema entry label.
-    assert!(err.contains("[bad]"), "got: {err}");
+    assert!(err.contains("entry \"bad\""), "got: {err}");
     assert!(
         err.contains("unknown field \"not_a_real_field\""),
         "got: {err}"
@@ -192,8 +192,8 @@ fn test_invalid_inner_schema_unknown_top_level_key_rejected() {
         }
     }))
     .expect_err("schema with typo'd top-level key must be rejected");
-    assert!(err.contains("[typo]"), "got: {err}");
-    assert!(err.contains("unknown schema key 'renaime'"), "got: {err}");
+    assert!(err.contains("entry \"typo\""), "got: {err}");
+    assert!(err.contains("unknown schema key \"renaime\""), "got: {err}");
 }
 
 #[test]
@@ -210,8 +210,11 @@ fn test_unknown_derived_field_entry_key_rejected_with_path() {
         }
     }))
     .expect_err("unknown derived-field keys must be rejected");
-    assert!(err.contains("[audit]"), "got: {err}");
-    assert!(err.contains("derived_fields[0].from"), "got: {err}");
+    assert!(err.contains("entry \"audit\""), "got: {err}");
+    assert!(
+        err.contains("\"from\" at `derived_fields[0]`"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -229,8 +232,8 @@ fn test_unknown_metadata_key_rejected_with_path() {
         }
     }))
     .expect_err("unknown metadata keys must be rejected");
-    assert!(err.contains("[audit]"), "got: {err}");
-    assert!(err.contains("metadata.on_collison"), "got: {err}");
+    assert!(err.contains("entry \"audit\""), "got: {err}");
+    assert!(err.contains("\"on_collison\" at `metadata`"), "got: {err}");
 }
 
 #[test]
@@ -244,7 +247,7 @@ fn test_invalid_inner_schema_bad_summary_type_rejected() {
     }))
     .expect_err("schema with bogus summary_type must be rejected");
     assert!(
-        err.contains("'summary_type' must be 'http', 'stream', or 'both'"),
+        err.contains("`summary_type` must be `http`, `stream`, or `both`"),
         "got: {err}"
     );
 }
@@ -280,7 +283,7 @@ fn test_multi_entry_with_one_invalid_rejects_whole_config() {
         }
     }))
     .expect_err("config containing an invalid schema must be rejected");
-    assert!(err.contains("[bad]"), "got: {err}");
+    assert!(err.contains("entry \"bad\""), "got: {err}");
 }
 
 // ── Registry interaction: validation-mode is a no-op ────────────────
@@ -328,7 +331,7 @@ fn test_metadata_options_are_validated_in_nested_and_omit_modes() {
     for mode in ["nested", "omit", "flatten"] {
         let err = validate_schema(json!({ "metadata": { "mode": mode, "prefix": 3 } }))
             .expect_err("a non-string metadata.prefix must be rejected");
-        assert_contains(&err, "'metadata.prefix' must be a string");
+        assert_contains(&err, "`metadata.prefix` must be a string");
 
         let err = validate_schema(json!({
             "metadata": { "mode": mode, "prefix": "bad\u{1}" }
@@ -340,13 +343,13 @@ fn test_metadata_options_are_validated_in_nested_and_omit_modes() {
             "metadata": { "mode": mode, "on_collision": "bad" }
         }))
         .expect_err("an unknown metadata.on_collision must be rejected");
-        assert_contains(&err, "must be 'skip' or 'overwrite'");
+        assert_contains(&err, "must be `skip` or `overwrite`");
 
         let err = validate_schema(json!({
             "metadata": { "mode": mode, "on_collision": 7 }
         }))
         .expect_err("a non-string metadata.on_collision must be rejected");
-        assert_contains(&err, "'metadata.on_collision' must be a string");
+        assert_contains(&err, "`metadata.on_collision` must be a string");
     }
 }
 
@@ -365,7 +368,10 @@ fn test_unknown_metadata_mode_still_names_the_mode() {
     // Option validation must not steal the diagnostic from an unknown mode.
     let err = validate_schema(json!({ "metadata": { "mode": "nope", "prefix": 3 } }))
         .expect_err("unknown mode rejected");
-    assert_contains(&err, "must be 'nested', 'omit', or 'flatten' (got 'nope')");
+    assert_contains(
+        &err,
+        "must be `nested`, `omit`, or `flatten` (got \"nope\")",
+    );
 }
 
 // ── Native gRPC message counters are projectable ────────────────────
@@ -660,4 +666,53 @@ fn test_every_published_cookbook_schema_passes_admission() {
         compiled_any,
         "no cookbook block carried a schema definition"
     );
+}
+
+#[test]
+fn startup_diagnostics_withhold_schema_names_keys_and_output_fields() {
+    let secret = "'diagnostic-marker-5594`\"\\\n";
+    for (schema, context) in [
+        (json!(false), "`schema` must be an object"),
+        (json!({secret: true}), "unknown schema key"),
+        (
+            json!({"metadata": {"mode": secret}}),
+            "`metadata.mode` must be `nested`, `omit`, or `flatten`",
+        ),
+        (
+            json!({"static_fields": {secret: null}}),
+            "`static_fields` value for",
+        ),
+        (
+            json!({"derived_fields": [{"name": "safe", "kind": "outcome", secret: 1}]}),
+            "`derived_fields[0]`",
+        ),
+        (
+            json!({"rename": {"proxy_id": secret}, "order": []}),
+            "`order` missing entries",
+        ),
+        (
+            json!({"static_fields": {secret: "safe"}, "rename": {"proxy_id": secret}}),
+            "duplicate output key",
+        ),
+        (
+            json!({"order": [secret, "*"]}),
+            "`order` references unknown output key",
+        ),
+    ] {
+        let error = validate_plugin_config(
+            "transaction_log_schema",
+            &json!({"schemas": {secret: schema}}),
+        )
+        .expect_err("invalid named schema must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("transaction_log_schema"), "{rendered}");
+        assert!(rendered.contains(context), "{rendered}");
+        assert!(!rendered.contains("diagnostic-marker-5594"), "{rendered}");
+    }
+
+    let error = validate_schema(json!({"omit": ["proxy_idd"]})).unwrap_err();
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains("schema `omit`"), "{rendered}");
+    assert!(rendered.contains("did you mean `proxy_id`"), "{rendered}");
+    assert!(!rendered.contains("proxy_idd"), "{rendered}");
 }

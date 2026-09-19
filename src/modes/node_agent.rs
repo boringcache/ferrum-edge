@@ -815,13 +815,23 @@ pub(crate) mod ingress_redirect_routing_seam {
 
 #[cfg(all(target_os = "linux", not(test)))]
 fn install_ingress_redirect_routing_impl(supports_ipv6: bool) -> Result<(), String> {
+    install_ingress_redirect_routing_with(supports_ipv6, |args| {
+        std::process::Command::new("ip").args(args).output()
+    })
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn install_ingress_redirect_routing_with(
+    supports_ipv6: bool,
+    mut execute: impl FnMut(&[String]) -> std::io::Result<std::process::Output>,
+) -> Result<(), String> {
     for ipv6 in [false, true] {
         if ipv6 && !supports_ipv6 {
             continue;
         }
         for args in ingress_redirect_routing_commands(ipv6) {
             let best_effort = args.iter().any(|arg| arg == "del");
-            match std::process::Command::new("ip").args(&args).output() {
+            match execute(&args) {
                 Ok(output) if output.status.success() => {}
                 Ok(output) if best_effort => {
                     debug!(
@@ -832,13 +842,19 @@ fn install_ingress_redirect_routing_impl(supports_ipv6: bool) -> Result<(), Stri
                 }
                 Ok(output) => {
                     return Err(format!(
-                        "`ip {}` failed: {}",
+                        "`ip {}` failed with {}; provider details withheld. \
+                         Ensure iproute2 is installed and the container has NET_ADMIN",
                         args.join(" "),
-                        String::from_utf8_lossy(&output.stderr).trim()
+                        output.status
                     ));
                 }
                 Err(e) => {
-                    return Err(format!("could not run `ip {}`: {e}", args.join(" ")));
+                    return Err(format!(
+                        "could not run `ip {}` ({:?}); provider details withheld. \
+                         Ensure iproute2 is installed and the container has NET_ADMIN",
+                        args.join(" "),
+                        e.kind()
+                    ));
                 }
             }
         }
@@ -9765,15 +9781,30 @@ fn ip6tables_best_effort_wrapped_command_for_table(cmd: &str, table: &str) -> St
 /// `IptablesPlan::for_config` / `cleanup_commands`, both of which use
 /// hardcoded chain names and operator inputs validated upstream
 /// (`validate_cidr_list`, `parse_port_list`, `parse_proxy_uid`).
-async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(), anyhow::Error> {
+async fn execute_iptables_commands(
+    commands: &[String],
+    phase: &'static str,
+) -> Result<(), anyhow::Error> {
+    execute_iptables_commands_with(commands, phase, |cmd| {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(cmd);
+        async move { command.output().await }
+    })
+    .await
+}
+
+async fn execute_iptables_commands_with<F, Fut>(
+    commands: &[String],
+    phase: &'static str,
+    mut execute: F,
+) -> Result<(), anyhow::Error>
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<std::process::Output>>,
+{
     for cmd in commands {
         debug!(command = %crate::startup::sanitize_startup_scalar(cmd), phase, "Executing iptables command");
-        match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .await
-        {
+        match execute(cmd).await {
             Ok(output) => {
                 if output.status.success() {
                     debug!(command = %crate::startup::sanitize_startup_scalar(cmd), phase, "iptables command succeeded");
@@ -9788,9 +9819,9 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(
                         "iptables command failed"
                     );
                     anyhow::bail!(
-                        "iptables {phase} command failed with exit code {:?}: {}",
-                        exit_code,
-                        stderr.trim()
+                        "iptables {phase} command failed with {}; provider details \
+                         withheld. Verify iptables/ip6tables availability and NET_ADMIN",
+                        output.status
                     );
                 }
             }
@@ -9802,12 +9833,23 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(
                     "Failed to spawn iptables command"
                 );
                 return Err(anyhow::anyhow!(
-                    "failed to spawn iptables {phase} command: {e}"
+                    "failed to spawn iptables {phase} command ({:?}); provider details withheld. \
+                     Verify /bin/sh and iptables/ip6tables availability and execution permissions",
+                    e.kind()
                 ));
             }
         }
     }
     Ok(())
+}
+
+// Backend errors are opaque provider strings. Retaining one as an inner
+// cause would bypass the safe outer diagnostic at final startup rendering.
+fn backend_startup_error(operation: &'static str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "node-agent eBPF {operation} failed (backend details withheld). Verify kernel eBPF \
+         support, cgroup/bpffs mounts, and BPF permissions before retrying startup"
+    )
 }
 
 fn initialize_backend(
@@ -9826,10 +9868,10 @@ fn initialize_backend(
         );
     }
 
-    if let Err(e) = backend.load_programs() {
+    if backend.load_programs().is_err() {
         metrics.set_topology_degraded("capture_unavailable");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-        return Err(anyhow::Error::msg(e));
+        return Err(backend_startup_error("program load"));
     }
 
     // Single owner of the inbound-redirect ROUTING teardown across this
@@ -9868,14 +9910,17 @@ fn initialize_backend_after_load(
     routing_installed: &std::cell::Cell<bool>,
 ) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
-    if let Err(e) = backend.update_capture_config(
-        &config
-            .capture_contract
-            .bpf_capture_config_for_topology(false),
-    ) {
+    if backend
+        .update_capture_config(
+            &config
+                .capture_contract
+                .bpf_capture_config_for_topology(false),
+        )
+        .is_err()
+    {
         metrics.set_topology_degraded("capture_unavailable");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-        return Err(anyhow::Error::msg(e));
+        return Err(backend_startup_error("capture configuration map update"));
     }
 
     if require_sock_ops {
@@ -9888,17 +9933,17 @@ fn initialize_backend_after_load(
             }
         };
         for ip in &node_source_ips.ipv4 {
-            if let Err(e) = backend.update_node_ip(*ip) {
+            if backend.update_node_ip(*ip).is_err() {
                 metrics.set_topology_degraded("capture_unavailable");
                 metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-                return Err(anyhow::Error::msg(e));
+                return Err(backend_startup_error("IPv4 node source map update"));
             }
         }
         for ip in &node_source_ips.ipv6 {
-            if let Err(e) = backend.update_node_ip6(*ip) {
+            if backend.update_node_ip6(*ip).is_err() {
                 metrics.set_topology_degraded("capture_unavailable");
                 metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-                return Err(anyhow::Error::msg(e));
+                return Err(backend_startup_error("IPv6 node source map update"));
             }
         }
         if node_source_ips.is_empty() {
@@ -9928,32 +9973,32 @@ fn initialize_backend_after_load(
     }
 
     if let Some(uid) = config.capture_config.proxy_uid
-        && let Err(e) = backend.update_bypass_uid(uid)
+        && backend.update_bypass_uid(uid).is_err()
     {
         metrics.set_topology_degraded("capture_unavailable");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-        return Err(anyhow::Error::msg(e));
+        return Err(backend_startup_error("proxy UID bypass map update"));
     }
 
     for cidr in &config.capture_config.include_cidrs {
-        if let Err(e) = backend.update_cidr_include(cidr) {
+        if backend.update_cidr_include(cidr).is_err() {
             metrics.set_topology_degraded("capture_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-            return Err(anyhow::Error::msg(e));
+            return Err(backend_startup_error("include CIDR map update"));
         }
     }
     for cidr in &config.capture_config.exclude_cidrs {
-        if let Err(e) = backend.update_cidr_exclude(cidr) {
+        if backend.update_cidr_exclude(cidr).is_err() {
             metrics.set_topology_degraded("capture_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-            return Err(anyhow::Error::msg(e));
+            return Err(backend_startup_error("exclude CIDR map update"));
         }
     }
     for port in &config.capture_config.exclude_ports {
-        if let Err(e) = backend.update_port_exclude(*port) {
+        if backend.update_port_exclude(*port).is_err() {
             metrics.set_topology_degraded("capture_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-            return Err(anyhow::Error::msg(e));
+            return Err(backend_startup_error("excluded port map update"));
         }
     }
     // Per-pod `includeOutboundPorts` narrowing is applied later in
@@ -9972,7 +10017,7 @@ fn initialize_backend_after_load(
         // Surface it as topology degradation (gauge + error) — not a quiet
         // telemetry warning — and refuse readiness so operators see identity
         // resolution is down before traffic is admitted.
-        if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
+        if backend.attach_sock_ops(&config.cgroup_root).is_err() {
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
             error!(
@@ -9987,7 +10032,8 @@ fn initialize_backend_after_load(
             );
             anyhow::bail!(
                 "node-waypoint eBPF capture requires the SOCK_OPS identity bridge to attach; \
-                 source workload identity resolution would be unavailable: {e}"
+                 source workload identity resolution would be unavailable. SOCK_OPS attachment \
+                 failed (backend details withheld). Verify the cgroup root and BPF permissions"
             );
         }
     }
@@ -10026,7 +10072,7 @@ fn initialize_backend_after_load(
         // after `cleanup_all` has retried the classifier detach.
         routing_installed.set(true);
         for iface in &config.capture_contract.ingress_redirect_ifaces {
-            if let Err(e) = backend.attach_ingress_redirect(iface) {
+            if backend.attach_ingress_redirect(iface).is_err() {
                 // Fail closed and unwind: a half-attached redirect would capture
                 // inbound traffic on some interfaces and not others, which is
                 // exactly the ambiguous state this feature exists to remove.
@@ -10049,7 +10095,7 @@ fn initialize_backend_after_load(
                 metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
                 anyhow::bail!(
                     "Failed to attach the NodeWaypoint inbound tc ingress redirect to \
-                     {iface:?}: {e}. Verify the interface exists on this node \
+                     {iface:?} (backend details withheld). Verify the interface exists on this node \
                      (FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES) and the container has \
                      NET_ADMIN."
                 );
@@ -10087,7 +10133,12 @@ fn initialize_backend_after_load(
             metrics.set_topology_degraded("capture_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         }
-        anyhow::bail!("node-agent eBPF startup validation failed: {e}");
+        let failure = if require_sock_ops && e.contains("SOCK_OPS") {
+            "SOCK_OPS identity bridge readiness validation"
+        } else {
+            "startup validation"
+        };
+        return Err(backend_startup_error(failure));
     }
 
     if ingress_redirect_enabled {
@@ -10735,21 +10786,32 @@ mod tests {
     }
 
     #[test]
-    fn rollback_logs_withhold_opaque_original_error_without_replacing_it() {
+    fn rollback_retains_safe_original_failure_through_final_rendering() {
         let mut backend = MockEbpfBackend {
+            fail_update_capture_config: true,
             fail_cleanup_all: true,
             ..MockEbpfBackend::default()
         };
-        let routing = std::cell::Cell::new(false);
-        let original = anyhow::anyhow!("bare UNREGISTERED_provider 'unbalanced\" payload");
-        let ((), logs) = crate::modes::tests::capture_logs(|| {
-            LoadedBackendRollback::new(&mut backend, &routing).roll_back(&original);
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let metrics = NodeAgentMetrics::default();
+        let (error, logs) = crate::modes::tests::capture_logs(|| {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("capture map failure must survive failed rollback")
         });
         assert!(logs.contains("Failed to roll back BPF state"), "{logs}");
         assert!(logs.contains("original_error="), "{logs}");
-        assert!(!logs.contains("UNREGISTERED_provider"), "{logs}");
+        assert!(!logs.contains("capture config update failed"), "{logs}");
         assert!(!logs.contains("injected cleanup_all failure"), "{logs}");
-        assert!(original.to_string().contains("UNREGISTERED_provider"));
+        let rendered = crate::startup::render_startup_error(error, &[]);
+        assert!(
+            rendered.contains("capture configuration map update failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("backend details withheld"), "{rendered}");
+        assert!(
+            !rendered.contains("injected cleanup_all failure"),
+            "{rendered}"
+        );
         assert_eq!(backend.cleanup_all_calls, 1);
     }
 
@@ -11767,9 +11829,12 @@ mod tests {
         let calls = ingress_redirect_routing_seam::take_calls();
         let entries = op_log.lock().unwrap().clone();
 
+        let rendered = crate::startup::render_startup_error(err, &[]);
+        assert!(rendered.contains("startup validation failed"), "{rendered}");
+        assert!(rendered.contains("backend details withheld"), "{rendered}");
         assert!(
-            err.to_string().contains("startup validation failed"),
-            "{err}"
+            !rendered.contains("injected startup validation failure"),
+            "{rendered}"
         );
         assert_eq!(calls.installs, 1);
         assert_eq!(
@@ -12159,9 +12224,19 @@ mod tests {
         assert!(logs.contains("SOCK_OPS attachment failed"), "{logs}");
         assert!(!logs.contains("UNREGISTERED_sock_ops"), "{logs}");
         assert!(!logs.contains("sock_ops attach failed"), "{logs}");
-        assert!(err.to_string().contains("sock_ops attach failed"));
+        let rendered = crate::startup::render_startup_error(err, &[]);
+        assert!(!rendered.contains("sock_ops attach failed"), "{rendered}");
+        assert!(!rendered.contains("UNREGISTERED"), "{rendered}");
+        assert!(
+            rendered.contains("SOCK_OPS attachment failed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Verify the cgroup root and BPF permissions"),
+            "{rendered}"
+        );
 
-        assert!(err.to_string().contains("SOCK_OPS identity bridge"));
+        assert!(rendered.contains("SOCK_OPS identity bridge"), "{rendered}");
         assert!(backend.cleaned_up);
         assert_eq!(backend.cleanup_all_calls, 1);
         // Read the attach state from the pre-rollback snapshot: rollback's
@@ -12259,7 +12334,16 @@ mod tests {
         let err = initialize_backend(&mut backend, &config, &metrics)
             .expect_err("capture-config failure should abort initialization");
 
-        assert!(err.to_string().contains("capture config update failed"));
+        let rendered = crate::startup::render_startup_error(err, &[]);
+        assert!(
+            rendered.contains("capture configuration map update failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("backend details withheld"), "{rendered}");
+        assert!(
+            rendered.contains("BPF permissions before retrying startup"),
+            "{rendered}"
+        );
         assert!(backend.programs_loaded);
         assert!(backend.cleaned_up);
         assert_eq!(backend.cleanup_all_calls, 1);
@@ -21076,3 +21160,7 @@ mod tests {
         assert_eq!(identity.workload_spiffe_hash, workload_spiffe_hash(&spiffe));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/unit/gateway_core/node_agent_provider_diagnostics_tests.rs"]
+mod provider_diagnostic_tests;
