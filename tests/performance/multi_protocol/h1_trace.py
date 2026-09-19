@@ -25,10 +25,9 @@ import time
 from process_usage import capture, parse_stat
 from transport_diagnostics import parse_diag
 from h1_trace_contract import (BOUNDS, LOSSES, SYSCALLS, COUNTERS, validate_record,
-                               syscall_coverage, fd_lifetimes, decode_cpu)
-# Use the settled H3 clock consumer; its sibling import is scoped explicitly.
+                               syscall_coverage, fd_lifetimes, decode_cpu, clock_receipt_window)
+# The shared hosted artifact scrubber's sibling import is scoped explicitly.
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'h3_proof'))
-from live_contract import measurement_window
 from hosted import scrub
 
 HERE = Path(__file__).resolve().parent
@@ -69,6 +68,31 @@ def clock():
     unix = time.time_ns()
     return dict(before_ns=before, unix_ns=unix,
                 after_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+
+
+def clock_receipt():
+    """Timestamp receipt in this producer's actual boot and time namespace."""
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    namespace = Path('/proc/self/ns/time').stat().st_ino
+    return dict(clock(), kind='clock_receipt', clock='CLOCK_MONOTONIC',
+                boot_id=boot, time_namespace=namespace)
+
+
+def write_binding(output, *, runtime, config, sample, arm, pair, payload, raw_sample, client_exit):
+    """Fixed data-only runner command; future client artifacts need not exist yet."""
+    paths = dict(runtime=runtime, config=config, sample=sample,
+                 raw_sample=raw_sample, client_exit=client_exit)
+    if (arm not in ('ferrum', 'ferrum-baseline', 'ferrum-exp-cutoff-one')
+            or type(pair) is not int or not 1 <= pair <= 4
+            or type(payload) is not int or payload not in (10240, 71680, 512000, 1048576, 5242880)):
+        raise ValueError('invalid H1 trace binding selection')
+    for path in (output, *paths.values()):
+        if not Path(path).is_absolute() or '..' in Path(path).parts:
+            raise ValueError('H1 trace binding requires absolute artifact paths')
+    destination = Path(output) / 'bind.json'
+    if destination.exists():
+        raise ValueError('H1 trace binding already exists')
+    write(destination, dict(paths, arm=arm, pair=pair, payload=payload))
 
 
 def identity(pid):
@@ -181,6 +205,8 @@ class CaptureLifecycle:
             return
         request = json.loads((self.out / 'teardown-request.json').read_text())
         now = clock()
+        if not isinstance(request, dict) or not isinstance(request.get('at'), dict):
+            raise ValueError('stale/mismatched teardown request')
         at = request['at']
         if (request.get('session') != self.ready['session'] or
                 request.get('binding_sha256') != self.ready['binding_sha256'] or
@@ -192,7 +218,8 @@ class CaptureLifecycle:
         evidence = completion_evidence(self.binding)
         if request.get('evidence') != evidence:
             raise ValueError('client completion changed after retention')
-        window = measurement_window(evidence['phases'], [dict(clock=self.ready['at']), dict(clock=at)])
+        window = clock_receipt_window(evidence['phases'], [self.ready['at'], at],
+            boot_id=self.owner['boot_id'], time_namespace=self.owner['namespaces']['time'])
         if not window.get('valid'):
             raise ValueError('completion does not bracket this capture measurement')
         self.acknowledge_teardown(request, dict(kind='retained_client_report', measurement=window))
@@ -263,7 +290,7 @@ def request_teardown(out):
     ready = json.loads((out / 'ready.json').read_text())
     binding = json.loads((out / 'bind.json').read_text())
     request = dict(session=ready['session'], binding_sha256=digest(out / 'bind.json'),
-                   owner=ready['owner'], evidence=completion_evidence(binding), at=clock())
+                   owner=ready['owner'], evidence=completion_evidence(binding), at=clock_receipt())
     if (out / 'teardown-request.json').exists() or (out / 'teardown-ready.json').exists():
         raise ValueError('teardown handshake already exists')
     write(out / 'teardown-request.json', request)
@@ -733,9 +760,10 @@ def campaign_trace_bytes(root):
     return total
 
 
-def boundary_report(sample, timeline, start, end):
+def boundary_report(sample, timeline, start, end, owner):
     phases = sample.get('phases') or {}
-    window = measurement_window(phases, timeline)
+    window = clock_receipt_window(phases, [row.get('clock') for row in timeline],
+        boot_id=owner['boot_id'], time_namespace=owner['namespaces']['time'])
     if window.get('valid') and (start > window['start_bounds_ns'][0] or end < window['end_bounds_ns'][1]):
         window = dict(valid=False, reason='capture does not cover full measurement')
     return dict(measurement=window, capture_start_ns=start, capture_end_ns=end,
@@ -809,11 +837,12 @@ def supervise(args):
         if mode == 'none':
             result['ready'] = dict(status='off', at=clock())
         started = time.monotonic_ns()
-        ready = dict(status=result['ready']['status'], at=clock(), owner=owner,
+        ready = dict(status=result['ready']['status'], at=clock_receipt(), owner=owner,
                      session=os.urandom(16).hex(), binding_sha256=digest(out / 'bind.json'),
                      deadline_monotonic=deadline, cookie_priming_errors=result['initial_sockets']['errors'])
         lifecycle = CaptureLifecycle(out, owner, binding, ready, dict(cpu=cpu, observer=observer))
         lifecycle.poll()
+        result['timeline'].append(dict(clock=ready['at'], ready=True))
         write(out / 'ready.json', ready)
         next_snapshot = 0
         while time.monotonic() < deadline:
@@ -837,7 +866,7 @@ def supervise(args):
                 raise RuntimeError('observer RSS/map reservation exceeded')
             if time.monotonic() >= next_snapshot:
                 next_snapshot = time.monotonic() + 5
-                sample = dict(clock=clock(), observer_usage=usage, observer_rss_bytes=rss)
+                sample = dict(clock=clock_receipt(), observer_usage=usage, observer_rss_bytes=rss)
                 if len(result['timeline']) >= BOUNDS['metadata_snapshots']:
                     raise RuntimeError('metadata snapshot cap')
                 try:
@@ -858,13 +887,15 @@ def supervise(args):
         if not stop_requested:
             raise RuntimeError('capture deadline: measurement/warmup/drain may be incomplete')
         ended = time.monotonic_ns()
-        result['timeline'].append(dict(clock=clock(), terminal=True))
+        if len(result['timeline']) >= BOUNDS['metadata_snapshots']:
+            raise RuntimeError('metadata snapshot cap')
+        result['timeline'].append(dict(clock=clock_receipt(), terminal=True))
         sample = {}
         try:
             sample = json.loads(Path(binding['sample']).read_text())
         except (OSError, ValueError):
             result['issues'].append('missing/failed raw traffic sample')
-        result['boundaries'] = boundary_report(sample, result['timeline'], started, lifecycle.coverage_end(ended))
+        result['boundaries'] = boundary_report(sample, result['timeline'], started, lifecycle.coverage_end(ended), owner)
         if not result['boundaries']['measurement'].get('valid'):
             result['issues'].append('capture measurement clock/coverage incomplete')
         result['useful_work'] = dict(sample=str(binding['sample']), validity='independent existing benchmark_validity contract')
@@ -970,12 +1001,21 @@ def main():
     s.add_argument('--enabled', action='store_true'); s.add_argument('--parent', type=int, required=True)
     s = sub.add_parser('preflight'); s.add_argument('--output', required=True)
     s = sub.add_parser('request-teardown'); s.add_argument('--output', required=True)
+    s = sub.add_parser('bind')
+    for field in ('output', 'runtime', 'config', 'sample', 'raw-sample', 'client-exit', 'arm'):
+        s.add_argument('--' + field, required=True)
+    s.add_argument('--pair', type=int, required=True); s.add_argument('--payload', type=int, required=True)
     args = parser.parse_args()
     if (os.environ.get('GITHUB_ACTIONS'), os.environ.get('RUNNER_ENVIRONMENT'), platform.system(), platform.machine()) != (
             'true', 'github-hosted', 'Linux', 'x86_64'):
         raise SystemExit('hosted native amd64 passive supervisor only')
     if args.action == 'request-teardown':
         request_teardown(args.output); return 0
+    if args.action == 'bind':
+        write_binding(args.output, runtime=args.runtime, config=args.config, sample=args.sample,
+                      arm=args.arm, pair=args.pair, payload=args.payload,
+                      raw_sample=args.raw_sample, client_exit=args.client_exit)
+        return 0
     if os.geteuid() != 0:
         raise SystemExit('hosted passive supervisor requires root')
     if args.action == 'stage':

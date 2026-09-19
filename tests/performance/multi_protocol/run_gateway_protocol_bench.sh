@@ -459,17 +459,13 @@ start_ferrum() {
                 "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
     fi
     if [ "$H1_TRACE" != none ]; then
-        python3 - "$h1_trace_output/bind.json" "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
-            "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" "$gw" "$PAIR" "$PAYLOAD_SIZES" \
-            "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit" <<'PYTRACE'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-value = dict(runtime=sys.argv[2], config=sys.argv[3], sample=sys.argv[4], arm=sys.argv[5],
-             pair=int(sys.argv[6]), payload=int(sys.argv[7]), raw_sample=sys.argv[8], client_exit=sys.argv[9])
-tmp = path.with_suffix('.tmp')
-tmp.write_text(json.dumps(value))
-tmp.replace(path)
-PYTRACE
+        python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
+            --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
+            --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
+            --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
+            --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
+            --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
+            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit"
         local trace_wait=0
         while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
             [ ! -s "$h1_trace_output/stopped.json" ] || return 1

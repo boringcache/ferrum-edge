@@ -685,9 +685,16 @@ ordering, and the target-exit/resource-read race. These new checks have not been
 executed locally; hosted results must be inspected before calling the repair
 verified.
 
-The merged H3 host CLOCK_MONOTONIC measurement bracket and time-namespace checks
-are reused. `process_usage.py` also retains paired realtime/monotonic brackets.
-No client process-local Instant epoch is compared with kernel ktime. Capture
+H1 teardown and trace event placement admit explicit `clock_receipt` records
+from readiness, the runner and the supervisor. Each carries the producer's boot
+ID, time namespace and paired realtime/CLOCK_MONOTONIC reads. Admission requires
+the owned target's boot/namespace, bounded read uncertainty, monotonic ordering,
+actual measurement start/end brackets, and realtime agreement with the client
+phase report (1 ms read uncertainty plus 1000 ppm slew). These receipts certify
+clock bounds only: the H3 passive resource consumer still requires whole read
+intervals and rejects clock-only rows. `process_usage.py` also retains paired
+realtime/monotonic brackets. No client process-local Instant epoch is compared
+with kernel ktime. Capture
 starts before client invocation and remains enabled during gateway removal;
 measurement coverage requires actual bracketing observations and the conservative
 collector end bound. Exact absolute warmup/drain boundaries

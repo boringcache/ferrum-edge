@@ -15,6 +15,7 @@ from h1_trace_contract import (COUNTERS, LOSSES, decode_cpu, fd_lifetimes,
 from h1_trace_preflight import reconcile
 from h1_internal_profile import validate_selection
 import h1_trace as trace
+from live_contract import measurement_window
 
 
 def counter(**changes):
@@ -204,6 +205,7 @@ class H1TeardownTests(unittest.TestCase):
                                                 dict(cpu=self.cpu, observer=self.observer))
         self.now = 5_000_000_000
         self.clock = self.patch('clock', side_effect=self.tick)
+        self.receipt = self.patch('clock_receipt', side_effect=self.tick)
         self.alive = self.patch('target_alive', return_value=True)
         self.identity = self.patch('identity', return_value=self.owner)
         self.monotonic = self.patch('time.monotonic', return_value=5)
@@ -216,7 +218,8 @@ class H1TeardownTests(unittest.TestCase):
 
     @staticmethod
     def at(ns):
-        return dict(before_ns=ns, after_ns=ns + 1, unix_ns=100_000_000_000 + ns)
+        return dict(kind='clock_receipt', clock='CLOCK_MONOTONIC', boot_id='boot', time_namespace=1,
+                    before_ns=ns, after_ns=ns + 1, unix_ns=100_000_000_000 + ns)
 
     def tick(self):
         self.now += 100
@@ -244,6 +247,11 @@ class H1TeardownTests(unittest.TestCase):
         self.monotonic.side_effect = [5, 5, 5, 30]
         trace.request_teardown(self.out)
         self.assertTrue((self.out / 'teardown-ready.json').exists())
+        measurement = self.lifecycle.teardown['completion']['measurement']
+        self.assertEqual(measurement['basis'], 'clock_receipts')
+        self.assertEqual(measurement['start_bounds_ns'], [2_000_000_000, 2_000_000_001])
+        self.assertEqual(measurement['end_bounds_ns'], [3_000_000_000, 3_000_000_001])
+        self.assertNotIn('passive_capture_bracket', measurement)
         # Docker removal can take arbitrarily many supervisor polls. Its stop
         # marker has not been published when perf naturally exits.
         self.alive.return_value = False
@@ -348,6 +356,92 @@ class H1TeardownTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'does not bracket'):
             self.lifecycle.authorize_teardown()
 
+    def test_receipt_admission_preserves_resource_interval_requirement(self):
+        receipts = [self.ready['at'], self.at(self.now)]
+        timeline = [dict(clock=c) for c in receipts]
+        window = trace.boundary_report(self.sample, timeline, 900_000_000, self.now, self.owner)['measurement']
+        self.assertTrue(window['valid'])
+        self.assertEqual(window['basis'], 'clock_receipts')
+        self.assertNotIn('passive_capture_bracket', window)
+        # The same receipts cannot certify passive resource reads, even though
+        # they suffice for event placement and teardown's clock admission.
+        self.assertEqual(measurement_window(self.raw['phases'], timeline)['reason'],
+                         'missing_or_invalid_capture_interval')
+        resources = [dict(row, monotonic_ns=row['clock']['before_ns'],
+                          capture_end_ns=row['clock']['after_ns'] + 100) for row in timeline]
+        self.assertTrue(measurement_window(self.raw['phases'], resources)['valid'])
+        resources[0]['capture_end_ns'] = 2_000_000_001
+        self.assertEqual(measurement_window(self.raw['phases'], resources)['reason'],
+                         'missing_passive_capture_bracket')
+        for start, end in [(2_000_000_001, self.now), (900_000_000, 3_000_000_000)]:
+            with self.subTest(start=start, end=end):
+                self.assertFalse(trace.boundary_report(self.sample, timeline, start, end, self.owner)
+                                 ['measurement']['valid'])
+
+    def test_missing_malformed_foreign_and_early_receipts_cannot_authorize(self):
+        request = self.request()
+        malformed = [None, [], {}, dict(request['at'], before_ns=True),
+                     dict(request['at'], after_ns='later')]
+        malformed += [dict(request['at'], **{key: value}) for key, value in (
+            ('kind', 'passive_capture'), ('clock', 'CLOCK_BOOTTIME'), ('boot_id', 'prior-boot'),
+            ('time_namespace', 2), ('time_namespace', True), ('unix_ns', None),
+            ('unix_ns', request['at']['unix_ns'] + 1_000_000_000),
+            ('unix_ns', request['at']['unix_ns'] - 1_000_000_000))]
+        malformed += [{key: value for key, value in request['at'].items() if key != missing}
+                      for missing in request['at']]
+        # Preserve realtime/monotonic correspondence while breaking uncertainty
+        # or the actual measurement end bracket.
+        malformed += [dict(self.at(4_000_000_000), after_ns=4_002_000_000),
+                      self.at(3_000_000_000)]
+        for at in malformed:
+            with self.subTest(at=at):
+                trace.write(self.out / 'teardown-request.json', dict(request, at=at))
+                with self.assertRaises(ValueError):
+                    self.lifecycle.authorize_teardown()
+                self.assertIsNone(self.lifecycle.teardown)
+                self.assertFalse((self.out / 'teardown-ready.json').exists())
+        trace.write(self.out / 'teardown-request.json', request)
+        self.lifecycle.authorize_teardown()
+        self.assertIsNotNone(self.lifecycle.teardown)
+
+    def test_invalid_phase_clock_cannot_authorize(self):
+        original = copy.deepcopy(self.raw['phases'])
+        invalid_clocks = [None, {}, dict(clock='process_local', before_ns=1, after_ns=2),
+                          dict(clock='CLOCK_MONOTONIC', before_ns=1, after_ns=2),
+                          dict(clock='CLOCK_MONOTONIC', before_ns=True, after_ns=2),
+                          dict(clock='CLOCK_MONOTONIC', before_ns=2_000_000_000,
+                               after_ns=2_002_000_000)]
+        changes = [('measurement_start_host_clock', c) for c in invalid_clocks]
+        changes += [('measurement_start_unix_secs', v) for v in (None, True, float('nan'), 1, 103)]
+        changes += [('measurement_secs', v) for v in (0, True, float('inf'), 301)]
+        for key, value in changes:
+            with self.subTest(key=key, value=value):
+                phases = dict(copy.deepcopy(original), **{key: value})
+                self.raw['phases'] = self.sample['phases'] = phases
+                self.retain_client()
+                try:
+                    self.request()
+                    self.lifecycle.authorize_teardown()
+                except ValueError:
+                    pass
+                else:
+                    self.fail('invalid client phase authorized teardown')
+                self.assertIsNone(self.lifecycle.teardown)
+                self.assertFalse((self.out / 'teardown-ready.json').exists())
+
+    def test_boundary_receipts_reject_missing_unordered_or_foreign_clocks(self):
+        a, b, c = self.ready['at'], self.at(2_500_000_000), self.at(self.now)
+        for receipts in ([a], [a, None, c], [a, b, b, c], [a, c, b],
+                         [a, dict(b, boot_id='other'), c],
+                         [a, dict(b, time_namespace=2), c],
+                         [dict(a, clock='CLOCK_BOOTTIME'), b, c],
+                         [dict(a, boot_id='prior-boot'), b, c],
+                         [a, dict(b, unix_ns=b['unix_ns'] + 1_000_000_000), c]):
+            with self.subTest(receipts=receipts):
+                timeline = [dict(clock=r) for r in receipts]
+                self.assertFalse(trace.boundary_report(self.sample, timeline, 1, self.now, self.owner)
+                                 ['measurement']['valid'])
+
     def test_nonzero_client_incomplete_drain_partial_json_and_failed_read(self):
         (self.out / 'exit').write_text('124\n')
         with self.assertRaisesRegex(ValueError, 'client exit'):
@@ -398,6 +492,45 @@ class H1TeardownTests(unittest.TestCase):
         self.assertLess(main.index('run_bench'), main.index('stop_gateway'))
         stop = source.split('stop_gateway() {', 1)[1].split('# ── Bench runner', 1)[0]
         self.assertLess(stop.index('docker rm -f'), stop.index('h1_trace_stop'))
+
+
+class H1BindingTests(unittest.TestCase):
+    def test_fixed_binding_command_retains_exact_data_and_rejects_bad_operands(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            data = dict(runtime=str(out / 'runtime.json'), config=str(out / 'config.yaml'),
+                        sample=str(out / 'sample.json'), raw_sample=str(out / 'raw.json'),
+                        client_exit=str(out / 'exit'), arm='ferrum', pair=1, payload=10240)
+            for key, value in [('arm', 'direct'), ('arm', 'envoy'), ('pair', 0), ('pair', 5),
+                               ('pair', True), ('payload', 1), ('sample', 'relative.json'),
+                               ('runtime', str(out / '..' / 'runtime.json'))]:
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(ValueError):
+                        trace.write_binding(str(out), **dict(data, **{key: value}))
+                    self.assertFalse((out / 'bind.json').exists())
+            trace.write_binding(str(out), **data)
+            self.assertEqual(json.loads((out / 'bind.json').read_text()), data)
+            with self.assertRaisesRegex(ValueError, 'already exists'):
+                trace.write_binding(str(out), **dict(data, pair=2))
+            self.assertEqual(json.loads((out / 'bind.json').read_text()), data)
+            for arm in ('ferrum-baseline', 'ferrum-exp-cutoff-one'):
+                arm_out = out / arm
+                arm_out.mkdir()
+                selected = dict(data, arm=arm, pair=4, payload=5242880)
+                trace.write_binding(str(arm_out), **selected)
+                self.assertEqual(json.loads((arm_out / 'bind.json').read_text()), selected)
+        source = (HERE / 'run_gateway_protocol_bench.sh').read_text()
+        self.assertIn('python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output"', source)
+        self.assertNotIn('PYTRACE', source)
+
+    @unittest.skipUnless(Path('/proc/self/ns/time').exists(), 'Linux clock receipt producer')
+    def test_clock_receipt_records_producer_namespace_and_boot(self):
+        receipt = trace.clock_receipt()
+        self.assertEqual(receipt['kind'], 'clock_receipt')
+        self.assertEqual(receipt['clock'], 'CLOCK_MONOTONIC')
+        self.assertEqual(receipt['time_namespace'], Path('/proc/self/ns/time').stat().st_ino)
+        self.assertEqual(receipt['boot_id'], Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+        self.assertLessEqual(receipt['before_ns'], receipt['after_ns'])
 
 
 if __name__ == '__main__':

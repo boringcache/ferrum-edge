@@ -1,6 +1,7 @@
 """Fixed H1 external evidence consumers. Unknown evidence never becomes zero."""
 import collections
 import json
+import math
 import re
 from pathlib import Path
 
@@ -24,6 +25,63 @@ BOUNDS = dict(observer_rss_and_map_bytes=32 * 1024**2, map_reservation_bytes=8 *
 
 def natural(value):
     return type(value) is int and 0 <= value <= 2**64 - 1
+
+
+def clock_receipt_window(phases, receipts, *, boot_id, time_namespace):
+    """Admit host clock receipts, without claiming any passive resource reads.
+
+    Teardown and trace event placement need a common measurement clock. Resource
+    deltas still require the separate H3 consumer's complete capture intervals.
+    Keep the same 1 ms uncertainty / 1000 ppm slew and phase realtime checks.
+    """
+    invalid = dict(valid=False, reason='missing_or_invalid_clock_receipt')
+    uncertainty = 1_000_000
+    try:
+        if (not isinstance(boot_id, str) or not boot_id or not natural(time_namespace)
+                or not time_namespace or not 2 <= len(receipts) <= BOUNDS['metadata_snapshots']):
+            return invalid
+        start = phases['measurement_start_host_clock']
+        lo, hi = start['before_ns'], start['after_ns']
+        duration = phases['measurement_secs']
+        if (start['clock'] != 'CLOCK_MONOTONIC' or not natural(lo) or not natural(hi)
+                or not 0 < lo <= hi <= lo + uncertainty
+                or type(duration) not in (int, float) or not math.isfinite(duration)
+                or not 0 < duration <= BOUNDS['seconds']):
+            return invalid
+        span = math.ceil(duration * 1e9)
+        for receipt in receipts:
+            if (receipt['kind'] != 'clock_receipt' or receipt['clock'] != 'CLOCK_MONOTONIC'
+                    or receipt['boot_id'] != boot_id or not natural(receipt['time_namespace'])
+                    or receipt['time_namespace'] != time_namespace
+                    or not all(natural(receipt[k]) for k in ('before_ns', 'after_ns', 'unix_ns'))
+                    or not 0 < receipt['before_ns'] <= receipt['after_ns'] <= receipt['before_ns'] + uncertainty):
+                return invalid
+        for a, b in zip(receipts, receipts[1:]):
+            if b['before_ns'] <= a['after_ns']:
+                return dict(valid=False, reason='nonmonotonic_clock_receipt')
+            slack = uncertainty + (b['after_ns'] - a['before_ns']) // 1000
+            if (b['unix_ns'] - b['after_ns'] > a['unix_ns'] - a['before_ns'] + slack
+                    or a['unix_ns'] - a['after_ns'] > b['unix_ns'] - b['before_ns'] + slack):
+                return dict(valid=False, reason='realtime_clock_jump')
+        before = [i for i, c in enumerate(receipts) if c['after_ns'] <= lo]
+        after = [i for i, c in enumerate(receipts) if c['before_ns'] >= hi + span]
+        if not before or not after:
+            return dict(valid=False, reason='missing_clock_receipt_bracket')
+        unix = phases['measurement_start_unix_secs']
+        if type(unix) not in (int, float) or not math.isfinite(unix):
+            return invalid
+        anchor = receipts[before[-1]]
+        slack = uncertainty + (hi - anchor['before_ns']) // 1000
+        if not (lo + anchor['unix_ns'] - anchor['after_ns'] - slack <= unix * 1e9
+                <= hi + anchor['unix_ns'] - anchor['before_ns'] + slack):
+            return dict(valid=False, reason='phase_realtime_clock_mismatch')
+        return dict(valid=True, basis='clock_receipts', clock='CLOCK_MONOTONIC',
+                    boot_id=boot_id, time_namespace=time_namespace,
+                    start_bounds_ns=[lo, hi], end_bounds_ns=[lo + span, hi + span],
+                    uncertainty_ns=hi - lo, receipt_indices=[before[-1], after[0]],
+                    realtime_check='1ms_read_uncertainty_plus_1000ppm_slew')
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return invalid
 
 
 def validate_record(row):
