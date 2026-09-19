@@ -62,7 +62,9 @@ paths:
   annotation overrides; shared unknown-key suggestions, rate-window/request/frame
   bounds, and socket-host/egress errors. Shared helper context that may contain
   document keys is Debug-escaped as a whole; callers must supply a separate fixed
-  schema field when one is available. WAF rule/signature ordinals and API-spec
+  schema field when one is available. HTTP rate-rule ordinals and GraphQL rate
+  collection names stay in a separate schema-authored prefix; supplied operation
+  keys stay in the opaque label. WAF rule/signature ordinals and API-spec
   extension request/response/bypass paths preserve this separate fixed context;
   supplied override IDs and extension keys never enter the visible prefix.
   SQL literals, fixed migration/listener/fault labels,
