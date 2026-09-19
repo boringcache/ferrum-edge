@@ -486,8 +486,16 @@ impl ServerlessFunction {
             ));
         }
         if let Some((key, _)) = config_object.iter().find(|(_, value)| value.is_null()) {
-            let is_required = key == "provider"
-                || (key == "function_url"
+            // Only schema-authored names may enter the trusted backtick span.
+            let field = ALLOWED_CONFIG_FIELDS
+                .iter()
+                .copied()
+                .find(|field| *field == key.as_str())
+                .ok_or_else(|| {
+                    format!("serverless_function: unknown configuration field(s): {key:?}")
+                })?;
+            let is_required = field == "provider"
+                || (field == "function_url"
                     && matches!(
                         config_object.get("provider").and_then(Value::as_str),
                         Some("azure_functions") | Some("gcp_cloud_functions")
@@ -498,7 +506,7 @@ impl ServerlessFunction {
                 "must not be null; omit the field instead"
             };
             return Err(format!(
-                "serverless_function: `config` field {key:?} {detail}"
+                "serverless_function: `config` field `{field}` {detail}"
             ));
         }
 

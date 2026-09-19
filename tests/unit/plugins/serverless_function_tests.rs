@@ -343,6 +343,11 @@ fn test_explicit_null_diagnostics_distinguish_required_and_optional_fields() {
                 "optional field received required guidance: field={field}, got: {err}"
             );
         }
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(err), &[]);
+        assert!(
+            rendered.contains(&format!("`{field}`")),
+            "field={field}, got: {rendered}"
+        );
     }
 }
 
@@ -6764,11 +6769,31 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     for (config, field, reason) in [
         (
             json!({"provider": null}),
-            "`config`",
+            "`provider`",
             "is required and must not be null",
         ),
         (
+            json!({"provider": "azure_functions", "function_url": null}),
+            "`function_url`",
+            "is required and must not be null",
+        ),
+        (
+            json!({"provider": "gcp_cloud_functions", "function_url": null}),
+            "`function_url`",
+            "is required and must not be null",
+        ),
+        (
+            json!({"provider": "azure_functions", "function_url": "https://example.com", "timeout_ms": null}),
+            "`timeout_ms`",
+            "must not be null; omit the field instead",
+        ),
+        (
             json!({token: true}),
+            "serverless_function",
+            "unknown configuration field",
+        ),
+        (
+            json!({"provider": null, token: null}),
             "serverless_function",
             "unknown configuration field",
         ),

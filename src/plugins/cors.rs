@@ -815,29 +815,33 @@ impl CorsPlugin {
                             let raw_origin = value.as_str().unwrap_or_default();
                             let origin = raw_origin.trim();
                             if origin.is_empty() {
-                                return Err(
-                                    "cors: `allowed_origins` entries must be non-empty strings"
-                                        .to_string(),
-                                );
+                                return Err(format!(
+                                    "`cors.allowed_origins[{index}]`: entries must be non-empty strings"
+                                ));
                             }
                             if origin.len() != raw_origin.len() {
-                                return Err(
-                                    "cors: `allowed_origins` string entries must not have leading or trailing whitespace"
-                                        .to_string(),
-                                );
+                                return Err(format!(
+                                    "`cors.allowed_origins[{index}]`: string entries must not have leading or trailing whitespace"
+                                ));
                             }
                             if origin == "*" {
                                 wildcard = true;
                                 continue;
                             }
-                            validate_origin_matcher_len("`allowed_origins` string entry", origin)?;
+                            validate_origin_matcher_len("`allowed_origins` string entry", origin)
+                                .map_err(|error| {
+                                    format!("`cors.allowed_origins[{index}]`: {error}")
+                                })?;
                             if origin.starts_with('*') {
-                                patterns.push(OriginPattern::WildcardSubdomain(
-                                    validate_wildcard_origin(origin)?,
-                                ));
+                                let suffix = validate_wildcard_origin(origin).map_err(|error| {
+                                    format!("`cors.allowed_origins[{index}]`: {error}")
+                                })?;
+                                patterns.push(OriginPattern::WildcardSubdomain(suffix));
                             } else {
-                                patterns
-                                    .push(OriginPattern::Exact(canonicalize_exact_origin(origin)?));
+                                let exact = canonicalize_exact_origin(origin).map_err(|error| {
+                                    format!("`cors.allowed_origins[{index}]`: {error}")
+                                })?;
+                                patterns.push(OriginPattern::Exact(exact));
                             }
                         }
                         Value::Object(_) => {

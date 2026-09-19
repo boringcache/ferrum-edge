@@ -331,7 +331,7 @@ fn unreachable_parsed_path_prefix_reason(path: &str) -> Option<&'static str> {
     }
     if path.contains('?') {
         return Some(
-            "must not contain a query delimiter ('?'); request paths are the parsed URI path, \
+            "must not contain a query delimiter (`?`); request paths are the parsed URI path, \
              so a prefix with a query can never match",
         );
     }
@@ -343,7 +343,7 @@ fn unreachable_parsed_path_prefix_reason(path: &str) -> Option<&'static str> {
     }
     if path.contains('#') {
         return Some(
-            "must not contain a fragment delimiter ('#'); request paths are the parsed URI path, \
+            "must not contain a fragment delimiter (`#`); request paths are the parsed URI path, \
              so a prefix with a fragment can never match",
         );
     }
