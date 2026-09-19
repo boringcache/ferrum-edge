@@ -978,6 +978,58 @@ fn bounds_validation_is_field_specific_and_value_free() {
 }
 
 #[test]
+fn rendered_bounds_diagnostics_keep_fields_and_reasons_without_supplied_numbers() {
+    let cases = [
+        (
+            AggregateSseBounds {
+                max_streams_per_session: 987654321,
+                ..bounds()
+            },
+            "`sessions.sse_max_streams_per_session`",
+            "must be between",
+        ),
+        (
+            AggregateSseBounds {
+                max_event_bytes: 314159,
+                max_retained_bytes: 271828,
+                ..bounds()
+            },
+            "`sessions.sse_max_event_bytes`",
+            "must leave room for SSE framing inside `sessions.sse_max_retained_bytes`",
+        ),
+        (
+            AggregateSseBounds {
+                max_replay_events: 4095,
+                max_retained_events: 2047,
+                ..bounds()
+            },
+            "`sessions.sse_max_replay_events`",
+            "must not exceed `sessions.sse_max_retained_events`",
+        ),
+        (
+            AggregateSseBounds {
+                keepalive_interval: Duration::from_secs(59),
+                listener_max_lifetime: Duration::from_secs(31),
+                ..bounds()
+            },
+            "`sessions.sse_keepalive_seconds`",
+            "must not exceed `sessions.sse_listener_max_lifetime_seconds`",
+        ),
+    ];
+    for (bounds, field, reason) in cases {
+        let error = bounds
+            .validate()
+            .expect_err("invalid bounds must be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for supplied in ["987654321", "314159", "271828", "4095", "2047", "59", "31"] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
 fn every_error_reason_is_a_fixed_low_cardinality_token() {
     let errors = [
         SseError::MissingSession,

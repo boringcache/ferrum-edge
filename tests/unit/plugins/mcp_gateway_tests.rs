@@ -952,6 +952,196 @@ fn unknown_root_key_is_rejected() {
     assert!(error.contains("not_a_real_mcp_key"), "{error}");
 }
 
+fn render_mcp_config_diagnostic(config: &Value) -> String {
+    let error = create_plugin("mcp_gateway", config)
+        .err()
+        .expect("invalid configuration must be rejected");
+    ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[])
+}
+
+#[test]
+fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
+    let hostile = "'MCP_UNREGISTERED_SECRET\"\\\n`field`";
+    let cases = [
+        (json!({"mode": hostile}), "`mode`", "`aggregate_router`"),
+        (
+            json!({"sessions": {"initialize_upstreams": hostile}}),
+            "`sessions.initialize_upstreams`",
+            "`lazy`, `startup`, or `passthrough`",
+        ),
+        (
+            json!({"sessions": {"downstream_session_header": hostile}}),
+            "`sessions.downstream_session_header`",
+            "valid HTTP header name",
+        ),
+        (
+            json!({"discovery": {"on_new_tool": hostile}}),
+            "`discovery.on_new_tool`",
+            "`allow` or `hide_until_configured`",
+        ),
+        (
+            json!({"policy": {"tools": {(hostile): false}}}),
+            "`policy.tools`",
+            "must be an object",
+        ),
+        (
+            json!({"policy": {"tools": {(hostile): {}}}}),
+            "`policy.tools.*.action`",
+            "is required",
+        ),
+        (
+            json!({"policy": {"tools": {(hostile): {"action": hostile}}}}),
+            "`policy.tools.*.action`",
+            "`allow`, `deny`, or `hide_from_discovery`",
+        ),
+        (
+            json!({"servers": {"MCP_SERVER_SECRET": {
+                "upstream_url": hostile, "namespace": "demo"
+            }}}),
+            "`upstream_url`",
+            "must be a valid URL",
+        ),
+        (
+            json!({"enabled": { (hostile): 987654321 }}),
+            "`enabled`",
+            "must be a boolean",
+        ),
+        (json!({"mode": true}), "`mode`", "must be a string"),
+        (
+            json!({"enabled": 987654321}),
+            "`enabled`",
+            "must be a boolean",
+        ),
+        (
+            json!({"sessions": {"sse_keepalive_seconds": true}}),
+            "`sse_keepalive_seconds`",
+            "must be a positive integer",
+        ),
+        (
+            json!({"endpoint": {"path": "/mcp", "protocol_versions": ["v1", 987654321]}}),
+            "`protocol_versions[1]`",
+            "must be a string",
+        ),
+    ];
+    for (overrides, field, reason) in cases {
+        let rendered = render_mcp_config_diagnostic(&schema_fixture(overrides));
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for supplied in [
+            "MCP_UNREGISTERED_SECRET",
+            "MCP_SERVER_SECRET",
+            "987654321",
+            "true",
+            "false",
+        ] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn stdio_diagnostics_omit_supplied_keys_and_keep_schema_paths() {
+    let hostile = "'MCP_TOOL_SECRET\"\\\n`path`";
+    for (overrides, field) in [
+        (
+            json!({"servers": {"MCP_SERVER_SECRET": {"command": "MCP_COMMAND_SECRET"}}}),
+            "`config.servers.*`",
+        ),
+        (
+            json!({"policy": {"tools": {(hostile): {"command": "MCP_COMMAND_SECRET"}}}}),
+            "`config.policy.tools.*`",
+        ),
+    ] {
+        let rendered = render_mcp_config_diagnostic(&schema_fixture(overrides));
+        for retained in [field, "`command`", "HTTP-only", "`servers.*.upstream_url`"] {
+            assert!(rendered.contains(retained), "{rendered}");
+        }
+        for supplied in ["MCP_TOOL_SECRET", "MCP_SERVER_SECRET", "MCP_COMMAND_SECRET"] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn unknown_key_diagnostics_omit_supplied_path_keys_and_keep_schema_context() {
+    let hostile = "'MCP_TOOL_SECRET\"\\\n`path`";
+    for (overrides, field) in [
+        (
+            json!({"servers": {"MCP_SERVER_SECRET": {"MCP_UNKNOWN_KEY": true}}}),
+            "`config.servers.*`",
+        ),
+        (
+            json!({"policy": {"tools": {(hostile): {"MCP_UNKNOWN_KEY": true}}}}),
+            "`config.policy.tools.*`",
+        ),
+    ] {
+        let rendered = render_mcp_config_diagnostic(&schema_fixture(overrides));
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
+        for supplied in ["MCP_TOOL_SECRET", "MCP_SERVER_SECRET", "MCP_UNKNOWN_KEY"] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn protocol_managed_session_header_diagnostic_withholds_the_header_value() {
+    let config = schema_fixture(json!({
+        "sessions": {"downstream_session_header": "Content-Length"}
+    }));
+    let rendered = render_mcp_config_diagnostic(&config);
+    assert!(rendered.contains("`sessions.downstream_session_header`"));
+    assert!(rendered.contains("protocol-managed"));
+    assert!(!rendered.contains("Content-Length"));
+    assert!(!rendered.contains("content-length"));
+}
+
+#[test]
+fn composition_diagnostic_withholds_apostrophe_leading_resource_ids() {
+    use ferrum_edge::config::types::{GatewayConfig, PluginConfig};
+
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.id = "'MCP_PROXY_SECRET\"\\\n`id`".to_string();
+    proxy.plugins.clear();
+    let plugin_configs = [
+        "'MCP_FIRST_SECRET\"\\\n`id`",
+        "'MCP_SECOND_SECRET\"\\\n`id`",
+    ]
+    .into_iter()
+    .map(|id| {
+        serde_json::from_value::<PluginConfig>(json!({
+            "id": id,
+            "plugin_name": "mcp_gateway",
+            "scope": "global",
+            "config": {"endpoint": {"path": "/mcp"}}
+        }))
+        .expect("global MCP plugin fixture must deserialize")
+    })
+    .collect();
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs,
+        ..GatewayConfig::default()
+    };
+    let errors = ferrum_edge::plugins::mcp_gateway::validate_composition(&config)
+        .expect_err("overlapping MCP endpoints must be rejected");
+    assert_eq!(errors.len(), 1);
+    let rendered =
+        ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors[0].clone()), &[]);
+    assert!(rendered.contains("`endpoint.path` scopes"), "{rendered}");
+    assert!(rendered.contains("have nesting"), "{rendered}");
+    assert!(
+        rendered.contains("disjoint `endpoint.path` values"),
+        "{rendered}"
+    );
+    for supplied in ["MCP_PROXY_SECRET", "MCP_FIRST_SECRET", "MCP_SECOND_SECRET"] {
+        assert!(!rendered.contains(supplied), "{rendered}");
+    }
+}
+
 #[test]
 fn servers_command_is_rejected_as_http_only() {
     let mut config = transparent_config("http://127.0.0.1:9/mcp");

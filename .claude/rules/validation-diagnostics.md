@@ -97,6 +97,11 @@ paths:
   Semantic-cache successful admission DEBUG fields sanitize every scalar at
   emission, including defaults and normalized/derived selections; captured
   constructor regressions pin the structured fields and fixed event message.
+- The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
+  configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
+  visible while supplied service/tool names, paths, tokens and parser payloads
+  are withheld. Registered real-constructor rendered regressions preserve the
+  existing admission decisions and protocol behavior assertions.
 - The #5594 security conversion covers authentication/authorization, IP/GeoIP,
   JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
   admission. Fixed schema paths and credential/operation ordinals survive
