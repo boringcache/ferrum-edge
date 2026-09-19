@@ -225,19 +225,19 @@ impl AggregateSseBounds {
         if framed_ceiling > self.max_retained_bytes {
             return Err(field_error(
                 "sse_max_event_bytes",
-                "must leave room for SSE framing inside 'sessions.sse_max_retained_bytes'",
+                "must leave room for SSE framing inside `sessions.sse_max_retained_bytes`",
             ));
         }
         if self.max_replay_events > self.max_retained_events {
             return Err(field_error(
                 "sse_max_replay_events",
-                "must not exceed 'sessions.sse_max_retained_events'",
+                "must not exceed `sessions.sse_max_retained_events`",
             ));
         }
         if self.keepalive_interval > self.listener_max_lifetime {
             return Err(field_error(
                 "sse_keepalive_seconds",
-                "must not exceed 'sessions.sse_listener_max_lifetime_seconds'",
+                "must not exceed `sessions.sse_listener_max_lifetime_seconds`",
             ));
         }
         Ok(self)
@@ -245,7 +245,7 @@ impl AggregateSseBounds {
 }
 
 fn field_error(field: &str, detail: &str) -> String {
-    format!("mcp_gateway: 'sessions.{field}' {detail}")
+    format!("mcp_gateway: `sessions.{field}` {detail}")
 }
 
 fn validate_bound(value: usize, min: usize, max: usize, field: &str) -> Result<(), String> {
