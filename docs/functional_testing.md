@@ -4,6 +4,27 @@ This document describes the functional testing strategy for the Ferrum Edge, par
 
 ## Test Files
 
+### scripted_backend_matrix_tests.rs
+
+The accept-then-RST matrix retains the immediate reset and exact HTTP 502
+assertion. [Hosted run 35406841651, job 105801133553](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35406841651/job/105801133553)
+returned HTTP 504 for `h2_to_h1` after 6.38 seconds, with
+`accepted=1 resets=1 step_errors=[]`. This refutes a missing reset step, but
+does not establish delivery to the gateway: the reset counter increments
+before socket close. The fixture repeats on every connection, and the cold
+in-process harness skips the initial capability probe. The matrix config has
+one direct backend and no configured retry policy or failover target.
+
+The cause of the remaining transport wait is unresolved. The matrix now
+installs transport tracing, which the in-process harness otherwise lacks,
+and the TCP fixture records accepted peer/connection identity and completion
+and duration of the synchronous reset close. These records distinguish delayed
+fixture execution from a gateway wait after close and expose connector, HTTP/1
+dispatcher, and timeout events. Do not treat a passing instrumented run as
+proof of repair, replace the immediate reset with a read-before-reset barrier,
+or accept 504 alongside 502. The raw-socket probe-first/reset-before-write
+regression remains in `tests/scaffolding/matrix.rs`.
+
 ### admin_metrics_tls_inventory_snapshot_tests.rs
 
 The TLS inventory scrape regressions run in-process through real admin listeners:

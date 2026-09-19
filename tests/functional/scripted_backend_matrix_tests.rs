@@ -37,6 +37,26 @@ use crate::gateway_matrix;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::matrix::{BackendKind, FrontendKind};
 
+fn init_rst_diagnostics() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // In-process harnesses do not install a subscriber. Nextest retains
+        // this process's output on failure, including spawned transport tasks.
+        if let Err(error) = tracing_subscriber::fmt()
+            .with_env_filter(
+                "off,ferrum_edge::proxy=debug,hyper_util::client::legacy=trace,\
+                 hyper::proto::h1=trace,reqwest=debug,\
+                 functional_tests::scaffolding::backends::tcp=debug",
+            )
+            .with_test_writer()
+            .with_ansi(false)
+            .try_init()
+        {
+            eprintln!("RST diagnostics subscriber unavailable: {error}");
+        }
+    });
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Scenario 1 — backend refuses the connection.
 // ────────────────────────────────────────────────────────────────────────────
@@ -155,6 +175,7 @@ gateway_matrix! {
         (Grpc, Tcp),
     ],
     scenario = |frontend: FrontendKind, backend: BackendKind| async move {
+        init_rst_diagnostics();
         let backend_handle = backend.spawn_accept_then_rst().await?;
         let yaml = backend.file_mode_yaml(backend_handle.port());
         let harness = GatewayHarness::builder()

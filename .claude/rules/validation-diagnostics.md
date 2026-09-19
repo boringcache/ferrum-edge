@@ -128,6 +128,12 @@ paths:
   visible while supplied service/tool names, paths, tokens and parser payloads
   are withheld. Registered real-constructor rendered regressions preserve the
   existing admission decisions and protocol behavior assertions.
+- The #5594 billing conversion covers API chargeback, chargeback sinks and
+  spend-limit admission. Fixed pricing-tier and schema paths remain visible;
+  supplied rates, identities, URLs, document keys and deserializer payloads are
+  withheld. Structural serde errors use the private schema allowlist and retain
+  admission parity. Registered constructor/rendered-output regressions and
+  existing projection/billing behavior assertions cover these diagnostics.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
