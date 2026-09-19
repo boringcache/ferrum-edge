@@ -102,12 +102,17 @@ static __noinline void socket_event(struct sock *sk, __u64 cookie, __u32 kind,
     e.rcvbuf = BPF_CORE_READ(sk, sk_rcvbuf); e.sndbuf = BPF_CORE_READ(sk, sk_sndbuf);
     e.drops = BPF_CORE_READ(sk, sk_drops.counter);
     // Only the allowlisted IPv4 destination endpoint; never packet/CID data.
-    if (msg && BPF_CORE_READ(msg, msg_namelen) >= sizeof(struct sockaddr_in)) {
-        struct sockaddr_in addr = {};
-        if (bpf_probe_read_kernel(&addr, sizeof(addr), BPF_CORE_READ(msg, msg_name)))
+    if (msg && BPF_CORE_READ(msg, msg_namelen) >= 16) { // IPv4 sockaddr ABI size
+        struct sockaddr_in *addr = BPF_CORE_READ(msg, msg_name);
+        __u16 family = 0, port = 0;
+        __u32 address = 0;
+        // Relocate kernel field accesses, never offsets into a partial stack copy.
+        if (BPF_CORE_READ_INTO(&family, addr, sin_family) ||
+            BPF_CORE_READ_INTO(&address, addr, sin_addr.s_addr) ||
+            BPF_CORE_READ_INTO(&port, addr, sin_port))
             loss(READ_FAILED);
-        else if (addr.sin_family == 2) {
-            e.peer.address = addr.sin_addr; e.peer.port = bpf_ntohs(addr.sin_port);
+        else if (family == 2) {
+            e.peer.address = address; e.peer.port = bpf_ntohs(port);
         }
     }
     struct identity_event *previous = bpf_map_lookup_elem(&sockets, &cookie);

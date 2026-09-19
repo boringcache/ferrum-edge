@@ -26,7 +26,11 @@ from h3_experiment import envoy_config
 from process_usage import capture, measurement_usage, parse_stat
 from transport_diagnostics import (backend_distribution, bracket, counter_delta,
                                    snapshot, thread_snapshot, envoy_counter_provenance)
-from live_contract import ARMS, PAYLOADS, ENVOY, assert_upstream_only, calibration, manifest, owned_role, group_history, socket_lifetimes
+from live_contract import (ARMS, PAYLOADS, ENVOY, FAMILIES, assert_upstream_only, calibration,
+                           manifest, owned_role, group_history, socket_lifetimes,
+                           measurement_window, measurement_position, provenance_issues,
+                           validate_observer_record, observer_issues, smoke_issues,
+                           sample_admission_issues, envoy_protocol_evidence)
 from evidence import LOSSES
 
 HERE = Path(__file__).resolve().parent
@@ -34,7 +38,6 @@ ROOT = HERE.parents[3]
 STAGE = Path('/tmp/ferrum-h3-live')
 TICKS = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
-FAMILIES = ('tx', 'rx', 'attach', 'lifetime', 'destroy', 'group', 'process', 'classic')
 
 
 def write(path, value):
@@ -95,6 +98,7 @@ def owner(pid, role):
     return dict(pid=pid, role=role, start_ticks=fields['start_ticks'], ticks=TICKS,
                 cgroup=cgroup, cgroup_id=Path('/sys/fs/cgroup', cgroup.lstrip('/')).stat().st_ino,
                 netns=(path / 'ns/net').stat().st_ino,
+                time_namespace=(path / 'ns/time').stat().st_ino,
                 privileges=[line for line in (path / 'status').read_text().splitlines()
                             if line.startswith(('Uid:', 'Gid:', 'Cap', 'NoNewPrivs:', 'Seccomp:'))],
                 executable=str((path / 'exe').resolve()), at_ns=time.monotonic_ns())
@@ -112,7 +116,9 @@ class Passive:
     def run(self):
         while not self.stop.is_set():
             start = time.monotonic_ns()
-            sample = dict(unix_secs=time.time(), monotonic_ns=start, processes=[], threads=[], sockets=[])
+            clock = dict(before_ns=start, unix_ns=time.time_ns(), after_ns=time.monotonic_ns())
+            sample = dict(unix_secs=clock['unix_ns'] / 1e9, monotonic_ns=start, clock=clock,
+                          processes=[], threads=[], sockets=[])
             try:
                 inode_owners = {}
                 for file in self.scope.rglob('cgroup.procs'):
@@ -128,6 +134,9 @@ class Passive:
                             state = capture(pid, TICKS, PAGE)
                             if state:
                                 sample['processes'].append(dict(state, pid=pid, role=role))
+                            else:
+                                self.errors.append(dict(at_ns=start, end_ns=time.monotonic_ns(),
+                                                        pid=pid, error='process_capture_failed'))
                             sample['threads'].extend(thread_snapshot(pid, TICKS, parse_stat))
                             for fd in Path(f'/proc/{pid}/fd').iterdir():
                                 try:
@@ -137,7 +146,7 @@ class Passive:
                                 except (OSError, ValueError):
                                     continue
                         except (OSError, ValueError, IndexError) as error:
-                            self.errors.append(dict(at_ns=start, pid=pid, error=str(error)))
+                            self.errors.append(dict(at_ns=start, end_ns=time.monotonic_ns(), pid=pid, error=str(error)))
                 transport = snapshot(self.arm.startswith('envoy'))
                 # The netlink dump may assign cookies. Only owned sockets persist.
                 transport['sockets'] = [dict(row, owners=inode_owners[row['inode']])
@@ -146,9 +155,10 @@ class Passive:
                 sample['sampler_cpu_ns'] = time.thread_time_ns()
                 sample['softirq'] = Path('/proc/softirqs').read_text()
                 sample['host_cpu'] = Path('/proc/stat').read_text()
-            except (OSError, ValueError, KeyError) as error:
-                self.errors.append(dict(at_ns=start, error=str(error)))
-            sample['capture_ns'] = time.monotonic_ns() - start
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                self.errors.append(dict(at_ns=start, end_ns=time.monotonic_ns(), error=str(error)))
+            sample['capture_end_ns'] = time.monotonic_ns()
+            sample['capture_ns'] = sample['capture_end_ns'] - start
             self.timeline.append(sample)
             if len(self.timeline) >= 1200:
                 self.errors.append(dict(error='passive_sample_cap')); return
@@ -204,6 +214,7 @@ class Observer:
                         while b'\n' in pending:
                             line, pending = pending.split(b'\n', 1)
                             row = json.loads(line)
+                            validate_observer_record(row, self.family)
                             self.rows.append(row)
                             if row.get('phase') == 'ready':
                                 self.ready = row; self.ready_event.set()
@@ -214,7 +225,7 @@ class Observer:
                         break
                     else:
                         time.sleep(0.02)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, KeyError, TypeError) as error:
             self.error = str(error)
         finally:
             self.ready_event.set()
@@ -223,6 +234,8 @@ class Observer:
         state = capture(self.process.pid, TICKS, PAGE)
         self.cpu.append(dict(at_ns=time.monotonic_ns(), state=state))
         if state: self.peak_rss_bytes = max(self.peak_rss_bytes, state['rss_bytes'])
+        elif (self.ready or {}).get('status') == 'supported':
+            self.error = 'observer_resource_capture_failed'
         return state['rss_bytes'] if state else 0
 
     def checkpoint(self):
@@ -241,8 +254,15 @@ class Observer:
             except (OSError, subprocess.TimeoutExpired):
                 self.error = 'forced_observer_stop'; self.process.kill(); self.process.wait()
         self.reader.join(timeout=3)
+        if self.reader.is_alive():
+            self.error = 'observer_reader_incomplete'
+        for phase in ('ready', 'final', 'termination'):
+            expected = 1 if phase == 'ready' or (self.ready or {}).get('status') == 'supported' else 0
+            if sum(r.get('phase') == phase for r in self.rows) != expected:
+                self.error = self.error or f'observer_{phase}_record_count'
         for file in self.files: file.close()
         return dict(family=self.family, ready=self.ready, returncode=self.process.returncode,
+                    capture_complete=not self.reader.is_alive(),
                     error=self.error, process_usage=self.cpu, peak_rss_bytes=self.peak_rss_bytes,
                     final=next((r for r in self.rows if r.get('phase') == 'final'), None),
                     termination=next((r for r in self.rows if r.get('phase') == 'termination'), None))
@@ -303,8 +323,9 @@ def proof(observers, usage, distribution, sample, provenance, namespace_lifetime
         if role:
             identities[(row['cookie'], row['pid'], row['process_start_ns'])] = role
     phases = sample.get('phases') or {}
-    start = phases.get('measurement_start_monotonic_secs', 0) or 0
-    end = start + phases.get('measurement_secs', 0)
+    window = measurement_window(phases, usage['timeline'])
+    if 'process_clock_namespace_unverified' in provenance_issues(usage, window, provenance['time_namespace']):
+        window = dict(valid=False, reason='process_clock_namespace_unverified')
     cookie_roles = {}
     for (cookie, _, _), role in identities.items(): cookie_roles.setdefault(cookie, set()).add(role)
     operation_coverage = {}
@@ -315,15 +336,19 @@ def proof(observers, usage, distribution, sample, provenance, namespace_lifetime
             if len(roles) == 1 and row['kind'] in (1, 2, 5, 6, 16):
                 role = next(iter(roles))
                 operation_coverage.setdefault(role, set()).add(row['kind'])
-    witnesses = []
+    witnesses, uncertain = [], []
     for observer in observers:
         for row in observer.rows:
             if row.get('phase') != 'witness' or row['kind'] not in (1, 5): continue
             role = identities.get((row['cookie'], row['pid'], row['process_start_ns']))
-            if role and start * 1e9 <= row['at_ns'] <= end * 1e9:
-                if row['result'] == row['length'] and row['length'] > row['segment'] > 0:
+            if role and row['result'] == row['length'] and row['length'] > row['segment'] > 0:
+                position = measurement_position(row['at_ns'], window)
+                if position == 'measurement':
                     witnesses.append(dict(row, role=role, scope='this_sample_measurement_only'))
+                elif position != 'outside':
+                    uncertain.append(dict(row, role=role, phase_correlation=position))
     return dict(positive=witnesses, operation_coverage={k: sorted(v) for k, v in operation_coverage.items()},
+                measurement_clock=window, uncorrelated_positive=uncertain,
                 operation_coverage_scope='whole_arm_including_setup;_not_measurement_witness',
                 completeness='partial', exact_totals=False, absence_claim_allowed=False,
                 roles=[dict(cookie=k[0], pid=k[1], process_start_ns=k[2], role=v) for k, v in identities.items()],
@@ -395,6 +420,11 @@ def prepare(out):
     if not any(d.endswith(ENVOY.split('@')[1]) for d in images['envoy']['RepoDigests']):
         raise ValueError('Envoy digest mismatch')
     command('buffers', out / 'buffers')
+    time_offsets = Path('/proc/self/timens_offsets').read_text()
+    offsets = {name: (int(sec), int(ns)) for name, sec, ns in
+               (line.split() for line in time_offsets.splitlines())}
+    if offsets.get('monotonic') != (0, 0) or offsets.get('boottime') != (0, 0):
+        raise ValueError('observer requires unshifted host clocks')
     if not Path('/sys/kernel/tracing/events/syscalls/sys_enter_recvmsg/format').exists():
         command('tracefs', out / 'tracefs')
     provenance = dict(plan=plan, build=inventory, images=images, configs_difference=differences,
@@ -402,6 +432,7 @@ def prepare(out):
         source_hashes={str(p.relative_to(ROOT)): digest(p) for p in HERE.iterdir() if p.is_file()},
         boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
         netns=os.stat('/proc/self/ns/net').st_ino, kernel=platform.uname()._asdict(),
+        time_namespace=os.stat('/proc/self/ns/time').st_ino, time_namespace_offsets=time_offsets,
         btf_sha256=digest('/sys/kernel/btf/vmlinux'), kernel_notes_sha256=digest('/sys/kernel/notes'),
         runner={k: os.environ.get(k) for k in ('ImageOS', 'ImageVersion', 'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')},
         cpu=Path('/proc/cpuinfo').read_text(), frontend_tls_verification='existing_harness_insecure_policy',
@@ -509,6 +540,9 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
                 with urllib.request.urlopen('http://127.0.0.1:15000/' + endpoint, timeout=5) as response:
                     (out / (endpoint.split('?')[0] + '.raw.json')).write_bytes(response.read(8 * 1024 * 1024))
         raw = json.loads((out / 'benchmark.raw.json').read_text())
+        if not isinstance(raw, dict) or not isinstance(raw.get('phases'), dict):
+            raw = {}
+            raise ValueError('malformed_benchmark_document')
         record['status'] = 'captured'
         record.pop('reason', None)
     except (OSError, ValueError, RuntimeError, KeyError, subprocess.TimeoutExpired) as error:
@@ -542,7 +576,7 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
         try:
             distribution = backend_distribution(out / 'backend.log', raw.get('phases') or {})
             write(out / 'backend-connections.json', distribution)
-        except (OSError, ValueError, KeyError) as error: record['backend_distribution_error'] = str(error)
+        except (OSError, ValueError, KeyError, TypeError) as error: record['backend_distribution_error'] = str(error)
         derived = dict(raw, gateway=arm, payload_size=payload, effective_concurrency=[200, 200, 200, 100, 50][PAYLOADS.index(payload)],
                        sample_schema=2, pair=pair, order_position=position, host_id=provenance['boot_id'])
         usage['measurement'] = measurement_usage(usage, raw.get('phases') or {})
@@ -552,7 +586,6 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
         derived['envoy_counter_provenance'] = envoy_counter_provenance(ENVOY if arm.startswith('envoy') else None)
         issues = sample_issues(derived)
         if record.get('client_returncode') != 0: issues.append('client_exit_or_timeout')
-        if record.get('status') == 'error': issues.append(record.get('reason', 'driver_error'))
         if not budgets['equal_socket_budget_verified']: issues.append('socket_budget_incomplete')
         if raw.get('phases', {}).get('transport_close_timed_out'): issues.append('endpoint_drain_incomplete')
         for o in usage['owners']:
@@ -567,52 +600,44 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
         if arm.startswith('envoy'):
             try:
                 stats = json.loads((out / 'stats.raw.json').read_text())
-                counters = {r['name']: r['value'] for r in stats['stats'] if 'name' in r}
-                checks = {'upstream_cx_http1_total': 0, 'upstream_cx_http2_total': 0,
-                          'upstream_rq_retry': 0, 'upstream_rq_retry_success': 0, 'upstream_rq_timeout': 0}
-                evidence = {k: counters.get('cluster.backend_h3.' + k) for k in checks}
-                evidence['upstream_cx_http3_total'] = counters.get('cluster.backend_h3.upstream_cx_http3_total')
-                record['envoy_protocol_contract'] = evidence
-                if any(evidence[k] != v for k, v in checks.items()) or not isinstance(evidence['upstream_cx_http3_total'], (int, float)) or evidence['upstream_cx_http3_total'] <= 0:
-                    issues.append('envoy_protocol_retry_timeout_contract_incomplete')
-            except (OSError, ValueError, KeyError, TypeError): issues.append('envoy_stats_unavailable')
+                record['envoy_protocol_contract'] = envoy_protocol_evidence(stats)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                record['envoy_protocol_error'] = str(error)
+                issues.append('envoy_protocol_retry_timeout_contract_incomplete')
         phases = raw.get('phases') or {}
-        measurement_start = (phases.get('measurement_start_monotonic_secs') or 0) * 1e9
-        measurement_end = measurement_start + phases.get('measurement_secs', 0) * 1e9
-        if any(measurement_start <= e.get('at_ns', 0) <= measurement_end for e in usage['errors']) or not usage['capture_complete']:
-            issues.append('process_provenance_incomplete')
+        window = measurement_window(phases, usage['timeline'])
+        record['measurement_clock'] = window
+        issues.extend(provenance_issues(usage, window, provenance['time_namespace']))
+        if record.get('backend_distribution_error'): issues.append('backend_distribution_incomplete')
         if record.get('cleanup_errors'): issues.append('cleanup_failed')
-        record['traffic_issues'] = sorted(set(issues))
-        derived['traffic_issues'] = record['traffic_issues']
-        # Include the explicit campaign validity in the existing paired-summary contract.
-        if issues: derived['error'] = '; '.join(sorted(set(issues)))
-        record['useful_traffic_valid'] = not issues
-        write(out / 'derived.json', derived)
         evidence = proof(observers, usage, distribution, raw, provenance, namespace_lifetime, arm) if traced else dict(completeness='not_traced', positive=[])
         record['proof_completeness'] = evidence['completeness']
         write(out / 'proof.json', evidence)
         if duration == 2 and traced:
-            required = {'client', 'backend'} | (set() if arm == 'direct' else {'gateway_frontend', 'gateway_upstream'})
-            qualified = all(any(o.family == family and (o.ready or {}).get('status') == 'supported' for o in observers)
-                            for family in ('tx', 'rx', 'lifetime'))
-            if qualified:
-                coverage = evidence['operation_coverage']
-                missing = [role for role in sorted(required) if not ({1, 2} & set(coverage.get(role, [])))
-                           or not ({5, 6, 16} & set(coverage.get(role, [])))]
-                record['smoke_missing_roles'] = missing
-                if missing: record.update(status='error', reason='supported_observer_missing_real_H3_role_coverage')
-            else:
-                record['smoke_proof_status'] = 'explicit_capability_gap; useful_traffic_assessed_separately'
-        record['observer_errors'] = [r for r in observer_results if r['error'] or r['returncode'] != 0
-            or (r['final'] or {}).get('map_read_failures')
-            or ((r['ready'] or {}).get('status') == 'supported'
-                and (r['final'] is None or not (r['termination'] or {}).get('requested_stop')))]
+            record['smoke_issues'] = smoke_issues(evidence, observer_results, arm)
+        record['observer_errors'] = observer_issues(observer_results) if traced else []
         record['end_ns'] = time.monotonic_ns()
-        record['artifact_bytes'] = sum(p.stat().st_size for p in out.rglob('*') if p.is_file())
-        if record['artifact_bytes'] > 64 * 1024 * 1024:
-            record.update(status='error', artifact_cap_exceeded=True)
+        record['artifact_bytes_before_final_metadata'] = sum(p.stat().st_size for p in out.rglob('*') if p.is_file())
+        issues = sample_admission_issues(record, issues)
+        record['traffic_issues'] = issues
+        derived['traffic_issues'] = record['traffic_issues']
+        # All validity checks precede calibration/paired-summary admission.
+        if issues: derived['error'] = '; '.join(record['traffic_issues'])
+        record['useful_traffic_valid'] = not issues
+        write(out / 'derived.json', derived)
         write(out / 'sample.json', record)
-    return dict(derived, sample_record=record, observer_ok=not bool(record.get('observer_errors'))
+        # Include both final metadata files in the cap. Failure metadata is
+        # retained even when the cap is exceeded; no raw artifact is discarded.
+        artifact_bytes = sum(p.stat().st_size for p in out.rglob('*') if p.is_file())
+        if artifact_bytes > 64 * 1024 * 1024:
+            record.update(status='error', reason='artifact_cap_exceeded', artifact_cap_exceeded=True,
+                          artifact_bytes=artifact_bytes, useful_traffic_valid=False)
+            issues = sample_admission_issues(record, issues)
+            record['traffic_issues'] = issues
+            derived.update(traffic_issues=issues, error='; '.join(issues))
+            write(out / 'derived.json', derived)
+            write(out / 'sample.json', record)
+    return dict(derived, sample_record=record, observer_ok=not issues
                 and all(any(r['family'] == f and (r['ready'] or {}).get('status') == 'supported'
                             for r in observer_results) for f in ('tx', 'rx')))
 

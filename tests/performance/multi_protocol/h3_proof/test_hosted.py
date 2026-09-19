@@ -2,15 +2,48 @@
 
 import contextlib
 import io
+import json
 import os
 import subprocess
+import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import hosted
 
 
 class HostedTests(unittest.TestCase):
+    def test_classic_unavailability_cannot_hide_fixture_failure(self):
+        ready = dict(phase='ready', status='unsupported', errno=2, verifier_log_truncated=False,
+                     reason='missing_run_bpf_filter_execution_site')
+        for fixture_status, code, expected in [('supported', 0, 'unsupported'),
+                                                ('error', 1, 'error'), ('malformed', 0, 'error')]:
+            with self.subTest(fixture_status=fixture_status), tempfile.TemporaryDirectory() as directory:
+                process = Mock(returncode=0, args=['observer'])
+                process.poll.return_value = 0
+                fixture = dict(returncode=code, truncated=False,
+                               stdout=json.dumps(dict(mode='classic-select', status=fixture_status,
+                                   reason='fixture_assertion', start_ns=10, end_ns=20,
+                                   operations=[{'op': 'selection'}], sockets=[{'cookie': 7}])))
+                with (patch('hosted.subprocess.Popen', return_value=process),
+                      patch('hosted.readiness', return_value=ready),
+                      patch('hosted.command', return_value=fixture)):
+                    case = hosted.observer_case(Path(directory), 'classic', 'classic-select')
+                self.assertEqual(case['status'], expected)
+                self.assertEqual(case['ready'], ready)
+                self.assertEqual(case['fixture_process'], fixture)
+
+    def test_fixture_exit_and_capture_must_match_diagnostics(self):
+        for code, status, truncated in [(0, 'error', False), (1, 'supported', False),
+                                        (0, 'supported', True), (0, 'unknown', False)]:
+            process = dict(returncode=code, truncated=truncated,
+                           stdout=json.dumps(dict(mode='offload', status=status)))
+            with self.assertRaises(AssertionError): hosted.fixture_result(process, 'offload')
+        empty = dict(mode='offload', status='supported', start_ns=10, end_ns=20, operations=[], sockets=[])
+        with self.assertRaises(AssertionError):
+            hosted.fixture_result(dict(returncode=0, truncated=False, stdout=json.dumps(empty)), 'offload')
+
     def test_actions_flag_does_not_admit_missing_or_self_hosted_environment(self):
         for environment in [None, "self-hosted"]:
             with self.subTest(environment=environment):

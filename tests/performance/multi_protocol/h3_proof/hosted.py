@@ -12,6 +12,7 @@ import subprocess
 import time
 
 from evidence import assess
+from live_contract import natural, validate_observer_record
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[3]
@@ -204,6 +205,22 @@ def readiness(process):
     raise AssertionError("observer readiness failed or exceeded 8 seconds")
 
 
+def fixture_result(process, mode):
+    assert process['returncode'] in (0, 1) and not process.get('truncated'), 'fixture failed to execute or capture'
+    value = json.loads(process['stdout'])
+    assert isinstance(value, dict) and value.get('mode') == mode, 'invalid fixture document'
+    assert value.get('status') in ('supported', 'unsupported', 'error'), 'invalid fixture status'
+    assert process['returncode'] == int(value['status'] == 'error'), 'fixture status/exit mismatch'
+    assert all(natural(value.get(k)) for k in ('start_ns', 'end_ns')), 'invalid fixture interval'
+    assert value['start_ns'] <= value['end_ns'], 'reversed fixture interval'
+    if value['status'] == 'supported':
+        assert isinstance(value.get('operations'), list) and value['operations'], 'missing fixture operations'
+        assert isinstance(value.get('sockets'), list) and value['sockets'], 'missing fixture sockets'
+    else:
+        assert isinstance(value.get('reason'), str) and value['reason'], 'missing fixture failure reason'
+    return value
+
+
 def observer_case(out, family, mode, capacity=512, fault="normal", unprivileged=False):
     name = f"{family}-{mode}-{capacity}-{fault}{'-unprivileged' if unprivileged else ''}"
     log = out / f"{name}.log"
@@ -225,6 +242,8 @@ def observer_case(out, family, mode, capacity=512, fault="normal", unprivileged=
             case["launcher_argv"] = process.args
             ready = readiness(process)
             case["ready"] = ready
+            validate_observer_record(ready, family)
+            assert ready['phase'] == 'ready', 'missing observer readiness'
             if ready["status"] != "supported":
                 process.communicate(timeout=3)
                 assert process.returncode == (1 if ready["status"] == "error" else 0)
@@ -233,8 +252,7 @@ def observer_case(out, family, mode, capacity=512, fault="normal", unprivileged=
                 if fault == "normal" and not unprivileged:
                     fixture = command("fixture", mode=mode, timeout=10)
                     case["fixture_process"] = fixture
-                    assert fixture["returncode"] in (0, 1), "fixture failed to execute"
-                    case["fixture"] = json.loads(fixture["stdout"])
+                    case["fixture"] = fixture_result(fixture, mode)
                     if fixture["returncode"] or case["fixture"]["status"] == "error":
                         case["status"] = "error"
                 return case
@@ -242,17 +260,17 @@ def observer_case(out, family, mode, capacity=512, fault="normal", unprivileged=
                 raise AssertionError("fault injection unexpectedly became supported")
             fixture = command("fixture", mode=mode, timeout=10)
             case["fixture_process"] = fixture
-            assert fixture["returncode"] in (0, 1), "fixture failed to execute"
-            case["fixture"] = json.loads(fixture["stdout"])
+            case["fixture"] = fixture_result(fixture, mode)
             # A snapshot is exposed for integration, then explicit stop/final/detach.
             rest, _ = process.communicate(b"sq", timeout=5)
             case["snapshots"] = [json.loads(line) for line in rest.splitlines()]
+            for row in case['snapshots']: validate_observer_record(row, family)
             assert process.returncode == 0, "observer map read or process failure"
             assert fixture["returncode"] == 0, "fixture deterministic failure"
             final = next(row for row in case["snapshots"] if row["phase"] == "final")
             case["assessment"] = assess(ready, final, case["fixture"], family, capacity == 1)
             case["status"] = case["assessment"]["status"]
-    except (AssertionError, OSError, ValueError, subprocess.TimeoutExpired, StopIteration) as error:
+    except (AssertionError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, StopIteration) as error:
         case.update(status="error", reason=type(error).__name__, detail=str(error)[:1024])
     finally:
         if process is not None and process.poll() is None:

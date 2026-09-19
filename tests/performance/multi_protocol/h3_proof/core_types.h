@@ -2,6 +2,7 @@
  * This is not a vmlinux layout. Only the named fields are read. */
 #ifndef H3_CORE_TYPES_H
 #define H3_CORE_TYPES_H
+#include <linux/bpf.h>
 #include <linux/types.h>
 #pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
 struct ns_common { unsigned int inum; };
@@ -14,10 +15,11 @@ typedef struct { int counter; } atomic_t;
 struct sock { struct sock_common __sk_common; int sk_rcvbuf, sk_sndbuf; atomic_t sk_drops; __u16 sk_protocol; struct sock_reuseport *sk_reuseport_cb; };
 struct sock_filter { __u16 code; __u8 jt, jf; __u32 k; };
 struct sock_fprog_kern { __u16 len; struct sock_filter *filter; };
-struct bpf_prog { __u32 type; struct sock_fprog_kern *orig_prog; };
+struct bpf_prog { enum bpf_prog_type type; struct sock_fprog_kern *orig_prog; };
 struct socket { struct sock *sk; };
 struct sockaddr { __u16 sa_family; };
-struct sockaddr_in { __u16 sin_family, sin_port; __u32 sin_addr; };
+struct in_addr { __be32 s_addr; };
+struct sockaddr_in { __u16 sin_family; __be16 sin_port; struct in_addr sin_addr; };
 struct sock_reuseport { __u16 num_socks; struct sock *socks[]; };
 struct nsproxy { struct net *net_ns; };
 struct task_struct { struct nsproxy *nsproxy; struct task_struct *group_leader;

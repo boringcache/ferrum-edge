@@ -70,6 +70,17 @@ possible with two pairs. Every arm must resolve within both tolerances to use
 active observation in the main comparison. Missing metrics, invalid traffic or
 failed observers never pass calibration.
 
+The harness retains a Linux `CLOCK_MONOTONIC` bracket around the actual
+measurement-start `Instant`. Its process-local `measurement_start_monotonic_secs`
+is never compared with kernel or observer timestamps. The driver verifies an
+unshifted host clock and matching workload time namespaces, retains paired
+realtime/monotonic reads, and requires captures before and after measurement.
+Clock reads wider than 1 ms, missing/reversed bounds, observed realtime steps
+beyond 1 ms plus 1000 ppm slew, and inconsistent phase realtime fail closed.
+Witnesses in either uncertain boundary band remain uncorrelated; errors whose
+capture interval might overlap measurement, including untimed errors, invalidate
+provenance. An empty matching witness set makes no absence or performance claim.
+
 Otherwise all four main pairs run without the active observer, followed after
 each pair by a matched traced diagnostic pair. Proof belongs to those diagnostic
 samples only. No observer overhead is subtracted. Every raw failed/malformed
@@ -103,6 +114,9 @@ an `rps: 0` benchmark. Useful-traffic validity and proof completeness are separa
   as a helper argument. Fixtures leave cookies unassigned before first observed
   bind/attachment/traffic, then compare actual observer cookies with SO_COOKIE
   and sock-diag. Verifier rejections are errors, not unsupported successes.
+  CO-RE declarations preserve field kinds as well as names: `sin_addr` is a
+  nested `struct in_addr` and `bpf_prog.type` is `enum bpf_prog_type`. Endpoint
+  reads relocate kernel fields directly rather than a partial stack structure.
 - Birth/bind, TX/RX, retirement, process fork/exec/exit, reuseport attachment,
   membership and classic execution load independently. The attach family does
   not require `run_bpf_filter`. Exact classic execution remains unavailable on
@@ -163,6 +177,15 @@ live smoke. This does not implement a general FD emulator or certify every
 close_range/namespace/restart interleaving. Short process/FD lifetimes between
 passive samples and unobserved retirement remain partial coverage; supported
 hooks with missing records are not relabelled as host capability failures.
+
+The live smoke requires supported TX/RX/birth/retirement observers, both traffic
+directions and actual socket birth/retirement events for every required role.
+Malformed readiness, rows or final diagnostics, missing families, capture/resource
+errors and artifact limits invalidate admission before calibration or comparison.
+Unavailable classic execution remains a distinct capability result; a malformed
+or failed fixture is still an error. Hosted prepare runs the common-clock Rust
+regression, formatting and targeted lint, plus the Python clock/admission tests
+and real verifier/fixture checks. No local execution substitutes for these gates.
 
 Both off/on treatments retain process/thread CPU/RSS, capture cost, host CPU and
 softirq snapshots. PMU opening in the original preflight is only event availability;
