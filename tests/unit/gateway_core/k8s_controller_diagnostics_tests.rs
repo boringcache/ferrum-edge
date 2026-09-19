@@ -2,10 +2,8 @@
 
 use super::*;
 use crate::config_sources::k8s::K8sMetadata;
+use crate::diagnostic_test_logs as diagnostic_logs;
 use serde_json::json;
-
-#[path = "../../common/diagnostic_logs.rs"]
-mod diagnostic_logs;
 
 fn object(kind: &str, spec: Value) -> K8sObject {
     K8sObject {
