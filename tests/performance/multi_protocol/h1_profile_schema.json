@@ -217,5 +217,32 @@
     "lost_events",
     "slot_capacity",
     "allocator_installed"
-  ]
+  ],
+  "external_trace_schema": {
+    "version": 1,
+    "manifest": "trace-manifest.json",
+    "dimensions": [
+      "syscall_totals",
+      "socket_roles",
+      "lifecycle",
+      "cpu_samples",
+      "unwind"
+    ],
+    "independent_validity": [
+      "useful_work",
+      "capture",
+      "profile"
+    ],
+    "required_evidence": [
+      "losses",
+      "reset",
+      "identity",
+      "boundaries",
+      "ready",
+      "termination",
+      "source_object_tool_hashes"
+    ],
+    "unknown_is_zero": false,
+    "allocation_copy_completeness_unproven": true
+  }
 }

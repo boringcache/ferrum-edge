@@ -60,6 +60,9 @@ pub mod plugin_cache;
 pub mod plugins;
 pub mod policy_path;
 pub mod pool;
+#[cfg(feature = "bench-pool-profile")]
+pub mod pool_profile;
+mod pool_profile_macros;
 pub mod proxy;
 pub mod request_epoch;
 pub mod retry;

@@ -322,8 +322,10 @@ class H1InternalProfileTests(unittest.TestCase):
         result = profile.report(root, mode)
         written = json.loads((root / "h1_profile_report.json").read_text())
         self.assertEqual(len(written["observations"]), 60)
-        self.assertEqual(result["fully_measured_comparison_eligible"], eligible)
-        self.assertEqual(written["fully_measured_comparison_eligible"], eligible)
+        self.assertEqual(result["internal_comparison_eligible"], eligible)
+        self.assertEqual(written["internal_comparison_eligible"], eligible)
+        self.assertFalse(result["fully_measured_comparison_eligible"])
+        self.assertFalse(written["fully_measured_comparison_eligible"])
         self.assertEqual({(row["pair"], row["gateway"], row["payload"]) for row in written["observations"]},
                          {(pair, gateway, size) for pair in range(1, 5)
                           for gateway in ["direct"] + list(profile.MANIFEST["campaigns"][mode])

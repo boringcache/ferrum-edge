@@ -442,3 +442,11 @@ The endpoint caches responses for 5 seconds, so polling faster than every 5 seco
 ### Modes without proxy state
 
 In Control Plane (`cp`) and node-agent (`node_agent`) modes, the process has no proxy state. The response returns zero values for runtime counters, empty `connection_pools` / `caches` objects, and still reports `gateway.mode`. Mesh mode serves the full proxy-backed payload with `gateway.mode` set to `mesh`.
+
+The default-off `bench-pool-profile` build adds the fixed integer-only
+`ferrum_pool_profile_*` schema to the same authenticated `/metrics` response.
+It retains the H1 observer contract, without a new allocator or labels. See
+[pool profiling coverage and completeness](pool_internal_profile.md) and
+`tests/performance/multi_protocol/pool_profile_schema.json` for phase/outcome,
+sampling, loss, tail and observer-cost meanings. Poll duration is elapsed
+execution, not CPU time or stream-credit wait.

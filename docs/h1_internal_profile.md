@@ -148,7 +148,7 @@ does not dispatch). Once the workflow is available to GitHub Actions:
 
 ```sh
 gh workflow run h1-internal-profile.yml \
-  --ref codex/20260918-5588-h1-profile -f payloads=all -f diagnostic_only=true
+  --ref codex/20260919-5588-h1-kernel-profile -f payloads=all -f diagnostic_only=true
 ```
 
 `diagnostic_only=true` is the default: it runs the bounded slice below, then
@@ -543,10 +543,10 @@ adapter limitation separately.
 
 ## Open obligations before any optimization
 
-Actual syscall collection is **not implemented**. AsyncWrite polls, TLS records,
+With the default `trace_mode=none`, actual syscall collection is **not enabled**. AsyncWrite polls, TLS records,
 logical body frames and `/proc/io` accounting are four different quantities.
-The artifact explicitly records syscall collection unavailable, permission not
-probed and loss unknown. A separately budgeted intrusive pass must establish
+Without an external trace, syscall availability and loss remain unknown. The
+opt-in follow-up below registers a separately budgeted intrusive pass to establish
 capabilities/permissions, PID/TID and socket/FD lifetime attribution, successful
 write/writev/send* returns, lost events and measured tracing overhead. No inference
 from a zero field or missing trace closes that obligation. Sampled CPU stacks and
@@ -556,7 +556,275 @@ The live cadence/safety gates above must pass on the exact reviewed head before
 any later aggregation/adapter optimization. They cover only their declared
 contracts, not H1 trailers, all policy modes, full native memory/copy coverage,
 syscalls, sampled CPU, backpressure saturation or performance. Syscall/CPU
-tracing remains later work after the H3 foundation settles.
+tracing uses the merged H3 foundation in the opt-in follow-up below; hosted
+results and measurement interpretation remain outstanding.
 Review allocator safety/publication, the nondefault feature's hosted results,
 calibration, partial-profile residuals, all-size traffic failures and source
 coverage before interpreting measurements. #5588 is not closed by instrumentation.
+
+## Hosted syscall and CPU follow-up (issue #5588)
+
+The follow-up integrates H1 parent
+`2491d44b1149bf33dece351595244351d2dbc322` and the reviewed H3 foundation
+`e00f0a91cb5ae2b0686392f504471283e6f52b4c` by normal merge. It adds no production
+forwarding change, Cargo dependency, tuning, competitor arm, pool/UDP profiling,
+frame-pointer rebuild or measurement claim. The H3 probes, fixture commands,
+calibration and campaign remain separate. The H1 cadence and fixed 5 MiB drain
+slice above remain required and unchanged.
+
+Manual input `trace_mode=none|syscalls|cpu` defaults to `none`.
+`diagnostic_only=true` still stops after the existing drain slice even if a trace
+mode was supplied. An intrusive campaign requires `diagnostic_only=false`, a
+successful slice and explicit `syscalls` or `cpu`, plus **one payload selection**.
+Run separate root-selected shards for 10240, 71680, 512000, 1048576 and 5242880;
+all five are still required, with 200/200/200/100/50 workers. No worker dispatch is
+authorized by this implementation. The workflow keeps internal observer off/on
+calibration and cutoff comparisons, then runs external off/on calibration with
+exactly the same observer-on image/config/cutoff, then a separate externally
+observed cutoff 0/1 matrix. Each matrix has four counterbalanced pairs, repeated
+direct controls, 15-second measurement, and unchanged warmup/drain/TLS/status,
+body, timeout and retry rules. Syscalls and CPU occupy separate repetitions.
+Raw overhead is retained without subtraction or historical throughput borrowing.
+
+The `trace-fixtures` job compiles the shared C/BPF observer with warnings as
+errors, compiles the optimized omitted-frame-pointer/unwind-table fixture,
+checks shell/Python syntax and consumer regressions, and actually runs the
+fixtures on GitHub-hosted Ubuntu. The same preflight runs again on the measurement
+VM. `H3 Proof Preflight` also runs on changes to the shared observer. These are
+registered gates, **not locally executed or passing results**. No trusted policy
+verifier/exemption or frozen gateway benchmark workflow was edited. All commands
+used by the supervisor have literal execution sites in `h1_trace_commands.sh`.
+Ubuntu package versions/origins and actual tool hashes are retained; no unpinned
+downloads are introduced. The installed distro perf ELF is retained separately
+from the running kernel version; a mismatched/unusable tool is reported, not
+assumed capable because its wrapper exists.
+
+### Syscall contract
+
+The shared observer's isolated `h1` mode enables only `h_*` programs/maps; H3
+modes do not allocate the H1 maps. Native amd64 `raw_tp/sys_enter/sys_exit` read
+actual register arguments and signed returns, admitting long-mode user CS 0x33
+and rejecting compat/x32/out-of-range calls. Runtime BTF and exact ftrace function
+visibility must establish `tcp_sendmsg(sock, msghdr, size_t)` and
+`tcp_recvmsg(sock, msghdr, size_t, int, int*)`, both returning int. Failure is a
+separate discovered/load/attach/unsupported record with errno and retained bounded
+verifier diagnostics. No guessed offsets, fallback FD lookup or JIT inspection.
+The ABI reference is the Linux
+[TCP implementation](https://github.com/torvalds/linux/blob/v6.17/net/ipv4/tcp.c);
+actual running BTF remains authoritative.
+
+All ten read/readv/recvfrom/recvmsg/recvmmsg/write/writev/sendto/sendmsg/sendmmsg
+paths keep entry attempts separate from signed outer exits. Counters separate
+positive, zero, errno and kernel restart results; known offered bytes, successful
+accepted bytes, shorts, TCP EOF and syscall elapsed time are distinct. A zero
+read counts EOF only after actual TCP context and a known nonzero request.
+`mmsg` positive returns count **messages**, with accepted bytes read only from
+the returned prefix's `msg_len`. Inner TCP calls/accepted bytes/errors remain
+separate: outer EFAULT can follow an inner transfer, and batch success can hide
+a later failure. Accepted bytes are not peer delivery; syscall elapsed time is
+not CPU time. The syscall census names sendfile/splice/vmsplice/tee/io_uring and
+pread/pwrite variants without claiming their bytes.
+
+Only length metadata is read: at most 16 iovecs per message and 16 messages per
+batch. Oversize, overflow and metadata read failures remain unknown. No payload,
+TLS buffer, control/credential data or raw kernel pointer is exported. Outer
+flags and effective inner flags/lengths are separate. Aggregate totals are atomic;
+min/max and first/last timestamps are explicitly approximate during concurrent
+updates. Counter overflow/reset, pending calls, unmatched entry/exit, abandoned
+calls, map exhaustion and unknown cookies remain explicit. The first 4096
+syscall witnesses are diagnostic examples, not an event-complete stream.
+
+The supervisor exists before `start_ferrum`; the loader attaches unbound, then
+receives the verified PID/start ticks/cgroup/netns. The process remains ordinary
+UID with zero effective/permitted/ambient capabilities. All existing threads
+are inventoried, new threads use actual task generation, exec invalidates the
+binding, and fork/exit events are retained. Health-check child processes, client,
+backend and sampler cannot pass the TGID/generation/cgroup filter. Boot identity,
+namespace inodes, selected safe runtime settings, exact config hash, image and
+matching retained release ELF bind the evidence. No arbitrary environment is
+copied. Startup before binding is an explicit coverage gap.
+
+TCP INET_DIAG runs in the target network namespace before admission and refreshes
+during capture; it primes the kernel cookie through the existing diag ABI/parser.
+Each syscall socket join comes from its actual `tcp_sendmsg/tcp_recvmsg` context.
+A zero cookie or socket created/closed between dumps stays unknown forever.
+IPv4 local port 8443 and IPv4 loopback peer port 3447 define the four
+frontend/upstream send/receive roles only after the exact runtime config is
+verified. Other target sockets are excluded. IPv6 role attribution is not claimed.
+The initial FD/inode/diag table is bracketed evidence, never an authoritative
+exit-time association. Lifecycle syscall records retain dup/reuse/close intervals;
+shared file tables, inherited FDs, SCM_RIGHTS, pidfd_getfd, close errors and races
+leave exact alias/lifetime joins unproven. Shutdown is not destruction. TLS
+handshake/control and HTTP overhead remain transport bytes, with no per-request
+or exact cross-hop request join. Startup probe traffic cannot be separated into
+requests by syscall metadata and is outside the measured phase.
+
+The actual fixture exercises scalar/vector/batch APIs, partial nonblocking sends,
+EAGAIN, zero reads/EOF, bad FDs, oversize/faulting metadata, partial batches and
+read-only `msg_len` copyout, signal-interrupted calls, sibling threads, dup/FD
+reuse, four socket roles and an excluded same-namespace process. Its receipts
+are reconciled with real observed signed returns and lengths. Deliberate map
+capacity, stale-generation binding, missing BTF/symbol and unprivileged attachment
+cases are separate. Actual PID-number recycling, compat/IPv6, shared-file-table
+and nondeterministic close-in-flight fixtures remain explicitly unexercised.
+A passing fixture cannot imply all gateway APIs were observed. If attachment is
+unavailable, this implementation retains an unavailable syscall capture; a stock
+perf syscall fallback is not enabled or spliced onto a different repetition.
+
+### CPU capture and bounds
+
+The CPU lane records actual `cpu-clock:uS` software samples (`S` retains sample-read enabled/running time) at fixed 99 Hz with
+`--clockid mono --call-graph dwarf,8192`, bounded mmap pages, target PID/all threads
+and inherited future tasks. It requires an actual perf enable/control receipt
+before client setup. Hardware cycles and kernel stacks are not selected.
+Raw perf.data, build IDs, header attributes, task/MMAP records, decoder exit
+status, loss/throttle records, per-TID samples, depth distribution, unresolved
+samples and folded/decoded call chains are retained. Matching mapped ELF/DSOs
+come from the target mount namespace while alive, never substituted host libc.
+The gateway's retained ELF must match exactly one symbolized release twin.
+Only this disposable synthetic benchmark process's user stack memory may enter
+perf.data. Matching DSO packages are retained once under the corresponding
+`builds/<twin>/symfs`, verified again before reuse, with a separate 512 MiB
+package ceiling; repeat artifacts reference that package.
+
+Attribute verification reads the retained, hash-matched `perf evlist -v` output
+within the existing 2 MiB metadata cap (at most 32 lines, 16 KiB per line).
+It binds fields to exactly one `cpu-clock:uS` event; the separate `dummy:u`
+metadata event or any unrelated event cannot supply missing requirements.
+The actual `{ sample_period, sample_freq }: 99` union is interpreted as 99 Hz
+only with `freq: 1`. Numeric software type 1/config 0, inheritance, kernel
+exclusion, `use_clockid: 1`/monotonic clock ID 1, an 8192-byte user stack dump,
+nonzero user register mask, and exact sample/read-format bits are verified on
+that same event. Missing, malformed, duplicate, ambiguous or wrong-valued fields
+fail with specific reasons in `attribute_validation` and the CPU issues list.
+The original attributes and command status remain retained on failure. The
+consumer fixture retains the verbatim two-event output from hosted run
+`35422193763` (artifact `10577439767`); regressions mutate it to exercise missing
+fields, wrong events, period mode, wrong values and cross-event borrowing.
+Attribute verification alone establishes neither successful capture nor complete
+unwinding; all sample, ownership, loss, symbol/CFI and nested-chain checks remain.
+
+The optimized CPU fixture contains noinline nested functions, sibling threads,
+a post-attach child and a separate busy control. The gate requires actual samples,
+thread/child coverage and **one admitted leaf-to-caller callchain containing
+`fixture_leaf`, then `fixture_middle`, then `fixture_outer`**. The preflight and
+consumer regressions call the same nested-proof helper. Three unrelated flat
+samples or a reversed chain fail; compiler clone/offset suffixes and intervening
+inline/unknown frames are allowed. Whole matching chains, PID/TID, sample times
+and matched frame indices remain in `nested_proof.witnesses`; unknown frames and
+unresolved sample counts are not erased by a successful nested witness. Symbol
+names pooled across samples or a PMU count alone cannot pass. Corrupt perf data
+and an actual 64 KiB negative capture cap test decoder/capture failure.
+Kernel/permission/tool failures retain
+explicit unsupported status. Optimized-away/tail/inlined/async frames, incomplete
+CFI, unresolved symbols and an 8192-byte stack truncation fraction that cannot be
+proved stay unknown. Useful multi-frame hotspots do not establish complete stacks,
+full native allocation/copy coverage or a fully profiled comparison.
+
+Each preflight case prints at most 4 KiB of verdict/error details and bounded,
+address-scrubbed stderr tails; `preflight.json` and each case's raw reports remain
+the complete evidence. Failed capability collection also writes a failed report.
+After collectors are reaped, their owned perf control/ack FIFOs are removed.
+Producer exit and an always-run workflow fallback hand only the declared trace
+trees to the ordinary sudo caller for upload, adding owner read/traversal access
+without widening group/other permissions. Regular raw data, including failed or
+capped `perf.data` and regular control receipts, is preserved byte for byte;
+verifier stderr retains its existing address redaction. The handoff does not
+follow symlinks or alter hard-linked files and fails on unexpected file types.
+Upload still runs after a failed fixture or handoff; no retention step changes
+the fixture verdict, capture limits, or measurement eligibility.
+
+One capture lasts at most 300 seconds through client setup/warmup/measurement,
+request drain and gateway removal, with 64 map/metadata snapshots. The existing
+32 MiB observer admission includes an 8 MiB conservative H1 map reservation plus
+observer RSS (CPU uses the same total RSS ceiling); per-repeat peak CPU/RSS and
+sample failures are retained. H1 capacities are 8192 aggregate rows, 512 pending
+calls, 512 process-total slots, 1024 census slots, a 512 KiB ring, 4096 syscall
+witnesses and 8192 userspace lifecycle/witness rows. Fixed non-LRU maps never
+silently evict evidence. Ring loss/witness omission and aggregate loss are separate.
+Raw perf has a hard 64 MiB RLIMIT_FSIZE per repeat, and total trace artifacts have
+128 MiB job-wide admission including previous failed repeats and preflight,
+excluding retained build/debug/DSO packages. A 32 MiB reservation covers bounded
+decoding/final records. Exhaustion can leave later matrix entries missing; no
+full campaign is claimed or automatically retried at a lower sampling rate. Deadline/cap exits
+stop/reap owned children and mark capture incomplete. Parent-death signals close
+observer/perf children; bounded decoder teardown does not extend measured work.
+No gateway runs privileged and no host perf/security sysctl is changed.
+
+### Workload completion and collector teardown
+
+The runner retains raw client stdout/exit and stamps the sample before requesting
+teardown, after the synchronous client has returned. H1 emits its phase report
+only after `Phases::finish` has joined all request workers. The supervisor rejects
+nonzero exit, absent/malformed/changed results, incomplete or timed-out drain,
+stalled workers, stale capture/session/binding/target evidence, and a measurement
+that is not inside this capture's host clock bracket. Error-free useful work is
+still assessed independently; a teardown receipt cannot turn failed requests
+into useful throughput. Request drain is not a claim that every idle gateway
+socket or transport has closed.
+
+The supervisor rechecks the live target generation and live collectors **before**
+publishing `teardown-ready.json`. The receipt retains the request, result hashes,
+binding hash, identity, host clocks and collector observations. The runner waits
+for that receipt before its existing owned `docker rm -f`, then signals `stop`.
+The acknowledgement wait uses the existing 30-second readiness budget capped by
+the original 300-second capture deadline. Failed startup/abort cleanup has no
+verified transition and remains incomplete. Client work, request timeouts, drain,
+retries, sample cadence and measured RPS are unchanged; this wait is postwork.
+
+This ordering addresses perf's normal target-exit behavior. Linux
+[`is_event_hup`/`perf_poll`](https://github.com/torvalds/linux/blob/v6.8/kernel/events/core.c#L5297)
+reports hangup after an event has exited and its inherited child events are gone.
+The [`perf record` drain loop](https://github.com/torvalds/linux/blob/v6.8/tools/perf/builtin-record.c#L2535)
+drains and ends after its event descriptors disappear. The previous runner
+removed the gateway before touching `stop`, while the 50 ms supervisor loop
+rejected any intervening collector exit. Thus a normal target teardown could be
+misclassified as premature loss. These upstream sources explain the race; actual
+hosted kernel/tool versions and fixture results remain authoritative.
+
+Capture stays enabled through removal where possible. Only perf's zero exit
+after an acknowledged transition and observed target exit is permitted; exit
+while the target is still live, pre-acknowledgement loss, early target death,
+nonzero/forced exit, syscall observer exit, missing/partial decoder output,
+loss/attribute failures and failed evidence reads remain incomplete. A stop
+marker alone cannot authorize closure. Final client evidence is checked again.
+Collector last-live/first-exited host clock bounds and reap clocks are retained
+separately from supervisor/decoder end. Coverage uses the conservative last-live
+bound. Exact exit time and full gateway-removal coverage are **not** certified;
+post-target-exit samples are not promised, and unwind gaps remain separate.
+
+The hosted CPU fixture now joins its worker threads/child, emits and retains a
+`workload_done` receipt, and waits for the same live transition helper before
+exiting. The supervisor observes real perf autoexit without first signaling it,
+under a bounded fixture deadline. This proves only synthetic fixture behavior,
+not gateway drain or RPS. Mocked consumer regressions exercise the real runner
+request and supervisor acknowledgement, stale/missing/partial evidence, bad event
+ordering, and the target-exit/resource-read race. These new checks have not been
+executed locally; hosted results must be inspected before calling the repair
+verified.
+
+H1 teardown and trace event placement admit explicit `clock_receipt` records
+from readiness, the runner and the supervisor. Each carries the producer's boot
+ID, time namespace and paired realtime/CLOCK_MONOTONIC reads. Admission requires
+the owned target's boot/namespace, bounded read uncertainty, monotonic ordering,
+actual measurement start/end brackets, and realtime agreement with the client
+phase report (1 ms read uncertainty plus 1000 ppm slew). These receipts certify
+clock bounds only: the H3 passive resource consumer still requires whole read
+intervals and rejects clock-only rows. `process_usage.py` also retains paired
+realtime/monotonic brackets. No client process-local Instant epoch is compared
+with kernel ktime. Capture
+starts before client invocation and remains enabled during gateway removal;
+measurement coverage requires actual bracketing observations and the conservative
+collector end bound. Exact absolute warmup/drain boundaries
+are an explicit gap in the existing phase report; cumulative snapshots are not
+instantaneous phase counts. A capture cap can never imply full measurement.
+
+Each `pairs/pair_NNN/traces/<arm>_<payload>/` directory retains capabilities,
+identity, initial/periodic TCP inventories, readiness/termination, raw syscall
+snapshots/lifetimes or raw perf/decoded stacks, build mapping inventory and
+`trace-manifest.json`. Failed raw client stdout/exit, including 5 MiB failures,
+remain alongside it. The report separates useful-work, internal-profile, syscall,
+socket/lifetime, CPU-sample and unwind validity. `internal_comparison_eligible`
+requires valid traffic, complete internal profiles and complete runtime pairing;
+`fully_measured_comparison_eligible` remains false with missing dimensions. Root must review actual hosted compiler,
+fixture and capture evidence before any interpretation; #5588 remains open.

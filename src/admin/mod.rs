@@ -3424,6 +3424,8 @@ async fn handle_admin_request_inner(
         let mut metrics_output = registry.render();
         #[cfg(feature = "bench-h1-profile")]
         metrics_output.push_str(&crate::h1_profile::render_prometheus());
+        #[cfg(feature = "bench-pool-profile")]
+        metrics_output.push_str(&crate::pool_profile::render_prometheus());
         #[cfg(feature = "bench-udp-profile")]
         metrics_output.push_str(&crate::udp_profile::render_prometheus());
         metrics_output.push_str(&crate::plugins::utils::jwks_cache::render_prometheus());
