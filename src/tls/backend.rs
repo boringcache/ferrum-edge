@@ -14,7 +14,6 @@ use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore};
-use thiserror::Error;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 use crate::config::types::{BackendTlsConfig, Proxy, validate_backend_tls_san_allow_list_entry};
@@ -26,23 +25,62 @@ use crate::tls::{
     NoVerifier, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
 };
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum TlsError {
-    #[error("Failed to read {kind} from {path}: {source}")]
     Io {
         kind: &'static str,
         path: PathBuf,
-        #[source]
         source: std::io::Error,
     },
-    #[error("Failed to parse {kind} from {path}: {details}")]
     Pem {
         kind: &'static str,
         path: PathBuf,
         details: String,
     },
-    #[error("rustls: {0}")]
     Rustls(String),
+}
+
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { kind, path, source } => write!(
+                f,
+                "Failed to read {} from {path:?}: {:?}",
+                crate::tls::material_diagnostic_label(kind),
+                source.to_string()
+            ),
+            Self::Pem {
+                kind,
+                path,
+                details,
+            } => {
+                write!(
+                    f,
+                    "Failed to parse {} from {path:?}: ",
+                    crate::tls::material_diagnostic_label(kind)
+                )?;
+                // These two closed reasons are produced by load_client_auth;
+                // all other detail is opaque, including third-party payloads.
+                match details.as_str() {
+                    "the private key is missing" => f.write_str("the private key is missing"),
+                    "the certificate is missing" => f.write_str("the certificate is missing"),
+                    _ => write!(f, "{details:?}"),
+                }
+            }
+            Self::Rustls(details) => write!(f, "rustls: {details}"),
+        }
+    }
+}
+
+impl std::error::Error for TlsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Match MaterialError: preserve OS error chains and the typed I/O
+            // field without re-exposing custom provider causes below Display.
+            Self::Io { source, .. } if source.raw_os_error().is_some() => Some(source),
+            _ => None,
+        }
+    }
 }
 
 /// Shared cache for backend rustls client configs keyed by TLS identity.
@@ -747,7 +785,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             Err(err) => {
                 tracing::warn!(
                     "Backend TLS policy is incompatible with HTTP/3/QUIC ({}); falling back to rustls safe defaults for the QUIC builder",
-                    err
+                    crate::startup::sanitize_startup_cause(err, &[])
                 );
                 backend_client_config_builder(None).map_err(|fallback_err| {
                     TlsError::Rustls(format!(
@@ -774,7 +812,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             tracing::warn!("{}", skip_verify_warning);
             if !self.proxy.resolved_tls.san_allow_list.is_empty() {
                 tracing::warn!(
-                    proxy_id = %self.proxy.id,
+                    proxy_id = %crate::startup::sanitize_startup_scalar(&self.proxy.id),
                     san_allow_list_entries = self.proxy.resolved_tls.san_allow_list.len(),
                     "Backend TLS SAN allow-list is configured but certificate verification is disabled; SAN allow-list will not be enforced"
                 );
@@ -989,9 +1027,9 @@ fn pkcs11_backend_client_auth(
     let certified_key =
         crate::tls::pkcs11::certified_key_from_uri(certs, uri).map_err(|error| {
             TlsError::Rustls(format!(
-                "Failed to configure PKCS#11 backend TLS client key {}: {}",
+                "Failed to configure `backend TLS client private key` from PKCS#11 source {:?}: token key configuration failed: {:?}",
                 uri.source_id(),
-                error
+                error.to_string()
             ))
         })?;
     Ok(BackendClientAuth::Resolver(Arc::new(
@@ -1005,7 +1043,7 @@ fn pkcs11_backend_client_auth(
     uri: &CertSourceUri,
 ) -> Result<BackendClientAuth, TlsError> {
     Err(TlsError::Rustls(format!(
-        "PKCS#11 backend TLS client key source {} requires building ferrum-edge with the 'pkcs11' Cargo feature",
+        "PKCS#11 backend TLS client key source {:?} requires building ferrum-edge with the `pkcs11` Cargo feature",
         uri.source_id()
     )))
 }
@@ -1017,13 +1055,12 @@ fn load_cert_chain(
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let material = load_backend_material(path, material_kind, kind)?;
     let source_id = material.display_source_id.clone();
+    // These shared helpers already quote supplied context and retain fixed
+    // record indexes/reasons (including measured public-key strength). Do not
+    // put that structured diagnostic inside Pem's opaque quoted detail.
     let certs =
         crate::tls::parse_pem_certificate_bundle(material.bytes.expose_secret(), kind, &source_id)
-            .map_err(|error| TlsError::Pem {
-                kind,
-                path: PathBuf::from(&source_id),
-                details: error.to_string(),
-            })?;
+            .map_err(|error| TlsError::Rustls(error.to_string()))?;
 
     Ok(certs)
 }
@@ -1031,13 +1068,8 @@ fn load_cert_chain(
 fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'static>, TlsError> {
     let material = load_backend_material(path, MaterialKind::Key, kind)?;
     let source_id = material.display_source_id.clone();
-    crate::tls::parse_pem_private_key(material.bytes.expose_secret(), kind, &source_id).map_err(
-        |error| TlsError::Pem {
-            kind,
-            path: PathBuf::from(&source_id),
-            details: error.to_string(),
-        },
-    )
+    crate::tls::parse_pem_private_key(material.bytes.expose_secret(), kind, &source_id)
+        .map_err(|error| TlsError::Rustls(error.to_string()))
 }
 
 fn load_backend_material(
@@ -1054,7 +1086,8 @@ fn load_backend_material(
             source,
         },
         other => TlsError::Rustls(format!(
-            "Failed to load {kind} from {}: {other}",
+            "Failed to load {} from {:?}: {other}",
+            crate::tls::material_diagnostic_label(kind),
             source.redacted_source_id()
         )),
     })
@@ -1828,7 +1861,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, TlsError::Rustls(message) if message.contains("'pkcs11' Cargo feature"))
+            matches!(err, TlsError::Rustls(message) if message.contains("`pkcs11` Cargo feature"))
         );
     }
 

@@ -59,9 +59,31 @@ paths:
   load messages; CP namespace rejection, mesh startup paths, xDS carriers,
   federation/remote clusters, probe/injector names, node-agent addresses/paths,
   and revision identities; capture boolean/port/mark/UID/CIDR parsing and
-  annotation overrides. SQL literals, fixed migration/listener/fault labels,
+  annotation overrides; shared unknown-key suggestions, rate-window/request/frame
+  bounds, socket-host/egress errors, and notification channel/SMTP/template
+  admission. Notification unknown-key failures retain the fixed `channels`
+  schema context separately from supplied channel names and keys. Shared helper
+  context that may contain document keys is Debug-escaped as a whole; callers
+  must supply a separate fixed schema field when one is available. HTTP rate-rule
+  ordinals and GraphQL rate collection names stay in a separate schema-authored
+  prefix; supplied operation keys stay in the opaque label. WAF rule/signature
+  ordinals and API-spec extension request/response/bypass paths preserve this
+  separate fixed context; supplied override IDs and extension keys never enter
+  the visible prefix. SQL literals, fixed migration/listener/fault labels,
   and schema-only constants are not document-value interpolation. Preserve these
   conventions when adding sibling validators; keep field/index and reason.
+- Shared TLS and plugin-client configuration diagnostics quote material paths,
+  source identifiers, cipher/group selections and opaque provider detail.
+  Fixed material labels, PEM/CRL record indexes and measured public-key strength
+  remain available. Custom I/O causes stay in typed fields but are omitted from
+  generic error-chain traversal; native OS causes remain chained. TLS constructor
+  logs sanitize source/proxy scalars at emission. Successful TLS policy INFO
+  events omit supplied selections (including normalized cipher/group aliases),
+  protocol versions and ordering scalars; retain fixed field names and counts.
+  Shared Redis/replay admission preserves schema fields and fixed rejection
+  reasons without supplied identities.
+  Registered loader, rendered-chain and captured-log regressions cover these
+  surfaces; source IDs retained for internal identity are not safe log labels.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
@@ -80,7 +102,8 @@ paths:
   Its explicit `ROOTS` list covers the above roots except `src/capture`, whose
   generated shell commands also use quoted interpolation. Capture parsing has
   rendered-output and captured-log regressions. The guard scans every Rust file
-  in its roots, including multiline/nested macros
+  in its roots, plus the converted shared unknown-key, rate-limit, and socket-host
+  helpers and notifications, including multiline/nested macros
   and raw strings, for single-quoted interpolation in diagnostic macros and for
   named error/message captures in `warn!`/`error!` without a sanitizer call in
   that statement. Its exact, commented exception list contains SQL query syntax,
