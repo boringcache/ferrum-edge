@@ -113,7 +113,7 @@ def annotate(sample, usage, lines):
     result["measurement_failures"] = [row["seq"] for row in result["events"]
                                       if row["event"] == 1 and row["phase"] == "measurement"]
     loss_keys = {f"log_dropped_{sink}_{reason}" for sink in ("stdout", "stderr")
-                 for reason in ("saturation", "oversized", "closed")}
+                 for reason in ("saturation", "record_too_large", "closed")}
     snapshots = [row["h2_gauges"] for row in usage.get("timeline", []) if "h2_gauges" in row]
     result["sink_loss_samples"] = [dict(unix_secs=row["unix_secs"], **{
         key: value for key, value in row.get("gauges", {}).items() if key in loss_keys})

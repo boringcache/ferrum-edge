@@ -13,7 +13,7 @@ def parse_gauges(text):
     values = {}
     for line in text.splitlines():
         loss = re.fullmatch(r'ferrum_log_sink_dropped_records_total\{sink="(stdout|stderr)",'
-                            r'reason="(saturation|oversized|closed)"\} ([0-9]+)', line)
+                            r'reason="(saturation|record_too_large|closed)"\} ([0-9]+)', line)
         if loss:
             key = "log_dropped_" + loss[1] + "_" + loss[2]
             if key in values:

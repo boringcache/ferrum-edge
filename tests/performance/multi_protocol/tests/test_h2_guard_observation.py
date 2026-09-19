@@ -34,7 +34,7 @@ def line(values, timestamp="2026-09-18T00:00:04Z", marker="H2_GUARD_V1"):
 
 def usage():
     gauges = {f"log_dropped_{sink}_{reason}": 0 for sink in ("stdout", "stderr")
-              for reason in ("saturation", "oversized", "closed")}
+              for reason in ("saturation", "record_too_large", "closed")}
     return dict(timeline=[dict(h2_gauges=dict(unix_secs=1789689604, gauges=gauges))])
 
 
@@ -138,6 +138,46 @@ class GuardObservationTests(unittest.TestCase):
                    'ferrum_overload_active_connections 21\n'
                    'ferrum_log_sink_dropped_records_total{sink="stdout",reason="saturation"} 3\n')
         self.assertEqual(parse_gauges(metrics)["log_dropped_stdout_saturation"], 3)
+
+    def test_exported_loss_metric_family_is_retained_and_missing_counters_fail_closed(self):
+        # These are the labels emitted by src/logging/mod.rs::render_prometheus.
+        gauges = ('ferrum_connection_pool_entries{pool="http2"} 1\n'
+                  'ferrum_connection_pool_entries{pool="grpc"} 2\n'
+                  'ferrum_overload_active_connections 21\n')
+        losses = (
+            'ferrum_log_sink_dropped_records_total{sink="stdout",reason="saturation"} 0\n'
+            'ferrum_log_sink_dropped_records_total{sink="stdout",reason="record_too_large"} 0\n'
+            'ferrum_log_sink_dropped_records_total{sink="stdout",reason="closed"} 0\n'
+            'ferrum_log_sink_dropped_records_total{sink="stderr",reason="saturation"} 0\n'
+            'ferrum_log_sink_dropped_records_total{sink="stderr",reason="record_too_large"} 0\n'
+            'ferrum_log_sink_dropped_records_total{sink="stderr",reason="closed"} 0\n'
+        )
+
+        def observe(metrics):
+            capture = usage()
+            capture["timeline"][0]["h2_gauges"]["gauges"] = parse_gauges(gauges + metrics)
+            sample = self.sample()
+            annotate(sample, capture, [line(row())])
+            return sample["h2_guard_observation"]
+
+        observation = observe(losses)
+        self.assertEqual(observation["capture_errors"], [])
+        self.assertFalse(observation["sink_loss_observed"])
+        self.assertEqual(len(observation["sink_loss_samples"][0]), 7)  # timestamp + six counters
+        for sink in ("stdout", "stderr"):
+            with self.subTest(sink=sink):
+                label = f'sink="{sink}",reason="record_too_large"'
+                positive = losses.replace(label + '} 0', label + '} 2')
+                observation = observe(positive)
+                self.assertEqual(observation["capture_errors"], [])
+                self.assertTrue(observation["sink_loss_observed"])
+                self.assertEqual(observation["sink_loss_samples"][0][
+                    f"log_dropped_{sink}_record_too_large"], 2)
+        for missing in losses.splitlines(keepends=True):
+            with self.subTest(missing=missing):
+                observation = observe(losses.replace(missing, ""))
+                self.assertIn("missing_log_sink_loss_counters", observation["capture_errors"])
+                self.assertFalse(observation["sink_loss_observed"])
 
     def test_explicit_manifest_does_not_enable_original_campaign(self):
         old = json.loads((ROOT / "experiment.json").read_text())
