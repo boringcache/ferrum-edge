@@ -1,0 +1,9 @@
+# Package the already compiled, hashed Ferrum binary once; no source rebuild.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
+ARG REVISION
+LABEL org.opencontainers.image.revision=$REVISION
+WORKDIR /app
+COPY --chmod=755 ferrum-edge /app/ferrum-edge
+USER 65534:65534
+ENTRYPOINT ["/app/ferrum-edge"]
+CMD ["run"]

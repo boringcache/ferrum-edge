@@ -243,9 +243,9 @@ impl ReplayScope {
             "process" => Ok(Self::Process),
             "shared" => Ok(Self::Shared),
             _ => Err(format!(
-                "{plugin}: '{field}' must be exactly 'process' or 'shared' — use 'shared' \
-                 together with sync_mode: 'redis' for any deployment running more than one \
-                 gateway replica, or 'process' to declare a single-process deployment whose \
+                "{plugin}: `{field}` must be exactly `process` or `shared` — use `shared` \
+                 together with `sync_mode: redis` for any deployment running more than one \
+                 gateway replica, or `process` to declare a single-process deployment whose \
                  replay protection is not cross-replica"
             )),
         }
@@ -1178,10 +1178,10 @@ pub fn validate_scope_backend(
 ) -> Result<(), String> {
     match (scope, redis_configured) {
         (ReplayScope::Shared, false) => Err(format!(
-            "{plugin}: '{field}' = 'shared' requires sync_mode: 'redis' and a 'redis_url'"
+            "{plugin}: `{field}` = `shared` requires `sync_mode: redis` and a `redis_url`"
         )),
         (ReplayScope::Process, true) => Err(format!(
-            "{plugin}: sync_mode: 'redis' is only meaningful with '{field}' = 'shared'"
+            "{plugin}: `sync_mode: redis` is only meaningful with `{field}` = `shared`"
         )),
         _ => Ok(()),
     }

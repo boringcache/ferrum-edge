@@ -19,15 +19,257 @@ use ferrum_edge::plugins::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp,
     LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS, LocalLimiter, LocalWindowAlgorithm,
     MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS, RateLimitAlgorithm,
-    RateLimitWindowSpec, SLIDING_WINDOW_BUCKET_COUNT, SlidingWindow, TokenBucket,
-    UdpRateLimitAlgorithm, UdpRateLimitOp, local_window_algorithm, single_window_ttl_seconds,
-    two_window_ttl_seconds,
+    RateLimitWindowSpec, RedisLimiter, SLIDING_WINDOW_BUCKET_COUNT, SlidingWindow, TokenBucket,
+    UdpRateLimitAlgorithm, UdpRateLimitOp, WS_FRAME_REDIS_MAX_WINDOW_SECONDS, WsFrameRateAlgorithm,
+    local_window_algorithm, parse_redis_failure_policy, single_window_ttl_seconds,
+    two_window_ttl_seconds, validate_max_requests, validate_window_seconds,
+    validate_ws_frame_rate_params,
 };
 use ferrum_edge::plugins::{PluginHttpClient, create_plugin};
+use ferrum_edge::startup::render_startup_error;
 use serde_json::{Value, json};
 
 const OVER_WINDOW: u64 = MAX_RATE_LIMIT_WINDOW_SECONDS + 1;
 const OVER_REQUESTS: u64 = MAX_RATE_LIMIT_MAX_REQUESTS + 1;
+
+#[test]
+fn shared_rate_limit_bounds_keep_schema_fields_and_withhold_values_and_labels() {
+    let label = "grpc_method_router: method_rate_limits[''UNREGISTERED_METHOD\"\\\n`host`']";
+    for (error, expected) in [
+        (
+            validate_window_seconds(label, "limits[2].window_seconds", u64::MAX).unwrap_err(),
+            format!(
+                "<redacted scalar>: `limits[2].window_seconds` must be <= \
+                 {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds, got: <redacted scalar>"
+            ),
+        ),
+        (
+            validate_max_requests(label, "limits[2].max_requests", u64::MAX).unwrap_err(),
+            format!(
+                "<redacted scalar>: `limits[2].max_requests` must be <= \
+                 {MAX_RATE_LIMIT_MAX_REQUESTS}, got: <redacted scalar>"
+            ),
+        ),
+        (
+            validate_window_seconds(label, "window_seconds", 0).unwrap_err(),
+            "<redacted scalar>: `window_seconds` must be greater than zero".to_string(),
+        ),
+        (
+            validate_max_requests(label, "max_requests", 0).unwrap_err(),
+            "<redacted scalar>: `max_requests` must be greater than zero".to_string(),
+        ),
+    ] {
+        assert_eq!(
+            render_startup_error(anyhow::Error::msg(error), &[]),
+            expected
+        );
+    }
+}
+
+#[test]
+fn rendered_http_rate_bounds_preserve_the_real_nonzero_rule_ordinal() {
+    for (field, maximum) in [
+        ("window_seconds", MAX_RATE_LIMIT_WINDOW_SECONDS),
+        ("max_requests", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_second", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_minute", MAX_RATE_LIMIT_MAX_REQUESTS),
+        ("requests_per_hour", MAX_RATE_LIMIT_MAX_REQUESTS),
+    ] {
+        for supplied in [0, maximum + 1] {
+            let mut rule = json!({
+                "scope": "consumers",
+                "consumers": ["UNREGISTERED_CONSUMER"],
+            });
+            if field == "window_seconds" || field == "max_requests" {
+                rule["window_seconds"] = json!(1);
+                rule["max_requests"] = json!(1);
+            }
+            rule[field] = json!(supplied);
+            let error = rate_limiting(json!({
+                "limit_by": "consumer",
+                "limits": [
+                    {"scope": "default", "requests_per_second": 10},
+                    rule,
+                ],
+            }))
+            .expect_err("the second rule must retain the shared bound rejection");
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            let reason = if supplied == 0 {
+                "must be greater than zero".to_string()
+            } else if field == "window_seconds" {
+                format!("must be <= {maximum} seconds, got: <redacted scalar>")
+            } else {
+                format!("must be <= {maximum}, got: <redacted scalar>")
+            };
+            assert_eq!(
+                rendered,
+                format!("rate_limiting: `limits[1]`: <redacted scalar>: `{field}` {reason}")
+            );
+        }
+    }
+}
+
+#[test]
+fn rendered_graphql_rate_bounds_preserve_the_schema_parent_without_operation_keys() {
+    for (parent, key) in [
+        ("type_rate_limits", "query"),
+        ("operation_rate_limits", "UNREGISTERED_OPERATION"),
+    ] {
+        for (field, supplied) in [
+            ("max_requests", OVER_REQUESTS),
+            ("window_seconds", OVER_WINDOW),
+        ] {
+            let mut spec = json!({"max_requests": 1, "window_seconds": 1});
+            spec[field] = json!(supplied);
+            let error = graphql(json!({(parent): {(key): spec}}))
+                .expect_err("the actual GraphQL constructor must reject the bound");
+            let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(
+                rendered.starts_with(&format!("graphql: `{parent}`: <redacted scalar>: ")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("`{field}` must be <=")),
+                "{rendered}"
+            );
+            assert!(!rendered.contains(key), "{rendered}");
+            assert!(!rendered.contains(&supplied.to_string()), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn shared_rate_limit_diagnostics_withhold_method_keys_from_real_callers() {
+    let method = "'UNREGISTERED_METHOD\"\\\n`method_rate_limits`";
+    for spec in [
+        json!({"max_requests": OVER_REQUESTS, "window_seconds": 1}),
+        json!({"max_requests": 1, "window_seconds": OVER_WINDOW}),
+        json!({"max_requests": 1, "window_seconds": 1, "max_requets": false}),
+    ] {
+        let field = if spec.get("max_requets").is_some() {
+            "did you mean `max_requests`?"
+        } else if spec["max_requests"] == json!(OVER_REQUESTS) {
+            "`max_requests` must be <="
+        } else {
+            "`window_seconds` must be <="
+        };
+        let error = grpc_method_router(json!({"method_rate_limits": {(method): spec}}))
+            .expect_err("invalid method rate specifications must fail admission");
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        for withheld in [
+            "UNREGISTERED_METHOD".to_string(),
+            "max_requets".to_string(),
+            "false".to_string(),
+            OVER_REQUESTS.to_string(),
+            OVER_WINDOW.to_string(),
+        ] {
+            assert!(!rendered.contains(&withheld), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn shared_redis_failure_policy_diagnostics_keep_fixed_choices_without_values() {
+    for supplied in [
+        json!("'UNREGISTERED_POLICY\"\\\n`redis_failure_policy`"),
+        json!(true),
+        json!(987654321),
+        json!({"'UNREGISTERED_KEY": "UNREGISTERED_VALUE"}),
+    ] {
+        let reason = if supplied.is_string() {
+            "must be exactly `fail_closed` or `local_fallback`"
+        } else {
+            "must be a string (`fail_closed` or `local_fallback`)"
+        };
+        let error =
+            parse_redis_failure_policy("rate_limiting", &json!({"redis_failure_policy": supplied}))
+                .unwrap_err();
+        assert_eq!(
+            render_startup_error(anyhow::Error::msg(error), &[]),
+            format!("rate limiting: `redis_failure_policy` {reason}")
+        );
+    }
+}
+
+#[test]
+fn shared_redis_identity_diagnostics_withhold_invalid_names_and_ids() {
+    let supplied = "'UNREGISTERED_ID\"\\\n`namespace`";
+    for (plugin_name, config_id, reason) in [
+        (supplied, "config-id", "invalid canonical plugin name"),
+        ("ws_rate_limiting", supplied, "invalid plugin config id"),
+    ] {
+        let error = RedisLimiter::new_with_config_id(
+            plugin_name,
+            config_id,
+            &json!({}),
+            &PluginHttpClient::default(),
+            WsFrameRateAlgorithm::new(1.0, 1.0),
+        )
+        .err()
+        .expect("invalid identities must fail before Redis construction");
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(reason), "{rendered}");
+        assert!(
+            rendered.contains("must start with an alphanumeric"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("UNREGISTERED_ID"), "{rendered}");
+    }
+}
+
+#[test]
+fn shared_ws_rate_diagnostics_keep_bounds_and_relations_without_supplied_numbers() {
+    for (frames_per_second, burst_size, expected) in [
+        (
+            0,
+            61,
+            "`frames_per_second` must be greater than zero".to_string(),
+        ),
+        (61, 0, "`burst_size` must be greater than zero".to_string()),
+        (
+            OVER_REQUESTS,
+            61,
+            format!(
+                "`frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, \
+                 got: <redacted scalar>"
+            ),
+        ),
+        (
+            61,
+            OVER_REQUESTS,
+            format!(
+                "`burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: <redacted scalar>"
+            ),
+        ),
+        (
+            57,
+            19,
+            "`burst_size` must be >= `frames_per_second`".to_string(),
+        ),
+        (
+            13,
+            27,
+            "`burst_size` must be an integer multiple of `frames_per_second` \
+             so Redis and local sustained rates match"
+                .to_string(),
+        ),
+        (
+            2,
+            8642,
+            format!(
+                "`burst_size` / `frames_per_second` refill window exceeds the \
+                 Redis-representable maximum of {WS_FRAME_REDIS_MAX_WINDOW_SECONDS} seconds"
+            ),
+        ),
+    ] {
+        let error = validate_ws_frame_rate_params(frames_per_second, burst_size).unwrap_err();
+        assert_eq!(
+            render_startup_error(anyhow::Error::msg(error), &[]),
+            format!("ws_rate_limiting: {expected}")
+        );
+    }
+}
 
 fn rate_limiting(config: Value) -> Result<(), String> {
     ferrum_edge::plugins::rate_limiting::RateLimiting::new(&config, PluginHttpClient::default())

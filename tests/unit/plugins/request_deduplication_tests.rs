@@ -954,7 +954,7 @@ fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
             error.contains("request_deduplication: unknown configuration key(s)"),
             "{error}"
         );
-        assert!(error.contains(&format!("'config.{unknown}'")), "{error}");
+        assert!(error.contains(&format!("\"config.{unknown}\"")), "{error}");
         assert!(error.contains(suggestion), "{error}");
     }
 
@@ -1064,7 +1064,7 @@ fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
         panic!("invalid sync_mode must be rejected");
     };
     assert!(
-        sync_error.contains("'sync_mode'") && sync_error.contains("'local' or 'redis'"),
+        sync_error.contains("`sync_mode`") && sync_error.contains("`local` or `redis`"),
         "expected RedisConfig sync_mode diagnostic: {sync_error}"
     );
     assert!(
@@ -1104,7 +1104,7 @@ fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
         panic!("invalid redis_url scheme must be rejected");
     };
     assert!(
-        url_error.contains("'redis_url'") && url_error.contains("scheme"),
+        url_error.contains("`redis_url`") && url_error.contains("scheme"),
         "expected redis_url diagnostic: {url_error}"
     );
     for secret in [PASSWORD, USER, "http://", "cache.internal"] {

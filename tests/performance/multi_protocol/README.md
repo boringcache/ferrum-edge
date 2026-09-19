@@ -1006,3 +1006,14 @@ both protocols at 10/70/500 KiB and 1/5 MiB with fixed adaptive=false. The repor
 retains failed/missing observations and distinguishes useful traffic from profile
 completeness. CPU stacks, hardware cache evidence and downstream stream-credit
 wait remain unavailable; correctness disposition and dispatch belong to root.
+
+## UDP internal profile campaign
+
+The separate [UDP Internal Profile lane](../../../.github/workflows/udp-internal-profile.yml)
+uses default-off `bench-udp-profile`, four UDP1024 echo200 pairs, repeated direct
+controls, and same-revision observer calibration. See
+[coverage and limitations](../../../docs/udp_internal_profile.md) and the fixed
+`udp_profile_manifest.json` / `udp_profile_schema.json` contracts. Profiles and
+traffic validity are separate; unpublished tails and scrape failures cannot
+become zero-filled success. Controlled locality/burst/churn remain explicit
+hooks, and `experiment.json` remains disabled.

@@ -2570,3 +2570,11 @@ Diagnostic builds with the default-off `bench-h1-profile` feature append fixed
 `ferrum_h1_profile_*` metrics to the existing authenticated `/metrics` response.
 See [H1 internal profiling](h1_internal_profile.md) for source coverage, allocator
 safety, publication loss and hosted-only collection.
+
+### Diagnostic UDP profiling metrics
+
+Default-off `bench-udp-profile` builds append a fixed `ferrum_udp_profile_*`
+family to the existing authenticated `/metrics` response. See
+[UDP profile contract](udp_internal_profile.md) for its literal schema, sampled
+synchronous timings, direction attribution, and explicit partial-data limits.
+Authentication and ordinary builds are unchanged.

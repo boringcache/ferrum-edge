@@ -111,12 +111,12 @@ impl PiiRedactor {
         for name in builtins {
             let Some(regex_str) = builtin_pii_pattern(name) else {
                 return Err(format!(
-                    "{plugin_name}: unknown built-in redaction pattern {name:?}"
+                    "{plugin_name}: `redaction.builtins` unknown built-in redaction pattern {name:?}"
                 ));
             };
             let regex = Regex::new(regex_str).map_err(|_| {
                 format!(
-                    "{plugin_name}: failed to compile built-in redaction pattern {name:?} (invalid regex or complexity limit exceeded)"
+                    "{plugin_name}: `redaction.builtins` failed to compile built-in redaction pattern {name:?} (invalid regex or complexity limit exceeded)"
                 )
             })?;
             patterns.push(CompiledPattern {
@@ -126,10 +126,10 @@ impl PiiRedactor {
             });
         }
 
-        for (name, regex_str) in custom {
+        for (index, (name, regex_str)) in custom.iter().enumerate() {
             let regex = Regex::new(regex_str).map_err(|_| {
                 format!(
-                    "{plugin_name}: failed to compile custom redaction pattern {name:?} (invalid regex or complexity limit exceeded)"
+                    "{plugin_name}: `redaction.custom_patterns[{index}].regex` failed to compile custom redaction pattern {name:?} (invalid regex or complexity limit exceeded)"
                 )
             })?;
             patterns.push(CompiledPattern {
@@ -140,8 +140,10 @@ impl PiiRedactor {
         }
 
         let detection_set = RegexSet::new(patterns.iter().map(|pattern| pattern.regex.as_str()))
-            .map_err(|error| {
-                format!("{plugin_name}: failed to build redaction detection set: {error}")
+            .map_err(|_| {
+                format!(
+                    "{plugin_name}: `redaction.builtins` / `redaction.custom_patterns` detection set is invalid or too complex"
+                )
             })?;
 
         let key: &[u8] = match hash_secret {

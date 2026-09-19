@@ -860,12 +860,12 @@ fn reject_unknown_validate_keys(
     path: &str,
     allowed: &[&str],
 ) -> Result<(), ExtractError> {
-    crate::util::unknown_keys::reject_unknown_keys(object, path, allowed, "").map_err(|error| {
-        ExtractError::MalformedExtension {
+    // Callers supply only the extension name and a literal request/response side.
+    crate::util::unknown_keys::reject_unknown_keys(object, path, allowed, &format!("`{path}`: "))
+        .map_err(|error| ExtractError::MalformedExtension {
             which: "x-ferrum-validate",
             error,
-        }
-    })
+        })
 }
 
 fn apply_validate_extension(
@@ -950,7 +950,7 @@ fn validate_openapi_validator_bypass(
         object,
         &format!("{which}.bypass"),
         OPENAPI_VALIDATOR_BYPASS_KEYS,
-        "",
+        &format!("`{which}.bypass`: "),
     )
     .map_err(|error| ExtractError::MalformedExtension { which, error })?;
     for key in ["paths", "methods", "consumers"] {

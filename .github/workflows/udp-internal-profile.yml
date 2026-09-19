@@ -1,0 +1,210 @@
+name: UDP Internal Profile
+
+on:
+  pull_request:
+    paths:
+      - src/udp_profile/**
+      - src/udp_profile_macros.rs
+      - src/proxy/udp_proxy.rs
+      - src/proxy/udp_batch.rs
+      - src/lib.rs
+      - src/admin/mod.rs
+      - Cargo.toml
+      - .github/scripts/check_fips_feature_policy.py
+      - tests/unit/gateway_core/udp*
+      - tests/performance/multi_protocol/**
+      - .github/workflows/udp-internal-profile.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTC_WRAPPER: ""
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+  RUSTFLAGS: ""
+
+jobs:
+  checks:
+    name: UDP observer feature and safety contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Hosted native prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
+      - name: Hosted formatting
+        run: cargo fmt --all -- --check
+      - name: Feature lint
+        run: cargo clippy --locked --features bench-udp-profile --lib --bin ferrum-edge --test unit_gateway_core_tests -- -D warnings
+      - name: UDP profile attribution and Linux batch semantics
+        run: |
+          cargo test --locked --features bench-udp-profile --lib udp_profile::store::tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_profile_tests
+          cargo test --locked --features bench-udp-profile --lib proxy::udp_batch
+      - name: Preserve setup races, pending FIFO and stop ownership
+        run: cargo test --locked --features bench-udp-profile --lib proxy::udp_proxy::tests
+      - name: Preserve expiry, queues, identity, generation, source and amplification
+        run: |
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_auth_lifetime_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_egress_isolation_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_reply_stop_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_setup_failure_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_amplification_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests udp_dtls_idle_activity_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests node_waypoint_udp_destination_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests node_waypoint_udp_identity_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests node_waypoint_udp_reply_source_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests mesh_udp_batch_tests
+          cargo test --locked --features bench-udp-profile --test unit_gateway_core_tests datagram_client_address
+          cargo test --locked --features bench-udp-profile --test unit_tests udp_amplification
+          cargo test --locked --features bench-udp-profile --lib socket_opts::pktinfo_tests
+          cargo test --locked --features bench-udp-profile --test integration_tests udp_hook_concurrency
+          cargo test --locked --features bench-udp-profile --test integration_tests mesh_node_waypoint_udp_scope
+      - name: Existing UDP functional contracts with observer enabled
+        run: |
+          cargo build --locked --features bench-udp-profile --bin ferrum-edge
+          cargo test --locked --features bench-udp-profile --test functional_tests functional_udp_proxy -- --ignored
+      - name: Observer-off and combined H1 compatibility
+        run: |
+          cargo test --locked --test unit_gateway_core_tests udp_
+          cargo check --locked --features bench-h1-profile,bench-udp-profile --lib --bin ferrum-edge
+      - name: Registered collector, Kong readback and parent measurement contracts
+        if: always()
+        run: |
+          bash -n tests/performance/multi_protocol/kong_udp_readback.sh
+          python3 -m unittest discover --verbose --start-directory tests/performance/multi_protocol/tests
+
+  measurement:
+    name: Hosted UDP same-revision calibration and echo profile
+    if: github.event_name == 'workflow_dispatch'
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Hosted prerequisites and memory headroom
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils
+          sudo fallocate -l 12G /mnt/udp-profile-swap
+          sudo chmod 600 /mnt/udp-profile-swap
+          sudo mkswap /mnt/udp-profile-swap
+          sudo swapon /mnt/udp-profile-swap
+      - name: Record source, toolchain and same-host identity
+        run: |
+          mkdir -p udp-profile-evidence/builds
+          git rev-parse HEAD > udp-profile-evidence/revision.txt
+          git status --porcelain > udp-profile-evidence/source-status.txt
+          git archive HEAD | sha256sum > udp-profile-evidence/source-tree.sha256
+          cp Cargo.lock Cargo.toml udp-profile-evidence/builds/
+          cp tests/performance/multi_protocol/Cargo.lock udp-profile-evidence/builds/harness-Cargo.lock
+          cp .cargo/config.toml udp-profile-evidence/builds/cargo-config.toml
+          cp tests/performance/multi_protocol/udp_profile_manifest.json udp-profile-evidence/
+          rustc -Vv > udp-profile-evidence/builds/rustc.txt
+          cargo -V > udp-profile-evidence/builds/cargo.txt
+          uname -a > udp-profile-evidence/kernel.txt
+          lscpu > udp-profile-evidence/cpu.txt
+          free -k > udp-profile-evidence/memory.txt
+          cat /proc/sys/kernel/random/boot_id > udp-profile-evidence/boot-id.txt
+      - name: Build same-revision observer-off image
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: '1'
+          CARGO_PROFILE_RELEASE_STRIP: 'none'
+        run: |
+          set -euo pipefail
+          mkdir -p bin/amd64 udp-profile-evidence/builds/off
+          cargo build --locked --release --bin ferrum-edge --bin ferrum-cni \
+            2>&1 | tee udp-profile-evidence/builds/off/build.log
+          cp target/release/ferrum-edge target/release/ferrum-cni bin/amd64/
+          sha256sum bin/amd64/* > udp-profile-evidence/builds/off/binaries.sha256
+          readelf -n bin/amd64/ferrum-edge > udp-profile-evidence/builds/off/build-id.txt
+          objcopy --only-keep-debug bin/amd64/ferrum-edge udp-profile-evidence/builds/off/ferrum-edge.debug
+          printf '%s\n' 'observer=off' 'profile=release' 'debug=1' 'strip=none' \
+            'default_features=crypto-ring' 'lto=fat' 'codegen_units=1' 'opt_level=3' \
+            'panic=abort' 'RUSTFLAGS=' > udp-profile-evidence/builds/off/flags.txt
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "ferrum.udp-profile=off" -t ferrum-udp:off . \
+            2>&1 | tee udp-profile-evidence/builds/off/image-build.log
+          docker image inspect ferrum-udp:off > udp-profile-evidence/builds/off/image.json
+      - name: Build same-revision observer-on image
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: '1'
+          CARGO_PROFILE_RELEASE_STRIP: 'none'
+        run: |
+          set -euo pipefail
+          mkdir -p bin/amd64 udp-profile-evidence/builds/on
+          cargo build --locked --release --features bench-udp-profile --bin ferrum-edge --bin ferrum-cni \
+            2>&1 | tee udp-profile-evidence/builds/on/build.log
+          cp target/release/ferrum-edge target/release/ferrum-cni bin/amd64/
+          sha256sum bin/amd64/* > udp-profile-evidence/builds/on/binaries.sha256
+          readelf -n bin/amd64/ferrum-edge > udp-profile-evidence/builds/on/build-id.txt
+          objcopy --only-keep-debug bin/amd64/ferrum-edge udp-profile-evidence/builds/on/ferrum-edge.debug
+          printf '%s\n' 'observer=on' 'profile=release' 'debug=1' 'strip=none' \
+            'default_features=crypto-ring' 'lto=fat' 'codegen_units=1' 'opt_level=3' \
+            'panic=abort' 'RUSTFLAGS=' > udp-profile-evidence/builds/on/flags.txt
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "ferrum.udp-profile=on" -t ferrum-udp:on . \
+            2>&1 | tee udp-profile-evidence/builds/on/image-build.log
+          docker image inspect ferrum-udp:on > udp-profile-evidence/builds/on/image.json
+      - name: Build common harness and retain unchanged Kong image metadata
+        run: |
+          cargo build --locked --release --manifest-path tests/performance/multi_protocol/Cargo.toml
+          sha256sum tests/performance/multi_protocol/target/release/proto_bench tests/performance/multi_protocol/target/release/proto_backend > udp-profile-evidence/builds/harness.sha256
+          docker pull kong/kong-gateway:3.10.0.0
+          docker image inspect kong/kong-gateway:3.10.0.0 > udp-profile-evidence/kong-image.json
+      - name: Four observer on/off pairs and repeated direct controls
+        id: calibration
+        continue-on-error: true
+        run: |
+          FERRUM_IMAGE=ferrum-udp:on bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
+            udp --udp-profile calibration --baseline-image ferrum-udp:off \
+            --gateways ferrum --skip-build --duration 15 --concurrency 200 --pairs 4 \
+            --payload-sizes 1024 --wallclock-budget-seconds 3600 \
+            --output-dir udp-profile-evidence/calibration
+      - name: Four echo profile pairs with unchanged Kong and repeated direct controls
+        id: profile
+        continue-on-error: true
+        run: |
+          FERRUM_IMAGE=ferrum-udp:on bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
+            udp --udp-profile profile --gateways 'ferrum kong' --skip-build \
+            --duration 15 --concurrency 200 --pairs 4 --payload-sizes 1024 \
+            --wallclock-budget-seconds 3600 --output-dir udp-profile-evidence/profile
+      - name: Retain raw failures and separate traffic/profile validity
+        if: always()
+        run: |
+          status=0
+          python3 tests/performance/multi_protocol/udp_internal_profile.py report udp-profile-evidence/calibration calibration || status=1
+          python3 tests/performance/multi_protocol/udp_internal_profile.py report udp-profile-evidence/profile profile || status=1
+          exit "$status"
+      - name: Upload evidence including incomplete campaigns
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: udp-internal-profile-${{ github.sha }}
+          path: udp-profile-evidence/
+          retention-days: 14
+      - name: Preserve runner failures in job conclusion
+        if: always()
+        env:
+          CALIBRATION_OUTCOME: ${{ steps.calibration.outcome }}
+          PROFILE_OUTCOME: ${{ steps.profile.outcome }}
+        run: test "$CALIBRATION_OUTCOME" = success && test "$PROFILE_OUTCOME" = success

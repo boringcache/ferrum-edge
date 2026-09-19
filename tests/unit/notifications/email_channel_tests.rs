@@ -228,7 +228,7 @@ fn plaintext_smtp_is_refused_at_admission() {
         "from": "ferrum@example.com",
         "to": ["oncall@example.com"]
     }));
-    assert!(error.contains("unknown 'tls_mode'"), "{error}");
+    assert!(error.contains("unknown `tls_mode`"), "{error}");
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn half_configured_credentials_are_refused() {
         "to": ["oncall@example.com"]
     }));
     assert!(
-        missing_username.contains("without 'username'"),
+        missing_username.contains("without `username`"),
         "{missing_username}"
     );
     assert!(
@@ -341,7 +341,7 @@ fn invalid_addresses_are_refused() {
             "to": [address]
         }));
         assert!(
-            error.contains("invalid 'to' address"),
+            error.contains("invalid `to` address"),
             "address={address} error={error}"
         );
 
@@ -352,7 +352,7 @@ fn invalid_addresses_are_refused() {
             "to": ["oncall@example.com"]
         }));
         assert!(
-            from_error.contains("invalid 'from' address"),
+            from_error.contains("invalid `from` address"),
             "address={address} error={from_error}"
         );
     }
@@ -420,11 +420,11 @@ fn host_port_timeout_and_template_bounds_are_explicit() {
         (json!({"subject_template": ""}), "must not be empty"),
         (
             json!({"helo_name": "not a hostname"}),
-            "invalid 'helo_name'",
+            "invalid `helo_name`",
         ),
         (
             json!({"tls_server_name": ""}),
-            "'tls_server_name' must not be empty",
+            "`tls_server_name` must not be empty",
         ),
         (
             json!({"tls_server_name": "not a name"}),
@@ -1738,4 +1738,93 @@ async fn a_relay_that_hangs_up_early_is_reported() {
         .expect_err("an early close must fail the send");
     assert!(error.contains("closed the connection"), "{error}");
     handle.abort();
+}
+
+#[test]
+fn startup_diagnostics_withhold_email_names_and_numeric_scalars() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (field, value, hidden) in [
+        ("tls_mode", json!(secret), "diagnostic-secret-5594"),
+        ("tls_server_name", json!(secret), "diagnostic-secret-5594"),
+        ("smtp_port", json!(987654321), "987654321"),
+        ("connect_timeout_ms", json!(987654321), "987654321"),
+        ("command_timeout_ms", json!(987654321), "987654321"),
+        ("smtp_port", json!(true), "true"),
+    ] {
+        let mut config = minimal_def(587);
+        config[field] = value;
+        let error = parse_error(config);
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
+        assert!(
+            !rendered.contains("diagnostic_secret_5594"),
+            "normalized TLS-mode operand must also be withheld: {rendered}"
+        );
+        if field == "tls_mode" {
+            assert!(rendered.contains("unknown `tls_mode`"), "{rendered}");
+        }
+        assert!(!rendered.contains("ops_email"), "{rendered}");
+    }
+
+    let mut config = minimal_def(587);
+    config["subject_template"] = json!("'diagnostic-secret-5594${unclosed");
+    let error = parse_error(config);
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains("`subject_template`"), "{rendered}");
+    assert!(
+        rendered.contains("unbalanced `${` starting at byte offset"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+}
+
+#[test]
+fn startup_diagnostics_preserve_empty_credential_env_field() {
+    let channel = "'ChannelName5594`\"\\\n";
+    let env_name = "'EnvName5594`\"\\\n";
+    for (key, env_key) in [("username", "username_env"), ("password", "password_env")] {
+        let mut config = minimal_def(587);
+        config["username"] = json!(SMTP_USERNAME);
+        config["password"] = json!(SMTP_PASSWORD);
+        config.as_object_mut().unwrap().remove(key);
+        config[env_key] = json!(env_name);
+        let mut env = HashMap::from([(env_name.to_string(), "ResolvedValue5594".to_string())]);
+        ferrum_edge::_test_support::email_channel_new_with_env_for_test(channel, &config, &env)
+            .expect("non-empty injected credentials must still be admitted");
+        env.insert(env_name.to_string(), String::new());
+        let error =
+            ferrum_edge::_test_support::email_channel_new_with_env_for_test(channel, &config, &env)
+                .expect_err("empty injected credentials must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains(&format!("referenced by `{env_key}`")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("resolved to empty string"), "{rendered}");
+        for hidden in ["ChannelName5594", "EnvName5594", "ResolvedValue5594"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn smtp_host_diagnostics_keep_channel_schema_without_supplied_names() {
+    let name = "UNREGISTERED_EMAIL_NAME";
+    let config = json!({
+        name: {
+            "type": "email",
+            "smtp_host": "https://UNREGISTERED_SMTP_HOST.invalid",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        }
+    });
+    let error = parse_channels(&config).expect_err("URL host must be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in ["`channels`", "email", "`smtp_host`", "scheme"] {
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+    for withheld in ["UNREGISTERED_EMAIL_NAME", "UNREGISTERED_SMTP_HOST"] {
+        assert!(!rendered.contains(withheld), "{rendered}");
+    }
 }

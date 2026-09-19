@@ -190,7 +190,7 @@ fn rejects_invalid_tool_action() {
     let err = try_make(json!({ "tools": { "x": { "action": "explode" } } }))
         .err()
         .unwrap();
-    assert!(err.contains("invalid action"), "{err}");
+    assert!(err.contains("invalid `action`"), "{err}");
 }
 
 #[test]
@@ -373,6 +373,97 @@ fn baseline_allow_policy() -> Value {
         "response": { "deny_status_code": 403 },
         "observability": { "emit_metadata": true, "hash_arguments": true }
     })
+}
+
+fn assert_rendered_unknown_governor_config(
+    config: Value,
+    path: &str,
+    typo: &str,
+    suggestion: &str,
+) {
+    let error = try_make(config)
+        .err()
+        .expect("unknown keys must reject admission");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(
+        rendered.contains(&format!("ai_tool_governor: `{path}`:")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("unknown configuration key(s)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("did you mean `{suggestion}`?")),
+        "{rendered}"
+    );
+    for supplied in ["918273", typo, "payloadKey", "payloadValue"] {
+        assert!(!rendered.contains(supplied), "{rendered}");
+    }
+}
+
+#[test]
+fn rendered_unknown_fixed_sections_retain_schema_context_without_supplied_data() {
+    for (section, typo, suggestion) in [
+        ("", "modde", "mode"),
+        ("inspect", "response_tool_callz", "response_tool_calls"),
+        ("approval", "timeout_mz", "timeout_ms"),
+        ("response", "deny_status_codz", "deny_status_code"),
+        ("observability", "emit_metadatz", "emit_metadata"),
+    ] {
+        for (key, payload) in [
+            ("suppliedKey918273", json!("payloadValue918273")),
+            ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+            (
+                "'suppliedKey918273\"\\\n`suppliedTail918273`",
+                json!([918273]),
+            ),
+        ] {
+            let mut config = baseline_allow_policy();
+            let path = if section.is_empty() {
+                "config".to_string()
+            } else {
+                format!("config.{section}")
+            };
+            let object = if section.is_empty() {
+                &mut config
+            } else {
+                &mut config[section]
+            };
+            object[typo] = payload.clone();
+            object[key] = payload;
+            assert_rendered_unknown_governor_config(config, &path, typo, suggestion);
+        }
+    }
+}
+
+#[test]
+fn rendered_unknown_tool_keys_withhold_names_and_retain_second_pattern_index() {
+    for name in [
+        "suppliedTool918273",
+        "918273",
+        "'suppliedTool918273\"\\\n`suppliedTail918273`",
+    ] {
+        let payload = json!({"payloadKey918273": ["payloadValue918273", 918273]});
+        // The missing action has a structured near-miss. Admission must still
+        // reject it in the early key sweep before ordinary policy parsing.
+        let config = json!({"tools": {(name): {"actoin": payload, (name): payload}}});
+        assert_rendered_unknown_governor_config(config, "config.tools", "actoin", "action");
+
+        let config = json!({"tools": {(name): {
+            "action": "allow",
+            "blocked_arg_patterns": [
+                {"name": "valid-preceding-pattern", "regex": "prior"},
+                {"name": name, "regxe": payload, (name): payload}
+            ]
+        }}});
+        assert_rendered_unknown_governor_config(
+            config,
+            "config.tools.*.blocked_arg_patterns[1]",
+            "regxe",
+            "regex",
+        );
+    }
 }
 
 fn assert_unknown_key_error(err: &str, path_fragment: &str, typo: &str) {
@@ -558,7 +649,7 @@ fn rejects_enforcement_relevant_unknown_keys_with_path_and_suggestion() {
         );
         if let Some(expected) = suggestion {
             assert!(
-                err.contains(&format!("did you mean '{expected}'")),
+                err.contains(&format!("did you mean `{expected}`")),
                 "{label}: missing suggestion for {expected}: {err}"
             );
         }
@@ -645,7 +736,7 @@ fn shared_admission_and_failure_policy_for_unknown_keys() {
     let err = validate_plugin_config("ai_tool_governor", &config)
         .expect_err("shared admission must use the strict constructor");
     assert!(err.contains("config.tools.search.required_arg"), "{err}");
-    assert!(err.contains("did you mean 'required_args'"), "{err}");
+    assert!(err.contains("did you mean `required_args`"), "{err}");
     assert_eq!(
         plugin_failure_policy("ai_tool_governor"),
         Some(PluginFailurePolicy::FailClosed)
@@ -12057,7 +12148,7 @@ fn non_string_tool_risk_is_rejected_rather_than_defaulted() {
     let err = try_make(misspelled.clone())
         .err()
         .expect("an unknown risk band must fail admission");
-    assert!(err.contains("invalid risk"), "{err}");
+    assert!(err.contains("invalid `risk`"), "{err}");
     assert!(!validator.is_valid(&misspelled));
 
     // Omission and every valid spelling are unchanged.
@@ -12381,7 +12472,7 @@ fn non_string_tool_action_is_reported_as_a_type_error_not_a_missing_key() {
     let err = try_make(misspelled.clone())
         .err()
         .expect("an unknown action must fail admission");
-    assert!(err.contains("invalid action"), "{err}");
+    assert!(err.contains("invalid `action`"), "{err}");
     assert!(!validator.is_valid(&misspelled));
 
     // Every valid spelling reachable without an approval webhook is unchanged.
@@ -12415,7 +12506,7 @@ fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_ke
         let err = try_make(config.clone())
             .err()
             .expect("a present non-string endpoint_url must fail admission");
-        assert!(err.contains("'approval.endpoint_url'"), "{err}");
+        assert!(err.contains("`approval.endpoint_url`"), "{err}");
         assert!(err.contains("must be a string"), "{err}");
         assert!(
             err.contains(kind),
@@ -12446,7 +12537,7 @@ fn non_string_approval_endpoint_url_is_reported_as_a_type_error_not_a_missing_ke
     let err = try_make(omitted.clone())
         .err()
         .expect("an omitted endpoint_url must fail admission");
-    assert!(err.contains("'approval.endpoint_url' is required"), "{err}");
+    assert!(err.contains("`approval.endpoint_url` is required"), "{err}");
     assert!(!validator.is_valid(&omitted));
 
     // A valid URL is unchanged.

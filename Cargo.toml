@@ -360,6 +360,8 @@ default = ["crypto-ring"]
 bench-h1-profile = []
 # Separate pool schema; reuse the existing allocator without changing H1 counters.
 bench-pool-profile = ["bench-h1-profile"]
+# Bounded plain-UDP observations; no allocator or crypto changes.
+bench-udp-profile = []
 
 # ── Cryptographic backend (mutually exclusive) ─────────────────────────────
 #

@@ -190,9 +190,9 @@ impl GeoRestriction {
         if !on_lookup_failure_explicit && on_lookup_failure == LookupFailureAction::Allow {
             warn!(
                 plugin = "geo_restriction",
-                "'on_lookup_failure' is not set; defaulting to 'allow' (fail-open) — \
+                "`on_lookup_failure` is not set; defaulting to `allow` (fail-open) — \
                  unresolved IPs and a missing/stale .mmdb will be permitted. Set \
-                 'on_lookup_failure' explicitly ('allow' or 'deny') to silence this warning"
+                 `on_lookup_failure` explicitly (`allow` or `deny`) to silence this warning"
             );
         }
 
@@ -202,16 +202,18 @@ impl GeoRestriction {
         let reader = match loader(&db_path) {
             Ok(reader) => Some(reader),
             Err(CountryMmdbLoadError::Unavailable(error)) => {
+                // The loader Debug-quotes the path around native filesystem
+                // errors, so cause sanitization retains the I/O stage/reason.
                 warn!(
-                    db_path = %db_path,
-                    error = %error,
+                    db_path = %crate::startup::sanitize_startup_scalar(&db_path),
+                    error = %crate::startup::sanitize_startup_cause(&error, &[]),
                     plugin = "geo_restriction",
                     "MaxMind database file not available — plugin will use on_lookup_failure policy until file is present"
                 );
                 None
             }
             Err(CountryMmdbLoadError::Invalid(error)) => {
-                return Err(format!("geo_restriction: invalid 'db_path': {error}"));
+                return Err(format!("geo_restriction: invalid `db_path`: {error}"));
             }
         };
 
@@ -307,7 +309,7 @@ impl GeoRestriction {
                 LookupFailureAction::Deny => {
                     warn_sampled!(
                         client_ip = %client_ip,
-                        db_path = %self.db_path,
+                        db_path = %crate::startup::sanitize_startup_scalar(&self.db_path),
                         plugin = "geo_restriction",
                         reason = "db_not_loaded",
                         "MaxMind database not loaded, denying by on_lookup_failure policy"
@@ -415,7 +417,7 @@ fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
         .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
     {
         return Err(format!(
-            "geo_restriction: unknown configuration field '{unknown}'"
+            "geo_restriction: unknown configuration field {unknown:?}"
         ));
     }
 
@@ -425,14 +427,14 @@ fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
 
     if allow_countries.is_empty() && deny_countries.is_empty() {
         return Err(
-            "geo_restriction: at least one 'allow_countries' or 'deny_countries' entry is required"
+            "geo_restriction: at least one `allow_countries` or `deny_countries` entry is required"
                 .to_string(),
         );
     }
 
     if !allow_countries.is_empty() && !deny_countries.is_empty() {
         return Err(
-            "geo_restriction: 'allow_countries' and 'deny_countries' are mutually exclusive"
+            "geo_restriction: `allow_countries` and `deny_countries` are mutually exclusive"
                 .to_string(),
         );
     }
@@ -459,14 +461,14 @@ fn string_config(config: &Value, key: &str) -> Result<String, String> {
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 Err(format!(
-                    "geo_restriction: '{key}' must be a non-empty string"
+                    "geo_restriction: `{key}` must be a non-empty string"
                 ))
             } else {
                 Ok(trimmed.to_string())
             }
         }
         None | Some(Value::Null) => Err(format!(
-            "geo_restriction: '{key}' is required (path to .mmdb file)"
+            "geo_restriction: `{key}` is required (path to .mmdb file)"
         )),
         Some(other) => Err(format!(
             "geo_restriction: `{key}` must be a string, got: {other:?}",
@@ -481,12 +483,12 @@ fn parse_country_set(config: &Value, key: &str) -> Result<CountrySet, String> {
     };
     if value.is_null() {
         return Err(format!(
-            "geo_restriction: '{key}' must be an array of ISO country codes"
+            "geo_restriction: `{key}` must be an array of ISO country codes"
         ));
     }
     let Value::Array(arr) = value else {
         return Err(format!(
-            "geo_restriction: '{key}' must be an array of ISO country codes"
+            "geo_restriction: `{key}` must be an array of ISO country codes"
         ));
     };
 
@@ -500,12 +502,12 @@ fn parse_country_set(config: &Value, key: &str) -> Result<CountrySet, String> {
         })?;
         let Some(country_code) = CountryCode::parse(country) else {
             return Err(format!(
-                "geo_restriction: '{key}' contains invalid ISO 3166-1 alpha-2 country code: {country:?}"
+                "geo_restriction: `{key}` contains invalid ISO 3166-1 alpha-2 country code: {country:?}"
             ));
         };
         if !country_code.is_supported() {
             return Err(format!(
-                "geo_restriction: '{key}' contains unassigned ISO 3166-1 alpha-2 country code: {country:?}"
+                "geo_restriction: `{key}` contains unassigned ISO 3166-1 alpha-2 country code: {country:?}"
             ));
         }
         countries.insert(country_code);

@@ -272,7 +272,7 @@ pub fn validate_template(template: &str) -> Result<(), String> {
         }
         if let Some(after_open) = rest.strip_prefix("${") {
             let close = after_open.find('}').ok_or_else(|| {
-                format!("template: unbalanced '${{' starting at byte offset {}", i)
+                format!("template: unbalanced `${{` starting at byte offset {}", i)
             })?;
             i += 2 + close + 1;
             continue;

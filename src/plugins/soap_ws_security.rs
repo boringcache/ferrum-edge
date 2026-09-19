@@ -776,28 +776,28 @@ fn present<'a>(
 
 /// Uniform type-mismatch diagnostic for a fixed-shape configuration field.
 fn type_error(path: &str, key: &str, expected: &str) -> String {
-    format!("soap_ws_security: '{path}.{key}' must be {expected}")
+    format!("soap_ws_security: `{path}.{key}` must be {expected}")
 }
 
 fn null_error(path: &str, key: &str) -> String {
-    format!("soap_ws_security: '{path}.{key}' must not be null; omit the field to use the default")
+    format!("soap_ws_security: `{path}.{key}` must not be null; omit the field to use the default")
 }
 
 fn range_error(path: &str, key: &str, min: u64, max: u64) -> String {
-    format!("soap_ws_security: '{path}.{key}' must be an integer {min}..={max}")
+    format!("soap_ws_security: `{path}.{key}` must be an integer {min}..={max}")
 }
 
 fn required_error(path: &str, key: &str) -> String {
-    format!("soap_ws_security: '{path}.{key}' is required")
+    format!("soap_ws_security: `{path}.{key}` is required")
 }
 
 fn duplicate_error(path: &str) -> String {
-    format!("soap_ws_security: '{path}.username' duplicates an earlier entry")
+    format!("soap_ws_security: `{path}.username` duplicates an earlier entry")
 }
 
 fn enum_error(path: &str, key: &str, allowed: &str) -> String {
     format!(
-        "soap_ws_security: '{path}.{key}' contains an unsupported value; accepted values: {allowed}"
+        "soap_ws_security: `{path}.{key}` contains an unsupported value; accepted values: {allowed}"
     )
 }
 
@@ -949,6 +949,7 @@ const DIGEST_ALGORITHM_VARIANTS: &[(&str, DigestAlgorithm)] = &[
 
 /// Reject unknown keys on a fixed-shape object with the shared path-qualified
 /// diagnostics (including spelling suggestions).
+/// Every caller supplies only schema literals and credential array ordinals.
 fn reject_unknown(
     object: Option<&ConfigObject>,
     path: &str,
@@ -957,7 +958,7 @@ fn reject_unknown(
     let Some(map) = object else {
         return Ok(());
     };
-    reject_unknown_keys(map, path, allowed, "soap_ws_security: ")
+    reject_unknown_keys(map, path, allowed, &format!("soap_ws_security: `{path}`: "))
 }
 
 /// Configured duration, converted once at admission so the request path never
@@ -1578,7 +1579,7 @@ impl SoapWsSecurity {
             "mixed_route" => ContentTypeMode::MixedRoute,
             _ => {
                 return Err(
-                    "soap_ws_security: 'config.content_type.mode' must be one of: strict, \
+                    "soap_ws_security: `config.content_type.mode` must be one of: strict, \
                      mixed_route"
                         .to_string(),
                 );
@@ -1632,7 +1633,7 @@ impl SoapWsSecurity {
             "PasswordDigest" => PasswordType::PasswordDigest,
             _ => {
                 return Err(
-                    "soap_ws_security: 'config.username_token.password_type' must be one of: PasswordText, PasswordDigest"
+                    "soap_ws_security: `config.username_token.password_type` must be one of: PasswordText, PasswordDigest"
                         .to_string(),
                 );
             }
@@ -1761,46 +1762,33 @@ impl SoapWsSecurity {
         }
 
         let mut trusted_certs = Vec::with_capacity(trusted_cert_paths.len());
-        for path in &trusted_cert_paths {
+        for (index, path) in trusted_cert_paths.iter().enumerate() {
             let source = parse_trusted_certificate_source(path);
-            let material = load_material_blocking(&source, MaterialKind::Cert)
-                .map_err(|e| format!("soap_ws_security: failed to load trusted cert: {e}"))?;
+            let material = load_material_blocking(&source, MaterialKind::Cert).map_err(|_| {
+                format!("soap_ws_security: `config.x509_signature.trusted_certs[{index}]`: failed to load trusted cert")
+            })?;
 
-            let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
+            let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|_| {
                 format!(
-                    "soap_ws_security: trusted cert '{}' is not valid UTF-8: {}",
-                    material.display_source_id, e
+                    "soap_ws_security: `config.x509_signature.trusted_certs[{index}]` is not valid UTF-8"
                 )
             })?;
 
-            // Every failure past a *successful* fetch names the material by its
-            // redacted `display_source_id`, never the configured `path`. A
-            // `vault://`/`aws://`/`azure://`/`gcp://` source carries its
-            // identifier in that path, and a PEM/X.509/RSA parse failure is
-            // reachable by an operator who can see the error but not the
-            // secret store — so interpolating `path` here would disclose the
-            // provider reference on exactly the paths most likely to fire.
-            // This matches `MaterializedMaterial::display_source_id`'s stated
-            // contract, which names this module as one of its call sites.
+            // Keep provider references and parser payloads out of admission diagnostics.
             let der_bytes = extract_pem_der(pem_str).ok_or_else(|| {
                 format!(
-                    "soap_ws_security: failed to decode PEM from '{}'",
-                    material.display_source_id
+                    "soap_ws_security: `config.x509_signature.trusted_certs[{index}]`: failed to decode PEM"
                 )
             })?;
 
-            let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|e| {
+            let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|_| {
                 format!(
-                    "soap_ws_security: failed to parse X.509 cert '{}': {}",
-                    material.display_source_id, e
+                    "soap_ws_security: `config.x509_signature.trusted_certs[{index}]`: failed to parse X.509 cert"
                 )
             })?;
 
             let public_key_der = load_rsa_public_key_from_cert(&cert).map_err(|e| {
-                format!(
-                    "soap_ws_security: trusted cert '{}' {}",
-                    material.display_source_id, e
-                )
+                format!("soap_ws_security: `config.x509_signature.trusted_certs[{index}]`: {e}")
             })?;
 
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
@@ -1826,7 +1814,7 @@ impl SoapWsSecurity {
         if x509_enabled && allowed_signature_algorithms.is_empty() {
             return Err(
                 "soap_ws_security: x509_signature.allowed_algorithms must contain at least one of \
-                 'rsa-sha256' or 'rsa-sha1' when x509_signature is enabled"
+                 `rsa-sha256` or `rsa-sha1` when x509_signature is enabled"
                     .to_string(),
             );
         }
@@ -1842,7 +1830,7 @@ impl SoapWsSecurity {
         if x509_enabled && allowed_digest_algorithms.is_empty() {
             return Err(
                 "soap_ws_security: x509_signature.allowed_digest_algorithms must contain at least \
-                 one of 'sha256' or 'sha1' when x509_signature is enabled"
+                 one of `sha256` or `sha1` when x509_signature is enabled"
                     .to_string(),
             );
         }
@@ -1864,8 +1852,8 @@ impl SoapWsSecurity {
         // GHSA-3mwq-c8j6-9xhp.
         if x509_enabled && require_signed_timestamp && !require_timestamp {
             return Err(
-                "soap_ws_security: 'config.x509_signature.require_signed_timestamp' requires \
-                 'config.timestamp.require' to be true — a signed Timestamp cannot be required \
+                "soap_ws_security: `config.x509_signature.require_signed_timestamp` requires \
+                 `config.timestamp.require` to be true — a signed Timestamp cannot be required \
                  while the Timestamp itself is optional"
                     .to_string(),
             );
@@ -1879,8 +1867,8 @@ impl SoapWsSecurity {
         // surfaces at admission instead of as a runtime 415.
         if x509_enabled && allow_mtom_explicit && allow_mtom {
             return Err(
-                "soap_ws_security: 'config.content_type.allow_mtom' cannot be true while \
-                 'config.x509_signature.enabled' is true — Ferrum implements no WS-Security \
+                "soap_ws_security: `config.content_type.allow_mtom` cannot be true while \
+                 `config.x509_signature.enabled` is true — Ferrum implements no WS-Security \
                  attachment-signature transform, so an X.509 signature cannot cover MTOM/XOP \
                  attachment octets"
                     .to_string(),
@@ -1909,7 +1897,7 @@ impl SoapWsSecurity {
         let saml_audience = soap_string(saml_cfg, "config.saml", "audience")?;
         if saml_enabled && saml_audience.is_none() {
             return Err(
-                "soap_ws_security: 'config.saml.audience' is required when saml is enabled — \
+                "soap_ws_security: `config.saml.audience` is required when saml is enabled — \
                  without a service-specific AudienceRestriction binding, an assertion minted by \
                  the same trusted issuer for another service is accepted here"
                     .to_string(),
@@ -1918,7 +1906,7 @@ impl SoapWsSecurity {
         let saml_recipient = soap_string(saml_cfg, "config.saml", "recipient")?;
         if saml_enabled && saml_recipient.is_none() {
             return Err(
-                "soap_ws_security: 'config.saml.recipient' is required when saml is enabled — it \
+                "soap_ws_security: `config.saml.recipient` is required when saml is enabled — it \
                  is matched against SubjectConfirmationData/@Recipient so a captured assertion \
                  cannot be presented to a different endpoint"
                     .to_string(),
@@ -1959,14 +1947,14 @@ impl SoapWsSecurity {
                     // gateway cannot enforce.
                     if method != SAML2_CM_BEARER {
                         let supported = if method == SAML2_CM_HOLDER_OF_KEY {
-                            "'urn:oasis:names:tc:SAML:2.0:cm:holder-of-key' is not supported \
+                            "`urn:oasis:names:tc:SAML:2.0:cm:holder-of-key` is not supported \
                              because the confirmation key is not bound to the message signature"
                         } else {
-                            "only 'urn:oasis:names:tc:SAML:2.0:cm:bearer' is supported"
+                            "only `urn:oasis:names:tc:SAML:2.0:cm:bearer` is supported"
                         };
                         return Err(format!(
                             "soap_ws_security: \
-                             'config.saml.allowed_subject_confirmation_methods' contains an \
+                             `config.saml.allowed_subject_confirmation_methods` contains an \
                              unsupported method; {supported}"
                         ));
                     }
@@ -2004,41 +1992,33 @@ impl SoapWsSecurity {
 
         let mut saml_trusted_signing_certs =
             Vec::with_capacity(saml_trusted_signing_cert_paths.len());
-        for path in &saml_trusted_signing_cert_paths {
+        for (index, path) in saml_trusted_signing_cert_paths.iter().enumerate() {
             let source = parse_trusted_certificate_source(path);
-            let material = load_material_blocking(&source, MaterialKind::Cert).map_err(|e| {
-                format!("soap_ws_security: failed to load SAML trusted signing cert: {e}")
+            let material = load_material_blocking(&source, MaterialKind::Cert).map_err(|_| {
+                format!("soap_ws_security: `config.saml.trusted_signing_certs[{index}]`: failed to load SAML trusted signing cert")
             })?;
 
-            let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
+            let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|_| {
                 format!(
-                    "soap_ws_security: SAML trusted signing cert '{}' is not valid UTF-8: {}",
-                    material.display_source_id, e
+                    "soap_ws_security: `config.saml.trusted_signing_certs[{index}]` is not valid UTF-8"
                 )
             })?;
 
-            // Same rule as the WS-Security X.509 loop above: past a successful
-            // fetch the material is named only by its redacted
-            // `display_source_id`.
+            // Report only the configured field and fixed parse reason.
             let der_bytes = extract_pem_der(pem_str).ok_or_else(|| {
                 format!(
-                    "soap_ws_security: failed to decode PEM from SAML trusted signing cert '{}'",
-                    material.display_source_id
+                    "soap_ws_security: `config.saml.trusted_signing_certs[{index}]`: failed to decode PEM"
                 )
             })?;
 
-            let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|e| {
+            let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|_| {
                 format!(
-                    "soap_ws_security: failed to parse SAML trusted signing cert '{}': {}",
-                    material.display_source_id, e
+                    "soap_ws_security: `config.saml.trusted_signing_certs[{index}]`: failed to parse X.509 cert"
                 )
             })?;
 
             let public_key_der = load_rsa_public_key_from_cert(&cert).map_err(|e| {
-                format!(
-                    "soap_ws_security: SAML trusted signing cert '{}' {}",
-                    material.display_source_id, e
-                )
+                format!("soap_ws_security: `config.saml.trusted_signing_certs[{index}]`: {e}")
             })?;
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
@@ -2063,7 +2043,7 @@ impl SoapWsSecurity {
         if saml_enabled && saml_allowed_signature_algorithms.is_empty() {
             return Err(
                 "soap_ws_security: saml.allowed_signature_algorithms must contain at least one of \
-                 'rsa-sha256' or 'rsa-sha1' when SAML is enabled"
+                 `rsa-sha256` or `rsa-sha1` when SAML is enabled"
                     .to_string(),
             );
         }
@@ -2079,7 +2059,7 @@ impl SoapWsSecurity {
         if saml_enabled && saml_allowed_digest_algorithms.is_empty() {
             return Err(
                 "soap_ws_security: saml.allowed_digest_algorithms must contain at least one of \
-                 'sha256' or 'sha1' when SAML is enabled"
+                 `sha256` or `sha1` when SAML is enabled"
                     .to_string(),
             );
         }
@@ -2104,14 +2084,14 @@ impl SoapWsSecurity {
             ut_created_clock_skew_seconds,
         )
         .ok_or_else(|| {
-            "soap_ws_security: 'config.username_token' Created window overflows the replay \
+            "soap_ws_security: `config.username_token` Created window overflows the replay \
              retention it requires"
                 .to_string()
         })?;
         if minimum_retention_seconds > NONCE_CLAIM_RETENTION_SECONDS {
             return Err(format!(
-                "soap_ws_security: 'config.username_token' Created window requires \
-                 {minimum_retention_seconds}s of nonce replay retention, which exceeds the \
+                "soap_ws_security: `config.username_token` Created window requires \
+                 \"{minimum_retention_seconds}\"s of nonce replay retention, which exceeds the \
                  {NONCE_CLAIM_RETENTION_SECONDS}s claims are retained for"
             ));
         }
@@ -2143,7 +2123,8 @@ impl SoapWsSecurity {
         // PasswordDigest request; refuse the contradiction at admission rather
         // than failing closed on live traffic.
         if max_nonce_cache_bytes < max_nonce_encoded_length {
-            let expected = format!("at least max_encoded_length ({max_nonce_encoded_length})");
+            let expected =
+                format!("at least `max_encoded_length` (\"{max_nonce_encoded_length}\")");
             let path = "config.nonce";
             return Err(type_error(path, "max_total_cache_bytes", &expected));
         }
@@ -2166,8 +2147,8 @@ impl SoapWsSecurity {
             // credential material in the same object graph.
             Some(_) => {
                 return Err(
-                    "soap_ws_security: 'config.nonce.replay_scope' must be exactly 'process' or \
-                     'shared'"
+                    "soap_ws_security: `config.nonce.replay_scope` must be exactly `process` or \
+                     `shared`"
                         .to_string(),
                 );
             }
@@ -2186,16 +2167,16 @@ impl SoapWsSecurity {
 
         if replay_active && replay_scope.is_none() {
             let trigger = if digest_replay_active && saml_enabled {
-                "username_token.password_type is 'PasswordDigest' and saml is enabled"
+                "username_token.password_type is `PasswordDigest` and saml is enabled"
             } else if digest_replay_active {
-                "username_token.password_type is 'PasswordDigest'"
+                "username_token.password_type is `PasswordDigest`"
             } else {
                 "saml is enabled"
             };
             return Err(format!(
-                "soap_ws_security: 'config.nonce.replay_scope' is required when {trigger} — use \
-                 'shared' together with sync_mode: 'redis' for any deployment running more than \
-                 one gateway replica, or 'process' to declare a single-replica deployment whose \
+                "soap_ws_security: `config.nonce.replay_scope` is required when {trigger} — use \
+                 `shared` together with sync_mode: `redis` for any deployment running more than \
+                 one gateway replica, or `process` to declare a single-replica deployment whose \
                  replay protection is not cross-replica"
             ));
         }
@@ -2213,15 +2194,15 @@ impl SoapWsSecurity {
         match (replay_scope, redis_config.is_some()) {
             (Some(NonceReplayScope::Shared), false) => {
                 return Err(
-                    "soap_ws_security: 'config.nonce.replay_scope' = 'shared' requires \
-                     sync_mode: 'redis' and a 'redis_url'"
+                    "soap_ws_security: `config.nonce.replay_scope` = `shared` requires \
+                     sync_mode: `redis` and a `redis_url`"
                         .to_string(),
                 );
             }
             (scope, true) if scope != Some(NonceReplayScope::Shared) => {
                 return Err(
-                    "soap_ws_security: sync_mode: 'redis' is only meaningful with \
-                     'config.nonce.replay_scope' = 'shared'"
+                    "soap_ws_security: sync_mode: `redis` is only meaningful with \
+                     `config.nonce.replay_scope` = `shared`"
                         .to_string(),
                 );
             }
@@ -2269,16 +2250,16 @@ impl SoapWsSecurity {
         if remove_credential {
             if !username_token_enabled {
                 return Err(
-                    "soap_ws_security: 'config.username_token.remove_credential' requires \
-                     'config.username_token.enabled' to be true — there is no verified \
+                    "soap_ws_security: `config.username_token.remove_credential` requires \
+                     `config.username_token.enabled` to be true — there is no verified \
                      credential to remove"
                         .to_string(),
                 );
             }
             if password_type != PasswordType::PasswordText {
                 return Err(
-                    "soap_ws_security: 'config.username_token.remove_credential' is supported \
-                     only for password_type 'PasswordText' — a PasswordDigest token carries no \
+                    "soap_ws_security: `config.username_token.remove_credential` is supported \
+                     only for password_type `PasswordText` — a PasswordDigest token carries no \
                      reusable plaintext secret, and deleting it would also remove the Nonce and \
                      Created a backend may still read"
                         .to_string(),
@@ -2286,8 +2267,8 @@ impl SoapWsSecurity {
             }
             if x509_enabled || saml_enabled {
                 return Err(
-                    "soap_ws_security: 'config.username_token.remove_credential' cannot be \
-                     combined with an enabled 'config.x509_signature' or 'config.saml' — \
+                    "soap_ws_security: `config.username_token.remove_credential` cannot be \
+                     combined with an enabled `config.x509_signature` or `config.saml` — \
                      rewriting the envelope would invalidate content a signature covers, so \
                      the composition is refused instead of silently breaking it"
                         .to_string(),
@@ -2298,8 +2279,8 @@ impl SoapWsSecurity {
             // refuses such a request. Surface the contradiction at admission.
             if allow_mtom_explicit && allow_mtom {
                 return Err(
-                    "soap_ws_security: 'config.content_type.allow_mtom' cannot be true while \
-                     'config.username_token.remove_credential' is true — an MTOM package \
+                    "soap_ws_security: `config.content_type.allow_mtom` cannot be true while \
+                     `config.username_token.remove_credential` is true — an MTOM package \
                      cannot be re-framed after the credential is removed, so such a request is \
                      refused at runtime"
                         .to_string(),
@@ -5225,12 +5206,12 @@ pub fn validate_composition(
                     AuthMode::Multi => "multi",
                 };
                 errors.push(format!(
-                    "soap_ws_security must be the sole authentication mechanism on proxy '{}' \
-                     while auth_mode is '{}': both authentication modes stop after the first \
+                    "soap_ws_security must be the sole authentication mechanism on proxy {:?} \
+                     while `auth_mode` is {:?}: both authentication modes stop after the first \
                      mechanism establishes an identity, single-auth also makes the first rejection \
                      terminal, and multi-auth can let a later success override an earlier rejection, \
                      so one or more WS-Security message gates would be skipped or ignored. \
-                     soap_ws_security: {}; other auth plugins: {}. Disable the other mechanisms \
+                     soap_ws_security: {:?}; other auth plugins: {:?}. Disable the other mechanisms \
                      on this proxy",
                     proxy.id,
                     auth_mode,
@@ -5251,11 +5232,11 @@ pub fn validate_composition(
             .collect();
         if !identity_soap.is_empty() && !decompressors.is_empty() {
             errors.push(format!(
-                "soap_ws_security cannot be composed with compression 'decompress_request' on \
-                 proxy '{}': SOAP identity is established in the authenticate phase, which runs \
+                "soap_ws_security cannot be composed with compression `decompress_request` on \
+                 proxy {:?}: SOAP identity is established in the authenticate phase, which runs \
                  before request-body decompression, so the gateway would validate the encoded \
-                 bytes rather than the plaintext the backend parses. soap_ws_security: {}; \
-                 compression: {}. Decompress upstream of the gateway, or disable \
+                 bytes rather than the plaintext the backend parses. soap_ws_security: {:?}; \
+                 compression: {:?}. Decompress upstream of the gateway, or disable \
                  decompress_request on this proxy",
                 proxy.id,
                 identity_soap
@@ -6820,8 +6801,8 @@ fn load_rsa_public_key_from_cert(cert: &X509Certificate<'_>) -> Result<Vec<u8>, 
     // hard to diagnose. Reject at load with a precise error.
     if public_key_info.algorithm.algorithm != oid_registry::OID_PKCS1_RSAENCRYPTION {
         return Err(format!(
-            "is not an RSA public key (algorithm OID '{}', expected \
-             '1.2.840.113549.1.1.1' / rsaEncryption); only RSA certificates \
+            "is not an RSA public key (algorithm OID \"{}\", expected \
+             `1.2.840.113549.1.1.1` / rsaEncryption); only RSA certificates \
              are supported for WS-Security signature verification",
             public_key_info.algorithm.algorithm,
         ));
@@ -6832,7 +6813,7 @@ fn load_rsa_public_key_from_cert(cert: &X509Certificate<'_>) -> Result<Vec<u8>, 
     // DER). Anything else is a malformed cert.
     if public_key_info.subject_public_key.unused_bits != 0 {
         return Err(format!(
-            "RSA SPKI BIT STRING has {} unused bits (expected 0)",
+            "RSA SPKI BIT STRING has \"{}\" unused bits (expected 0)",
             public_key_info.subject_public_key.unused_bits,
         ));
     }
@@ -6873,7 +6854,7 @@ fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
     }
     if der[0] != 0x30 {
         return Err(format!(
-            "expected DER SEQUENCE tag (0x30) at offset 0, got 0x{:02x}",
+            "expected DER SEQUENCE tag (0x30) at offset 0, got \"0x{:02x}\"",
             der[0]
         ));
     }
@@ -6893,7 +6874,7 @@ fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
         }
         if n > 4 {
             return Err(format!(
-                "length uses {n} octets (refusing to parse > 4; a 4-octet length covers 4 GiB)"
+                "length uses \"{n}\" octets (refusing to parse > 4; a 4-octet length covers 4 GiB)"
             ));
         }
         if der.len() < 2 + n {
@@ -6912,8 +6893,8 @@ fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
 
     if expected_total != der.len() {
         return Err(format!(
-            "length mismatch: header declares {declared_content_len} content bytes \
-             ({expected_total}-byte total), buffer is {} bytes",
+            "length mismatch: header declares \"{declared_content_len}\" content bytes \
+             (\"{expected_total}\"-byte total), buffer is \"{}\" bytes",
             der.len()
         ));
     }
@@ -8257,7 +8238,7 @@ mod tests {
         // 0x85 = 5 length octets — refused (a 4-octet length already covers 4 GiB).
         let der = [0x30, 0x85, 0, 0, 0, 0, 0, 0];
         let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
-        assert!(err.contains("length uses 5 octets"), "got: {err}");
+        assert!(err.contains("length uses \"5\" octets"), "got: {err}");
     }
 
     #[test]

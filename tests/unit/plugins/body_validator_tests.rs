@@ -2961,7 +2961,7 @@ fn test_protobuf_invalid_message_type_degrades_gracefully() {
         .err()
         .expect("expected error for invalid message type");
     assert!(
-        err.contains("configured 'protobuf_request_type' was not found in the descriptor"),
+        err.contains("configured `protobuf_request_type` was not found in the descriptor"),
         "got: {err}"
     );
     assert!(!err.contains(MESSAGE_TYPE), "got: {err}");
@@ -3046,7 +3046,7 @@ fn test_protobuf_descriptor_file_dependency_validates_message_references() {
     let errors = gateway.validate_plugin_file_dependencies();
     assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
     assert!(
-        errors[0].contains("configured 'protobuf_request_type' was not found in the descriptor")
+        errors[0].contains("configured `protobuf_request_type` was not found in the descriptor")
     );
     assert!(!errors[0].contains(MESSAGE_TYPE));
 }
@@ -3068,7 +3068,7 @@ fn protobuf_method_resolution_errors_redact_method_path_and_type() {
         .expect("missing per-method type must reject configuration");
     assert_eq!(
         error,
-        "body_validator: a 'protobuf_method_messages' request type was not found in the descriptor"
+        "body_validator: a `protobuf_method_messages` request type was not found in the descriptor"
     );
     assert!(!error.contains(METHOD_PATH), "{error}");
     assert!(!error.contains(MESSAGE_TYPE), "{error}");
@@ -3776,35 +3776,35 @@ fn configuration_errors_redact_supplied_schema_and_shape_text() {
 
     assert_redacted_configuration_error(
         json!({"json_schema_draft": DRAFT}),
-        "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7'",
+        "body_validator: `json_schema_draft` must be `draft2020-12` or `draft7`",
         &[DRAFT],
     );
     assert_redacted_configuration_error(
         json!({"json_schema": {"$ref": EXTERNAL_REF}}),
-        "body_validator: 'json_schema' has a non-local '$ref'; only local references \
-         (starting with '#') are supported and no external reference is ever retrieved",
+        "body_validator: `json_schema` has a non-local `$ref`; only local references \
+         (starting with `#`) are supported and no external reference is ever retrieved",
         &[EXTERNAL_REF, "BODY_VALIDATOR_CONFIG_CANARY_REF"],
     );
     assert_redacted_configuration_error(
         json!({"json_schema": {"$ref": LOCAL_REF}}),
-        "body_validator: 'json_schema' has a local '$ref' JSON Pointer that resolves nowhere",
+        "body_validator: `json_schema` has a local `$ref` JSON Pointer that resolves nowhere",
         &[LOCAL_REF, "BODY_VALIDATOR_CONFIG_CANARY_LOCAL_REF"],
     );
     assert_redacted_configuration_error(
         json!({"json_schema": {"$id": ID_URI, "type": "object"}}),
-        "body_validator: 'json_schema' has a non-fragment '$id'; a base URI would allow \
+        "body_validator: `json_schema` has a non-fragment `$id`; a base URI would allow \
          external reference resolution",
         &[ID_URI, "BODY_VALIDATOR_CONFIG_CANARY_ID"],
     );
     assert_redacted_configuration_error(
         json!({"json_schema": {"$schema": SCHEMA_URI, "type": "object"}}),
-        "body_validator: 'json_schema' declares an unsupported '$schema'; configured draft is \
-         'draft2020-12'",
+        "body_validator: `json_schema` declares an unsupported `$schema`; configured draft is \
+         `draft2020-12`",
         &[SCHEMA_URI, "BODY_VALIDATOR_CONFIG_CANARY_SCHEMA"],
     );
     assert_redacted_configuration_error(
         json!({"json_schema": {"type": "string", "pattern": PATTERN}}),
-        "body_validator: 'json_schema' is not a valid draft2020-12 JSON Schema",
+        "body_validator: `json_schema` is not a valid draft2020-12 JSON Schema",
         &[PATTERN, "BODY_VALIDATOR_CONFIG_CANARY_PATTERN"],
     );
     assert_redacted_configuration_error(
@@ -3813,15 +3813,15 @@ fn configuration_errors_redact_supplied_schema_and_shape_text() {
             "unknown_BODY_VALIDATOR_CONFIG_CANARY_KEY": true
         }),
         &format!(
-            "body_validator: unknown configuration key; allowed keys: {}",
-            BODY_VALIDATOR_CONFIG_KEYS.join(", ")
+            "body_validator: unknown configuration key; allowed keys: `{}`",
+            BODY_VALIDATOR_CONFIG_KEYS.join("`, `")
         ),
         &[UNKNOWN_KEY, "BODY_VALIDATOR_CONFIG_CANARY_KEY"],
     );
     assert_redacted_configuration_error(
         json!({"required_xml_elements": [XML_ENTRY]}),
-        "body_validator: 'required_xml_elements' entry at index 0 opens Clark notation with '{' \
-         but never closes it with '}'",
+        "body_validator: `required_xml_elements` entry at index 0 opens Clark notation with `{` \
+         but never closes it with `}`",
         &[XML_ENTRY, "BODY_VALIDATOR_CONFIG_CANARY_XML"],
     );
     assert_redacted_configuration_error(
@@ -3835,9 +3835,9 @@ fn configuration_errors_redact_supplied_schema_and_shape_text() {
             }
         }),
         &format!(
-            "body_validator: a 'protobuf_method_messages' entry has an unknown key; allowed \
-             keys: {}",
-            BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join(", ")
+            "body_validator: a `protobuf_method_messages` entry has an unknown key; allowed \
+             keys: `{}`",
+            BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join("`, `")
         ),
         &[
             METHOD_PATH,
@@ -3983,7 +3983,7 @@ fn local_pointer_targets_apply_nested_forbidden_policy_in_both_directions() {
         let error = BodyValidator::new(&config)
             .err()
             .expect("referenced nested external policy must be rejected");
-        assert!(error.contains("non-local '$ref'"), "{error}");
+        assert!(error.contains("non-local `$ref`"), "{error}");
     }
 }
 
@@ -4131,7 +4131,7 @@ fn draft_specific_definition_maps_match_referencing_semantics() {
     let error = BodyValidator::new(&draft7_referenced)
         .err()
         .expect("Draft 7 pointer target under $defs must be audited");
-    assert!(error.contains("non-local '$ref'"), "{error}");
+    assert!(error.contains("non-local `$ref`"), "{error}");
 
     // The library's 2020-12 walker deliberately retains `definitions` as a
     // schema-bearing compatibility map in addition to `$defs`.
@@ -4147,7 +4147,7 @@ fn draft_specific_definition_maps_match_referencing_semantics() {
     let error = BodyValidator::new(&draft202012_definitions)
         .err()
         .expect("2020-12 definitions values are schema positions");
-    assert!(error.contains("non-local '$ref'"), "{error}");
+    assert!(error.contains("non-local `$ref`"), "{error}");
 }
 
 #[test]
@@ -4171,7 +4171,7 @@ fn anchor_targets_are_covered_by_the_ordinary_schema_position_walk() {
     let error = BodyValidator::new(&json!({"json_schema": schema}))
         .err()
         .expect("policy at an anchored schema position must be enforced");
-    assert!(error.contains("non-local '$ref'"), "{error}");
+    assert!(error.contains("non-local `$ref`"), "{error}");
 }
 
 #[tokio::test]
@@ -4340,7 +4340,7 @@ fn non_local_references_are_rejected_in_supported_subschema_positions() {
         let error = BodyValidator::new(&config)
             .err()
             .expect("nested non-local reference must be rejected");
-        assert!(error.contains("non-local '$ref'"), "{error}");
+        assert!(error.contains("non-local `$ref`"), "{error}");
     }
 
     let draft7 = [
@@ -4356,7 +4356,7 @@ fn non_local_references_are_rejected_in_supported_subschema_positions() {
         let error = BodyValidator::new(&config)
             .err()
             .expect("nested Draft 7 non-local reference must be rejected");
-        assert!(error.contains("non-local '$ref'"), "{error}");
+        assert!(error.contains("non-local `$ref`"), "{error}");
     }
 }
 
@@ -4483,11 +4483,11 @@ fn non_string_schema_keywords_fail_closed() {
     // Active keyword values must be strings; a typed mismatch used to skip the
     // decisive policy check while admission still reported the schema as live.
     let cases = [
-        (json!({"$ref": true}), "non-string '$ref'"),
-        (json!({"$dynamicRef": 7}), "non-string '$dynamicRef'"),
-        (json!({"$id": false}), "non-string '$id'"),
-        (json!({"id": ["legacy"]}), "non-string 'id'"),
-        (json!({"$schema": {"uri": "x"}}), "non-string '$schema'"),
+        (json!({"$ref": true}), "non-string `$ref`"),
+        (json!({"$dynamicRef": 7}), "non-string `$dynamicRef`"),
+        (json!({"$id": false}), "non-string `$id`"),
+        (json!({"id": ["legacy"]}), "non-string `id`"),
+        (json!({"$schema": {"uri": "x"}}), "non-string `$schema`"),
     ];
     for (schema, needle) in cases {
         let error = BodyValidator::new(&json!({"json_schema": schema}))
@@ -4509,7 +4509,7 @@ fn draft7_schema_mismatch_names_the_configured_draft() {
     let error = BodyValidator::new(&mismatched)
         .err()
         .expect("draft mismatch must fail closed");
-    assert!(error.contains("unsupported '$schema'"), "{error}");
+    assert!(error.contains("unsupported `$schema`"), "{error}");
     assert!(
         error.contains("draft7"),
         "rejection must name the configured draft: {error}"
@@ -6444,5 +6444,53 @@ async fn ordinary_entity_declarations_still_pass_under_the_new_grammar() {
         let mut ctx = make_xml_ctx(body);
         let mut headers = make_xml_headers();
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"json_schema": {"type": "string", "pattern": format!("{canary}[")}}),
+            &["`json_schema`", "not a valid", "JSON Schema"],
+        ),
+        (
+            json!({"required_xml_elements": [canary]}),
+            &[
+                "`required_xml_elements`",
+                "index 0",
+                "invalid local element",
+            ],
+        ),
+        (
+            json!({"required_fields": [true]}),
+            &["`required_fields`", "index 0", "must be strings"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("body_validator", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
     }
 }

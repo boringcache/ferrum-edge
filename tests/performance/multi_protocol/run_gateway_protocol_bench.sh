@@ -33,6 +33,14 @@
 
 set -eo pipefail
 
+# Finite opt-in live lane; all ordinary H1/H2 and historical H3 inputs stay intact.
+if [[ ${1:-} == http3 && ${2:-} == --h3-live ]]; then
+    [[ $# == 6 && $3 == corrected-v1 && $5 == --output-dir ]] || exit 2
+    case "$4" in smoke|10240|71680|512000|1048576|5242880) ;; *) exit 2 ;; esac
+    exec python3 tests/performance/multi_protocol/h3_proof/live.py \
+        --campaign corrected-v1 --payload "$4" --output "$6"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
@@ -72,6 +80,7 @@ EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
 POOL_PROFILE=""
+UDP_PROFILE=""
 H2_GUARD_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
@@ -91,6 +100,7 @@ while [[ $# -gt 0 ]]; do
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
         --pool-profile) POOL_PROFILE="$2"; shift 2 ;;
+        --udp-profile) UDP_PROFILE="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -131,11 +141,19 @@ fi
 
 # Independent fixed-policy pool lane; ordinary experiment.json stays disabled.
 if [ -n "$POOL_PROFILE" ]; then
-    [ -z "$H1_PROFILE" ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+    [ -z "$H1_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
     python3 "$SCRIPT_DIR/pool_internal_profile.py" validate-selection \
         "$POOL_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
         "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
     H2_OBSERVE=1
+fi
+
+# Dedicated UDP campaign; never selects or rewrites H1/H2/H3 manifests.
+if [ -n "$UDP_PROFILE" ]; then
+    [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+    python3 "$SCRIPT_DIR/udp_internal_profile.py" validate-selection \
+        "$UDP_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
+        "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
 fi
 
 if [ "$H1_PROFILE" = diagnostic ] && [ -z "${H1_DIAGNOSTIC_WORK_DEADLINE:-}" ]; then
@@ -426,6 +444,11 @@ start_ferrum() {
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32
                     -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false)
     fi
+    if [ -n "$UDP_PROFILE" ]; then
+        extra_env+=(-e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1
+                    -e FERRUM_ADMIN_HTTP_PORT=9000
+                    -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
+    fi
 
     if [ "$H1_PROFILE" = diagnostic ]; then
         extra_env+=(--name "$H1_DIAGNOSTIC_CONTAINER_PREFIX-$gw")
@@ -484,6 +507,13 @@ start_ferrum() {
             python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
                 "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
                 "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
+    fi
+    if [ -n "$UDP_PROFILE" ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/udp_internal_profile.py" runtime \
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
     fi
     wait_for_gateway
 }
@@ -637,7 +667,17 @@ start_kong() {
         -v "$CERT_DIR:/certs:ro" \
         "$KONG_IMAGE")
 
-    wait_for_gateway
+    if [ "$UDP_PROFILE" = profile ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$cfg_dst" "$OUTPUT_DIR/diagnostics/kong_config.yaml"
+    fi
+    wait_for_gateway || return 1
+    if [ "$UDP_PROFILE" = profile ]; then
+        # Capture the actual ready fixture before any measured traffic. Readback
+        # failures remain in the ledger; this never changes Kong/traffic policy.
+        bash "$SCRIPT_DIR/kong_udp_readback.sh" "$GATEWAY_CID" "$KONG_IMAGE" \
+            "$OUTPUT_DIR/diagnostics/kong-readback" || return 1
+    fi
 }
 
 kong_config_name() {
@@ -920,6 +960,9 @@ run_bench() {
         sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
                       --h1-container-id "$GATEWAY_CID")
     fi
+    if [ -n "$UDP_PROFILE" ] && [ "$gateway" = ferrum ]; then
+        sampler_args+=(--udp-profile)
+    fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
     fi
@@ -1101,7 +1144,7 @@ main() {
     if [ "$H1_PROFILE" = cutoff ] || [ "$H1_PROFILE" = diagnostic ]; then
         expected_gateways+=" ferrum-exp-cutoff-one"
     fi
-    if [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
+    if [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
         EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
             "$EXPERIMENT_MANIFEST" "$PROTOCOL")
         if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
@@ -1170,12 +1213,16 @@ PYEOF
         cp "$SCRIPT_DIR/pool_profile_manifest.json" "$root_output/pool_profile_manifest.json"
         cp "$SCRIPT_DIR/pool_profile_schema.json" "$root_output/pool_profile_schema.json"
     fi
+    if [ -n "$UDP_PROFILE" ]; then
+        cp "$SCRIPT_DIR/udp_profile_manifest.json" "$root_output/udp_profile_manifest.json"
+        cp "$SCRIPT_DIR/udp_profile_schema.json" "$root_output/udp_profile_schema.json"
+    fi
     build_binaries
     # Save immutable image IDs as well as operator-supplied tags for revision A/B.
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
-    if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ]; then
+    if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ] || [ -n "$UDP_PROFILE" ]; then
         if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
             local source_identity
             source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
@@ -1193,6 +1240,11 @@ PYEOF
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"
+    fi
+    if [ "$UDP_PROFILE" = profile ]; then
+        # Preserve tag and immutable image evidence; no vendor correspondence inferred.
+        docker image inspect "$KONG_IMAGE" > "$root_output/kong-image.json"
+        KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')
     fi
     local requested_pairs="$PAIRS"
     local final_pairs="$PAIRS"

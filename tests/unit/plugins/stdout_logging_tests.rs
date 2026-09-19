@@ -109,7 +109,7 @@ fn test_stdout_logging_rejects_non_object_config() {
 fn test_shared_validation_rejects_invalid_stdout_logging_config() {
     let err = validate_plugin_config("stdout_logging", &json!({"filter": "errors"}))
         .expect_err("shared plugin validation must reject a non-object filter");
-    assert_eq!(err, "stdout_logging: filter must be an object");
+    assert_eq!(err, "stdout_logging: `filter` must be an object");
 }
 
 #[test]
@@ -432,4 +432,41 @@ fn test_stdout_logging_rejects_unknown_errors_only_expression_fields() {
     failed.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionReset);
     assert!(plugin.should_log_transaction(&failed));
     assert!(!plugin.should_log_transaction(&create_test_transaction_summary()));
+}
+
+#[test]
+fn startup_diagnostics_withhold_expression_scalars_and_unknown_keys() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (config, path) in [
+        (json!({(secret): true}), "`stdout_logging`"),
+        (
+            json!({"filter": {(secret): false}}),
+            "`stdout_logging.filter`",
+        ),
+    ] {
+        let error = StdoutLogging::new(&config)
+            .err()
+            .expect("unknown key rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(path), "{rendered}");
+        assert!(rendered.contains("unknown configuration key"), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+    }
+    for expression in [
+        json!({"op": secret}),
+        json!({"op": "status_code_min", "value": 987654321}),
+        json!({"op": "status_code_min", "value": true}),
+        json!({"op": "errors_only", secret: false}),
+        json!({"op": "and", "left": {"op": "errors_only", secret: 1}, "right": {"op": "errors_only"}}),
+    ] {
+        let error = StdoutLogging::new(&json!({"filter": {"expression": expression}}))
+            .err()
+            .expect("invalid expression must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("filter.expression"), "{rendered}");
+        assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
+        assert!(!rendered.contains("987654321"), "{rendered}");
+        assert!(!rendered.contains("true"), "{rendered}");
+        assert!(!rendered.contains("false"), "{rendered}");
+    }
 }

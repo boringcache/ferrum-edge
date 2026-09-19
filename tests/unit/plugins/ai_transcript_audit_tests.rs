@@ -339,7 +339,7 @@ async fn sink_is_required() {
         .err()
         .expect("expected config rejection");
     assert!(
-        err.contains("'sink' configuration is required"),
+        err.contains("`sink` configuration is required"),
         "got: {err}"
     );
 }
@@ -372,7 +372,7 @@ async fn invalid_mode_rejected() {
     let err = AiTranscriptAudit::new(&config, loopback_http_client())
         .err()
         .expect("expected config rejection");
-    assert!(err.contains("'mode' must be one of"), "got: {err}");
+    assert!(err.contains("`mode` must be one of"), "got: {err}");
 }
 
 #[tokio::test]
@@ -514,20 +514,20 @@ async fn rejects_multiple_unknown_root_keys_sorted_with_suggestions() {
         .expect("unknown root keys must fail closed");
     assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(
-        err.contains("'config.aaa_unknown'")
-            && err.contains("'config.allow_full_bod'")
-            && err.contains("'config.zzz_unknown'"),
+        err.contains("\"config.aaa_unknown\"")
+            && err.contains("\"config.allow_full_bod\"")
+            && err.contains("\"config.zzz_unknown\""),
         "got: {err}"
     );
-    let aaa = err.find("'config.aaa_unknown'").expect("aaa path");
-    let allow = err.find("'config.allow_full_bod'").expect("allow path");
-    let zzz = err.find("'config.zzz_unknown'").expect("zzz path");
+    let aaa = err.find("\"config.aaa_unknown\"").expect("aaa path");
+    let allow = err.find("\"config.allow_full_bod\"").expect("allow path");
+    let zzz = err.find("\"config.zzz_unknown\"").expect("zzz path");
     assert!(
         aaa < allow && allow < zzz,
         "unknown keys must be sorted: {err}"
     );
     assert!(
-        err.contains("did you mean 'allow_full_body'"),
+        err.contains("did you mean `allow_full_body`"),
         "typo should suggest allow_full_body: {err}"
     );
 }
@@ -609,12 +609,12 @@ async fn rejects_privacy_capture_sampling_redaction_limits_and_fail_posture_typo
             "missing unknown-key wording for {needle}: {err}"
         );
         assert!(
-            err.contains(&format!("'{needle}'")),
+            err.contains(&format!("{needle:?}")),
             "error did not identify {needle}: {err}"
         );
         if let Some(suggestion) = suggestion {
             assert!(
-                err.contains(&format!("did you mean '{suggestion}'")),
+                err.contains(&format!("did you mean `{suggestion}`")),
                 "expected suggestion {suggestion} for {needle}: {err}"
             );
         }
@@ -7299,6 +7299,15 @@ async fn metadata_only_empty_redaction_patterns_rejected() {
     .expect("metadata_only with an empty pattern set must be rejected");
     assert!(err.contains("metadata_only"), "got: {err}");
     assert!(err.contains("full_body"), "got: {err}");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+    assert!(rendered.contains("`mode` <redacted scalar>"), "{rendered}");
+    assert!(rendered.contains("`redaction.builtins: []`"), "{rendered}");
+    assert!(
+        rendered.contains("unredacted request-derived data"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("`full_body`"), "{rendered}");
+    assert!(!rendered.contains("metadata_only"), "{rendered}");
 
     let hash_only = json!({
         "mode": "hash_only",
@@ -12785,4 +12794,226 @@ async fn http_records_never_carry_a_grpc_status() {
         record.get("grpc_status").is_none(),
         "an HTTP record must not carry a gRPC application status: {record:?}"
     );
+}
+
+fn assert_rendered_unknown_transcript_config(
+    config: Value,
+    path: &str,
+    typo: &str,
+    suggestion: &str,
+) {
+    let error = AiTranscriptAudit::new_shape_only(&config, loopback_http_client())
+        .err()
+        .expect("unknown keys must reject shape admission");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(
+        rendered.contains(&format!("ai_transcript_audit: `{path}`:")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("unknown configuration key(s)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("did you mean `{suggestion}`?")),
+        "{rendered}"
+    );
+    for supplied in ["918273", typo, "payloadKey", "payloadValue"] {
+        assert!(!rendered.contains(supplied), "{rendered}");
+    }
+}
+
+#[test]
+fn rendered_unknown_transcript_sections_retain_fixed_context_without_supplied_data() {
+    for (section, typo, suggestion) in [
+        ("", "modde", "mode"),
+        ("capture", "requestz", "request"),
+        ("sampling", "ratez", "rate"),
+        ("redaction", "builtinz", "builtins"),
+        ("limits", "max_request_bytez", "max_request_bytes"),
+        ("privacy", "path_modz", "path_mode"),
+        ("sink", "endpoint_urz", "endpoint_url"),
+        ("grpc", "methodz", "methods"),
+    ] {
+        for (key, payload) in [
+            ("suppliedKey918273", json!("payloadValue918273")),
+            ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+            (
+                "'suppliedKey918273\"\\\n`suppliedTail918273`",
+                json!([918273]),
+            ),
+        ] {
+            let mut config = config_with_sink("https://audit.example.com/ingest", json!({}));
+            let path = match section {
+                "" => "config".to_string(),
+                "grpc" => "grpc".to_string(),
+                _ => format!("config.{section}"),
+            };
+            let object = if section.is_empty() {
+                &mut config
+            } else {
+                if config.get(section).is_none() {
+                    config[section] = json!({});
+                }
+                &mut config[section]
+            };
+            object[typo] = payload.clone();
+            object[key] = payload;
+            assert_rendered_unknown_transcript_config(config, &path, typo, suggestion);
+        }
+    }
+}
+
+#[test]
+fn rendered_unknown_custom_pattern_retains_second_index_without_name_or_payload() {
+    for name in [
+        "suppliedPattern918273",
+        "918273",
+        "'suppliedPattern918273\"\\\n`suppliedTail918273`",
+    ] {
+        let payload = json!({"payloadKey918273": ["payloadValue918273", 918273]});
+        let config = config_with_sink(
+            "https://audit.example.com/ingest",
+            json!({"redaction": {"custom_patterns": [
+                {"name": "valid-preceding-pattern", "regex": "prior"},
+                {"name": name, "regxe": payload, (name): payload}
+            ]}}),
+        );
+        assert_rendered_unknown_transcript_config(
+            config,
+            "config.redaction.custom_patterns[1]",
+            "regxe",
+            "regex",
+        );
+    }
+}
+
+#[test]
+fn rendered_unknown_grpc_method_config_retains_parent_without_supplied_method_or_keys() {
+    // Method names are validated before the shared unknown-key helper. Keep
+    // this key syntactically valid so every hostile leaf reaches that helper.
+    for key in [
+        "suppliedKey918273",
+        "918273",
+        "'suppliedKey918273\"\\\n`suppliedTail918273`",
+    ] {
+        let payload = json!({"payloadKey918273": ["payloadValue918273", 918273]});
+        let config = config_with_sink(
+            "https://audit.example.com/ingest",
+            json!({"grpc": {
+                "descriptor_path": "/suppliedDescriptor918273.pb",
+                "methods": {"/supplied.Service918273/Call918273": {
+                    "request_typz": payload,
+                    (key): payload
+                }}
+            }}),
+        );
+        assert_rendered_unknown_transcript_config(
+            config,
+            "grpc.methods",
+            "request_typz",
+            "request_type",
+        );
+    }
+}
+
+#[test]
+fn rendered_invalid_grpc_method_keys_preserve_the_earlier_typed_rejection() {
+    for method in [
+        "/918273/918273",
+        "/supplied.Service/'suppliedMethod918273\"\\\n`suppliedTail918273`",
+    ] {
+        let config = config_with_sink(
+            "https://audit.example.com/ingest",
+            json!({"grpc": {
+                "descriptor_path": "/suppliedDescriptor918273.pb",
+                "methods": {(method): {"request_type": "supplied.Request918273"}}
+            }}),
+        );
+        let error = AiTranscriptAudit::new_shape_only(&config, loopback_http_client())
+            .err()
+            .expect("invalid method keys must reject before method-config parsing");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("ai_transcript_audit:"), "{rendered}");
+        assert!(
+            rendered.contains("`grpc.methods` key must be"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("`/package.Service/Method` path"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("unknown configuration key"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("918273"), "{rendered}");
+    }
+}
+
+#[test]
+fn transcript_config_header_diagnostics_withhold_keys_and_secret_references() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for headers in [
+        json!({"'unregistered_header_secret": "bad\nvalue"}),
+        json!({"'unregistered_header_secret": 918273}),
+        json!({"'unregistered_header_secret\n": "value"}),
+        json!({"authorization": "${'unregistered_reference_secret}"}),
+        json!({"authorization": "${secret:'unregistered_reference_secret}"}),
+        json!({"authorization": "${secret:'unregistered_reference_secret"}),
+    ] {
+        let config = json!({"sink": {
+            "endpoint_url": "https://audit.example.com/ingest",
+            "custom_headers": headers
+        }});
+        let error = validate_plugin_config("ai_transcript_audit", &config).unwrap_err();
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("`sink.custom_headers`"), "{rendered}");
+        assert!(
+            !rendered.contains("unregistered_header_secret"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("unregistered_reference_secret"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("918273"), "{rendered}");
+    }
+}
+
+#[test]
+fn transcript_config_limit_diagnostics_withhold_supplied_and_derived_sizes() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for (limits, field, secrets) in [
+        (
+            json!({
+                "max_request_bytes": 900001,
+                "max_response_bytes": 900001,
+                "max_stream_capture_bytes": 900001
+            }),
+            "`limits.max_request_bytes`",
+            vec!["900001", "2700003"],
+        ),
+        (
+            json!({"max_entry_bytes": 91827}),
+            "`limits.max_entry_bytes`",
+            vec!["91827"],
+        ),
+        (
+            json!({"buffer_max_bytes": 91827}),
+            "`limits.buffer_max_bytes`",
+            vec!["91827"],
+        ),
+    ] {
+        let error =
+            validate_plugin_config("ai_transcript_audit", &json!({"limits": limits})).unwrap_err();
+        let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains("must be"), "{rendered}");
+        for secret in secrets {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
 }

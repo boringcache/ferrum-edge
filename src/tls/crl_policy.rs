@@ -329,7 +329,7 @@ pub fn validate_crl_windows_at(
     for (index, crl) in crls.iter().enumerate() {
         if let Err(rejection) = classify_crl_window(crl, now_unix) {
             return Err(format!(
-                "CRL record #{} in '{}' {}",
+                "CRL record #{} in {:?} {}",
                 index + 1,
                 display_source,
                 rejection.reason()

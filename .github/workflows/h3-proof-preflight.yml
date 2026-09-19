@@ -1,0 +1,94 @@
+name: H3 Proof Preflight
+
+on:
+  pull_request:
+    paths:
+      - tests/performance/multi_protocol/h3_proof/**
+      - .github/workflows/h3-proof-preflight.yml
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Synthetic observer capability preflight only
+        required: true
+        type: choice
+        default: capability-v1
+        options: [capability-v1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: h3-proof-preflight-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: H3 observer compile and hosted self-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare retained artifacts
+        run: |
+          mkdir -p "$RUNNER_TEMP/h3-proof/build"
+          printf '%s\n' '{"schema":1,"status":"error","reason":"build_or_driver_not_completed","fixture_only":true,"issue_5588_closed":false}' > "$RUNNER_TEMP/h3-proof/summary.json"
+
+      - name: Install observer tools from Ubuntu and retain resolved provenance
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3 \
+            2>&1 | tee "$RUNNER_TEMP/h3-proof/apt-update.log"
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev \
+            libelf-dev zlib1g-dev gcc libc6-dev binutils iproute2 util-linux python3-yaml \
+            2>&1 | tee "$RUNNER_TEMP/h3-proof/apt-install.log"
+          dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' \
+            > "$RUNNER_TEMP/h3-proof/resolved-packages.tsv"
+          apt-cache policy clang-18 llvm-18 libbpf-dev libelf-dev gcc libc6-dev linux-libc-dev \
+            > "$RUNNER_TEMP/h3-proof/package-origins.txt"
+
+      - name: Compile only the isolated observer and PMU probe
+        working-directory: tests/performance/multi_protocol/h3_proof
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            clang-18 -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wall -Werror \
+              -I/usr/include/x86_64-linux-gnu -c observer.bpf.c \
+              -o "$RUNNER_TEMP/h3-proof/build/observer.bpf.o"
+            cc -std=gnu11 -O2 -g -Wall -Wextra -Werror observer.c -lbpf -lelf -lz \
+              -o "$RUNNER_TEMP/h3-proof/build/observer"
+            cc -std=gnu11 -O2 -g -Wall -Wextra -Werror pmu.c \
+              -o "$RUNNER_TEMP/h3-proof/build/pmu"
+          } 2>&1 | tee "$RUNNER_TEMP/h3-proof/build.log"
+
+      - name: Static syntax and evidence contract self-tests
+        run: |
+          set -euo pipefail
+          cc -std=gnu11 -O2 -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/decoder_test.c -o "$RUNNER_TEMP/h3-proof/build/decoder_test"
+          "$RUNNER_TEMP/h3-proof/build/decoder_test"
+          bash -n tests/performance/multi_protocol/h3_proof/commands.sh
+          python3 -m py_compile tests/performance/multi_protocol/h3_proof/*.py
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/h3_proof \
+            -p 'test_*.py' 2>&1 | tee "$RUNNER_TEMP/h3-proof/contract-tests.log"
+
+      - name: Capability probes and real isolated fixtures
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT \
+            python3 tests/performance/multi_protocol/h3_proof/hosted.py \
+            --suite capability-v1 --output "$RUNNER_TEMP/h3-proof" \
+            2>&1 | tee "$RUNNER_TEMP/h3-proof/driver.log"
+
+      - name: Retain complete results even when unsupported or failed
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h3-proof-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/h3-proof/
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 6

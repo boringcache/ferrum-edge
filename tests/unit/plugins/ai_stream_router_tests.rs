@@ -217,7 +217,7 @@ fn test_shared_validation_rejects_invalid_ai_stream_router_config() {
         .expect_err("shared plugin validation must require a providers array");
     assert_eq!(
         err,
-        "ai_stream_router: 'providers' must be a non-empty array"
+        "ai_stream_router: `providers` must be a non-empty array"
     );
 }
 
@@ -231,7 +231,7 @@ fn test_config_rejects_unknown_provider_type() {
         }]
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("unknown provider_type"), "{err}");
+    assert!(err.contains("unknown `provider_type`"), "{err}");
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn test_config_rejects_malformed_endpoint() {
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(
-        err.contains("invalid endpoint") || err.contains("no host"),
+        err.contains("invalid `endpoint`") || err.contains("no host"),
         "{err}"
     );
 }
@@ -365,6 +365,62 @@ fn valid_provider() -> Value {
 }
 
 #[test]
+fn rendered_unknown_config_retains_root_or_second_provider_context_without_supplied_data() {
+    for (key, payload) in [
+        ("suppliedKey918273", json!("payloadValue918273")),
+        ("918273", json!({"payloadKey918273": "payloadValue918273"})),
+        (
+            "'suppliedKey918273\"\\\n`suppliedTail918273`",
+            json!([918273]),
+        ),
+    ] {
+        for nested in [false, true] {
+            let mut config = openai_and_anthropic_config();
+            config["providers"][1]["name"] = json!(key);
+            let (object, path, typo, suggestion) = if nested {
+                (
+                    &mut config["providers"][1],
+                    "config.providers[1]",
+                    "model_patternz",
+                    "model_patterns",
+                )
+            } else {
+                (&mut config, "config", "enabeld", "enabled")
+            };
+            object[typo] = payload.clone();
+            object[key] = payload.clone();
+            let error = AiStreamRouter::new(&config, http_client())
+                .err()
+                .expect("unknown keys must reject admission");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert!(
+                rendered.contains(&format!("ai_stream_router: `{path}`:")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("unknown configuration key(s)"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("did you mean `{suggestion}`?")),
+                "{rendered}"
+            );
+            for supplied in [
+                "918273",
+                typo,
+                "payloadKey",
+                "payloadValue",
+                "sk-openai-secret",
+                "sk-ant-secret",
+            ] {
+                assert!(!rendered.contains(supplied), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
 fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
     let mut cfg = json!({
         "enabeld": false,
@@ -373,8 +429,8 @@ fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(
         err.contains("unknown configuration key")
-            && err.contains("'config.enabeld'")
-            && err.contains("did you mean 'enabled'"),
+            && err.contains("\"config.enabeld\"")
+            && err.contains("did you mean `enabled`"),
         "{err}"
     );
 
@@ -391,13 +447,13 @@ fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
         "providers": [valid_provider()]
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("'config.fail_on_missing_mode'"), "{err}");
-    assert!(err.contains("'config.inject_usage_option'"), "{err}");
-    assert!(err.contains("'config.normalize_response_strem'"), "{err}");
+    assert!(err.contains("\"config.fail_on_missing_mode\""), "{err}");
+    assert!(err.contains("\"config.inject_usage_option\""), "{err}");
+    assert!(err.contains("\"config.normalize_response_strem\""), "{err}");
     assert!(
-        err.contains("did you mean 'fail_on_missing_model'")
-            || err.contains("did you mean 'inject_usage_options'")
-            || err.contains("did you mean 'normalize_response_stream'"),
+        err.contains("did you mean `fail_on_missing_model`")
+            || err.contains("did you mean `inject_usage_options`")
+            || err.contains("did you mean `normalize_response_stream`"),
         "{err}"
     );
 }
@@ -425,7 +481,7 @@ fn test_config_rejects_fallback_block_in_every_shape() {
             .err()
             .unwrap_or_else(|| panic!("fallback {fallback} must be rejected"));
         assert!(
-            err.contains("unsupported field 'fallback'"),
+            err.contains("unsupported field `fallback`"),
             "fallback {fallback}: {err}"
         );
         assert!(
@@ -453,7 +509,7 @@ fn test_fallback_rejection_is_specific_not_a_typo_suggestion() {
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(!err.contains("did you mean"), "{err}");
     assert!(!err.contains("unknown configuration key"), "{err}");
-    assert!(err.contains("Remove the 'fallback' block"), "{err}");
+    assert!(err.contains("Remove the `fallback` block"), "{err}");
 }
 
 /// Omitting `fallback` preserves the plugin's existing behavior exactly: the
@@ -482,16 +538,16 @@ fn test_config_rejects_unknown_provider_keys() {
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
     assert!(
-        err.contains("'config.providers[0].allow_plaintex'"),
+        err.contains("\"config.providers[0].allow_plaintex\""),
         "{err}"
     );
     assert!(
-        err.contains("'config.providers[0].inherit_backend_tl'"),
+        err.contains("\"config.providers[0].inherit_backend_tl\""),
         "{err}"
     );
     assert!(
-        err.contains("did you mean 'allow_plaintext'")
-            || err.contains("did you mean 'inherit_backend_tls'"),
+        err.contains("did you mean `allow_plaintext`")
+            || err.contains("did you mean `inherit_backend_tls`"),
         "{err}"
     );
 }
@@ -509,7 +565,7 @@ fn test_shared_admission_and_failure_policy_for_unknown_keys() {
     )
     .expect_err("shared plugin validation must reject unknown keys");
     assert!(
-        err.contains("'config.enabeld'") && err.contains("did you mean 'enabled'"),
+        err.contains("\"config.enabeld\"") && err.contains("did you mean `enabled`"),
         "{err}"
     );
     assert_eq!(

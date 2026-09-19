@@ -2349,11 +2349,11 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
     assert!(
-        error.contains("'config.vary_by_header'"),
+        error.contains("\"config.vary_by_header\""),
         "reload error must path-qualify Vary typo: {error}"
     );
     assert!(
-        error.contains("'config.cache_key_include_consumr'"),
+        error.contains("\"config.cache_key_include_consumr\""),
         "reload error must path-qualify consumer typo: {error}"
     );
 
@@ -2457,11 +2457,11 @@ fn test_ws_rate_limiting_unknown_key_reload_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
     assert!(
-        error.contains("'config.frames_per_secod'"),
+        error.contains("\"config.frames_per_secod\""),
         "reload error must path-qualify FPS typo: {error}"
     );
     assert!(
-        error.contains("'config.redis_tsl'"),
+        error.contains("\"config.redis_tsl\""),
         "reload error must path-qualify TLS typo: {error}"
     );
 
@@ -2570,7 +2570,7 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let dir = tempfile::tempdir().expect("tempdir");
-    let ca_path = dir.path().join("ws-ca.pem");
+    let ca_path = dir.path().join("'ReloadCaPath5594`.pem");
     let valid_ca = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
     std::fs::write(&ca_path, &valid_ca).expect("write valid CA");
 
@@ -2604,7 +2604,25 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let error = cache
         .rebuild(&replacement)
         .expect_err("malformed replacement CA must reject cache publication");
-    assert!(error.contains("record #2"), "got: {error}");
+    let visible = [
+        "ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`",
+        "certificate record #2",
+        "malformed PEM certificate record",
+    ];
+    for fragment in visible {
+        assert!(error.contains(fragment), "{error}");
+    }
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for fragment in visible {
+        assert!(rendered.contains(fragment), "{rendered}");
+    }
+    for hidden in [
+        "ReloadCaPath5594",
+        ca_path.to_str().unwrap(),
+        valid_ca.as_str(),
+    ] {
+        assert!(!rendered.contains(hidden), "{rendered}");
+    }
 
     let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
@@ -5510,7 +5528,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert!(
         error
             .to_string()
-            .contains("jwt_auth: unknown config key 'audience'"),
+            .contains("jwt_auth: unknown config key \"audience\""),
         "unexpected reload error: {error}"
     );
 
@@ -5744,7 +5762,7 @@ fn test_apply_delta_rejects_invalid_ai_stream_router_config_and_keeps_last_known
                 "fallback": {"on_connect_error": true}
             }),
             &[
-                "unsupported field 'fallback'",
+                "unsupported field `fallback`",
                 "provider fallback is not implemented",
             ][..],
         ),
@@ -11804,7 +11822,7 @@ async fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good()
             )
             .expect_err("unknown ai_semantic_cache key must reject reload");
         assert!(
-            error.contains("ai_semantic_cache: unknown configuration key(s):"),
+            error.contains("ai_semantic_cache: `config`: unknown configuration key(s):"),
             "unexpected reload error for {bad_config}: {error}"
         );
         let after_reject = cache.get_plugins("ferrum", "p1");

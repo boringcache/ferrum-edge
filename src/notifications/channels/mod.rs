@@ -203,9 +203,9 @@ impl NotificationChannel {
 pub fn parse_channels(value: &Value) -> Result<HashMap<String, Arc<NotificationChannel>>, String> {
     let map = value
         .as_object()
-        .ok_or_else(|| "'channels' must be an object".to_string())?;
+        .ok_or_else(|| "`channels` must be an object".to_string())?;
     if map.is_empty() {
-        return Err("'channels' must contain at least one channel".to_string());
+        return Err("`channels` must contain at least one channel".to_string());
     }
     let mut out = HashMap::with_capacity(map.len());
     for (name, def) in map {
@@ -225,7 +225,7 @@ fn validate_channel_name(name: &str) -> Result<(), String> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
         return Err(format!(
-            "channel name '{name}' must match [A-Za-z0-9_-]+ (got disallowed characters)"
+            "channel name {name:?} must match [A-Za-z0-9_-]+ (got disallowed characters)"
         ));
     }
     Ok(())
@@ -234,50 +234,50 @@ fn validate_channel_name(name: &str) -> Result<(), String> {
 fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String> {
     let obj = def
         .as_object()
-        .ok_or_else(|| format!("channel '{name}': definition must be an object"))?;
+        .ok_or_else(|| format!("channel {name:?}: definition must be an object"))?;
     let kind = match obj.get("type") {
         Some(v) => v
             .as_str()
-            .ok_or_else(|| format!("channel '{name}': 'type' must be a string"))?,
+            .ok_or_else(|| format!("channel {name:?}: `type` must be a string"))?,
         None => {
             return Err(match near_miss_for_missing_key(obj, "type") {
                 Some(typo) => format!(
-                    "channel '{name}': 'type' is required (did you mean 'type' instead of '{typo}'?)"
+                    "channel {name:?}: `type` is required (did you mean `type` instead of {typo:?}?)"
                 ),
-                None => format!("channel '{name}': 'type' is required"),
+                None => format!("channel {name:?}: `type` is required"),
             });
         }
     };
     let path = format!("channels.{name}");
     match kind {
         "slack" => {
-            reject_unknown_keys(obj, &path, SLACK_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, SLACK_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Slack(SlackChannel::new(name, def)?))
         }
         "teams" => {
-            reject_unknown_keys(obj, &path, TEAMS_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, TEAMS_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Teams(TeamsChannel::new(name, def)?))
         }
         "discord" => {
-            reject_unknown_keys(obj, &path, DISCORD_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, DISCORD_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Discord(DiscordChannel::new(
                 name, def,
             )?))
         }
         "webhook" => {
-            reject_unknown_keys(obj, &path, WEBHOOK_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, WEBHOOK_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Webhook(WebhookChannel::new(
                 name, def,
             )?))
         }
         "email" => {
-            reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "")?;
+            reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "`channels`: ")?;
             Ok(NotificationChannel::Email(Box::new(EmailChannel::new(
                 name, def,
             )?)))
         }
         other => Err(format!(
-            "channel '{name}': unknown 'type' '{other}' (expected one of: slack, teams, discord, webhook, email)"
+            "channel {name:?}: unknown `type` {other:?} (expected one of: slack, teams, discord, webhook, email)"
         )),
     }
 }
@@ -312,29 +312,29 @@ pub(super) fn resolve_optional_string_with_lookup(
     if let Some(v) = value.get(key) {
         let s = v
             .as_str()
-            .ok_or_else(|| format!("channel '{channel}': '{key}' must be a string"))?;
+            .ok_or_else(|| format!("channel {channel:?}: `{key}` must be a string"))?;
         if s.is_empty() {
-            return Err(format!("channel '{channel}': '{key}' must not be empty"));
+            return Err(format!("channel {channel:?}: `{key}` must not be empty"));
         }
         return Ok(Some(s.to_string()));
     }
     if let Some(v) = value.get(env_key) {
         let env_name = v
             .as_str()
-            .ok_or_else(|| format!("channel '{channel}': '{env_key}' must be a string"))?;
+            .ok_or_else(|| format!("channel {channel:?}: `{env_key}` must be a string"))?;
         if env_name.is_empty() {
             return Err(format!(
-                "channel '{channel}': '{env_key}' must not be empty"
+                "channel {channel:?}: `{env_key}` must not be empty"
             ));
         }
         let resolved = env_lookup(env_name).map_err(|_| {
             format!(
-                "channel '{channel}': env var '{env_name}' (referenced by '{env_key}') is not set"
+                "channel {channel:?}: env var {env_name:?} (referenced by `{env_key}`) is not set"
             )
         })?;
         if resolved.is_empty() {
             return Err(format!(
-                "channel '{channel}': env var '{env_name}' resolved to empty string"
+                "channel {channel:?}: env var {env_name:?} (referenced by `{env_key}`) resolved to empty string"
             ));
         }
         return Ok(Some(resolved));
@@ -353,23 +353,23 @@ pub(super) fn validate_notification_url(
     field: &str,
 ) -> Result<(), String> {
     let parsed = Url::parse(url)
-        .map_err(|e| format!("channel '{channel}' ({kind}): invalid '{field}': {e}"))?;
+        .map_err(|_| format!("channel {channel:?} ({kind}): invalid `{field}`: invalid URL"))?;
     match parsed.scheme() {
         "http" | "https" => {}
         s => {
             return Err(format!(
-                "channel '{channel}' ({kind}): '{field}' must use http:// or https:// (got '{s}')"
+                "channel {channel:?} ({kind}): `{field}` must use http:// or https:// (got {s:?})"
             ));
         }
     }
     if parsed.host_str().is_none() {
         return Err(format!(
-            "channel '{channel}' ({kind}): '{field}' must include a hostname"
+            "channel {channel:?} ({kind}): `{field}` must include a hostname"
         ));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
-            "channel '{channel}' ({kind}): '{field}' must not include username or password credentials"
+            "channel {channel:?} ({kind}): `{field}` must not include username or password credentials"
         ));
     }
     Ok(())
