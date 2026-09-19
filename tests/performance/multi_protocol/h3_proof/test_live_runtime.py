@@ -145,6 +145,39 @@ class LiveRuntimeTests(unittest.TestCase):
             self.assertTrue(any(i.startswith('attach:') for i in observer_issues(results)))
             self.assertEqual(attachment['ready']['errno'], 28)
 
+    def test_lifecycle_cap_loss_invalidates_otherwise_complete_role_proof(self):
+        roles = ['backend', 'client', 'gateway_frontend', 'gateway_upstream']
+        evidence = dict(operation_coverage={r: [2, 6] for r in roles},
+                        roles=[dict(cookie=i + 1, role=r) for i, r in enumerate(roles)],
+                        socket_lifetimes=[dict(cookie=i + 1, birth_ns=10, retirement_ns=20) for i in range(4)])
+        for family in FAMILIES:
+            for omitted in (1, 71701):  # one row is enough; latter is retained direct/destroy loss
+                with self.subTest(family=family, omitted=omitted):
+                    results = supported_results()
+                    result = next(r for r in results if r['family'] == family)
+                    result['termination']['lifecycle_omitted'] = omitted
+                    self.assertEqual(smoke_issues(evidence, results, 'envoy'), [])
+                    errors = observer_issues(results)
+                    self.assertEqual(errors, [f'{family}:observer_lifecycle_incomplete'])
+                    issues = sample_admission_issues(dict(observer_errors=errors), [])
+                    off = dict(rps=100, p99_us=100, traffic_issues=[], observer_ok=True)
+                    on = dict(off, traffic_issues=issues)
+                    self.assertFalse(calibration([(off, on), (off, on)])['active_main'])
+                    self.assertEqual(result['termination']['lifecycle_omitted'], omitted)
+
+    def test_lifecycle_ring_loss_cannot_pass_before_output_cap(self):
+        for family in FAMILIES:
+            for field in ('ring_drops', 'losses'):
+                with self.subTest(family=family, field=field):
+                    results = supported_results()
+                    result = next(r for r in results if r['family'] == family)
+                    if field == 'losses':
+                        result['final']['losses'][LOSSES.index('ring_full')] = 4021
+                    else:
+                        result['final']['ring_drops'] = 3941
+                    self.assertEqual(result['termination']['lifecycle_omitted'], 0)
+                    self.assertEqual(observer_issues(results), [f'{family}:observer_lifecycle_incomplete'])
+
     def test_missing_observer_resource_capture_is_an_error(self):
         observer = live.Observer.__new__(live.Observer)
         observer.process = SimpleNamespace(pid=123)

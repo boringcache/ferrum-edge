@@ -197,6 +197,9 @@ def observer_issues(results):
                 raise ValueError('observer_final_capture_failed')
             if final['verifier_log_truncated']:
                 raise ValueError('observer_diagnostics_incomplete')
+            if (stop['lifecycle_omitted'] or final['ring_drops']
+                    or final['losses'][LOSSES.index('ring_full')]):
+                raise ValueError('observer_lifecycle_incomplete')
         except (KeyError, TypeError, ValueError) as error:
             issues.append(f'{family}:{error}')
     return issues
