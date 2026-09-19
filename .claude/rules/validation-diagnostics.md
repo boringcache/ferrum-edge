@@ -80,6 +80,13 @@ paths:
   Registered rendered-output and captured-log tests cover constructor and
   configuration-admission messages. Runtime transport logs outside this
   configuration scope are not certified by the mechanical producer guard.
+  StatsD/frame-logging unknown root keys remain Debug-quoted behind a fixed
+  `config` prefix. Every alert rule parse/duplicate-name failure retains its
+  current ordinal; named-schema enum failures retain the caller and field path.
+  Empty notification env lookups name the fixed reference field, and frame-log
+  constructor warnings sanitize the selected level as a scalar. TCP/WebSocket
+  CA wrappers retain shared TLS failure classes and record ordinals with fixed
+  plugin/CA-field context; supplied source paths remain withheld when rendered.
 - The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
   configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
   visible while supplied service/tool names, paths, tokens and parser payloads

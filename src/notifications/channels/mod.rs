@@ -334,7 +334,7 @@ pub(super) fn resolve_optional_string_with_lookup(
         })?;
         if resolved.is_empty() {
             return Err(format!(
-                "channel {channel:?}: env var {env_name:?} resolved to empty string"
+                "channel {channel:?}: env var {env_name:?} (referenced by `{env_key}`) resolved to empty string"
             ));
         }
         return Ok(Some(resolved));

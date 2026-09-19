@@ -828,7 +828,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "rules[0].enabled must be a boolean",
+            "`rules[0]`: `enabled` must be a boolean",
         ),
         (
             json!({
@@ -847,7 +847,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "rules[0].enabled must be a boolean",
+            "`rules[0]`: `enabled` must be a boolean",
         ),
         (
             json!({
@@ -2888,5 +2888,161 @@ fn startup_diagnostics_preserve_second_rule_index_when_type_is_missing() {
             }
             assert_rendered_alert_diagnostic(&config, &visible, &[name, "typee"]);
         }
+    }
+}
+
+#[test]
+fn startup_diagnostics_preserve_second_rule_semantic_errors() {
+    let marker = "'CallerKey5594`\"\\\n";
+    for (field, value, reason) in [
+        ("type", json!(marker), "unknown `type`"),
+        ("type", json!(987654321), "`type` must be a string"),
+        ("name", json!(987654321), "`name` must be a string"),
+        ("name", json!(""), "`name` must not be empty"),
+        ("enabled", json!(marker), "`enabled` must be a boolean"),
+        (
+            "threshold_percent",
+            json!(987654321),
+            "`threshold_percent` must be in",
+        ),
+        (
+            "threshold_percent",
+            json!(marker),
+            "`threshold_percent` is required",
+        ),
+        ("severity", json!(marker), "unknown `severity`"),
+        ("severity", json!(987654321), "`severity` must be a string"),
+        ("channels", json!([marker]), "references unknown channel"),
+        (
+            "channels",
+            json!([987654321]),
+            "`channels` entries must be strings",
+        ),
+        (
+            "channels",
+            json!([]),
+            "`channels` must contain at least one channel name",
+        ),
+        ("channels", json!(marker), "`channels` is required"),
+        (
+            "window_seconds",
+            json!(987654321),
+            "`window_seconds` must be in",
+        ),
+        (
+            "cooldown_seconds",
+            json!(987654321),
+            "`cooldown_seconds` must be in",
+        ),
+        (
+            "min_request_count",
+            json!(marker),
+            "`min_request_count` must be an unsigned integer",
+        ),
+        ("recovery", json!(marker), "`recovery` must be an object"),
+        (
+            "recovery",
+            json!({"resolved_window_seconds": marker}),
+            "`recovery.resolved_window_seconds` must be an unsigned integer",
+        ),
+        (
+            "recovery",
+            json!({"resolved_window_seconds": 987654321}),
+            "`recovery.resolved_window_seconds` must be in",
+        ),
+        (
+            "recovery",
+            json!({"resolved_window_seconds": 9876543210_u64}),
+            "`recovery.resolved_window_seconds` is too large for u32",
+        ),
+    ] {
+        let mut config = minimal_config();
+        let mut second = config["rules"][0].clone();
+        second["name"] = json!(marker);
+        config["rules"].as_array_mut().unwrap().push(second);
+        assert!(ProxyAlerts::new(&config, http_client()).is_ok());
+        config["rules"][1][field] = value;
+        assert_rendered_alert_diagnostic(&config, &["`rules[1]`", reason], &[marker]);
+    }
+
+    for second in [json!(987654321), json!({"type": "error_rate"})] {
+        let mut config = minimal_config();
+        config["rules"].as_array_mut().unwrap().push(second);
+        assert_rendered_alert_diagnostic(&config, &["`rules[1]`"], &[]);
+    }
+
+    let mut config = minimal_config();
+    config["rules"][0]["name"] = json!(marker);
+    let duplicate = config["rules"][0].clone();
+    config["rules"].as_array_mut().unwrap().push(duplicate);
+    assert_rendered_alert_diagnostic(
+        &config,
+        &[
+            "`rules[1]`",
+            "duplicate rule name",
+            "rule names must be unique",
+        ],
+        &[marker],
+    );
+}
+
+#[test]
+fn startup_diagnostics_preserve_second_rule_threshold_errors_for_every_kind() {
+    for (rule, field, value, reason) in [
+        (
+            json!({"type": "error_rate", "status_codes": [500], "threshold_percent": 5.0}),
+            "threshold_percent",
+            json!(987654321),
+            "must be in",
+        ),
+        (
+            json!({"type": "status_code_count", "status_codes": [500], "threshold_count": 10}),
+            "threshold_count",
+            json!(0),
+            "must be > 0",
+        ),
+        (
+            json!({"type": "latency_percentile", "metric": "backend_total_ms", "percentile": 95, "threshold_ms": 1000}),
+            "threshold_ms",
+            json!(987654321),
+            "largest finite histogram bucket",
+        ),
+        (
+            json!({"type": "error_class", "classes": ["connection_refused"], "threshold_count": 10}),
+            "threshold_count",
+            json!(0),
+            "must be > 0",
+        ),
+        (
+            json!({"type": "stream_disconnect_cause", "causes": ["backend_error"], "threshold_count": 10}),
+            "threshold_count",
+            json!(0),
+            "must be > 0",
+        ),
+        (
+            json!({"type": "grpc_status_count", "grpc_statuses": [14], "threshold_count": 10}),
+            "threshold_count",
+            json!(0),
+            "must be > 0",
+        ),
+        (
+            json!({"type": "grpc_status_rate", "grpc_statuses": [14], "threshold_percent": 5.0}),
+            "threshold_percent",
+            json!(987654321),
+            "must be in",
+        ),
+    ] {
+        let mut config = minimal_config();
+        let mut second = rule;
+        second["name"] = json!("'CallerKey5594`\"\\\n");
+        second["channels"] = json!(["ops_slack"]);
+        config["rules"].as_array_mut().unwrap().push(second);
+        assert!(ProxyAlerts::new(&config, http_client()).is_ok());
+        config["rules"][1][field] = value;
+        assert_rendered_alert_diagnostic(
+            &config,
+            &["`rules[1]`", &format!("`{field}`"), reason],
+            &[],
+        );
     }
 }
