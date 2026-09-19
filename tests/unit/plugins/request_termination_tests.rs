@@ -1157,6 +1157,16 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "`trigger.path_prefix`",
             "must be a string",
         ),
+        (
+            json!({"trigger": {"path_prefix": "/UNREGISTERED_TRAFFIC_TOKEN?query"}}),
+            "`trigger.path_prefix`",
+            "query delimiter (`?`)",
+        ),
+        (
+            json!({"trigger": {"path_prefix": "/UNREGISTERED_TRAFFIC_TOKEN#fragment"}}),
+            "`trigger.path_prefix`",
+            "fragment delimiter (`#`)",
+        ),
     ] {
         let error = ferrum_edge::plugins::validate_plugin_config("request_termination", &config)
             .expect_err("invalid configuration must still be rejected");

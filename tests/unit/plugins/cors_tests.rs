@@ -2040,11 +2040,11 @@ fn semantic_cors_diagnostics_withhold_unregistered_values() {
     assert!(rendered.contains("invalid or exceeds"), "{rendered}");
     assert!(!rendered.contains("UNREGISTERED_CORS_TOKEN"), "{rendered}");
 
-    let url_error = CorsPlugin::new(&json!({"allowed_origins": [token]}))
+    let url_error = CorsPlugin::new(&json!({"allowed_origins": ["https://example.com", token]}))
         .err()
         .expect("invalid origin must still be rejected");
     let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(url_error), &[]);
-    assert!(rendered.contains("`allowed_origins`"), "{rendered}");
+    assert!(rendered.contains("`cors.allowed_origins[1]`"), "{rendered}");
     assert!(rendered.contains("invalid origin URL"), "{rendered}");
     assert!(!rendered.contains("UNREGISTERED_CORS_TOKEN"), "{rendered}");
 
@@ -2056,6 +2056,59 @@ fn semantic_cors_diagnostics_withhold_unregistered_values() {
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains("invalid HTTP"), "{rendered}");
         assert!(!rendered.contains("UNREGISTERED_CORS_TOKEN"), "{rendered}");
+    }
+}
+
+#[test]
+fn string_origin_diagnostics_keep_index_and_reason_without_supplied_values() {
+    let token = "'\"`UNREGISTERED_CORS_TOKEN\\tail";
+    for (origin, reason) in [
+        (String::new(), "non-empty strings"),
+        (" \t ".to_string(), "non-empty strings"),
+        (
+            format!(" {token}"),
+            "must not have leading or trailing whitespace",
+        ),
+        (
+            format!("{token} "),
+            "must not have leading or trailing whitespace",
+        ),
+        (token.repeat(20), "byte matcher limit"),
+        (format!("*{token}"), "must use the `*.example.com` form"),
+        (
+            format!("*.example.com/{token}"),
+            "must be a hostname suffix without URL delimiters",
+        ),
+        (token.to_string(), "invalid origin URL"),
+        (
+            format!("https://example.com/{token}"),
+            "without path, query, or fragment",
+        ),
+        (
+            "https://UNREGISTERED_CORS_TOKEN@example.com".to_string(),
+            "must not include credentials",
+        ),
+        (
+            "ftp://UNREGISTERED_CORS_TOKEN.example.com".to_string(),
+            "origin scheme must be http or https",
+        ),
+        (
+            format!("https://{token} example.com"),
+            "must not contain whitespace",
+        ),
+    ] {
+        // An earlier allow-all entry must still validate every later string.
+        for first in ["https://example.com", "*"] {
+            let error = CorsPlugin::new(&json!({"allowed_origins": [first, &origin]}))
+                .err()
+                .expect("invalid later string origin must still be rejected");
+            let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+            assert!(rendered.contains("`cors.allowed_origins[1]`"), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            for withheld in ["UNREGISTERED_CORS_TOKEN", "\\tail", "ftp", "example.com/"] {
+                assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+            }
+        }
     }
 }
 
