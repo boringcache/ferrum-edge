@@ -10692,7 +10692,7 @@ fn test_tcp_connection_throttle_proxy_group_rejects_mixed_protocol_attachment() 
     let error = PluginCache::new(&config)
         .err()
         .expect("mixed-protocol proxy-group attachment must fail closed");
-    assert!(error.contains("udp (dtls)"), "{error}");
+    assert!(error.contains("\"udp\" (dtls)"), "{error}");
     assert!(error.contains("only TCP/TCP+TLS is supported"), "{error}");
 }
 
