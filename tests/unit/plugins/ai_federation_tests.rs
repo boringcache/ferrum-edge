@@ -5089,7 +5089,10 @@ fn test_construction_uses_resolved_backend_allow_ips_policy() {
         .err()
         .unwrap();
     assert!(err.contains("169.254.169.254"), "got: {err}");
-    assert!(err.contains("denied by backend egress policy"), "got: {err}");
+    assert!(
+        err.contains("denied by backend egress policy"),
+        "got: {err}"
+    );
 }
 
 #[test]
