@@ -19,6 +19,51 @@ def natural(value):
     return type(value) is int and value >= 0
 
 
+def capture_interval(row):
+    """Whole passive read interval; the realtime clock read is not the data read."""
+    try:
+        start, end, clock = row['monotonic_ns'], row['capture_end_ns'], row['clock']
+        if (not all(natural(v) for v in (start, end, clock['before_ns'], clock['after_ns']))
+                or not 0 < start == clock['before_ns'] <= clock['after_ns'] <= end
+                or ('capture_ns' in row and (not natural(row['capture_ns'])
+                                            or row['capture_ns'] != end - start))):
+            return None
+        return start, end
+    except (KeyError, TypeError):
+        return None
+
+
+def passive_bracket(timeline, indices, window):
+    """Select definite boundary captures, retaining intervals instead of midpoints.
+
+    Indices refer to the unfiltered raw timeline. Consumers must also check
+    population continuity through every intervening capture, including overlaps.
+    """
+    result = dict(complete_bracket=False, clock='CLOCK_MONOTONIC',
+                  left_sample_index=None, right_sample_index=None)
+    if not window.get('valid'):
+        return dict(result, reason=window.get('reason', 'measurement_clock_unverified'))
+    intervals = [capture_interval(row) for row in timeline]
+    if any(interval is None for interval in intervals):
+        return dict(result, reason='missing_or_invalid_capture_interval')
+    start_lo, start_hi = window['start_bounds_ns']
+    end_lo, end_hi = window['end_bounds_ns']
+    before = [i for i in indices if intervals[i][1] <= start_lo]
+    after = [i for i in indices if intervals[i][0] >= end_hi]
+    left, right = before[-1] if before else None, after[0] if after else None
+    result.update(left_sample_index=left, right_sample_index=right,
+                  left_capture_bounds_ns=list(intervals[left]) if left is not None else None,
+                  right_capture_bounds_ns=list(intervals[right]) if right is not None else None)
+    if left is None or right is None:
+        return dict(result, reason='missing_resource_capture_bracket')
+    a, b = intervals[left], intervals[right]
+    result.update(complete_bracket=True,
+                  bracket_duration_bounds_ns=[b[0] - a[1], b[1] - a[0]],
+                  start_slack_bounds_ns=[start_lo - a[1], start_hi - a[0]],
+                  end_slack_bounds_ns=[b[0] - end_hi, b[1] - end_lo])
+    return result
+
+
 def measurement_window(phases, timeline):
     """Retained Linux CLOCK_MONOTONIC bounds, never the client's local epoch.
 
@@ -50,21 +95,28 @@ def measurement_window(phases, timeline):
             if (b['unix_ns'] - b['after_ns'] > a['unix_ns'] - a['before_ns'] + slack
                     or a['unix_ns'] - a['after_ns'] > b['unix_ns'] - b['before_ns'] + slack):
                 return dict(valid=False, reason='realtime_clock_jump')
-        before = [c for c in clocks if c['after_ns'] <= lo]
-        after = [c for c in clocks if c['before_ns'] >= hi + span]
+        intervals = [capture_interval(row) for row in timeline]
+        if any(interval is None for interval in intervals):
+            return dict(valid=False, reason='missing_or_invalid_capture_interval')
+        if any(b[0] < a[1] for a, b in zip(intervals, intervals[1:])):
+            return dict(valid=False, reason='nonmonotonic_capture_interval')
+        before = [i for i, (_, end) in enumerate(intervals) if end <= lo]
+        after = [i for i, (start, _) in enumerate(intervals) if start >= hi + span]
         if not before or not after:
-            return dict(valid=False, reason='missing_clock_capture_bracket')
+            return dict(valid=False, reason='missing_passive_capture_bracket')
         unix = phases['measurement_start_unix_secs']
         if type(unix) not in (int, float) or not math.isfinite(unix):
             return invalid
-        anchor = before[-1]
+        anchor = clocks[before[-1]]
         slack = CLOCK_UNCERTAINTY_NS + (hi - anchor['before_ns']) // 1000
         if not (lo + anchor['unix_ns'] - anchor['after_ns'] - slack <= unix * 1e9
                 <= hi + anchor['unix_ns'] - anchor['before_ns'] + slack):
             return dict(valid=False, reason='phase_realtime_clock_mismatch')
-        return dict(valid=True, clock='CLOCK_MONOTONIC', start_bounds_ns=[lo, hi],
-                    end_bounds_ns=[lo + span, hi + span], uncertainty_ns=hi - lo,
-                    realtime_check='1ms_read_uncertainty_plus_1000ppm_slew')
+        window = dict(valid=True, clock='CLOCK_MONOTONIC', start_bounds_ns=[lo, hi],
+                      end_bounds_ns=[lo + span, hi + span], uncertainty_ns=hi - lo,
+                      realtime_check='1ms_read_uncertainty_plus_1000ppm_slew')
+        window['passive_capture_bracket'] = passive_bracket(timeline, range(len(timeline)), window)
+        return window
     except (KeyError, TypeError, ValueError, OverflowError):
         return invalid
 

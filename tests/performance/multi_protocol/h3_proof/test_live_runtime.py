@@ -4,15 +4,246 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import live
 from evidence import LOSSES
+from process_usage import IO_FIELDS, measurement_usage
+from transport_diagnostics import bracket
 from live_contract import (FAMILIES, calibration, measurement_window, measurement_position,
                            provenance_issues, observer_issues, smoke_issues,
                            sample_admission_issues, validate_observer_record, envoy_protocol_evidence)
 
 NS = 1_000_000_000
+
+
+class PassiveBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.phases = dict(measurement_secs=30, measurement_elapsed_secs=30,
+                           measurement_start_unix_secs=1_800_000_000,
+                           measurement_start_host_clock=dict(clock='CLOCK_MONOTONIC',
+                               before_ns=1000 * NS, after_ns=1000 * NS + 100),
+                           client_usage=dict(pid=43, role='client', complete_bracket=True,
+                                             cpu_seconds=2, peak_rss_bytes=4096))
+        self.before = self.capture(999 * NS, 999 * NS + 1000, 1)
+        self.cross_start = self.capture(1000 * NS - 10_000_000, 1000 * NS + 40_000_000, 2)
+        self.middle = self.capture(1005 * NS, 1005 * NS + 1000, 3)
+        self.cross_end = self.capture(1030 * NS - 10_000_000, 1030 * NS + 40_000_000, 4)
+        self.after = self.capture(1031 * NS, 1031 * NS + 1000, 5)
+
+    def capture(self, start, end, counter):
+        owners = [dict(pid=42, start_ticks=7, role='backend', time_namespace=123),
+                  dict(pid=43, start_ticks=8, role='client', time_namespace=123)]
+        sockets = [dict(cookie=[p['pid'], 0], inode=p['pid'], family=socket.AF_INET,
+                        local_address='127.0.0.1', local_port=3445 if p['role'] == 'backend' else 20000,
+                        peer_address='127.0.0.1', peer_port=3445, owners=[dict(p)],
+                        so_rcvbuf=4194304, so_sndbuf=4194304, socket_drops=counter * 10)
+                   for p in owners]
+        return dict(monotonic_ns=start, capture_end_ns=end, capture_ns=end - start,
+                    unix_secs=1_800_000_000 + (start - 1000 * NS) / NS,
+                    clock=dict(before_ns=start, after_ns=start + 100,
+                               unix_ns=1_800_000_000 * NS + start - 1000 * NS),
+                    processes=[dict(p, cpu_seconds=counter, rss_bytes=4096,
+                                    io={key: counter * 100 for key in IO_FIELDS}) for p in owners],
+                    transport=dict(errors=[], sockets=sockets))
+
+    def assess(self, timeline):
+        usage = dict(timeline=timeline, errors=[], capture_complete=True, available=True,
+                     owners=copy.deepcopy(self.before['processes']),
+                     processes=copy.deepcopy(self.before['processes']))
+        raw = copy.deepcopy(usage)
+        cpu = live.live_measurement_usage(usage, self.phases)
+        budgets = live.passive_roles(usage, [], 'direct', self.phases)
+        sample = dict(sample_schema=2, gateway='direct', duration_secs=30, phases=self.phases,
+                      effective_concurrency=1, warmup_requests=1, total_errors=0, total_requests=3000,
+                      payload_size=10240, total_bytes=3000 * 10240, rps=100, p99_us=100,
+                      process_usage=dict(usage, measurement=cpu),
+                      observed=dict(samples=1, workers_retired_before_deadline=0, workers_at_barrier=1,
+                                    **{key: dict(min=1, max=1, mean=1) for key in
+                                       ('active_workers', 'active_connections', 'active_streams', 'queued_requests')}))
+        issues = live.sample_issues(sample)
+        if not budgets['equal_socket_budget_verified']:
+            issues.append('socket_budget_incomplete')
+        issues.extend(provenance_issues(usage, measurement_window(self.phases, timeline), 123))
+        issues = sample_admission_issues({}, issues)
+        self.assertEqual(usage, raw)  # rejected/selected captures remain raw, never relabelled
+        return cpu, budgets, issues
+
+    def assert_rejected(self, timeline):
+        cpu, budgets, issues = self.assess(timeline)
+        self.assertFalse(cpu[0]['complete_bracket'])
+        self.assertNotIn('cpu_seconds', cpu[0])
+        self.assertNotIn('io', cpu[0])
+        self.assertFalse(budgets['equal_socket_budget_verified'])
+        self.assertTrue(budgets['sockets'])
+        self.assertTrue(all(not row['complete_bracket'] for row in budgets['sockets']))
+        self.assertTrue(all(row['drops'] is None for row in budgets['sockets']))
+        self.assertIn('incomplete backend measurement bracket', issues)
+        self.assertIn('socket_budget_incomplete', issues)
+        off = dict(rps=100, p99_us=100, traffic_issues=[], observer_ok=True)
+        on = dict(off, traffic_issues=issues)
+        self.assertFalse(calibration([(off, on), (off, on)])['active_main'])
+
+    def test_successful_start_crossing_with_narrow_clock_is_not_a_left_boundary(self):
+        row = self.cross_start
+        self.assertEqual(row['clock']['after_ns'] - row['clock']['before_ns'], 100)
+        self.assertLess(row['unix_secs'], self.phases['measurement_start_unix_secs'])
+        self.assertEqual(row['transport']['errors'], [])
+        self.assert_rejected([row, self.middle, self.after])
+        self.assertEqual(measurement_window(self.phases, [row, self.middle, self.after])['reason'],
+                         'missing_passive_capture_bracket')
+
+    def test_earlier_completed_capture_supplies_cpu_io_socket_and_drop_boundaries(self):
+        older = self.capture(998 * NS, 998 * NS + 1000, 0)
+        timeline = [older, self.before, self.cross_start, self.middle, self.cross_end, self.after]
+        cpu, budgets, issues = self.assess(timeline)
+        self.assertEqual(issues, [])
+        self.assertTrue(cpu[0]['complete_bracket'])
+        self.assertEqual(cpu[0]['cpu_seconds'], 4)
+        self.assertEqual(cpu[0]['io'], {key: 400 for key in IO_FIELDS})
+        self.assertEqual(cpu[0]['start_ticks'], 7)
+        self.assertEqual(cpu[1], self.phases['client_usage'])
+        self.assertTrue(budgets['equal_socket_budget_verified'])
+        bounds = cpu[0]['capture_bracket']
+        self.assertEqual(bounds['left_sample_index'], 1)
+        self.assertEqual(bounds['right_sample_index'], 5)
+        self.assertEqual(bounds['left_capture_bounds_ns'], [999 * NS, 999 * NS + 1000])
+        self.assertEqual(bounds['right_capture_bounds_ns'], [1031 * NS, 1031 * NS + 1000])
+        self.assertEqual(bounds['bracket_duration_bounds_ns'], [32 * NS - 1000, 32 * NS + 1000])
+        self.assertEqual(bounds['start_slack_bounds_ns'], [NS - 1000, NS + 100])
+        self.assertEqual(bounds['end_slack_bounds_ns'], [NS - 100, NS + 1000])
+        for row in budgets['sockets']:
+            self.assertEqual(row['capture_bracket'], bounds)
+            self.assertEqual(row['drops'], {'socket_drops': 40})
+
+    def test_end_crossing_capture_is_not_a_right_boundary(self):
+        self.assert_rejected([self.before, self.middle, self.cross_end])
+        # Even a start within the 100 ns end-boundary band is too early.
+        end_band = self.capture(1030 * NS + 50, 1030 * NS + 1000, 4)
+        self.assert_rejected([self.before, self.middle, end_band])
+
+    def test_global_clock_bracket_cannot_substitute_for_resource_boundaries(self):
+        for boundary in ('start', 'end'):
+            with self.subTest(boundary=boundary):
+                timeline = copy.deepcopy([self.before, self.cross_start, self.middle, self.cross_end, self.after])
+                row = timeline[0 if boundary == 'start' else -1]
+                row['processes'] = []
+                row['transport']['sockets'] = []
+                self.assertTrue(measurement_window(self.phases, timeline)['valid'])
+                self.assert_rejected(timeline)
+
+    def test_exact_outer_bounds_are_admitted_but_start_uncertainty_is_not(self):
+        left = self.capture(999 * NS, 1000 * NS, 1)
+        right = self.capture(1030 * NS + 100, 1030 * NS + 1000, 5)
+        self.assertEqual(self.assess([left, self.middle, right])[2], [])
+        left['capture_end_ns'] += 1
+        left['capture_ns'] += 1
+        self.assert_rejected([left, self.middle, right])
+
+    def test_invalid_intervals_fail_closed_even_when_other_captures_bracket(self):
+        mutations = [('capture_end_ns', None), ('capture_end_ns', 'bad'), ('capture_end_ns', True),
+                     ('capture_end_ns', 1005 * NS - 1), ('capture_end_ns', 1005 * NS + 50),
+                     ('monotonic_ns', None), ('monotonic_ns', 1005 * NS + 1),
+                     ('capture_ns', -1), ('capture_ns', 1001)]
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                middle = copy.deepcopy(self.middle)
+                middle[field] = value
+                self.assert_rejected([self.before, middle, self.after])
+        for field in ('capture_end_ns', 'monotonic_ns'):
+            with self.subTest(missing=field):
+                middle = copy.deepcopy(self.middle)
+                del middle[field]
+                self.assert_rejected([self.before, middle, self.after])
+        overlap = self.capture(999 * NS, 1006 * NS, 1)
+        self.assert_rejected([overlap, self.middle, self.after])
+        self.assertEqual(measurement_window(self.phases, [overlap, self.middle, self.after])['reason'],
+                         'nonmonotonic_capture_interval')
+
+    def test_overlapping_only_population_cannot_hide_as_pre_or_post_measurement(self):
+        for only in (self.cross_start, self.cross_end):
+            with self.subTest(start=only['monotonic_ns']):
+                row = copy.deepcopy(only)
+                row['processes'].append(dict(row['processes'][0], pid=99, start_ticks=10))
+                row['transport']['sockets'].append(dict(row['transport']['sockets'][0], cookie=[99, 0]))
+                cpu, budgets, issues = self.assess([self.before, row, self.after])
+                extra = next(p for p in cpu if p['pid'] == 99)
+                self.assertFalse(extra['complete_bracket'])
+                extra_socket = next(sk for sk in budgets['sockets'] if sk['cookie'] == 99)
+                self.assertFalse(extra_socket['complete_bracket'])
+                self.assertNotIn(99, [sk['cookie'] for sk in budgets['probe_or_retired_outside_measurement']])
+                self.assertIn('incomplete backend measurement bracket', issues)
+                self.assertIn('socket_budget_incomplete', issues)
+
+    def test_selected_endpoints_do_not_hide_missing_or_reused_population(self):
+        for mode in ('missing', 'reused', 'duplicate'):
+            with self.subTest(mode=mode):
+                middle = copy.deepcopy(self.cross_start)
+                if mode == 'missing':
+                    middle['processes'] = []
+                    middle['transport']['sockets'] = []
+                elif mode == 'reused':
+                    middle['processes'][0]['start_ticks'] += 1
+                    middle['transport']['sockets'] = []
+                else:
+                    middle['processes'] += copy.deepcopy(middle['processes'])
+                    middle['transport']['sockets'] += copy.deepcopy(middle['transport']['sockets'])
+                self.assert_rejected([self.before, middle, self.after])
+
+    def test_skipped_crossing_read_still_checks_buffers_and_io_counters(self):
+        row = copy.deepcopy(self.cross_start)
+        row['transport']['sockets'][0]['so_rcvbuf'] = 1024
+        row['processes'][0]['io']['read_bytes'] = 9999
+        cpu, budgets, issues = self.assess([self.before, row, self.after])
+        self.assertTrue(cpu[0]['complete_bracket'])
+        self.assertNotIn('io', cpu[0])
+        self.assertIn('io_error', cpu[0])
+        self.assertFalse(budgets['equal_socket_budget_verified'])
+        self.assertIn('socket_budget_incomplete', issues)
+
+    def test_historical_point_contract_is_unchanged_and_not_a_live_fallback(self):
+        timeline = copy.deepcopy([self.before, self.middle, self.after])
+        for row in timeline:
+            for key in ('clock', 'monotonic_ns', 'capture_end_ns', 'capture_ns'):
+                del row[key]
+        self.assertTrue(measurement_usage(dict(timeline=timeline), self.phases)[0]['complete_bracket'])
+        self.assertIsNotNone(bracket(timeline, self.phases['measurement_start_unix_secs'],
+                                     self.phases['measurement_start_unix_secs'] + 30))
+        self.assert_rejected(timeline)
+
+    def test_passive_producer_retains_successful_delayed_capture_interval(self):
+        monitor = live.Passive.__new__(live.Passive)
+        monitor.timeline, monitor.owners, monitor.errors, monitor.transitions = [], {}, [], []
+        monitor.arm = 'direct'
+        monitor.stop = Mock()
+        monitor.stop.is_set.side_effect = [False, True]
+        monitor.scope = SimpleNamespace(rglob=lambda _: [SimpleNamespace(
+            parent=SimpleNamespace(name='backend'), read_text=lambda: '42')])
+        path = Mock()
+        path.iterdir.return_value = [SimpleNamespace(name='7')]
+        path.read_text.return_value = 'raw host diagnostic'
+        owner = self.cross_start['processes'][0]
+        read_times = []
+
+        def read_process(*_):
+            read_times.append(live.time.monotonic_ns())
+            return dict(owner)
+
+        with patch('live.Path', return_value=path), patch('live.owner', return_value=owner), \
+                patch('live.capture', side_effect=read_process), patch('live.thread_snapshot', return_value=[]), \
+                patch('live.os.readlink', return_value='socket:[42]'), \
+                patch('live.snapshot', return_value=copy.deepcopy(self.cross_start['transport'])), \
+                patch('live.time.time_ns', return_value=self.cross_start['clock']['unix_ns']), \
+                patch('live.time.thread_time_ns', return_value=1), \
+                patch('live.time.monotonic_ns', side_effect=[1000 * NS - 10_000_000,
+                    1000 * NS - 10_000_000 + 100, 1000 * NS + 30_000_000, 1000 * NS + 40_000_000]):
+            monitor.run()
+        self.assertEqual(monitor.errors, [])
+        self.assertEqual(read_times, [1000 * NS + 30_000_000])
+        self.assertEqual(monitor.timeline[0]['capture_end_ns'], 1000 * NS + 40_000_000)
+        self.assertEqual(monitor.timeline[0]['capture_ns'], 50_000_000)
+        self.assertEqual(len(monitor.timeline[0]['transport']['sockets']), 1)
+        self.assert_rejected(monitor.timeline + [self.middle, self.after])
 
 
 def supported_results():

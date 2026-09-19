@@ -77,9 +77,31 @@ unshifted host clock and matching workload time namespaces, retains paired
 realtime/monotonic reads, and requires captures before and after measurement.
 Clock reads wider than 1 ms, missing/reversed bounds, observed realtime steps
 beyond 1 ms plus 1000 ppm slew, and inconsistent phase realtime fail closed.
+Live H3 passive socket/buffer/drop and process CPU/I/O boundaries use the entire
+retained monotonic capture interval, not its opening realtime timestamp. The
+left capture must finish at or before the measurement start's lower bound; the
+right must begin at or after the end's upper bound. An earlier completed capture
+is selected when present. Otherwise the bracket remains incomplete and the raw
+observations remain retained. Missing, malformed, reversed or overlapping capture
+intervals cannot authorize admission. Selected raw timeline indices, read bounds,
+bracket-duration bounds and boundary-slack bounds expose the uncertainty without
+assigning a midpoint. Every intervening capture still participates in process
+generation/socket population continuity and buffer/process-counter checks.
+Deltas span the selected captures and may include work outside measurement.
+RSS is labelled
+as observations from captures possibly overlapping measurement, not an exact peak.
+The client's own phase-boundary CPU snapshots remain authoritative. This strict
+path is confined to live H3; shared historical point-sampled process/transport
+helpers are unchanged and are never a fallback for missing live intervals.
 Witnesses in either uncertain boundary band remain uncorrelated; errors whose
 capture interval might overlap measurement, including untimed errors, invalidate
 provenance. An empty matching witness set makes no absence or performance claim.
+
+This repairs review F1's reachable successful-capture boundary crossing. The
+retained `e00f0a91` smoke did not exercise that counterexample: its selected
+predecessor captures completed before measurement. It remains evidence for its
+original revision. The added boundary regressions and this repair require fresh
+hosted validation; no rerun or new performance result is asserted here.
 
 Otherwise all four main pairs run without the active observer, followed after
 each pair by a matched traced diagnostic pair. Proof belongs to those diagnostic
