@@ -36,8 +36,8 @@ ROOT = HERE.parents[2]
 STAGE = Path('/tmp/ferrum-h1-trace')
 TICKS = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
-PARENTS = dict(h1='2491d44b1149bf33dece351595244351d2dbc322',
-               h3='e00f0a91cb5ae2b0686392f504471283e6f52b4c')
+PARENTS = dict(h1='ac7ff645f766597b9e4f38aa9e18272c0b3c249d',
+               h3='45dbde8ccc9575b225890afb450579213d62cb21')
 
 
 def write(path, value):
