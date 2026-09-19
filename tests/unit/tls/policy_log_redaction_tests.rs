@@ -97,7 +97,11 @@ fn assert_policy_and_log(config: &EnvConfig, versions: &[ProtocolVersion]) {
                 .is_some_and(|message| message.starts_with("TLS policy:"))
         })
         .collect();
-    assert_eq!(policy_records.len(), 1, "policy INFO event missing: {output}");
+    assert_eq!(
+        policy_records.len(),
+        1,
+        "policy INFO event missing: {output}"
+    );
     let record = policy_records[0];
     assert_eq!(record["level"], "INFO");
     let message = record["fields"]["message"].as_str().unwrap();
@@ -235,5 +239,8 @@ fn successful_policy_info_withholds_external_selections_and_scalars() {
     assert_eq!(config.tls_max_version, "1.3");
     assert!(!config.tls_prefer_server_cipher_order);
     assert_eq!(config.tls_session_cache_size, 927451);
-    assert_policy_and_log(&config, &[ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3]);
+    assert_policy_and_log(
+        &config,
+        &[ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3],
+    );
 }
