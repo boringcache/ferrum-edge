@@ -310,28 +310,35 @@ cargo test test_backend_mtls_global_config -- --nocapture
 ### Common Issues
 
 1. **Certificate File Not Found**
+   A representative rendered configuration-validation cause is:
    ```
-   Error: Failed to read client certificate from /path/to/cert.pem: No such file or directory
+   `backend_tls_client_cert_path`: failed to load certificate source <redacted scalar>: failed to read TLS material from <redacted scalar>: <redacted scalar>
    ```
-   **Solution**: Ensure certificate files exist and are readable by the gateway process.
+   **Solution**: Check the source configured in `backend_tls_client_cert_path`
+   (or `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE` for global settings).
+   Ensure the file exists and is readable by the gateway process. Supplied
+   paths and opaque I/O detail are withheld as `<redacted scalar>`. The shared
+   expiry-check loader instead reports the field followed by
+   `failed to read TLS material or resolve its source (io)`, omitting the source
+   position entirely.
 
 2. **Invalid Certificate Format**
+   For a malformed first PEM certificate record, the rendered cause is:
    ```
-   Error: Failed to parse client certificate/key: invalid PEM format
+   `backend_tls_client_cert_path`: certificate record #1 in <redacted scalar> is malformed: malformed PEM certificate record
    ```
    **Solution**: Verify certificates are in PEM format and not corrupted.
 
 3. **Certificate/Key Mismatch**
-   ```
-   Error: Failed to parse client certificate/key: private key does not match certificate
-   ```
+   Backend client construction reports `rustls: Invalid client certificate/key pair:`
+   followed by the TLS library's failure reason.
    **Solution**: Ensure the private key matches the certificate.
 
 4. **Backend Certificate Verification**
-   ```
-   Error: TLS handshake failed: certificate verification failed
-   ```
-   **Solution**: The backend may not trust the client certificate. Ensure the backend is configured to accept the client certificate.
+   A handshake failure can indicate that the gateway rejected the backend
+   certificate or the backend rejected the gateway's client certificate.
+   **Solution**: Check the configured backend CA trust and server identity,
+   and ensure the backend trusts the gateway's client certificate.
 
 ### Debug Tips
 
