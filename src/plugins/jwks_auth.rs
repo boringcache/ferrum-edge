@@ -316,12 +316,12 @@ const REMOVED_PROVIDER_FIELDS: &[(&str, &str)] = &[
     (
         "dpop_jti_ttl_secs",
         "replay retention is no longer configurable — every marker is retained for a fixed \
-         horizon that dominates the widest admissible clock skew, so no reload can shorten an \
-         already-admitted proof's protection",
+         horizon that dominates the widest admissible clock skew, so no reload can shorten the \
+         protection of an already-admitted proof",
     ),
     (
         "dpop_jti_cache_max_entries",
-        "renamed to 'dpop_replay_max_entries'; it now bounds a process replay lane that never \
+        "renamed to `dpop_replay_max_entries`; it now bounds a process replay lane that never \
          evicts an unexpired marker (at capacity the request is refused instead)",
     ),
 ];
@@ -447,12 +447,12 @@ impl JwksAuth {
         )?;
         if refresh_interval_secs == 0 {
             return Err(
-                "jwks_auth: 'jwks_refresh_interval_secs' must be greater than 0".to_string(),
+                "jwks_auth: `jwks_refresh_interval_secs` must be greater than 0".to_string(),
             );
         }
         if refresh_interval_secs > MAX_JWKS_REFRESH_INTERVAL_SECS {
             return Err(format!(
-                "jwks_auth: 'jwks_refresh_interval_secs' must be <= {MAX_JWKS_REFRESH_INTERVAL_SECS}"
+                "jwks_auth: `jwks_refresh_interval_secs` must be <= {MAX_JWKS_REFRESH_INTERVAL_SECS}"
             ));
         }
         let refresh_interval = Duration::from_secs(refresh_interval_secs);
@@ -467,7 +467,7 @@ impl JwksAuth {
         )?;
         if kid_miss_refresh_cooldown_seconds > MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS {
             return Err(format!(
-                "jwks_auth: 'kid_miss_refresh_cooldown_seconds' must be <= {MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS}"
+                "jwks_auth: `kid_miss_refresh_cooldown_seconds` must be <= {MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS}"
             ));
         }
         let kid_miss_cooldown = Duration::from_secs(kid_miss_refresh_cooldown_seconds);
@@ -501,10 +501,10 @@ impl JwksAuth {
 
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
-            return Err("jwks_auth: 'providers' must be a non-empty array".to_string());
+            return Err("jwks_auth: `providers` must be a non-empty array".to_string());
         };
         if providers_arr.is_empty() {
-            return Err("jwks_auth: 'providers' array must not be empty".to_string());
+            return Err("jwks_auth: `providers` array must not be empty".to_string());
         }
 
         let mut providers = Vec::with_capacity(providers_arr.len());
@@ -526,7 +526,7 @@ impl JwksAuth {
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
                 format!(
-                    "jwks_auth: provider[{idx}] must be an object, got: {prov_cfg:?}",
+                    "jwks_auth: `provider[{idx}]` must be an object, got: {prov_cfg:?}",
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
@@ -553,24 +553,24 @@ impl JwksAuth {
                 + usize::from(inline_jwks.is_some());
             if configured_jwks_sources == 0 {
                 return Err(format!(
-                    "jwks_auth: provider[{}] requires one of 'jwks_uri', 'discovery_url', or 'jwks'",
+                    "jwks_auth: `provider[{}]` requires one of `jwks_uri`, `discovery_url`, or `jwks`",
                     idx
                 ));
             }
             if configured_jwks_sources > 1 {
                 return Err(format!(
-                    "jwks_auth: provider[{}] must configure exactly one of 'jwks_uri', 'discovery_url', or 'jwks'",
+                    "jwks_auth: `provider[{}]` must configure exactly one of `jwks_uri`, `discovery_url`, or `jwks`",
                     idx
                 ));
             }
             if inline_jwks.is_some() && prov_obj.contains_key("jwks_max_stale_seconds") {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].jwks_max_stale_seconds' applies only to remote JWKS sources"
+                    "jwks_auth: `provider[{idx}].jwks_max_stale_seconds` applies only to remote JWKS sources"
                 ));
             }
             if inline_jwks.is_none() && refresh_interval_secs > provider_max_stale_seconds {
                 return Err(format!(
-                    "jwks_auth: 'jwks_refresh_interval_secs' must be <= the effective provider[{idx}] jwks_max_stale_seconds"
+                    "jwks_auth: `jwks_refresh_interval_secs` must be <= the effective `provider[{idx}].jwks_max_stale_seconds`"
                 ));
             }
             let provider_max_stale = Duration::from_secs(provider_max_stale_seconds);
@@ -617,8 +617,8 @@ impl JwksAuth {
                     .any(|mapping| mapping.destination_header == output.destination_header)
             }) {
                 return Err(format!(
-                    "jwks_auth: provider[{idx}] maps header '{}' through both \
-                     'claim_headers' and 'output_claim_headers'; a destination may be asserted \
+                    "jwks_auth: `provider[{idx}]` maps header {:?} through both \
+                     `claim_headers` and `output_claim_headers`; a destination may be asserted \
                      from exactly one claim mapping family",
                     duplicate.destination_header
                 ));
@@ -629,7 +629,7 @@ impl JwksAuth {
                 optional_provider_bool(prov_obj, "require_dpop", idx)?.unwrap_or(false);
             if require_dpop && issuer.is_none() {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].issuer' is required when 'require_dpop' is true \
+                    "jwks_auth: `provider[{idx}].issuer` is required when `require_dpop` is true \
                      — DPoP replay is bound to an exact issuer realm, so a blank or omitted \
                      issuer cannot isolate or preserve single-use proofs across key or source \
                      rotation"
@@ -639,7 +639,7 @@ impl JwksAuth {
                 optional_provider_u64(prov_obj, "dpop_clock_skew_secs", idx)?.unwrap_or(30);
             if dpop_clock_skew_secs > MAX_DPOP_CLOCK_SKEW_SECS {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_clock_skew_secs' must be <= {MAX_DPOP_CLOCK_SKEW_SECS}"
+                    "jwks_auth: `provider[{idx}].dpop_clock_skew_secs` must be <= {MAX_DPOP_CLOCK_SKEW_SECS}"
                 ));
             }
             let dpop_replay_max_entries =
@@ -647,7 +647,7 @@ impl JwksAuth {
                     .unwrap_or(DEFAULT_DPOP_REPLAY_MAX_ENTRIES);
             if dpop_replay_max_entries == 0 {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_replay_max_entries' must be greater than 0"
+                    "jwks_auth: `provider[{idx}].dpop_replay_max_entries` must be greater than 0"
                 ));
             }
 
@@ -667,17 +667,17 @@ impl JwksAuth {
             };
             if require_dpop && declared_scope.is_none() {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_replay_scope' is required when \
-                     'require_dpop' is true — use 'shared' together with sync_mode: 'redis' for \
-                     any deployment running more than one gateway replica, or 'process' to \
+                    "jwks_auth: `provider[{idx}].dpop_replay_scope` is required when \
+                     `require_dpop` is true — use `shared` together with sync_mode: `redis` for \
+                     any deployment running more than one gateway replica, or `process` to \
                      declare a single-process deployment whose replay protection is not \
                      cross-replica"
                 ));
             }
             if !require_dpop && declared_scope.is_some() {
                 return Err(format!(
-                    "jwks_auth: 'provider[{idx}].dpop_replay_scope' is only meaningful with \
-                     'require_dpop': true"
+                    "jwks_auth: `provider[{idx}].dpop_replay_scope` is only meaningful with \
+                     `require_dpop`: true"
                 ));
             }
             if let Some(scope) = declared_scope {
@@ -767,7 +767,8 @@ impl JwksAuth {
                 Arc::new(ArcSwap::from_pointee(None));
 
             let jwks_source = if let Some(ref jwks_json) = inline_jwks {
-                let store = JwksKeyStore::from_inline_jwks(jwks_json)?;
+                let store = JwksKeyStore::from_inline_jwks(jwks_json)
+                    .map_err(|error| format!("jwks_auth: `provider[{idx}].jwks`: {error}"))?;
                 jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
                 JwksSource::Inline
             } else if let Some(ref uri) = jwks_uri {
@@ -2090,7 +2091,7 @@ fn reject_removed_provider_fields(config: &Map<String, Value>, idx: usize) -> Re
     for (removed, guidance) in REMOVED_PROVIDER_FIELDS {
         if config.contains_key(*removed) {
             return Err(format!(
-                "jwks_auth: 'provider[{idx}].{removed}' was removed — {guidance}"
+                "jwks_auth: `provider[{idx}].{removed}` was removed — {guidance}"
             ));
         }
     }
@@ -2104,7 +2105,7 @@ fn reject_unknown_fields(
 ) -> Result<(), String> {
     for field in config.keys() {
         if !allowed.contains(&field.as_str()) {
-            return Err(format!("jwks_auth: unknown field '{field}' in {context}"));
+            return Err(format!("jwks_auth: unknown field {field:?} in `{context}`"));
         }
     }
     Ok(())
@@ -2129,12 +2130,12 @@ fn optional_u64(
 fn validate_max_stale_seconds(field: &str, value: u64) -> Result<(), String> {
     if value == 0 {
         return Err(format!(
-            "jwks_auth: '{field}' must be greater than 0; unlimited stale trust cannot be enabled"
+            "jwks_auth: `{field}` must be greater than 0; unlimited stale trust cannot be enabled"
         ));
     }
     if value > MAX_JWKS_MAX_STALE_SECONDS {
         return Err(format!(
-            "jwks_auth: '{field}' must be <= {MAX_JWKS_MAX_STALE_SECONDS}"
+            "jwks_auth: `{field}` must be <= {MAX_JWKS_MAX_STALE_SECONDS}"
         ));
     }
     Ok(())
@@ -2198,7 +2199,7 @@ fn optional_non_empty_string(
     let value = raw.trim();
     if value.is_empty() {
         return Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].{field}' must not be empty"
+            "jwks_auth: `provider[{provider_idx}].{field}` must not be empty"
         ));
     }
     Ok(Some(value.to_string()))
@@ -2221,15 +2222,15 @@ fn parse_url_field(
     let url = raw.trim();
     if url.is_empty() {
         return Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].{field}' must not be empty"
+            "jwks_auth: `provider[{provider_idx}].{field}` must not be empty"
         ));
     }
     let parsed = Url::parse(url).map_err(|e| {
-        format!("jwks_auth: 'provider[{provider_idx}].{field}' is not a valid URL: {e}")
+        format!("jwks_auth: `provider[{provider_idx}].{field}` is not a valid URL: {e}")
     })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].{field}' must not contain URL userinfo"
+            "jwks_auth: `provider[{provider_idx}].{field}` must not contain URL userinfo"
         ));
     }
     match parsed.scheme() {
@@ -2237,7 +2238,7 @@ fn parse_url_field(
         "http" if is_local_auth_endpoint(&parsed) => {}
         "http" => {
             return Err(format!(
-                "jwks_auth: 'provider[{provider_idx}].{field}' must use https except for literal loopback or localhost"
+                "jwks_auth: `provider[{provider_idx}].{field}` must use https except for literal loopback or localhost"
             ));
         }
         scheme => {
@@ -2248,11 +2249,11 @@ fn parse_url_field(
     }
     if !has_non_empty_authority(url) {
         return Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].{field}' must include a hostname"
+            "jwks_auth: `provider[{provider_idx}].{field}` must include a hostname"
         ));
     }
     let hostname = hostname_from_parsed_url(&parsed).ok_or_else(|| {
-        format!("jwks_auth: 'provider[{provider_idx}].{field}' must include a hostname")
+        format!("jwks_auth: `provider[{provider_idx}].{field}` must include a hostname")
     })?;
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),
@@ -2339,16 +2340,16 @@ fn reject_equivalent_provider_replay_disagreement(
     let idx = later.idx;
     if earlier.require_dpop != later.require_dpop {
         return Err(format!(
-            "jwks_auth: equivalent providers must agree on 'require_dpop'; \
-             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+            "jwks_auth: equivalent providers must agree on `require_dpop`; \
+             `provider[{earlier_idx}]` and `provider[{idx}]` share one issuer \
              realm with incompatible DPoP requirements"
         ));
     }
     if later.require_dpop && earlier.scope != later.scope {
         return Err(format!(
             "jwks_auth: equivalent DPoP providers must declare the same \
-             'dpop_replay_scope'; provider[{earlier_idx}] and \
-             provider[{idx}] share one replay domain with incompatible \
+             `dpop_replay_scope`; `provider[{earlier_idx}]` and \
+             `provider[{idx}]` share one replay domain with incompatible \
              replay authorities"
         ));
     }
@@ -2358,22 +2359,22 @@ fn reject_equivalent_provider_replay_disagreement(
     {
         return Err(format!(
             "jwks_auth: equivalent DPoP providers must declare the same \
-             'dpop_replay_max_entries'; provider[{earlier_idx}] and \
-             provider[{idx}] share one replay domain with incompatible \
+             `dpop_replay_max_entries`; `provider[{earlier_idx}]` and \
+             `provider[{idx}]` share one replay domain with incompatible \
              capacities"
         ));
     }
     if earlier.require_mtls_binding != later.require_mtls_binding {
         return Err(format!(
-            "jwks_auth: equivalent providers must agree on 'require_mtls_binding'; \
-             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+            "jwks_auth: equivalent providers must agree on `require_mtls_binding`; \
+             `provider[{earlier_idx}]` and `provider[{idx}]` share one issuer \
              realm with incompatible certificate-binding requirements"
         ));
     }
     if earlier.required_scopes != later.required_scopes {
         return Err(format!(
-            "jwks_auth: equivalent providers must agree on 'required_scopes'; \
-             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+            "jwks_auth: equivalent providers must agree on `required_scopes`; \
+             `provider[{earlier_idx}]` and `provider[{idx}]` share one issuer \
              realm with incompatible scope requirements"
         ));
     }
@@ -2383,21 +2384,21 @@ fn reject_equivalent_provider_replay_disagreement(
     if !later.required_scopes.is_empty() && earlier.scope_claim != later.scope_claim {
         return Err(format!(
             "jwks_auth: equivalent providers that require scopes must agree on \
-             'scope_claim'; provider[{earlier_idx}] and provider[{idx}] share one \
+             `scope_claim`; `provider[{earlier_idx}]` and `provider[{idx}]` share one \
              issuer realm but read their required scopes from different claim paths"
         ));
     }
     if earlier.required_roles != later.required_roles {
         return Err(format!(
-            "jwks_auth: equivalent providers must agree on 'required_roles'; \
-             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+            "jwks_auth: equivalent providers must agree on `required_roles`; \
+             `provider[{earlier_idx}]` and `provider[{idx}]` share one issuer \
              realm with incompatible role requirements"
         ));
     }
     if !later.required_roles.is_empty() && earlier.role_claim != later.role_claim {
         return Err(format!(
             "jwks_auth: equivalent providers that require roles must agree on \
-             'role_claim'; provider[{earlier_idx}] and provider[{idx}] share one \
+             `role_claim`; `provider[{earlier_idx}]` and `provider[{idx}]` share one \
              issuer realm but read their required roles from different claim paths"
         ));
     }
@@ -2478,14 +2479,14 @@ fn parse_inline_jwks(
             let jwks = raw.trim();
             if jwks.is_empty() {
                 return Err(format!(
-                    "jwks_auth: 'provider[{provider_idx}].jwks' must not be empty"
+                    "jwks_auth: `provider[{provider_idx}].jwks` must not be empty"
                 ));
             }
             Ok(Some(jwks.to_string()))
         }
         Value::Object(_) => serde_json::to_string(value)
             .map(Some)
-            .map_err(|e| format!("jwks_auth: 'provider[{provider_idx}].jwks' is invalid: {e}")),
+            .map_err(|_| format!("jwks_auth: `provider[{provider_idx}].jwks` is invalid")),
         _ => Err(format!(
             "jwks_auth: `provider[{provider_idx}].jwks` must be a JWKS JSON string or object, got: {value:?}",
             value = value.to_string()
@@ -2534,7 +2535,7 @@ fn parse_string_array(
         let value = raw.trim();
         if value.is_empty() {
             return Err(format!(
-                "jwks_auth: 'provider[{provider_idx}].{field}[{idx}]' must not be empty"
+                "jwks_auth: `provider[{provider_idx}].{field}[{idx}]` must not be empty"
             ));
         }
         values.push(value.to_string());
@@ -2570,7 +2571,7 @@ fn parse_token_locations(
             )?;
             let name_value = object.get("name").ok_or_else(|| {
                 format!(
-                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' is required"
+                    "jwks_auth: `provider[{provider_idx}].from_headers[{idx}].name` is required"
                 )
             })?;
             let raw_name = name_value.as_str().ok_or_else(|| {
@@ -2582,13 +2583,13 @@ fn parse_token_locations(
             let name = raw_name.trim().to_ascii_lowercase();
             if name.is_empty() {
                 return Err(format!(
-                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' must not be empty"
+                    "jwks_auth: `provider[{provider_idx}].from_headers[{idx}].name` must not be empty"
                 ));
             }
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| {
                     format!(
-                        "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' is not a valid HTTP header name: {e}"
+                        "jwks_auth: `provider[{provider_idx}].from_headers[{idx}].name` is not a valid HTTP header name: {e}"
                     )
                 })?
                 .as_str()
@@ -2650,7 +2651,7 @@ fn optional_provider_string(
     })?;
     if raw.is_empty() {
         return Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].{field}' must not be empty"
+            "jwks_auth: `provider[{provider_idx}].{field}` must not be empty"
         ));
     }
     Ok(Some(raw.to_string()))
@@ -2685,7 +2686,7 @@ fn optional_provider_usize(
     };
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("jwks_auth: 'provider[{provider_idx}].{field}' is too large"))
+        .map_err(|_| format!("jwks_auth: `provider[{provider_idx}].{field}` is too large"))
 }
 
 fn reject(status_code: u16, body: String) -> PluginResult {

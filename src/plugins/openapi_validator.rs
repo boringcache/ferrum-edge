@@ -638,7 +638,12 @@ impl OpenapiValidator {
         // Fail closed on typos before any default is applied: a misspelled
         // enforcement control would otherwise construct successfully with the
         // weaker default still in force (GHSA-692x-352q-6gm8).
-        reject_unknown_keys(object, "config", CONFIG_KEYS, ERROR_PREFIX)?;
+        reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_KEYS,
+            "openapi_validator: `config`: ",
+        )?;
 
         let mode = parse_mode(optional_string(object, "enforcement_mode")?.unwrap_or("block"))?;
         let validate_request = optional_bool(object, "validate_request")?.unwrap_or(true);
@@ -651,7 +656,7 @@ impl OpenapiValidator {
             optional_usize(object, "max_body_bytes")?.unwrap_or(DEFAULT_MAX_BODY_BYTES);
         if max_body_bytes == 0 {
             return Err(
-                "openapi_validator: 'max_body_bytes' must be greater than zero".to_string(),
+                "openapi_validator: `max_body_bytes` must be greater than zero".to_string(),
             );
         }
         let request_content_types = normalize_configured_media_types(
@@ -669,12 +674,12 @@ impl OpenapiValidator {
 
         let operations_value = object
             .get("operations")
-            .ok_or_else(|| "openapi_validator: 'operations' is required".to_string())?;
+            .ok_or_else(|| "openapi_validator: `operations` is required".to_string())?;
         let operations = operations_value
             .as_array()
-            .ok_or_else(|| "openapi_validator: 'operations' must be an array".to_string())?;
+            .ok_or_else(|| "openapi_validator: `operations` must be an array".to_string())?;
         if operations.is_empty() {
-            return Err("openapi_validator: 'operations' must not be empty".to_string());
+            return Err("openapi_validator: `operations` must not be empty".to_string());
         }
 
         let mut grouped_ops: AHashMap<String, Vec<(String, OperationEntry)>> = AHashMap::new();
@@ -727,7 +732,12 @@ impl OpenapiValidator {
 
         let bypass = optional_object(object, "bypass")?;
         if let Some(bypass) = bypass {
-            reject_unknown_keys(bypass, "config.bypass", BYPASS_KEYS, ERROR_PREFIX)?;
+            reject_unknown_keys(
+                bypass,
+                "config.bypass",
+                BYPASS_KEYS,
+                "openapi_validator: `config.bypass`: ",
+            )?;
         }
         let bypass_paths = parse_regex_set(bypass.and_then(|b| b.get("paths")), "bypass.paths")?;
         let bypass_methods = optional_string_vec_from_object(bypass, "methods")?
@@ -748,7 +758,7 @@ impl OpenapiValidator {
                 error_response,
                 "config.error_response",
                 ERROR_RESPONSE_KEYS,
-                ERROR_PREFIX,
+                "openapi_validator: `config.error_response`: ",
             )?;
         }
         let request_error_status =
@@ -1586,26 +1596,29 @@ fn parse_operation(
 ) -> Result<ParsedOperation, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| format!("openapi_validator: operations[{index}] must be an object"))?;
+        .ok_or_else(|| format!("openapi_validator: `operations[{index}]` must be an object"))?;
     reject_unknown_keys(
         object,
         &format!("config.operations[{index}]"),
         OPERATION_KEYS,
-        ERROR_PREFIX,
+        &format!("{ERROR_PREFIX}`config.operations[{index}]`: "),
     )?;
     let method = optional_string(object, "method")?
-        .ok_or_else(|| format!("openapi_validator: operations[{index}].method is required"))?
+        .ok_or_else(|| format!("openapi_validator: `operations[{index}].method` is required"))?
         .to_ascii_uppercase();
     if method.is_empty() {
         return Err(format!(
-            "openapi_validator: operations[{index}].method must not be empty"
+            "openapi_validator: `operations[{index}].method` must not be empty"
         ));
     }
     let path_template = optional_string(object, "path_template")?
-        .ok_or_else(|| format!("openapi_validator: operations[{index}].path_template is required"))?
+        .ok_or_else(|| {
+            format!("openapi_validator: `operations[{index}].path_template` is required")
+        })?
         .to_string();
-    let path_regex_raw = optional_string(object, "path_regex")?
-        .ok_or_else(|| format!("openapi_validator: operations[{index}].path_regex is required"))?;
+    let path_regex_raw = optional_string(object, "path_regex")?.ok_or_else(|| {
+        format!("openapi_validator: `operations[{index}].path_regex` is required")
+    })?;
     // Anchor operator-supplied patterns so a loose regex like `/users/\d+`
     // cannot substring-match an unintended superstring path such as
     // `/admin/users/1/secret` and thus validate a request against the wrong
@@ -1615,7 +1628,7 @@ fn parse_operation(
     // `^a|b$` (only the first branch anchored).
     let path_regex_anchored = anchor_path_regex(path_regex_raw);
     Regex::new(&path_regex_anchored).map_err(|_| {
-        format!("openapi_validator: operations[{index}].path_regex is invalid or too complex")
+        format!("openapi_validator: `operations[{index}].path_regex` is invalid or too complex")
     })?;
     let operation_label = optional_string(object, "operation_label")?
         .map(str::to_string)
@@ -1626,7 +1639,7 @@ fn parse_operation(
         parse_request_validators(object.get("request_body"), index, schema_draft)?;
     if request_required && request_validators.is_empty() {
         return Err(format!(
-            "openapi_validator: operations[{index}].request_required requires at least one request-body schema"
+            "openapi_validator: `operations[{index}].request_required` requires at least one request-body schema"
         ));
     }
     let response_validators =
@@ -1655,11 +1668,11 @@ fn parse_request_validators(
     };
     if value.is_null() {
         return Err(format!(
-            "openapi_validator: operations[{operation_index}].request_body must be an object"
+            "openapi_validator: `operations[{operation_index}].request_body` must be an object"
         ));
     }
     let object = value.as_object().ok_or_else(|| {
-        format!("openapi_validator: operations[{operation_index}].request_body must be an object")
+        format!("openapi_validator: `operations[{operation_index}].request_body` must be an object")
     })?;
     let path = format!("config.operations[{operation_index}].request_body");
     let mut validators = AHashMap::new();
@@ -1672,16 +1685,21 @@ fn parse_request_validators(
         .iter()
         .any(|key| object.contains_key(*key));
     if is_inline_form {
-        reject_unknown_keys(object, &path, REQUEST_BODY_INLINE_KEYS, ERROR_PREFIX)?;
+        reject_unknown_keys(
+            object,
+            &path,
+            REQUEST_BODY_INLINE_KEYS,
+            &format!("{ERROR_PREFIX}`{path}`: "),
+        )?;
         let content_type = object
             .get("content_type")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                format!("openapi_validator: {path}.content_type is required and must be a string")
+                format!("openapi_validator: `{path}.content_type` is required and must be a string")
             })?;
         let schema = object
             .get("schema")
-            .ok_or_else(|| format!("openapi_validator: {path}.schema is required"))?;
+            .ok_or_else(|| format!("openapi_validator: `{path}.schema` is required"))?;
         validate_media_type_key(content_type, &path)?;
         let media_type = normalize_media_type(content_type);
         let encoding = object.get("encoding");
@@ -1691,7 +1709,7 @@ fn parse_request_validators(
             compile_media_validator(schema, encoding, &media_type, schema_draft).map_err(
                 |error| {
                     format!(
-                        "openapi_validator: operations[{operation_index}].request_body schema for {content_type:?} is invalid: {error}"
+                        "openapi_validator: `operations[{operation_index}].request_body` schema for {content_type:?} is invalid: {error}"
                     )
                 },
             )?,
@@ -1699,14 +1717,19 @@ fn parse_request_validators(
         )?;
         return Ok(validators);
     }
-    reject_unknown_keys(object, &path, REQUEST_BODY_CONTENT_KEYS, ERROR_PREFIX)?;
+    reject_unknown_keys(
+        object,
+        &path,
+        REQUEST_BODY_CONTENT_KEYS,
+        &format!("{ERROR_PREFIX}`{path}`: "),
+    )?;
     let content = object
         .get("content")
         .and_then(Value::as_object)
-        .ok_or_else(|| format!("openapi_validator: {path}.content must be an object"))?;
+        .ok_or_else(|| format!("openapi_validator: `{path}.content` must be an object"))?;
     if content.is_empty() {
         return Err(format!(
-            "openapi_validator: {path}.content must not be empty"
+            "openapi_validator: `{path}.content` must not be empty"
         ));
     }
     for (content_type, media_value) in content {
@@ -1714,7 +1737,7 @@ fn parse_request_validators(
         let media_type = normalize_media_type(content_type);
         let (schema, encoding) = split_media_type_value(media_value).map_err(|error| {
             format!(
-                "openapi_validator: operations[{operation_index}].request_body content['{content_type}'] is invalid: {error}"
+                "openapi_validator: `operations[{operation_index}].request_body` content[{content_type:?}] is invalid: {error}"
             )
         })?;
         insert_media_validator(
@@ -1723,7 +1746,7 @@ fn parse_request_validators(
             compile_media_validator(schema, encoding, &media_type, schema_draft).map_err(
                 |error| {
                     format!(
-                        "openapi_validator: operations[{operation_index}].request_body schema for {content_type:?} is invalid: {error}"
+                        "openapi_validator: `operations[{operation_index}].request_body` schema for {content_type:?} is invalid: {error}"
                     )
                 },
             )?,
@@ -1743,36 +1766,38 @@ fn parse_response_validators(
     };
     if value.is_null() {
         return Err(format!(
-            "openapi_validator: operations[{operation_index}].responses must be an object"
+            "openapi_validator: `operations[{operation_index}].responses` must be an object"
         ));
     }
     let object = value.as_object().ok_or_else(|| {
-        format!("openapi_validator: operations[{operation_index}].responses must be an object")
+        format!("openapi_validator: `operations[{operation_index}].responses` must be an object")
     })?;
     let mut statuses = ResponseValidators::default();
     for (status_raw, response_value) in object {
         let status = parse_response_status_key(status_raw, operation_index)?;
         let response_object = response_value.as_object().ok_or_else(|| {
             format!(
-                "openapi_validator: operations[{operation_index}].responses['{status_raw}'] must be an object"
+                "openapi_validator: `operations[{operation_index}].responses[{status_raw:?}]` must be an object"
             )
         })?;
         let response_path =
-            format!("config.operations[{operation_index}].responses['{status_raw}']");
+            format!("config.operations[{operation_index}].responses[{status_raw:?}]");
         // Two structurally distinct shapes: a Response Object carrying `content`
         // (fixed fields, key-enumerated) or the canonical generated media map
         // (free-form media-type keys, shape-validated). `description` stays
         // accepted in the media map form and is skipped.
         let content = match response_object.get("content") {
             Some(content) => {
+                // The visible prefix is schema-only; response_path includes a
+                // supplied status key, even though that key is Debug-escaped.
                 reject_unknown_keys(
                     response_object,
-                    &response_path,
+                    &format!("config.operations[{operation_index}].responses"),
                     RESPONSE_OBJECT_KEYS,
-                    ERROR_PREFIX,
+                    &format!("{ERROR_PREFIX}`config.operations[{operation_index}].responses`: "),
                 )?;
                 content.as_object().ok_or_else(|| {
-                    format!("openapi_validator: {response_path}.content must be an object")
+                    format!("openapi_validator: `{response_path}.content` must be an object")
                 })?
             }
             None => response_object,
@@ -1782,7 +1807,7 @@ fn parse_response_validators(
             && !description.is_string()
         {
             return Err(format!(
-                "openapi_validator: {response_path}.description must be a string"
+                "openapi_validator: `{response_path}.description` must be a string"
             ));
         }
         let mut validators = AHashMap::new();
@@ -1790,7 +1815,7 @@ fn parse_response_validators(
             if content_type == "description" {
                 if response_object.contains_key("content") {
                     return Err(format!(
-                        "openapi_validator: {response_path}.content must contain only media types; put description on the response object"
+                        "openapi_validator: `{response_path}.content` must contain only media types; put description on the response object"
                     ));
                 }
                 continue;
@@ -1798,12 +1823,12 @@ fn parse_response_validators(
             validate_media_type_key(content_type, &response_path)?;
             let (schema, encoding) = split_media_type_value(media_value).map_err(|error| {
                 format!(
-                    "openapi_validator: operations[{operation_index}].responses['{status_raw}'] content['{content_type}'] is invalid: {error}"
+                    "openapi_validator: `operations[{operation_index}].responses[{status_raw:?}]` content[{content_type:?}] is invalid: {error}"
                 )
             })?;
             if encoding.is_some() {
                 return Err(format!(
-                    "openapi_validator: operations[{operation_index}].responses['{status_raw}'] content['{content_type}'] must not contain an Encoding Object"
+                    "openapi_validator: `operations[{operation_index}].responses[{status_raw:?}]` content[{content_type:?}] must not contain an Encoding Object"
                 ));
             }
             let media_type = normalize_media_type(content_type);
@@ -1813,7 +1838,7 @@ fn parse_response_validators(
                 compile_media_validator(schema, None, content_type, schema_draft).map_err(
                     |error| {
                         format!(
-                            "openapi_validator: operations[{operation_index}].responses['{status_raw}'] schema for {content_type:?} is invalid: {error}"
+                            "openapi_validator: `operations[{operation_index}].responses[{status_raw:?}]` schema for {content_type:?} is invalid: {error}"
                         )
                     },
                 )?,
@@ -1824,7 +1849,7 @@ fn parse_response_validators(
             ResponseStatusKey::Exact(status) => {
                 if statuses.exact.contains_key(&status) {
                     return Err(format!(
-                        "openapi_validator: operations[{operation_index}].responses contains duplicate status declarations for '{status}'"
+                        "openapi_validator: `operations[{operation_index}].responses` contains duplicate status declarations for \"{status}\""
                     ));
                 }
                 statuses.exact.insert(status, validators);
@@ -1836,7 +1861,7 @@ fn parse_response_validators(
                     .any(|range| range.start == start && range.end == end)
                 {
                     return Err(format!(
-                        "openapi_validator: operations[{operation_index}].responses contains duplicate status-range declarations for '{status_raw}'"
+                        "openapi_validator: `operations[{operation_index}].responses` contains duplicate status-range declarations for {status_raw:?}"
                     ));
                 }
                 statuses.ranges.push(ResponseRangeValidators {
@@ -1848,7 +1873,7 @@ fn parse_response_validators(
             ResponseStatusKey::Default => {
                 if statuses.default.is_some() {
                     return Err(format!(
-                        "openapi_validator: operations[{operation_index}].responses contains duplicate default declarations"
+                        "openapi_validator: `operations[{operation_index}].responses` contains duplicate default declarations"
                     ));
                 }
                 statuses.default = Some(validators);
@@ -1890,12 +1915,12 @@ fn parse_response_status_key(
             .map(ResponseStatusKey::Exact)
             .map_err(|_| {
                 format!(
-                    "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
+                    "openapi_validator: `operations[{operation_index}].responses` contains invalid status {status_raw:?}"
                 )
             });
     }
     Err(format!(
-        "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
+        "openapi_validator: `operations[{operation_index}].responses` contains invalid status {status_raw:?}"
     ))
 }
 
@@ -1907,7 +1932,7 @@ fn insert_media_validator(
 ) -> Result<(), String> {
     if validators.contains_key(&media_type) {
         return Err(format!(
-            "{ERROR_PREFIX}'{path}' contains duplicate media type '{media_type}' after normalization"
+            "{ERROR_PREFIX}`{path}` contains duplicate media type {media_type:?} after normalization"
         ));
     }
     validators.insert(media_type, validator);
@@ -1964,7 +1989,7 @@ fn split_media_type_value(value: &Value) -> Result<(&Value, Option<&Value>), Str
         .all(|key| MEDIA_TYPE_OBJECT_KEYS.contains(&key.as_str()));
     if !only_media_type_fields {
         return Err(
-            "media type object with encoding may contain only 'schema' and 'encoding'".to_string(),
+            "media type object with encoding may contain only `schema` and `encoding`".to_string(),
         );
     }
     let schema = object
@@ -1984,13 +2009,13 @@ fn parse_encoding_map(
     };
     let object = encoding
         .as_object()
-        .ok_or_else(|| "encoding must be an object".to_string())?;
+        .ok_or_else(|| "`encoding` must be an object".to_string())?;
     let normalized = media_type.to_ascii_lowercase();
     let supports_style =
         normalized == "application/x-www-form-urlencoded" || normalized == "multipart/form-data";
     if !supports_style {
         return Err(format!(
-            "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type:?})"
+            "`encoding` is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type:?})"
         ));
     }
     let mut out = AHashMap::new();
@@ -2011,7 +2036,7 @@ fn parse_encoding_map(
         .collect();
     if free_form_exploded_objects.len() > 1 {
         return Err(format!(
-            "encoding contains multiple explode=true free-form object properties ({}) whose unprefixed child keys are ambiguous",
+            "`encoding` contains multiple explode=true free-form object properties ({:?}) whose unprefixed child keys are ambiguous",
             free_form_exploded_objects.join(", ")
         ));
     }
@@ -2048,7 +2073,7 @@ fn reject_exploded_object_key_collisions(
         for child in &child_names {
             if child != property && root_names.contains(child) {
                 return Err(format!(
-                    "encoding['{property}'] explode=true object child '{child}' collides with a root request-body property"
+                    "`encoding[{property:?}]` explode=true object child {child:?} collides with a root request-body property"
                 ));
             }
         }
@@ -2065,7 +2090,7 @@ fn reject_exploded_object_key_collisions(
             }
             overlap.sort_unstable();
             return Err(format!(
-                "encoding explode=true object properties '{left_property}' and '{right_property}' emit colliding child keys ({})",
+                "`encoding` explode=true object properties {left_property:?} and {right_property:?} emit colliding child keys ({:?})",
                 overlap.join(", ")
             ));
         }
@@ -2086,7 +2111,7 @@ fn reject_exploded_object_key_collisions(
             .collect();
         others.sort_unstable();
         return Err(format!(
-            "encoding explode=true free-form object '{free}' cannot coexist with other explode=true object properties ({}); its unbounded child key space would populate more than one logical property",
+            "`encoding` explode=true free-form object {free:?} cannot coexist with other explode=true object properties ({:?}); its unbounded child key space would populate more than one logical property",
             others.join(", ")
         ));
     }
@@ -2124,18 +2149,18 @@ fn parse_property_encoding(
     schema_draft: SchemaDraft,
 ) -> Result<PropertyEncoding, String> {
     let property_schema = property_schema_from_object(schema, property).ok_or_else(|| {
-        format!("encoding['{property}'] does not name a request-body schema property")
+        format!("`encoding[{property:?}]` does not name a request-body schema property")
     })?;
     let object = value
         .as_object()
-        .ok_or_else(|| format!("encoding['{property}'] must be an object"))?;
+        .ok_or_else(|| format!("`encoding[{property:?}]` must be an object"))?;
     for key in object.keys() {
         if !matches!(
             key.as_str(),
             "style" | "explode" | "allowReserved" | "contentType" | "headers"
         ) {
             return Err(format!(
-                "encoding['{property}'] contains unsupported field '{key}'"
+                "`encoding[{property:?}]` contains unsupported field {key:?}"
             ));
         }
     }
@@ -2143,7 +2168,7 @@ fn parse_property_encoding(
     let style_raw = match object.get("style") {
         None => "form",
         Some(Value::String(value)) => value.as_str(),
-        Some(_) => return Err(format!("encoding['{property}'].style must be a string")),
+        Some(_) => return Err(format!("`encoding[{property:?}].style` must be a string")),
     };
     let style = match style_raw {
         "form" => EncodingStyle::Form,
@@ -2152,7 +2177,7 @@ fn parse_property_encoding(
         "deepObject" => EncodingStyle::DeepObject,
         other => {
             return Err(format!(
-                "encoding['{property}'].style {other:?} is unsupported for request bodies (supported: form, spaceDelimited, pipeDelimited, deepObject)"
+                "`encoding[{property:?}].style` {other:?} is unsupported for request bodies (supported: form, spaceDelimited, pipeDelimited, deepObject)"
             ));
         }
     };
@@ -2160,14 +2185,18 @@ fn parse_property_encoding(
     let explode = match object.get("explode") {
         None => style == EncodingStyle::Form,
         Some(Value::Bool(value)) => *value,
-        Some(_) => return Err(format!("encoding['{property}'].explode must be a boolean")),
+        Some(_) => {
+            return Err(format!(
+                "`encoding[{property:?}].explode` must be a boolean"
+            ));
+        }
     };
     let allow_reserved = match object.get("allowReserved") {
         None => false,
         Some(Value::Bool(value)) => *value,
         Some(_) => {
             return Err(format!(
-                "encoding['{property}'].allowReserved must be a boolean"
+                "`encoding[{property:?}].allowReserved` must be a boolean"
             ));
         }
     };
@@ -2178,19 +2207,19 @@ fn parse_property_encoding(
         (EncodingStyle::DeepObject, true) => {}
         (EncodingStyle::SpaceDelimited | EncodingStyle::PipeDelimited, true) => {
             return Err(format!(
-                "encoding['{property}']: style '{style_raw}' requires explode=false"
+                "`encoding[{property:?}]`: style {style_raw:?} requires explode=false"
             ));
         }
         (EncodingStyle::DeepObject, false) => {
             return Err(format!(
-                "encoding['{property}']: style 'deepObject' requires explode=true"
+                "`encoding[{property:?}]`: style `deepObject` requires explode=true"
             ));
         }
     }
 
     if style == EncodingStyle::DeepObject && !schema_accepts_object(property_schema) {
         return Err(format!(
-            "encoding['{property}']: style 'deepObject' requires an object schema property"
+            "`encoding[{property:?}]`: style `deepObject` requires an object schema property"
         ));
     }
     if matches!(
@@ -2199,7 +2228,7 @@ fn parse_property_encoding(
     ) && !(schema_accepts_array(property_schema) || schema_accepts_object(property_schema))
     {
         return Err(format!(
-            "encoding['{property}']: style '{style_raw}' requires an array or object schema property"
+            "`encoding[{property:?}]`: style {style_raw:?} requires an array or object schema property"
         ));
     }
 
@@ -2209,26 +2238,26 @@ fn parse_property_encoding(
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 return Err(format!(
-                    "encoding['{property}'].contentType must not be empty"
+                    "`encoding[{property:?}].contentType` must not be empty"
                 ));
             }
             if trimmed.len() > MAX_MULTIPART_PARAM_BYTES {
                 return Err(format!(
-                    "encoding['{property}'].contentType exceeds {MAX_MULTIPART_PARAM_BYTES} bytes"
+                    "`encoding[{property:?}].contentType` exceeds {MAX_MULTIPART_PARAM_BYTES} bytes"
                 ));
             }
             Some(trimmed.to_string())
         }
         Some(_) => {
             return Err(format!(
-                "encoding['{property}'].contentType must be a string"
+                "`encoding[{property:?}].contentType` must be a string"
             ));
         }
     };
 
     if content_type.is_some() && media_type != "multipart/form-data" {
         return Err(format!(
-            "encoding['{property}'].contentType is only valid for multipart/form-data"
+            "`encoding[{property:?}].contentType` is only valid for multipart/form-data"
         ));
     }
 
@@ -2236,15 +2265,15 @@ fn parse_property_encoding(
     if let Some(headers_value) = object.get("headers") {
         if media_type != "multipart/form-data" {
             return Err(format!(
-                "encoding['{property}'].headers is only valid for multipart/form-data"
+                "`encoding[{property:?}].headers` is only valid for multipart/form-data"
             ));
         }
         let headers_object = headers_value
             .as_object()
-            .ok_or_else(|| format!("encoding['{property}'].headers must be an object"))?;
+            .ok_or_else(|| format!("`encoding[{property:?}].headers` must be an object"))?;
         if headers_object.len() > 32 {
             return Err(format!(
-                "encoding['{property}'].headers must not exceed 32 entries"
+                "`encoding[{property:?}].headers` must not exceed 32 entries"
             ));
         }
         for (header_name, header_schema) in headers_object {
@@ -2254,7 +2283,7 @@ fn parse_property_encoding(
                 || http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
             {
                 return Err(format!(
-                    "encoding['{property}'].headers contains an invalid header name"
+                    "`encoding[{property:?}].headers` contains an invalid header name"
                 ));
             }
             if matches!(
@@ -2262,12 +2291,12 @@ fn parse_property_encoding(
                 "content-type" | "content-disposition" | "content-transfer-encoding"
             ) {
                 return Err(format!(
-                    "encoding['{property}'].headers must not redefine {name:?}"
+                    "`encoding[{property:?}].headers` must not redefine {name:?}"
                 ));
             }
             if headers.contains_key(&name) {
                 return Err(format!(
-                    "encoding['{property}'].headers contains duplicate header name {name:?}"
+                    "`encoding[{property:?}].headers` contains duplicate header name {name:?}"
                 ));
             }
             // Header Object may wrap `schema`; accept either that public OAS
@@ -2286,24 +2315,24 @@ fn parse_property_encoding(
             let (schema_value, content_media_type, required, explode) = if is_header_object {
                 let header_object = header_object.ok_or_else(|| {
                     format!(
-                        "encoding['{property}'].headers['{header_name}'] must be a Header Object"
+                        "`encoding[{property:?}].headers[{header_name:?}]` must be a Header Object"
                     )
                 })?;
-                let header_path = format!("encoding['{property}'].headers['{header_name}']");
+                let header_path = format!("encoding[{property:?}].headers[{header_name:?}]");
                 let has_schema = header_object.contains_key("schema");
                 let has_content = header_object.contains_key("content");
                 if has_schema && has_content {
                     return Err(format!(
-                        "{header_path} must not declare both schema and content"
+                        "`{header_path}` must not declare both schema and content"
                     ));
                 }
                 if !has_schema && !has_content {
-                    return Err(format!("{header_path} must contain schema or content"));
+                    return Err(format!("`{header_path}` must contain schema or content"));
                 }
                 for key in ENCODING_HEADER_OBJECT_INVALID_KEYS {
                     if header_object.contains_key(*key) {
                         return Err(format!(
-                            "{header_path}.{key} is not valid for Header Objects"
+                            "`{header_path}.{key}` is not valid for Header Objects"
                         ));
                     }
                 }
@@ -2311,7 +2340,7 @@ fn parse_property_encoding(
                     for key in ["style", "explode", "example", "examples", "schema"] {
                         if header_object.contains_key(key) {
                             return Err(format!(
-                                "{header_path}.{key} is a schema-form Header Object field and is not valid with content"
+                                "`{header_path}.{key}` is a schema-form Header Object field and is not valid with content"
                             ));
                         }
                     }
@@ -2319,65 +2348,67 @@ fn parse_property_encoding(
                 // Keep spelling suggestions for near-miss keys on the selected form.
                 reject_unknown_keys(
                     header_object,
-                    &header_path,
+                    "encoding.headers",
                     if has_content {
                         ENCODING_HEADER_OBJECT_CONTENT_KEYS
                     } else {
                         ENCODING_HEADER_OBJECT_SCHEMA_KEYS
                     },
-                    ERROR_PREFIX,
+                    "openapi_validator: `encoding.headers`: ",
                 )?;
                 if let Some(description) = header_object.get("description")
                     && !description.is_null()
                     && !description.is_string()
                 {
-                    return Err(format!("{header_path}.description must be a string"));
+                    return Err(format!("`{header_path}.description` must be a string"));
                 }
                 if let Some(deprecated) = header_object.get("deprecated")
                     && !deprecated.is_boolean()
                 {
-                    return Err(format!("{header_path}.deprecated must be a boolean"));
+                    return Err(format!("`{header_path}.deprecated` must be a boolean"));
                 }
                 let required = match header_object.get("required") {
                     None => false,
                     Some(Value::Bool(value)) => *value,
                     Some(_) => {
-                        return Err(format!("{header_path}.required must be a boolean"));
+                        return Err(format!("`{header_path}.required` must be a boolean"));
                     }
                 };
                 if has_content {
                     let content_object = header_object
                         .get("content")
                         .and_then(Value::as_object)
-                        .ok_or_else(|| format!("{header_path}.content must be an object"))?;
+                        .ok_or_else(|| format!("`{header_path}.content` must be an object"))?;
                     if content_object.len() != 1 {
                         return Err(format!(
-                            "{header_path}.content must contain exactly one media type"
+                            "`{header_path}.content` must contain exactly one media type"
                         ));
                     }
                     let (media_type, media_value) =
                         content_object.iter().next().ok_or_else(|| {
-                            format!("{header_path}.content must contain exactly one media type")
+                            format!("`{header_path}.content` must contain exactly one media type")
                         })?;
-                    let media_path = format!("{header_path}.content['{media_type}']");
+                    let media_path = format!("{header_path}.content[{media_type:?}]");
                     validate_concrete_media_type(media_type, &media_path)?;
                     let media_base = normalize_media_type(media_type);
                     if media_base == "multipart/form-data" {
-                        return Err(format!("{media_path} does not support multipart/form-data"));
+                        return Err(format!(
+                            "`{media_path}` does not support multipart/form-data"
+                        ));
                     }
                     let media_object = media_value
                         .as_object()
-                        .ok_or_else(|| format!("{media_path} must be a Media Type Object"))?;
+                        .ok_or_else(|| format!("`{media_path}` must be a Media Type Object"))?;
                     reject_unknown_keys(
                         media_object,
-                        &media_path,
+                        "encoding.headers.content",
                         &["schema", "example", "examples"],
-                        ERROR_PREFIX,
+                        "openapi_validator: `encoding.headers.content`: ",
                     )?;
                     if let Some(examples) = media_object.get("examples")
                         && !examples.is_object()
                     {
-                        return Err(format!("{media_path}.examples must be an object"));
+                        return Err(format!("`{media_path}.examples` must be an object"));
                     }
                     if media_object.contains_key("example") && media_object.contains_key("examples")
                     {
@@ -2387,27 +2418,27 @@ fn parse_property_encoding(
                     }
                     let schema = media_object
                         .get("schema")
-                        .ok_or_else(|| format!("{media_path} must contain schema"))?;
+                        .ok_or_else(|| format!("`{media_path}` must contain schema"))?;
                     (schema, Some(media_base), required, false)
                 } else {
                     if let Some(style) = header_object.get("style")
                         && style.as_str() != Some("simple")
                     {
-                        return Err(format!("{header_path}.style must be 'simple'"));
+                        return Err(format!("`{header_path}.style` must be `simple`"));
                     }
                     if let Some(explode) = header_object.get("explode")
                         && !explode.is_boolean()
                     {
-                        return Err(format!("{header_path}.explode must be a boolean"));
+                        return Err(format!("`{header_path}.explode` must be a boolean"));
                     }
                     if let Some(examples) = header_object.get("examples")
                         && !examples.is_object()
                     {
-                        return Err(format!("{header_path}.examples must be an object"));
+                        return Err(format!("`{header_path}.examples` must be an object"));
                     }
                     let schema = header_object
                         .get("schema")
-                        .ok_or_else(|| format!("{header_path} must contain schema or content"))?;
+                        .ok_or_else(|| format!("`{header_path}` must contain schema or content"))?;
                     let explode = header_object
                         .get("explode")
                         .and_then(Value::as_bool)
@@ -2419,7 +2450,7 @@ fn parse_property_encoding(
             };
             let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
                 format!(
-                    "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                    "`encoding[{property:?}].headers[{header_name:?}]` schema is invalid: {error}"
                 )
             })?;
             let schema = Arc::new(schema_value.clone());
@@ -2427,7 +2458,7 @@ fn parse_property_encoding(
             let conversion =
                 ConversionPlan::compile(schema.as_ref(), schema_draft).map_err(|error| {
                     format!(
-                        "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                        "`encoding[{property:?}].headers[{header_name:?}]` schema is invalid: {error}"
                     )
                 })?;
             headers.insert(
@@ -4928,7 +4959,7 @@ fn normalize_configured_media_types(
         let value = normalize_media_type(&value);
         if !seen.insert(value.clone()) {
             return Err(format!(
-                "{ERROR_PREFIX}'{field}' contains duplicate media type {value:?} after normalization"
+                "{ERROR_PREFIX}`{field}` contains duplicate media type {value:?} after normalization"
             ));
         }
         normalized.push(value);
@@ -4950,7 +4981,7 @@ fn content_type_base(content_type: Option<&str>) -> Option<&str> {
 fn validate_media_type_key(key: &str, path: &str) -> Result<(), String> {
     if key.chars().any(char::is_control) {
         return Err(format!(
-            "{ERROR_PREFIX}'{path}' contains a media type with control characters"
+            "{ERROR_PREFIX}`{path}` contains a media type with control characters"
         ));
     }
     let base = key.split(';').next().unwrap_or("").trim();
@@ -4958,7 +4989,7 @@ fn validate_media_type_key(key: &str, path: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{ERROR_PREFIX}'{path}' contains '{key}', which is not a media type or media range"
+            "{ERROR_PREFIX}`{path}` contains {key:?}, which is not a media type or media range"
         ))
     }
 }
@@ -4976,12 +5007,12 @@ fn is_media_type_or_range(base: &str) -> bool {
 fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
     if value.parse::<http::HeaderValue>().is_err() {
         return Err(format!(
-            "{ERROR_PREFIX}'{path}' must be a valid HTTP header value"
+            "{ERROR_PREFIX}`{path}` must be a valid HTTP header value"
         ));
     }
     if !is_concrete_http_media_type(value) {
         return Err(format!(
-            "{ERROR_PREFIX}'{path}' must be a concrete media type"
+            "{ERROR_PREFIX}`{path}` must be a concrete media type"
         ));
     }
     Ok(())
@@ -4994,7 +5025,7 @@ fn optional_object<'a>(
     match object.get(key) {
         None => Ok(None),
         Some(Value::Object(value)) => Ok(Some(value)),
-        Some(_) => Err(format!("{ERROR_PREFIX}'{key}' must be an object")),
+        Some(_) => Err(format!("{ERROR_PREFIX}`{key}` must be an object")),
     }
 }
 
@@ -5833,7 +5864,7 @@ fn parse_mode(raw: &str) -> Result<EnforcementMode, String> {
         "log_only" => Ok(EnforcementMode::LogOnly),
         "disabled" => Ok(EnforcementMode::Disabled),
         other => Err(format!(
-            "openapi_validator: 'enforcement_mode' must be one of block, log_only, disabled; got {other:?}"
+            "openapi_validator: `enforcement_mode` must be one of block, log_only, disabled; got {other:?}"
         )),
     }
 }
@@ -5844,7 +5875,7 @@ fn parse_schema_draft(raw: &str) -> Result<SchemaDraft, String> {
         "draft7" => Ok(SchemaDraft::Draft7),
         "draft2020-12" => Ok(SchemaDraft::Draft202012),
         other => Err(format!(
-            "openapi_validator: 'schema_draft' must be auto, draft7, or draft2020-12; got {other:?}"
+            "openapi_validator: `schema_draft` must be auto, draft7, or draft2020-12; got {other:?}"
         )),
     }
 }
@@ -5855,7 +5886,7 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
     };
     let values = value
         .as_array()
-        .ok_or_else(|| format!("openapi_validator: '{field}' must be an array"))?;
+        .ok_or_else(|| format!("openapi_validator: `{field}` must be an array"))?;
     if values.is_empty() {
         return Ok(None);
     }
@@ -5863,12 +5894,12 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
     for (index, value) in values.iter().enumerate() {
         let Some(pattern) = value.as_str() else {
             return Err(format!(
-                "openapi_validator: '{field}' entries must be strings (invalid entry at index {index})"
+                "openapi_validator: `{field}` entries must be strings (invalid entry at index {index})"
             ));
         };
         if pattern.is_empty() {
             return Err(format!(
-                "openapi_validator: '{field}' entries must not be empty (invalid entry at index {index})"
+                "openapi_validator: `{field}` entries must not be empty (invalid entry at index {index})"
             ));
         }
         patterns.push(pattern.to_string());
@@ -5886,34 +5917,34 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
             for (key, value) in map {
                 if key.is_empty() {
                     return Err(
-                        "openapi_validator: bypass.header_present keys must not be empty"
+                        "openapi_validator: `bypass.header_present` keys must not be empty"
                             .to_string(),
                     );
                 }
                 if http::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
                     return Err(format!(
-                        "openapi_validator: bypass.header_present contains invalid header name '{key}'"
+                        "openapi_validator: `bypass.header_present` contains invalid header name {key:?}"
                     ));
                 }
                 let expected = if value.is_null() {
                     None
                 } else {
                     Some(value.as_str().ok_or_else(|| {
-                        "openapi_validator: bypass.header_present values must be strings or null"
+                        "openapi_validator: `bypass.header_present` values must be strings or null"
                             .to_string()
                     })?)
                 };
                 let normalized = key.to_ascii_lowercase();
                 if parsed.contains_key(&normalized) {
                     return Err(format!(
-                        "openapi_validator: bypass.header_present contains duplicate header name '{normalized}'"
+                        "openapi_validator: `bypass.header_present` contains duplicate header name {normalized:?}"
                     ));
                 }
                 parsed.insert(normalized, expected.map(str::to_string));
             }
             Ok(parsed)
         }
-        Some(_) => Err("openapi_validator: bypass.header_present must be an object".to_string()),
+        Some(_) => Err("openapi_validator: `bypass.header_present` must be an object".to_string()),
     }
 }
 
@@ -5924,8 +5955,8 @@ fn optional_string<'a>(
     match object.get(key) {
         None => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
-        Some(Value::String(_)) => Err(format!("openapi_validator: '{key}' must not be empty")),
-        Some(_) => Err(format!("openapi_validator: '{key}' must be a string")),
+        Some(Value::String(_)) => Err(format!("openapi_validator: `{key}` must not be empty")),
+        Some(_) => Err(format!("openapi_validator: `{key}` must be a string")),
     }
 }
 
@@ -5946,7 +5977,7 @@ fn optional_bool_from_object(
     match object.get(key) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(format!("openapi_validator: '{key}' must be a boolean")),
+        Some(_) => Err(format!("openapi_validator: `{key}` must be a boolean")),
     }
 }
 
@@ -5958,14 +5989,14 @@ fn optional_usize(
         None => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("openapi_validator: '{key}' must be an unsigned integer"))
+            .ok_or_else(|| format!("openapi_validator: `{key}` must be an unsigned integer"))
             .and_then(|value| {
                 usize::try_from(value)
-                    .map_err(|_| format!("openapi_validator: '{key}' is too large"))
+                    .map_err(|_| format!("openapi_validator: `{key}` is too large"))
             })
             .map(Some),
         Some(_) => Err(format!(
-            "openapi_validator: '{key}' must be an unsigned integer"
+            "openapi_validator: `{key}` must be an unsigned integer"
         )),
     }
 }
@@ -5981,13 +6012,13 @@ fn optional_u16_from_object(
         None => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("openapi_validator: '{key}' must be an unsigned integer"))
+            .ok_or_else(|| format!("openapi_validator: `{key}` must be an unsigned integer"))
             .and_then(|value| {
-                u16::try_from(value).map_err(|_| format!("openapi_validator: '{key}' is too large"))
+                u16::try_from(value).map_err(|_| format!("openapi_validator: `{key}` is too large"))
             })
             .map(Some),
         Some(_) => Err(format!(
-            "openapi_validator: '{key}' must be an unsigned integer"
+            "openapi_validator: `{key}` must be an unsigned integer"
         )),
     }
 }
@@ -6009,7 +6040,7 @@ fn optional_string_vec(
     match object.get(key) {
         None => Ok(None),
         Some(Value::Array(values)) => parse_string_array(values, key),
-        Some(_) => Err(format!("openapi_validator: '{key}' must be an array")),
+        Some(_) => Err(format!("openapi_validator: `{key}` must be an array")),
     }
 }
 
@@ -6028,12 +6059,12 @@ fn parse_string_array(values: &[Value], key: &'static str) -> Result<Option<Vec<
     for (index, value) in values.iter().enumerate() {
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "openapi_validator: '{key}' entries must be strings (invalid entry at index {index})"
+                "openapi_validator: `{key}` entries must be strings (invalid entry at index {index})"
             ));
         };
         if value.is_empty() {
             return Err(format!(
-                "openapi_validator: '{key}' entries must not be empty (invalid entry at index {index})"
+                "openapi_validator: `{key}` entries must not be empty (invalid entry at index {index})"
             ));
         }
         out.push(value.to_string());
@@ -6046,7 +6077,7 @@ fn validate_status(status: u16, field: &'static str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "openapi_validator: '{field}' must be from 400 to 599"
+            "openapi_validator: `{field}` must be from 400 to 599"
         ))
     }
 }

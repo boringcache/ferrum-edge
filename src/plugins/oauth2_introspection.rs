@@ -265,14 +265,14 @@ impl Oauth2Introspection {
 
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
-            return Err("oauth2_introspection: 'providers' must be a non-empty array".to_string());
+            return Err("oauth2_introspection: `providers` must be a non-empty array".to_string());
         };
         if providers_arr.is_empty() {
-            return Err("oauth2_introspection: 'providers' array must not be empty".to_string());
+            return Err("oauth2_introspection: `providers` array must not be empty".to_string());
         }
         if providers_arr.len() > MAX_PROVIDERS {
             return Err(format!(
-                "oauth2_introspection: 'providers' must contain at most {MAX_PROVIDERS} entries"
+                "oauth2_introspection: `providers` must contain at most {MAX_PROVIDERS} entries"
             ));
         }
 
@@ -281,7 +281,7 @@ impl Oauth2Introspection {
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: provider[{idx}] must be an object, got: {prov_cfg:?}",
+                    "oauth2_introspection: `provider[{idx}]` must be an object, got: {prov_cfg:?}",
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
@@ -311,19 +311,19 @@ impl Oauth2Introspection {
                     "consumer_header_claim",
                     "claim_headers",
                 ],
-                &format!("oauth2_introspection: provider[{idx}]"),
+                &format!("oauth2_introspection: `provider[{idx}]`"),
             )?;
 
             let endpoint = parse_url_field(prov_obj, "introspection_endpoint", idx)?;
             let discovery = parse_url_field(prov_obj, "discovery_url", idx)?;
             if endpoint.is_none() && discovery.is_none() {
                 return Err(format!(
-                    "oauth2_introspection: provider[{idx}] requires 'introspection_endpoint' or 'discovery_url'"
+                    "oauth2_introspection: `provider[{idx}]` requires `introspection_endpoint` or `discovery_url`"
                 ));
             }
             if endpoint.is_some() && discovery.is_some() {
                 return Err(format!(
-                    "oauth2_introspection: provider[{idx}] must not configure both 'introspection_endpoint' and 'discovery_url'"
+                    "oauth2_introspection: `provider[{idx}]` must not configure both `introspection_endpoint` and `discovery_url`"
                 ));
             }
 
@@ -377,7 +377,7 @@ impl Oauth2Introspection {
                 .saturating_add(max_cache_entry_bytes);
             if max_cache_total_bytes < minimum_total_bytes {
                 return Err(format!(
-                    "oauth2_introspection: 'provider[{idx}].max_cache_total_bytes' must be at least {minimum_total_bytes} for max_cache_entries={max_cache_entries} and max_cache_entry_bytes={max_cache_entry_bytes}"
+                    "oauth2_introspection: `provider[{idx}].max_cache_total_bytes` must be at least \"{minimum_total_bytes}\" for `max_cache_entries`=\"{max_cache_entries}\" and `max_cache_entry_bytes`=\"{max_cache_entry_bytes}\""
                 ));
             }
             let token_hint_param = optional_nullable_string(prov_obj, "token_hint_param", idx)?;
@@ -1151,7 +1151,7 @@ fn register_provider_location(
         && previous_provider_idx != provider_idx
     {
         return Err(
-            "oauth2_introspection: provider token locations must be distinct unless 'allow_provider_fanout' explicitly enables a shared trust boundary"
+            "oauth2_introspection: provider token locations must be distinct unless `allow_provider_fanout` explicitly enables a shared trust boundary"
                 .to_string(),
         );
     }
@@ -1600,14 +1600,16 @@ fn parse_client_auth(
 ) -> Result<ClientAuth, String> {
     let auth = match config.get("client_auth") {
         Some(value) => value.as_object().cloned().ok_or_else(|| {
-            format!("oauth2_introspection: provider[{provider_idx}].client_auth must be an object")
+            format!(
+                "oauth2_introspection: `provider[{provider_idx}].client_auth` must be an object"
+            )
         })?,
         None => Map::new(),
     };
     reject_unknown_keys(
         &auth,
         &CLIENT_AUTH_STRING_FIELDS,
-        &format!("oauth2_introspection: provider[{provider_idx}].client_auth"),
+        &format!("oauth2_introspection: `provider[{provider_idx}].client_auth`"),
     )?;
     // Every accepted `client_auth` key is a string, whether or not the selected
     // method reads it. Type-checking the whole object here — instead of only
@@ -1617,14 +1619,14 @@ fn parse_client_auth(
     for field in CLIENT_AUTH_STRING_FIELDS {
         if auth.get(field).is_some_and(|value| !value.is_string()) {
             return Err(format!(
-                "oauth2_introspection: provider[{provider_idx}].client_auth.{field} must be a string"
+                "oauth2_introspection: `provider[{provider_idx}].client_auth.{field}` must be a string"
             ));
         }
     }
     let method = match auth.get("method") {
         Some(value) => value.as_str().ok_or_else(|| {
             format!(
-                "oauth2_introspection: provider[{provider_idx}].client_auth.method must be a string"
+                "oauth2_introspection: `provider[{provider_idx}].client_auth.method` must be a string"
             )
         })?,
         None => "client_secret_basic",
@@ -1636,7 +1638,7 @@ fn parse_client_auth(
                 .as_str()
                 .ok_or_else(|| {
                     format!(
-                        "oauth2_introspection: provider[{provider_idx}].client_auth.client_id must be a string"
+                        "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` must be a string"
                     )
                 })?
                 .trim(),
@@ -1660,7 +1662,7 @@ fn parse_client_auth(
     ) && endpoint.is_some_and(is_insecure_credentialed_endpoint)
     {
         return Err(format!(
-            "oauth2_introspection: provider[{provider_idx}].client_auth.method='{method}' requires an https introspection_endpoint/discovery_url (http is only allowed for localhost or loopback endpoints)"
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.method`={method:?} requires an https introspection_endpoint/discovery_url (http is only allowed for localhost or loopback endpoints)"
         ));
     }
 
@@ -1668,7 +1670,7 @@ fn parse_client_auth(
         "client_secret_basic" => {
         let client_id = client_id.ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?;
             let client_secret = required_auth_string(
@@ -1683,7 +1685,7 @@ fn parse_client_auth(
         "client_secret_post" => Ok(ClientAuth::Post {
             client_id: client_id.ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?,
             client_secret: SecretString(required_auth_string(
@@ -1695,41 +1697,41 @@ fn parse_client_auth(
         "private_key_jwt" => {
         let client_id = client_id.ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?;
             let pem = required_auth_string(&auth, "private_key_pem", provider_idx)?;
             let alg = parse_private_key_alg(auth.get("private_key_jwt_alg"), provider_idx)?;
             let encoding_key = match alg {
                 Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-                    EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
+                    EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| {
                         format!(
-                            "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_pem is invalid RSA PEM: {e}"
+                            "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid RSA PEM"
                         )
                     })?
                 }
                 Algorithm::ES256 | Algorithm::ES384 => {
-                    EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| {
+                    EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|_| {
                         format!(
-                            "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_pem is invalid EC PEM: {e}"
+                            "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid EC PEM"
                         )
                     })?
                 }
-                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|e| {
+                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|_| {
                     format!(
-                        "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_pem is invalid EdDSA PEM: {e}"
+                        "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid EdDSA PEM"
                     )
                 })?,
                 _ => {
                     return Err(format!(
-                        "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg is unsupported"
+                        "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_alg` is unsupported"
                     ));
                 }
             };
             let kid = match auth.get("private_key_jwt_kid") {
                 Some(value) => Some(value.as_str().ok_or_else(|| {
                     format!(
-                        "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_kid must be a string"
+                        "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_kid` must be a string"
                     )
                 })?),
                 None => None,
@@ -1758,13 +1760,13 @@ fn parse_client_auth(
         "none" => {
             if endpoint.is_some_and(|endpoint| !is_local_introspection_host(&endpoint.hostname)) {
                 return Err(format!(
-                    "oauth2_introspection: provider[{provider_idx}].client_auth.method='none' is only allowed for localhost or loopback endpoints"
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.method`=`none` is only allowed for localhost or loopback endpoints"
                 ));
             }
             Ok(ClientAuth::None)
         }
         _ => Err(format!(
-            "oauth2_introspection: provider[{provider_idx}].client_auth.method is unsupported"
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.method` is unsupported"
         )),
     }
 }
@@ -1785,7 +1787,7 @@ fn probe_client_assertion_signing(
         .map(|_| ())
         .map_err(|_| {
             format!(
-                "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_pem cannot sign with private_key_jwt_alg='{alg:?}' (key type, curve, or size mismatch)"
+                "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` cannot sign with private_key_jwt_alg=\"{alg:?}\" (key type, curve, or size mismatch)"
             )
         })
 }
@@ -1796,16 +1798,16 @@ fn required_auth_string(
     provider_idx: usize,
 ) -> Result<String, String> {
     let value = auth.get(field).ok_or_else(|| {
-        format!("oauth2_introspection: provider[{provider_idx}].client_auth.{field} is required")
+        format!("oauth2_introspection: `provider[{provider_idx}].client_auth.{field}` is required")
     })?;
     let raw = value.as_str().ok_or_else(|| {
         format!(
-            "oauth2_introspection: provider[{provider_idx}].client_auth.{field} must be a string"
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.{field}` must be a string"
         )
     })?;
     if raw.is_empty() {
         return Err(format!(
-            "oauth2_introspection: provider[{provider_idx}].client_auth.{field} must not be empty"
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.{field}` must not be empty"
         ));
     }
     Ok(raw.to_string())
@@ -1850,7 +1852,7 @@ fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<A
     let algorithm = match value {
         Some(value) => value.as_str().ok_or_else(|| {
             format!(
-                "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg must be a string"
+                "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_alg` must be a string"
             )
         })?,
         None => "RS256",
@@ -1863,7 +1865,7 @@ fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<A
         "ES384" => Ok(Algorithm::ES384),
         "EdDSA" => Ok(Algorithm::EdDSA),
         _ => Err(format!(
-            "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg is unsupported"
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_alg` is unsupported"
         )),
     }
 }
@@ -1901,35 +1903,35 @@ fn parse_token_locations(
     if let Some(value) = config.get("from_headers") {
         let headers = value.as_array().ok_or_else(|| {
             format!(
-                "oauth2_introspection: 'provider[{provider_idx}].from_headers' must be an array"
+                "oauth2_introspection: `provider[{provider_idx}].from_headers` must be an array"
             )
         })?;
         for (idx, header) in headers.iter().enumerate() {
             let object = header.as_object().ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}]' must be an object"
+                    "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]` must be an object"
                 )
             })?;
             reject_unknown_keys(
                 object,
                 &["name", "prefix"],
-                &format!("oauth2_introspection: provider[{provider_idx}].from_headers[{idx}]"),
+                &format!("oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]`"),
             )?;
             let raw_name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}].name' is required"
+                    "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}].name` is required"
                 )
             })?;
             let name = raw_name.trim().to_ascii_lowercase();
             if name.is_empty() {
                 return Err(format!(
-                    "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}].name' must not be empty"
+                    "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}].name` must not be empty"
                 ));
             }
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| {
                     format!(
-                        "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}].name' is invalid: {e}"
+                        "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}].name` is invalid: {e}"
                     )
                 })?
                 .as_str()
@@ -1940,7 +1942,7 @@ fn parse_token_locations(
                 Some(Value::Null) | None => None,
                 Some(_value) => {
                     return Err(format!(
-                        "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}].prefix' must be a string"
+                        "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}].prefix` must be a string"
                     ));
                 }
             };
@@ -1971,7 +1973,7 @@ fn reject_unknown_keys(
     path: &str,
 ) -> Result<(), String> {
     if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("{path} contains unknown field '{unknown}'"));
+        return Err(format!("{path} contains unknown field {unknown:?}"));
     }
     Ok(())
 }
@@ -1986,7 +1988,7 @@ fn optional_top_level_bool(
         .map(|value| {
             value
                 .as_bool()
-                .ok_or_else(|| format!("{plugin}: '{field}' must be a boolean"))
+                .ok_or_else(|| format!("{plugin}: `{field}` must be a boolean"))
         })
         .transpose()
 }
@@ -2024,7 +2026,7 @@ fn optional_non_empty_string(
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "oauth2_introspection: 'provider[{provider_idx}].{field}' must not be empty"
+            "oauth2_introspection: `provider[{provider_idx}].{field}` must not be empty"
         ));
     }
     Ok(Some(trimmed.to_string()))
@@ -2040,7 +2042,7 @@ fn optional_provider_bool(
         .map(|value| {
             value.as_bool().ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: 'provider[{provider_idx}].{field}' must be a boolean"
+                    "oauth2_introspection: `provider[{provider_idx}].{field}` must be a boolean"
                 )
             })
         })
@@ -2059,12 +2061,12 @@ fn optional_nullable_string(
         return Ok(None);
     }
     let raw = value.as_str().ok_or_else(|| {
-        format!("oauth2_introspection: 'provider[{provider_idx}].{field}' must be a string or null")
+        format!("oauth2_introspection: `provider[{provider_idx}].{field}` must be a string or null")
     })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "oauth2_introspection: 'provider[{provider_idx}].{field}' must not be empty"
+            "oauth2_introspection: `provider[{provider_idx}].{field}` must not be empty"
         ));
     }
     Ok(Some(trimmed.to_string()))
@@ -2079,19 +2081,19 @@ fn parse_string_array(
         return Ok(Vec::new());
     };
     let arr = value.as_array().ok_or_else(|| {
-        format!("oauth2_introspection: 'provider[{provider_idx}].{field}' must be an array")
+        format!("oauth2_introspection: `provider[{provider_idx}].{field}` must be an array")
     })?;
     let mut values = Vec::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
         let raw = entry.as_str().ok_or_else(|| {
             format!(
-                "oauth2_introspection: 'provider[{provider_idx}].{field}[{idx}]' must be a string"
+                "oauth2_introspection: `provider[{provider_idx}].{field}[{idx}]` must be a string"
             )
         })?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(format!(
-                "oauth2_introspection: 'provider[{provider_idx}].{field}[{idx}]' must not be empty"
+                "oauth2_introspection: `provider[{provider_idx}].{field}[{idx}]` must not be empty"
             ));
         }
         values.push(trimmed.to_string());
@@ -2112,7 +2114,7 @@ fn ranged_provider_u64(
         .map(|value| {
             value.as_u64().ok_or_else(|| {
                 format!(
-                    "oauth2_introspection: 'provider[{provider_idx}].{field}' must be an unsigned integer"
+                    "oauth2_introspection: `provider[{provider_idx}].{field}` must be an unsigned integer"
                 )
             })
         })
@@ -2120,7 +2122,7 @@ fn ranged_provider_u64(
         .unwrap_or(default_value);
     if value < min || value > max {
         return Err(format!(
-            "oauth2_introspection: 'provider[{provider_idx}].{field}' must be between {min} and {max}"
+            "oauth2_introspection: `provider[{provider_idx}].{field}` must be between {min} and {max}"
         ));
     }
     Ok(value)
@@ -2143,7 +2145,7 @@ fn ranged_provider_usize(
         max as u64,
     )?;
     usize::try_from(value).map_err(|_| {
-        format!("oauth2_introspection: 'provider[{provider_idx}].{field}' is too large")
+        format!("oauth2_introspection: `provider[{provider_idx}].{field}` is too large")
     })
 }
 
@@ -2162,16 +2164,16 @@ fn parse_url_field(
         return Ok(None);
     };
     let raw = value.as_str().ok_or_else(|| {
-        format!("oauth2_introspection: 'provider[{provider_idx}].{field}' must be a URL string")
+        format!("oauth2_introspection: `provider[{provider_idx}].{field}` must be a URL string")
     })?;
     let url = raw.trim();
     if url.is_empty() {
         return Err(format!(
-            "oauth2_introspection: 'provider[{provider_idx}].{field}' must not be empty"
+            "oauth2_introspection: `provider[{provider_idx}].{field}` must not be empty"
         ));
     }
     let parsed = Url::parse(url).map_err(|e| {
-        format!("oauth2_introspection: 'provider[{provider_idx}].{field}' is invalid: {e}")
+        format!("oauth2_introspection: `provider[{provider_idx}].{field}` is invalid: {e}")
     })?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -2182,7 +2184,7 @@ fn parse_url_field(
         }
     }
     let hostname = hostname_from_parsed_url(&parsed).ok_or_else(|| {
-        format!("oauth2_introspection: 'provider[{provider_idx}].{field}' must include a hostname")
+        format!("oauth2_introspection: `provider[{provider_idx}].{field}` must include a hostname")
     })?;
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),

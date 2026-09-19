@@ -7,6 +7,11 @@
 /// The Ferrum Edge binary/crate version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[macro_use]
+mod udp_profile_macros;
+#[cfg(feature = "bench-udp-profile")]
+pub mod udp_profile;
+
 pub mod adaptive_buffer;
 pub mod adaptive_concurrency;
 pub mod admin;
