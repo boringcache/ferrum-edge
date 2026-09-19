@@ -189,6 +189,24 @@ pub enum CpGrpcAdmissionRejection {
     FirstRequestTimeout,
 }
 
+/// Preserve known CP budget guidance, but never trust arbitrary peer status
+/// text merely because the status code is RESOURCE_EXHAUSTED.
+pub(crate) fn admission_status_diagnostic(status: &tonic::Status) -> String {
+    for rejection in [
+        CpGrpcAdmissionRejection::TotalStreams,
+        CpGrpcAdmissionRejection::NamespaceStreams,
+        CpGrpcAdmissionRejection::PrincipalStreams,
+        CpGrpcAdmissionRejection::NodeStreams,
+        CpGrpcAdmissionRejection::NodeCardinality,
+    ] {
+        let known = rejection.into_native_status();
+        if status.message() == known.message() {
+            return known.message().to_string();
+        }
+    }
+    "CP gRPC stream admission refused (unrecognized details withheld)".to_string()
+}
+
 impl CpGrpcAdmissionRejection {
     /// Fixed-cardinality metric label. Never client-supplied.
     pub fn metric_reason(self) -> &'static str {
