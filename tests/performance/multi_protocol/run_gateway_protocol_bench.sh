@@ -77,6 +77,10 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
+H1_TRACE=none
+H1_TRACE_BUILDS=""
+h1_trace_pid=""
+h1_trace_output=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -93,6 +97,8 @@ while [[ $# -gt 0 ]]; do
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
+        --h1-trace) H1_TRACE="$2"; shift 2 ;;
+        --h1-trace-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -129,6 +135,15 @@ if [ -n "$H1_PROFILE" ]; then
         "$H1_PROFILE" "$PROTOCOL" "$PAIRS" "$DURATION" "$CONCURRENCY" \
         "$GATEWAYS" "$PAYLOAD_SIZES" "$BASELINE_IMAGE" "${FERRUM_EXTRA_ENV:-}" || exit 2
     [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+fi
+
+case "$H1_TRACE" in none|syscalls|cpu) ;; *) exit 2 ;; esac
+if [ "$H1_TRACE" != none ]; then
+    # One existing payload shard per bounded collector lifetime; all five shards
+    # remain required. Direct controls are never profiled.
+    [[ "$H1_PROFILE" == trace-calibration || "$H1_PROFILE" == cutoff ]] || exit 2
+    [[ "$PAYLOAD_SIZES" != *" "* && -d "$H1_TRACE_BUILDS" ]] || exit 2
+    [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 2
 fi
 
 # UDP protocols are fixed to 1 KB regardless of caller.
@@ -274,6 +289,7 @@ cleanup() {
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    h1_trace_stop
     for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
                 50052 50053 \
                 $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
@@ -436,6 +452,25 @@ start_ferrum() {
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
                 "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
+    fi
+    if [ "$H1_TRACE" != none ]; then
+        python3 - "$h1_trace_output/bind.json" "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
+            "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" "$gw" "$PAIR" "$PAYLOAD_SIZES" <<'PYTRACE'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = dict(runtime=sys.argv[2], config=sys.argv[3], sample=sys.argv[4], arm=sys.argv[5],
+             pair=int(sys.argv[6]), payload=int(sys.argv[7]))
+tmp = path.with_suffix('.tmp')
+tmp.write_text(json.dumps(value))
+tmp.replace(path)
+PYTRACE
+        local trace_wait=0
+        while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
+            [ ! -s "$h1_trace_output/stopped.json" ] || return 1
+            sleep 0.05
+            trace_wait=$(( trace_wait + 1 ))
+        done
+        [ -s "$h1_trace_output/ready.json" ] || return 1
     fi
     wait_for_gateway
 }
@@ -795,9 +830,41 @@ wait_for_gateway() {
     return 1
 }
 
+h1_trace_start() {
+    [ "$H1_TRACE" != none ] && [ "$gw" != direct ] || return 0
+    h1_trace_output="$OUTPUT_DIR/traces/${gw}_${PAYLOAD_SIZES}"
+    mkdir -p "$h1_trace_output"
+    local enabled=(--enabled)
+    if [ "$H1_PROFILE" = trace-calibration ] && [ "$gw" = ferrum-baseline ]; then enabled=(); fi
+    sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
+        python3 "$SCRIPT_DIR/h1_trace.py" supervise --mode "$H1_TRACE" "${enabled[@]}" \
+        --parent "$$" --builds "$H1_TRACE_BUILDS" --artifact-root "$(dirname "$H1_TRACE_BUILDS")" --output "$h1_trace_output" \
+        > "$h1_trace_output/supervisor.stdout" 2> "$h1_trace_output/supervisor.stderr" &
+    h1_trace_pid=$!
+    local attempts=0
+    while [ ! -s "$h1_trace_output/supervisor-ready.json" ] && [ "$attempts" -lt 600 ]; do
+        [ ! -s "$h1_trace_output/stopped.json" ] || return 1
+        sleep 0.05
+        attempts=$(( attempts + 1 ))
+    done
+    [ -s "$h1_trace_output/supervisor-ready.json" ]
+}
+
+h1_trace_stop() {
+    if [ -n "$h1_trace_pid" ]; then
+        touch "$h1_trace_output/stop"
+        # Supervisor enforces its own 300s bound and kills/reaps owned children;
+        # decoder bounds are additional finite teardown work, never measurement.
+        wait "$h1_trace_pid" || true
+        h1_trace_pid=""
+        h1_trace_output=""
+    fi
+}
+
 stop_gateway() {
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    h1_trace_stop
     GATEWAY_CID=""
     REDIS_CID=""
     sleep 2
@@ -961,7 +1028,7 @@ run_bench() {
         fi
     fi
 
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ "$H1_TRACE" != none ]; then
         # Preserve even partial stdout before error placeholders or stamping.
         cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"
         printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
@@ -1084,6 +1151,10 @@ PYEOF
             BASELINE_IMAGE=$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')
         fi
     fi
+    if [ "$H1_PROFILE" = trace-calibration ] && [ "$FERRUM_IMAGE" != "$BASELINE_IMAGE" ]; then
+        echo 'external calibration requires the identical binary/image in both arms' >&2
+        exit 2
+    fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"
@@ -1108,6 +1179,7 @@ PYEOF
                     wait "$BACKEND_PID" 2>/dev/null || true
                 fi
                 start_backend
+                h1_trace_start || { stop_gateway; continue; }
                 case "$gw" in
                     direct) ;;
                     ferrum|ferrum-exp-*)

@@ -601,4 +601,5 @@ SEC("tp_btf/sched_process_exit") int BPF_PROG(p_exit, struct task_struct *task)
 {
     process_event(task, PROCESS_DEATH); return 0;
 }
+#include "h1_syscalls.bpf.h"
 char LICENSE[] SEC("license") = "GPL";

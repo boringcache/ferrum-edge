@@ -162,7 +162,7 @@ def validate_selection(mode, protocol, pairs, duration, workers, gateways, sizes
                 "http1-tls", "1", "30", "200", "ferrum", "5242880", "", ""):
             raise ValueError("H1 diagnostic requires one pass, 5 MiB, 50 scaled workers, 30 seconds")
         return
-    if mode not in ("calibration", "cutoff") or protocol != "http1-tls":
+    if mode not in ("calibration", "cutoff", "trace-calibration") or protocol != "http1-tls":
         raise ValueError("H1-only calibration/cutoff selection required")
     if (pairs, duration, workers, gateways) != ("4", "15", "200", "ferrum") or extra:
         raise ValueError("H1 profile requires four pairs, 15 seconds, 200 scaled workers, ferrum only")
@@ -170,7 +170,7 @@ def validate_selection(mode, protocol, pairs, duration, workers, gateways, sizes
     if not selected or len(set(selected)) != len(selected) or any(
             size not in MANIFEST["payload_sizes"] for size in selected):
         raise ValueError("invalid H1 payload subset")
-    if bool(baseline) != (mode == "calibration"):
+    if bool(baseline) != (mode in ("calibration", "trace-calibration")):
         raise ValueError("only calibration requires the identical-revision observer-off image")
 
 
@@ -222,8 +222,8 @@ def report(directory, mode):
     manifest["gateways"] = expected_gateways
     report = dict(mode=mode, manifest_issues=manifest_issues, observations=[],
                   traffic_complete=True, profiles_complete=True,
-                  actual_syscalls="unavailable: no collector implemented",
-                  cpu_stacks="unavailable: no collector implemented",
+                  actual_syscalls="separate trace manifest; never inferred from internal counters",
+                  cpu_stacks="separate trace manifest; never inferred from process CPU",
                   overhead="raw same-revision on/off pairs; no guessed subtraction",
                   claims="no performance result asserted by this implementation")
     if manifest_issues:
@@ -260,8 +260,12 @@ def report(directory, mode):
                         report["profiles_complete"] = False
                 else:
                     row["profile"] = dict(expected=False, reason="direct or observer-off control")
+                from h1_trace_contract import load_trace
+                row["external_trace"] = load_trace(folder / "traces" / f"{gateway}_{size}" / "trace-manifest.json")
                 report["observations"].append(row)
-    report["fully_measured_comparison_eligible"] = report["traffic_complete"] and report["profiles_complete"]
+    report["internal_comparison_eligible"] = report["traffic_complete"] and report["profiles_complete"]
+    report["fully_measured_comparison_eligible"] = False
+    report["missing_dimensions_remain_open"] = ["complete native allocation/copy coverage", "separately calibrated syscall and CPU dimensions", "complete unwinding"]
     (directory / "h1_profile_report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 

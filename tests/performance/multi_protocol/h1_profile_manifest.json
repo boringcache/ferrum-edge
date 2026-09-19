@@ -31,10 +31,30 @@
     "cutoff": {
       "ferrum": "observer on cutoff 0",
       "ferrum-exp-cutoff-one": "observer on cutoff 1"
+    },
+    "trace-calibration": {
+      "ferrum": "internal observer on cutoff 0 external observer on",
+      "ferrum-baseline": "same exact image/internal observer/cutoff, external observer off"
     }
   },
   "direct": "repeated for every pair",
-  "actual_syscalls": "not collected; separate intrusive pass remains open",
-  "sampled_cpu_stacks": "not collected",
-  "streaming_regression": "required before any optimization; this branch changes no forwarding policy"
+  "actual_syscalls": "opt-in hosted syscalls lane; per-repeat explicit total/socket/lifecycle completeness",
+  "sampled_cpu_stacks": "opt-in separate hosted cpu-clock:u 99 Hz DWARF8192 lane; matching ELF/DSOs",
+  "streaming_regression": "required before any optimization; this branch changes no forwarding policy",
+  "external_trace": {
+    "modes": [
+      "none",
+      "syscalls",
+      "cpu"
+    ],
+    "default": "none",
+    "one_payload_per_shard": true,
+    "same_binary_external_calibration": true,
+    "pairs": 4,
+    "parents": {
+      "h1": "a798c0bac68151fbe860e3cb48843cbd434c0f84",
+      "h3": "d19abaa3c4fbb40af6136cb577a1ed7e82bf8529"
+    },
+    "fully_profiled_with_missing_dimensions": false
+  }
 }
