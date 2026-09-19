@@ -20,7 +20,7 @@ def supported_results():
                  start_ns=1, netns=2, links=1), error=None, returncode=0, capture_complete=True,
                  final=dict(phase='final', start_ns=1, end_ns=50, rows=[], losses=[0] * len(LOSSES),
                             map_read_failures=0, pending_tx=0, pending_rx=0, pending_selector=0,
-                            pending_detach=0, ring_drops=0),
+                            pending_detach=0, ring_drops=0, verifier_log_truncated=False),
                  termination=dict(phase='termination', requested_stop=True, signal=False,
                                   forced_or_parent_death=False, snapshot_failures=0,
                                   lifecycle_omitted=0, checkpoints_omitted=0)) for f in FAMILIES]
@@ -125,12 +125,25 @@ class LiveRuntimeTests(unittest.TestCase):
             self.assertTrue(observer_issues(bad), (field, value))
         self.assertTrue(observer_issues(results[:-1]))
         for field, value in [('losses', []), ('map_read_failures', 1), ('map_read_failures', None),
-                             ('start_ns', 'bad'), ('pending_tx', False)]:
+                             ('start_ns', 'bad'), ('pending_tx', False),
+                             ('verifier_log_truncated', True), ('verifier_log_truncated', None),
+                             ('verifier_log_truncated', 0)]:
             bad = copy.deepcopy(results)
             bad[0]['final'][field] = value
             self.assertTrue(observer_issues(bad), (field, value))
         for row in ([], {}, {'phase': 'unknown'}, dict(phase='ready', status='bogus')):
             with self.assertRaises(ValueError): validate_observer_record(row, 'tx')
+
+    def test_attachment_load_error_survives_valid_schema_and_admission(self):
+        results = supported_results()
+        attachment = next(r for r in results if r['family'] == 'attach')
+        for truncated in (False, True):
+            attachment.update(ready=dict(phase='ready', status='error', reason='load',
+                                        errno=28, verifier_log_truncated=truncated),
+                              final=None, termination=None, returncode=1)
+            validate_observer_record(attachment['ready'], 'attach')
+            self.assertTrue(any(i.startswith('attach:') for i in observer_issues(results)))
+            self.assertEqual(attachment['ready']['errno'], 28)
 
     def test_missing_observer_resource_capture_is_an_error(self):
         observer = live.Observer.__new__(live.Observer)

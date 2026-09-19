@@ -11,15 +11,62 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import hosted
+from evidence import LOSSES
 
 
 class HostedTests(unittest.TestCase):
+    def test_attachment_enospc_is_an_error_even_when_fixture_succeeds(self):
+        for truncated in (False, True):
+            with self.subTest(truncated=truncated), tempfile.TemporaryDirectory() as directory:
+                ready = dict(phase='ready', status='error', reason='load', errno=28,
+                             verifier_log_truncated=truncated)
+                process = Mock(returncode=1, args=['observer'])
+                process.poll.return_value = 1
+                fixture = dict(returncode=0, truncated=False,
+                               stdout=json.dumps(dict(mode='classic-select', status='supported',
+                                   start_ns=10, end_ns=20, operations=[{'op': 'selection'}],
+                                   sockets=[{'cookie': 7}])))
+                with (patch('hosted.subprocess.Popen', return_value=process),
+                      patch('hosted.readiness', return_value=ready),
+                      patch('hosted.command', return_value=fixture),
+                      patch('hosted.read_file', return_value=dict(text='load -28', truncated=truncated))):
+                    case = hosted.observer_case(Path(directory), 'attach', 'classic-select')
+                retained = json.loads((Path(directory) / 'attach-classic-select-512-normal.json').read_text())
+                self.assertEqual(retained, case)
+                self.assertEqual(case['status'], 'error')
+                self.assertEqual(case['reason'], 'load')
+                self.assertEqual(case['ready'], ready)
+                self.assertEqual(case['fixture_process'], fixture)
+
+    def test_final_log_truncation_cannot_pass_fixture_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ready = dict(phase='ready', status='supported', family='attach',
+                         start_ns=1, netns=2, links=1)
+            final = dict(phase='final', start_ns=1, end_ns=30, rows=[],
+                         losses=[0] * len(LOSSES),
+                         map_read_failures=0, pending_tx=0, pending_rx=0, pending_selector=0,
+                         pending_detach=0, ring_drops=0, verifier_log_truncated=True)
+            process = Mock(returncode=0, args=['observer'])
+            process.poll.return_value = 0
+            process.communicate.return_value = (json.dumps(final).encode() + b'\n', None)
+            fixture = dict(returncode=0, truncated=False,
+                           stdout=json.dumps(dict(mode='classic-select', status='supported',
+                               start_ns=10, end_ns=20, operations=[{'op': 'selection'}],
+                               sockets=[{'cookie': 7}])))
+            with (patch('hosted.subprocess.Popen', return_value=process),
+                  patch('hosted.readiness', return_value=ready),
+                  patch('hosted.command', return_value=fixture)):
+                case = hosted.observer_case(Path(directory), 'attach', 'classic-select')
+            self.assertEqual(case['status'], 'error')
+            self.assertEqual(case['detail'], 'observer diagnostics incomplete')
+            self.assertEqual(case['snapshots'], [final])
+
     def test_classic_unavailability_cannot_hide_fixture_failure(self):
         ready = dict(phase='ready', status='unsupported', errno=2, verifier_log_truncated=False,
                      reason='missing_run_bpf_filter_execution_site')
-        for fixture_status, code, expected in [('supported', 0, 'unsupported'),
-                                                ('error', 1, 'error'), ('malformed', 0, 'error')]:
-            with self.subTest(fixture_status=fixture_status), tempfile.TemporaryDirectory() as directory:
+        for fixture_status, code, truncated, expected in [('supported', 0, False, 'unsupported'),
+                ('supported', 0, True, 'error'), ('error', 1, False, 'error'), ('malformed', 0, False, 'error')]:
+            with self.subTest(fixture_status=fixture_status, truncated=truncated), tempfile.TemporaryDirectory() as directory:
                 process = Mock(returncode=0, args=['observer'])
                 process.poll.return_value = 0
                 fixture = dict(returncode=code, truncated=False,
@@ -28,7 +75,8 @@ class HostedTests(unittest.TestCase):
                                    operations=[{'op': 'selection'}], sockets=[{'cookie': 7}])))
                 with (patch('hosted.subprocess.Popen', return_value=process),
                       patch('hosted.readiness', return_value=ready),
-                      patch('hosted.command', return_value=fixture)):
+                      patch('hosted.command', return_value=fixture),
+                      patch('hosted.read_file', return_value=dict(text='', truncated=truncated))):
                     case = hosted.observer_case(Path(directory), 'classic', 'classic-select')
                 self.assertEqual(case['status'], expected)
                 self.assertEqual(case['ready'], ready)

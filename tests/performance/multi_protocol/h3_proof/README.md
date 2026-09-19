@@ -147,6 +147,47 @@ and [reuseport lifecycle](https://github.com/torvalds/linux/blob/v6.17/net/core/
 The running hosted BTF/verifier/fixtures, rather than a source version assumption,
 determine availability.
 
+### Attachment load diagnostics after `5c8cb5bf`
+
+Both hosted [preflight 35409593353](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35409593353)
+and [live prepare 35409593373](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35409593373)
+failed loading `a_attach` with `-28` (`ENOSPC`) on `6.17.0-1022-azure`.
+The retained attachment fixtures successfully attached/replaced/detached the real
+classic filter. The observer reached 4254 processed instructions, 150 total
+states and 133 peak states; only the verifier statistics remained in stderr.
+The existing `verifier_log_truncated=false` described the libbpf print callback,
+not the kernel log's maximum size during verification. It did not establish that
+the kernel log fit. Neither filesystem exhaustion nor unsupported attachment is
+established by this failure.
+
+Linux v6.17's [log implementation](https://github.com/torvalds/linux/blob/v6.17/kernel/bpf/log.c)
+keeps `len_max` across log rewinds and returns `ENOSPC` when that maximum exceeds
+the supplied buffer. The [verifier](https://github.com/torvalds/linux/blob/v6.17/kernel/bpf/verifier.c)
+rewinds successful paths at level 1, then appends statistics; log finalization can
+also replace an earlier error. Thus a short final log can still overflow.
+[libbpf 1.3](https://github.com/libbpf/libbpf/blob/v1.3.0/src/libbpf.c), matching the
+retained package, leaves a caller-supplied buffer fixed and does not expose
+`log_true_size` through its object API. This is the source-backed explanation to
+test on the next head, not a claim that the Azure kernel's exact maximum was
+measured or that every subsequent verifier/JIT/attach stage passed.
+
+Only `a_attach`, in either family that loads it, now requests `BPF_LOG_STATS`
+(`4`): errors and verification/stack statistics without instruction-path logs.
+The 256 KiB buffer, probe bytecode, typed cookie context, subprograms, 64-instruction
+digest bound, maps and fixture remain unchanged. The loader retains the selected
+logging mode, object load result, final-buffer byte count and final kernel log on
+success as well as failure. There is no added load retry. A successful real
+attachment fixture after this single logging change supports the log-overflow
+diagnosis; a remaining rejection retains its errno and diagnostic text. No
+instruction bytes from the observed classic program or packet payload are exported.
+
+`ENOSPC` now conservatively marks verifier diagnostics incomplete, even when the
+final string is short; this flag is not an errno reclassification. Snapshot
+validation requires the emitted boolean, and fixture/live admission rejects
+incomplete final diagnostics. Contract regressions retain error readiness and
+the original load errno alongside successful fixtures. These changes still need
+hosted compilation, real fixtures, Python contracts and the full four-arm smoke.
+
 ## Bounds and remaining evidence limits
 
 A live arm is limited to 300 seconds, at most 64 snapshots including final, and

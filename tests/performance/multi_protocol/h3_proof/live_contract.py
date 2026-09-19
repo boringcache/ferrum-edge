@@ -130,6 +130,8 @@ def validate_observer_record(row, family):
                   'pending_selector', 'pending_detach', 'ring_drops')
         if not all(natural(row.get(k)) for k in fields):
             raise ValueError('invalid_observer_snapshot_diagnostic')
+        if type(row.get('verifier_log_truncated')) is not bool:
+            raise ValueError('invalid_observer_snapshot_log_diagnostic')
         losses = row.get('losses')
         if (not isinstance(losses, list) or len(losses) != len(LOSSES)
                 or not all(natural(v) for v in losses) or not isinstance(row.get('rows'), list)):
@@ -193,6 +195,8 @@ def observer_issues(results):
                     or final['map_read_failures'] or stop['snapshot_failures']
                     or not stop['requested_stop'] or stop['signal'] or stop['forced_or_parent_death']):
                 raise ValueError('observer_final_capture_failed')
+            if final['verifier_log_truncated']:
+                raise ValueError('observer_diagnostics_incomplete')
         except (KeyError, TypeError, ValueError) as error:
             issues.append(f'{family}:{error}')
     return issues

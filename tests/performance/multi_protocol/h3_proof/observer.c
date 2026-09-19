@@ -28,6 +28,9 @@ static unsigned int lifecycle_rows, lifecycle_omitted;
 static int rx_argc;
 static volatile sig_atomic_t stopping;
 static char verifier[256 * 1024];
+// Linux include/linux/bpf_verifier.h: statistics without per-instruction traces.
+// This is a logging flag, not a verifier/program/resource limit.
+#define ATTACH_LOG_STATS 4U
 static size_t log_bytes;
 static bool log_truncated;
 
@@ -366,6 +369,19 @@ int main(int argc, char **argv)
         if ((!strcmp(name, "r_inner4") && rx_argc != 4) ||
             (!strcmp(name, "r_inner5") && rx_argc != 5)) enabled = false;
         bpf_program__set_autoload(prog, enabled);
+        if (enabled && !strcmp(name, "a_attach")) {
+            // Level 1 rewinds successful paths but retains their log high-water
+            // mark. That can return ENOSPC with only final statistics visible.
+            // Keep the complete probe and fixed buffer; request errors + stats
+            // for this program in both the attach and classic families.
+            int error = bpf_program__set_log_level(prog, ATTACH_LOG_STATS);
+            if (error) {
+                bpf_object__close(obj);
+                return unavailable("error", "attachment_log_config", -error);
+            }
+            fprintf(stderr, "verifier program=a_attach log_level=%u buffer_bytes=%zu\n",
+                    ATTACH_LOG_STATS, sizeof(verifier));
+        }
     }
     struct bpf_map *map = bpf_object__find_map_by_name(obj, "counts");
     if (!map || bpf_map__set_max_entries(map, (__u32)atoi(argv[4]))) return unavailable("error", "map_config", errno);
@@ -373,8 +389,18 @@ int main(int argc, char **argv)
     if (live && bpf_map__set_max_entries(bpf_object__find_map_by_name(obj, "lifecycle"), 512 * 1024))
         return unavailable("error", "ring_budget", errno);
     int err = bpf_object__load(obj);
+    size_t verifier_bytes = strnlen(verifier, sizeof(verifier));
+    // libbpf's high-level object API does not expose log_true_size. ENOSPC
+    // therefore cannot certify complete diagnostics, even for a short string.
+    // Conservatively flag incomplete evidence without changing errno/status.
+    if (err == -ENOSPC || verifier_bytes == sizeof(verifier)) log_truncated = true;
+    fprintf(stderr, "object_load result=%d kernel_log_retained_bytes=%zu buffer_bytes=%zu "
+            "log_true_size=unavailable diagnostics_incomplete=%s\n",
+            err, verifier_bytes, sizeof(verifier), log_truncated ? "true" : "false");
+    // The shared buffer belongs to the last kernel load attempt, not necessarily
+    // the attachment program. Retain it on success too, including stack stats.
+    fwrite(verifier, 1, verifier_bytes, stderr);
     if (err) {
-        fwrite(verifier, 1, strnlen(verifier, sizeof(verifier)), stderr);
         bpf_object__close(obj);
         return unavailable(err == -EOPNOTSUPP ? "unsupported" : "error", "load", -err);
     }

@@ -268,6 +268,7 @@ def observer_case(out, family, mode, capacity=512, fault="normal", unprivileged=
             assert process.returncode == 0, "observer map read or process failure"
             assert fixture["returncode"] == 0, "fixture deterministic failure"
             final = next(row for row in case["snapshots"] if row["phase"] == "final")
+            assert not final['verifier_log_truncated'], 'observer diagnostics incomplete'
             case["assessment"] = assess(ready, final, case["fixture"], family, capacity == 1)
             case["status"] = case["assessment"]["status"]
     except (AssertionError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, StopIteration) as error:
@@ -284,6 +285,10 @@ def observer_case(out, family, mode, capacity=512, fault="normal", unprivileged=
         text = read_file(log, 768 * 1024)
         log.write_text(scrub(text.get("text", "")), encoding="utf-8")
         case["diagnostics_truncated"] = text.get("truncated", False)
+        if text.get('error') or case['diagnostics_truncated']:
+            # Keep any original load/fixture failure and its errno in ready.
+            case['status'] = 'error'
+            case.setdefault('reason', 'observer_diagnostics_incomplete')
         write(out / f"{name}.json", case)
     return case
 
