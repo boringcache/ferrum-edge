@@ -883,7 +883,12 @@ run_bench() {
     if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" \
-            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json"
+            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
+    fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
     fi
     if [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "${bench_wallclock}s" \
@@ -902,6 +907,10 @@ run_bench() {
             --payload-size "$payload" \
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
+    fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
     fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
@@ -922,7 +931,8 @@ run_bench() {
     cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
         if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json"
+            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json" \
+                --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
         fi
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
@@ -1110,7 +1120,8 @@ PYEOF
                 fi
                 if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$gw" != direct ]; then
                     # Explicit trigger/HTTP ack/log-fence smoke before offered work.
-                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json"
+                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" \
+                        --identity "$gw" "$PROTOCOL" 0 "$PAIR" "$HOST_ID"
                     docker logs --timestamps "$GATEWAY_CID" \
                         > "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.log" 2>&1 || true
                     python3 "$SCRIPT_DIR/h2_guard/verify.py" smoke \

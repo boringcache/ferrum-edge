@@ -107,13 +107,40 @@ no trigger retries. The smoke checks its HTTP ack against the log fence before
 offered work. Failure retains evidence and leaves missing samples invalid.
 No workload timeout, retry policy, concurrency or campaign duration changes.
 
+Schema-2 samples must identify the manifest's host and their canonical
+pair/gateway/protocol/payload cell, with 200 requested/effective workers and
+15 seconds of offered measurement. Setup, warmup, measurement and drain
+timings are required, finite, typed and ordered. HTTP/2 also requires its
+existing transport-close interval; gRPC has no graceful-close timestamp and
+none is inferred. Request errors and transport-close timeouts remain diagnostic
+evidence, never permission for a performance claim. Samples that never reach
+measurement remain retained but cannot establish bounded capture completeness.
+
+The harness writes a separate `*_invocation.json` immediately before launching
+the existing client command and immediately after it returns, retaining its
+exit code. This records the whole invocation, including output/teardown after
+measurement and drain. Before/after snapshots and the invocation carry the
+same host/pair/gateway/protocol/payload identity; the process's shared smoke
+uses payload zero. Each boundary requires schema 2 and finite ordered start,
+sink-observation and end times. The before capture must finish before launch,
+the after capture must start after return, and the reported client phase
+interval must fit inside that envelope. These are harness wall-clock bounds,
+not precise DATA timestamps or new connection/cross-hop identities. Clock
+reversal or inconsistent phase timing rejects completeness.
+
 The HTTP response returns the generation's final-issued sequence separately
 from the tracing sink. The collector requires matching fence delivery, every
 sequence through it, each promised tail in order, every enumerated live summary,
 and successful client-role DATA progress between boundaries. It checks both
 log sinks' drops, health, queued records/bytes/reservations, write/flush failures,
 shutdown timeouts and incomplete shutdown records. No missing counter means
-zero. The index recomputes annotations from retained raw files and hashes them.
+zero. Counters must be nonnegative JSON integers, excluding booleans, fractions
+and nonfinite numbers. The index recomputes annotations from retained raw files
+and hashes them, including the manifest and invocation envelopes. It always
+writes the full expected 12-cell HTTP/2 or 24-cell gRPC matrix before reporting
+validation failure. Missing/unparseable/nonobject samples retain placeholders,
+available input hashes, and per-row causes; a corrupt first row or raw artifact
+does not prevent reconciliation of later rows and remaining raw inputs.
 
 `bounded_capture_complete` certifies only that enumerated boundary evidence.
 `full_transition_history_complete` is false on wrap or omitted terminal history.

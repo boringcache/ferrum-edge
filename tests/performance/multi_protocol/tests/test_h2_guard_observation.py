@@ -13,7 +13,10 @@ sys.path.insert(0, str(ROOT / "h2_guard"))
 from benchmark_validity import sample_issues
 from experiment_arms import load_experiment
 from h2_diagnostics import parse_gauges
-from h2_guard_observation import FIELDS, TAIL_FIELDS, annotate, parse_line, parse_ack, sink_problems
+from h2_guard_observation import (
+    FIELDS, GATEWAYS, TAIL_FIELDS, annotate, capture_identity, expected_sample,
+    parse_line, parse_ack, sink_problems,
+)
 from prepare import SHA256, extract_source, patch_source
 from verify import verify_campaign
 from lint import compare
@@ -43,8 +46,45 @@ def usage():
     return dict(timeline=[dict(h2_gauges=dict(unix_secs=1789689604, gauges=gauges))])
 
 
+def manifest(protocol="http2"):
+    return dict(sample_schema=2, host_id="fixture-host", pairs=4, gateways=list(GATEWAYS),
+                payload_sizes=[71680] if protocol == "http2" else [10240, 71680],
+                h2_observation_enabled=True)
+
+
+def sample_fixture(gateway="ferrum", protocol="http2", pair=1, size=71680):
+    sample = expected_sample(manifest(protocol), protocol, pair, gateway, size)
+    # Synthetic harness/PhaseReport metadata around the unchanged actual h2
+    # export. These are contract fixtures, not measured campaign/frame times.
+    start = 1789689600 + (pair - 1) * 1000 + (GATEWAYS.index(gateway) - 1) * 100
+    if protocol == "grpcs" and size == 71680:
+        start += 30
+    sample.update(total_errors=148, phases=dict(
+        setup_start_unix_secs=start, setup_start_monotonic_secs=0,
+        warmup_start_monotonic_secs=1, measurement_start_monotonic_secs=3,
+        measurement_start_unix_secs=start + 3, drain_start_monotonic_secs=18,
+        setup_secs=1, warmup_secs=1, barrier_secs=1, measurement_secs=15,
+        measurement_elapsed_secs=15, drain_secs=3,
+        transport_close_start_monotonic_secs=21 if protocol == "http2" else None,
+        transport_close_secs=1 if protocol == "http2" else 0,
+        transport_close_timed_out=False, timed_out=False))
+    return sample
+
+
+def expected_for(sample):
+    protocol = "http2" if sample["protocol"] == "HTTP/2" else "grpcs"
+    return expected_sample(manifest(protocol), protocol, sample["pair"], sample["gateway"], sample["payload_size"])
+
+
+def invocation_fixture(sample):
+    start = sample["phases"]["setup_start_unix_secs"]
+    return dict(schema=2, identity=capture_identity(sample), start_unix_secs=start - 0.5,
+                end_unix_secs=start + 23, exit_code=0)
+
+
 class GuardObservationTests(unittest.TestCase):
-    def producer_contract(self):
+    def producer_contract(self, sample=None):
+        sample = sample or sample_fixture()
         path = os.environ.get("H2_GUARD_PRODUCER_CONTRACT")
         if path is None:
             self.skipTest("actual h2 producer export is required in the dedicated hosted lane")
@@ -59,15 +99,22 @@ class GuardObservationTests(unittest.TestCase):
                                  fields=dict(message=message))) for message in messages]
         boundaries = {}
         gauges = usage()["timeline"][0]["h2_gauges"]["gauges"]
-        for label, ack in zip(("smoke", "before", "after"), acks):
-            boundaries[label] = dict(raw_ack=ack, ack=parse_ack(ack), errors=[],
-                start_unix_secs=1789689604, end_unix_secs=1789689604,
-                sink_samples=[dict(unix_secs=1789689604, gauges=gauges)])
+        start = sample["phases"]["setup_start_unix_secs"]
+        smoke = start - (30 if sample["protocol"] == "gRPC" and sample["payload_size"] == 71680 else 0) - 3
+        for label, ack, at in zip(("smoke", "before", "after"), acks, (smoke, start - 1, start + 24)):
+            identity = capture_identity(sample)
+            if label == "smoke":
+                identity["payload_size"] = 0
+            boundaries[label] = dict(schema=2, identity=identity, raw_ack=ack, ack=parse_ack(ack), errors=[],
+                start_unix_secs=at, end_unix_secs=at + 0.1,
+                sink_samples=[dict(unix_secs=at + 0.05, gauges=gauges)])
         return lines, boundaries
 
-    def observe_contract(self, lines, boundaries):
-        sample = dict(gateway="ferrum", phases={})
-        annotate(sample, usage(), lines, boundaries)
+    def observe_contract(self, lines, boundaries, sample=None, invocation=None, expected=None):
+        sample = sample if sample is not None else sample_fixture()
+        annotate(sample, usage(), lines, boundaries,
+                 invocation if invocation is not None else invocation_fixture(sample_fixture()),
+                 expected if expected is not None else expected_for(sample_fixture()))
         return sample["h2_guard_observation"]
 
     def test_actual_producer_live_fixed_failure_refund_and_wrap_contract(self):
@@ -154,36 +201,214 @@ class GuardObservationTests(unittest.TestCase):
             self.assertTrue(sink_problems(missing, drained=True))
         gauges["log_stdout_healthy"] = 0
         self.assertIn("unhealthy_log_sink", sink_problems(gauges))
+        for bad in (True, False, float("nan"), float("inf"), -float("inf"), 0.0, 0.5, "0", None):
+            for key in ("log_stdout_healthy", "log_dropped_stdout_saturation", "log_stdout_queued_bytes"):
+                with self.subTest(key=key, value=bad):
+                    changed = dict(usage()["timeline"][0]["h2_gauges"]["gauges"], **{key: bad})
+                    self.assertIn("invalid_log_sink_counter", sink_problems(changed))
 
-    def test_actual_producer_index_reconciles_raw_files_and_rejects_missing_ack(self):
+    def test_actual_producer_requires_canonical_schema_identity_and_workload(self):
         lines, boundaries = self.producer_contract()
-        # Reuse a real producer transcript to exercise index file plumbing;
-        # these temporary cells are not claimed to be a measured campaign.
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for pair in range(1, 5):
-                cell = root / "pairs" / f"pair_{pair:03d}"
-                diagnostics = cell / "diagnostics"
-                diagnostics.mkdir(parents=True)
-                for gateway in ("direct", "ferrum", "ferrum-exp-fixed"):
-                    sample = dict(gateway=gateway, phases={}, effective_concurrency=200, total_errors=148)
-                    annotate(sample, usage(), lines, boundaries)
-                    (cell / f"{gateway}_http2_71680.json").write_text(json.dumps(sample))
+        for key, value in (("sample_schema", 1), ("sample_schema", True), ("gateway", "ferrum-exp-fixed"),
+                           ("pair", 2), ("pair", True), ("host_id", "other-host"),
+                           ("protocol", "gRPC"), ("payload_size", 10240),
+                           ("concurrency", 199), ("effective_concurrency", 199), ("duration_secs", 14)):
+            with self.subTest(key=key, value=value):
+                sample = sample_fixture()
+                sample[key] = value
+                result = self.observe_contract(lines, boundaries, sample)
+                self.assertFalse(result["bounded_capture_complete"])
+                self.assertIn("sample_identity_or_workload_mismatch", result["capture_errors"])
+                self.assertTrue(any(row["event"] == 1 for row in result["events"]))
+        for key in expected_for(sample_fixture()):
+            sample = sample_fixture()
+            del sample[key]
+            self.assertFalse(self.observe_contract(lines, boundaries, sample)["bounded_capture_complete"])
+
+    def test_actual_producer_rejects_missing_malformed_nonfinite_and_reversed_phases(self):
+        lines, boundaries = self.producer_contract()
+        for phases in (None, {}, [], "phases"):
+            sample = dict(sample_fixture(), phases=phases)
+            self.assertIn("missing_or_malformed_phases", self.observe_contract(lines, boundaries, sample)["capture_errors"])
+        for key in ("setup_start_unix_secs", "measurement_start_unix_secs", "setup_start_monotonic_secs",
+                    "warmup_start_monotonic_secs", "measurement_start_monotonic_secs", "drain_start_monotonic_secs",
+                    "measurement_secs", "drain_secs", "transport_close_start_monotonic_secs", "transport_close_secs"):
+            for bad in (None, True, "1", float("nan"), float("inf"), -1):
+                with self.subTest(key=key, value=bad):
+                    sample = sample_fixture()
+                    sample["phases"][key] = bad
+                    self.assertFalse(self.observe_contract(lines, boundaries, sample)["bounded_capture_complete"])
+        for key, bad in (("warmup_start_monotonic_secs", 4), ("drain_start_monotonic_secs", 17),
+                         ("transport_close_start_monotonic_secs", 20), ("measurement_secs", 14)):
+            sample = sample_fixture()
+            sample["phases"][key] = bad
+            self.assertFalse(self.observe_contract(lines, boundaries, sample)["bounded_capture_complete"])
+
+    def test_actual_producer_requires_typed_ordered_boundary_and_whole_invocation(self):
+        lines, boundaries = self.producer_contract()
+        for label in ("smoke", "before", "after"):
+            for key in ("schema", "start_unix_secs", "end_unix_secs"):
+                for bad in (None, True, "2", float("nan"), float("inf"), -1):
+                    with self.subTest(label=label, key=key, value=bad):
+                        changed = copy.deepcopy(boundaries)
+                        changed[label][key] = bad
+                        self.assertFalse(self.observe_contract(lines, changed)["bounded_capture_complete"])
+            changed = copy.deepcopy(boundaries)
+            changed[label]["end_unix_secs"] = changed[label]["start_unix_secs"] - 1
+            self.assertFalse(self.observe_contract(lines, changed)["bounded_capture_complete"])
+            for key, bad in (("gateway", "ferrum-exp-fixed"), ("pair", 2), ("payload_size", 10240),
+                             ("host_id", "other-host"), ("protocol", "gRPC")):
+                changed = copy.deepcopy(boundaries)
+                changed[label]["identity"][key] = bad
+                self.assertFalse(self.observe_contract(lines, changed)["bounded_capture_complete"])
+        # After measurement but before drain, close, or client process return.
+        for offset in (19, 21.5, 22.5):
+            changed = copy.deepcopy(boundaries)
+            at = sample_fixture()["phases"]["setup_start_unix_secs"] + offset
+            changed["after"].update(start_unix_secs=at, end_unix_secs=at + 0.1)
+            changed["after"]["sink_samples"][0]["unix_secs"] = at + 0.05
+            self.assertIn("early_after_snapshot", self.observe_contract(lines, changed)["capture_errors"])
+        for key, bad in (("schema", True), ("start_unix_secs", float("nan")),
+                         ("end_unix_secs", 0), ("exit_code", False)):
+            invocation = invocation_fixture(sample_fixture())
+            invocation[key] = bad
+            self.assertFalse(self.observe_contract(lines, boundaries, invocation=invocation)["bounded_capture_complete"])
+        self.assertFalse(self.observe_contract(lines, boundaries, invocation={})["bounded_capture_complete"])
+
+    def write_campaign(self, root, protocol):
+        (root / "manifest.json").write_text(json.dumps(manifest(protocol)))
+        for pair in range(1, 5):
+            cell = root / "pairs" / f"pair_{pair:03d}"
+            diagnostics = cell / "diagnostics"
+            diagnostics.mkdir(parents=True)
+            for gateway in GATEWAYS:
+                for size in manifest(protocol)["payload_sizes"]:
+                    sample = sample_fixture(gateway, protocol, pair, size)
+                    lines, boundaries = self.producer_contract(sample)
+                    invocation = invocation_fixture(sample)
+                    annotate(sample, usage(), lines, boundaries, invocation, expected_for(sample))
+                    (cell / f"{gateway}_{protocol}_{size}.json").write_text(json.dumps(sample))
+                    prefix = f"{gateway}_{size}"
+                    (diagnostics / (prefix + "_invocation.json")).write_text(json.dumps(invocation))
                     if gateway == "direct":
                         continue
-                    prefix = gateway + "_71680"
                     (diagnostics / (prefix + ".log")).write_text("\n".join(lines) + "\n")
                     (diagnostics / (prefix + "_process_usage.json")).write_text(json.dumps(usage()))
                     for label, boundary in boundaries.items():
                         name = (gateway if label == "smoke" else prefix) + "_guard_" + label + ".json"
                         (diagnostics / name).write_text(json.dumps(boundary))
-            verify_campaign(root, "http2")
-            report = json.loads((root / "guard-evidence-index.json").read_text())
-            self.assertEqual(len(report["samples"]), 12)
-            self.assertTrue(all(row["total_errors"] == 148 for row in report["samples"]))
-            (root / "pairs/pair_004/diagnostics/ferrum_71680_guard_after.json").unlink()
+
+    def test_actual_producer_index_reconciles_both_matrices_and_rejects_missing_ack(self):
+        for protocol, count in (("http2", 12), ("grpcs", 24)):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_campaign(root, protocol)
+                verify_campaign(root, protocol)
+                report = json.loads((root / "guard-evidence-index.json").read_text())
+                self.assertEqual(len(report["samples"]), count)
+                self.assertTrue(all(row["total_errors"] == 148 for row in report["samples"]))
+                self.assertTrue(all(not row["validation_failures"] for row in report["samples"]))
+                (root / "pairs/pair_004/diagnostics/ferrum_71680_guard_after.json").unlink()
+                with self.assertRaises(ValueError):
+                    verify_campaign(root, protocol)
+                report = json.loads((root / "guard-evidence-index.json").read_text())
+                self.assertEqual(len(report["samples"]), count)
+                missing = next(row for row in report["samples"] if row["expected"]["pair"] == 4
+                               and row["expected"]["gateway"] == "ferrum"
+                               and row["expected"]["payload_size"] == 71680)
+                self.assertIsNone(missing["raw_sha256"]["after"])
+                self.assertTrue(any("after:FileNotFoundError" in error for error in missing["validation_failures"]))
+
+    def test_actual_producer_corrupt_first_cell_does_not_stop_later_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_campaign(root, "http2")
+            first = root / "pairs/pair_001/direct_http2_71680.json"
+            original = first.read_text()
+            for contents in ("{", "[]", "null", None):
+                with self.subTest(contents=contents):
+                    if contents is None:
+                        first.unlink()
+                    else:
+                        first.write_text(contents)
+                    with self.assertRaises(ValueError):
+                        verify_campaign(root, "http2")
+                    report = json.loads((root / "guard-evidence-index.json").read_text())
+                    self.assertEqual(len(report["samples"]), 12)
+                    self.assertTrue(report["samples"][0]["validation_failures"])
+                    self.assertFalse(report["samples"][-1]["validation_failures"])
+                    self.assertTrue(report["samples"][-1]["raw_sha256"]["after"])
+                    self.assertEqual(report["samples"][-1]["recomputed_capture_errors"], [])
+                    first.write_text(original)
+
+    def test_actual_producer_index_rejects_copied_cells_and_retains_all_raw_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_campaign(root, "grpcs")
+            target = root / "pairs/pair_001/ferrum_grpcs_71680.json"
+            original = target.read_text()
+            for source in ("pair_002/ferrum_grpcs_71680.json", "pair_001/ferrum-exp-fixed_grpcs_71680.json",
+                           "pair_001/ferrum_grpcs_10240.json"):
+                with self.subTest(source=source):
+                    target.write_text((root / "pairs" / source).read_text())
+                    with self.assertRaises(ValueError):
+                        verify_campaign(root, "grpcs")
+                    report = json.loads((root / "guard-evidence-index.json").read_text())
+                    failed = next(row for row in report["samples"] if row["path"] == str(target.relative_to(root)))
+                    self.assertIn("sample_identity_or_workload_mismatch", failed["validation_failures"])
+                    self.assertEqual(failed["total_errors"], 148)
+                    self.assertEqual(len(report["samples"]), 24)
+            target.write_text(original)
+            diagnostics = target.parent / "diagnostics"
+            (diagnostics / "ferrum_71680_process_usage.json").write_text("{")
+            (diagnostics / "ferrum_71680_guard_before.json").write_text("[]")
+            (diagnostics / "ferrum_71680_guard_after.json").unlink()
             with self.assertRaises(ValueError):
-                verify_campaign(root, "http2")
+                verify_campaign(root, "grpcs")
+            report = json.loads((root / "guard-evidence-index.json").read_text())
+            failed = next(row for row in report["samples"] if row["path"] == str(target.relative_to(root)))
+            for label in ("usage", "before", "after"):
+                self.assertTrue(any(error.startswith(label + ":") for error in failed["validation_failures"]))
+            self.assertTrue(failed["raw_sha256"]["log"])
+            self.assertTrue(failed["raw_sha256"]["usage"])
+            self.assertTrue(failed["raw_sha256"]["before"])
+            self.assertFalse(report["samples"][-1]["validation_failures"])
+
+    def test_actual_producer_index_binds_manifest_and_rejects_forged_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_campaign(root, "http2")
+            path = root / "pairs/pair_001/ferrum_http2_71680.json"
+            original = json.loads(path.read_text())
+            for key, bad in (("schema", 2.0), ("bounded_capture_complete", 1),
+                             ("suppression_observed", 0), ("sink_loss_observed", 0)):
+                sample = copy.deepcopy(original)
+                sample["h2_guard_observation"][key] = bad
+                path.write_text(json.dumps(sample))
+                with self.assertRaises(ValueError):
+                    verify_campaign(root, "http2")
+            path.write_text(json.dumps(original))
+            for key, bad in (("host_id", "other-host"), ("sample_schema", 1), ("pairs", True),
+                             ("payload_sizes", [10240]), ("gateways", ["direct", "ferrum"])):
+                changed = dict(manifest(), **{key: bad})
+                (root / "manifest.json").write_text(json.dumps(changed))
+                with self.assertRaises(ValueError):
+                    verify_campaign(root, "http2")
+                report = json.loads((root / "guard-evidence-index.json").read_text())
+                self.assertEqual(len(report["samples"]), 12)
+
+    def test_missing_manifest_samples_and_raw_files_retain_every_expected_cell(self):
+        for protocol, count in (("http2", 12), ("grpcs", 24)):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaises(ValueError):
+                    verify_campaign(root, protocol)
+                report = json.loads((root / "guard-evidence-index.json").read_text())
+                self.assertEqual(len(report["samples"]), count)
+                self.assertTrue(all(not row["sample_present"] and row["validation_failures"]
+                                    for row in report["samples"]))
+                self.assertTrue(all(row["sha256"] is None for row in report["samples"]))
+                self.assertTrue(all("invocation" in row["raw_sha256"] for row in report["samples"]))
 
     def test_lint_gate_rejects_new_changed_duplicate_and_incomplete_diagnostics(self):
         warning = dict(reason="compiler-message", message=dict(
@@ -218,10 +443,7 @@ class GuardObservationTests(unittest.TestCase):
                     compare(before, after)
 
     def sample(self):
-        return dict(gateway="ferrum", total_errors=361, phases=dict(
-            setup_start_unix_secs=1789689600, setup_start_monotonic_secs=0,
-            warmup_start_monotonic_secs=1, measurement_start_monotonic_secs=3,
-            measurement_secs=15))
+        return dict(sample_fixture(), total_errors=361)
 
     def test_fixed_schema_and_branch_identity_do_not_copy_arbitrary_fields(self):
         for branch in (1, 2, 3, 4, 5):
@@ -249,7 +471,7 @@ class GuardObservationTests(unittest.TestCase):
         rows = [line(row(seq=1), "2026-09-17T23:59:59Z"),
                 line(row(seq=2, event=1, branch=2, reason=11, empty=101)),
                 line(row(seq=3, event=2), "2026-09-18T00:00:20Z")]
-        annotate(sample, usage(), rows)
+        annotate(sample, usage(), rows, invocation=invocation_fixture(sample), expected=expected_for(sample))
         observation = sample["h2_guard_observation"]
         self.assertEqual([r["phase"] for r in observation["events"]],
                          ["before_sample", "measurement", "drain"])

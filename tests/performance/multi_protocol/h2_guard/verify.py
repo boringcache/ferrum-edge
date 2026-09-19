@@ -6,11 +6,15 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from h2_guard_observation import FENCE_FIELDS, MAX_BYTES, annotate, parse_ack, parse_line, sink_problems
+from h2_guard_observation import (
+    FENCE_FIELDS, GATEWAYS, MAX_BYTES, annotate, boundary_range, expected_sample,
+    manifest_problems, matches_fields, parse_ack, parse_line, sink_problems,
+)
 
 
 def verify_smoke(path):
     boundary = json.loads(path.read_text())
+    boundary_range(boundary)
     ack = parse_ack(boundary["raw_ack"])
     if (boundary["errors"] or boundary["ack"] != ack or ack["generation"] != 1
             or not ack["captured"] or any(ack[key] for key in
@@ -60,68 +64,94 @@ def verify_graph(path):
     return chains
 
 
+def read_artifact(path, hashes, failures, label, as_json=True):
+    """Retain an identity and a cause for each input, even when its JSON is bad."""
+    hashes[label] = None
+    try:
+        if path.stat().st_size > MAX_BYTES:
+            raise ValueError("artifact byte bound")
+        raw = path.read_bytes()
+        hashes[label] = hashlib.sha256(raw).hexdigest()
+        value = json.loads(raw) if as_json else raw.decode("utf-8")
+        if as_json and not isinstance(value, dict):
+            raise ValueError("JSON object required")
+        return value
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        failures.append(f"{label}:{type(error).__name__}:{error}")
+        return None
+
+
 def verify_campaign(root, protocol):
     sizes = [71680] if protocol == "http2" else [10240, 71680]
     rows = []
     problems = []
+    manifest_hash = {}
+    manifest = read_artifact(root / "manifest.json", manifest_hash, problems, "manifest") or {}
+    problems.extend(manifest_problems(manifest, protocol))
     for pair in range(1, 5):
-        for gateway in ("direct", "ferrum", "ferrum-exp-fixed"):
+        for gateway in GATEWAYS:
             for size in sizes:
                 path = root / "pairs" / f"pair_{pair:03d}" / f"{gateway}_{protocol}_{size}.json"
-                if not path.is_file():
-                    problems.append(f"missing_sample:{pair}:{gateway}:{size}")
-                    continue
-                sample = json.loads(path.read_text())
-                observation = sample.get("h2_guard_observation", {})
-                row = dict(path=str(path.relative_to(root)), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                           total_errors=sample.get("total_errors"), error=sample.get("error"),
-                           offered=sample.get("effective_concurrency"),
-                           measurement_failures=observation.get("measurement_failures", []),
-                           capture_errors=observation.get("capture_errors", []),
-                           suppression_observed=observation.get("suppression_observed"),
-                           sink_loss_observed=observation.get("sink_loss_observed"))
-                row["bounded_capture_complete"] = observation.get("bounded_capture_complete")
-                row["full_transition_history_complete"] = observation.get("full_transition_history_complete")
-                row["process_capture_closed"] = observation.get("process_capture_closed")
-                rows.append(row)
-                if sample.get("effective_concurrency") != 200:
-                    problems.append("wrong_offered_load:" + row["path"])
-                if observation.get("schema") != 2:
-                    problems.append("missing_observer_annotation:" + row["path"])
-                if row["capture_errors"]:
-                    problems.append("incomplete_capture:" + row["path"])
-                if gateway != "direct" and (row["bounded_capture_complete"] is not True
-                        or row["suppression_observed"] is not False or row["sink_loss_observed"] is not False):
-                    problems.append("unacknowledged_or_lossy_capture:" + row["path"])
+                expected = expected_sample(manifest, protocol, pair, gateway, size)
+                failures = []
+                hashes = {}
+                row = dict(path=str(path.relative_to(root)), expected=expected,
+                           validation_failures=failures, raw_sha256={})
+                rows.append(row)  # Every expected cell survives absent/malformed input.
+                sample = read_artifact(path, hashes, failures, "sample")
+                row.update(sha256=hashes["sample"], sample_present=path.is_file(),
+                           sample_object_valid=sample is not None)
+                retained = sample or {}
+                observation = retained.get("h2_guard_observation")
+                if not isinstance(observation, dict):
+                    failures.append("missing_or_malformed_observer_annotation")
+                    observation = {}
+                if not matches_fields(observation, dict(schema=2, diagnostic_only=True)):
+                    failures.append("invalid_observer_schema")
+                if observation.get("capture_errors"):
+                    failures.append("annotated_capture_errors")
+                if gateway != "direct" and not matches_fields(observation, dict(
+                        bounded_capture_complete=True, suppression_observed=False, sink_loss_observed=False)):
+                    failures.append("unacknowledged_or_lossy_capture")
+                row.update(total_errors=retained.get("total_errors"), error=retained.get("error"),
+                           offered=retained.get("effective_concurrency"))
+                for key in ("measurement_failures", "capture_errors", "suppression_observed",
+                            "sink_loss_observed", "bounded_capture_complete",
+                            "full_transition_history_complete", "process_capture_closed"):
+                    row[key] = observation.get(key)
+                # Read every raw artifact independently, including when the sample
+                # or an earlier raw input is missing/corrupt. Never hide later causes.
+                diagnostics = path.parent / "diagnostics"
+                prefix = f"{gateway}_{size}"
+                raw_paths = {"invocation": diagnostics / (prefix + "_invocation.json")}
                 if gateway != "direct":
-                    # Reconcile annotation against the exact retained producer
-                    # logs, HTTP acks and process capture. Flags alone cannot pass.
-                    diagnostics = path.parent / "diagnostics"
-                    prefix = f"{gateway}_{size}"
-                    raw_paths = {"log": diagnostics / (prefix + ".log"),
-                                 "usage": diagnostics / (prefix + "_process_usage.json")}
+                    raw_paths.update(log=diagnostics / (prefix + ".log"),
+                                     usage=diagnostics / (prefix + "_process_usage.json"))
                     raw_paths.update({label: diagnostics / (
                         (gateway if label == "smoke" else prefix) + "_guard_" + label + ".json")
                         for label in ("smoke", "before", "after")})
-                    row["raw_sha256"] = {}
-                    try:
-                        for label, raw_path in raw_paths.items():
-                            if raw_path.stat().st_size > MAX_BYTES:
-                                raise ValueError("raw artifact byte bound")
-                            row["raw_sha256"][label] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
-                        usage = json.loads(raw_paths["usage"].read_text())
-                        boundaries = {label: json.loads(raw_paths[label].read_text())
-                                      for label in ("smoke", "before", "after")}
-                        recomputed = dict(sample)
-                        with raw_paths["log"].open() as stream:
-                            annotate(recomputed, usage, stream, boundaries)
-                        actual = json.loads(json.dumps(recomputed["h2_guard_observation"]))
-                        if actual != observation or not actual["bounded_capture_complete"]:
-                            raise ValueError("raw capture does not establish annotated completeness")
-                    except (OSError, ValueError, KeyError, TypeError):
-                        problems.append("raw_capture_reconciliation_failed:" + row["path"])
+                raw = {label: read_artifact(raw_path, row["raw_sha256"], failures, label,
+                                           as_json=label != "log")
+                       for label, raw_path in raw_paths.items()}
+                recomputed = dict(sample if sample is not None else expected)
+                try:
+                    annotate(recomputed, raw.get("usage"), (raw.get("log") or "").splitlines(),
+                             {label: raw.get(label) for label in ("smoke", "before", "after")},
+                             raw.get("invocation"), expected)
+                    actual = json.loads(json.dumps(recomputed["h2_guard_observation"]))
+                    row["recomputed_capture_errors"] = actual["capture_errors"]
+                    row["recomputed_measurement_failures"] = actual.get("measurement_failures", [])
+                    failures.extend(actual["capture_errors"])
+                    if actual != observation:
+                        failures.append("raw_capture_annotation_mismatch")
+                    if gateway != "direct" and actual["bounded_capture_complete"] is not True:
+                        failures.append("raw_capture_incomplete")
+                except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
+                    failures.append(f"raw_capture_reconciliation_failed:{type(error).__name__}:{error}")
+                problems.extend(f"{row['path']}:{failure}" for failure in failures)
     report = dict(protocol=protocol, expected_samples=12 * len(sizes), samples=rows,
-                  problems=problems, interpretation="diagnosis only; request failures retained; no repair/rate claim")
+                  manifest_sha256=manifest_hash["manifest"], problems=problems,
+                  interpretation="diagnosis only; request failures retained; no repair/rate claim")
     (root / "guard-evidence-index.json").write_text(json.dumps(report, indent=2) + "\n")
     if problems:
         raise ValueError("campaign evidence incomplete; inspect guard-evidence-index.json")

@@ -5,6 +5,7 @@ payloads; phase annotation is of emission time, never a per-frame timeline.
 """
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -25,6 +26,108 @@ MAX_BYTES = 144 * 1024 * 1024
 BRANCHES = {0: "none", 1: "small_nonfinal_credit", 2: "empty_nonfinal_lifetime",
             3: "send_internal_reset_limit", 4: "recv_internal_reset_limit",
             5: "pending_accept_remote_reset_limit"}
+GATEWAYS = ("direct", "ferrum", "ferrum-exp-fixed")
+PROTOCOLS = {"http2": "HTTP/2", "grpcs": "gRPC"}
+
+
+def finite_time(value):
+    return type(value) in (int, float) and 0 <= value < 1e12 and math.isfinite(value)
+
+
+def matches_fields(value, expected):
+    return isinstance(value, dict) and all(
+        key in value and type(value[key]) is type(want) and value[key] == want for key, want in expected.items())
+
+
+def manifest_problems(manifest, protocol):
+    sizes = [71680] if protocol == "http2" else [10240, 71680]
+    if (not matches_fields(manifest, dict(sample_schema=2, pairs=4, h2_observation_enabled=True))
+            or manifest.get("gateways") != list(GATEWAYS)
+            or manifest.get("payload_sizes") != sizes
+            or any(type(size) is not int for size in manifest.get("payload_sizes", []))
+            or not isinstance(manifest.get("host_id"), str) or not manifest["host_id"].strip()):
+        return ["missing_or_malformed_campaign_manifest"]
+    return []
+
+
+def expected_sample(manifest, protocol, pair, gateway, size):
+    return dict(sample_schema=2, host_id=manifest.get("host_id"), pair=pair,
+                gateway=gateway, protocol=PROTOCOLS[protocol], payload_size=size,
+                concurrency=200, effective_concurrency=200, duration_secs=15)
+
+
+def sample_problems(sample, expected):
+    errors = []
+    if not expected or not matches_fields(sample, expected):
+        errors.append("sample_identity_or_workload_mismatch")
+    if (not isinstance(sample.get("host_id"), str) or not sample["host_id"].strip()
+            or type(sample.get("pair")) is not int or not 1 <= sample["pair"] <= 4
+            or sample.get("gateway") not in GATEWAYS
+            or sample.get("protocol") not in PROTOCOLS.values()
+            or not matches_fields(sample, dict(sample_schema=2, concurrency=200,
+                                               effective_concurrency=200, duration_secs=15))
+            or type(sample.get("payload_size")) is not int
+            or sample["payload_size"] not in ([71680] if sample.get("protocol") == "HTTP/2"
+                                             else [10240, 71680])):
+        errors.append("invalid_sample_identity_or_workload")
+    return errors
+
+
+def capture_identity(sample):
+    return {key: sample.get(key) for key in ("host_id", "pair", "gateway", "protocol", "payload_size")}
+
+
+def phase_interval(sample):
+    """Require real PhaseReport fields; no invented gRPC close timestamp."""
+    phases = sample["phases"]
+    times = ("setup_start_unix_secs", "measurement_start_unix_secs",
+             "setup_start_monotonic_secs", "warmup_start_monotonic_secs",
+             "measurement_start_monotonic_secs", "drain_start_monotonic_secs",
+             "setup_secs", "warmup_secs", "barrier_secs", "measurement_secs",
+             "measurement_elapsed_secs", "drain_secs", "transport_close_secs")
+    if not isinstance(phases, dict) or any(not finite_time(phases.get(key)) for key in times):
+        raise ValueError("missing or invalid phase timing")
+    setup, warmup, measure, drain = (phases[key + "_start_monotonic_secs"]
+                                     for key in ("setup", "warmup", "measurement", "drain"))
+    if (not setup <= warmup <= measure <= drain or phases["measurement_secs"] != 15
+            or phases["measurement_elapsed_secs"] < 15 or drain < measure + 15
+            or phases["setup_start_unix_secs"] > phases["measurement_start_unix_secs"]
+            or any(type(phases.get(key)) is not bool for key in ("timed_out", "transport_close_timed_out"))):
+        raise ValueError("unordered or incomplete phases")
+    end = drain + phases["drain_secs"]
+    close = phases["transport_close_start_monotonic_secs"]
+    if sample.get("protocol") == "HTTP/2" or close is not None:
+        if not finite_time(close) or close < end:
+            raise ValueError("invalid transport close timing")
+        end = close + phases["transport_close_secs"]
+    elif phases["transport_close_secs"] != 0:
+        raise ValueError("close duration without start")
+    # The monotonic epoch is client-local. Anchor the elapsed tail to the
+    # client's own measurement wall time, never a gateway/frame timestamp.
+    return phases["setup_start_unix_secs"], phases["measurement_start_unix_secs"] + end - measure
+
+
+def capture_range(record):
+    if (not matches_fields(record, dict(schema=2))
+            or not all(finite_time(record.get(key)) for key in ("start_unix_secs", "end_unix_secs"))
+            or record["start_unix_secs"] > record["end_unix_secs"]):
+        raise ValueError("invalid capture range")
+    return record["start_unix_secs"], record["end_unix_secs"]
+
+
+def boundary_range(boundary):
+    start, end = capture_range(boundary)
+    if (not isinstance(boundary.get("errors"), list)
+            or not all(isinstance(error, str) for error in boundary["errors"])
+            or not isinstance(boundary.get("sink_samples"), list) or not 1 <= len(boundary["sink_samples"]) <= 6):
+        raise ValueError("invalid boundary samples")
+    previous = start
+    for sink in boundary["sink_samples"]:
+        if (not isinstance(sink, dict) or not finite_time(sink.get("unix_secs"))
+                or not previous <= sink["unix_secs"] <= end):
+            raise ValueError("sink sample outside boundary")
+        previous = sink["unix_secs"]
+    return start, end
 
 
 def numeric_fields(pairs, names):
@@ -64,12 +167,12 @@ def sink_problems(gauges, drained=False):
     required |= {f"log_{sink}_{field}" for sink in ("stdout", "stderr") for field in (
         "healthy", "queued_records", "queued_bytes", "reserved_bytes", "shutdown_timeouts_total",
         "shutdown_incomplete_records_total", "io_write", "io_flush")}
-    if not required <= gauges.keys():
+    if not isinstance(gauges, dict) or not required <= gauges.keys():
         return ["missing_log_sink_health_counters"]
     errors = []
     for key in required:
         value = gauges[key]
-        if not isinstance(value, (int, float)) or value < 0:
+        if type(value) is not int or value < 0:
             errors.append("invalid_log_sink_counter")
         elif key.endswith("_healthy"):
             if value != 1:
@@ -82,8 +185,24 @@ def sink_problems(gauges, drained=False):
     return sorted(set(errors))
 
 
-def validate_capture(result, sample, boundaries, seqs):
+def validate_capture(result, sample, boundaries, seqs, invocation):
     errors = result["capture_errors"]
+    interval = None
+    try:
+        interval = phase_interval(sample)
+    except (ValueError, KeyError, TypeError):
+        errors.append("missing_or_malformed_phases")
+    invocation_range = None
+    try:
+        invocation_range = capture_range(invocation)
+        if (not matches_fields(invocation.get("identity"), capture_identity(sample))
+                or type(invocation.get("exit_code")) is not int or not 0 <= invocation["exit_code"] <= 255):
+            raise ValueError("invocation identity or exit status")
+        if interval and not invocation_range[0] <= interval[0] <= interval[1] <= invocation_range[1]:
+            errors.append("phases_outside_client_invocation")
+    except (ValueError, KeyError, TypeError):
+        errors.append("missing_or_malformed_invocation")
+    result["invocation"] = invocation
     summaries = {row["seq"]: row for row in result["events"]}
     tails = {}
     for row in sorted(result["transitions"], key=lambda r: r["seq"]):
@@ -130,11 +249,18 @@ def validate_capture(result, sample, boundaries, seqs):
         errors.append("duplicate_snapshot_generation")
     result["boundaries"] = boundaries
     generations = []
+    ranges = {}
     for label in ("smoke", "before", "after"):
         boundary = boundaries.get(label, {})
         try:
+            ranges[label] = boundary_range(boundary)
+            identity = capture_identity(sample)
+            if label == "smoke":
+                identity["payload_size"] = 0  # One smoke per gateway process, before either payload.
+            if not matches_fields(boundary.get("identity"), identity):
+                raise ValueError("boundary identity")
             ack = parse_ack(boundary["raw_ack"])
-            if boundary["ack"] != ack:
+            if not matches_fields(boundary["ack"], ack):
                 raise ValueError("changed ack")
             generation = ack["generation"]
             generations.append(generation)
@@ -165,17 +291,16 @@ def validate_capture(result, sample, boundaries, seqs):
                 errors.append("missing_successful_or_fixed_live_traffic_state")
             if boundary["errors"]:
                 errors.append("boundary_capture_error:" + label)
-            sink = boundary["sink_samples"][-1]
-            errors.extend(sink_problems(sink["gauges"], drained=True))
-            start = sample.get("phases", {}).get("setup_start_unix_secs")
-            measurement = sample.get("phases", {}).get("measurement_start_unix_secs")
-            if start is not None and label == "before" and boundary["end_unix_secs"] > start:
+            for index, sink in enumerate(boundary["sink_samples"]):
+                errors.extend(sink_problems(sink.get("gauges"), drained=index == len(boundary["sink_samples"]) - 1))
+            if invocation_range and label == "before" and ranges[label][1] > invocation_range[0]:
                 errors.append("late_before_snapshot")
-            if measurement is not None and label == "after" and boundary["start_unix_secs"] < (
-                    measurement + sample["phases"]["measurement_secs"]):
+            if invocation_range and label == "after" and ranges[label][0] < invocation_range[1]:
                 errors.append("early_after_snapshot")
         except (ValueError, KeyError, TypeError, IndexError):
             errors.append("missing_or_malformed_boundary:" + label)
+    if len(ranges) == 3 and not ranges["smoke"][1] <= ranges["before"][0] <= ranges["before"][1] <= ranges["after"][0]:
+        errors.append("invalid_boundary_time_order")
     if len(generations) == 3 and not generations[0] < generations[1] < generations[2]:
         errors.append("invalid_boundary_generation_order")
     if len(generations) == 3:
@@ -262,7 +387,7 @@ def parse_line(line):
     return row
 
 
-def annotate(sample, usage, lines, boundaries=None):
+def annotate(sample, usage, lines, boundaries=None, invocation=None, expected=None):
     result = dict(schema=2, diagnostic_only=True, events=[], transitions=[], fences=[], suppression_notices=[], capture_errors=[],
                   id_scope="gateway process / h2 connection; no cross-hop or pool-family mapping",
                   counter_scope="connection lifetime, including earlier payloads",
@@ -270,10 +395,29 @@ def annotate(sample, usage, lines, boundaries=None):
                   tail_scope="bounded live boundary snapshots; process shutdown and overwritten history remain unclosed",
                   suppression_counts_are_lower_bounds=True)
     sample["h2_guard_observation"] = result
+    result["capture_errors"].extend(sample_problems(sample, expected))
+    if not isinstance(boundaries, dict):
+        boundaries = {}
+    if not isinstance(invocation, dict):
+        invocation = {}
     if sample.get("gateway") == "direct":
         result["not_applicable"] = "unpatched direct control"
+        try:
+            start, end = phase_interval(sample)
+            left, right = capture_range(invocation)
+            if (not matches_fields(invocation.get("identity"), capture_identity(sample))
+                    or not left <= start <= end <= right
+                    or type(invocation.get("exit_code")) is not int or not 0 <= invocation["exit_code"] <= 255):
+                raise ValueError("invalid direct invocation")
+        except (ValueError, KeyError, TypeError):
+            result["capture_errors"].append("missing_or_malformed_direct_phases_or_invocation")
+        result["invocation"] = invocation
         return
-    phases = sample.get("phases") or {}
+    try:
+        phase_interval(sample)
+        phases = sample["phases"]
+    except (ValueError, KeyError, TypeError):
+        phases = {}
     seqs = set()
     size = 0
     for line in lines:
@@ -308,14 +452,26 @@ def annotate(sample, usage, lines, boundaries=None):
                                       if row["event"] == 1 and row["phase"] == "measurement"]
     loss_keys = {f"log_dropped_{sink}_{reason}" for sink in ("stdout", "stderr")
                  for reason in ("saturation", "record_too_large", "closed")}
-    snapshots = [row["h2_gauges"] for row in usage.get("timeline", []) if "h2_gauges" in row]
+    timeline = usage.get("timeline", []) if isinstance(usage, dict) else []
+    if not isinstance(timeline, list):
+        result["capture_errors"].append("malformed_process_timeline")
+        timeline = []
+    if any(not isinstance(row, dict) or ("h2_gauges" in row and not isinstance(row["h2_gauges"], dict))
+           for row in timeline):
+        result["capture_errors"].append("malformed_log_sink_sample")
+    snapshots = [row["h2_gauges"] for row in timeline if isinstance(row, dict)
+                 and isinstance(row.get("h2_gauges"), dict)]
+    if any(not isinstance(row.get("gauges"), dict) or not finite_time(row.get("unix_secs")) for row in snapshots):
+        result["capture_errors"].append("malformed_log_sink_sample")
+        snapshots = [row for row in snapshots if isinstance(row.get("gauges"), dict)
+                     and finite_time(row.get("unix_secs"))]
     result["sink_loss_samples"] = [dict(unix_secs=row["unix_secs"], **{
         key: value for key, value in row.get("gauges", {}).items() if key in loss_keys})
         for row in snapshots]
     if not snapshots or any(not loss_keys <= row.get("gauges", {}).keys() for row in snapshots):
         result["capture_errors"].append("missing_log_sink_loss_counters")
-    result["sink_loss_observed"] = any(row.get(key, 0) > 0 for row in result["sink_loss_samples"]
-                                        for key in loss_keys)
+    result["sink_loss_observed"] = any(type(row.get(key)) is int and row[key] > 0
+                                     for row in result["sink_loss_samples"] for key in loss_keys)
     result["suppression_observed"] = bool(result["suppression_notices"]) or any(
         row[key] > 0 for row in result["events"] for key in
         ("suppressed_connections", "suppressed_lifecycle", "suppressed_failures"))
@@ -323,13 +479,25 @@ def annotate(sample, usage, lines, boundaries=None):
     result["sink_health_samples"] = snapshots
     for snapshot in snapshots:
         result["capture_errors"].extend(sink_problems(snapshot.get("gauges", {})))
-    validate_capture(result, sample, boundaries or {}, seqs)
+    validate_capture(result, sample, boundaries, seqs, invocation)
 
 
 def main():
     path, usage_path, log_path = map(Path, sys.argv[1:])
     sample = json.loads(path.read_text())
     errors = []
+    expected = None
+    try:
+        gateway, protocol, size = path.stem.rsplit("_", 2)
+        manifest = json.loads((path.parents[2] / "manifest.json").read_text())
+        errors.extend(manifest_problems(manifest, protocol))
+        expected = expected_sample(manifest, protocol, int(path.parent.name.removeprefix("pair_")), gateway, int(size))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        errors.append("missing_or_malformed_campaign_manifest")
+    try:
+        invocation = json.loads(log_path.with_name(log_path.stem + "_invocation.json").read_text())
+    except (OSError, ValueError):
+        invocation = {}
     try:
         usage = json.loads(usage_path.read_text())
     except (OSError, ValueError):
@@ -339,15 +507,15 @@ def main():
         with log_path.open() as stream:
             boundaries = {}
             for label in ("smoke", "before", "after"):
-                stem = sample["gateway"] if label == "smoke" else log_path.stem
+                stem = expected["gateway"] if label == "smoke" and expected else log_path.stem
                 boundary = log_path.with_name(stem + "_guard_" + label + ".json")
                 try:
                     boundaries[label] = json.loads(boundary.read_text())
                 except (OSError, ValueError):
                     pass
-            annotate(sample, usage, stream, boundaries)
+            annotate(sample, usage, stream, boundaries, invocation, expected)
     except OSError:
-        annotate(sample, usage, [])
+        annotate(sample, usage, [], invocation=invocation, expected=expected)
         if sample.get("gateway") != "direct":
             errors.append("missing_gateway_log")
     sample["h2_guard_observation"]["capture_errors"].extend(errors)
