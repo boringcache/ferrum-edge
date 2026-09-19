@@ -1150,12 +1150,12 @@ fn parse_target_string(
 ) -> Result<RuleTarget, String> {
     if path.is_some() && raw != "body_json_path" {
         return Err(format!(
-            "waf: target {raw:?} does not support 'path'; 'path' is only valid for body_json_path"
+            "waf: target {raw:?} does not support `path`; `path` is only valid for body_json_path"
         ));
     }
     if names.is_some() && !matches!(raw, "header_values" | "request_headers") {
         return Err(format!(
-            "waf: target {raw:?} does not support 'names'; 'names' is only valid for header_values/request_headers"
+            "waf: target {raw:?} does not support `names`; `names` is only valid for header_values/request_headers"
         ));
     }
     match raw {
@@ -1163,7 +1163,7 @@ fn parse_target_string(
         "header_values" | "request_headers" => {
             if names.as_ref().is_some_and(Vec::is_empty) {
                 return Err(
-                    "waf: header_values target 'names' must be non-empty when provided".to_string(),
+                    "waf: header_values target `names` must be non-empty when provided".to_string(),
                 );
             }
             Ok(RuleTarget::HeaderValues(names))
@@ -1176,7 +1176,7 @@ fn parse_target_string(
         "method" | "request_method" => Ok(RuleTarget::Method),
         "body_text" | "request_body" => Ok(RuleTarget::BodyText),
         "body_json_path" => Ok(RuleTarget::BodyJsonPath(path.ok_or_else(|| {
-            "waf: body_json_path target requires string 'path'".to_string()
+            "waf: body_json_path target requires string `path`".to_string()
         })?)),
         "response_headers" => Ok(RuleTarget::ResponseHeaders),
         "response_body" => Ok(RuleTarget::ResponseBody),

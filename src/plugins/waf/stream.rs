@@ -142,7 +142,7 @@ pub(super) fn parse_stream_config(
     }
     let stream = raw
         .as_object()
-        .ok_or_else(|| "waf: 'stream' must be an object".to_string())?;
+        .ok_or_else(|| "waf: `stream` must be an object".to_string())?;
     reject_unknown_keys(
         stream,
         "config.stream",
@@ -182,7 +182,7 @@ fn compile_stream_signatures(
     if let Some(value) = stream.get("signatures").filter(|v| !v.is_null()) {
         let array = value
             .as_array()
-            .ok_or_else(|| "waf: 'stream.signatures' must be an array".to_string())?;
+            .ok_or_else(|| "waf: `stream.signatures` must be an array".to_string())?;
         let mut seen_ids = HashSet::new();
         for (idx, entry) in array.iter().enumerate() {
             let obj = entry

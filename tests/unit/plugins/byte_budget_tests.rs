@@ -14,6 +14,10 @@ use ferrum_edge::plugins::utils::byte_budget::{
     record_batch_materialization_loss,
 };
 use ferrum_edge::plugins::utils::summary_log_budget::serialize_under_byte_budget;
+use ferrum_edge::plugins::{
+    PluginHttpClient, http_logging::HttpLogging, statsd_logging::StatsdLogging,
+    tcp_logging::TcpLogging, udp_logging::UdpLogging,
+};
 use serde_json::json;
 use std::io::Write;
 
@@ -56,6 +60,72 @@ fn admit_byte_limits_defaults_and_bounds() {
     )
     .expect_err("buffer above hard max");
     assert!(err.contains("buffer_max_bytes"), "{err}");
+}
+
+#[tokio::test]
+async fn logging_byte_limit_rejections_retain_rendered_fields_and_fixed_bounds() {
+    let token = "'BYTE_BUDGET_SECRET\"`\\\n";
+    for plugin in ["http_logging", "tcp_logging", "udp_logging", "statsd_logging"] {
+        for (limits, expected) in [
+            (
+                json!({"max_entry_bytes": token}),
+                "`max_entry_bytes` must be an unsigned integer",
+            ),
+            (
+                json!({"max_entry_bytes": 1023}),
+                "`max_entry_bytes` must be >= 1024",
+            ),
+            (
+                json!({"max_entry_bytes": 1_048_577}),
+                "`max_entry_bytes` must be <= 1048576",
+            ),
+            (
+                json!({"buffer_max_bytes": {"BYTE_BUDGET_SECRET": token}}),
+                "`buffer_max_bytes` must be an unsigned integer",
+            ),
+            (
+                json!({"max_entry_bytes": 2048, "buffer_max_bytes": 4097}),
+                "`buffer_max_bytes` must be greater than or equal to 2 * (`max_entry_bytes` + 1)",
+            ),
+            (
+                json!({"buffer_max_bytes": 268_435_457}),
+                "`buffer_max_bytes` must be <= 268435456",
+            ),
+        ] {
+            let mut config = if plugin == "http_logging" {
+                json!({"endpoint_url": "https://logs.example.test/ingest"})
+            } else {
+                json!({"host": "logs.example.test", "port": 8125})
+            };
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(limits.as_object().unwrap().clone());
+            let client = PluginHttpClient::default();
+            let result = match plugin {
+                "http_logging" => HttpLogging::new(&config, client).map(|_| ()),
+                "tcp_logging" => TcpLogging::new(&config, client).map(|_| ()),
+                "udp_logging" => UdpLogging::new(&config, client).map(|_| ()),
+                "statsd_logging" => StatsdLogging::new(&config, client).map(|_| ()),
+                _ => unreachable!(),
+            };
+            let error = result.expect_err("invalid byte limits must reject construction");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            assert_eq!(rendered, format!("{plugin}: {expected}"));
+            for supplied in [
+                "BYTE_BUDGET_SECRET",
+                "logs.example.test",
+                "1023",
+                "1048577",
+                "2048",
+                "4097",
+                "268435457",
+            ] {
+                assert!(!rendered.contains(supplied), "{supplied}: {rendered}");
+            }
+        }
+    }
 }
 
 #[test]

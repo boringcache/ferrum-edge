@@ -6805,7 +6805,14 @@ async fn exact_key_framing_defeats_newline_field_boundary_forgery() {
 
 #[tokio::test]
 async fn semantic_cache_config_admits_anonymous_caller_scope_key() {
-    for value in ["caller_address", "caller-address", "shared", " SHARED "] {
+    for value in [
+        "caller_address",
+        "caller-address",
+        "shared",
+        " SHARED ",
+        " Caller-Address ",
+        "\u{85}SHARED\u{85}",
+    ] {
         assert!(
             AiSemanticCache::new(
                 &json!({ "anonymous_caller_scope": value }),
@@ -7971,5 +7978,37 @@ async fn semantic_cache_encoded_admission_is_bounded_and_fail_closed() {
                 assert!(!headers.keys().any(|key| key.eq_ignore_ascii_case(name)));
             }
         }
+    }
+}
+
+#[test]
+fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_values() {
+    for value in [
+        "REPLAY_SCOPE_SECRET",
+        "'REPLAY_SCOPE_SECRET",
+        "\"REPLAY_SCOPE_SECRET",
+        "`REPLAY_SCOPE_SECRET`",
+        "'\nREPLAY_SCOPE_SECRET\\tail\"`",
+    ] {
+        let config = json!({"anonymous_caller_scope": value});
+        let error = AiSemanticCache::new(&config, PluginHttpClient::default())
+            .err()
+            .expect("unknown anonymous caller scope must reject construction");
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("ai_semantic_cache: unknown `anonymous_caller_scope` value"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(expected `caller_address` or `shared`)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<redacted scalar>"), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("replay_scope_secret"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\n'), "{rendered}");
     }
 }

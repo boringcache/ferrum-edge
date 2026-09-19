@@ -346,7 +346,7 @@ impl Waf {
         )?;
         let paranoia_level = optional_u8(object, "paranoia_level")?.unwrap_or(1);
         if !(1..=4).contains(&paranoia_level) {
-            return Err("waf: 'paranoia_level' must be from 1 to 4".to_string());
+            return Err("waf: `paranoia_level` must be from 1 to 4".to_string());
         }
 
         let request_inspection = optional_bool(object, "request_inspection")?.unwrap_or(true);
@@ -360,7 +360,7 @@ impl Waf {
         let scan_budget_ms = optional_u64(object, "scan_budget_ms")?.unwrap_or(50);
         let max_scan_bytes = optional_usize(object, "max_scan_bytes")?.unwrap_or(1_048_576);
         if max_scan_bytes == 0 {
-            return Err("waf: 'max_scan_bytes' must be greater than zero".to_string());
+            return Err("waf: `max_scan_bytes` must be greater than zero".to_string());
         }
         // The budget is post-hoc only (issue #5528): a scan that missed its
         // deadline still ran to completion and its hits still rejected, so a
@@ -483,7 +483,7 @@ impl Waf {
             scoring,
         };
         if !(400..=599).contains(&config.reject_status_code) {
-            return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
+            return Err("waf: `reject_status_code` must be from 400 to 599".to_string());
         }
 
         let specials = SpecialRuleIndices {
@@ -2096,7 +2096,7 @@ fn parse_timeout_action(raw: &str) -> Result<TimeoutAction, String> {
         "fail_closed" => Ok(TimeoutAction::FailClosed),
         "log_and_allow" => Ok(TimeoutAction::LogAndAllow),
         other => Err(format!(
-            "waf: 'on_scan_timeout' must be allow, block, fail_closed, or \
+            "waf: `on_scan_timeout` must be allow, block, fail_closed, or \
              log_and_allow; got {other:?}"
         )),
     }
@@ -2109,7 +2109,7 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
         "skip" => Ok(TooLargeAction::Skip),
         "block" => Ok(TooLargeAction::Block),
         other => Err(format!(
-            "waf: 'on_body_too_large' must be fail_closed, scan_truncated, \
+            "waf: `on_body_too_large` must be fail_closed, scan_truncated, \
              skip, or block; got {other:?}"
         )),
     }
@@ -2172,11 +2172,11 @@ fn validate_enforce_mode_has_enforcing_rules(
         return Ok(());
     }
     Err(
-        "waf: mode is 'enforce' but no enabled enforcement path can block traffic. Built-in \
-         rules are monitor-only by default; set 'default_rule_action' to 'enforce' or opt \
-         rules in via 'rule_modes' / custom_rules[].action, enable anomaly scoring over an \
-         inspected HTTP rule, enable a stream enforcement rule, or set 'on_body_too_large' \
-         to 'block' on an inspected body surface"
+        "waf: `mode` is `enforce` but no enabled enforcement path can block traffic. Built-in \
+         rules are monitor-only by default; set `default_rule_action` to `enforce` or opt \
+         rules in via `rule_modes` / `custom_rules[].action`, enable anomaly scoring over an \
+         inspected HTTP rule, enable a stream enforcement rule, or set `on_body_too_large` \
+         to `block` on an inspected body surface"
             .to_string(),
     )
 }
@@ -2215,7 +2215,7 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
     }
     let object = value
         .as_object()
-        .ok_or_else(|| "waf: 'scoring' must be an object".to_string())?;
+        .ok_or_else(|| "waf: `scoring` must be an object".to_string())?;
     reject_unknown_keys(
         object,
         "config.scoring",
@@ -2227,12 +2227,12 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
     }
     let block_threshold = optional_u64(object, "block_threshold")?
         .map(|v| {
-            u32::try_from(v).map_err(|_| "waf: 'scoring.block_threshold' is too large".to_string())
+            u32::try_from(v).map_err(|_| "waf: `scoring.block_threshold` is too large".to_string())
         })
         .transpose()?
         .unwrap_or(7);
     if block_threshold == 0 {
-        return Err("waf: 'scoring.block_threshold' must be greater than zero".to_string());
+        return Err("waf: `scoring.block_threshold` must be greater than zero".to_string());
     }
     // Defaults: one critical, or one high plus one medium, crosses the default
     // threshold of 7; a lone medium does not.
@@ -2261,7 +2261,7 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
                     })?;
             }
         }
-        Some(_) => return Err("waf: 'scoring.weights' must be an object".to_string()),
+        Some(_) => return Err("waf: `scoring.weights` must be an object".to_string()),
     }
     Ok(Some(ScoringConfig {
         block_threshold,

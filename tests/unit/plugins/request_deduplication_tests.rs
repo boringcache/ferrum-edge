@@ -6794,7 +6794,14 @@ async fn dedup_shared_anonymous_scope_does_not_relax_authenticated_callers() {
 
 #[tokio::test]
 async fn dedup_config_admits_anonymous_caller_scope_key() {
-    for value in ["caller_address", "caller-address", "shared", " SHARED "] {
+    for value in [
+        "caller_address",
+        "caller-address",
+        "shared",
+        " SHARED ",
+        " Caller-Address ",
+        "\u{85}SHARED\u{85}",
+    ] {
         assert!(
             RequestDeduplication::new(
                 &json!({ "anonymous_caller_scope": value }),
@@ -6887,5 +6894,37 @@ fn composition_diagnostics_withhold_proxy_and_plugin_ids() {
         assert!(rendered.contains(&format!("`{plugin_name}`")), "{rendered}");
         assert!(rendered.contains("replay"), "{rendered}");
         assert!(!rendered.contains("UNREGISTERED_"), "{rendered}");
+    }
+}
+
+#[test]
+fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_values() {
+    for value in [
+        "REPLAY_SCOPE_SECRET",
+        "'REPLAY_SCOPE_SECRET",
+        "\"REPLAY_SCOPE_SECRET",
+        "`REPLAY_SCOPE_SECRET`",
+        "'\nREPLAY_SCOPE_SECRET\\tail\"`",
+    ] {
+        let config = json!({"anonymous_caller_scope": value});
+        let error = RequestDeduplication::new(&config, PluginHttpClient::default())
+            .err()
+            .expect("unknown anonymous caller scope must reject construction");
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(
+            rendered.contains("request_deduplication: unknown `anonymous_caller_scope` value"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(expected `caller_address` or `shared`)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<redacted scalar>"), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("replay_scope_secret"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\n'), "{rendered}");
     }
 }
