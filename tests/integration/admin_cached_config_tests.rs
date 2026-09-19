@@ -2185,11 +2185,11 @@ async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    for (id, config, expected_path) in [
+    for (id, config, expected_diagnostic) in [
         (
             "unknown-outer",
             json!({"schemas": {"audit": {}}, "strict": true}),
-            "config.strict",
+            "unknown config key \"strict\" at `config`",
         ),
         (
             "unknown-derived",
@@ -2198,7 +2198,7 @@ async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
                     {"name": "outcome", "kind": "outcome", "from": "status"}
                 ]}}
             }),
-            "derived_fields[0].from",
+            "unknown schema key \"from\" at `derived_fields[0]`",
         ),
         (
             "unknown-metadata",
@@ -2207,7 +2207,7 @@ async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
                     "mode": "flatten", "on_collison": "overwrite"
                 }}}
             }),
-            "metadata.on_collison",
+            "unknown schema key \"on_collison\" at `metadata`",
         ),
     ] {
         let plugin = json!({
@@ -2220,8 +2220,11 @@ async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
         let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
         assert_eq!(status, 400, "unknown key was admitted: {body:?}");
         assert!(
-            body.to_string().contains(expected_path),
-            "error did not identify {expected_path}: {body:?}"
+            body["error"]
+                .as_str()
+                .expect("admin error string")
+                .contains(expected_diagnostic),
+            "error did not identify {expected_diagnostic}: {body:?}"
         );
     }
 }
@@ -3046,7 +3049,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
                     "channels": ["ops"]
                 }]
             }),
-            "'max_concurrent_dispatches' must be >= 1",
+            "`max_concurrent_dispatches` must be >= 1",
         ),
         (
             "proxy-alerts-min-request-count-wrong-type",
@@ -3086,7 +3089,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
                     "channels": ["ops"]
                 }]
             }),
-            "'quiet_hours_utc' must be an array",
+            "`quiet_hours_utc` must be an array",
         ),
         (
             "proxy-alerts-unused-default-resolved-window-out-of-range",

@@ -240,22 +240,46 @@ async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let dir = tempfile::tempdir().expect("tempdir");
-    let ca_path = dir.path().join("mixed-ca.pem");
+    let ca_path = dir.path().join("'CaPath5594`.pem");
     let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
-    std::fs::write(
-        &ca_path,
-        format!("{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
-    )
-    .expect("write mixed CA");
+    for (record, reason) in [
+        ("!PemPayload5594", "malformed PEM certificate record"),
+        ("AQIDBA==", "certificate failed trust-anchor admission"),
+    ] {
+        std::fs::write(
+            &ca_path,
+            format!("{valid}-----BEGIN CERTIFICATE-----\n{record}\n-----END CERTIFICATE-----\n"),
+        )
+        .expect("write mixed CA");
 
-    let error = WsLogging::new(
-        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
-        client_with_ca(ca_path.to_str().expect("utf8 path")),
-    )
-    .err()
-    .expect("a malformed later CA record must reject plugin construction");
-    assert!(error.contains("ws_logging CA bundle"), "got: {error}");
-    assert!(error.contains("record #2"), "got: {error}");
+        let error = WsLogging::new(
+            &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+            client_with_ca(ca_path.to_str().expect("utf8 path")),
+        )
+        .err()
+        .expect("a rejected later CA record must reject plugin construction");
+        let visible = [
+            "ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`",
+            "certificate record #2",
+            reason,
+        ];
+        for fragment in visible {
+            assert!(error.contains(fragment), "{error}");
+        }
+        assert!(!error.contains(record), "{error}");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in visible {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        for hidden in [
+            "CaPath5594",
+            record,
+            ca_path.to_str().unwrap(),
+            valid.as_str(),
+        ] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -276,7 +300,15 @@ async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
     )
     .err()
     .expect("an all-malformed CA bundle must reject plugin construction");
-    assert!(error.contains("record #1"), "got: {error}");
+    assert!(
+        error.contains("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`"),
+        "{error}"
+    );
+    assert!(error.contains("certificate record #1"), "{error}");
+    assert!(
+        error.contains("malformed PEM certificate record"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -293,7 +325,14 @@ async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
     )
     .err()
     .expect("an empty custom CA store must reject plugin construction");
-    assert!(error.contains("no valid PEM certificates"), "got: {error}");
+    assert!(
+        error.contains("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("no valid PEM certificates (no CERTIFICATE records)"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -354,7 +393,7 @@ async fn test_ws_logging_rejects_malformed_endpoint_url() {
         default_client(),
     );
     match result {
-        Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
+        Err(e) => assert!(e.contains("invalid `endpoint_url`")),
         Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
     }
 }

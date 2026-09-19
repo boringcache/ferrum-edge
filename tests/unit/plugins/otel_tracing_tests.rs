@@ -265,7 +265,10 @@ async fn test_otel_tracing_rejects_non_http_endpoint_scheme() {
     .err()
     .expect("non-http endpoint scheme must be rejected");
 
-    assert!(err.contains("http or https"), "got: {err}");
+    assert!(
+        err.contains("`endpoint` scheme must be `http` or `https`"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -313,7 +316,7 @@ async fn test_otel_tracing_rejects_non_string_custom_header_value() {
     .err()
     .expect("non-string custom header value must be rejected");
 
-    assert!(err.contains("headers.x-tenant-id"), "got: {err}");
+    assert!(err.contains("`headers` key \"x-tenant-id\""), "got: {err}");
 }
 
 #[tokio::test]
@@ -2766,4 +2769,45 @@ async fn test_otel_tracing_pending_spans_can_exceed_buffer_capacity() {
         .as_array()
         .expect("OTLP spans");
     assert_eq!(spans.len(), 2, "buffer_capacity 1 retained two spans");
+}
+
+#[test]
+fn startup_diagnostics_withhold_sampling_values_and_header_keys() {
+    let secret = "'diagnostic-secret-5594`\"\\\n";
+    for (extra, field, hidden) in [
+        (
+            json!({"root_sampling": secret, "root_sampling_ratio": 0.5}),
+            "`root_sampling`",
+            "diagnostic-secret-5594",
+        ),
+        (
+            json!({"root_sampling": "ratio", "root_sampling_ratio": 987654321}),
+            "`root_sampling_ratio`",
+            "987654321",
+        ),
+        (
+            json!({"headers": {secret: false}}),
+            "`headers`",
+            "diagnostic-secret-5594",
+        ),
+        (
+            json!({"headers": {"'diagnostic-secret-5594": 987654321}}),
+            "`headers`",
+            "diagnostic-secret-5594",
+        ),
+    ] {
+        let mut config = json!({"endpoint": "http://localhost:4318/v1/traces"});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = OtelTracing::new_with_http_client(&config, PluginHttpClient::default())
+            .err()
+            .expect("invalid tracing configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        assert!(rendered.contains("otel_tracing"), "{rendered}");
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(!rendered.contains(hidden), "{rendered}");
+        assert!(!rendered.contains("987654321"), "{rendered}");
+    }
 }
