@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -12,7 +13,7 @@ sys.path.insert(0, str(ROOT / "h2_guard"))
 from benchmark_validity import sample_issues
 from experiment_arms import load_experiment
 from h2_diagnostics import parse_gauges
-from h2_guard_observation import FIELDS, annotate, parse_line
+from h2_guard_observation import FIELDS, TAIL_FIELDS, annotate, parse_line, parse_ack, sink_problems
 from prepare import SHA256, extract_source, patch_source
 from verify import verify_campaign
 from lint import compare
@@ -26,7 +27,7 @@ def row(**updates):
     return values
 
 
-def line(values, timestamp="2026-09-18T00:00:04Z", marker="H2_GUARD_V1"):
+def line(values, timestamp="2026-09-18T00:00:04Z", marker="H2_GUARD_V2"):
     message = marker + " " + " ".join(f"{key}={value}" for key, value in values.items())
     return timestamp + " " + json.dumps(dict(timestamp=timestamp, target="ferrum_h2_guard",
                                              fields=dict(message=message)))
@@ -35,10 +36,155 @@ def line(values, timestamp="2026-09-18T00:00:04Z", marker="H2_GUARD_V1"):
 def usage():
     gauges = {f"log_dropped_{sink}_{reason}": 0 for sink in ("stdout", "stderr")
               for reason in ("saturation", "record_too_large", "closed")}
+    for sink in ("stdout", "stderr"):
+        for name in ("healthy", "queued_records", "queued_bytes", "reserved_bytes", "io_write", "io_flush",
+                     "shutdown_timeouts_total", "shutdown_incomplete_records_total"):
+            gauges[f"log_{sink}_{name}"] = int(name == "healthy")
     return dict(timeline=[dict(h2_gauges=dict(unix_secs=1789689604, gauges=gauges))])
 
 
 class GuardObservationTests(unittest.TestCase):
+    def producer_contract(self):
+        path = os.environ.get("H2_GUARD_PRODUCER_CONTRACT")
+        if path is None:
+            self.skipTest("actual h2 producer export is required in the dedicated hosted lane")
+        # Missing export in that lane is a failure, never a skipped producer test.
+        raw = Path(path).read_text().splitlines()
+        messages = [message for message in raw if message.startswith("H2_GUARD_")]
+        acks = [message for message in raw if message.startswith("# H2_GUARD_ACK_V2 ")]
+        self.assertEqual(len(acks), 3)
+        self.assertTrue(messages)
+        timestamp = "2026-09-18T00:00:04Z"
+        lines = [json.dumps(dict(timestamp=timestamp, target="ferrum_h2_guard",
+                                 fields=dict(message=message))) for message in messages]
+        boundaries = {}
+        gauges = usage()["timeline"][0]["h2_gauges"]["gauges"]
+        for label, ack in zip(("smoke", "before", "after"), acks):
+            boundaries[label] = dict(raw_ack=ack, ack=parse_ack(ack), errors=[],
+                start_unix_secs=1789689604, end_unix_secs=1789689604,
+                sink_samples=[dict(unix_secs=1789689604, gauges=gauges)])
+        return lines, boundaries
+
+    def observe_contract(self, lines, boundaries):
+        sample = dict(gateway="ferrum", phases={})
+        annotate(sample, usage(), lines, boundaries)
+        return sample["h2_guard_observation"]
+
+    def test_actual_producer_live_fixed_failure_refund_and_wrap_contract(self):
+        lines, boundaries = self.producer_contract()
+        result = self.observe_contract(lines, boundaries)
+        self.assertEqual(result["capture_errors"], [])
+        self.assertTrue(result["bounded_capture_complete"])
+        self.assertFalse(result["full_transition_history_complete"])
+        self.assertFalse(result["process_capture_closed"])
+        self.assertTrue(any(row["event"] == 3 and row["max"] == 16777216 and row["frames"] > 0
+                            for row in result["events"]))
+        failure = next(row for row in result["events"] if row["event"] == 1)
+        self.assertEqual((failure["pending"], failure["high_pending"], failure["min_credit"]), (129, 129, 127))
+        tail = [row for row in result["transitions"] if row["snapshot"] == failure["seq"]]
+        self.assertEqual((tail[-1]["consume"], tail[-1]["before"], tail[-1]["after"]), (2, 127, 127))
+        self.assertTrue(any(row["kind"] == 2 for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 3 for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 1 and row["len"] == 1 and row["flow"] == 4
+                            for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 1 and row["len"] == 512 and row["after"] > row["before"]
+                            for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 2 and row["len"] == 1 and row["delta"] == 0
+                            for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 4 for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 5 for row in result["transitions"]))
+        self.assertTrue(any(row["kind"] == 6 for row in result["transitions"]))
+
+    def test_actual_producer_missing_live_tail_loss_order_generation_and_overflow_fail_closed(self):
+        lines, boundaries = self.producer_contract()
+        parsed = [parse_line(text) for text in lines]
+        for label in ("smoke", "before", "after"):
+            missing = copy.deepcopy(boundaries)
+            del missing[label]
+            self.assertFalse(self.observe_contract(lines, missing)["bounded_capture_complete"])
+        initial_only = list(lines)
+        for index, record in enumerate(parsed):
+            if record.get("event") == 3 and record["generation"] == boundaries["after"]["ack"]["generation"]:
+                values = {name: record[name] for name in FIELDS}
+                values["frames"] = 0
+                initial_only[index] = line(values)
+        self.assertIn("missing_successful_or_fixed_live_traffic_state",
+                      self.observe_contract(initial_only, boundaries)["capture_errors"])
+        wrong_order = dict(boundaries, before=boundaries["after"], after=boundaries["before"])
+        self.assertIn("invalid_boundary_generation_order",
+                      self.observe_contract(lines, wrong_order)["capture_errors"])
+        for marker in ("H2_GUARD_V2", "H2_GUARD_TAIL_V2", "H2_GUARD_FENCE_V2"):
+            index = next(i for i, row in enumerate(parsed) if row["record_type"] == marker
+                         and (marker != "H2_GUARD_V2" or row["event"] == 3))
+            self.assertFalse(self.observe_contract(lines[:index] + lines[index + 1:], boundaries)["bounded_capture_complete"])
+        index = next(i for i, row in enumerate(parsed) if row["record_type"] == "H2_GUARD_TAIL_V2")
+        for key, value in (("n", 9999), ("generation", 16), ("epoch", 2**64 - 1)):
+            changed = list(lines)
+            row = {key: parsed[index][key] for key in TAIL_FIELDS}
+            row[key] = value
+            changed[index] = line(row, marker="H2_GUARD_TAIL_V2")
+            self.assertFalse(self.observe_contract(changed, boundaries)["bounded_capture_complete"])
+        changed = list(lines)
+        changed[index] = changed[index].replace(" kind=", " arbitrary=")
+        self.assertFalse(self.observe_contract(changed, boundaries)["bounded_capture_complete"])
+        for key in ("memory_overflow", "overflow", "overwritten"):
+            changed = list(lines)
+            index = next(i for i, row in enumerate(parsed) if row.get("event") == 3)
+            row = {name: parsed[index][name] for name in FIELDS}
+            row[key] += 1
+            changed[index] = line(row)
+            self.assertFalse(self.observe_contract(changed, boundaries)["bounded_capture_complete"])
+        # A final fence present only in HTTP catches otherwise invisible tail loss.
+        fence = boundaries["after"]["ack"]["seq"]
+        changed = [text for text, row in zip(lines, parsed) if row["seq"] < fence]
+        self.assertIn("unacknowledged_snapshot_delivery:after",
+                      self.observe_contract(changed, boundaries)["capture_errors"])
+        for key in ("log_stdout_io_write", "log_stderr_shutdown_incomplete_records_total",
+                    "log_stdout_queued_records", "log_dropped_stdout_record_too_large"):
+            changed = copy.deepcopy(boundaries)
+            changed["after"]["sink_samples"][-1]["gauges"][key] = 1
+            self.assertFalse(self.observe_contract(lines, changed)["bounded_capture_complete"])
+
+    def test_sink_health_requires_every_counter_and_zero_drain(self):
+        gauges = usage()["timeline"][0]["h2_gauges"]["gauges"]
+        self.assertEqual(sink_problems(gauges, drained=True), [])
+        for key in gauges:
+            missing = dict(gauges)
+            del missing[key]
+            self.assertTrue(sink_problems(missing, drained=True))
+        gauges["log_stdout_healthy"] = 0
+        self.assertIn("unhealthy_log_sink", sink_problems(gauges))
+
+    def test_actual_producer_index_reconciles_raw_files_and_rejects_missing_ack(self):
+        lines, boundaries = self.producer_contract()
+        # Reuse a real producer transcript to exercise index file plumbing;
+        # these temporary cells are not claimed to be a measured campaign.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for pair in range(1, 5):
+                cell = root / "pairs" / f"pair_{pair:03d}"
+                diagnostics = cell / "diagnostics"
+                diagnostics.mkdir(parents=True)
+                for gateway in ("direct", "ferrum", "ferrum-exp-fixed"):
+                    sample = dict(gateway=gateway, phases={}, effective_concurrency=200, total_errors=148)
+                    annotate(sample, usage(), lines, boundaries)
+                    (cell / f"{gateway}_http2_71680.json").write_text(json.dumps(sample))
+                    if gateway == "direct":
+                        continue
+                    prefix = gateway + "_71680"
+                    (diagnostics / (prefix + ".log")).write_text("\n".join(lines) + "\n")
+                    (diagnostics / (prefix + "_process_usage.json")).write_text(json.dumps(usage()))
+                    for label, boundary in boundaries.items():
+                        name = (gateway if label == "smoke" else prefix) + "_guard_" + label + ".json"
+                        (diagnostics / name).write_text(json.dumps(boundary))
+            verify_campaign(root, "http2")
+            report = json.loads((root / "guard-evidence-index.json").read_text())
+            self.assertEqual(len(report["samples"]), 12)
+            self.assertTrue(all(row["total_errors"] == 148 for row in report["samples"]))
+            (root / "pairs/pair_004/diagnostics/ferrum_71680_guard_after.json").unlink()
+            with self.assertRaises(ValueError):
+                verify_campaign(root, "http2")
+
     def test_lint_gate_rejects_new_changed_duplicate_and_incomplete_diagnostics(self):
         warning = dict(reason="compiler-message", message=dict(
             level="warning", code=dict(code="clippy::question_mark"), message="use ?",
@@ -108,7 +254,9 @@ class GuardObservationTests(unittest.TestCase):
         self.assertEqual([r["phase"] for r in observation["events"]],
                          ["before_sample", "measurement", "drain"])
         self.assertEqual(observation["measurement_failures"], [2])
-        self.assertEqual(observation["capture_errors"], [])
+        self.assertEqual(observation["capture_errors"], [
+            "missing_or_malformed_boundary:after", "missing_or_malformed_boundary:before",
+            "missing_or_malformed_boundary:smoke"])
         self.assertEqual(sample["total_errors"], 361)
         self.assertIn("instrumented H2 guard build: diagnostic only", sample_issues(sample))
 
@@ -161,7 +309,7 @@ class GuardObservationTests(unittest.TestCase):
             return sample["h2_guard_observation"]
 
         observation = observe(losses)
-        self.assertEqual(observation["capture_errors"], [])
+        self.assertIn("missing_log_sink_health_counters", observation["capture_errors"])
         self.assertFalse(observation["sink_loss_observed"])
         self.assertEqual(len(observation["sink_loss_samples"][0]), 7)  # timestamp + six counters
         for sink in ("stdout", "stderr"):
@@ -169,7 +317,7 @@ class GuardObservationTests(unittest.TestCase):
                 label = f'sink="{sink}",reason="record_too_large"'
                 positive = losses.replace(label + '} 0', label + '} 2')
                 observation = observe(positive)
-                self.assertEqual(observation["capture_errors"], [])
+                self.assertIn("missing_log_sink_health_counters", observation["capture_errors"])
                 self.assertTrue(observation["sink_loss_observed"])
                 self.assertEqual(observation["sink_loss_samples"][0][
                     f"log_dropped_{sink}_record_too_large"], 2)
@@ -225,9 +373,12 @@ class GuardObservationTests(unittest.TestCase):
                 path.mkdir(parents=True)
                 for gateway in ("direct", "ferrum", "ferrum-exp-fixed"):
                     sample = dict(effective_concurrency=200, total_errors=361 if pair == 1 else 0,
-                                  h2_guard_observation=dict(schema=1, capture_errors=[]))
+                                  h2_guard_observation=dict(schema=2, capture_errors=[], bounded_capture_complete=True,
+                                      suppression_observed=False, sink_loss_observed=False))
                     (path / f"{gateway}_http2_71680.json").write_text(json.dumps(sample))
-            verify_campaign(root, "http2")
+            # Completeness booleans without raw live snapshots cannot certify a campaign.
+            with self.assertRaises(ValueError):
+                verify_campaign(root, "http2")
             report = json.loads((root / "guard-evidence-index.json").read_text())
             self.assertEqual(len(report["samples"]), 12)
             self.assertEqual(report["samples"][0]["total_errors"], 361)

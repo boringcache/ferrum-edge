@@ -78,6 +78,10 @@ impl Drop for ConnectionFixture {
 }
 
 fn connection() -> ConnectionFixture {
+    connection_with_budget(32767)
+}
+
+fn connection_with_budget(budget: usize) -> ConnectionFixture {
     ConnectionFixture(Streams::new(Config {
         initial_max_send_streams: 1000,
         local_max_buffer_size: 1024 * 1024,
@@ -90,7 +94,7 @@ fn connection() -> ConnectionFixture {
         remote_init_window_sz: 65535,
         remote_max_initiated: Some(1000),
         local_max_error_reset_streams: Some(1000),
-        data_frame_budget: 32767,
+        data_frame_budget: budget,
     }))
 }
 
@@ -251,7 +255,10 @@ fn guard_observation_window_growth_retains_guard_and_large_frames_replenish() {
 #[test]
 fn guard_observation_opt_in_and_bounded_suppression() {
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        let issued = crate::proto::streams::guard_observe::SEQUENCE.load(Ordering::Relaxed);
         assert!(connection().inner.lock().unwrap().counts.observation.is_none());
+        assert_eq!(super::guard_snapshot(), "# H2_GUARD_ACK_V2 ack=0\n");
+        assert_eq!(crate::proto::streams::guard_observe::SEQUENCE.load(Ordering::Relaxed), issued);
     });
     let limit = Limit::new(3);
     for id in 1..=3 {
@@ -282,4 +289,90 @@ fn guard_observation_opt_in_and_bounded_suppression() {
         }
     });
     assert_eq!(rows.len(), 2); // initial and terminal, no per-frame records
+}
+
+#[test]
+fn guard_observation_live_snapshot_and_contended_lock_are_explicit() {
+    observed(|| {
+        let mut s = connection_with_budget(16777216);
+        let stream = response(&mut s);
+        data(&s, &stream, 1, false).unwrap();
+        let ack = super::guard_snapshot();
+        assert!(ack.contains("captured=1"));
+        assert!(ack.contains("missed=0"));
+        let _held = s.inner.lock().unwrap();
+        let ack = super::guard_snapshot();
+        assert!(ack.contains("captured=0"));
+        assert!(ack.contains("missed=1"));
+    });
+}
+
+#[test]
+fn guard_observation_memory_admission_is_finite_and_released() {
+    use crate::proto::streams::guard_observe::{Observation, MEMORY_OVERFLOW, SLOTS};
+    observed(|| {
+        let before = MEMORY_OVERFLOW.load(Ordering::Relaxed);
+        let admitted: Vec<_> = (0..SLOTS).map(|_| Observation::new(false, 32767).unwrap()).collect();
+        assert!(admitted.iter().all(|observation| observation.allocation_with_metadata_allowance() <= 128 * 1024));
+        assert!(Observation::new(false, 32767).is_none());
+        assert_eq!(MEMORY_OVERFLOW.load(Ordering::Relaxed), before + 1);
+        assert!(super::guard_snapshot().contains(&format!("memory_overflow={}", before + 1)));
+        drop(admitted);
+        assert!(Observation::new(false, 32767).is_some());
+    });
+}
+
+#[test]
+fn guard_observation_export_contract() {
+    // A second, isolated hosted invocation exports the actual producer's messages
+    // for Python completeness/negative tests. This synthetic boundary fixture is
+    // NOT a replay of the campaign's unobserved fragmentation/poll schedule.
+    let mut acks = Vec::new();
+    let rows = observed(|| {
+        let mut fixed = connection_with_budget(16777216);
+        let mut body = response(&mut fixed);
+        acks.push(super::guard_snapshot());
+        acks.push(super::guard_snapshot());
+        fixed.clear_expired_reset_streams(); // real receive poll2 entry hook
+        data(&fixed, &body, 1, false).unwrap();
+        data(&fixed, &body, 512, false).unwrap(); // capped receive replenishment
+        assert!(matches!(body.opaque.poll_data(&Context::from_waker(&noop_waker())), Poll::Ready(Some(Ok(_)))));
+        body.opaque.clear_recv_buffer(); // actual clear, including a large event
+        let mut body = response(&mut fixed);
+        for _ in 0..180 {
+            fixed.clear_expired_reset_streams();
+            data(&fixed, &body, 256, false).unwrap();
+            assert!(matches!(body.opaque.poll_data(&Context::from_waker(&noop_waker())), Poll::Ready(Some(Ok(_)))));
+            body.opaque.release_capacity(256).unwrap();
+        }
+        let padded = frame::Data::load(
+            frame::Head::new(frame::Kind::Data, 0x8, body.stream_id()),
+            Bytes::from_static(&[2, b'x', 0, 0]),
+        ).unwrap();
+        fixed.as_dyn().recv_data(padded).unwrap();
+        data(&fixed, &body, 512, false).unwrap();
+        assert!(matches!(body.opaque.poll_data(&Context::from_waker(&noop_waker())), Poll::Ready(Some(Ok(_)))));
+        body.opaque.clear_recv_buffer();
+        fixed.set_target_connection_window_size(33554432).unwrap();
+        let mut settings = frame::Settings::default();
+        settings.set_initial_window_size(Some(8388608));
+        fixed.apply_local_settings(&settings).unwrap();
+        let mut final_body = response(&mut fixed);
+        data(&fixed, &final_body, 1, true).unwrap(); // final exemption stays explicit
+        assert!(matches!(final_body.opaque.poll_data(&Context::from_waker(&noop_waker())), Poll::Ready(Some(Ok(_)))));
+        let mut failing = connection();
+        let failed_body = response(&mut failing);
+        failing.clear_expired_reset_streams();
+        for _ in 0..128 { data(&failing, &failed_body, 1, false).unwrap(); }
+        guard_error(data(&failing, &failed_body, 1, false).unwrap_err());
+        assert_eq!(failing.inner.lock().unwrap().counts.observation.as_ref().unwrap().pending, 129);
+        acks.push(super::guard_snapshot()); // both fixed and failed Inner are LIVE
+    });
+    assert!(rows.iter().any(|row| row.contains("H2_GUARD_TAIL_V2") && row.contains("consume=2 before=127 after=127")));
+    if let Some(path) = std::env::var_os("H2_GUARD_PRODUCER_CONTRACT") {
+        let mut text = rows.join("\n");
+        text.push('\n');
+        text.push_str(&acks.concat());
+        std::fs::write(path, text).unwrap();
+    }
 }

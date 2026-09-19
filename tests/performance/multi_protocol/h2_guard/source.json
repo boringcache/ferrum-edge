@@ -5,27 +5,42 @@
   "url": "https://static.crates.io/crates/h2/h2-0.4.19.crate",
   "sha256": "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16",
   "revision": "d57d1b852fec9dda6d42d3454502006d52104da8",
-  "patch_sha256": "c8d3546f497f4c1ffdc26467bbc339e670ab5b84f14fffcfbc3d8bbc4b8554ed",
+  "patch_sha256": "9e64ffc335ef39c0704b01aefdca2ff2196e2e161f3d6baac2c1bb1fb1dfe3ba",
   "files": {
+    "src/lib.rs": {
+      "before": "c8680fc4eb13ccb4ce944716042bd33c6554677cf8261c371442f91fbee352e0",
+      "after": "7ae46934e2af01bf0b246780d8fa2885f845f0cdd5309fab4c3188298eda4001"
+    },
+    "src/proto/mod.rs": {
+      "before": "592f8c60d97425946ff62cf694e3f36097a793863fc218fb4357dd440ed377e8",
+      "after": "6d89842e80dc2247a968bdc231242c356a982e770c9b406620ae2a1c44b73f89"
+    },
     "src/proto/streams/counts.rs": {
       "before": "aba319047c01074d9e97afde4999c28e14f0ef21d1d39b7d6c6db4aebc786b79",
       "after": "58b38853d490ca75a172996b3f04650b392fc65af7e3f5a219154cf8c56c0d1f"
     },
     "src/proto/streams/mod.rs": {
       "before": "3f7afa89a19943b1ac56052f64c4e220dbf0e951a4ac74405adbf83ea7050c27",
-      "after": "40c979a24ae59ef01a90d6b33ea88eef9d3a53fcbcdb049737269e03a345fd1e"
+      "after": "964a8e124583211fd35190dd36ad6b91347ed1e2ff392a46686114ddca19fbaf"
     },
     "src/proto/streams/recv.rs": {
       "before": "49888eca03594469393d8b3bf328036007aff0e87df704f61a4556e4272386f8",
-      "after": "d4e470b7a43640da61be3886f358727ae0396677001a9c68200b5b5de2574092"
+      "after": "9aae67b0f29dcd05f4af1c74ba1a268ebe5337446e672d3d4bc8f0c78a1fd40b"
     },
     "src/proto/streams/streams.rs": {
       "before": "d2f866b385ea8107ecb4a56e0089523abeabb6a5dc8e107c0a6c3eeb26955290",
-      "after": "9dc75f8d09c4af34084816dbe95b11aa5fa2a9557fdcfd06fda32a5419ab2246"
+      "after": "8fa211ae3d5c1b17e87b9ec24a9dca8f79c436238786c8cfa3e9b7a24d405d64"
     }
   },
   "assets": {
-    "observer.rs": "955bccb05d7d0c9e3963333bf8b6af95441c951b6d384a3e7af8779486ee5436",
-    "guard_tests.rs": "c0725582da9956e9a5e27506c06992bba9b19fa3df77caca444415a891b1cbaa"
+    "observer.rs": "198add4e6ea4771c15dd6a41e2ad42fbebfe2cd15da7b8b6feeaaa32d51dd178",
+    "guard_tests.rs": "a9cb27706e82dd21222a286c072dbe43553e652ab61cb196a50e3894c7cc03b3",
+    "metrics-hook.txt": "c3e18b33e790351221a7383fd83e7bfa53b59a96b26e7b434a565d714454d539"
+  },
+  "context_files": {
+    "src/admin/mod.rs": {
+      "before": "3cdefa8ce1f1c4f8f19f542f66620ca08c4ef313ffe205085f868faa876f0d1c",
+      "after": "7cbec9c18509b40fb9e84321f4a306678a9a1325673c82467a0c1ca5f317418f"
+    }
   }
 }

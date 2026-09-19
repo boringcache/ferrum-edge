@@ -880,6 +880,11 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" \
+            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json"
+    fi
     if [ -n "$TIMEOUT_CMD" ]; then
         $TIMEOUT_CMD "${bench_wallclock}s" \
             "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
@@ -916,6 +921,9 @@ run_bench() {
     # the capture exists to diagnose.
     cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json"
+        fi
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
             curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
@@ -1099,6 +1107,18 @@ PYEOF
                     if [[ "$gw" == envoy* ]]; then
                         cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
                     fi
+                fi
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$gw" != direct ]; then
+                    # Explicit trigger/HTTP ack/log-fence smoke before offered work.
+                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json"
+                    docker logs --timestamps "$GATEWAY_CID" \
+                        > "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.log" 2>&1 || true
+                    python3 "$SCRIPT_DIR/h2_guard/verify.py" smoke \
+                        "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" || {
+                        echo "[guard] snapshot smoke incomplete; retained raw evidence" >&2
+                        stop_gateway
+                        continue
+                    }
                 fi
                 for size in $PAYLOAD_SIZES; do
                     if [ "$gw" = direct ]; then
