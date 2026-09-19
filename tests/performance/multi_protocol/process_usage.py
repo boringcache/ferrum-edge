@@ -127,7 +127,8 @@ def client_pids(parent, proc_root=Path("/proc")):
 
 
 def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, stop_file=None,
-                     *, http3=False, envoy=False, h2_gauges=False, h1_profile=False, udp_profile=False,
+                     *, http3=False, envoy=False, h2_gauges=False, h1_profile=False,
+                     pool_profile=False, udp_profile=False,
                      h1_runtime=None, h1_container_id=None):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
@@ -161,6 +162,13 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
             owned_gateway = None
             identity_error = "owned gateway runtime unavailable or mismatched"
     started = time.monotonic()
+    sampler_cpu_start = time.process_time() if pool_profile else None
+
+    def write_pool_capture(document):
+        # Atomic replacement retains the previous checkpoint on interruption.
+        partial = Path(str(output) + ".partial")
+        partial.write_text(json.dumps(document) + "\n")
+        partial.replace(output)
 
     def sample():
         for pid in client_pids(parent):
@@ -197,6 +205,9 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
             snapshot["h1_profile"] = h1_snapshot(len(timeline), snapshot["processes"], owned_gateway)
             if identity_error:
                 snapshot["h1_profile"]["identity_error"] = identity_error
+        if pool_profile:
+            from pool_internal_profile import snapshot as pool_snapshot
+            snapshot["pool_profile"] = pool_snapshot(len(timeline))
         if udp_profile:
             from udp_internal_profile import snapshot as udp_snapshot
             snapshot["udp_profile"] = udp_snapshot(len(timeline), snapshot["processes"])
@@ -204,10 +215,16 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
             with Path(str(output) + ".udp-profile.jsonl").open("a") as raw:
                 raw.write(json.dumps(snapshot) + "\n")
         timeline.append(snapshot)
+        if pool_profile:
+            # Persist partial observations before the next interval. A killed
+            # sampler remains incomplete but does not erase earlier failures.
+            write_pool_capture(dict(capture_complete=False, timeline=timeline,
+                                    sampler_lifetime_cpu_secs=time.process_time() - sampler_cpu_start))
 
     try:
         sample()
-        Path(output).write_text(json.dumps({"capture_complete": False}) + "\n")
+        if not pool_profile:
+            Path(output).write_text(json.dumps({"capture_complete": False}) + "\n")
         while not stopping:
             if stop_file is not None and Path(stop_file).exists():
                 stopping = True
@@ -233,7 +250,11 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
         }
         if h1_profile:
             report["h1_gateway"] = owned_gateway
-        Path(output).write_text(json.dumps(report) + "\n")
+        if pool_profile:
+            report["sampler_lifetime_cpu_secs"] = time.process_time() - sampler_cpu_start
+            write_pool_capture(report)
+        else:
+            Path(output).write_text(json.dumps(report) + "\n")
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
@@ -249,6 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--envoy", action="store_true")
     parser.add_argument("--h2-gauges", action="store_true")
     parser.add_argument("--h1-profile", action="store_true")
+    parser.add_argument("--pool-profile", action="store_true")
     parser.add_argument("--udp-profile", action="store_true")
     parser.add_argument("--h1-runtime")
     parser.add_argument("--h1-container-id")
@@ -260,4 +282,4 @@ if __name__ == "__main__":
                      stop_file=args.stop_file, http3=args.http3, envoy=args.envoy,
                      h2_gauges=args.h2_gauges, h1_profile=args.h1_profile,
                      h1_runtime=args.h1_runtime, h1_container_id=args.h1_container_id,
-                     udp_profile=args.udp_profile)
+                     pool_profile=args.pool_profile, udp_profile=args.udp_profile)

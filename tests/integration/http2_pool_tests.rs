@@ -2162,3 +2162,57 @@ async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
         .expect("complete H2 response");
     assert_eq!(body.to_bytes(), Bytes::from_static(b"ok"));
 }
+
+#[cfg(feature = "bench-pool-profile")]
+#[tokio::test]
+async fn pool_profile_live_h2_grpc_hit_miss_and_purpose_attribution() {
+    use ferrum_edge::pool_profile::{Event, current_thread_counters, schema};
+
+    let (_backend, port) = start_h2_tls_backend().await.unwrap();
+    let config = PoolConfig {
+        http2_connections_per_host: 1,
+        ..PoolConfig::default()
+    };
+    let h2 = Http2ConnectionPool::new(
+        config.clone(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let grpc = GrpcConnectionPool::new(
+        config,
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "localhost".into();
+    proxy.backend_port = port;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.verify_server_cert = false;
+    let before = current_thread_counters();
+    for _ in 0..129 {
+        h2.get_sender(&proxy).await.unwrap();
+        grpc.get_sender(&proxy).await.unwrap();
+        h2.get_sender_for_capability_probe(&proxy).await.unwrap();
+        grpc.get_sender_for_capability_probe(&proxy).await.unwrap();
+    }
+    let after = current_thread_counters();
+    for group in 0..4 {
+        let base = group * schema::STRIDE;
+        let delta = |event: Event| after[base + event as usize] - before[base + event as usize];
+        assert_eq!(delta(Event::Acquisitions), 129);
+        assert!(delta(Event::WarmHit) >= 1);
+        assert!(delta(Event::SenderClone) >= 1);
+        assert_eq!(delta(Event::Errors), 0);
+        assert_eq!(delta(Event::Cancelled), 0);
+        if group % 2 == 0 {
+            assert_eq!(delta(Event::CreateOwner), 1);
+            assert_eq!(delta(Event::MissFallback), 1);
+        }
+    }
+    assert_eq!(h2.pool_size(), 1);
+    assert_eq!(grpc.pool_size(), 1);
+}

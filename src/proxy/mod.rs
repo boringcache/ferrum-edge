@@ -11092,7 +11092,12 @@ impl ProxyState {
             previous_grpc_h2_tls,
             previous_h1,
         } = target;
-        match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(probe_proxy)).await {
+        match tokio::time::timeout(
+            probe_timeout,
+            self.http2_pool.get_sender_for_capability_probe(probe_proxy),
+        )
+        .await
+        {
             Ok(Ok(_)) => {
                 record.plain_http.h2_tls = ProtocolSupport::Supported;
                 record.grpc_transport.h2_tls = ProtocolSupport::Supported;

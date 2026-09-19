@@ -1000,6 +1000,32 @@ impl Http2ConnectionPool {
     }
 
     pub async fn get_sender(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
+        let future = self.get_sender_unprofiled(proxy);
+        #[cfg(feature = "bench-pool-profile")]
+        let future = crate::pool_profile::acquisition(
+            crate::pool_profile::Family::H2,
+            crate::pool_profile::Purpose::Request,
+            future,
+        );
+        future.await
+    }
+
+    /// Same acquisition behavior with a fixed diagnostic purpose for warmup.
+    pub async fn get_sender_for_capability_probe(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<Http2Sender, Http2PoolError> {
+        let future = self.get_sender_unprofiled(proxy);
+        #[cfg(feature = "bench-pool-profile")]
+        let future = crate::pool_profile::acquisition(
+            crate::pool_profile::Family::H2,
+            crate::pool_profile::Purpose::Capability,
+            future,
+        );
+        future.await
+    }
+
+    async fn get_sender_unprofiled(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -1014,63 +1040,86 @@ impl Http2ConnectionPool {
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
-        let phase1 = self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
-            let base_len = key_buf.len();
+        let phase1 = crate::profile_pool_sync!(Phase1, {
+            self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
+                let base_len = key_buf.len();
 
-            // Round-robin counter is per-host, but on FIRST access we seed it
-            // with a thread-local PRNG offset so a burst of concurrent
-            // requests on a cold pool does not land all on shard 0 before
-            // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
-            // Relaxed)` is wait-free after the seed — the seed only matters
-            // for the first `shard_count` picks per host on this gateway.
-            let rr = get_or_seed_rr_counter(
-                &self.rr_counters,
-                &key_buf[..base_len],
-                svid_generation,
-                &self.pool.manager().backend_svid_generation,
-            );
-            let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+                // Round-robin counter is per-host, but on FIRST access we seed it
+                // with a thread-local PRNG offset so a burst of concurrent
+                // requests on a cold pool does not land all on shard 0 before
+                // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
+                // Relaxed)` is wait-free after the seed — the seed only matters
+                // for the first `shard_count` picks per host on this gateway.
+                let start = crate::profile_pool_sync!(Rr, {
+                    let rr = get_or_seed_rr_counter(
+                        &self.rr_counters,
+                        &key_buf[..base_len],
+                        svid_generation,
+                        &self.pool.manager().backend_svid_generation,
+                    );
+                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                });
 
-            // Cheap probe pass — any shard whose cached sender is
-            // immediately ready wins. `now_or_never` never awaits, so this
-            // is a quick sweep of the shard ring with no per-shard stall.
-            for offset in 0..shard_count {
-                let shard = (start + offset) % shard_count;
-                Self::write_shard_key_inplace(key_buf, base_len, shard);
+                // Cheap probe pass — any shard whose cached sender is
+                // immediately ready wins. `now_or_never` never awaits, so this
+                // is a quick sweep of the shard ring with no per-shard stall.
+                #[cfg(feature = "bench-pool-profile")]
+                let mut saw_busy = false;
+                for offset in 0..shard_count {
+                    let shard = (start + offset) % shard_count;
+                    Self::write_shard_key_inplace(key_buf, base_len, shard);
 
-                if let Some(mut sender) = self.pool.cached(key_buf) {
-                    match futures_util::FutureExt::now_or_never(sender.ready()) {
-                        Some(Ok(())) => return Phase1::Hit(sender),
-                        Some(Err(_)) => {
-                            self.pool.invalidate(key_buf);
+                    crate::profile_pool_event!(Probe);
+                    if let Some(mut sender) =
+                        crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
+                    {
+                        match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
+                            sender.ready()
+                        )) {
+                            Some(Ok(())) => {
+                                crate::profile_pool_event!(WarmHit);
+                                return Phase1::Hit(sender);
+                            }
+                            Some(Err(_)) => {
+                                self.pool.invalidate(key_buf);
+                            }
+                            // Shard exists but is mid-send. Previously we
+                            // stashed the first such sender and `timeout(5ms,
+                            // ready())`ed on it, which serialized ~100-
+                            // concurrent bursts onto the already-busy shard and
+                            // net-pessimized throughput (5 MB/100-conc HTTP/2
+                            // stuck at 81 RPS vs direct 232). Skip — phase 2's
+                            // `create_or_get_existing_owned` checks `cached()`
+                            // first; the existing sender is still healthy
+                            // (`!is_closed()`), so the create closure never runs
+                            // and the pool does NOT grow beyond the shard ring.
+                            // Callers queue on the start shard's existing sender
+                            // via H2 readiness / stream-cap backpressure.
+                            None => {
+                                #[cfg(feature = "bench-pool-profile")]
+                                {
+                                    saw_busy = true;
+                                }
+                            }
                         }
-                        // Shard exists but is mid-send. Previously we
-                        // stashed the first such sender and `timeout(5ms,
-                        // ready())`ed on it, which serialized ~100-
-                        // concurrent bursts onto the already-busy shard and
-                        // net-pessimized throughput (5 MB/100-conc HTTP/2
-                        // stuck at 81 RPS vs direct 232). Skip — phase 2's
-                        // `create_or_get_existing_owned` checks `cached()`
-                        // first; the existing sender is still healthy
-                        // (`!is_closed()`), so the create closure never runs
-                        // and the pool does NOT grow beyond the shard ring.
-                        // Callers queue on the start shard's existing sender
-                        // via H2 readiness / stream-cap backpressure.
-                        None => {}
                     }
                 }
-            }
 
-            Self::write_shard_key_inplace(key_buf, base_len, start);
-            // Single allocation: clone the thread-local buffer into the
-            // owned key that `create_or_get_existing_owned` consumes. This
-            // is the only `String` allocation on the cache-miss path now —
-            // cache hits take the early return above without allocating.
-            Phase1::Miss {
-                selected_key: key_buf.clone(),
-                base_len,
-                start,
-            }
+                #[cfg(feature = "bench-pool-profile")]
+                crate::pool_profile::event(if saw_busy {
+                    crate::pool_profile::Event::BusyFallback
+                } else {
+                    crate::pool_profile::Event::MissFallback
+                });
+                Self::write_shard_key_inplace(key_buf, base_len, start);
+                // Clone the selected key for the asynchronous fallback. Cold
+                // pending-registration and creation paths can allocate further keys.
+                Phase1::Miss {
+                    selected_key: key_buf.clone(),
+                    base_len,
+                    start,
+                }
+            })
         });
 
         let (selected_key, base_len, start) = match phase1 {
@@ -1082,27 +1131,33 @@ impl Http2ConnectionPool {
             } => (selected_key, base_len, start),
         };
 
+        crate::profile_pool_event!(Fallback);
         let manager = Arc::clone(self.pool.manager());
-        match self
-            .pool
-            .create_or_get_existing_owned(selected_key, |key| async move {
-                let _ = key;
-                manager.create_connection(proxy, svid_generation).await
-            })
-            .await
-        {
+        let acquired = crate::profile_pool_future!(FallbackPoll, {
+            self.pool
+                .create_or_get_existing_owned(selected_key, |key| async move {
+                    let _ = key;
+                    manager.create_connection(proxy, svid_generation).await
+                })
+        });
+        match acquired {
             Ok(sender) => Ok(sender),
             Err(err) => {
                 // Phase 2 (synchronous re-borrow): rebuild the pool key in
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
                 // build is identical to phase 1's prelude.
+                crate::profile_pool_event!(Recovery);
                 let recovered = self.with_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
                         Self::write_shard_key_inplace(key_buf, base_len, shard);
-                        if let Some(sender) = self.pool.cached(key_buf) {
+                        crate::profile_pool_event!(Probe);
+                        if let Some(sender) =
+                            crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
+                        {
+                            crate::profile_pool_event!(Recovered);
                             return Some(sender);
                         }
                     }

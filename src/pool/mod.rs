@@ -869,17 +869,20 @@ impl<M: PoolManager> GenericPool<M> {
     pub fn cached(&self, key: &str) -> Option<M::Connection> {
         if let Some(entry) = self.entries.get(key) {
             let conn = entry.conn.clone();
+            crate::profile_pool_event!(SenderClone);
             if self.manager.is_healthy(&conn) {
                 entry
                     .last_used_tick_ms
                     .store(now_tick_ms(), Ordering::Relaxed);
                 Some(conn)
             } else {
+                crate::profile_pool_event!(Unhealthy);
                 drop(entry);
                 self.invalidate(key);
                 None
             }
         } else {
+            crate::profile_pool_event!(CacheMiss);
             None
         }
     }
@@ -981,10 +984,11 @@ impl<M: PoolManager> GenericPool<M> {
             };
             on_join(&attempt);
             if !is_creator {
+                crate::profile_pool_event!(CoalescedWait);
                 // `watch` stores a durable outcome, so even a waiter that
                 // subscribes after the creator finishes will observe it and
                 // either return the shared failure or loop without hanging.
-                match pending.wait().await {
+                match crate::profile_pool_future!(WaitPoll, pending.wait()) {
                     CreationNotify::Failed(err) => {
                         on_waiter_failure(&attempt);
                         return Err(E::from(err));
@@ -993,6 +997,7 @@ impl<M: PoolManager> GenericPool<M> {
                 }
             }
 
+            crate::profile_pool_event!(CreateOwner);
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
                 .create_after_recheck(key.clone(), {
@@ -1074,14 +1079,16 @@ impl<M: PoolManager> GenericPool<M> {
             return Ok(conn);
         }
 
-        let created = match create(key.clone()).await {
+        let created = match crate::profile_pool_future!(CreationPoll, create(key.clone())) {
             Ok(created) => {
+                crate::profile_pool_event!(CreateSuccess);
                 if let Some(kind) = self.manager.runtime_metrics_kind() {
                     crate::runtime_metrics::global_ref().record_pool_handshake(kind);
                 }
                 created
             }
             Err(err) => {
+                crate::profile_pool_event!(CreateError);
                 if let Some(kind) = self.manager.runtime_metrics_kind() {
                     crate::runtime_metrics::global_ref().record_pool_failure(kind);
                 }
@@ -1096,6 +1103,7 @@ impl<M: PoolManager> GenericPool<M> {
                 if self.manager.is_healthy(&entry.conn) {
                     entry.last_used_tick_ms.store(now, Ordering::Relaxed);
                     let existing = entry.conn.clone();
+                    crate::profile_pool_event!(SenderClone);
                     if let Some(kind) = self.manager.runtime_metrics_kind() {
                         crate::runtime_metrics::global_ref().record_pool_eviction(kind);
                     }
@@ -1103,6 +1111,7 @@ impl<M: PoolManager> GenericPool<M> {
                     Ok(existing)
                 } else {
                     let old = std::mem::replace(&mut entry.conn, created.clone());
+                    crate::profile_pool_event!(SenderClone);
                     entry.last_used_tick_ms.store(now, Ordering::Relaxed);
                     if let Some(kind) = self.manager.runtime_metrics_kind() {
                         crate::runtime_metrics::global_ref().record_pool_eviction(kind);
@@ -1113,6 +1122,7 @@ impl<M: PoolManager> GenericPool<M> {
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 vacant.insert(PoolEntry::new(created.clone()));
+                crate::profile_pool_event!(SenderClone);
                 Ok(created)
             }
         }
