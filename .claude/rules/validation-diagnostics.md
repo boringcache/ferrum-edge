@@ -98,6 +98,13 @@ paths:
   parser payloads are withheld. LDAP CA-load and GeoIP fallback constructor logs
   sanitize configured paths at emission. Registered rendered/captured regressions
   and existing rejection/reload-retention assertions cover these boundaries.
+- The #5594 traffic/transform conversion covers request/response/body/header
+  transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
+  GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and
+  schema paths survive rendered failures; configured routes, method/operation
+  names, keys, regexes and numeric operands remain withheld. Existing typed
+  rejection, constructor/rendered-output and last-good reload assertions retain
+  admission and retention coverage.
 - Shared TLS and plugin-client configuration diagnostics quote material paths,
   source identifiers, cipher/group selections and opaque provider detail.
   Fixed material labels, PEM/CRL record indexes and measured public-key strength

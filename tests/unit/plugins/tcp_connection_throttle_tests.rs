@@ -533,3 +533,30 @@ async fn proxy_protocol_forwarded_source_shares_the_native_budget() {
     ));
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"max_connections_per_key": 1, token: true}),
+            "tcp_connection_throttle",
+            "unknown config field",
+        ),
+        (
+            json!({"max_connections_per_key": true}),
+            "`max_connections_per_key`",
+            "must be a positive integer",
+        ),
+    ] {
+        let error =
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &config)
+                .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

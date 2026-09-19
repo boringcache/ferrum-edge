@@ -483,11 +483,11 @@ pub fn validate_composition(
                 continue;
             }
             errors.push(format!(
-                "request_deduplication cannot be composed with {dynamic_name} on proxy '{}': \
-                 an idempotent replay is served without re-running {dynamic_name}'s response \
+                "request_deduplication cannot be composed with `{dynamic_name}` on proxy {:?}: \
+                 an idempotent replay is served without re-running the `{dynamic_name}` response \
                  rewrite, which is derived from live upstream discovery state rather than \
                  configuration, so a replay cannot be proven to match the current policy. \
-                 request_deduplication: {}; {dynamic_name}: {}. \
+                 request_deduplication: {:?}; `{dynamic_name}`: {:?}. \
                  Disable one of them on this proxy",
                 proxy.id,
                 dedup_ids.join(", "),
@@ -503,14 +503,14 @@ pub fn validate_composition(
                 continue;
             }
             errors.push(format!(
-                "request_deduplication cannot be composed with {dynamic_name} on proxy '{}' \
+                "request_deduplication cannot be composed with `{dynamic_name}` on proxy {:?} \
                  while {dynamic_name} derives its public base from the request: an idempotent \
-                 replay is served without re-running {dynamic_name}'s Agent Card rewrite, and \
-                 with discovery.public_base_url unset and discovery.trust_forwarded_headers \
+                 replay is served without re-running the `{dynamic_name}` Agent Card rewrite, and \
+                 with `discovery.public_base_url` unset and `discovery.trust_forwarded_headers` \
                  enabled that rewrite is shaped by per-request forwarded headers and by the \
-                 connection's TLS SNI, neither of which the deduplication fingerprint binds. \
-                 request_deduplication: {}; {dynamic_name}: {}. \
-                 Set discovery.public_base_url on {dynamic_name}, or disable one of them on \
+                 connection TLS SNI, neither of which the deduplication fingerprint binds. \
+                 request_deduplication: {:?}; `{dynamic_name}`: {:?}. \
+                 Set `discovery.public_base_url` on `{dynamic_name}`, or disable one of them on \
                  this proxy",
                 proxy.id,
                 dedup_ids.join(", "),
@@ -1124,7 +1124,7 @@ impl RequestDeduplication {
             object,
             "config",
             REQUEST_DEDUPLICATION_CONFIG_KEYS,
-            "request_deduplication: ",
+            "request_deduplication: `config`: ",
         )?;
 
         // Redis-only fields outside Redis mode are a configuration error rather
@@ -1142,11 +1142,11 @@ impl RequestDeduplication {
                 supplied.sort_unstable();
                 let rendered: Vec<String> = supplied
                     .into_iter()
-                    .map(|key| format!("'config.{key}'"))
+                    .map(|key| format!("`config.{key}`"))
                     .collect();
                 return Err(format!(
                     "request_deduplication: Redis-only configuration key(s) {} require \
-                     sync_mode='redis' (did you mean to set sync_mode?)",
+                     `sync_mode=redis` (did you mean to set `sync_mode`?)",
                     rendered.join(", ")
                 ));
             }
@@ -1196,8 +1196,8 @@ impl RequestDeduplication {
             Some(_) => {
                 // Value-redacted: the rejected string can be a mistyped secret.
                 return Err(
-                    "request_deduplication: 'on_redis_unavailable' must be exactly \
-                     'fail_closed' or 'local_only'"
+                    "request_deduplication: `on_redis_unavailable` must be exactly \
+                     `fail_closed` or `local_only`"
                         .to_string(),
                 );
             }
@@ -3304,7 +3304,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("request_deduplication: '{field}' must be a string"))
+        .ok_or_else(|| format!("request_deduplication: `{field}` must be a string"))
 }
 
 fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
@@ -3313,12 +3313,12 @@ fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "request_deduplication: '{field}' must be an integer greater than zero"
+            "request_deduplication: `{field}` must be an integer greater than zero"
         ));
     };
     if value == 0 {
         return Err(format!(
-            "request_deduplication: '{field}' must be greater than zero"
+            "request_deduplication: `{field}` must be greater than zero"
         ));
     }
     Ok(Some(value))
@@ -3330,7 +3330,7 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     };
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("request_deduplication: '{field}' is too large for this platform"))
+        .map_err(|_| format!("request_deduplication: `{field}` is too large for this platform"))
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -3340,14 +3340,14 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("request_deduplication: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("request_deduplication: `{field}` must be a boolean"))
 }
 
 fn parse_header_name(value: &str) -> Result<String, String> {
     HeaderName::from_bytes(value.as_bytes())
         .map(|name| name.as_str().to_string())
         .map_err(|_| {
-            "request_deduplication: 'header_name' must be a valid HTTP header name".to_string()
+            "request_deduplication: `header_name` must be a valid HTTP header name".to_string()
         })
 }
 
@@ -3361,25 +3361,25 @@ fn parse_applicable_methods(config: &Value) -> Result<Vec<String>, String> {
     };
     let Some(methods) = value.as_array() else {
         return Err(
-            "request_deduplication: 'applicable_methods' must be an array of method strings"
+            "request_deduplication: `applicable_methods` must be an array of method strings"
                 .to_string(),
         );
     };
     if methods.is_empty() {
-        return Err("request_deduplication: applicable_methods must not be empty".to_string());
+        return Err("request_deduplication: `applicable_methods` must not be empty".to_string());
     }
 
     let mut parsed = Vec::with_capacity(methods.len());
     for method in methods {
         let Some(method) = method.as_str() else {
             return Err(
-                "request_deduplication: 'applicable_methods' must contain only strings".to_string(),
+                "request_deduplication: `applicable_methods` must contain only strings".to_string(),
             );
         };
         let method = method.trim();
         if method.is_empty() || Method::from_bytes(method.as_bytes()).is_err() {
             return Err(
-                "request_deduplication: 'applicable_methods' contains an invalid HTTP method"
+                "request_deduplication: `applicable_methods` contains an invalid HTTP method"
                     .to_string(),
             );
         }

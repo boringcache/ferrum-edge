@@ -6649,7 +6649,7 @@ fn dedup_and_mcp_gateway_on_one_proxy_are_rejected() {
         .expect_err("dedup + mcp_gateway on one proxy must be refused");
     let joined = errs.join("; ");
     assert!(
-        joined.contains("request_deduplication cannot be composed with mcp_gateway"),
+        joined.contains("request_deduplication cannot be composed with `mcp_gateway`"),
         "unexpected errors: {joined}"
     );
     // Operators need both offending ids to act on the error.
@@ -6678,7 +6678,7 @@ fn dedup_and_a_global_mcp_gateway_are_rejected() {
         .expect_err("a global mcp_gateway still composes with a proxy-scoped dedup");
     assert!(
         errs.iter()
-            .any(|e| e.contains("request_deduplication cannot be composed with mcp_gateway")),
+            .any(|e| e.contains("request_deduplication cannot be composed with `mcp_gateway`")),
         "unexpected errors: {errs:?}"
     );
 }
@@ -6898,7 +6898,7 @@ fn a_global_mcp_gateway_in_another_namespace_blocks_dedup() {
         .expect_err("a foreign-namespace global mcp_gateway still runs on this proxy");
     assert!(
         errors.iter().any(|error| {
-            error.contains("request_deduplication cannot be composed with mcp_gateway")
+            error.contains("request_deduplication cannot be composed with `mcp_gateway`")
                 && error.contains("p1")
         }),
         "the gateway-wide composition conflict must be reported: {errors:?}"
@@ -6993,7 +6993,7 @@ fn dedup_and_request_derived_a2a_gateway_are_rejected() {
         .expect_err("dedup + a request-derived a2a_gateway must be refused");
     let joined = errs.join("; ");
     assert!(
-        joined.contains("request_deduplication cannot be composed with a2a_gateway"),
+        joined.contains("request_deduplication cannot be composed with `a2a_gateway`"),
         "unexpected errors: {joined}"
     );
     assert!(
@@ -7001,7 +7001,7 @@ fn dedup_and_request_derived_a2a_gateway_are_rejected() {
         "the error must name the configuration that is actually unprovable: {joined}"
     );
     assert!(
-        joined.contains("Set discovery.public_base_url"),
+        joined.contains("Set `discovery.public_base_url`"),
         "the error must name the remedy: {joined}"
     );
     assert!(
@@ -7036,7 +7036,7 @@ fn dedup_and_a_global_request_derived_a2a_gateway_are_rejected() {
         .expect_err("a global request-derived a2a_gateway still composes with a scoped dedup");
     assert!(
         errs.iter()
-            .any(|e| e.contains("request_deduplication cannot be composed with a2a_gateway")),
+            .any(|e| e.contains("request_deduplication cannot be composed with `a2a_gateway`")),
         "unexpected errors: {errs:?}"
     );
 }

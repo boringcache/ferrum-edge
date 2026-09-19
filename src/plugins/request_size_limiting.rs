@@ -46,7 +46,7 @@ impl RequestSizeLimiting {
             config_obj,
             "config",
             REQUEST_SIZE_LIMITING_CONFIG_KEYS,
-            "request_size_limiting: ",
+            "request_size_limiting: `config`: ",
         )?;
 
         let max_bytes = required_positive_u64(config, "max_bytes", "request_size_limiting")?;

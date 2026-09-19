@@ -389,3 +389,21 @@ async fn test_final_request_body_over_limit_still_rejects_after_transforms() {
         other => panic!("Expected 413 Reject, got {other:?}"),
     }
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [(
+        json!({"max_bytes": true}),
+        "`max_bytes`",
+        "must be greater than zero",
+    )] {
+        let error = ferrum_edge::plugins::validate_plugin_config("request_size_limiting", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

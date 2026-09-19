@@ -146,7 +146,7 @@ impl GrpcMethodRouter {
             object,
             "config",
             GRPC_METHOD_ROUTER_CONFIG_KEYS,
-            "grpc_method_router: ",
+            "grpc_method_router: `config`: ",
         )?;
 
         let allow_methods = parse_optional_method_set(config, "allow_methods")?;
@@ -160,7 +160,7 @@ impl GrpcMethodRouter {
                 let lc = s.to_lowercase();
                 if !matches!(lc.as_str(), "ip" | "consumer") {
                     return Err(format!(
-                        "grpc_method_router: 'limit_by' must be one of 'ip' or 'consumer', got: {s:?}"
+                        "grpc_method_router: `limit_by` must be one of `ip` or `consumer`, got: {s:?}"
                     ));
                 }
                 lc
@@ -185,21 +185,22 @@ impl GrpcMethodRouter {
             })?;
             for (method, spec) in obj {
                 let spec_obj = spec.as_object().ok_or_else(|| {
-                    format!("grpc_method_router: method_rate_limits['{method}'] must be an object")
+                    format!("grpc_method_router: `method_rate_limits` entry {method:?} must be an object")
                 })?;
-                let label = format!("grpc_method_router: method_rate_limits['{method}']");
+                let label = format!("grpc_method_router: `method_rate_limits` entry {method:?}");
                 reject_unknown_keys(
                     spec_obj,
                     &format!("config.method_rate_limits[{method}]"),
                     RATE_SPEC_KEYS,
                     "grpc_method_router: ",
-                )?;
+                )
+                .map_err(|error| format!("`method_rate_limits`: {error}"))?;
                 let max_requests = spec_obj
                     .get("max_requests")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| {
                         format!(
-                            "grpc_method_router: method_rate_limits['{method}']: 'max_requests' is required and must be a positive integer"
+                            "grpc_method_router: `method_rate_limits` entry {method:?}: `max_requests` is required and must be a positive integer"
                         )
                     })?;
                 let window_seconds = spec_obj
@@ -207,12 +208,17 @@ impl GrpcMethodRouter {
                     .and_then(Value::as_u64)
                     .ok_or_else(|| {
                         format!(
-                            "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' is required and must be a positive integer"
+                            "grpc_method_router: `method_rate_limits` entry {method:?}: `window_seconds` is required and must be a positive integer"
                         )
                     })?;
-                let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
+                let max_requests = validate_max_requests(&label, "max_requests", max_requests)
+                    .map_err(|error| {
+                        format!("grpc_method_router: `method_rate_limits`: {error}")
+                    })?;
                 let window_seconds =
-                    validate_window_seconds(&label, "window_seconds", window_seconds)?;
+                    validate_window_seconds(&label, "window_seconds", window_seconds).map_err(
+                        |error| format!("grpc_method_router: `method_rate_limits`: {error}"),
+                    )?;
                 let normalized = normalize_config_method_path(method, "method_rate_limits")?;
                 let window = Duration::from_secs(window_seconds);
                 if method_rate_limits
@@ -229,7 +235,7 @@ impl GrpcMethodRouter {
                     .is_some()
                 {
                     return Err(format!(
-                        "grpc_method_router: duplicate method_rate_limits entry after normalization: {method:?}"
+                        "grpc_method_router: duplicate `method_rate_limits` entry after normalization: {method:?}"
                     ));
                 }
             }
@@ -240,8 +246,8 @@ impl GrpcMethodRouter {
 
         if !has_any_config {
             return Err(
-                "grpc_method_router: no rules configured — set 'allow_methods', 'deny_methods', \
-                 or 'method_rate_limits'"
+                "grpc_method_router: no rules configured — set `allow_methods`, `deny_methods`, \
+                 or `method_rate_limits`"
                     .to_string(),
             );
         }
@@ -273,7 +279,8 @@ impl GrpcMethodRouter {
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("grpc_method_router: {error}"))?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
@@ -494,7 +501,7 @@ fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet
         let normalized = normalize_config_method_path(method, key)?;
         if !methods.insert(normalized.clone()) {
             return Err(format!(
-                "grpc_method_router: duplicate method in '{key}' after normalization: {normalized:?}"
+                "grpc_method_router: duplicate method in `{key}` after normalization: {normalized:?}"
             ));
         }
     }
@@ -505,23 +512,23 @@ fn normalize_config_method_path(method: &str, field: &str) -> Result<String, Str
     let trimmed = method.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "grpc_method_router: '{field}' entries must not be empty"
+            "grpc_method_router: `{field}` entries must not be empty"
         ));
     }
     let normalized = trimmed.strip_prefix('/').unwrap_or(trimmed);
     let Some((service, method_name)) = normalized.split_once('/') else {
         return Err(format!(
-            "grpc_method_router: '{field}' entry must use 'package.Service/Method': {method:?}"
+            "grpc_method_router: `{field}` entry must use `package.Service/Method`: {method:?}"
         ));
     };
     if service.is_empty() || method_name.is_empty() || method_name.contains('/') {
         return Err(format!(
-            "grpc_method_router: invalid gRPC method path in '{field}': {method:?}"
+            "grpc_method_router: invalid gRPC method path in `{field}`: {method:?}"
         ));
     }
     if !is_valid_grpc_service(service) || !is_valid_grpc_identifier(method_name) {
         return Err(format!(
-            "grpc_method_router: invalid gRPC method path in '{field}': {method:?}"
+            "grpc_method_router: invalid gRPC method path in `{field}`: {method:?}"
         ));
     }
     Ok(normalized.to_string())

@@ -729,7 +729,7 @@ impl CorsPlugin {
                         "cors: allow_credentials=true is incompatible with an effectively \
                          universal origin matcher (the opaque exact `null` origin, a prefix \
                          that does not terminate at an origin boundary — only a \
-                         'scheme://host:' prefix pins the host, because prefix matching is an \
+                         `scheme://host:` prefix pins the host, because prefix matching is an \
                          unbounded starts_with — or a regex that admits every origin of a \
                          scheme); specify a host-constraining origin policy to use credentials"
                             .to_string(),
@@ -794,13 +794,13 @@ impl CorsPlugin {
     fn parse_origins(config: &Value) -> Result<AllowedOrigins, String> {
         match config.get("allowed_origins") {
             None => Err(
-                "cors: `allowed_origins` is required; use ['*'] for intentional allow-all"
+                "cors: `allowed_origins` is required; use an array containing `*` for intentional allow-all"
                     .to_string(),
             ),
             Some(Value::Array(arr)) => {
                 if arr.is_empty() {
                     return Err(
-                        "cors: `allowed_origins` must contain at least one origin or '*'"
+                        "cors: `allowed_origins` must contain at least one origin or `*`"
                             .to_string(),
                     );
                 }
@@ -842,7 +842,7 @@ impl CorsPlugin {
                         }
                         Value::Object(_) => {
                             match Self::parse_origin_matcher(value).map_err(|error| {
-                                format!("cors.allowed_origins[{index}]: {error}")
+                                format!("`cors.allowed_origins[{index}]`: {error}")
                             })? {
                                 Some(pattern) => patterns.push(pattern),
                                 None => wildcard = true,
@@ -1620,7 +1620,7 @@ pub(crate) fn validate_header_name(key: &str, value: &str) -> Result<(), String>
 fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     let Some(suffix) = origin.strip_prefix("*.") else {
         return Err(format!(
-            "cors: wildcard origins must use the '*.example.com' form, got: {origin:?}"
+            "cors: wildcard origins must use the `*.example.com` form, got: {origin:?}"
         ));
     };
     if suffix.is_empty()
@@ -1689,7 +1689,8 @@ pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> 
         ));
     }
 
-    let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin {origin:?}: {e}"))?;
+    let url = Url::parse(origin)
+        .map_err(|_| format!("cors: invalid origin URL in `allowed_origins`: {origin:?}"))?;
     match url.scheme() {
         "http" | "https" => {}
         scheme => {

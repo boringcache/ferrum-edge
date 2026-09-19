@@ -461,8 +461,8 @@ fn test_creation_rejects_all_unknown_keys_with_actionable_error() {
     .err()
     .expect("unknown config keys must be rejected");
 
-    assert!(error.contains("'cache_ttl_second'"), "{error}");
-    assert!(error.contains("'tls_no_verfy'"), "{error}");
+    assert!(error.contains("\"cache_ttl_second\""), "{error}");
+    assert!(error.contains("\"tls_no_verfy\""), "{error}");
     assert!(error.contains("supported keys"), "{error}");
 }
 
@@ -513,8 +513,8 @@ fn test_creation_fails_closed_when_configured_ca_cannot_be_loaded_or_parsed() {
     assert!(missing_error.contains("refusing to widen trust"));
 
     let tempdir = tempfile::tempdir().expect("create tempdir");
-    let invalid_path = tempdir.path().join("invalid-ca.pem");
-    std::fs::write(&invalid_path, "not a certificate").expect("write invalid CA");
+    let invalid_path = tempdir.path().join("'UNREGISTERED_CA_PATH.pem");
+    std::fs::write(&invalid_path, "'UNREGISTERED_CA_MATERIAL").expect("write invalid CA");
     let invalid_error = SpecExpose::new(
         &json!({ "spec_url": "https://example.com/openapi.yaml" }),
         plugin_http_client_with_ca(invalid_path.to_str().expect("utf8 path"), false),
@@ -522,6 +522,11 @@ fn test_creation_fails_closed_when_configured_ca_cannot_be_loaded_or_parsed() {
     .err()
     .expect("invalid configured CA must reject construction");
     assert!(invalid_error.contains("refusing to widen trust"));
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(invalid_error), &[]);
+    assert!(rendered.contains("configured CA bundle"), "{rendered}");
+    assert!(rendered.contains("refusing to widen trust"), "{rendered}");
+    assert!(!rendered.contains("UNREGISTERED_CA_PATH"), "{rendered}");
+    assert!(!rendered.contains("UNREGISTERED_CA_MATERIAL"), "{rendered}");
 }
 
 #[test]
@@ -1801,4 +1806,36 @@ async fn test_ttl_zero_coalesces_concurrent_fetches() {
         elapsed < std::time::Duration::from_millis(600),
         "TTL=0 concurrent fetches did not coalesce (took {elapsed:?}, expected <600ms)"
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({token: true}),
+            "supported keys",
+            "unsupported configuration key",
+        ),
+        (json!({"spec_url": token}), "`spec_url`", "not a valid URL"),
+        (
+            json!({"spec_url": "https://example.com", "content_type": true}),
+            "`content_type`",
+            "must be a string",
+        ),
+        (
+            json!({"spec_url": "https://example.com", "content_type": 918273641}),
+            "`content_type`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("spec_expose", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

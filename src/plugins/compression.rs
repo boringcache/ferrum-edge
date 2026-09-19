@@ -444,7 +444,7 @@ impl CompressionPlugin {
         // unknown-key gate so operators still see an explicit migration hint.
         if config.get("disable_on_etag").is_some() {
             return Err(
-                "compression: 'disable_on_etag' has been removed; strong ETag responses are always preserved"
+                "compression: `disable_on_etag` has been removed; strong ETag responses are always preserved"
                     .to_string(),
             );
         }
@@ -456,7 +456,7 @@ impl CompressionPlugin {
             config_object,
             "config",
             COMPRESSION_CONFIG_KEYS,
-            "compression: ",
+            "compression: `config`: ",
         )?;
 
         // Parse `algorithms` strictly. Unknown values are rejected (no silent
@@ -471,11 +471,13 @@ impl CompressionPlugin {
                         Some("br") | Some("brotli") => algos.push(Algorithm::Brotli),
                         Some(other) => {
                             return Err(format!(
-                                "compression: algorithms[{idx}]: unknown algorithm {other:?} (expected `gzip` or `br`)"
+                                "compression: `algorithms[{idx}]`: unknown algorithm {other:?} (expected `gzip` or `br`)"
                             ));
                         }
                         None => {
-                            return Err(format!("compression: algorithms[{idx}] must be a string"));
+                            return Err(format!(
+                                "compression: `algorithms[{idx}]` must be a string"
+                            ));
                         }
                     }
                 }
@@ -483,7 +485,7 @@ impl CompressionPlugin {
             }
             Some(Value::Null) | None => vec![Algorithm::Gzip, Algorithm::Brotli],
             Some(_) => {
-                return Err("compression: 'algorithms' must be an array of strings".to_string());
+                return Err("compression: `algorithms` must be an array of strings".to_string());
             }
         };
         if algorithms.is_empty() {
@@ -533,7 +535,7 @@ impl CompressionPlugin {
         let gzip_level = optional_u64(config, "gzip_level")?
             .map(|value| {
                 if value > 9 {
-                    Err("compression: 'gzip_level' must be between 0 and 9".to_string())
+                    Err("compression: `gzip_level` must be between 0 and 9".to_string())
                 } else {
                     Ok(value as u32)
                 }
@@ -544,7 +546,7 @@ impl CompressionPlugin {
         let brotli_quality = optional_u64(config, "brotli_quality")?
             .map(|value| {
                 if value > 11 {
-                    Err("compression: 'brotli_quality' must be between 0 and 11".to_string())
+                    Err("compression: `brotli_quality` must be between 0 and 11".to_string())
                 } else {
                     Ok(value as u32)
                 }
@@ -1383,7 +1385,7 @@ fn resolve_max_decompressed_request_size(
 ) -> Result<usize, String> {
     if configured > HARD_MAX_DECOMPRESSED_REQUEST_SIZE {
         return Err(format!(
-            "compression: 'max_decompressed_request_size' exceeds hard maximum of {HARD_MAX_DECOMPRESSED_REQUEST_SIZE} bytes"
+            "compression: `max_decompressed_request_size` exceeds hard maximum of {HARD_MAX_DECOMPRESSED_REQUEST_SIZE} bytes"
         ));
     }
     let mut limit = configured.min(HARD_MAX_DECOMPRESSED_REQUEST_SIZE);
@@ -1447,7 +1449,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     match config.get(field) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("compression: '{field}' must be a boolean")),
+        Some(_) => Err(format!("compression: `{field}` must be a boolean")),
     }
 }
 
@@ -1455,11 +1457,11 @@ fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, Stri
     match config.get(field) {
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("compression: '{field}' must be an unsigned integer"))
+            .ok_or_else(|| format!("compression: `{field}` must be an unsigned integer"))
             .map(Some),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(format!(
-            "compression: '{field}' must be an unsigned integer"
+            "compression: `{field}` must be an unsigned integer"
         )),
     }
 }
@@ -1470,7 +1472,7 @@ fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, 
     };
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("compression: '{field}' is too large"))
+        .map_err(|_| format!("compression: `{field}` is too large"))
 }
 
 fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
@@ -1478,7 +1480,7 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
         return Ok(None);
     };
     if value == 0 {
-        return Err(format!("compression: '{field}' must be greater than zero"));
+        return Err(format!("compression: `{field}` must be greater than zero"));
     }
     Ok(Some(value))
 }
@@ -1491,27 +1493,27 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
             .collect());
     };
     let Some(values) = value.as_array() else {
-        return Err("compression: 'content_types' must be an array".to_string());
+        return Err("compression: `content_types` must be an array".to_string());
     };
     if values.is_empty() {
-        return Err("compression: 'content_types' must not be empty".to_string());
+        return Err("compression: `content_types` must not be empty".to_string());
     }
 
     let mut content_types = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(content_type) = value.as_str() else {
             return Err(format!(
-                "compression: 'content_types[{index}]' must be a string"
+                "compression: `content_types[{index}]` must be a string"
             ));
         };
         if content_type.is_empty() {
             return Err(format!(
-                "compression: 'content_types[{index}]' must not be empty"
+                "compression: `content_types[{index}]` must not be empty"
             ));
         }
         if !content_type.is_ascii() {
             return Err(format!(
-                "compression: 'content_types[{index}]' must contain only ASCII"
+                "compression: `content_types[{index}]` must contain only ASCII"
             ));
         }
         // The matcher compares the response's trimmed, parameter-stripped media
@@ -1523,9 +1525,9 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
         // diagnostic instead.
         if !is_media_type_token(content_type) {
             return Err(format!(
-                "compression: 'content_types[{index}]' must be a bare 'type/subtype' media type \
-                 with no whitespace and no parameters (use 'application/json', not \
-                 'application/json; charset=utf-8')"
+                "compression: `content_types[{index}]` must be a bare `type/subtype` media type \
+                 with no whitespace and no parameters (use `application/json`, not \
+                 `application/json; charset=utf-8`)"
             ));
         }
         content_types.push(content_type.to_ascii_lowercase());
