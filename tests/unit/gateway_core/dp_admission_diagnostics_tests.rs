@@ -23,8 +23,14 @@ fn dp_admission_emission_retains_all_five_known_budgets() {
             log_subscribe_admission_refusal(status, "http://UNREGISTERED_cp", 1, 2);
         });
         assert!(logs.contains(&expected), "{logs}");
-        assert!(logs.contains("REFUSED the ConfigSync subscription"), "{logs}");
-        assert!(logs.contains("Last-known-good configuration keeps serving"), "{logs}");
+        assert!(
+            logs.contains("REFUSED the ConfigSync subscription"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("Last-known-good configuration keeps serving"),
+            "{logs}"
+        );
         assert!(!logs.contains("UNREGISTERED_cp"), "{logs}");
         assert_eq!(status.message(), expected);
     }

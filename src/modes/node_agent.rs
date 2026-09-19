@@ -10808,7 +10808,10 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("backend details withheld"), "{rendered}");
-        assert!(!rendered.contains("injected cleanup_all failure"), "{rendered}");
+        assert!(
+            !rendered.contains("injected cleanup_all failure"),
+            "{rendered}"
+        );
         assert_eq!(backend.cleanup_all_calls, 1);
     }
 
@@ -12224,7 +12227,10 @@ mod tests {
         let rendered = crate::startup::render_startup_error(err, &[]);
         assert!(!rendered.contains("sock_ops attach failed"), "{rendered}");
         assert!(!rendered.contains("UNREGISTERED"), "{rendered}");
-        assert!(rendered.contains("SOCK_OPS attachment failed"), "{rendered}");
+        assert!(
+            rendered.contains("SOCK_OPS attachment failed"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("Verify the cgroup root and BPF permissions"),
             "{rendered}"

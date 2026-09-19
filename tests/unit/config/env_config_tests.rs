@@ -1278,10 +1278,8 @@ fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
             assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED"));
             assert!(error.contains("FERRUM_GATEWAY_SVID"));
             assert!(error.contains("overrides automatic CA-backed issuance"));
-            let rendered = ferrum_edge::startup::render_startup_error(
-                anyhow::Error::msg(error.clone()),
-                &[],
-            );
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error.clone()), &[]);
             assert_eq!(rendered, error);
             assert!(rendered.contains("Remove the FERRUM_GATEWAY_SVID_* override"));
             assert!(rendered.contains("or disable the Ferrum Workload API"));
@@ -1307,11 +1305,10 @@ fn workload_api_spire_refusal_retains_complete_rendered_recovery_guidance() {
             ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
         ],
         || {
-            let error = EnvConfig::from_env().expect_err("SPIRE cannot issue downstream identities");
-            let rendered = ferrum_edge::startup::render_startup_error(
-                anyhow::Error::msg(error.clone()),
-                &[],
-            );
+            let error =
+                EnvConfig::from_env().expect_err("SPIRE cannot issue downstream identities");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error.clone()), &[]);
             assert_eq!(rendered, error);
             for expected in [
                 "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported",

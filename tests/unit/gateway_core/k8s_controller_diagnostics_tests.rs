@@ -99,7 +99,10 @@ fn controller_withholds_skipped_resource_values_and_retains_status_errors() {
         }
         if kind == "PeerAuthentication" {
             assert!(diagnostic.contains("UNREGISTERED_mode"));
-            assert!(logs.contains("UNSET, DISABLE, PERMISSIVE, STRICT"), "{logs}");
+            assert!(
+                logs.contains("UNSET, DISABLE, PERMISSIVE, STRICT"),
+                "{logs}"
+            );
         }
         assert!(!logs.contains("UNREGISTERED"), "{logs}");
     }
@@ -129,7 +132,10 @@ fn controller_fault_delay_warning_retains_the_fixed_cap() {
         .expect("clamp warning");
     let rendered = crate::startup::render_startup_error(anyhow::anyhow!(warning.clone()), &[]);
     for output in [&rendered, &logs] {
-        assert!(output.contains("http[0].fault.delay.fixedDelay"), "{output}");
+        assert!(
+            output.contains("http[0].fault.delay.fixedDelay"),
+            "{output}"
+        );
         assert!(
             output.contains("clamping to the Ferrum 60000 ms fault-delay cap"),
             "{output}"
