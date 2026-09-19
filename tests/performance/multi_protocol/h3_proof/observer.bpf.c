@@ -9,6 +9,7 @@
 #include <bpf/bpf_endian.h>
 #include "contract.h"
 #include "rx_contract.h"
+#include "socket_contract.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
@@ -121,13 +122,10 @@ static __noinline void socket_event(struct sock *sk, __u64 cookie, __u32 kind,
         e.process_start_ns = previous->process_start_ns; e.thread_start_ns = previous->thread_start_ns;
     }
     if (!e.peer.port && previous) e.peer = previous->peer;
-    // Keep each owner's uses and tuple/buffer changes; avoid one event per packet.
-    if (kind == SOCKET_OBSERVED && previous && (previous->pid_tgid >> 32) == (e.pid_tgid >> 32) &&
-        previous->process_start_ns == e.process_start_ns &&
-        previous->local.address == e.local.address && previous->local.port == e.local.port &&
-        ((previous->peer.address == e.peer.address && previous->peer.port == e.peer.port) ||
-         (e.local.port == 8443 && previous->local.port == 8443)) &&
-        previous->rcvbuf == e.rcvbuf && previous->sndbuf == e.sndbuf) return;
+    // Shared by TX, RX and retirement enrollment. Both fixed listeners must
+    // suppress peer churn before the ring, leaving bounded space for teardown.
+    // Owner, local tuple and buffer changes still emit; retirement always emits.
+    if (h3_same_socket_observation(&e, previous)) return;
     if (bpf_map_update_elem(&sockets, &cookie, &e, BPF_ANY)) loss(IDENTITY_FULL);
     if (bpf_ringbuf_output(&lifecycle, &e, sizeof(e), 0)) loss(RING_FULL);
 }

@@ -190,6 +190,17 @@ hosted compilation, real fixtures, Python contracts and the full four-arm smoke.
 
 ## Bounds and remaining evidence limits
 
+The subsequent d19 live smoke passed prepare/preflight but lost required
+retirements to backend peer churn. The [smoke failure report](../../../../docs/benchmark_h3_smoke_2026_09_18.md)
+retains exact counts and sites. The shared observation predicate now treats
+both fixed listeners (3445 and 8443) alike: a send destination change alone is
+not a new listener identity. Listener peers are representative metadata;
+backend connection logs still supply the upstream peer join. Hosted metadata
+regressions exceed the unchanged lifecycle cap with rotating peers, while the
+real four-arm smoke still requires kernel births and retirements. Lifecycle
+output omissions and ring loss explicitly invalidate admission. Repaired
+hosted execution remains pending.
+
 A live arm is limited to 300 seconds, at most 64 snapshots including final, and
 10-second checkpoints plus explicit phase boundaries. Stop detaches writers
 before final stable map iteration; signals/parent death, missing final, forced
