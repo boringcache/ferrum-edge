@@ -186,6 +186,7 @@ async fn clean_plain_and_tls_echo_preserve_opt_in_off_semantics_and_retirement()
             assert_eq!(worker.request.version, Some("HTTP/1.1"));
             assert!(snapshot.connections[0].local.is_some());
             assert!(snapshot.connections[0].peer.is_some());
+            assert_eq!(snapshot.connections[0].driver, "completed_ok");
             let retirement = report.retirement.unwrap();
             assert_eq!(retirement.started, 1);
             assert_eq!(retirement.completed_ok, 1);
@@ -306,6 +307,11 @@ async fn retirement_timeout_is_separate_from_request_completion_and_connection_g
             std::future::pending::<Result<(), hyper::Error>>().await
         })
         .unwrap();
+    diagnostic.snapshot("registered_before_first_poll");
+    assert_eq!(
+        diagnostic.report().unwrap().snapshots[0].connections[0].driver,
+        "running"
+    );
     DiagnosticBody::new(
         Full::new(Bytes::from_static(&ECHO)),
         observation.clone(),

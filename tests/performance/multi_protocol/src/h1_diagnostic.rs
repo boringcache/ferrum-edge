@@ -661,6 +661,9 @@ impl Drivers {
                 result.as_ref().err().map(error_class),
             );
             guard.completed = true;
+            // Own and retire the whole Drop guard inside this task, including
+            // cancellation before its first poll; do not capture only fields.
+            drop(guard);
             result.is_ok()
         });
         Ok(())
