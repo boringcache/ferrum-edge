@@ -498,11 +498,25 @@ pub(super) fn compile_rules(
     let mut seen_default = HashSet::new();
     let mut compiled_rules = Vec::new();
     let mut builders = RuleSetBuilders::default();
+    let mut next_custom_index = 0usize;
 
     for (mut rule, is_default) in rules.drain(..) {
-        validate_rule(&rule)?;
+        // Count source entries before any disabled/paranoia filtering. Built-in
+        // rules must not shift the custom_rules ordinal in a rejection.
+        let custom_index = if is_default {
+            None
+        } else {
+            let index = next_custom_index;
+            next_custom_index += 1;
+            Some(index)
+        };
+        let with_rule_context = |error: String| match custom_index {
+            Some(index) => format!("waf: `config.custom_rules[{index}]`: {error}"),
+            None => error,
+        };
+        validate_rule(&rule).map_err(with_rule_context)?;
         if !seen.insert(rule.id.clone()) {
-            return Err(format!("waf: duplicate rule id {:?}", rule.id));
+            return Err(with_rule_context(format!("waf: duplicate rule id {:?}", rule.id)));
         }
         if is_default {
             seen_default.insert(rule.id.clone());
@@ -556,13 +570,13 @@ pub(super) fn compile_rules(
             continue;
         }
 
-        let fp_filters = compile_fp_filters(&rule)?;
+        let fp_filters = compile_fp_filters(&rule).map_err(with_rule_context)?;
         let cidr = if rule.match_kind == MatchKind::Cidr {
             Some(IpCidr::parse(&rule.pattern).ok_or_else(|| {
-                format!(
+                with_rule_context(format!(
                     "waf: rule {:?} has invalid CIDR {:?}",
                     rule.id, rule.pattern
-                )
+                ))
             })?)
         } else {
             None
@@ -573,7 +587,7 @@ pub(super) fn compile_rules(
             .as_ref()
             .map(CompiledConditions::compile)
             .transpose()
-            .map_err(|e| format!("waf: rule {:?}: {e}", rule.id))?;
+            .map_err(|e| with_rule_context(format!("waf: rule {:?}: {e}", rule.id)))?;
 
         let rule_index = compiled_rules.len();
         let compiled = CompiledRule {
@@ -588,7 +602,9 @@ pub(super) fn compile_rules(
             cidr,
             score: rule.score,
         };
-        builders.add_rule(rule_index, &rule)?;
+        builders
+            .add_rule(rule_index, &rule)
+            .map_err(with_rule_context)?;
         compiled_rules.push(compiled);
     }
 

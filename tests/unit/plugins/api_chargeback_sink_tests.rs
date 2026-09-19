@@ -182,6 +182,75 @@ fn constructor_decode_diagnostics_withhold_values_and_document_paths() {
 }
 
 #[test]
+fn constructor_unknown_fields_keep_schema_owned_choices_for_every_sink_struct() {
+    use ferrum_edge::startup::render_startup_error;
+
+    for (path, fields) in [
+        (
+            "",
+            "mode clickhouse batch retry spool snapshot pricing_version currency \
+             include_request_id include_trace_id pricing_tiers bandwidth_pricing \
+             stream_connection_pricing schema schema_ref",
+        ),
+        (
+            "clickhouse",
+            "url database table username password_ref tls insert_query_params \
+             allow_lossy_async_insert timeout_ms",
+        ),
+        (
+            "clickhouse.tls",
+            "ca_file client_cert_file client_key_file verify_hostname insecure_skip_verify",
+        ),
+        (
+            "batch",
+            "size flush_interval_ms buffer_capacity buffer_max_bytes",
+        ),
+        ("retry", "max_attempts initial_delay_ms max_delay_ms jitter"),
+        (
+            "spool",
+            "enabled dir max_bytes replay_interval_secs delivery_queue_capacity compression",
+        ),
+        (
+            "snapshot",
+            "interval_secs emit_zero_deltas cleanup_interval_secs stale_entry_ttl_secs \
+             max_entries max_retained_bytes",
+        ),
+    ] {
+        for key in [
+            "szie",
+            "'SINK_KEY\"\\\n`map.key`",
+            "SINK_KEY`, expected one of `SINK_FAKE_CHOICE`, `password=SINK_SECRET`",
+            "https://SINK_USER:SINK_PASSWORD@example.invalid/?token=SINK_TOKEN",
+        ] {
+            let mut config = json!({(key): {"SINK_PAYLOAD": "SINK_VALUE"}});
+            for parent in path.split('.').rev().filter(|parent| !parent.is_empty()) {
+                config = json!({(parent): config});
+            }
+            let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+                .err()
+                .expect("unknown fields must reject before sink validation");
+            let rendered = render_startup_error(anyhow::anyhow!(error), &[]);
+            let field = if path.is_empty() { "config" } else { path };
+            let choices = fields
+                .split_ascii_whitespace()
+                .map(|field| format!("`{field}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_eq!(
+                rendered,
+                format!(
+                    "api_chargeback_sink: invalid `config` at `{field}`: \
+                     unknown field; expected one of {choices}"
+                ),
+            );
+            for withheld in [key, "szie", "SINK_", "map.key"] {
+                assert!(!rendered.contains(withheld), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
 fn constructor_preserves_known_unit_enum_object_representations() {
     let temp = tempfile::tempdir().unwrap();
     for mode in ["per_event", "snapshot"] {

@@ -2198,6 +2198,223 @@ fn assert_rendered_waf_rejection(config: &serde_json::Value, expected: &str, wit
     assert!(!rendered.contains('\n'), "{rendered}");
 }
 
+fn assert_rendered_waf_entry_rejection(config: &serde_json::Value, path: &str, reason: &str) {
+    let error = Waf::new(config).expect_err("invalid entry must reject construction");
+    let rendered = render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.contains(&format!("waf: `{path}`:")), "{rendered}");
+    assert!(rendered.contains(reason), "{rendered}");
+    for withheld in ["WAF_ENTRY_", "918273641"] {
+        assert!(!rendered.contains(withheld), "{rendered}");
+    }
+    assert!(!rendered.contains('\n'), "{rendered}");
+}
+
+#[test]
+fn rendered_stream_signature_failures_keep_each_source_ordinal() {
+    let first_id = "'WAF_ENTRY_FIRST\"\\`config`";
+    let second_id = "'WAF_ENTRY_SECOND\"\\`config`";
+    let token = "'WAF_ENTRY_SECRET\"\\\n`password=WAF_ENTRY_PASSWORD`";
+    for first_action in [serde_json::Value::Null, json!("disabled")] {
+        let config = json!({
+            "include_default_rules": false,
+            "stream": {"signatures": [
+                {"id": first_id, "pattern": "WAF_ENTRY_FIRST_PATTERN", "action": first_action},
+                {"id": second_id, "pattern": "WAF_ENTRY_SECOND_PATTERN",
+                 "severity": null, "action": null}
+            ]}
+        });
+        Waf::new(&config).expect("default/null fields and a preceding disabled entry stay valid");
+        for (field, value, reason) in [
+            ("id", None, "requires `id`"),
+            ("pattern", None, "requires `pattern`"),
+            ("id", Some(json!(first_id)), "duplicate stream signature id"),
+            ("severity", Some(json!(token)), "invalid `severity`"),
+            (
+                "action",
+                Some(json!(token)),
+                "must be one of enforce, monitor, disabled",
+            ),
+            (
+                "id",
+                Some(json!({"WAF_ENTRY_KEY": token})),
+                "`id` must be a string",
+            ),
+            ("id", Some(json!("")), "`id` must be non-empty"),
+            ("pattern", Some(json!([token])), "`pattern` must be a string"),
+            ("pattern", Some(json!("")), "`pattern` must be non-empty"),
+            (
+                "severity",
+                Some(json!(918273641)),
+                "`severity` must be a string",
+            ),
+            ("action", Some(json!([token])), "`action` must be a string"),
+            (
+                "pattern",
+                Some(json!("[WAF_ENTRY_PATTERN")),
+                "is invalid or too complex",
+            ),
+        ] {
+            let mut invalid = config.clone();
+            let entry = invalid["stream"]["signatures"][1].as_object_mut().unwrap();
+            if let Some(value) = value {
+                entry.insert(field.to_string(), value);
+            } else {
+                entry.remove(field);
+            }
+            assert_rendered_waf_entry_rejection(&invalid, "config.stream.signatures[1]", reason);
+        }
+        let mut invalid = config.clone();
+        invalid["stream"]["signatures"][1] = json!([token]);
+        assert_rendered_waf_entry_rejection(
+            &invalid,
+            "config.stream.signatures[1]",
+            "must be an object",
+        );
+    }
+}
+
+#[test]
+fn rendered_custom_rule_parse_failures_keep_each_source_ordinal() {
+    let token = "'WAF_ENTRY_SECRET\"\\\n`password=WAF_ENTRY_PASSWORD`";
+    let config = json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {"id": "WAF_ENTRY_FIRST", "category": "WAF_ENTRY_CATEGORY",
+             "target": "query_values", "pattern": "WAF_ENTRY_FIRST_PATTERN"},
+            {"id": token, "category": "WAF_ENTRY_CATEGORY",
+             "target": "query_values", "pattern": "WAF_ENTRY_SECOND_PATTERN"}
+        ]
+    });
+    Waf::new(&config).expect("preceding entries and omitted optional fields stay valid");
+    for (field, value, reason) in [
+        ("id", None, "missing required string `id`"),
+        ("category", None, "missing required string `category`"),
+        ("target", None, "requires `target`"),
+        ("severity", Some(json!(token)), "severity must be one of"),
+        (
+            "action",
+            Some(json!(token)),
+            "must be one of enforce, monitor, disabled",
+        ),
+        ("match_kind", Some(json!(token)), "match_kind must be regex"),
+        ("id", Some(json!([token])), "`id` must be a string"),
+        ("name", Some(json!([token])), "`name` must be a string"),
+        (
+            "category",
+            Some(json!(918273641)),
+            "`category` must be a string",
+        ),
+        ("severity", Some(json!([token])), "`severity` must be a string"),
+        ("action", Some(json!([token])), "`action` must be a string"),
+        (
+            "match_kind",
+            Some(json!([token])),
+            "`match_kind` must be a string",
+        ),
+        ("pattern", Some(json!([token])), "`pattern` must be a string"),
+        (
+            "target",
+            Some(json!([token])),
+            "target must be a string or object",
+        ),
+        ("target", Some(json!({})), "missing required string `type`"),
+        (
+            "target",
+            Some(json!({"type": "header_values", "names": [918273641]})),
+            "`names` entries must be strings",
+        ),
+        (
+            "conditions",
+            Some(json!([token])),
+            "conditions must be an object",
+        ),
+        (
+            "conditions",
+            Some(json!({"paths": [918273641]})),
+            "`paths` entries must be strings",
+        ),
+        (
+            "fp_filters",
+            Some(json!([918273641])),
+            "`fp_filters` entries must be strings",
+        ),
+        (
+            "paranoia_min",
+            Some(json!([token])),
+            "`paranoia_min` must be an integer",
+        ),
+        ("score", Some(json!([token])), "`score` must be an integer"),
+    ] {
+        let mut invalid = config.clone();
+        let entry = invalid["custom_rules"][1].as_object_mut().unwrap();
+        if let Some(value) = value {
+            entry.insert(field.to_string(), value);
+        } else {
+            entry.remove(field);
+        }
+        assert_rendered_waf_entry_rejection(&invalid, "config.custom_rules[1]", reason);
+    }
+    let mut invalid = config.clone();
+    invalid["custom_rules"][1] = json!([token]);
+    assert_rendered_waf_entry_rejection(
+        &invalid,
+        "config.custom_rules[1]",
+        "entries must be objects",
+    );
+}
+
+#[test]
+fn rendered_custom_rule_compile_failures_keep_source_ordinals_before_filtering() {
+    let token = "'WAF_ENTRY_SECRET\"\\\n`password=WAF_ENTRY_PASSWORD`";
+    for include_default_rules in [false, true] {
+        for preceding in [json!({"action": "disabled"}), json!({"paranoia_min": 4})] {
+            let mut config = json!({
+                "include_default_rules": include_default_rules,
+                "custom_rules": [
+                    {"id": token, "category": "WAF_ENTRY_CATEGORY",
+                     "target": "query_values", "pattern": "WAF_ENTRY_FIRST_PATTERN"},
+                    {"id": "WAF_ENTRY_SECOND", "category": "WAF_ENTRY_CATEGORY",
+                     "target": "query_values", "pattern": "WAF_ENTRY_SECOND_PATTERN"}
+                ]
+            });
+            for (key, value) in preceding.as_object().unwrap() {
+                config["custom_rules"][0][key] = value.clone();
+            }
+            Waf::new(&config)
+                .expect("built-ins and filtered entries must not shift source ordinals");
+            for (overlay, reason) in [
+                (json!({"id": token}), "duplicate rule id"),
+                (json!({"pattern": null}), "pattern must be non-empty"),
+                (json!({"paranoia_min": 5}), "paranoia_min must be from 1 to 4"),
+                (
+                    json!({"fp_filters": ["[WAF_ENTRY_FILTER"]}),
+                    "is invalid or too complex",
+                ),
+                (json!({"match_kind": "cidr", "pattern": token}), "invalid CIDR"),
+                (
+                    json!({"conditions": {"paths": ["~[WAF_ENTRY_CONDITION"]}}),
+                    "invalid conditions.paths regex",
+                ),
+                (
+                    json!({"target": {"type": "body_json_path", "path": "WAF_ENTRY_PATH..key"}}),
+                    "body_json_path contains an empty segment",
+                ),
+                (
+                    json!({"target": {"type": "body_json_path", "path": "WAF_ENTRY_PATH"},
+                           "pattern": "[WAF_ENTRY_PATTERN"}),
+                    "invalid regex or complexity limit exceeded",
+                ),
+            ] {
+                let mut invalid = config.clone();
+                for (key, value) in overlay.as_object().unwrap() {
+                    invalid["custom_rules"][1][key] = value.clone();
+                }
+                assert_rendered_waf_entry_rejection(&invalid, "config.custom_rules[1]", reason);
+            }
+        }
+    }
+}
+
 #[test]
 fn rendered_waf_fixed_field_rejections_keep_bounds_and_withhold_values() {
     let token = "'WAF_RESIDUAL_SECRET\"`\\\n";

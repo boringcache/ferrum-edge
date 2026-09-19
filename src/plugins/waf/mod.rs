@@ -2299,11 +2299,9 @@ fn parse_custom_rules(
             .iter()
             .enumerate()
             .map(|(idx, value)| {
-                parse_custom_rule(
-                    value,
-                    default_action,
-                    &format!("config.custom_rules[{idx}]"),
-                )
+                let path = format!("config.custom_rules[{idx}]");
+                parse_custom_rule(value, default_action, &path)
+                    .map_err(|error| format!("waf: `{path}`: {error}"))
             })
             .collect(),
         Some(other) => Err(format!(
