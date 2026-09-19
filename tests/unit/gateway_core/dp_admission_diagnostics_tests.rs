@@ -1,10 +1,8 @@
 //! Capture the actual DP refusal emitter without starting a reconnect loop.
 
 use super::*;
+use crate::diagnostic_test_logs as diagnostic_logs;
 use crate::grpc::admission::CpGrpcAdmissionRejection;
-
-#[path = "../../common/diagnostic_logs.rs"]
-mod diagnostic_logs;
 
 #[test]
 fn dp_admission_emission_retains_all_five_known_budgets() {
