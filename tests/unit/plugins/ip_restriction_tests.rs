@@ -503,7 +503,7 @@ fn invalid_allow_rule_rejects_creation() {
         result
             .err()
             .unwrap()
-            .contains("invalid allow rule 'not-an-ip'"),
+            .contains("invalid `allow` rule \"not-an-ip\""),
     );
 }
 
@@ -519,7 +519,7 @@ fn invalid_deny_cidr_rule_rejects_creation() {
         result
             .err()
             .unwrap()
-            .contains("invalid deny rule '10.0.0.0/99'"),
+            .contains("invalid `deny` rule \"10.0.0.0/99\""),
     );
 }
 
@@ -707,7 +707,7 @@ fn mapped_ipv6_cidr_prefixes_below_96_reject_construction() {
         let error = IpRestriction::new(&config)
             .err()
             .expect("mapped IPv6 CIDRs below /96 must be rejected");
-        assert!(error.contains("invalid allow rule"), "{error}");
+        assert!(error.contains("invalid `allow` rule"), "{error}");
     }
 }
 
@@ -977,7 +977,7 @@ fn unknown_keys_are_rejected_even_when_another_policy_list_is_valid() {
             .err()
             .expect("unknown key must be rejected");
         assert!(error.contains("unknown configuration field"), "{error}");
-        assert!(error.contains("allow, deny, mode"), "{error}");
+        assert!(error.contains("`allow`, `deny`, `mode`"), "{error}");
     }
 }
 
@@ -990,7 +990,7 @@ fn shared_admin_and_config_admission_rejects_broadened_policy_shape() {
     let error = ferrum_edge::plugins::validate_plugin_config("ip_restriction", &config)
         .expect_err("shared plugin admission must reject the typo");
     assert!(
-        error.contains("unknown configuration field 'alow'"),
+        error.contains("unknown configuration field \"alow\""),
         "{error}"
     );
 }
@@ -1141,4 +1141,52 @@ async fn malformed_client_ip_is_cached_and_fails_closed_for_every_instance() {
     assert!(ctx.canonical_client_ip_is_initialized());
     assert_eq!(ctx.canonical_client_ip(), None);
     plugin_utils::assert_reject(second.on_request_received(&mut ctx).await, Some(403));
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"allow": [canary]}),
+            &["`allow`", "expected exact IP or CIDR"],
+        ),
+        (
+            json!({"deny": [canary]}),
+            &["`deny`", "expected exact IP or CIDR"],
+        ),
+        (
+            json!({(canary): true}),
+            &["unknown configuration field", "`allow`"],
+        ),
+        (
+            json!({"allow": ["127.0.0.1"], "mode": 8675309}),
+            &["`mode`", "`allow_first`", "`deny_first`"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("ip_restriction", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
+    }
 }

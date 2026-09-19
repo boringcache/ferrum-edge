@@ -1,3 +1,4 @@
+pub mod h1_diagnostic;
 pub mod h1_profile;
 pub mod h2_observation;
 pub mod metrics;

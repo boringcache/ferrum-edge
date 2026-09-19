@@ -304,8 +304,8 @@ impl BodyValidator {
             .any(|key| !BODY_VALIDATOR_CONFIG_KEYS.contains(&key.as_str()))
         {
             return Err(format!(
-                "body_validator: unknown configuration key; allowed keys: {}",
-                BODY_VALIDATOR_CONFIG_KEYS.join(", ")
+                "body_validator: unknown configuration key; allowed keys: `{}`",
+                BODY_VALIDATOR_CONFIG_KEYS.join("`, `")
             ));
         }
 
@@ -374,7 +374,7 @@ impl BodyValidator {
 
         if !has_request_validation && !has_response_validation {
             return Err(
-                "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', 'required_xml_elements' (request), their 'response_*' equivalents, or 'protobuf_descriptor_path' with message types"
+                "body_validator: no validation rules configured — set `json_schema`, `required_fields`, `validate_xml`, `required_xml_elements` (request), their `response_*` equivalents, or `protobuf_descriptor_path` with message types"
                     .to_string(),
             );
         }
@@ -1020,7 +1020,7 @@ fn parse_schema_draft(raw: Option<&str>) -> Result<SchemaDraft, String> {
         Some("draft2020-12") => Ok(SchemaDraft::Draft202012),
         Some("draft7") => Ok(SchemaDraft::Draft7),
         Some(_) => Err(
-            "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7'".to_string(),
+            "body_validator: `json_schema_draft` must be `draft2020-12` or `draft7`".to_string(),
         ),
     }
 }
@@ -1042,11 +1042,11 @@ fn optional_compiled_schema(
     };
     let Some(object) = value.as_object() else {
         return Err(format!(
-            "body_validator: '{field}' must be a JSON Schema object"
+            "body_validator: `{field}` must be a JSON Schema object"
         ));
     };
     if object.is_empty() {
-        return Err(format!("body_validator: '{field}' must not be empty"));
+        return Err(format!("body_validator: `{field}` must not be empty"));
     }
 
     let audit = audit_schema(value, field, draft)?;
@@ -1063,7 +1063,7 @@ fn optional_compiled_schema(
         .build(value)
         .map_err(|_| {
             format!(
-                "body_validator: '{field}' is not a valid {} JSON Schema",
+                "body_validator: `{field}` is not a valid {} JSON Schema",
                 draft.config_value()
             )
         })
@@ -1130,13 +1130,13 @@ fn audit_schema_structure(
 ) -> Result<(), String> {
     if depth > MAX_SCHEMA_DEPTH {
         return Err(format!(
-            "body_validator: '{field}' nests deeper than the {MAX_SCHEMA_DEPTH}-level schema budget"
+            "body_validator: `{field}` nests deeper than the {MAX_SCHEMA_DEPTH}-level schema budget"
         ));
     }
     *nodes += 1;
     if *nodes > MAX_SCHEMA_NODES {
         return Err(format!(
-            "body_validator: '{field}' exceeds the {MAX_SCHEMA_NODES}-node schema budget"
+            "body_validator: `{field}` exceeds the {MAX_SCHEMA_NODES}-node schema budget"
         ));
     }
 
@@ -1186,13 +1186,13 @@ fn audit_schema_node(
         if let Some(value) = map.get(key) {
             let Some(reference) = value.as_str() else {
                 return Err(format!(
-                    "body_validator: '{field}' has a non-string '{key}'"
+                    "body_validator: `{field}` has a non-string `{key}`"
                 ));
             };
             if !reference.starts_with('#') {
                 return Err(format!(
-                    "body_validator: '{field}' has a non-local '{key}'; \
-                     only local references (starting with '#') \
+                    "body_validator: `{field}` has a non-local `{key}`; \
+                     only local references (starting with `#`) \
                      are supported and no external reference is ever retrieved"
                 ));
             }
@@ -1206,12 +1206,12 @@ fn audit_schema_node(
         if let Some(value) = map.get(key) {
             let Some(id) = value.as_str() else {
                 return Err(format!(
-                    "body_validator: '{field}' has a non-string '{key}'"
+                    "body_validator: `{field}` has a non-string `{key}`"
                 ));
             };
             if !id.starts_with('#') {
                 return Err(format!(
-                    "body_validator: '{field}' has a non-fragment '{key}'; \
+                    "body_validator: `{field}` has a non-fragment `{key}`; \
                      a base URI would allow external reference resolution"
                 ));
             }
@@ -1220,7 +1220,7 @@ fn audit_schema_node(
 
     if map.contains_key("$vocabulary") {
         return Err(format!(
-            "body_validator: '{field}' declares '$vocabulary'; custom \
+            "body_validator: `{field}` declares `$vocabulary`; custom \
              vocabularies are not supported and would not be enforced"
         ));
     }
@@ -1228,13 +1228,13 @@ fn audit_schema_node(
     if let Some(value) = map.get("$schema") {
         let Some(uri) = value.as_str() else {
             return Err(format!(
-                "body_validator: '{field}' has a non-string '$schema'"
+                "body_validator: `{field}` has a non-string `$schema`"
             ));
         };
         if !draft.schema_uris().contains(&uri) {
             return Err(format!(
-                "body_validator: '{field}' declares an unsupported '$schema'; \
-                 configured draft is '{}'",
+                "body_validator: `{field}` declares an unsupported `$schema`; \
+                 configured draft is `{}`",
                 draft.config_value()
             ));
         }
@@ -1373,7 +1373,7 @@ fn local_json_pointer_target<'a>(
 ) -> Result<Option<&'a Value>, String> {
     let fragment = reference
         .strip_prefix('#')
-        .ok_or_else(|| format!("body_validator: '{field}' has a non-local '{keyword}'"))?;
+        .ok_or_else(|| format!("body_validator: `{field}` has a non-local `{keyword}`"))?;
     if fragment.is_empty() || !fragment.starts_with('/') {
         // The root was already visited. Anchor resources are indexed only while
         // the library walks actual draft-specific schema positions, which this
@@ -1385,8 +1385,8 @@ fn local_json_pointer_target<'a>(
         .decode_utf8()
         .map_err(|_| {
             format!(
-                "body_validator: '{field}' has invalid UTF-8 percent encoding \
-                 in a local '{keyword}' JSON Pointer"
+                "body_validator: `{field}` has invalid UTF-8 percent encoding \
+                 in a local `{keyword}` JSON Pointer"
             )
         })?;
     let mut target = document;
@@ -1395,13 +1395,13 @@ fn local_json_pointer_target<'a>(
             Value::Array(items) => {
                 let index = raw_segment.parse::<usize>().map_err(|_| {
                     format!(
-                        "body_validator: '{field}' has invalid array index in \
-                         a local '{keyword}' JSON Pointer"
+                        "body_validator: `{field}` has invalid array index in \
+                         a local `{keyword}` JSON Pointer"
                     )
                 })?;
                 items.get(index).ok_or_else(|| {
                     format!(
-                        "body_validator: '{field}' has a local '{keyword}' JSON \
+                        "body_validator: `{field}` has a local `{keyword}` JSON \
                          Pointer that resolves nowhere"
                     )
                 })?
@@ -1410,14 +1410,14 @@ fn local_json_pointer_target<'a>(
                 let segment = unescape_json_pointer_segment(raw_segment);
                 map.get(segment.as_ref()).ok_or_else(|| {
                     format!(
-                        "body_validator: '{field}' has a local '{keyword}' JSON \
+                        "body_validator: `{field}` has a local `{keyword}` JSON \
                          Pointer that resolves nowhere"
                     )
                 })?
             }
             _ => {
                 return Err(format!(
-                    "body_validator: '{field}' has a local '{keyword}' JSON \
+                    "body_validator: `{field}` has a local `{keyword}` JSON \
                      Pointer that resolves nowhere"
                 ));
             }
@@ -1523,8 +1523,8 @@ fn parse_required_xml_elements(
                 Some((namespace, local)) => (Some(namespace.to_string()), local.to_string()),
                 None => {
                     return Err(format!(
-                        "body_validator: '{field}' entry at index {index} opens Clark notation \
-                         with '{{' but never closes it with '}}'"
+                        "body_validator: `{field}` entry at index {index} opens Clark notation \
+                         with `{{` but never closes it with `}}`"
                     ));
                 }
             },
@@ -1532,7 +1532,7 @@ fn parse_required_xml_elements(
         };
         if local.is_empty() {
             return Err(format!(
-                "body_validator: '{field}' entry at index {index} has an empty local element name"
+                "body_validator: `{field}` entry at index {index} has an empty local element name"
             ));
         }
         // The matcher compares against `roxmltree`'s parsed LOCAL name, so a
@@ -1543,7 +1543,7 @@ fn parse_required_xml_elements(
         // (`GHSA-5p2h-fq6q-gwh9`).
         if !is_xml_ncname(&local) {
             return Err(format!(
-                "body_validator: '{field}' entry at index {index} has an invalid local element \
+                "body_validator: `{field}` entry at index {index} has an invalid local element \
                  name; it must be an XML NCName (no whitespace, markup, namespace prefix, or \
                  braces)"
             ));
@@ -1714,7 +1714,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     value
         .as_bool()
         .map(Some)
-        .ok_or_else(|| format!("body_validator: '{field}' must be a boolean"))
+        .ok_or_else(|| format!("body_validator: `{field}` must be a boolean"))
 }
 
 fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
@@ -1723,12 +1723,12 @@ fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, 
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "body_validator: '{field}' must be an unsigned integer"
+            "body_validator: `{field}` must be an unsigned integer"
         ));
     };
     usize::try_from(value)
         .map(Some)
-        .map_err(|_| format!("body_validator: '{field}' is too large for this platform"))
+        .map_err(|_| format!("body_validator: `{field}` is too large for this platform"))
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -1736,10 +1736,10 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
         return Ok(None);
     };
     let Some(value) = value.as_str() else {
-        return Err(format!("body_validator: '{field}' must be a string"));
+        return Err(format!("body_validator: `{field}` must be a string"));
     };
     if value.is_empty() {
-        return Err(format!("body_validator: '{field}' must not be empty"));
+        return Err(format!("body_validator: `{field}` must not be empty"));
     }
     Ok(Some(value))
 }
@@ -1754,7 +1754,7 @@ fn optional_object<'a>(
     value
         .as_object()
         .map(Some)
-        .ok_or_else(|| format!("body_validator: '{field}' must be an object"))
+        .ok_or_else(|| format!("body_validator: `{field}` must be an object"))
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -1762,19 +1762,19 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
         return Ok(None);
     };
     let Some(values) = value.as_array() else {
-        return Err(format!("body_validator: '{field}' must be an array"));
+        return Err(format!("body_validator: `{field}` must be an array"));
     };
 
     let mut parsed = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(value) = value.as_str() else {
             return Err(format!(
-                "body_validator: '{field}' entries must be strings (invalid entry at index {index})"
+                "body_validator: `{field}` entries must be strings (invalid entry at index {index})"
             ));
         };
         if value.is_empty() {
             return Err(format!(
-                "body_validator: '{field}' entries must not be empty (invalid entry at index {index})"
+                "body_validator: `{field}` entries must not be empty (invalid entry at index {index})"
             ));
         }
         parsed.push(value.to_string());
@@ -1796,7 +1796,7 @@ fn optional_content_types(
         let normalized = media_type_essence(&value)
             .ok_or_else(|| {
                 format!(
-                    "body_validator: '{field}' entries must be valid media types \
+                    "body_validator: `{field}` entries must be valid media types \
                      (type/subtype), not empty, parameter-only, or malformed \
                      (invalid entry at index {index})"
                 )
@@ -2573,7 +2573,7 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
             || config.get("protobuf_method_messages").is_some())
     {
         return Err(
-            "body_validator: 'protobuf_descriptor_path' is required when configuring protobuf validation"
+            "body_validator: `protobuf_descriptor_path` is required when configuring protobuf validation"
                 .to_string(),
         );
     }
@@ -2590,14 +2590,14 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
         for (method_path, method_config) in method_configs {
             if !is_grpc_method_path(method_path) {
                 return Err(
-                    "body_validator: 'protobuf_method_messages' keys must be gRPC method paths \
-                     of the form '/package.Service/Method'"
+                    "body_validator: `protobuf_method_messages` keys must be gRPC method paths \
+                     of the form `/package.Service/Method`"
                         .to_string(),
                 );
             }
             let Some(method_object) = method_config.as_object() else {
                 return Err(
-                    "body_validator: a 'protobuf_method_messages' entry must be an object"
+                    "body_validator: a `protobuf_method_messages` entry must be an object"
                         .to_string(),
                 );
             };
@@ -2609,17 +2609,17 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
                 .any(|key| !BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.contains(&key.as_str()))
             {
                 return Err(format!(
-                    "body_validator: a 'protobuf_method_messages' entry has an unknown key; \
-                     allowed keys: {}",
-                    BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join(", ")
+                    "body_validator: a `protobuf_method_messages` entry has an unknown key; \
+                     allowed keys: `{}`",
+                    BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join("`, `")
                 ));
             }
             let request = optional_string(method_config, "request")?.map(str::to_string);
             let response = optional_string(method_config, "response")?.map(str::to_string);
             if request.is_none() && response.is_none() {
                 return Err(
-                    "body_validator: a 'protobuf_method_messages' entry must configure 'request' \
-                     or 'response'"
+                    "body_validator: a `protobuf_method_messages` entry must configure `request` \
+                     or `response`"
                         .to_string(),
                 );
             }
@@ -2686,7 +2686,7 @@ fn resolve_protobuf_shape(
         .as_deref()
         .map(|name| {
             pool.get_message_by_name(name).ok_or_else(|| {
-                "body_validator: configured 'protobuf_request_type' was not found in the descriptor"
+                "body_validator: configured `protobuf_request_type` was not found in the descriptor"
                     .to_string()
             })
         })
@@ -2696,7 +2696,7 @@ fn resolve_protobuf_shape(
         .as_deref()
         .map(|name| {
             pool.get_message_by_name(name).ok_or_else(|| {
-                "body_validator: configured 'protobuf_response_type' was not found in the descriptor"
+                "body_validator: configured `protobuf_response_type` was not found in the descriptor"
                     .to_string()
             })
         })
@@ -2708,7 +2708,7 @@ fn resolve_protobuf_shape(
             .as_deref()
             .map(|name| {
                 pool.get_message_by_name(name).ok_or_else(|| {
-                    "body_validator: a 'protobuf_method_messages' request type was not found in \
+                    "body_validator: a `protobuf_method_messages` request type was not found in \
                      the descriptor"
                         .to_string()
                 })
@@ -2719,7 +2719,7 @@ fn resolve_protobuf_shape(
             .as_deref()
             .map(|name| {
                 pool.get_message_by_name(name).ok_or_else(|| {
-                    "body_validator: a 'protobuf_method_messages' response type was not found in \
+                    "body_validator: a `protobuf_method_messages` response type was not found in \
                      the descriptor"
                         .to_string()
                 })

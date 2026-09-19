@@ -80,7 +80,7 @@ impl JwtAuth {
         let audiences = parse_string_array(config_obj.get("audiences"), "audiences")?;
         let leeway_secs = parse_optional_u64(config_obj.get("leeway_secs"), "leeway_secs", 0)?;
         if leeway_secs > 300 {
-            return Err("jwt_auth: 'leeway_secs' must be <= 300".to_string());
+            return Err("jwt_auth: `leeway_secs` must be <= 300".to_string());
         }
 
         let mut validation = Validation::new(Algorithm::HS256);
@@ -184,7 +184,7 @@ fn reject_unknown_keys(config: &serde_json::Map<String, Value>) -> Result<(), St
     ];
     for key in config.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("jwt_auth: unknown config key '{key}'"));
+            return Err(format!("jwt_auth: unknown config key {key:?}"));
         }
     }
     Ok(())
@@ -336,20 +336,20 @@ fn parse_token_lookup(value: Option<&Value>) -> Result<TokenLookup, String> {
         None => "header:Authorization",
     };
     if raw.is_empty() {
-        return Err("jwt_auth: 'token_lookup' must not be empty".to_string());
+        return Err("jwt_auth: `token_lookup` must not be empty".to_string());
     }
     if raw.trim() != raw {
         return Err(
-            "jwt_auth: 'token_lookup' must not have leading or trailing whitespace".to_string(),
+            "jwt_auth: `token_lookup` must not have leading or trailing whitespace".to_string(),
         );
     }
     if let Some(name) = raw.strip_prefix("header:") {
         if name.is_empty() {
-            return Err("jwt_auth: 'token_lookup' header name must not be empty".to_string());
+            return Err("jwt_auth: `token_lookup` header name must not be empty".to_string());
         }
         let canonical = HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
             .map_err(|_| {
-                "jwt_auth: 'token_lookup' header name is not a valid HTTP header name".to_string()
+                "jwt_auth: `token_lookup` header name is not a valid HTTP header name".to_string()
             })?
             .as_str()
             .to_string();
@@ -359,16 +359,16 @@ fn parse_token_lookup(value: Option<&Value>) -> Result<TokenLookup, String> {
         })
     } else if let Some(name) = raw.strip_prefix("query:") {
         if name.is_empty() {
-            return Err("jwt_auth: 'token_lookup' query name must not be empty".to_string());
+            return Err("jwt_auth: `token_lookup` query name must not be empty".to_string());
         }
         if name.chars().any(char::is_whitespace) {
             return Err(
-                "jwt_auth: 'token_lookup' query name must not contain whitespace".to_string(),
+                "jwt_auth: `token_lookup` query name must not contain whitespace".to_string(),
             );
         }
         Ok(TokenLookup::Query(name.to_string()))
     } else {
-        Err("jwt_auth: 'token_lookup' must use 'header:<name>' or 'query:<name>'".to_string())
+        Err("jwt_auth: `token_lookup` must use `header:<name>` or `query:<name>`".to_string())
     }
 }
 
@@ -388,7 +388,7 @@ fn parse_non_empty_string(
     })?;
     let value = raw.trim();
     if value.is_empty() {
-        return Err(format!("jwt_auth: '{field}' must not be empty"));
+        return Err(format!("jwt_auth: `{field}` must not be empty"));
     }
     Ok(value.to_string())
 }
@@ -411,7 +411,7 @@ fn parse_expected_issuers(config: &serde_json::Map<String, Value>) -> Result<Vec
     let expected_issuers = config.get("expected_issuers");
     if expected_issuer.is_some() && expected_issuers.is_some() {
         return Err(
-            "jwt_auth: 'expected_issuer' and 'expected_issuers' are mutually exclusive".to_string(),
+            "jwt_auth: `expected_issuer` and `expected_issuers` are mutually exclusive".to_string(),
         );
     }
 
@@ -449,7 +449,7 @@ fn parse_required_string(value: &Value, field: &str) -> Result<String, String> {
     })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(format!("jwt_auth: '{field}' must not be empty"));
+        return Err(format!("jwt_auth: `{field}` must not be empty"));
     }
     Ok(trimmed.to_string())
 }

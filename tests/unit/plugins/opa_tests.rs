@@ -1367,7 +1367,7 @@ fn opa_rejects_a_fail_posture_configured_twice_even_when_the_values_agree() {
         panic!("configuring both fail-posture flags must be rejected");
     };
     assert!(
-        error.contains("configure only one of 'fail_open' or 'fail_closed'"),
+        error.contains("configure only one of `fail_open` or `fail_closed`"),
         "unexpected error: {error}"
     );
 }
@@ -1385,5 +1385,62 @@ fn opa_accepts_null_byte_limits_as_the_documented_defaults() {
             .insert(field.to_string(), Value::Null);
         Opa::new(&config, default_client())
             .unwrap_or_else(|error| panic!("null {field} must select the default: {error}"));
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let header = "'security-diagnostic-canary";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({
+                "opa_host": "https://opa.example.com",
+                "policy_path": "allow",
+                "headers": {(header): true}
+            }),
+            &["`headers`", "must be a string"],
+        ),
+        (
+            json!({
+                "opa_host": "https://opa.example.com",
+                "policy_path": "allow",
+                "redact_headers": [canary]
+            }),
+            &["`redact_headers[0]`", "invalid", "header name"],
+        ),
+        (
+            json!({
+                "opa_host": "https://opa.example.com",
+                "policy_path": "allow",
+                "timeout_ms": -8675309
+            }),
+            &["`timeout_ms`", "unsigned integer"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("opa", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
     }
 }

@@ -217,13 +217,13 @@ fn rejects_names_outside_http_field_name_grammar_without_trimming() {
         set.insert(name.clone(), json!("value"));
         let err = SecurityHeaders::new(&json!({ "set": set })).unwrap_err();
         assert!(
-            err.contains("'set' contains invalid HTTP field name"),
+            err.contains("`set` contains invalid HTTP field name"),
             "unexpected set error for {name:?}: {err}"
         );
 
         let err = SecurityHeaders::new(&json!({ "remove": [name] })).unwrap_err();
         assert!(
-            err.contains("'remove' contains invalid HTTP field name"),
+            err.contains("`remove` contains invalid HTTP field name"),
             "unexpected remove error: {err}"
         );
     }
@@ -238,7 +238,7 @@ fn invalid_header_name_errors_identify_the_offending_set_or_remove_entry() {
         }
     }))
     .unwrap_err();
-    assert!(err.contains("'set'"), "set path missing from: {err}");
+    assert!(err.contains("`set`"), "set path missing from: {err}");
     assert!(
         err.contains("x-bad name"),
         "offending set entry missing from: {err}"
@@ -252,9 +252,9 @@ fn invalid_header_name_errors_identify_the_offending_set_or_remove_entry() {
         "remove": ["x-valid-name", "x-bad\tname"]
     }))
     .unwrap_err();
-    assert!(err.contains("'remove'"), "remove path missing from: {err}");
+    assert!(err.contains("`remove`"), "remove path missing from: {err}");
     assert!(
-        err.contains(r"x-bad\tname"),
+        err.contains(r"x-bad\\tname"),
         "offending remove entry must be escaped in: {err}"
     );
 }
@@ -265,7 +265,7 @@ fn invalid_header_name_error_rendering_is_escaped_and_bounded() {
     let err = SecurityHeaders::new(&json!({ "remove": [hostile] })).unwrap_err();
 
     assert!(
-        err.contains(r"x\r\n"),
+        err.contains(r"x\\r\\n"),
         "control characters must be escaped in: {err}"
     );
     assert!(err.contains("..."), "truncated names must be marked: {err}");
@@ -344,7 +344,7 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         "unknown": true
     }))
     .unwrap_err();
-    assert!(err.contains("under 'security_headers': fram_options, unknown"));
+    assert!(err.contains("under `security_headers`: \"fram_options, unknown\""));
 
     let err = SecurityHeaders::new(&json!({
         "hsts": {
@@ -354,7 +354,7 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         }
     }))
     .unwrap_err();
-    assert!(err.contains("under 'security_headers.hsts': include_subdomain, unknown"));
+    assert!(err.contains("under `security_headers.hsts`: \"include_subdomain, unknown\""));
 }
 
 #[test]
@@ -573,5 +573,54 @@ fn set_still_accepts_ordinary_response_header_destinations() {
     ] {
         SecurityHeaders::new(&set_config(name, "1"))
             .unwrap_or_else(|error| panic!("set.{name} must stay allowed: {error}"));
+    }
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
+    let header = "'security-diagnostic-canary";
+    let cases: &[(serde_json::Value, &[&str])] = &[
+        (
+            json!({"set": {(header): true}}),
+            &["`set`", "must be a string"],
+        ),
+        (
+            json!({"set": {(header): canary}}),
+            &["`set`", "valid HTTP field value"],
+        ),
+        (
+            json!({"hsts": {(canary): 8675309}}),
+            &["`security_headers.hsts`", "unknown configuration key"],
+        ),
+        (
+            json!({"remove": [canary]}),
+            &["`remove`", "invalid HTTP field name"],
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = ferrum_edge::plugins::validate_plugin_config("security_headers", config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for &fragment in *expected {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for supplied in [
+            "SECURITY_DIAGNOSTIC_CANARY",
+            "security-diagnostic-canary",
+            "8675309",
+            "54321",
+            "16384",
+            "true",
+        ] {
+            assert!(
+                !rendered.contains(supplied),
+                "leaked {supplied:?}: {rendered}"
+            );
+        }
     }
 }
