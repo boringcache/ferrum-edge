@@ -146,7 +146,7 @@ def verify_campaign(root, protocol):
                         failures.append("raw_capture_annotation_mismatch")
                     if gateway != "direct" and actual["bounded_capture_complete"] is not True:
                         failures.append("raw_capture_incomplete")
-                except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
+                except (ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError) as error:
                     failures.append(f"raw_capture_reconciliation_failed:{type(error).__name__}:{error}")
                 problems.extend(f"{row['path']}:{failure}" for failure in failures)
     report = dict(protocol=protocol, expected_samples=12 * len(sizes), samples=rows,

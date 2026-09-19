@@ -140,7 +140,10 @@ and hashes them, including the manifest and invocation envelopes. It always
 writes the full expected 12-cell HTTP/2 or 24-cell gRPC matrix before reporting
 validation failure. Missing/unparseable/nonobject samples retain placeholders,
 available input hashes, and per-row causes; a corrupt first row or raw artifact
-does not prevent reconciliation of later rows and remaining raw inputs.
+does not prevent reconciliation of later rows and remaining raw inputs. JSON
+decoder recursion failures become malformed-record causes at the line boundary,
+preserving surrounding valid records. A separate row boundary retains escaped
+recursion failures and continues indexing all later cells and raw hashes.
 
 `bounded_capture_complete` certifies only that enumerated boundary evidence.
 `full_transition_history_complete` is false on wrap or omitted terminal history.
@@ -159,11 +162,17 @@ partial too. None of these fields grants a cross-hop or pool-family join.
   peaks at 56 (fixed HTTP/2 pair 1: 21 server-role and 35 client-role IDs).
   Sixty-four covers that observed peak; it is not a future concurrency guarantee.
   At quota exhaustion the connection is unobserved and the global memory-loss
-  counter prevents a complete-capture claim. Released slots can be reused.
+  counter prevents a complete-capture claim. Each owner frees its ring before
+  releasing its shared permit; the last owning snapshot clone keeps that permit
+  live until its own ring is freed. Only then can another connection reuse it.
 * Ordinary emission reserves 128 MiB per process in 4,096-byte record units;
-  actual failures have a separate 8 MiB reserve (2,048 units). The latter covers
-  three full 513-record failure dumps with spare capacity; a later partial
-  dump is explicitly rejected by the promised tail length and suppression.
+  actual failures have a separate 8 MiB reserve (2,048 units). Each failure
+  atomically reserves its summary plus its complete retained tail before any
+  emission. The reserve admits three full 513-record dumps even when a fourth
+  full failure competes concurrently. An unreservable dump emits no fragment,
+  consumes no units, and increments the explicit suppressed-failure-dump count;
+  the remaining 509 units can still admit a smaller complete dump. No global
+  emission lock is introduced. Ordinary live dumps still use per-record units.
   These are diagnostic serialized-byte budgets, **not** larger h2 credits.
   Ordinary capacity accommodates three full sets of 16 backend tails across
   the two gRPC payloads (~24,576 entries), plus summaries/smoke; it does not
@@ -192,6 +201,16 @@ It also type-checks the generated admin hook and exports a real receive/poll/
 clear producer transcript in an isolated test invocation. Python consumes that
 transcript and mutates it to reject missing live snapshots, lost final fences,
 missing/ordered tails, malformed fields/generations, overflow and sink loss.
+An isolated producer regression fills four real rings and releases their tracing
+callbacks one record per producer per round, requiring three complete failure
+tails (including each failed debit) and explicit suppression of the fourth.
+This schedule exposes per-record quota interleaving; the invocation starts with
+a fresh process-wide reserve. A test-only ring destructor probe checks admission
+while the original and then its last snapshot clone are being freed. It adds no
+allocation, lock or field to non-test builds. Parser regressions use recursive
+stdlib JSON decoding/encoding with a controlled stack bound, independently of
+the host's C decoder, and require all 12/24 cells, every raw hash, surrounding
+valid records and later good reconciliation after recursion failure.
 Synthetic fixture ordering is boundary coverage, never a campaign replay.
 Artifacts retain the input archive, patch/assets, generated source, selection
 diff, compiler identities and logs. No local project execution is required.

@@ -440,7 +440,7 @@ def annotate(sample, usage, lines, boundaries=None, invocation=None, expected=No
             bucket = {"H2_GUARD_V2": "events", "H2_GUARD_TAIL_V2": "transitions",
                       "H2_GUARD_FENCE_V2": "fences", "H2_GUARD_LIMIT_V1": "suppression_notices"}
             result[bucket[row["record_type"]]].append(row)
-        except (ValueError, KeyError, TypeError, OverflowError):
+        except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
             if "malformed_guard_record" not in result["capture_errors"]:
                 result["capture_errors"].append("malformed_guard_record")
     result["missing_sequence_count"] = max(seqs, default=0) - len(seqs)

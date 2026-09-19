@@ -1,4 +1,5 @@
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -80,6 +82,16 @@ def invocation_fixture(sample):
     start = sample["phases"]["setup_start_unix_secs"]
     return dict(schema=2, identity=capture_identity(sample), start_unix_secs=start - 0.5,
                 end_unix_secs=start + 23, exit_code=0)
+
+
+@contextmanager
+def limited_json_recursion():
+    previous = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(200)
+        yield
+    finally:
+        sys.setrecursionlimit(previous)
 
 
 class GuardObservationTests(unittest.TestCase):
@@ -340,6 +352,123 @@ class GuardObservationTests(unittest.TestCase):
                     self.assertTrue(report["samples"][-1]["raw_sha256"]["after"])
                     self.assertEqual(report["samples"][-1]["recomputed_capture_errors"], [])
                     first.write_text(original)
+
+    def assert_campaign_hashes(self, root, report, count):
+        self.assertEqual(report["expected_samples"], count)
+        self.assertEqual(len(report["samples"]), count)
+        self.assertEqual(report["manifest_sha256"], hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest())
+        for row in report["samples"]:
+            path = root / row["path"]
+            self.assertEqual(row["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            gateway, size = row["expected"]["gateway"], row["expected"]["payload_size"]
+            prefix = f"{gateway}_{size}"
+            names = {"invocation": prefix + "_invocation.json"}
+            if gateway != "direct":
+                names.update(log=prefix + ".log", usage=prefix + "_process_usage.json",
+                             smoke=gateway + "_guard_smoke.json",
+                             before=prefix + "_guard_before.json", after=prefix + "_guard_after.json")
+            self.assertEqual(set(row["raw_sha256"]), set(names))
+            for label, name in names.items():
+                self.assertEqual(row["raw_sha256"][label],
+                                 hashlib.sha256((path.parent / "diagnostics" / name).read_bytes()).hexdigest())
+
+    def test_actual_producer_recursive_first_instrumented_log_retains_both_matrices(self):
+        # C JSON decoders vary by interpreter. Use the real stdlib recursive
+        # scanner with a bounded stack for this envelope only, never a model of
+        # annotate or a mock that merely raises the desired exception.
+        decoder = json.JSONDecoder()
+        decoder.scan_once = json.scanner.py_make_scanner(decoder)
+        original_loads = json.loads
+        recursive = ('{"timestamp":"2026-09-18T00:00:04Z","target":"ferrum_h2_guard",'
+                     '"fields":{"message":"H2_GUARD_V2"},"recursive_log_probe":'
+                     + "[" * 1200 + "0" + "]" * 1200 + "}")
+        self.assertLess(len(recursive), 8192)
+        for protocol, count in (("http2", 12), ("grpcs", 24)):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_campaign(root, protocol)
+                size = manifest(protocol)["payload_sizes"][0]
+                path = root / "pairs/pair_001" / f"ferrum_{protocol}_{size}.json"
+                log = path.parent / "diagnostics" / f"ferrum_{size}.log"
+                good_lines = log.read_text().splitlines()
+                lines = good_lines[:1] + [recursive] + good_lines[1:]
+                log.write_text("\n".join(lines) + "\n")
+                sample = json.loads(path.read_text())
+                expected_observation = sample["h2_guard_observation"]
+                _, boundaries = self.producer_contract(sample)
+                recursions = []
+
+                def loads(value, *args, **kwargs):
+                    if isinstance(value, str) and '"recursive_log_probe":' in value:
+                        with limited_json_recursion():
+                            try:
+                                return decoder.decode(value)
+                            except RecursionError:
+                                recursions.append(True)
+                                raise
+                    return original_loads(value, *args, **kwargs)
+
+                with mock.patch("h2_guard_observation.json.loads", side_effect=loads):
+                    annotate(sample, usage(), lines, boundaries, invocation_fixture(sample), expected_for(sample))
+                    actual = sample["h2_guard_observation"]
+                    self.assertEqual(actual["capture_errors"], ["malformed_guard_record"])
+                    self.assertFalse(actual["bounded_capture_complete"])
+                    for bucket in ("events", "transitions", "fences", "measurement_failures"):
+                        self.assertEqual(actual[bucket], expected_observation[bucket])
+                    with self.assertRaisesRegex(ValueError, "campaign evidence incomplete"):
+                        verify_campaign(root, protocol)
+                self.assertEqual(len(recursions), 2)  # annotation and raw reconciliation
+                report = json.loads((root / "guard-evidence-index.json").read_text())
+                self.assert_campaign_hashes(root, report, count)
+                for row in report["samples"]:
+                    if row["path"] == str(path.relative_to(root)):
+                        self.assertEqual(row["recomputed_capture_errors"], ["malformed_guard_record"])
+                        self.assertIn("malformed_guard_record", row["validation_failures"])
+                        self.assertEqual(row["recomputed_measurement_failures"], expected_observation["measurement_failures"])
+                    else:
+                        self.assertEqual(row["validation_failures"], [])
+                        self.assertEqual(row["recomputed_capture_errors"], [])
+
+    def test_actual_producer_row_recursion_safety_boundary_retains_both_matrices(self):
+        # Exercise the outer safety net independently of the per-line handler:
+        # a real recursive stdlib encoder fails while normalizing a deep raw
+        # invocation retained by annotate. All later rows still reconcile.
+        encoder = json.JSONEncoder()
+        original_dumps = json.dumps
+        for protocol, count in (("http2", 12), ("grpcs", 24)):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_campaign(root, protocol)
+                size = manifest(protocol)["payload_sizes"][0]
+                path = root / "pairs/pair_001" / f"ferrum_{protocol}_{size}.json"
+                invocation = path.parent / "diagnostics" / f"ferrum_{size}_invocation.json"
+                invocation.write_text(invocation.read_text()[:-1] + ',"recursive_row_probe":'
+                                      + "[" * 300 + "0" + "]" * 300 + "}")
+                recursions = []
+
+                def dumps(value, *args, **kwargs):
+                    if isinstance(value, dict) and "recursive_row_probe" in value.get("invocation", {}):
+                        with limited_json_recursion():
+                            try:
+                                return "".join(encoder.iterencode(value))
+                            except RecursionError:
+                                recursions.append(True)
+                                raise
+                    return original_dumps(value, *args, **kwargs)
+
+                with mock.patch("verify.json.dumps", side_effect=dumps):
+                    with self.assertRaisesRegex(ValueError, "campaign evidence incomplete"):
+                        verify_campaign(root, protocol)
+                self.assertEqual(len(recursions), 1)
+                report = json.loads((root / "guard-evidence-index.json").read_text())
+                self.assert_campaign_hashes(root, report, count)
+                for row in report["samples"]:
+                    if row["path"] == str(path.relative_to(root)):
+                        self.assertTrue(any(error.startswith("raw_capture_reconciliation_failed:RecursionError:")
+                                            for error in row["validation_failures"]))
+                    else:
+                        self.assertEqual(row["validation_failures"], [])
+                        self.assertEqual(row["recomputed_capture_errors"], [])
 
     def test_actual_producer_index_rejects_copied_cells_and_retains_all_raw_failures(self):
         with tempfile.TemporaryDirectory() as directory:

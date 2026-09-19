@@ -67,6 +67,9 @@ jobs:
           cargo clippy --manifest-path "$crate/Cargo.toml" --locked --lib --tests --message-format=json -- --cap-lints warn > "$evidence/clippy-observed.jsonl"
           python3 tests/performance/multi_protocol/h2_guard/lint.py "$evidence/clippy-upstream.jsonl" "$evidence/clippy-observed.jsonl" > "$evidence/clippy-comparison.json"
           cargo test --manifest-path "$crate/Cargo.toml" --locked --lib guard_observation -- --nocapture --test-threads=1 2>&1 | tee "$evidence/guard-tests.log"
+          # The four competing failures need an untouched process-wide reserve.
+          cargo test --manifest-path "$crate/Cargo.toml" --locked --lib guard_observation_concurrent_failure_dumps_reserve_complete_tails -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee "$evidence/concurrent-failure-tests.log"
           cargo test --manifest-path "$crate/Cargo.toml" --locked --lib data_frame_budget 2>&1 | tee "$evidence/upstream-budget-tests.log"
           H2_GUARD_PRODUCER_CONTRACT="$evidence/producer-contract.txt" \
             cargo test --manifest-path "$crate/Cargo.toml" --locked --lib guard_observation_export_contract -- --nocapture --test-threads=1 \

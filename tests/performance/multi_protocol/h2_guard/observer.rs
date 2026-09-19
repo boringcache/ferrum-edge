@@ -36,6 +36,20 @@ impl Drop for Permit {
 struct Transition {
     fields: [u64; 16],
     byte_available: isize,
+    #[cfg(test)]
+    drop_barrier: Option<Arc<std::sync::Barrier>>,
+}
+
+// Pause an actual ring element's destruction while its allocation is still
+// owned. This probe and its storage do not exist in the diagnostic build.
+#[cfg(test)]
+impl Drop for Transition {
+    fn drop(&mut self) {
+        if let Some(barrier) = &self.drop_barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -54,11 +68,11 @@ impl Limit {
         }
     }
 
-    pub(super) fn take(&self) -> Result<u64, u64> {
+    pub(super) fn take(&self, records: u64) -> Result<u64, u64> {
         match self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            (n < self.cap).then_some(n + 1)
+            n.checked_add(records).filter(|&next| next <= self.cap)
         }) {
-            Ok(n) => Ok(n + 1),
+            Ok(n) => Ok(n + records),
             Err(_) => {
                 let old = self.suppressed.fetch_update(
                     Ordering::Relaxed,
@@ -86,7 +100,11 @@ pub(super) fn suppressed() -> u64 {
 }
 
 pub(super) fn admit(limit: &Limit, scope: u8) -> Option<u64> {
-    match limit.take() {
+    admit_records(limit, scope, 1)
+}
+
+fn admit_records(limit: &Limit, scope: u8, records: u64) -> Option<u64> {
+    match limit.take(records) {
         Ok(id) => Some(id),
         Err(n) => {
             // At most 64 notices per scope, saturation cannot repeat a notice
@@ -104,7 +122,6 @@ pub(super) fn admit(limit: &Limit, scope: u8) -> Option<u64> {
 #[derive(Clone, Debug)]
 pub(super) struct Observation {
     pub(super) cid: u64,
-    _permit: Arc<Permit>,
     tail: Box<[Transition]>,
     pub(super) transitions: u64,
     pub(super) epoch: u64,
@@ -138,12 +155,20 @@ pub(super) struct Observation {
     pub(super) disposition: u8,
     pub(super) branch: u8,
     reason: u32,
+    // Fields drop in declaration order. Every owning clone must free its ring
+    // before the last Arc can return the live slot to another connection.
+    _permit: Arc<Permit>,
 }
 
 impl Observation {
     #[cfg(test)]
     pub(super) fn allocation_with_metadata_allowance(&self) -> usize {
         std::mem::size_of::<Self>() + std::mem::size_of_val(self.tail.as_ref()) + 1024
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_tail_drop(&mut self, barrier: Arc<std::sync::Barrier>) {
+        self.tail[TAIL - 1].drop_barrier = Some(barrier);
     }
 
     pub(super) fn transition(&mut self, kind: u8, frame: [u64; 5], credit: [usize; 2], consume: u8) {
@@ -168,6 +193,8 @@ impl Observation {
                      credit[1].abs_diff(credit[0]) as u64, self.pending, u64::from(self.target),
                      u64::from(self.wire_window), u64::from(self.in_flight), u64::from(self.stream_window)],
             byte_available: self.byte_available,
+            #[cfg(test)]
+            drop_barrier: None,
         };
         self.transitions += 1;
     }
@@ -195,7 +222,6 @@ impl Observation {
         let permit = Permit::take()?;
         Some(Self {
             cid,
-            _permit: Arc::new(permit),
             tail: vec![Transition::default(); TAIL].into_boxed_slice(),
             transitions: 0, epoch: 0, pending: 0, high_pending: 0,
             min_credit: budget, overflow: 0,
@@ -222,6 +248,7 @@ impl Observation {
             disposition: 0,
             branch: 0,
             reason: 0,
+            _permit: Arc::new(permit),
         })
     }
 
@@ -282,7 +309,12 @@ impl Observation {
             self.reason = reason;
         }
         let (limit, scope) = if event == 1 { (&FAILURES, 3) } else { (&LIFECYCLE, 2) };
-        if admit(limit, scope).is_none() {
+        let tail_len = if matches!(event, 1 | 3) { self.transitions.min(TAIL as u64) } else { 0 };
+        // Reserve the entire failure dump before emitting its summary. Other
+        // connections cannot spend its promised tail units, even while tracing
+        // interleaves. Refusal counts one suppressed dump and emits no fragment.
+        let records = if event == 1 { 1 + tail_len } else { 1 };
+        if admit_records(limit, scope, records).is_none() {
             return;
         }
         let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -303,14 +335,14 @@ impl Observation {
             CONNECTIONS.suppressed.load(Ordering::Relaxed),
             LIFECYCLE.suppressed.load(Ordering::Relaxed),
             FAILURES.suppressed.load(Ordering::Relaxed), generation, self.transitions,
-            if matches!(event, 1 | 3) { self.transitions.min(TAIL as u64) } else { 0 }, self.transitions.saturating_sub(1) / TAIL as u64,
+            tail_len, self.transitions.saturating_sub(1) / TAIL as u64,
             self.transitions.saturating_sub(TAIL as u64), self.overflow, self.pending,
             self.high_pending, self.min_credit, self.epoch, MEMORY_OVERFLOW.load(Ordering::Relaxed));
         // Constructor has no transitions. Each dump is linked to its summary seq.
         // Terminal summaries retain exact totals; failure/live dumps carry tails.
         if !matches!(event, 1 | 3) { return; }
         for n in self.transitions.saturating_sub(TAIL as u64)..self.transitions {
-            if admit(limit, scope).is_none() { break; }
+            if event != 1 && admit(limit, scope).is_none() { break; }
             let t = &self.tail[n as usize % TAIL];
             let f = &t.fields;
             let issued = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;

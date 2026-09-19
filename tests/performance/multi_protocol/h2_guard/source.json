@@ -33,8 +33,8 @@
     }
   },
   "assets": {
-    "observer.rs": "198add4e6ea4771c15dd6a41e2ad42fbebfe2cd15da7b8b6feeaaa32d51dd178",
-    "guard_tests.rs": "a9cb27706e82dd21222a286c072dbe43553e652ab61cb196a50e3894c7cc03b3",
+    "observer.rs": "c0f216e1cc88f3c05693c19569810d7a8a516f6c80977a9c49e61fab0169cf50",
+    "guard_tests.rs": "48d5bb259409470d3b45aa7f11c0d88279ec628fc55de6c9bb44f9cb6c9099ec",
     "metrics-hook.txt": "c3e18b33e790351221a7383fd83e7bfa53b59a96b26e7b434a565d714454d539"
   },
   "context_files": {
