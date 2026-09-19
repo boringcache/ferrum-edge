@@ -890,14 +890,26 @@ async fn test_udp_logging_dtls_rejects_mismatched_certificate_and_key_at_admissi
     )
     .err()
     .expect("mismatched DTLS certificate/key must fail admission");
+    assert!(err.contains("key_mismatch"), "got: {err}");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+    assert!(rendered.contains("key_mismatch"), "{rendered}");
     assert!(
-        err.contains("DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`"),
-        "got: {err}"
+        rendered.contains("`dtls_cert_path` / `dtls_key_path`"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(cert.path().to_str().unwrap()),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(other_key.path().to_str().unwrap()),
+        "{rendered}"
     );
 }
 
 #[tokio::test]
 async fn test_udp_logging_dtls_rejects_rsa_key_at_admission() {
+    ensure_crypto_provider();
     let (cert, key) = mint_rsa_pair();
     let err = UdpLogging::new(
         &json!({
@@ -912,9 +924,20 @@ async fn test_udp_logging_dtls_rejects_rsa_key_at_admission() {
     )
     .err()
     .expect("RSA keys are unsupported for DTLS");
+    assert!(err.contains("unsupported_key"), "got: {err}");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+    assert!(rendered.contains("unsupported_key"), "{rendered}");
     assert!(
-        err.contains("DTLS cert/key materialization failed for `dtls_cert_path` / `dtls_key_path`"),
-        "got: {err}"
+        rendered.contains("`dtls_cert_path` / `dtls_key_path`"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(cert.path().to_str().unwrap()),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(key.path().to_str().unwrap()),
+        "{rendered}"
     );
 }
 
@@ -1972,5 +1995,85 @@ fn startup_diagnostics_name_only_supported_dtls_verification_host() {
             !rendered.to_ascii_lowercase().contains("diagnostichost5594"),
             "{rendered}"
         );
+    }
+}
+
+#[test]
+fn dtls_diagnostics_keep_source_class_material_field_and_pem_record() {
+    ensure_crypto_provider();
+    let (cert, key) = mint_ecdsa_p256_pair();
+    let valid_cert = std::fs::read_to_string(cert.path()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("MissingDtlsSourceMarker5594.pem");
+    let oversized = directory.path().join("OversizedDtlsSourceMarker5594.pem");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(ferrum_edge::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES as u64 + 1)
+        .unwrap();
+    for (source, class) in [
+        (missing.to_str().unwrap(), "io"),
+        (
+            "file://SourceUserMarker5594:SourceSecretMarker5594@localhost/private",
+            "invalid_source",
+        ),
+        (oversized.to_str().unwrap(), "oversized"),
+    ] {
+        for field in ["dtls_cert_path", "dtls_key_path", "dtls_ca_cert_path"] {
+            let mut config = json!({
+                "host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_no_verify": true,
+                "dtls_cert_path": cert.path().to_str().unwrap(),
+                "dtls_key_path": key.path().to_str().unwrap()
+            });
+            config[field] = json!(source);
+            let error = UdpLogging::new(&config, test_client()).err().unwrap();
+            assert!(error.contains(&format!("({class})")), "{error}");
+            let rendered =
+                ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+            for expected in ["udp_logging", field, &format!("({class})")] {
+                assert!(rendered.contains(expected), "{rendered}");
+            }
+            for hidden in [source, "SourceMarker5594", "SourceSecretMarker5594"] {
+                assert!(!rendered.contains(hidden), "{rendered}");
+            }
+        }
+    }
+
+    for (field, material, expected) in [
+        (
+            "dtls_ca_cert_path",
+            format!(
+                "{valid_cert}-----BEGIN CERTIFICATE-----\n!PemMarker5594\n-----END CERTIFICATE-----\n"
+            ),
+            "certificate record #2",
+        ),
+        (
+            "dtls_cert_path",
+            format!(
+                "{valid_cert}-----BEGIN CERTIFICATE-----\n!PemMarker5594\n-----END CERTIFICATE-----\n"
+            ),
+            "certificate record #2",
+        ),
+        (
+            "dtls_key_path",
+            "-----BEGIN PRIVATE KEY-----\n!PemMarker5594\n-----END PRIVATE KEY-----\n".into(),
+            "private key in <redacted scalar> is malformed",
+        ),
+    ] {
+        let path = directory.path().join("PemPathMarker5594.pem");
+        std::fs::write(&path, &material).unwrap();
+        let mut config = json!({
+            "host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_no_verify": true,
+            "dtls_cert_path": cert.path().to_str().unwrap(),
+            "dtls_key_path": key.path().to_str().unwrap()
+        });
+        config[field] = json!(path.to_str().unwrap());
+        let error = UdpLogging::new(&config, test_client()).err().unwrap();
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in ["udp_logging", field, expected] {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        for hidden in ["PemPathMarker5594", "PemMarker5594", valid_cert.as_str()] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
     }
 }

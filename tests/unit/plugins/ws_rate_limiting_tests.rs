@@ -1187,3 +1187,54 @@ async fn empty_fragment_batch_is_not_charged_under_the_fail_closed_default() {
         "a zero-fragment batch must not create local rate-limit state"
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [
+        (
+            json!({"frames_per_second": "'UNREGISTERED_TRAFFIC_TOKEN"}),
+            "`frames_per_second`",
+            "must be an integer",
+        ),
+        (
+            json!({"frames_per_second": true}),
+            "`frames_per_second`",
+            "must be an integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("ws_rate_limiting", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn shared_frame_rate_relations_keep_fields_and_withhold_numeric_operands() {
+    for (frames, burst, reason) in [
+        (731, 730, "must be >="),
+        (731, 1463, "must be an integer multiple of"),
+        (1, 3731, "exceeds the Redis-representable maximum"),
+    ] {
+        let config = json!({"frames_per_second": frames, "burst_size": burst});
+        let error = WsRateLimiting::new(&config, PluginHttpClient::default())
+            .err()
+            .expect("unrepresentable frame rate must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for retained in [
+            "ws_rate_limiting:",
+            "`frames_per_second`",
+            "`burst_size`",
+            reason,
+        ] {
+            assert!(rendered.contains(retained), "{retained}: {rendered}");
+        }
+        for withheld in ["731", "730", "1463", "3731"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

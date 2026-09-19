@@ -144,7 +144,7 @@ fn test_invalid_bool_config_rejected() {
     let err = SsePlugin::new(&json!({"strip_accept_encoding": "yes"}))
         .err()
         .expect("invalid bool must be rejected");
-    assert!(err.contains("'strip_accept_encoding' must be a boolean"));
+    assert!(err.contains("`strip_accept_encoding` must be a boolean"));
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn test_invalid_retry_ms_rejected() {
     let err = SsePlugin::new(&json!({"retry_ms": "3000"}))
         .err()
         .expect("invalid retry_ms must be rejected");
-    assert!(err.contains("'retry_ms' must be an unsigned integer"));
+    assert!(err.contains("`retry_ms` must be an unsigned integer"));
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn test_zero_retry_ms_rejected() {
     let err = SsePlugin::new(&json!({"retry_ms": 0}))
         .err()
         .expect("zero retry_ms must be rejected");
-    assert!(err.contains("'retry_ms' must be greater than zero"));
+    assert!(err.contains("`retry_ms` must be greater than zero"));
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn test_explicit_null_members_rejected() {
         .err()
         .expect("null member must be rejected");
     assert!(
-        err.contains("'require_get_method' must be a boolean"),
+        err.contains("`require_get_method` must be a boolean"),
         "{err}"
     );
 }
@@ -211,7 +211,7 @@ fn test_null_retry_ms_rejected() {
         .err()
         .expect("null retry_ms must be rejected");
     assert!(
-        err.contains("'retry_ms' must be an unsigned integer"),
+        err.contains("`retry_ms` must be an unsigned integer"),
         "{err}"
     );
 }
@@ -1801,4 +1801,29 @@ async fn test_the_refinement_answer_depends_on_pristine_backend_headers() {
         "the relabelled map releases the body — which is exactly why every \
          dispatch path must refine before `after_proxy` runs"
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [
+        (
+            json!({"require_get_method": "'UNREGISTERED_TRAFFIC_TOKEN"}),
+            "`require_get_method`",
+            "must be a boolean",
+        ),
+        (
+            json!({"retry_ms": -918273641}),
+            "`retry_ms`",
+            "must be an unsigned integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("sse", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

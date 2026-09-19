@@ -1025,3 +1025,48 @@ async fn true_ipv6_sources_keep_independent_budgets() {
     );
     assert_eq!(plugin.tracked_keys_count(), Some(4));
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    for (config, field, reason) in [
+        (
+            json!({"datagrams_per_second": "'UNREGISTERED_TRAFFIC_TOKEN"}),
+            "`datagrams_per_second`",
+            "must be an integer",
+        ),
+        (
+            json!({"datagrams_per_second": true}),
+            "`datagrams_per_second`",
+            "must be an integer",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("udp_rate_limiting", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn shared_window_bound_keeps_udp_plugin_and_field_when_rendered() {
+    use ferrum_edge::plugins::utils::rate_limit::MAX_RATE_LIMIT_WINDOW_SECONDS;
+
+    let value = MAX_RATE_LIMIT_WINDOW_SECONDS + 1;
+    let config = json!({"datagrams_per_second": 1, "window_seconds": value});
+    let error = ferrum_edge::plugins::validate_plugin_config("udp_rate_limiting", &config)
+        .expect_err("an excessive window must fail the shared bound");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    assert!(rendered.starts_with("udp_rate_limiting:"), "{rendered}");
+    assert!(rendered.contains("`window_seconds`"), "{rendered}");
+    assert!(
+        rendered.contains(&format!(
+            "must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds"
+        )),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(&value.to_string()), "{rendered}");
+}

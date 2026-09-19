@@ -181,7 +181,7 @@ impl SsePlugin {
                 value_kind(config)
             ));
         };
-        reject_unknown_keys(config_obj, "config", SSE_CONFIG_KEYS, "sse: ")?;
+        reject_unknown_keys(config_obj, "config", SSE_CONFIG_KEYS, "sse: `config`: ")?;
 
         let require_accept_header = bool_config(config_obj, "require_accept_header", true)?;
         let require_get_method = bool_config(config_obj, "require_get_method", true)?;
@@ -507,7 +507,7 @@ fn bool_config(config: &Map<String, Value>, key: &str, default: bool) -> Result<
         None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "sse: '{key}' must be a boolean, got: {}",
+            "sse: `{key}` must be a boolean, got: {}",
             value_kind(other)
         )),
     }
@@ -521,13 +521,13 @@ fn optional_positive_u64_config(
         None => Ok(None),
         Some(Value::Number(number)) => match unsigned_integer_value(number) {
             Some(value) if value > 0 => Ok(Some(value)),
-            Some(_) => Err(format!("sse: '{key}' must be greater than zero")),
+            Some(_) => Err(format!("sse: `{key}` must be greater than zero")),
             None => Err(format!(
                 "sse: `{key}` must be an unsigned integer, got: \"{number}\""
             )),
         },
         Some(other) => Err(format!(
-            "sse: '{key}' must be an unsigned integer, got: {}",
+            "sse: `{key}` must be an unsigned integer, got: {}",
             value_kind(other)
         )),
     }

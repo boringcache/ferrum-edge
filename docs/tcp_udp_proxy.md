@@ -2,6 +2,10 @@
 
 Ferrum Edge supports raw TCP and UDP stream proxying alongside its HTTP-based proxying. Each stream proxy binds to a dedicated port and forwards traffic bidirectionally between clients and backends.
 
+The default-off [`bench-udp-profile` diagnostic feature](udp_internal_profile.md)
+measures existing session/queue and occupied batch work through authenticated
+fixed metrics. It changes no UDP session/cache policy.
+
 ## Use Cases
 
 - **Databases**: Proxy PostgreSQL (TCP:5432), MySQL (TCP:3306), Redis (TCP:6379) with load balancing and health checks

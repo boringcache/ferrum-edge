@@ -81,6 +81,7 @@ use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
+use crate::plugins::mesh::diagnostics::{self, Schema};
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use crate::plugins::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use crate::plugins::utils::route_header_transform::{
@@ -111,8 +112,9 @@ pub struct MeshRouteDispatchConfig {
 
 impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
-        crate::util::deserialization::from_json_value::<crate::util::json_object::JsonObject<Self>>(
+        diagnostics::from_value::<crate::util::json_object::JsonObject<Self>>(
             config.clone(),
+            Schema::Route,
         )
         .map(|object| object.0)
         .map_err(|e| format!("mesh_route_dispatch config: {e}"))
@@ -132,7 +134,7 @@ impl MeshRouteDispatchConfig {
 
     fn normalize_and_validate(&mut self) -> Result<(), String> {
         if self.rules.is_empty() {
-            return Err("mesh_route_dispatch.rules cannot be empty".to_string());
+            return Err("`mesh_route_dispatch.rules` cannot be empty".to_string());
         }
         for (idx, rule) in self.rules.iter_mut().enumerate() {
             normalize_header_match_keys(idx, &mut rule.match_.headers)?;
@@ -153,8 +155,8 @@ impl MeshRouteDispatchConfig {
                 || rule.redirect.is_some();
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].match requires at least one of \
-                     methods / headers / query_params / authority / source_namespace / uri \
+                    "`mesh_route_dispatch.rules[{idx}].match` requires at least one of \
+                     `methods` / `headers` / `query_params` / `authority` / `source_namespace` / `uri` \
                      (an empty match would silently never fire, contradicting \
                      first-match-wins semantics)"
                 ));
@@ -166,26 +168,26 @@ impl MeshRouteDispatchConfig {
             // catch-all) or it would be a no-op.
             if rule.destination.is_empty() && rule.redirect.is_none() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination requires upstream_id or \
-                     a direct backend override (backend_host and backend_port); backend_tls \
+                    "`mesh_route_dispatch.rules[{idx}].destination` requires `upstream_id` or \
+                     a direct backend override (`backend_host` and `backend_port`); `backend_tls` \
                      may only accompany a direct backend"
                 ));
             }
             if rule.retry.is_some() && rule.retry_disabled {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}] cannot set both retry and retry_disabled"
+                    "`mesh_route_dispatch.rules[{idx}]` cannot set both `retry` and `retry_disabled`"
                 ));
             }
             if rule.timeout_ms.is_some() && rule.timeout_disabled {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}] cannot set both timeout_ms and timeout_disabled"
+                    "`mesh_route_dispatch.rules[{idx}]` cannot set both `timeout_ms` and `timeout_disabled`"
                 ));
             }
             if let Some(retry) = &rule.retry
                 && let Err(errors) = retry.validate_fields()
             {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].retry: {}",
+                    "`mesh_route_dispatch.rules[{idx}].retry`: {}",
                     errors.join("; ")
                 ));
             }
@@ -193,29 +195,29 @@ impl MeshRouteDispatchConfig {
                 && port == 0
             {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_port must be non-zero"
+                    "`mesh_route_dispatch.rules[{idx}].destination.backend_port` must be non-zero"
                 ));
             }
             if let Some(host) = rule.destination.backend_host.as_mut() {
                 let trimmed = host.trim();
                 if trimmed.is_empty() {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not be empty"
+                        "`mesh_route_dispatch.rules[{idx}].destination.backend_host` must not be empty"
                     ));
                 }
                 if trimmed.len() > MAX_BACKEND_HOST_LENGTH {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not exceed {MAX_BACKEND_HOST_LENGTH} characters"
+                        "`mesh_route_dispatch.rules[{idx}].destination.backend_host` must not exceed {MAX_BACKEND_HOST_LENGTH} characters"
                     ));
                 }
                 if trimmed.contains("://") {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not contain a scheme"
+                        "`mesh_route_dispatch.rules[{idx}].destination.backend_host` must not contain a scheme"
                     ));
                 }
                 if trimmed.chars().any(char::is_whitespace) {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{idx}].destination.backend_host must not contain whitespace"
+                        "`mesh_route_dispatch.rules[{idx}].destination.backend_host` must not contain whitespace"
                     ));
                 }
                 validate_route_backend_host(idx, trimmed)?;
@@ -227,20 +229,20 @@ impl MeshRouteDispatchConfig {
                 && (has_backend_host || has_backend_port || rule.destination.backend_tls.is_some())
             {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.upstream_id cannot be \
-                     combined with backend_host / backend_port / backend_tls"
+                    "`mesh_route_dispatch.rules[{idx}].destination.upstream_id` cannot be \
+                     combined with `backend_host` / `backend_port` / `backend_tls`"
                 ));
             }
             if has_backend_host != has_backend_port {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_host and \
-                     backend_port must be set together for direct-backend overrides"
+                    "`mesh_route_dispatch.rules[{idx}].destination.backend_host` and \
+                     `backend_port` must be set together for direct-backend overrides"
                 ));
             }
             if rule.destination.backend_tls.is_some() && !(has_backend_host && has_backend_port) {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{idx}].destination.backend_tls requires \
-                     backend_host and backend_port so TLS overrides only apply to a direct backend"
+                    "`mesh_route_dispatch.rules[{idx}].destination.backend_tls` requires \
+                     `backend_host` and `backend_port` so TLS overrides only apply to a direct backend"
                 ));
             }
             rule.destination.node_waypoint_backend_match_key = rule
@@ -297,9 +299,9 @@ impl MeshRouteDispatchConfig {
 fn validate_route_backend_host(rule_idx: usize, host: &str) -> Result<(), String> {
     let reject = |reason: &str| -> Result<(), String> {
         Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_host must be a bare \
+            "`mesh_route_dispatch.rules[{rule_idx}].destination.backend_host` must be a bare \
              host — a DNS name, an IPv4 literal, or an IPv6 literal written as `::1` or \
-             `[::1]` — with the port carried by backend_port: {reason}"
+             `[::1]` — with the port carried by `backend_port`: {reason}"
         ))
     };
     if let Some(rest) = host.strip_prefix('[') {
@@ -335,19 +337,19 @@ fn validate_route_backend_host(rule_idx: usize, host: &str) -> Result<(), String
 fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(), String> {
     if fault.delay.is_none() && fault.abort.is_none() {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].fault must contain at least one of \
-             'delay' or 'abort'"
+            "`mesh_route_dispatch.rules[{rule_idx}].fault` must contain at least one of \
+             `delay` or `abort`"
         ));
     }
     if let Some(delay) = fault.delay.as_ref() {
         if delay.duration_ms == 0 {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be > 0"
+                "`mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms` must be > 0"
             ));
         }
         if delay.duration_ms > MAX_FAULT_DELAY_MS {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be \
+                "`mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms` must be \
                  <= {MAX_FAULT_DELAY_MS} (1 minute), got \"{}\"",
                 delay.duration_ms
             ));
@@ -357,7 +359,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
     if let Some(abort) = fault.abort.as_ref() {
         if !(200..=599).contains(&abort.status_code) {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].fault.abort.status_code must be \
+                "`mesh_route_dispatch.rules[{rule_idx}].fault.abort.status_code` must be \
                  200-599, got \"{}\"",
                 abort.status_code
             ));
@@ -367,7 +369,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
             && code > 16
         {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].fault.abort.grpc_status must be \
+                "`mesh_route_dispatch.rules[{rule_idx}].fault.abort.grpc_status` must be \
                  0-16, got \"{code}\""
             ));
         }
@@ -382,18 +384,18 @@ fn validate_fault_percentage(
 ) -> Result<(), String> {
     if !percentage.is_finite() {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be a finite number"
+            "`mesh_route_dispatch.rules[{rule_idx}].{field_name}` must be a finite number"
         ));
     }
     if !(0.0..=100.0).contains(&percentage) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be in [0.0, 100.0], \
+            "`mesh_route_dispatch.rules[{rule_idx}].{field_name}` must be in [0.0, 100.0], \
              got \"{percentage}\""
         ));
     }
     if percentage == 0.0 {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be > 0.0 (a 0% \
+            "`mesh_route_dispatch.rules[{rule_idx}].{field_name}` must be > 0.0 (a 0% \
              fault would be a no-op; omit the action to disable it instead)"
         ));
     }
@@ -407,7 +409,7 @@ fn validate_fault_percentage(
 fn reject_crlf(rule_idx: usize, field: &str, value: &str) -> Result<(), String> {
     if value.contains(['\r', '\n']) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].{field} must not contain CR or LF"
+            "`mesh_route_dispatch.rules[{rule_idx}].{field}` must not contain CR or LF"
         ));
     }
     Ok(())
@@ -419,38 +421,38 @@ fn validate_and_normalize_rewrite(
 ) -> Result<(), String> {
     if rewrite.is_empty() {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].rewrite must set at least one of \
-             'uri' or 'authority'"
+            "`mesh_route_dispatch.rules[{rule_idx}].rewrite` must set at least one of \
+             `uri` or `authority`"
         ));
     }
     if let Some(uri) = rewrite.uri.as_deref() {
         if uri.is_empty() {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].rewrite.uri must not be empty"
+                "`mesh_route_dispatch.rules[{rule_idx}].rewrite.uri` must not be empty"
             ));
         }
         reject_crlf(rule_idx, "rewrite.uri", uri)?;
         if !uri.starts_with('/') || uri.contains(['?', '#']) {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].rewrite.uri must be an absolute path without a query or fragment"
+                "`mesh_route_dispatch.rules[{rule_idx}].rewrite.uri` must be an absolute path without a query or fragment"
             ));
         }
         if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(uri) {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].rewrite.uri is not canonical: {reason}"
+                "`mesh_route_dispatch.rules[{rule_idx}].rewrite.uri` is not canonical: {reason}"
             ));
         }
     }
     if let Some(authority) = rewrite.authority.as_mut() {
         if authority.is_empty() {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].rewrite.authority must not be empty"
+                "`mesh_route_dispatch.rules[{rule_idx}].rewrite.authority` must not be empty"
             ));
         }
         reject_crlf(rule_idx, "rewrite.authority", authority)?;
         if authority.chars().any(char::is_whitespace) {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].rewrite.authority must not contain whitespace"
+                "`mesh_route_dispatch.rules[{rule_idx}].rewrite.authority` must not contain whitespace"
             ));
         }
     }
@@ -471,14 +473,14 @@ fn validate_and_normalize_redirect(
 ) -> Result<(), String> {
     if !(300..=399).contains(&redirect.redirect_code) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got \"{}\"",
+            "`mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code` must be 300-399, got \"{}\"",
             redirect.redirect_code
         ));
     }
     if let Some(uri) = redirect.uri.as_deref() {
         if uri.is_empty() {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].redirect.uri must not be empty"
+                "`mesh_route_dispatch.rules[{rule_idx}].redirect.uri` must not be empty"
             ));
         }
         reject_crlf(rule_idx, "redirect.uri", uri)?;
@@ -491,24 +493,24 @@ fn validate_and_normalize_redirect(
     if let Some(authority) = redirect.authority.as_mut() {
         if authority.is_empty() {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].redirect.authority must not be empty"
+                "`mesh_route_dispatch.rules[{rule_idx}].redirect.authority` must not be empty"
             ));
         }
         reject_crlf(rule_idx, "redirect.authority", authority)?;
         if authority.chars().any(char::is_whitespace) {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].redirect.authority must not contain whitespace"
+                "`mesh_route_dispatch.rules[{rule_idx}].redirect.authority` must not contain whitespace"
             ));
         }
     }
     if redirect.port == Some(0) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect.port must be in the 1-65535 range"
+            "`mesh_route_dispatch.rules[{rule_idx}].redirect.port` must be in the 1-65535 range"
         ));
     }
     if redirect.port.is_some() && redirect.derive_port.is_some() {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect.port and redirect.derive_port \
+            "`mesh_route_dispatch.rules[{rule_idx}].redirect.port` and `redirect.derive_port` \
              are mutually exclusive"
         ));
     }
@@ -516,7 +518,7 @@ fn validate_and_normalize_redirect(
         *scheme = scheme.to_ascii_lowercase();
         if scheme != "http" && scheme != "https" {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].redirect.scheme must be 'http' or 'https'"
+                "`mesh_route_dispatch.rules[{rule_idx}].redirect.scheme` must be `http` or `https`"
             ));
         }
     }
@@ -547,8 +549,8 @@ fn compile_transform_field(
                         &rule.key,
                     ) {
                         return Err(format!(
-                            "{context}[{idx}].key '{}' is protocol-managed (hop-by-hop or framing) \
-                             and cannot be a response_transform destination",
+                            "`{context}[{idx}].key` {:?} is protocol-managed (hop-by-hop or framing) \
+                             and cannot be a `response_transform` destination",
                             rule.key
                         ));
                     }
@@ -714,7 +716,7 @@ fn normalize_and_validate_backend_tls(
     ] {
         if path.is_some_and(str::is_empty) {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.{field} \
+                "`mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.{field}` \
                  must not be empty"
             ));
         }
@@ -724,8 +726,8 @@ fn normalize_and_validate_backend_tls(
     let has_client_key = tls.client_key_path.is_some();
     if has_client_cert != has_client_key {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.client_cert_path \
-             and client_key_path must be set together"
+            "`mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.client_cert_path` \
+             and `client_key_path` must be set together"
         ));
     }
 
@@ -756,14 +758,14 @@ fn normalize_and_validate_backend_tls(
 
     if let Some(sni) = tls.sni.as_mut() {
         validate_backend_tls_sni(sni).map_err(|e| {
-            format!("mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.sni: {e}")
+            format!("`mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.sni`: {e}")
         })?;
         *sni = sni.to_ascii_lowercase();
     }
 
     if tls.san_allow_list.len() > MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.san_allow_list \
+            "`mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.san_allow_list` \
              must not have more than {MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES} entries (got {})",
             tls.san_allow_list.len()
         ));
@@ -771,7 +773,7 @@ fn normalize_and_validate_backend_tls(
     for (san_idx, san) in tls.san_allow_list.iter_mut().enumerate() {
         validate_backend_tls_san_allow_list_entry(san).map_err(|e| {
             format!(
-                "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.san_allow_list[{san_idx}]: {e}"
+                "`mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.san_allow_list[{san_idx}]`: {e}"
             )
         })?;
         normalize_backend_tls_san_allow_list_entry(san);
@@ -1628,12 +1630,12 @@ fn normalize_source_namespace(
     };
     if ns.is_empty() {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].match.source_namespace must not be empty"
+            "`mesh_route_dispatch.rules[{rule_idx}].match.source_namespace` must not be empty"
         ));
     }
     if ns.chars().any(char::is_whitespace) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].match.source_namespace must not contain whitespace"
+            "`mesh_route_dispatch.rules[{rule_idx}].match.source_namespace` must not contain whitespace"
         ));
     }
     Ok(())
@@ -1661,7 +1663,7 @@ fn compile_authority_matcher(
         AuthorityMatchOp::Legacy(value) => {
             if value.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority must not be empty"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.authority` must not be empty"
                 ));
             }
             AuthorityMatcher::Exact(value.clone())
@@ -1669,7 +1671,7 @@ fn compile_authority_matcher(
         AuthorityMatchOp::Tagged(AuthorityStringMatch::Exact(value)) => {
             if value.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.exact must not be empty"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.authority.exact` must not be empty"
                 ));
             }
             AuthorityMatcher::Exact(value.clone())
@@ -1677,7 +1679,7 @@ fn compile_authority_matcher(
         AuthorityMatchOp::Tagged(AuthorityStringMatch::Prefix(prefix)) => {
             if prefix.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.prefix must not be \
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.authority.prefix` must not be \
                      empty (every authority would match — likely a misconfiguration)"
                 ));
             }
@@ -1686,12 +1688,12 @@ fn compile_authority_matcher(
         AuthorityMatchOp::Tagged(AuthorityStringMatch::Regex(pattern)) => {
             if pattern.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex must not be empty"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.authority.regex` must not be empty"
                 ));
             }
             let re = compile_full_match_regex(pattern).map_err(|_| {
                 format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid or too complex"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.authority.regex` is invalid or too complex"
                 )
             })?;
             AuthorityMatcher::Regex(re)
@@ -1726,7 +1728,7 @@ fn compile_uri_matcher(
     let Some(uri) = uri else {
         if ignore_uri_case {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].match.ignore_uri_case=true requires a \
+                "`mesh_route_dispatch.rules[{rule_idx}].match.ignore_uri_case` requires a \
                  uri predicate (exact / prefix / regex); without one the flag would have no \
                  effect"
             ));
@@ -1737,7 +1739,7 @@ fn compile_uri_matcher(
         UriMatchOp::Exact(value) => {
             if value.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.exact must not be empty"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.uri.exact` must not be empty"
                 ));
             }
             let value = if ignore_uri_case {
@@ -1753,7 +1755,7 @@ fn compile_uri_matcher(
         UriMatchOp::Prefix(value) => {
             if value.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.prefix must not be empty \
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.uri.prefix` must not be empty \
                      (every path would match — likely a misconfiguration)"
                 ));
             }
@@ -1770,12 +1772,12 @@ fn compile_uri_matcher(
         UriMatchOp::Regex(pattern) => {
             if pattern.is_empty() {
                 return Err(format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.uri.regex` must not be empty"
                 ));
             }
             let re = compile_full_match_regex(pattern).map_err(|_| {
                 format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid or too complex"
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.uri.regex` is invalid or too complex"
                 )
             })?;
             UriMatcher::Regex(re)
@@ -1809,18 +1811,17 @@ fn normalize_header_match_keys(
         let key = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| {
                 format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.headers contains `{}`, \
+                    "`mesh_route_dispatch.rules[{rule_idx}].match.headers` contains {name:?}, \
                      which is not a valid HTTP header name (RFC 9110 token) and can \
-                     therefore never match a request",
-                    crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(&name)
+                     therefore never match a request"
                 )
             })?
             .as_str()
             .to_string();
         if normalized.insert(key.clone(), expected).is_some() {
             return Err(format!(
-                "mesh_route_dispatch.rules[{rule_idx}].match.headers contains duplicate \
-                 header `{key}` after ASCII case normalization"
+                "`mesh_route_dispatch.rules[{rule_idx}].match.headers` contains duplicate \
+                 header {key:?} after ASCII case normalization"
             ));
         }
     }
@@ -1851,7 +1852,7 @@ fn validate_method_token(
 ) -> Result<(), String> {
     if Method::from_bytes(value.as_bytes()).is_err() {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].{operator} must be \
+            "`mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].{operator}` must be \
              a non-empty HTTP method token (RFC 9110 §9.1); a value containing a space or any \
              other non-token character can never match a request method"
         ));
@@ -1889,7 +1890,7 @@ fn compile_method_matchers(
             MethodMatchOp::Tagged(MethodStringMatch::Prefix(prefix)) => {
                 if prefix.is_empty() {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].prefix \
+                        "`mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].prefix` \
                          must not be empty (every method would match — likely a misconfiguration)"
                     ));
                 }
@@ -1899,13 +1900,13 @@ fn compile_method_matchers(
             MethodMatchOp::Tagged(MethodStringMatch::Regex(pattern)) => {
                 if pattern.is_empty() {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
+                        "`mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex` \
                          must not be empty"
                     ));
                 }
                 let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
-                        "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
+                        "`mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex` \
                          is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
@@ -1937,7 +1938,7 @@ fn compile_header_matchers(
             HeaderMatchOp::Tagged(HeaderStringMatch::Prefix(prefix)) => {
                 if prefix.is_empty() {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].prefix \
+                        "`mesh_route_dispatch.rules[{rule_idx}].match.headers` key {name:?} `prefix` \
                          must not be empty (every value would match — likely a misconfiguration)"
                     ));
                 }
@@ -1946,13 +1947,13 @@ fn compile_header_matchers(
             HeaderMatchOp::Tagged(HeaderStringMatch::Regex(pattern)) => {
                 if pattern.is_empty() {
                     return Err(format!(
-                        "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
+                        "`mesh_route_dispatch.rules[{rule_idx}].match.headers` key {name:?} `regex` \
                          must not be empty"
                     ));
                 }
                 let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
-                        "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
+                        "`mesh_route_dispatch.rules[{rule_idx}].match.headers` key {name:?} `regex` \
                          is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
@@ -2715,7 +2716,7 @@ mod tests {
             "rules": [{"match": {}, "destination": {"upstream_id": "x"}}]
         }))
         .unwrap_err();
-        assert!(err.contains("match requires at least one"), "got: {err}");
+        assert!(err.contains("match` requires at least one"), "got: {err}");
     }
 
     #[test]
@@ -2726,7 +2727,7 @@ mod tests {
             "rules": [{"destination": {"upstream_id": "x"}}]
         }))
         .unwrap_err();
-        assert!(err.contains("match requires at least one"), "got: {err}");
+        assert!(err.contains("match` requires at least one"), "got: {err}");
     }
 
     #[test]
@@ -2771,7 +2772,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.contains("cannot set both timeout_ms and timeout_disabled"),
+            err.contains("cannot set both `timeout_ms` and `timeout_disabled`"),
             "got: {err}"
         );
     }
@@ -2823,7 +2824,10 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("backend_host must not be empty"), "got: {err}");
+        assert!(
+            err.contains("backend_host` must not be empty"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -3457,7 +3461,7 @@ mod tests {
             "rules": [{"match": {}, "destination": {"upstream_id": "x"}}]
         }))
         .unwrap_err();
-        assert!(err.contains("match requires at least one"), "got: {err}");
+        assert!(err.contains("match` requires at least one"), "got: {err}");
     }
 
     #[tokio::test]
@@ -3498,8 +3502,14 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("request_transform"), "got: {err}");
-        assert!(err.contains("add/update/remove"), "got: {err}");
+        let expected = concat!(
+            "`mesh_route_dispatch.rules[0].request_transform[0].operation` ",
+            "must be one of `add`/`update`/`remove`"
+        );
+        assert!(err.starts_with(expected), "got: {err}");
+        let rendered = crate::startup::render_startup_error(anyhow::Error::msg(err), &[]);
+        assert!(rendered.starts_with(expected), "got: {rendered}");
+        assert!(!rendered.contains("rename"), "got: {rendered}");
     }
 
     // ── MethodMatchOp (exact / prefix / regex) ────────────────────────────
@@ -5351,7 +5361,7 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            err.contains("at least one of 'delay' or 'abort'"),
+            err.contains("at least one of `delay` or `abort`"),
             "got: {err}"
         );
     }
@@ -5366,7 +5376,7 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("duration_ms must be > 0"), "got: {err}");
+        assert!(err.contains("duration_ms` must be > 0"), "got: {err}");
     }
 
     #[test]
@@ -5379,7 +5389,7 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("duration_ms must be"), "got: {err}");
+        assert!(err.contains("duration_ms` must be"), "got: {err}");
     }
 
     #[test]
@@ -5405,7 +5415,7 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("status_code must be 200-599"), "got: {err}");
+        assert!(err.contains("status_code` must be 200-599"), "got: {err}");
     }
 
     #[test]
@@ -5422,7 +5432,7 @@ mod tests {
             }]
         }))
         .unwrap_err();
-        assert!(err.contains("grpc_status must be 0-16"), "got: {err}");
+        assert!(err.contains("grpc_status` must be 0-16"), "got: {err}");
     }
 
     #[tokio::test]
@@ -6305,7 +6315,7 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            err.contains("port and redirect.derive_port are mutually exclusive"),
+            err.contains("port` and `redirect.derive_port` are mutually exclusive"),
             "got: {err}"
         );
     }
@@ -6350,7 +6360,7 @@ mod tests {
             "rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "x"}, "rewrite": {}}]
         }))
         .unwrap_err();
-        assert!(err.contains("rewrite must set at least one"), "got: {err}");
+        assert!(err.contains("rewrite` must set at least one"), "got: {err}");
     }
 
     #[tokio::test]
@@ -6386,7 +6396,7 @@ mod tests {
             "rules": [{"match": {"methods": ["GET"]}, "redirect": {"uri": "/x", "redirect_code": 404}}]
         }))
         .unwrap_err();
-        assert!(err.contains("redirect_code must be 300-399"), "got: {err}");
+        assert!(err.contains("redirect_code` must be 300-399"), "got: {err}");
     }
 
     #[test]

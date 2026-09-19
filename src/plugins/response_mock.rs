@@ -152,8 +152,8 @@ impl ResponseMock {
     pub fn new(config: &Value) -> Result<Self, String> {
         let config = config.as_object().ok_or_else(|| {
             format!(
-                "response_mock: config must be an object; allowed keys: {}",
-                RESPONSE_MOCK_CONFIG_KEYS.join(", ")
+                "response_mock: config must be an object; allowed keys: `{}`",
+                RESPONSE_MOCK_CONFIG_KEYS.join("`, `")
             )
         })?;
         reject_unknown_keys(config, "config", RESPONSE_MOCK_CONFIG_KEYS)?;
@@ -163,11 +163,11 @@ impl ResponseMock {
 
         let rules_val = match config.get("rules") {
             Some(Value::Array(rules)) => rules,
-            _ => return Err("response_mock: 'rules' must be a JSON array".to_string()),
+            _ => return Err("response_mock: `rules` must be a JSON array".to_string()),
         };
 
         if rules_val.is_empty() {
-            return Err("response_mock: 'rules' array must not be empty".to_string());
+            return Err("response_mock: `rules` array must not be empty".to_string());
         }
 
         let mut rules = Vec::with_capacity(rules_val.len());
@@ -175,7 +175,7 @@ impl ResponseMock {
         for (i, rule_val) in rules_val.iter().enumerate() {
             let rule_obj = rule_val
                 .as_object()
-                .ok_or_else(|| format!("response_mock: rule[{i}] must be an object"))?;
+                .ok_or_else(|| format!("response_mock: `rule[{i}]` must be an object"))?;
             let rule_path = format!("config.rules[{i}]");
             reject_unknown_keys(rule_obj, &rule_path, RESPONSE_MOCK_RULE_KEYS)?;
 
@@ -183,20 +183,20 @@ impl ResponseMock {
                 Some(Value::String(method)) if !method.is_empty() => {
                     Method::from_bytes(method.as_bytes()).map_err(|_| {
                         format!(
-                            "response_mock: rule[{i}] 'method' must be a valid HTTP method token"
+                            "response_mock: `rule[{i}]` `method` must be a valid HTTP method token"
                         )
                     })?;
                     Some(method.to_ascii_uppercase())
                 }
                 Some(Value::String(_)) => {
                     return Err(format!(
-                        "response_mock: rule[{i}] 'method' must not be empty"
+                        "response_mock: `rule[{i}]` `method` must not be empty"
                     ));
                 }
                 Some(Value::Null) | None => None,
                 Some(_) => {
                     return Err(format!(
-                        "response_mock: rule[{i}] 'method' must be a string"
+                        "response_mock: `rule[{i}]` `method` must be a string"
                     ));
                 }
             };
@@ -204,21 +204,23 @@ impl ResponseMock {
             let path_str = rule_obj
                 .get("path")
                 .and_then(Value::as_str)
-                .ok_or_else(|| format!("response_mock: rule[{i}] missing 'path'"))?;
+                .ok_or_else(|| format!("response_mock: `rule[{i}]` missing `path`"))?;
             if path_str.is_empty() {
-                return Err(format!("response_mock: rule[{i}] 'path' must not be empty"));
+                return Err(format!(
+                    "response_mock: `rule[{i}]` `path` must not be empty"
+                ));
             }
 
             let path = if let Some(pattern) = path_str.strip_prefix('~') {
                 if pattern.is_empty() {
                     return Err(format!(
-                        "response_mock: rule[{i}] regex path must not be empty"
+                        "response_mock: `rule[{i}]` regex path must not be empty"
                     ));
                 }
                 let anchored = crate::config::types::anchor_regex_pattern(pattern);
                 let re = Regex::new(&anchored).map_err(|_| {
                     format!(
-                        "response_mock: rule[{i}].path: invalid regex or complexity limit exceeded"
+                        "response_mock: `rule[{i}].path`: invalid regex or complexity limit exceeded"
                     )
                 })?;
                 PathMatcher::Regex(re)
@@ -233,20 +235,22 @@ impl ResponseMock {
                 Some(Value::Object(obj)) => {
                     for (k, v) in obj {
                         HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
-                            format!("response_mock: rule[{i}] header '{k}' is not a valid name")
+                            format!("response_mock: `rule[{i}]` header {k:?} is not a valid name")
                         })?;
                         let s = v.as_str().ok_or_else(|| {
-                            format!("response_mock: rule[{i}] header '{k}' value must be a string")
+                            format!(
+                                "response_mock: `rule[{i}]` header {k:?} value must be a string"
+                            )
                         })?;
                         HeaderValue::from_str(s).map_err(|_| {
-                            format!("response_mock: rule[{i}] header '{k}' value is invalid")
+                            format!("response_mock: `rule[{i}]` header {k:?} value is invalid")
                         })?;
                         let lower = k.to_ascii_lowercase();
                         if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
                             &lower,
                         ) {
                             return Err(format!(
-                                "response_mock: rule[{i}] header '{k}' is protocol-managed \
+                                "response_mock: `rule[{i}]` header {k:?} is protocol-managed \
                                  (hop-by-hop or framing) and cannot be configured; the gateway \
                                  derives Content-Length from the mock body/status/method and \
                                  strips Connection/Transfer-Encoding/Trailer/Upgrade at the \
@@ -259,7 +263,7 @@ impl ResponseMock {
                 Some(Value::Null) | None => {}
                 Some(_) => {
                     return Err(format!(
-                        "response_mock: rule[{i}] 'headers' must be an object"
+                        "response_mock: `rule[{i}]` `headers` must be an object"
                     ));
                 }
             }
@@ -271,14 +275,16 @@ impl ResponseMock {
                 Some(Value::String(body)) => body.clone(),
                 Some(Value::Null) | None => String::new(),
                 Some(_) => {
-                    return Err(format!("response_mock: rule[{i}] 'body' must be a string"));
+                    return Err(format!(
+                        "response_mock: `rule[{i}]` `body` must be a string"
+                    ));
                 }
             };
 
             let delay_ms = optional_u64(rule_obj, "delay_ms", i)?.unwrap_or(0);
             if delay_ms > MAX_DELAY_MS {
                 return Err(format!(
-                    "response_mock: rule[{i}] `delay_ms` must be <= {MAX_DELAY_MS}, got \"{delay_ms}\""
+                    "response_mock: `rule[{i}]` `delay_ms` must be <= {MAX_DELAY_MS}, got \"{delay_ms}\""
                 ));
             }
 
@@ -327,9 +333,9 @@ fn reject_unknown_keys(
     }
     unknown.sort_unstable();
     Err(format!(
-        "response_mock: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        "response_mock: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
         unknown.join(", "),
-        allowed.join(", ")
+        allowed.join("`, `")
     ))
 }
 
@@ -337,7 +343,7 @@ fn optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<bool>,
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(format!("response_mock: '{key}' must be a boolean")),
+        Some(_) => Err(format!("response_mock: `{key}` must be a boolean")),
     }
 }
 
@@ -348,11 +354,11 @@ fn optional_u64(
 ) -> Result<Option<u64>, String> {
     match config.get(key) {
         Some(Value::Number(value)) => value.as_u64().map(Some).ok_or_else(|| {
-            format!("response_mock: rule[{rule_idx}] '{key}' must be an unsigned integer")
+            format!("response_mock: `rule[{rule_idx}]` `{key}` must be an unsigned integer")
         }),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(format!(
-            "response_mock: rule[{rule_idx}] '{key}' must be an unsigned integer"
+            "response_mock: `rule[{rule_idx}]` `{key}` must be an unsigned integer"
         )),
     }
 }
@@ -364,7 +370,7 @@ fn optional_status_code(rule_val: &Map<String, Value>, rule_idx: usize) -> Resul
 
     if !(100..=599).contains(&raw) {
         return Err(format!(
-            "response_mock: rule[{rule_idx}] 'status_code' must be in range 100-599"
+            "response_mock: `rule[{rule_idx}]` `status_code` must be in range 100-599"
         ));
     }
 
@@ -376,7 +382,7 @@ fn optional_status_code(rule_val: &Map<String, Value>, rule_idx: usize) -> Resul
     // stream).
     if (100..200).contains(&status) && status != 101 {
         return Err(format!(
-            "response_mock: rule[{rule_idx}] 'status_code' {status} is an unsupported \
+            "response_mock: `rule[{rule_idx}]` `status_code` \"{status}\" is an unsupported \
              informational status; use a final status (200–599), or 101 only for a \
              synthetic WebSocket handshake response"
         ));

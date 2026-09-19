@@ -87,6 +87,12 @@ paths:
   constructor warnings sanitize the selected level as a scalar. TCP/WebSocket
   CA wrappers retain shared TLS failure classes and record ordinals with fixed
   plugin/CA-field context; supplied source paths remain withheld when rendered.
+  TCP/WebSocket source-load failures retain `MaterialError::failure_class`.
+  DTLS materialization retains source classes, PEM/CA record ordinals and typed
+  key-mismatch/unsupported-key reasons without retaining opaque crypto errors.
+  Stdout filter decode failures retain nested fixed expression paths, missing
+  fields and expected integer bounds; the diagnostic walk runs only after the
+  original serde rejection and must never change expression admission.
 - The #5594 AI conversion covers prompt/response/PII filters, provider routing,
   semantic caching, token limits, tool governance and transcript audit admission.
   Provider/custom-pattern ordinals and fixed tool-pattern paths survive rendering;
@@ -103,6 +109,39 @@ paths:
   withheld. Structural serde errors use the private schema allowlist and retain
   admission parity. Registered constructor/rendered-output regressions and
   existing projection/billing behavior assertions cover these diagnostics.
+- The #5594 traffic/transform conversion covers request/response/body/header
+  transforms, rate and size limits, routing/redirect/cache/dedup/mirror helpers,
+  GraphQL, gRPC-Web, SSE and WebSocket/UDP admission. Fixed rule ordinals and
+  schema paths survive rendered failures; configured routes, method/operation
+  names, keys, regexes and numeric operands remain withheld. Existing typed
+  rejection, constructor/rendered-output and last-good reload assertions retain
+  admission and retention coverage.
+  Serverless null-field failures resolve recognized keys to schema-authored
+  allowlist entries before backtick rendering; unknown keys remain withheld.
+  Every CORS string-origin failure retains its `allowed_origins[index]` context,
+  including empty, whitespace, length, wildcard and exact-origin rejection.
+  Request-termination path-prefix guidance preserves the fixed `?` and `#`
+  delimiters through the startup renderer.
+- The #5594 mesh plugin conversion covers authorization/baggage trust, route
+  dispatch, BPF/workload metrics, telemetry tag expressions and effective metric
+  plans. Fixed rule, assertor and effective baggage-gate ordinals remain visible;
+  supplied identities, label/header keys, expressions and numeric values are
+  withheld. Registered constructor/rendered-output regressions retain the
+  existing admission and composed-plan budget checks.
+  Successful mesh-wide assertor and audit-selector warnings sanitize identity
+  scalars at emission and retain assertor/policy/effective-gate ordinals.
+  Typed mesh adapters use `plugins::mesh::diagnostics` to retain trusted schema
+  prefixes and sequence indexes. Document map/unknown keys are withheld even
+  when they spell a real schema field. Extend the scoped path table when adding
+  typed fields; never infer trust from a global field-name allowlist. The shared
+  document deserializer is unchanged by this scoped adapter.
+  Workload exporters retain safe option bounds and provider endpoint ordinals;
+  CEL failures retain fixed coercion, length, nesting and syntax remedies.
+- The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
+  configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
+  visible while supplied service/tool names, paths, tokens and parser payloads
+  are withheld. Registered real-constructor rendered regressions preserve the
+  existing admission decisions and protocol behavior assertions.
 - The #5594 security conversion covers authentication/authorization, IP/GeoIP,
   JWT/JWKS, LDAP, mTLS, HMAC, SOAP security, body/OpenAPI validation and bot
   admission. Fixed schema paths and credential/operation ordinals survive

@@ -153,6 +153,113 @@ fn a2a_gateway_rejects_unknown_root_key() {
     assert!(error.contains("not_a_real_a2a_key"), "{error}");
 }
 
+#[test]
+fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
+    let hostile = "'A2A_UNREGISTERED_SECRET\"\\\n`field`";
+    let cases = [
+        (json!({"mode": hostile}), "`mode`", "`transparent_proxy`"),
+        (
+            json!({"detection": {"bindings": [hostile]}}),
+            "`detection.bindings`",
+            "`jsonrpc`, `rest`, or `grpc`",
+        ),
+        (
+            json!({"detection": {"version_header": hostile}}),
+            "`detection.version_header`",
+            "valid HTTP header name",
+        ),
+        (
+            json!({"endpoint": {"grpc_services": [hostile]}}),
+            "`endpoint.grpc_services`",
+            "valid gRPC service names",
+        ),
+        (
+            json!({"endpoint": {"grpc_services": [{
+                "service": "acme.v1.Agents", "card_schema": hostile
+            }]}}),
+            "`endpoint.grpc_services[].card_schema`",
+            "`a2a-0.3`, `a2a-1.0`, or `none`",
+        ),
+        (
+            json!({"policy": {"methods": {(hostile): {"action": "allow"}}}}),
+            "`policy.methods`",
+            "unsupported policy method name",
+        ),
+        (
+            json!({"policy": {"methods": {"message/send": {"action": hostile}}}}),
+            "`policy.methods.*.action`",
+            "`allow` or `deny`",
+        ),
+        (
+            json!({"discovery": {"public_base_url": hostile}}),
+            "`discovery.public_base_url`",
+            "must be a valid URL",
+        ),
+        (
+            json!({"enabled": { (hostile): 987654321 }}),
+            "`enabled`",
+            "must be a boolean",
+        ),
+        (json!({"mode": true}), "`mode`", "must be a string"),
+        (
+            json!({"enabled": 987654321}),
+            "`enabled`",
+            "must be a boolean",
+        ),
+        (
+            json!({"endpoint": {"protocol_versions": ["0.3.0", true]}}),
+            "`protocol_versions[1]`",
+            "must be a string",
+        ),
+        (
+            json!({"endpoint": {"grpc_services": [987654321]}}),
+            "`endpoint.grpc_services`",
+            "service name string",
+        ),
+    ];
+    for (config, field, reason) in cases {
+        let error = create_plugin("a2a_gateway", &config)
+            .err()
+            .expect("invalid configuration must be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for supplied in ["A2A_UNREGISTERED_SECRET", "987654321", "true"] {
+            assert!(!rendered.contains(supplied), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn unknown_key_diagnostics_keep_independent_schema_context() {
+    for (config, field) in [
+        (
+            json!({"endpoint": {"A2A_UNKNOWN_KEY": true}}),
+            "`config.endpoint`",
+        ),
+        (
+            json!({"endpoint": {"grpc_services": [{"A2A_UNKNOWN_KEY": true}]}}),
+            "`config.endpoint.grpc_services[]`",
+        ),
+        (
+            json!({"policy": {"methods": {"message/send": {"A2A_UNKNOWN_KEY": true}}}}),
+            "`config.policy.methods.*`",
+        ),
+    ] {
+        let error = create_plugin("a2a_gateway", &config)
+            .err()
+            .expect("unknown configuration keys must be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(
+            rendered.contains("unknown configuration key(s)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("A2A_UNKNOWN_KEY"), "{rendered}");
+        assert!(!rendered.contains("message/send"), "{rendered}");
+    }
+}
+
 #[tokio::test]
 async fn jsonrpc_request_emits_metadata_and_strips_accept_encoding() {
     let plugin = plugin(json!({}));
@@ -2491,7 +2598,7 @@ fn grpc_service_card_schema_declarations_are_validated() {
             json!([{"service": "acme.v1.Agents", "card_schema": "a2a-2.0"}]),
             "card_schema",
         ),
-        (json!([{"card_schema": "a2a-0.3"}]), "require 'service'"),
+        (json!([{"card_schema": "a2a-0.3"}]), "require `service`"),
         (json!([42]), "service name string"),
     ];
     for (services, expected) in rejected {
@@ -4061,7 +4168,7 @@ fn invalid_a2a_gateway_configs_are_rejected() {
         ),
         (
             json!({"endpoint": {"grpc_services": ["a2a.v1.A2AService", "a2a.v1.A2AService"]}}),
-            "duplicate endpoint.grpc_services",
+            "duplicate `endpoint.grpc_services`",
             "duplicate gRPC services should reject",
         ),
         (
@@ -4076,17 +4183,17 @@ fn invalid_a2a_gateway_configs_are_rejected() {
         ),
         (
             json!({"discovery": {"public_base_url": "ftp://agents.example.com"}}),
-            "discovery.public_base_url scheme",
+            "`discovery.public_base_url` scheme",
             "public base scheme must be HTTP-family",
         ),
         (
             json!({"discovery": {"public_base_url": "https://agents.example.com?a=b"}}),
-            "discovery.public_base_url must not contain query",
+            "`discovery.public_base_url` must not contain query",
             "public base cannot carry query",
         ),
         (
             json!({"discovery": {"public_base_url": "https://user:pass@agents.example.com"}}),
-            "discovery.public_base_url must not contain credentials",
+            "`discovery.public_base_url` must not contain credentials",
             "public base cannot carry credentials",
         ),
         (

@@ -182,7 +182,7 @@ fn test_trigger_rejects_ambiguous_fields() {
     }))
     .err()
     .expect("header_value without header should be rejected");
-    assert!(err.contains("requires 'trigger.header'"), "got: {err}");
+    assert!(err.contains("requires `trigger.header`"), "got: {err}");
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn test_trigger_rejects_path_prefix_without_leading_slash() {
     .expect("path_prefix without a leading slash should be rejected");
 
     assert!(err.contains("path_prefix"), "got: {err}");
-    assert!(err.contains("start with '/'"), "got: {err}");
+    assert!(err.contains("start with `/`"), "got: {err}");
 }
 
 #[test]
@@ -1131,4 +1131,56 @@ async fn test_native_grpc_maps_to_trailers_only_error() {
     assert_eq!(normalized.http_status, StatusCode::OK);
     assert!(normalized.body.is_empty());
     assert_eq!(normalized.grpc_status, Some(13));
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"trigger": {token: true}}),
+            "`trigger`",
+            "unknown config key",
+        ),
+        (
+            json!({"status_code": 918273641}),
+            "`status_code`",
+            "final response from 200 to 599",
+        ),
+        (
+            json!({"status_code": 205, "body": token}),
+            "`status_code`",
+            "cannot carry a response body",
+        ),
+        (
+            json!({"trigger": {"path_prefix": true}}),
+            "`trigger.path_prefix`",
+            "must be a string",
+        ),
+        (
+            json!({"trigger": {"path_prefix": "/UNREGISTERED_TRAFFIC_TOKEN?query"}}),
+            "`trigger.path_prefix`",
+            "query delimiter (`?`)",
+        ),
+        (
+            json!({"trigger": {"path_prefix": "/UNREGISTERED_TRAFFIC_TOKEN#fragment"}}),
+            "`trigger.path_prefix`",
+            "fragment delimiter (`#`)",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("request_termination", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in [
+            "UNREGISTERED_TRAFFIC_TOKEN",
+            "918273641",
+            "205",
+            "true",
+            "false",
+        ] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

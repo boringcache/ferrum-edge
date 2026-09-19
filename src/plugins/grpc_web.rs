@@ -954,7 +954,12 @@ impl GrpcWebPlugin {
         let object = config
             .as_object()
             .ok_or_else(|| "grpc_web: config must be an object".to_string())?;
-        reject_unknown_keys(object, "config", GRPC_WEB_CONFIG_KEYS, "grpc_web: ")?;
+        reject_unknown_keys(
+            object,
+            "config",
+            GRPC_WEB_CONFIG_KEYS,
+            "grpc_web: `config`: ",
+        )?;
 
         let mut expose_headers = BASE_EXPOSE_HEADERS
             .iter()
@@ -1237,11 +1242,11 @@ fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
         let header = header.trim_matches(|ch| ch == ' ' || ch == '\t');
         if header.is_empty() {
             return Err(format!(
-                "grpc_web: 'expose_headers[{idx}]' must not be empty"
+                "grpc_web: `expose_headers[{idx}]` must not be empty"
             ));
         }
         let header_name = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
-            format!("grpc_web: 'expose_headers[{idx}]' is not a valid HTTP header name")
+            format!("grpc_web: `expose_headers[{idx}]` is not a valid HTTP header name")
         })?;
         let normalized = header_name.as_str().to_string();
         if seen.insert(normalized.clone()) {

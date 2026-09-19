@@ -100,7 +100,13 @@ impl StdoutLogging {
                             "stdout_logging.filter.expression",
                         )?;
                         let expression = serde_json::from_value(value.clone()).map_err(|_| {
-                            "stdout_logging: `filter.expression` is invalid: invalid expression shape or scalar type".to_string()
+                            // Internally tagged serde enums can lose the nested
+                            // path. Diagnose only AFTER the original rejection;
+                            // this walk never admits or rejects a configuration.
+                            expression_decode_diagnostic(value, "filter.expression")
+                                .unwrap_or_else(|| {
+                                    "stdout_logging: `filter.expression` is invalid: invalid expression structure".to_string()
+                                })
                         })?;
                         validate_access_log_filter_expr(&expression).map_err(|err| {
                             format!("stdout_logging: `filter.expression` is invalid: {err}")
@@ -310,6 +316,62 @@ fn reject_unknown_errors_only_fields(value: &Value, path: &str) -> Result<(), St
         }
         _ => Ok(()),
     }
+}
+
+fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
+    let failure =
+        |field: &str, reason: &str| Some(format!("stdout_logging: `{field}` is invalid: {reason}"));
+    let Some(object) = value.as_object() else {
+        return failure(path, "expected an expression object");
+    };
+    let Some(operation) = object.get("op") else {
+        return failure(path, "missing field `op`");
+    };
+    let Some(operation) = operation.as_str() else {
+        return failure(&format!("{path}.op"), "expected a string operation");
+    };
+    let fields: &[&str] = match operation {
+        "and" | "or" => {
+            for field in ["left", "right"] {
+                let Some(child) = object.get(field) else {
+                    return failure(path, &format!("missing field `{field}`"));
+                };
+                if let Some(error) = expression_decode_diagnostic(child, &format!("{path}.{field}"))
+                {
+                    return Some(error);
+                }
+            }
+            &["op", "left", "right"]
+        }
+        "status_code_min" | "status_code_max" | "min_latency_ms" => {
+            let Some(value) = object.get("value") else {
+                return failure(path, "missing field `value`");
+            };
+            let max = if operation == "min_latency_ms" {
+                u64::MAX
+            } else {
+                u64::from(u16::MAX)
+            };
+            if value.as_u64().is_none_or(|value| value > max) {
+                return failure(
+                    &format!("{path}.value"),
+                    &format!("expected an unsigned integer between 0 and {max}"),
+                );
+            }
+            &["op", "value"]
+        }
+        "errors_only" => &["op"],
+        _ => {
+            return failure(
+                &format!("{path}.op"),
+                "unknown operation; expected `and`, `or`, `status_code_min`, `status_code_max`, `min_latency_ms` or `errors_only`",
+            );
+        }
+    };
+    if object.keys().any(|key| !fields.contains(&key.as_str())) {
+        return failure(path, "unknown field");
+    }
+    None
 }
 
 fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u16>, String> {
@@ -591,7 +653,7 @@ mod tests {
                         }
                     }
                 }),
-                "`filter.expression` is invalid: invalid expression shape or scalar type",
+                "`filter.expression.left` is invalid: unknown field",
             ),
         ] {
             let err = match StdoutLogging::new(&config) {

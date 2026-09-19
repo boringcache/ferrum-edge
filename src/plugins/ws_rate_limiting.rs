@@ -121,7 +121,7 @@ impl WsRateLimiting {
             object,
             "config",
             WS_RATE_LIMITING_CONFIG_KEYS,
-            "ws_rate_limiting: ",
+            "ws_rate_limiting: `config`: ",
         )?;
 
         let frames_per_second = optional_positive_u64(config, "frames_per_second")?.unwrap_or(100);
@@ -140,7 +140,7 @@ impl WsRateLimiting {
         if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
             tracing::debug!(
                 max_bytes = Self::MAX_CLOSE_REASON_BYTES,
-                "ws_rate_limiting: 'close_reason' exceeds WebSocket control-frame limit — truncating"
+                "ws_rate_limiting: `close_reason` exceeds WebSocket control-frame limit — truncating"
             );
             close_reason.truncate(Self::truncate_utf8_boundary(
                 &close_reason,
@@ -170,7 +170,8 @@ impl WsRateLimiting {
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second as f64, burst_size as f64),
                 &semantics,
-            )?,
+            )
+            .map_err(|error| format!("ws_rate_limiting: {error}"))?,
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
@@ -413,12 +414,12 @@ fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u
     };
     let Some(value) = value.as_u64() else {
         return Err(format!(
-            "ws_rate_limiting: '{field}' must be an integer greater than zero"
+            "ws_rate_limiting: `{field}` must be an integer greater than zero"
         ));
     };
     if value == 0 {
         return Err(format!(
-            "ws_rate_limiting: '{field}' must be greater than zero"
+            "ws_rate_limiting: `{field}` must be greater than zero"
         ));
     }
     Ok(Some(value))
@@ -431,7 +432,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
     value
         .as_str()
         .map(Some)
-        .ok_or_else(|| format!("ws_rate_limiting: '{field}' must be a string"))
+        .ok_or_else(|| format!("ws_rate_limiting: `{field}` must be a string"))
 }
 
 #[async_trait]

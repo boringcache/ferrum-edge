@@ -7393,3 +7393,34 @@ async fn a_committed_gateway_coding_keeps_its_body_on_the_buffered_path() {
         "and must not release it either"
     );
 }
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"algorithms": [token]}),
+            "`algorithms[0]`",
+            "unknown algorithm",
+        ),
+        (
+            json!({"content_types": [token]}),
+            "`content_types[0]`",
+            "media type",
+        ),
+        (
+            json!({"gzip_level": 918273641}),
+            "`gzip_level`",
+            "between 0 and 9",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("compression", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
+}

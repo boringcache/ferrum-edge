@@ -1025,3 +1025,108 @@ async fn multiple_stream_instances_preserve_surviving_destination_port_need() {
         .expect("TCP opened metric");
     assert!(opened.contains(r#"destination_service="9080""#), "{opened}");
 }
+
+#[test]
+fn rendered_metric_tag_diagnostics_withhold_names_operations_and_cel_payloads() {
+    let hostile = "'MESH_DIAG_SECRET\"\\`";
+    let cases = [
+        (
+            json!({"name": hostile, "operation": {"type": "rename", "new_name": hostile}}),
+            "`metrics.tag_overrides[0].name`",
+            "unsupported metric tag",
+        ),
+        (
+            json!({"name": "source_workload", "operation": {"type": "rename", "new_name": hostile}}),
+            "`metrics.tag_overrides[0].operation.new_name`",
+            "unsupported renamed metric tag",
+        ),
+        (
+            json!({"name": hostile, "operation": {"type": hostile}}),
+            "`metrics.tag_overrides[0].operation`",
+            "unsupported operation `type`",
+        ),
+        (
+            json!({"name": hostile, "operation": {"type": "set_expr", "cel": hostile}}),
+            "`metrics.tag_overrides[0].operation`",
+            "CEL string literal",
+        ),
+        (
+            json!({"name": hostile, "operation": {"type": "set_expr", "expression": {"kind": hostile}}}),
+            "`metrics.tag_overrides[0].operation`",
+            "invalid compiled CEL `expression`",
+        ),
+        (
+            json!({"name": "source_workload", "metric": hostile, "operation": {"type": "remove"}}),
+            "`metrics.tag_overrides[0].metric`",
+            "unsupported metric",
+        ),
+        (
+            json!({"name": hostile, "operation": {"type": 8675309}}),
+            "`metrics.tag_overrides[0].operation`",
+            "operation `type` is required",
+        ),
+        (
+            json!({"name": "source_workload", "metric": true, "operation": {"type": "remove"}}),
+            "`metrics.tag_overrides[0].metric`",
+            "must be a string",
+        ),
+    ];
+    for (entry, field, reason) in cases {
+        let error = WorkloadMetrics::new(&json!({"metrics": {"tag_overrides": [entry]}}))
+            .err()
+            .expect("invalid metric override must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in [field, reason] {
+            assert!(
+                rendered.contains(fragment),
+                "missing {fragment:?}: {rendered}"
+            );
+        }
+        for fragment in ["MESH_DIAG_SECRET", "8675309", "true"] {
+            assert!(
+                !rendered.contains(fragment),
+                "disclosed {fragment:?}: {rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cel_diagnostics_keep_coercion_length_and_complexity_remedies() {
+    let integer = json!({"op": "attribute", "name": "destination_port"});
+    let mut nested = json!({"op": "literal", "value": "CEL_VALUE_MARKER_5594"});
+    for _ in 0..20 {
+        nested = json!({
+            "op": "has_then_else", "attribute": "request_host",
+            "then_expr": nested, "else_expr": {"op": "literal", "value": "fallback"}
+        });
+    }
+    for (operation, reason) in [
+        (
+            json!({"type": "set_expr", "expression": integer}),
+            "require `string()`",
+        ),
+        (
+            json!({"type": "set_expr", "cel": "CEL_VALUE_MARKER_5594".repeat(30)}),
+            "maximum length of 512 bytes",
+        ),
+        (
+            json!({"type": "set_expr", "expression": nested}),
+            "maximum nesting depth",
+        ),
+    ] {
+        let error = WorkloadMetrics::new(&json!({"metrics": {"tag_overrides": [
+            {"name": "source_workload", "metric": "REQUEST_COUNT", "operation": {"type": "remove"}},
+            {"name": "destination_service", "metric": "REQUEST_COUNT", "operation": operation}
+        ]}}))
+        .err()
+        .expect("invalid CEL operation must still reject");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in ["metrics.tag_overrides[1].operation", reason] {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        for hidden in ["destination_service", "CEL_VALUE_MARKER_5594", "fallback"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}

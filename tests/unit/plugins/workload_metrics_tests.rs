@@ -536,3 +536,67 @@ fn standalone_documented_configuration_is_admitted() {
     let validator = jsonschema::draft202012::options().build(&schema).unwrap();
     assert!(validator.is_valid(&config.plugin_configs[0].config));
 }
+
+#[test]
+fn unknown_effective_baggage_gate_keeps_index_and_withholds_supplied_key() {
+    let unknown = "'MESH_GATE_KEY_MARKER`\"\\\n";
+    let config = json!({
+        "_effective_mesh_authz_baggage_gates": [{}, {unknown: "MESH_GATE_VALUE_MARKER"}]
+    });
+    let error = WorkloadMetrics::new(&config)
+        .err()
+        .expect("the unknown gate key must still be rejected");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+    for expected in [
+        "workload_metrics",
+        "`_effective_mesh_authz_baggage_gates[1]`",
+        "unknown configuration key(s)",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?}: {rendered}"
+        );
+    }
+    for withheld in ["MESH_GATE_KEY_MARKER", "MESH_GATE_VALUE_MARKER"] {
+        assert!(
+            !rendered.contains(withheld),
+            "leaked {withheld}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn exporter_diagnostics_keep_batch_bounds_and_later_provider_endpoint() {
+    let provider = json!({
+        "kind": "zipkin", "config": {"url": "https://collector-marker-5594.example/spans"}
+    });
+    let cases = [
+        (
+            json!({"tracing_provider": provider, "batch_size": 0}),
+            vec!["workload_metrics", "`batch_size`", "must be between 1 and"],
+        ),
+        (
+            json!({"tracing_providers": [provider, {
+                "kind": "datadog", "config": {"agent_url": "https:///endpoint-marker-5594"}
+            }]}),
+            vec![
+                "workload_metrics",
+                "`tracing_providers[1].config`",
+                "`agent_url`",
+                "must include a hostname",
+            ],
+        ),
+    ];
+    for (config, expected) in cases {
+        let error = WorkloadMetrics::new(&config)
+            .err()
+            .expect("invalid exporter config");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
+        for fragment in expected {
+            assert!(rendered.contains(fragment), "{rendered}");
+        }
+        for hidden in ["collector-marker-5594", "endpoint-marker-5594", "got: 0"] {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}

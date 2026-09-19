@@ -229,6 +229,16 @@ Where to look, and what to expect, when the mesh data plane misbehaves. All slic
 
 ## Observability and Troubleshooting Quick Reference
 
+Plugin configuration diagnostics retain fixed fields and zero-based list
+positions while withholding supplied identities, values and document map keys.
+For example, a malformed label value identifies `mesh_slice` and
+`labels[<redacted key>]`; a rejected exporter identifies the batch option or
+provider position and endpoint field. Metric-tag CEL errors distinguish the
+512-byte expression limit, nesting/complexity limits and integer attributes
+that require `string()`. Successful constructors still warn about `mesh_wide`
+assertor grants and unenforced selector policies, using sanitized identities
+and separate assertor, policy and effective baggage-gate indexes.
+
 ### Admin introspection endpoints (JWT-authenticated; status codes are per-endpoint)
 
 Every row below requires a valid admin JWT. Wrong-mode and boot-time responses are **not** a blanket `404` outside mesh mode — several surfaces return `200` with an empty body before convergence, `503` when `proxy_state` is unwired (typical `cp` mode), or `404` only on CP-only routes. Operators rely on the split between **`404` = wrong mode or endpoint not applicable** and **`200` with null/empty fields = mesh mode, not converged yet** (for example `GET /mesh/config-drift` with `last_received_at: null` vs `GET /mesh/federation` returning `404` until the first federation poll succeeds).

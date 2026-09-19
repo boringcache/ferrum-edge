@@ -343,6 +343,11 @@ fn test_explicit_null_diagnostics_distinguish_required_and_optional_fields() {
                 "optional field received required guidance: field={field}, got: {err}"
             );
         }
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(err), &[]);
+        assert!(
+            rendered.contains(&format!("`{field}`")),
+            "field={field}, got: {rendered}"
+        );
     }
 }
 
@@ -460,7 +465,7 @@ fn test_unknown_provider_rejects() {
         }),
         default_client(),
     ));
-    assert!(err.contains("unknown provider"));
+    assert!(err.contains("unknown `provider`"));
 }
 
 #[test]
@@ -497,7 +502,7 @@ fn test_aws_rejects_invalid_ignored_function_url() {
         }),
         default_client(),
     ));
-    assert!(err.contains("invalid function_url"), "got: {err}");
+    assert!(err.contains("invalid `function_url`"), "got: {err}");
 }
 
 #[test]
@@ -574,7 +579,7 @@ fn test_invalid_url_rejects() {
         }),
         default_client(),
     ));
-    assert!(err.contains("invalid function_url"));
+    assert!(err.contains("invalid `function_url`"));
 }
 
 #[test]
@@ -709,7 +714,7 @@ fn test_unknown_mode_rejects() {
         }),
         default_client(),
     ));
-    assert!(err.contains("unknown mode"), "got: {}", err);
+    assert!(err.contains("unknown `mode`"), "got: {}", err);
 }
 
 #[test]
@@ -784,7 +789,7 @@ fn test_non_string_mode_rejects() {
         }),
         default_client(),
     ));
-    assert!(err.contains("'mode' must be a string"), "got: {}", err);
+    assert!(err.contains("`mode` must be a string"), "got: {}", err);
 }
 
 #[test]
@@ -799,7 +804,7 @@ fn test_non_bool_forward_body_rejects() {
         default_client(),
     ));
     assert!(
-        err.contains("'forward_body' must be a boolean"),
+        err.contains("`forward_body` must be a boolean"),
         "got: {}",
         err
     );
@@ -817,7 +822,7 @@ fn test_non_bool_forward_query_params_rejects() {
         default_client(),
     ));
     assert!(
-        err.contains("'forward_query_params' must be a boolean"),
+        err.contains("`forward_query_params` must be a boolean"),
         "got: {}",
         err
     );
@@ -849,7 +854,7 @@ fn test_non_array_forward_headers_rejects() {
         default_client(),
     ));
     assert!(
-        err.contains("'forward_headers' must be an array"),
+        err.contains("`forward_headers` must be an array"),
         "got: {}",
         err
     );
@@ -867,7 +872,7 @@ fn test_non_integer_timeout_rejects() {
         default_client(),
     ));
     assert!(
-        err.contains("'timeout_ms' must be an unsigned integer"),
+        err.contains("`timeout_ms` must be an unsigned integer"),
         "got: {}",
         err
     );
@@ -884,7 +889,7 @@ fn test_non_string_on_error_rejects() {
         }),
         default_client(),
     ));
-    assert!(err.contains("'on_error' must be a string"), "got: {}", err);
+    assert!(err.contains("`on_error` must be a string"), "got: {}", err);
 }
 
 // ---------------------------------------------------------------------------
@@ -6183,7 +6188,7 @@ fn test_inactive_provider_fields_still_reject_wrong_json_types() {
         config[field] = json!(123);
         let err = expect_err(ServerlessFunction::new(&config, default_client()));
         assert!(
-            err.contains(&format!("'{field}' must be a string")),
+            err.contains(&format!("`{field}` must be a string")),
             "provider={provider} field={field}, got: {err}"
         );
     }
@@ -6313,7 +6318,7 @@ fn test_shape_only_admission_defers_node_local_aws_credentials() {
 
     let err = expect_err(ServerlessFunction::new(&config, default_client()));
     assert!(
-        err.contains("'aws_access_key_id' is required for aws_lambda"),
+        err.contains("`aws_access_key_id` is required for aws_lambda"),
         "runtime construction must still fail closed, got: {err}"
     );
 }
@@ -6326,25 +6331,25 @@ fn test_shape_only_admission_still_rejects_supplied_field_errors() {
     for (config, fragment) in [
         (
             json!({"provider": "aws_lambda", "aws_region": 123}),
-            "'aws_region' must be a string",
+            "`aws_region` must be a string",
         ),
         (
             json!({"provider": "aws_lambda", "aws_function_name": "bad name"}),
-            "'aws_function_name' is not a valid Lambda function name",
+            "`aws_function_name` is not a valid Lambda function name",
         ),
         (
             json!({"provider": "aws_lambda", "aws_endpoint_url": "tcp://localhost:4566"}),
-            "aws_endpoint_url must use http:// or https://",
+            "`aws_endpoint_url` must use http:// or https://",
         ),
         (
             json!({"provider": "aws_lambda", "mode": "terminat"}),
-            "unknown mode",
+            "unknown `mode`",
         ),
         (
             json!({"provider": "azure_functions"}),
-            "'function_url' is required for azure_functions",
+            "`function_url` is required for azure_functions",
         ),
-        (json!({"provider": "nope"}), "unknown provider"),
+        (json!({"provider": "nope"}), "unknown `provider`"),
     ] {
         let err = ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
             .expect_err("shape-only admission must still reject supplied-field errors");
@@ -6444,12 +6449,12 @@ fn test_over_length_lambda_identifiers_are_rejected() {
         (
             "aws_function_name",
             long_name.as_str(),
-            "'aws_function_name' must be at most 170 characters",
+            "`aws_function_name` must be at most 170 characters",
         ),
         (
             "aws_qualifier",
             long_qualifier.as_str(),
-            "'aws_qualifier' must be at most 128 characters",
+            "`aws_qualifier` must be at most 128 characters",
         ),
     ] {
         let mut config = json!({
@@ -6522,7 +6527,7 @@ fn test_unrepresentable_credential_headers_fail_admission() {
         config[field] = json!(value);
         let err = expect_err(ServerlessFunction::new(&config, default_client()));
         assert!(
-            err.contains(&format!("'{field}' is not a valid HTTP header value")),
+            err.contains(&format!("`{field}` is not a valid HTTP header value")),
             "provider={provider} field={field}: {err}"
         );
         assert!(
@@ -6756,4 +6761,65 @@ async fn test_oversized_http_terminate_output_still_honors_on_error_continue() {
             .map(String::as_str),
         Some("response_body_too_large")
     );
+}
+
+#[test]
+fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
+    let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
+    for (config, field, reason) in [
+        (
+            json!({"provider": null}),
+            "`provider`",
+            "is required and must not be null",
+        ),
+        (
+            json!({"provider": "azure_functions", "function_url": null}),
+            "`function_url`",
+            "is required and must not be null",
+        ),
+        (
+            json!({"provider": "gcp_cloud_functions", "function_url": null}),
+            "`function_url`",
+            "is required and must not be null",
+        ),
+        (
+            json!({"provider": "azure_functions", "function_url": "https://example.com", "timeout_ms": null}),
+            "`timeout_ms`",
+            "must not be null; omit the field instead",
+        ),
+        (
+            json!({token: true}),
+            "serverless_function",
+            "unknown configuration field",
+        ),
+        (
+            json!({"provider": null, token: null}),
+            "serverless_function",
+            "unknown configuration field",
+        ),
+        (
+            json!({"provider": token}),
+            "`provider`",
+            "must be `aws_lambda`",
+        ),
+        (
+            json!({"provider": "azure_functions", "function_url": token}),
+            "`function_url`",
+            "invalid",
+        ),
+        (
+            json!({"provider": "azure_functions", "function_url": "https://example.com", "mode": false}),
+            "`mode`",
+            "must be a string",
+        ),
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+            .expect_err("invalid configuration must still be rejected");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+        assert!(rendered.contains(field), "{rendered}");
+        assert!(rendered.contains(reason), "{rendered}");
+        for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
+            assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
+        }
+    }
 }

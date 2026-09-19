@@ -850,7 +850,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "metric tag \"source_workload\" value exceeds 256 bytes",
+            "metric tag \"source_workload\" `value` exceeds 256 bytes",
         ),
         (
             "credential-bearing custom header",
@@ -970,7 +970,7 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                     }]
                 }]
             }),
-            "OTLP: `endpoint` must be a valid URL",
+            "`providers[0].config`: OTLP: `endpoint` must be a valid URL",
         ),
     ];
 

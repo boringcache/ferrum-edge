@@ -15,6 +15,9 @@
 //! up to the adaptive `batch_limit`, so total datagrams drained per cycle can
 //! exceed the batch size.
 
+#[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+use crate::udp_profile::BatchField;
+
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
 
@@ -28,6 +31,8 @@ use std::net::SocketAddr;
 /// existing `try_recv_from` drain loop with no change in behavior.
 #[cfg(target_os = "linux")]
 pub struct RecvMmsgBatch {
+    #[cfg(feature = "bench-udp-profile")]
+    pub profile_direction: crate::udp_profile::Direction,
     /// Per-slot datagram buffers. Each is MAX_DGRAM_SIZE bytes.
     bufs: Vec<Vec<u8>>,
     /// Per-slot source addresses (converted from sockaddr_storage after recv).
@@ -122,6 +127,8 @@ impl RecvMmsgBatch {
         // same allocation; sized for the v6 worst case so both families fit.
         let cmsg_space = crate::socket_opts::recv_cmsg_space();
         Self {
+            #[cfg(feature = "bench-udp-profile")]
+            profile_direction: crate::udp_profile::Direction::Other,
             bufs: (0..capacity).map(|_| vec![0u8; MAX_DGRAM_SIZE]).collect(),
             result_addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); capacity],
             result_lens: vec![0u32; capacity],
@@ -250,20 +257,83 @@ impl RecvMmsgBatch {
         };
 
         if ret < 0 {
+            let error = std::io::Error::last_os_error();
+            #[cfg(feature = "bench-udp-profile")]
+            crate::udp_profile::recvmmsg(self.profile_direction, n, &Err(error.kind().into()));
             self.count = 0;
-            return Err(std::io::Error::last_os_error());
+            return Err(error);
         }
 
         let received = ret as usize;
+        #[cfg(feature = "bench-udp-profile")]
+        {
+            crate::udp_profile::recvmmsg(self.profile_direction, n, &Ok(received));
+            let bytes: usize = self
+                .msgs
+                .iter()
+                .take(received)
+                .map(|m| m.msg_len as usize)
+                .sum();
+            crate::udp_profile::batch_count(self.profile_direction, BatchField::RxBytes, bytes);
+        }
         // Hoisted (Copy bool) so the per-datagram loop never re-reads the field
         // and so plain UDP proxy listeners skip the orig-dst cmsg scan entirely.
         let parse_orig_dst = self.parse_orig_dst;
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
-            self.result_addrs[i] = sockaddr_storage_to_std(&self.raw_addrs[i])?;
+            #[cfg(feature = "bench-udp-profile")]
+            let address = sockaddr_storage_to_std(&self.raw_addrs[i]).inspect_err(|_| {
+                crate::udp_profile::batch_count(
+                    self.profile_direction,
+                    BatchField::RxParseErrors,
+                    1,
+                );
+            });
+            #[cfg(not(feature = "bench-udp-profile"))]
+            let address = sockaddr_storage_to_std(&self.raw_addrs[i]);
+            self.result_addrs[i] = address?;
             // Parse GRO cmsg to get segment size (if kernel coalesced datagrams).
             self.gro_segments[i] =
                 crate::socket_opts::extract_gro_segment_size(&self.msgs[i].msg_hdr);
+            #[cfg(feature = "bench-udp-profile")]
+            {
+                if self.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                    udp_count!(RecvTruncatedSlots, 1);
+                }
+                if self.msgs[i].msg_hdr.msg_flags & libc::MSG_CTRUNC != 0 {
+                    udp_count!(RecvControlTruncatedSlots, 1);
+                }
+                if self.gro_segments[i] == Some(0) {
+                    udp_count!(RecvInvalidGroSegment, 1);
+                }
+                let bytes = self.result_lens[i] as usize;
+                let packets = match self.gro_segments[i].filter(|size| *size > 0) {
+                    Some(size) => bytes.div_ceil(usize::from(size)),
+                    None => 1,
+                };
+                crate::udp_profile::batch_count(
+                    self.profile_direction,
+                    BatchField::RxLogicalPackets,
+                    packets,
+                );
+                if self.gro_segments[i].is_some() {
+                    crate::udp_profile::batch_count(
+                        self.profile_direction,
+                        BatchField::RxGroSlots,
+                        1,
+                    );
+                    crate::udp_profile::batch_count(
+                        self.profile_direction,
+                        BatchField::RxGroPackets,
+                        packets,
+                    );
+                    crate::udp_profile::batch_count(
+                        self.profile_direction,
+                        BatchField::RxGroBytes,
+                        bytes,
+                    );
+                }
+            }
             // Parse IP(v6)_PKTINFO cmsg to recover the local destination address.
             // Present when the socket has IP_PKTINFO / IPV6_RECVPKTINFO enabled;
             // `None` otherwise (non-Linux, pktinfo disabled, or connected socket).
@@ -329,6 +399,8 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
 /// individual `send_to` calls.
 #[cfg(target_os = "linux")]
 pub struct SendMmsgBatch {
+    #[cfg(feature = "bench-udp-profile")]
+    pub profile_direction: crate::udp_profile::Direction,
     /// Per-slot datagram buffers (data copied in on push). Empty until the
     /// slot is first used; then sized to [`SEND_MMSG_SLOT_SIZE`].
     bufs: Vec<Vec<u8>>,
@@ -393,6 +465,8 @@ impl SendMmsgBatch {
         let cmsg_space =
             unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
         Self {
+            #[cfg(feature = "bench-udp-profile")]
+            profile_direction: crate::udp_profile::Direction::Other,
             // Lazy: no eager capacity × 65535 (or even capacity × slot_size).
             bufs: (0..capacity).map(|_| Vec::new()).collect(),
             lens: vec![0usize; capacity],
@@ -463,6 +537,8 @@ impl SendMmsgBatch {
     ) -> SendMmsgPushResult {
         let len = data.len().min(MAX_DGRAM_SIZE);
         if len > self.slot_size {
+            #[cfg(feature = "bench-udp-profile")]
+            crate::udp_profile::batch_count(self.profile_direction, BatchField::TxOversized, 1);
             return SendMmsgPushResult::Oversized;
         }
         if self.count >= self.capacity {
@@ -497,6 +573,20 @@ impl SendMmsgBatch {
     /// [`Self::flush`] is a no-op — discarded payloads must not be counted as
     /// sent.
     pub fn discard(&mut self) {
+        #[cfg(feature = "bench-udp-profile")]
+        {
+            crate::udp_profile::batch_count(
+                self.profile_direction,
+                BatchField::TxDiscardedSlots,
+                self.count,
+            );
+            let bytes = self.lens.iter().take(self.count).sum();
+            crate::udp_profile::batch_count(
+                self.profile_direction,
+                BatchField::TxDiscardedBytes,
+                bytes,
+            );
+        }
         self.count = 0;
     }
 
@@ -624,6 +714,13 @@ impl SendMmsgBatch {
 
         if ret < 0 {
             let err = std::io::Error::last_os_error();
+            #[cfg(feature = "bench-udp-profile")]
+            crate::udp_profile::sendmmsg(
+                self.profile_direction,
+                self.count,
+                &Err(err.kind().into()),
+                0,
+            );
             // Clear the batch on error — UDP is best-effort and preserving
             // stale datagrams would cause reorder/requeue across iterations.
             // (GsoBatchBuf preserves on error because it has drain_to_sendmmsg
@@ -634,6 +731,8 @@ impl SendMmsgBatch {
 
         let sent = ret as usize;
         let sent_bytes = self.lens.iter().take(sent).sum();
+        #[cfg(feature = "bench-udp-profile")]
+        crate::udp_profile::sendmmsg(self.profile_direction, self.count, &Ok(sent), sent_bytes);
         let remaining = self.count - sent;
         if remaining > 0 {
             // Shift unsent datagrams to the front so a retry sends them.
@@ -810,6 +909,8 @@ impl SendMmsgBatch {
 /// or individual sends.
 #[cfg(target_os = "linux")]
 pub struct GsoBatchBuf {
+    #[cfg(feature = "bench-udp-profile")]
+    pub profile_direction: crate::udp_profile::Direction,
     /// Contiguous buffer holding concatenated same-size datagrams.
     buf: Vec<u8>,
     /// Segment size of datagrams currently in the buffer (0 = empty).
@@ -830,6 +931,8 @@ impl GsoBatchBuf {
     /// has a ~64KB limit per sendmsg, so 65535 is a safe maximum.
     pub fn new(max_bytes: usize) -> Self {
         Self {
+            #[cfg(feature = "bench-udp-profile")]
+            profile_direction: crate::udp_profile::Direction::Other,
             buf: Vec::with_capacity(max_bytes.min(65535)),
             segment_size: 0,
             count: 0,
@@ -848,6 +951,19 @@ impl GsoBatchBuf {
     /// After discard the buffer is empty, so a subsequent [`Self::flush_to`]
     /// is a no-op — discarded payloads must not be counted as sent.
     pub fn discard(&mut self) {
+        #[cfg(feature = "bench-udp-profile")]
+        {
+            crate::udp_profile::batch_count(
+                self.profile_direction,
+                BatchField::GsoDiscardedSegments,
+                self.count,
+            );
+            crate::udp_profile::batch_count(
+                self.profile_direction,
+                BatchField::GsoDiscardedBytes,
+                self.buf.len(),
+            );
+        }
         self.buf.clear();
         self.count = 0;
         self.segment_size = 0;
@@ -916,6 +1032,14 @@ impl GsoBatchBuf {
                 dest_len,
             )
         };
+        #[cfg(feature = "bench-udp-profile")]
+        crate::udp_profile::gso(
+            self.profile_direction,
+            self.count,
+            self.buf.len(),
+            self.segment_size,
+            &result,
+        );
         let sent_count = self.count;
         // Only clear on success — on failure, the buffer is preserved so
         // drain_to_sendmmsg() can replay the datagrams through sendmmsg.
@@ -969,6 +1093,12 @@ impl GsoBatchBuf {
             self.buf.drain(..offset);
             self.count -= drained;
         }
+        #[cfg(feature = "bench-udp-profile")]
+        crate::udp_profile::batch_count(
+            self.profile_direction,
+            BatchField::GsoFallbackToMmsgSegments,
+            drained,
+        );
         drained
     }
 
@@ -990,6 +1120,12 @@ impl GsoBatchBuf {
             self.count = 0;
             self.segment_size = 0;
         }
+        #[cfg(feature = "bench-udp-profile")]
+        crate::udp_profile::batch_count(
+            self.profile_direction,
+            BatchField::GsoFallbackDirectSegments,
+            1,
+        );
         Some(dgram)
     }
 }

@@ -240,14 +240,14 @@ fn parse_config(config: &Value) -> Result<(u64, u64), String> {
     let max_connections_per_key = parse_required_u64(object, "max_connections_per_key")?;
     if max_connections_per_key == 0 {
         return Err(
-            "tcp_connection_throttle: 'max_connections_per_key' must be greater than 0".to_string(),
+            "tcp_connection_throttle: `max_connections_per_key` must be greater than 0".to_string(),
         );
     }
     let cleanup_interval_seconds =
         parse_optional_u64(object, "cleanup_interval_seconds")?.unwrap_or(60);
     if cleanup_interval_seconds > MAX_CLEANUP_INTERVAL_SECONDS {
         return Err(format!(
-            "tcp_connection_throttle: 'cleanup_interval_seconds' must be at most {MAX_CLEANUP_INTERVAL_SECONDS}"
+            "tcp_connection_throttle: `cleanup_interval_seconds` must be at most {MAX_CLEANUP_INTERVAL_SECONDS}"
         ));
     }
     reject_unknown_fields(object)?;
@@ -269,7 +269,7 @@ fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), 
         Ok(())
     } else {
         Err(format!(
-            "tcp_connection_throttle: unknown config field(s): {}",
+            "tcp_connection_throttle: unknown config field(s): {:?}",
             unknown.join(", ")
         ))
     }
@@ -277,7 +277,7 @@ fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), 
 
 fn parse_required_u64(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
     object.get(field).and_then(Value::as_u64).ok_or_else(|| {
-        format!("tcp_connection_throttle: '{field}' is required and must be a positive integer")
+        format!("tcp_connection_throttle: `{field}` is required and must be a positive integer")
     })
 }
 
@@ -290,7 +290,7 @@ fn parse_optional_u64(
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| format!("tcp_connection_throttle: '{field}' must be an integer"))
+                .ok_or_else(|| format!("tcp_connection_throttle: `{field}` must be an integer"))
         })
         .transpose()
 }

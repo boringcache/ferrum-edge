@@ -2339,31 +2339,29 @@ fn plugin_structs_behind_raw_json_values_retain_object_admission() {
 
 #[test]
 fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
-    for (path, signature, terminator) in [
+    for (path, signature, terminator, guarded_type) in [
         (
             "src/plugins/mesh/authz.rs",
             "fn parse_node_waypoint_route_upstreams(",
             "\n}",
+            "json_object::from_json_object_vec_value",
         ),
         (
             "src/plugins/mesh/authz.rs",
             "pub fn new_with_http_client(",
             "\n    }",
+            "Vec<crate::util::json_object::JsonObject<MeshPolicy>>",
         ),
         (
             "src/modes/mesh/mod.rs",
             "fn mesh_authz_config_policies(config: &serde_json::Value)",
             "\n}",
+            "json_object::from_json_object_vec_value",
         ),
     ] {
         let text = admission_source_without_line_comments(&source(path));
         assert!(
-            [
-                "json_object::deserialize_object_vec",
-                "json_object::from_json_object_vec_value",
-            ]
-            .iter()
-            .any(|guard| item_body(&text, signature, terminator).contains(guard)),
+            item_body(&text, signature, terminator).contains(guarded_type),
             "{path}: raw JSON lists must guard every typed struct element"
         );
     }

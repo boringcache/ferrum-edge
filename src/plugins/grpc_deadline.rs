@@ -47,7 +47,7 @@ impl GrpcDeadline {
                 .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
         {
             return Err(format!(
-                "grpc_deadline: unknown configuration property 'config.{key}'"
+                "grpc_deadline: unknown configuration property in `config`: {key:?}"
             ));
         }
 
@@ -59,13 +59,13 @@ impl GrpcDeadline {
 
         if let Some(0) = max_deadline_ms {
             return Err(
-                "grpc_deadline: 'max_deadline_ms' must be greater than zero (configured value would reject every request)"
+                "grpc_deadline: `max_deadline_ms` must be greater than zero (configured value would reject every request)"
                     .to_string(),
             );
         }
         if let Some(0) = default_deadline_ms {
             return Err(
-                "grpc_deadline: 'default_deadline_ms' must be greater than zero".to_string(),
+                "grpc_deadline: `default_deadline_ms` must be greater than zero".to_string(),
             );
         }
         if let (Some(default_ms), Some(max_ms)) = (default_deadline_ms, max_deadline_ms)
@@ -94,8 +94,8 @@ impl GrpcDeadline {
             || reject_no_deadline;
         if !has_any_rule {
             return Err(
-                "grpc_deadline: no rules configured — set at least one of 'max_deadline_ms', \
-                 'default_deadline_ms', 'subtract_gateway_processing', or 'reject_no_deadline'"
+                "grpc_deadline: no rules configured — set at least one of `max_deadline_ms`, \
+                 `default_deadline_ms`, `subtract_gateway_processing`, or `reject_no_deadline`"
                     .to_string(),
             );
         }
@@ -113,7 +113,7 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         None => Ok(None),
-        Some(_) => Err(format!("grpc_deadline: '{key}' must be a boolean")),
+        Some(_) => Err(format!("grpc_deadline: `{key}` must be a boolean")),
     }
 }
 
@@ -122,10 +122,10 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(Value::Number(value)) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("grpc_deadline: '{key}' must be an unsigned integer")),
+            .ok_or_else(|| format!("grpc_deadline: `{key}` must be an unsigned integer")),
         None => Ok(None),
         Some(_) => Err(format!(
-            "grpc_deadline: '{key}' must be an unsigned integer"
+            "grpc_deadline: `{key}` must be an unsigned integer"
         )),
     }
 }

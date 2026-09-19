@@ -823,8 +823,9 @@ async fn test_workload_metrics_rejects_datadog_agent_url_with_empty_authority() 
     .err()
     .expect("datadog agent_url with empty authority must be rejected");
 
-    assert!(err.contains("agent_url"), "got: {err}");
-    assert!(err.contains("hostname"), "got: {err}");
+    assert!(err.contains("`tracing_providers[0].config`"), "{err}");
+    assert!(err.contains("`agent_url` must include a hostname"), "{err}");
+    assert!(!err.contains("https:///traces"), "{err}");
 }
 
 #[tokio::test]
