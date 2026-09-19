@@ -178,7 +178,7 @@ pub fn parse_route_header_transforms(
             "remove" => RouteHeaderTransformOp::Remove,
             other => {
                 return Err(format!(
-                    "{context}[{idx}].operation must be one of add/update/remove (got \"{other}\")"
+                    "{context}[{idx}].operation must be one of add/update/remove (got {other:?})"
                 ));
             }
         };

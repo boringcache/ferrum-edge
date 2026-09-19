@@ -1333,7 +1333,7 @@ pub fn is_safe_pod_registry_uid(pod_uid: &str) -> bool {
 
 pub fn parse_pod_uid(raw: &str) -> Result<[u8; 16], String> {
     let uuid = uuid::Uuid::parse_str(raw)
-        .map_err(|error| format!("invalid Kubernetes pod UID '{raw}': {error}"))?;
+        .map_err(|error| format!("invalid Kubernetes pod UID {raw:?}: {error}"))?;
     Ok(*uuid.as_bytes())
 }
 

@@ -2132,7 +2132,7 @@ fn optional_capture_budget(
     }
     if raw > MAX_BODY_CAPTURE_BYTES {
         return Err(format!(
-            "transaction_debugger: '{field}' must be <= {MAX_BODY_CAPTURE_BYTES} (got {raw})"
+            "transaction_debugger: `{field}` must be <= {MAX_BODY_CAPTURE_BYTES} (got \"{raw}\")"
         ));
     }
     Ok(raw as usize)

@@ -1902,11 +1902,19 @@ native_rotation_component_logs() {
     --tail=-1 2>/dev/null || true
 }
 
+native_rotation_client_logs() {
+  # node_id is withheld in application logs. Bind evidence to the original
+  # running pod through kubectl provenance, including the container name.
+  # Never select deploy/capp here: a replacement pod must not supply proof.
+  kubectl --context "$CONTEXT" -n "$NS" logs "pod/$NATIVE_ROTATION_NODE_ID" \
+    -c ferrum-edge --prefix=true --tail=-1 2>/dev/null || true
+}
+
 count_native_rotation_observations() {
   local client_file cp_file
   client_file="$RESULTS_DIR/native-rotation.client-log.tmp"
   cp_file="$RESULTS_DIR/native-rotation.cp-log.tmp"
-  native_rotation_component_logs deploy/capp > "$client_file"
+  native_rotation_client_logs > "$client_file"
   native_rotation_component_logs deploy/ferrum-cp > "$cp_file"
   python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --rotation-count \
     --pod-name "$NATIVE_ROTATION_NODE_ID" \
@@ -1942,6 +1950,10 @@ capture_native_rotation_baseline() {
     log "native TLS rotation baseline: non-integer counts raw=$raw"
     return 1
   fi
+  if (( cp_count < 1 || client_count < 1 )); then
+    log "native TLS rotation baseline: missing accepted connection cp=$cp_count client=$client_count"
+    return 1
+  fi
   NATIVE_ROTATION_BASELINE_CP="$cp_count"
   NATIVE_ROTATION_BASELINE_CLIENT="$client_count"
   NATIVE_ROTATION_BASELINE_CAPTURED=true
@@ -1958,7 +1970,7 @@ native_rotation_fresh_now() {
   fi
   client_file="$RESULTS_DIR/native-rotation.client-log.tmp"
   cp_file="$RESULTS_DIR/native-rotation.cp-log.tmp"
-  native_rotation_component_logs deploy/capp > "$client_file"
+  native_rotation_client_logs > "$client_file"
   native_rotation_component_logs deploy/ferrum-cp > "$cp_file"
   st=0
   python3 "$NATIVE_PROBE_CLASSIFY_HELPER" --rotation-fresh \

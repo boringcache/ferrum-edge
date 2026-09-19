@@ -42,6 +42,7 @@ use crate::config::validation_pipeline::{
 use crate::fips::approved::Sha256;
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::proxy::stream_match::StreamMatchCriteria;
+use crate::util::deserialization as config_decode;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -357,7 +358,7 @@ impl std::fmt::Display for RowDecodeRejection {
         match &self.resource_id {
             Some(id) => write!(
                 f,
-                "SQL row decode rejected for {} '{}': {}",
+                "SQL row decode rejected for {} {:?}: {}",
                 self.resource_type, id, self.reason
             ),
             None => write!(
@@ -578,23 +579,23 @@ pub(crate) fn format_consumer_identity_conflict(
 ) -> String {
     match (candidate_field, existing_field) {
         ("username", "username") => format!(
-            "A consumer with username '{}' already exists (consumer '{}')",
+            "A consumer with username {:?} already exists (consumer {:?})",
             candidate_value, existing_id
         ),
         ("custom_id", "custom_id") => format!(
-            "A consumer with custom_id '{}' already exists (consumer '{}')",
+            "A consumer with custom_id {:?} already exists (consumer {:?})",
             candidate_value, existing_id
         ),
         ("username", "custom_id") => format!(
-            "Consumer username '{}' conflicts with custom_id of consumer '{}'",
+            "Consumer username {:?} conflicts with custom_id of consumer {:?}",
             candidate_value, existing_id
         ),
         ("custom_id", "username") => format!(
-            "Consumer custom_id '{}' conflicts with username of consumer '{}'",
+            "Consumer custom_id {:?} conflicts with username of consumer {:?}",
             candidate_value, existing_id
         ),
         _ => format!(
-            "Consumer {} '{}' conflicts with {} of consumer '{}'",
+            "Consumer {} {:?} conflicts with {} of consumer {:?}",
             candidate_field, candidate_value, existing_field, existing_id
         ),
     }
@@ -1319,8 +1320,8 @@ impl DatabaseStore {
 
         for row in rows {
             let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
-            let existing_hosts: Vec<String> =
-                serde_json::from_str(&existing_hosts_raw).map_err(|error| {
+            let existing_hosts: Vec<String> = config_decode::from_json_str(&existing_hosts_raw)
+                .map_err(|error| {
                     anyhow::anyhow!("failed to parse hosts JSON during uniqueness check: {error}")
                 })?;
 
@@ -1479,14 +1480,17 @@ impl DatabaseStore {
             (None, None) => {}
             (Some(actual), Some(allowed)) if actual == allowed => {}
             (Some(_), _) => {
-                return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                    "mTLS DNS admission is blocked while a guarded operation owns namespace '{namespace}'"
-                )));
+                return Err(
+                    anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
+                        "mTLS DNS admission is blocked while a guarded operation owns namespace \
+                     {namespace:?}"
+                    )),
+                );
             }
             (None, Some(_)) => {
                 return Err(
                     anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                        "mTLS DNS admission guard ownership was lost for namespace '{namespace}'"
+                        "mTLS DNS admission guard ownership was lost for namespace {namespace:?}"
                     )),
                 );
             }
@@ -2110,7 +2114,7 @@ impl DatabaseStore {
         ) {
             Ok(snapshot) => snapshot.pin(options),
             Err(error) => {
-                let safe_error = crate::config::db_backend::redact_error_text(&error, &[db_url]);
+                let safe_error = crate::startup::sanitize_startup_cause(&error, &[db_url]);
                 warn!(
                     "Database TLS material could not be snapshotted for the backup-bootstrap pool; starting from the unmodified URL and retrying on reconnect: {safe_error}"
                 );
@@ -2492,7 +2496,7 @@ impl DatabaseStore {
         for assoc in associations {
             if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
                 errors.push(format!(
-                    "Proxy '{}' references plugin_config '{}' more than once",
+                    "Proxy {:?} references plugin_config {:?} more than once",
                     proxy_id, assoc.plugin_config_id
                 ));
             } else {
@@ -2500,14 +2504,15 @@ impl DatabaseStore {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
-                                "Proxy '{}' references global plugin_config '{}'",
+                                "Proxy {:?} references global plugin_config {:?}",
                                 proxy_id, plugin.id
                             ));
                         }
                         PluginScope::ProxyGroup => {
                             if plugin.proxy_id.is_some() {
                                 errors.push(format!(
-                                    "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                    "Proxy {:?} references proxy_group plugin_config {:?} with \
+                                     proxy_id {:?}",
                                     proxy_id,
                                     plugin.id,
                                     plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -2517,7 +2522,8 @@ impl DatabaseStore {
                         PluginScope::Proxy => {
                             if plugin.proxy_id.as_deref() != Some(proxy_id) {
                                 errors.push(format!(
-                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    "Proxy {:?} references plugin_config {:?} targeted to proxy \
+                                     {:?}",
                                     proxy_id,
                                     plugin.id,
                                     plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -2526,7 +2532,7 @@ impl DatabaseStore {
                         }
                     },
                     None => errors.push(format!(
-                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        "Proxy {:?} references non-existent plugin_config {:?}",
                         proxy_id, assoc.plugin_config_id
                     )),
                 }
@@ -2695,7 +2701,7 @@ impl DatabaseStore {
         let quarantined = config.quarantine_colliding_consumer_identities();
         if !quarantined.is_empty() {
             for message in &quarantined {
-                error!("{}", message);
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
             }
             error!(
                 "Quarantined {} consumer(s) with colliding identities during full config load",
@@ -2711,7 +2717,7 @@ impl DatabaseStore {
         let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
         if !hmac_quarantined.is_empty() {
             for message in &hmac_quarantined {
-                error!("{}", message);
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
             }
             error!(
                 "Quarantined {} hmac_auth credential(s) during full config load",
@@ -2745,7 +2751,7 @@ impl DatabaseStore {
             for message in &quarantined {
                 error!(
                     "Database config: quarantined unconstructible plugin config — {}",
-                    message
+                    crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
             if !quarantined.is_empty() {
@@ -2762,7 +2768,10 @@ impl DatabaseStore {
         let validation_errors = collect_rejecting_runtime_config_errors(&config);
         if !validation_errors.is_empty() {
             for message in &validation_errors {
-                tracing::error!("Database config rejected — {}", message);
+                tracing::error!(
+                    "Database config rejected — {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
             }
             // Typed, downcast-discoverable rejection (parity with the Mongo
             // loader) so the database-mode poll loop classifies this as a
@@ -2978,7 +2987,7 @@ impl DatabaseStore {
                     .await?;
             if proxy_row.is_none() {
                 anyhow::bail!(
-                    "cannot restore api_spec '{}': owning proxy '{}' is missing",
+                    "cannot restore api_spec {:?}: owning proxy {:?} is missing",
                     spec.id,
                     spec.proxy_id
                 );
@@ -3100,7 +3109,10 @@ impl DatabaseStore {
                 let isolation = Self::mysql_transaction_isolation(tx).await?;
                 if !Self::is_mysql_repeatable_read(&isolation) {
                     return Err(anyhow::anyhow!(
-                        "MySQL full-load transactions require REPEATABLE READ isolation; current transaction isolation is '{}'. Configure the MySQL server or Ferrum session default to REPEATABLE READ so full runtime loads fail closed instead of publishing mixed snapshots.",
+                        "MySQL full-load transactions require REPEATABLE READ isolation; current \
+                         transaction isolation is {:?}. Configure the MySQL server or Ferrum \
+                         session default to REPEATABLE READ so full runtime loads fail closed \
+                         instead of publishing mixed snapshots.",
                         isolation
                     ));
                 }
@@ -4198,7 +4210,8 @@ impl DatabaseStore {
         {
             tx.rollback().await?;
             anyhow::bail!(
-                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                "Consumer {:?} is referenced by access_control plugin_config {:?} and cannot be \
+                 deleted",
                 id,
                 plugin.id
             );
@@ -5598,7 +5611,7 @@ impl DatabaseStore {
         if !ref_rows.is_empty() {
             tx.rollback().await?;
             anyhow::bail!(
-                "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                "Upstream {:?} is referenced by one or more proxies and cannot be deleted",
                 id
             );
         }
@@ -5608,7 +5621,8 @@ impl DatabaseStore {
         {
             tx.rollback().await?;
             anyhow::bail!(
-                "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                "Upstream {:?} is referenced by mesh_route_dispatch plugin_config {:?} and cannot \
+                 be deleted",
                 id,
                 plugin.id
             );
@@ -5849,7 +5863,7 @@ impl DatabaseStore {
             // Index claimed a collision but the owner row is gone. Fail
             // closed rather than treating an inconclusive index hit as unique.
             return Ok(format!(
-                "Consumer identity '{}' conflicts with consumer '{}'",
+                "Consumer identity {:?} conflicts with consumer {:?}",
                 identity_value, owner_id
             ));
         };
@@ -5874,7 +5888,7 @@ impl DatabaseStore {
             }
         }
         Ok(format!(
-            "Consumer identity '{}' conflicts with consumer '{}'",
+            "Consumer identity {:?} conflicts with consumer {:?}",
             identity_value, owner_id
         ))
     }
@@ -5983,9 +5997,10 @@ impl DatabaseStore {
                 }
                 let credentials_json = required_utf8_text_column(&row, "credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
-                    serde_json::from_str(&credentials_json).map_err(|error| {
+                    config_decode::from_json_str(&credentials_json).map_err(|error| {
                         anyhow::anyhow!(
-                            "Consumer {}: failed to parse credentials JSON while checking mTLS uniqueness: {}",
+                            "Consumer {:?}: failed to parse credentials JSON while checking \
+                             mTLS uniqueness: {}",
                             consumer_id,
                             error
                         )
@@ -6057,7 +6072,7 @@ impl DatabaseStore {
         for assoc in associations {
             if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
                 errors.push(format!(
-                    "Proxy '{}' references plugin_config '{}' more than once",
+                    "Proxy {:?} references plugin_config {:?} more than once",
                     proxy_id, assoc.plugin_config_id
                 ));
             } else {
@@ -6078,7 +6093,9 @@ impl DatabaseStore {
                 Some(plugin) => match plugin.scope {
                     PluginScope::Global => {
                         errors.push(format!(
-                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
+                            "Proxy {:?} references plugin_config {:?} with scope `global` — proxy \
+                             associations may only reference proxy-scoped or proxy_group-scoped \
+                             plugin configs",
                             proxy_id, plugin.id
                         ));
                         continue;
@@ -6086,7 +6103,7 @@ impl DatabaseStore {
                     PluginScope::Proxy => {
                         if plugin.proxy_id.as_deref() != Some(proxy_id) {
                             errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                "Proxy {:?} references plugin_config {:?} targeted to proxy {:?}",
                                 proxy_id,
                                 plugin.id,
                                 plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -6096,7 +6113,8 @@ impl DatabaseStore {
                     PluginScope::ProxyGroup => {
                         if plugin.proxy_id.is_some() {
                             errors.push(format!(
-                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                "Proxy {:?} references proxy_group plugin_config {:?} with \
+                                 proxy_id {:?}",
                                 proxy_id,
                                 plugin.id,
                                 plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -6105,7 +6123,7 @@ impl DatabaseStore {
                     }
                 },
                 None => errors.push(format!(
-                    "Proxy '{}' references non-existent plugin_config '{}'",
+                    "Proxy {:?} references non-existent plugin_config {:?}",
                     proxy_id, assoc.plugin_config_id
                 )),
             }
@@ -6203,8 +6221,8 @@ impl DatabaseStore {
         for change in changes {
             if change.operation != "upsert" && change.operation != "delete" {
                 warn!(
-                    "Ignoring config_changes row with unknown operation '{}' for {} {}",
-                    change.operation, change.resource_type, change.resource_id
+                    "Ignoring `config_changes` row with unknown `operation`; \
+                     `operation`, `resource_type`, and `resource_id` values withheld"
                 );
                 continue;
             }
@@ -6224,10 +6242,10 @@ impl DatabaseStore {
                 GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
                     gateway_trust_bundle_changed = true;
                 }
-                other => {
+                _ => {
                     warn!(
-                        "Ignoring config_changes row with unknown resource_type '{}' for id {}",
-                        other, change.resource_id
+                        "Ignoring `config_changes` row with unknown `resource_type`; \
+                         `resource_type` and `resource_id` values withheld"
                     );
                 }
             }
@@ -6394,7 +6412,7 @@ impl DatabaseStore {
             let retained_sequence = retained_sequence.max(0) as u64;
             if after_sequence < retained_sequence {
                 anyhow::bail!(
-                    "config change cursor {} for namespace '{}' is behind retained sequence {}",
+                    "config change cursor {} for namespace {:?} is behind retained sequence {}",
                     after_sequence,
                     namespace,
                     retained_sequence
@@ -6427,7 +6445,7 @@ impl DatabaseStore {
 
         if rows.len() >= Self::CHANGE_LOG_BATCH_LIMIT as usize {
             anyhow::bail!(
-                "config change batch for namespace '{}' reached limit {}; forcing full reload",
+                "config change batch for namespace {:?} reached limit {}; forcing full reload",
                 namespace,
                 Self::CHANGE_LOG_BATCH_LIMIT
             );
@@ -7716,7 +7734,8 @@ impl DatabaseStore {
             Ok(())
         } else {
             Err(anyhow::Error::new(BatchAdmissionLeaseLost).context(format!(
-                "namespace '{namespace}' config admission lease generation {generation} was not held at commit"
+                "namespace {namespace:?} config admission lease generation {generation} was not \
+                 held at commit"
             )))
         }
     }
@@ -9878,7 +9897,7 @@ impl DatabaseStore {
             // can return 0 changed rows.
             if existing_spec.is_none() {
                 anyhow::bail!(
-                    "API spec row not found for id '{}' in namespace '{}' during \
+                    "API spec row not found for id {:?} in namespace {:?} during \
                      metadata-only replace",
                     spec.id,
                     spec.namespace
@@ -10456,7 +10475,7 @@ impl DatabaseStore {
                 .try_get::<String, _>("upstream_id")
                 .unwrap_or_else(|_| "<unknown>".to_string());
             anyhow::bail!(
-                "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
                  detach it before replacing or deleting the API spec",
                 proxy_id,
                 upstream_id,
@@ -10510,7 +10529,8 @@ impl DatabaseStore {
                 mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
             {
                 anyhow::bail!(
-                    "mesh_route_dispatch plugin_config '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                    "mesh_route_dispatch plugin_config {:?} references a spec-owned upstream {:?} \
+                     from api_spec {:?}; \
                      detach it before replacing or deleting the API spec",
                     plugin.id,
                     upstream_id,
@@ -12258,7 +12278,7 @@ fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error
         .transpose()
         .map_err(|e| {
             anyhow::anyhow!(
-                "Proxy {}: failed to serialize stream_match JSON: {}",
+                "Proxy {:?}: failed to serialize stream_match JSON: {}",
                 proxy.id,
                 e
             )
@@ -12283,24 +12303,24 @@ fn row_to_proxy_inner(
     let pid = id.clone();
     let scheme_str: String = row
         .try_get::<String, _>("backend_scheme")
-        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read backend_scheme: {}", pid, e))?;
+        .map_err(|e| anyhow::anyhow!("Proxy {:?}: failed to read backend_scheme: {}", pid, e))?;
     let backend_scheme =
-        parse_scheme(&scheme_str).map_err(|e| anyhow::anyhow!("Proxy {}: {}", pid, e))?;
+        parse_scheme(&scheme_str).map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?;
     let auth_mode_str: String = row
         .try_get("auth_mode")
-        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;
+        .map_err(|e| anyhow::anyhow!("Proxy {:?}: failed to read auth_mode: {}", pid, e))?;
 
     let hosts_str = required_utf8_text_column(row, "hosts").map_err(|error| {
-        anyhow::anyhow!("Proxy {}: failed to read hosts column: {}", pid, error)
+        anyhow::anyhow!("Proxy {:?}: failed to read hosts column: {}", pid, error)
     })?;
-    let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
+    let hosts: Vec<String> = config_decode::from_json_str(&hosts_str).map_err(|e| {
         // Do not embed the raw hosts column — poll/startup rejection logs
         // surface this message (issue #2997 redaction).
-        anyhow::anyhow!("Proxy {}: failed to parse hosts JSON: {}", pid, e)
+        anyhow::anyhow!("Proxy {:?}: failed to parse hosts JSON: {}", pid, e)
     })?;
 
     Ok(Proxy {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id,
         namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
@@ -12369,16 +12389,22 @@ fn row_to_proxy_inner(
         upstream_id: optional_utf8_text_column(row, "upstream_id")?,
         circuit_breaker: match optional_utf8_text_column(row, "circuit_breaker")? {
             Some(s) => Some(
-                serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
-                    anyhow::anyhow!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e)
+                config_decode::from_json_str::<CircuitBreakerConfig>(&s).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Proxy {:?}: failed to parse circuit_breaker JSON: {}",
+                        pid,
+                        e
+                    )
                 })?,
             ),
             None => None,
         },
         retry: match optional_utf8_text_column(row, "retry")? {
-            Some(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
-                anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
-            })?),
+            Some(s) => Some(
+                config_decode::from_json_str::<RetryConfig>(&s).map_err(|e| {
+                    anyhow::anyhow!("Proxy {:?}: failed to parse retry JSON: {}", pid, e)
+                })?,
+            ),
             None => None,
         },
         response_body_mode: row
@@ -12471,15 +12497,21 @@ fn row_to_proxy_inner(
             .ok()
             .map(|v| v.max(0) as u64),
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
-            Some(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
-                anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
-            })?),
+            Some(s) => Some(
+                config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Proxy {:?}: failed to parse allowed_methods JSON: {}",
+                        pid,
+                        e
+                    )
+                })?,
+            ),
             None => None,
         },
         allowed_ws_origins: match optional_utf8_text_column(row, "allowed_ws_origins")? {
-            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+            Some(s) => config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Proxy {}: failed to parse allowed_ws_origins JSON: {}",
+                    "Proxy {:?}: failed to parse allowed_ws_origins JSON: {}",
                     pid,
                     e
                 )
@@ -12508,7 +12540,7 @@ fn row_to_proxy_inner(
                         crate::config::types::BackendProxyProtocol::parse(trimmed).ok_or_else(
                             || {
                                 anyhow::anyhow!(
-                                    "Proxy {}: invalid backend_proxy_protocol value",
+                                    "Proxy {:?}: invalid backend_proxy_protocol value",
                                     pid
                                 )
                             },
@@ -12520,8 +12552,8 @@ fn row_to_proxy_inner(
         },
         stream_match: match optional_utf8_text_column(row, "stream_match")? {
             Some(s) => Some(
-                serde_json::from_str::<StreamMatchCriteria>(&s).map_err(|_| {
-                    anyhow::anyhow!("Proxy {}: failed to parse stream_match JSON", pid)
+                config_decode::from_json_str::<StreamMatchCriteria>(&s).map_err(|_| {
+                    anyhow::anyhow!("Proxy {:?}: failed to parse stream_match JSON", pid)
                 })?,
             ),
             None => None,
@@ -12561,12 +12593,12 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
             // corrupt JSON/config value behind a default.
             let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                 anyhow::anyhow!(
-                    "column '{column}' could not be decoded as SQL text ({text_error}) \
+                    "column `{column}` could not be decoded as SQL text ({text_error}) \
                      or bytes ({blob_error})"
                 )
             })?;
             String::from_utf8(bytes)
-                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
+                .map_err(|error| anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}"))
         }
     }
 }
@@ -12589,19 +12621,19 @@ fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String
             Ok(None) => Ok(None),
             Ok(Some(bytes)) => String::from_utf8(bytes)
                 .map(Some)
-                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")),
+                .map_err(|error| anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}")),
             Err(blob_opt_error) => {
                 // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
                 // as a bare BLOB rather than Option<BLOB>.
                 let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                     anyhow::anyhow!(
-                        "column '{column}' could not be decoded as optional SQL text \
+                        "column `{column}` could not be decoded as optional SQL text \
                          ({text_error}), optional bytes ({blob_opt_error}), or bytes \
                          ({blob_error})"
                     )
                 })?;
                 String::from_utf8(bytes).map(Some).map_err(|error| {
-                    anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")
+                    anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}")
                 })
             }
         },
@@ -12621,14 +12653,14 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, anyhow::Error> {
     let creds_str = required_utf8_text_column(row, "credentials").map_err(|e| {
         anyhow::anyhow!(
-            "Consumer {}: failed to read credentials column: {}",
+            "Consumer {:?}: failed to read credentials column: {}",
             id_preview,
             e
         )
     })?;
-    let credentials = serde_json::from_str(&creds_str).map_err(|e| {
+    let credentials = config_decode::from_json_str(&creds_str).map_err(|e| {
         anyhow::anyhow!(
-            "Consumer {}: failed to parse credentials JSON: {}",
+            "Consumer {:?}: failed to parse credentials JSON: {}",
             id_preview,
             e
         )
@@ -12636,23 +12668,23 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
 
     let acl_groups_str = required_utf8_text_column(row, "acl_groups").map_err(|e| {
         anyhow::anyhow!(
-            "Consumer {}: failed to read acl_groups column: {}",
+            "Consumer {:?}: failed to read acl_groups column: {}",
             id_preview,
             e
         )
     })?;
-    let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
+    let acl_groups: Vec<String> = config_decode::from_json_str(&acl_groups_str).map_err(|e| {
         // Never embed the raw acl_groups column in the error — poll rejection
         // logs would otherwise leak row content (issue #2997).
         anyhow::anyhow!(
-            "Consumer {}: failed to parse acl_groups JSON: {}",
+            "Consumer {:?}: failed to parse acl_groups JSON: {}",
             id_preview,
             e
         )
     })?;
 
     Ok(Consumer {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
@@ -12693,21 +12725,21 @@ fn row_to_plugin_config_inner(
 ) -> Result<PluginConfig, anyhow::Error> {
     let config_str = required_utf8_text_column(row, "config").map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to read config column: {}",
+            "PluginConfig {:?}: failed to read config column: {}",
             id_preview,
             e
         )
     })?;
-    let config_val = serde_json::from_str(&config_str).map_err(|e| {
+    let config_val = config_decode::from_json_str(&config_str).map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to parse config JSON: {}",
+            "PluginConfig {:?}: failed to parse config JSON: {}",
             id_preview,
             e
         )
     })?;
     let scope_str: String = row.try_get("scope").map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to read scope column: {}",
+            "PluginConfig {:?}: failed to read scope column: {}",
             id_preview,
             e
         )
@@ -12715,7 +12747,7 @@ fn row_to_plugin_config_inner(
 
     let trigger = optional_utf8_text_column(row, "trigger_json").map_err(|e| {
         anyhow::anyhow!(
-            "PluginConfig {}: failed to read trigger_json column: {}",
+            "PluginConfig {:?}: failed to read trigger_json column: {}",
             id_preview,
             e
         )
@@ -12724,9 +12756,9 @@ fn row_to_plugin_config_inner(
         // A stored trigger that no longer parses is a fail-closed error, not a
         // silently untriggered instance: dropping it would run a plugin the
         // operator scoped away.
-        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+        Some(raw) => Some(config_decode::from_json_str(&raw).map_err(|e| {
             anyhow::anyhow!(
-                "PluginConfig {}: failed to parse trigger JSON: {}",
+                "PluginConfig {:?}: failed to parse trigger JSON: {}",
                 id_preview,
                 e
             )
@@ -12735,7 +12767,7 @@ fn row_to_plugin_config_inner(
     };
 
     Ok(PluginConfig {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
@@ -12855,8 +12887,10 @@ fn row_to_gateway_trust_bundle_inner(
         );
     }
     // Never surface serde's message: it can quote the offending document.
-    let bundle: crate::modes::mesh::config::TrustBundleSet = serde_json::from_str(&bundle_json)
-        .map_err(|_| anyhow::anyhow!("gateway trust bundle stored material is not decodable"))?;
+    let bundle: crate::modes::mesh::config::TrustBundleSet =
+        config_decode::from_json_str(&bundle_json).map_err(|_| {
+            anyhow::anyhow!("gateway trust bundle stored material is not decodable")
+        })?;
     let revision = strict_stored_revision(row)?;
     let updated_by = optional_utf8_text_column(row, "updated_by").map_err(|error| {
         anyhow::anyhow!("gateway trust bundle updated_by column is unreadable: {error}")
@@ -12887,14 +12921,14 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
 fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
     let targets_str = required_utf8_text_column(row, "targets").map_err(|e| {
         anyhow::anyhow!(
-            "Upstream {}: failed to read targets column: {}",
+            "Upstream {:?}: failed to read targets column: {}",
             id_preview,
             e
         )
     })?;
-    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).map_err(|e| {
+    let targets: Vec<UpstreamTarget> = config_decode::from_json_str(&targets_str).map_err(|e| {
         anyhow::anyhow!(
-            "Upstream {}: failed to parse targets JSON: {}",
+            "Upstream {:?}: failed to parse targets JSON: {}",
             id_preview,
             e
         )
@@ -12902,24 +12936,24 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let algo_str = required_utf8_text_column(row, "algorithm").map_err(|e| {
         anyhow::anyhow!(
-            "Upstream {}: failed to read algorithm column: {}",
+            "Upstream {:?}: failed to read algorithm column: {}",
             id_preview,
             e
         )
     })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|_| {
+        config_decode::from_json_value(serde_json::Value::String(algo_str)).map_err(|_| {
             // Do not embed the raw algorithm column — hostile/oversized DB
             // values must not reach poll/startup rejection logs through either
             // this message or serde's unknown-variant error (issue #2997).
-            anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
+            anyhow::anyhow!("Upstream {:?}: failed to parse algorithm", id_preview)
         })?;
 
     let health_checks: Option<HealthCheckConfig> =
         match optional_utf8_text_column(row, "health_checks")? {
-            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse health_checks JSON: {}",
+                    "Upstream {:?}: failed to parse health_checks JSON: {}",
                     id_preview,
                     e
                 )
@@ -12929,9 +12963,9 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let service_discovery: Option<ServiceDiscoveryConfig> =
         match optional_utf8_text_column(row, "service_discovery")? {
-            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse service_discovery JSON: {}",
+                    "Upstream {:?}: failed to parse service_discovery JSON: {}",
                     id_preview,
                     e
                 )
@@ -12941,9 +12975,9 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> =
         match optional_utf8_text_column(row, "hash_on_cookie_config")? {
-            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
+                    "Upstream {:?}: failed to parse hash_on_cookie_config JSON: {}",
                     id_preview,
                     e
                 )
@@ -12958,9 +12992,9 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         .unwrap_or(true);
 
     let subsets = match optional_utf8_text_column(row, "subsets")? {
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+        Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
             anyhow::anyhow!(
-                "Upstream {}: failed to parse subsets JSON: {}",
+                "Upstream {:?}: failed to parse subsets JSON: {}",
                 id_preview,
                 e
             )
@@ -12970,9 +13004,9 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
 
     let backend_tls_san_allow_list =
         match optional_utf8_text_column(row, "backend_tls_san_allow_list")? {
-            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+            Some(s) => config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
-                    "Upstream {}: failed to parse backend_tls_san_allow_list JSON: {}",
+                    "Upstream {:?}: failed to parse backend_tls_san_allow_list JSON: {}",
                     id_preview,
                     e
                 )
@@ -12982,7 +13016,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
     let backend_tls_sni = optional_utf8_text_column(row, "backend_tls_sni")?;
 
     Ok(Upstream {
-        labels: serde_json::from_str(&required_utf8_text_column(row, "labels")?)?,
+        labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         name: row.try_get("name").ok(),
@@ -13104,10 +13138,10 @@ fn row_to_api_spec_with_content(
 
     // Wave 5: parse JSON-text arrays for tags / server_urls.
     let tags_raw = required_utf8_text_column(row, "tags")?;
-    let tags: Vec<String> = serde_json::from_str(&tags_raw)
+    let tags: Vec<String> = config_decode::from_json_str(&tags_raw)
         .map_err(|error| anyhow::anyhow!("failed to parse api_specs.tags JSON: {error}"))?;
     let server_urls_raw = required_utf8_text_column(row, "server_urls")?;
-    let server_urls: Vec<String> = serde_json::from_str(&server_urls_raw)
+    let server_urls: Vec<String> = config_decode::from_json_str(&server_urls_raw)
         .map_err(|error| anyhow::anyhow!("failed to parse api_specs.server_urls JSON: {error}"))?;
     let operation_count: u32 = row
         .try_get::<i64, _>("operation_count")
@@ -13170,10 +13204,10 @@ fn row_to_api_spec_with_content(
 fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
     let id: String = row.try_get("id")?;
     let diff_raw = required_utf8_text_column(row, "diff")?;
-    let diff = serde_json::from_str(&diff_raw).unwrap_or_else(|e| {
+    let diff = config_decode::from_json_str(&diff_raw).unwrap_or_else(|e| {
         warn!(
-            audit_event_id = %id,
-            error = %e,
+            audit_event_id = %crate::startup::sanitize_startup_cause(format!("{id:?}"), &[]),
+            error = %crate::startup::sanitize_startup_cause(e, &[]),
             "Audit event diff column is not valid JSON; returning empty diff"
         );
         serde_json::json!({})
@@ -13205,7 +13239,7 @@ fn serialize_api_spec_string_list(
 ) -> Result<String, anyhow::Error> {
     serde_json::to_string(values).map_err(|e| {
         anyhow::anyhow!(
-            "ApiSpec {}: failed to serialize {} JSON: {}",
+            "ApiSpec {:?}: failed to serialize {} JSON: {}",
             spec_id,
             field,
             e
@@ -13232,7 +13266,7 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             .unwrap_or_else(|_| {
                 warn!(
                     column,
-                    value = %raw,
+                    value = %crate::startup::sanitize_startup_cause(format!("{raw:?}"), &[]),
                     "Could not parse datetime column, falling back to Utc::now()"
                 );
                 Utc::now()
@@ -13240,7 +13274,7 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
         Err(error) => {
             warn!(
                 column,
-                error = %error,
+                error = %crate::startup::sanitize_startup_cause(error, &[]),
                 "Could not read datetime column, falling back to Utc::now()"
             );
             Utc::now()

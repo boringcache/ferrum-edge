@@ -15,6 +15,11 @@
 //! wrappers are zero-sized and forward straight to the wrapped type's own
 //! `Deserialize`, so `deny_unknown_fields`, field defaults, and custom field
 //! deserializers all keep working unchanged.
+//!
+//! These generic serde visitors enforce shape only. Sanitize errors at the
+//! document/value adapters in `deserialization`, where path and inner error are
+//! separate. A generic `D::Error` may already contain a native YAML path and must
+//! never be classified as a bare diagnostic here.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -148,5 +153,20 @@ pub fn from_json_object_slice<T>(body: &[u8]) -> Result<T, serde_json::Error>
 where
     T: DeserializeOwned,
 {
-    serde_json::from_slice::<JsonObject<T>>(body).map(|object| object.0)
+    super::deserialization::from_json_slice::<JsonObject<T>>(body).map(|object| object.0)
+}
+
+/// Object admission from a value tree, with a separate path and sanitized cause.
+pub fn from_json_object_value<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, serde_json::Error> {
+    super::deserialization::from_json_value::<JsonObject<T>>(value).map(|object| object.0)
+}
+
+/// Object-array admission from a value tree, with sanitized causes.
+pub fn from_json_object_vec_value<T: DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<Vec<T>, serde_json::Error> {
+    super::deserialization::from_json_value::<Vec<JsonObject<T>>>(value)
+        .map(|objects| objects.into_iter().map(|object| object.0).collect())
 }

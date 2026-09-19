@@ -17,6 +17,9 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
 
+#[path = "../common/diagnostic_logs.rs"]
+mod diagnostic_logs;
+
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("incremental_poll_test.db");
@@ -25,6 +28,67 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
         .await
         .expect("SQLite store creation must succeed");
     (store, temp_dir)
+}
+
+#[test]
+fn malformed_change_rows_withhold_values_and_preserve_incremental_progress() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (resource_type, operation, reason) in [
+        (
+            "UNREGISTERED_resource_type_operation",
+            "UNREGISTERED_operation",
+            "unknown `operation`",
+        ),
+        (
+            "UNREGISTERED_resource_type",
+            "upsert",
+            "unknown `resource_type`",
+        ),
+    ] {
+        let ((), logs) = diagnostic_logs::capture_logs(|| {
+            runtime.block_on(async {
+                let (store, _temp_dir) = sqlite_store().await;
+                sqlx::query(
+                    "INSERT INTO config_changes \
+                     (sequence, namespace, resource_type, resource_id, operation, created_at) \
+                     VALUES (1, 'ferrum', ?, ?, ?, ?), \
+                            (2, 'ferrum', 'proxy', 'valid-delete', 'delete', ?)",
+                )
+                .bind(resource_type)
+                .bind("'UNREGISTERED_resource_id\"\\tail")
+                .bind(operation)
+                .bind(Utc::now().to_rfc3339())
+                .bind(Utc::now().to_rfc3339())
+                .execute(&store.pool())
+                .await
+                .unwrap();
+
+                let result = store.load_incremental_config("ferrum", 0).await.unwrap();
+                assert_eq!(result.sequence_cursor, 2);
+                assert_eq!(result.removed_proxy_ids.len(), 1);
+                assert_eq!(
+                    result.removed_proxy_ids[0],
+                    ferrum_edge::config::db_loader::NamespacedResourceId::new(
+                        "ferrum",
+                        "valid-delete"
+                    )
+                );
+                let next = store
+                    .load_incremental_config("ferrum", result.sequence_cursor)
+                    .await
+                    .unwrap();
+                assert!(next.is_empty());
+                assert_eq!(next.sequence_cursor, 2);
+            });
+        });
+        assert!(logs.contains("Ignoring `config_changes` row"), "{logs}");
+        assert!(logs.contains(reason), "{logs}");
+        assert!(logs.contains("values withheld"), "{logs}");
+        assert!(!logs.contains("UNREGISTERED"), "{logs}");
+    }
 }
 
 fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
@@ -822,7 +886,7 @@ mod mongo_incremental_poll_contract {
         );
         let message = error.to_string();
         assert!(
-            message.contains("non-string field 'resource_id'"),
+            message.contains("non-string field `resource_id`"),
             "typed decode error must name the field, got: {message}"
         );
         assert!(
@@ -841,7 +905,7 @@ mod mongo_incremental_poll_contract {
         let error = poll_cursor(1, &[missing, later])
             .expect_err("missing operation must abort before the cursor can move");
         assert!(
-            error.to_string().contains("missing field 'operation'"),
+            error.to_string().contains("missing field `operation`"),
             "missing field must fail closed, got: {error}"
         );
     }
@@ -886,7 +950,7 @@ mod mongo_incremental_poll_contract {
             };
             let message = error.to_string();
             assert!(
-                message.contains("invalid 'sequence'"),
+                message.contains("invalid `sequence`"),
                 "{label} sequence error must name the field, got: {message}"
             );
             assert!(
@@ -908,7 +972,7 @@ mod mongo_incremental_poll_contract {
         let error = decode_mongo_config_change_record(&malformed)
             .expect_err("a Double beyond 2^53 must fail closed");
         assert!(
-            error.to_string().contains("invalid 'sequence'"),
+            error.to_string().contains("invalid `sequence`"),
             "out-of-range sequence must fail closed, got: {error}"
         );
     }
@@ -923,7 +987,7 @@ mod mongo_incremental_poll_contract {
         let error = decode_mongo_config_change_record(&malformed)
             .expect_err("a string sequence must fail closed");
         assert!(
-            error.to_string().contains("invalid 'sequence'"),
+            error.to_string().contains("invalid `sequence`"),
             "string sequence must fail closed, got: {error}"
         );
     }

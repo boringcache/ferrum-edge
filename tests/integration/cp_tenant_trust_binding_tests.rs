@@ -1586,7 +1586,7 @@ fn duplicate_key_ids_are_refused_as_ambiguous_selection() {
     .to_string();
     let error = CpDpTrustBundle::from_document_str(&document, "dup-bundle", None)
         .expect_err("duplicate kids must be refused");
-    assert!(error.contains("duplicate kid"), "got: {error}");
+    assert!(error.contains("duplicate `kid`"), "got: {error}");
 }
 
 #[test]
@@ -1647,6 +1647,33 @@ fn malformed_bundles_are_refused_without_echoing_material() {
             !error.contains(TENANT_A_SECRET) && !error.contains("too-short"),
             "startup errors must not echo secret material, got: {error}"
         );
+    }
+}
+
+#[test]
+fn trust_bundle_version_and_algorithm_errors_withhold_unregistered_values() {
+    for (document, secret, required) in [
+        (
+            json!({"version": 429400001, "keys": []}),
+            "429400001",
+            "unsupported version <redacted scalar>; only version 1 is understood",
+        ),
+        (
+            json!({"keys": [{
+                "kid": "fixture",
+                "algorithm": "UNREGISTERED_ALGORITHM_TOKEN",
+                "secret": TENANT_A_SECRET,
+                "namespaces": [TENANT_A]
+            }]}),
+            "UNREGISTERED_ALGORITHM_TOKEN",
+            "unsupported algorithm <redacted scalar>",
+        ),
+    ] {
+        let error = CpDpTrustBundle::from_document_str(&document.to_string(), "fixture", None)
+            .expect_err("unsupported document scalar must be refused");
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains(TENANT_A_SECRET), "{error}");
+        assert!(error.contains(required), "{error}");
     }
 }
 

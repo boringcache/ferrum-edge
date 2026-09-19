@@ -162,7 +162,7 @@ fn upstream_rejects_a_system_source_with_a_path_or_options() {
         assert!(
             errors
                 .iter()
-                .any(|error| error.contains("must be exactly 'system://'")),
+                .any(|error| error.contains("must be exactly `system://`")),
             "'{value}' must be rejected rather than silently selecting system roots: {errors:?}"
         );
     }

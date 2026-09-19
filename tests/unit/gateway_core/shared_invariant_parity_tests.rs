@@ -38,6 +38,63 @@ use ferrum_edge::tls::backend::SvidGenerationMatcher;
 use ferrum_edge::util::sharding::pool_shard_amount;
 use serde_json::json;
 
+#[test]
+fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
+    let entry = source("src/gateway_entry.rs");
+    let diagnostics: Vec<&str> = entry
+        .split("error!(")
+        .skip(1)
+        .map(|invocation| invocation.split(';').next().unwrap())
+        .collect();
+
+    for sibling in [
+        "Validation error:",
+        "Configuration error:",
+        "Failed to create tokio runtime:",
+        "Failed to initialize the admin audit pipeline:",
+        "Failed to register SIGTERM handler:",
+        "Failed to register SIGINT handler:",
+        "Failed to await Ctrl+C notification:",
+        "Failed to register SIGHUP handler:",
+        "Fatal error:",
+        "FIPS verification failed:",
+        "Ambient UDP node preflight failed:",
+    ] {
+        assert!(
+            diagnostics.iter().any(|site| site.contains(sibling)),
+            "startup diagnostic inventory lost {sibling}"
+        );
+    }
+    for diagnostic in diagnostics {
+        assert!(
+            diagnostic.contains("render_startup_error("),
+            "startup errors must share cause-chain rendering and redaction: {diagnostic}"
+        );
+    }
+    assert!(
+        item_body(&entry, "fn emit_bootstrap_error(", "\n}\n").contains("render_startup_error("),
+        "bootstrap failures bypass tracing and must use the same redaction boundary"
+    );
+}
+
+#[test]
+fn startup_redaction_never_derives_database_tls_urls() {
+    let entry = source("src/gateway_entry.rs");
+    for derivation in [
+        "effective_db_url",
+        "effective_db_read_replica_url",
+        "effective_db_failover_urls",
+    ] {
+        assert!(
+            !entry.contains(derivation),
+            "diagnostic inventory must not fetch or persist TLS material: {derivation}"
+        );
+    }
+    for raw_url in [".db_url", ".db_read_replica_url", ".db_failover_urls"] {
+        assert!(entry.contains(raw_url), "redaction lost {raw_url}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared source-inventory helpers
 // ---------------------------------------------------------------------------
@@ -2301,7 +2358,12 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
     ] {
         let text = admission_source_without_line_comments(&source(path));
         assert!(
-            item_body(&text, signature, terminator).contains("json_object::deserialize_object_vec"),
+            [
+                "json_object::deserialize_object_vec",
+                "json_object::from_json_object_vec_value",
+            ]
+            .iter()
+            .any(|guard| item_body(&text, signature, terminator).contains(guard)),
             "{path}: raw JSON lists must guard every typed struct element"
         );
     }
@@ -2333,7 +2395,7 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         "fn decode_virtual_service_l4_upstreams(",
     ] {
         assert!(
-            item_body(&text, signature, "\n}").contains("json_object::deserialize_object("),
+            item_body(&text, signature, "\n}").contains("json_object::from_json_object_value("),
             "{signature}: typed L4 resource elements must require objects"
         );
     }

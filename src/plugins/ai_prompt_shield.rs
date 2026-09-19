@@ -604,10 +604,9 @@ impl AiPromptShield {
                             placeholder,
                         });
                     }
-                    Err(e) => {
+                    Err(_) => {
                         return Err(format!(
-                            "ai_prompt_shield: failed to compile custom pattern '{}': {}",
-                            name, e,
+                            "ai_prompt_shield: `custom_patterns[{index}].regex` is invalid or too complex"
                         ));
                     }
                 }
@@ -2131,7 +2130,7 @@ fn render_placeholder(template: &str, name: &str) -> Result<String, String> {
     let placeholder = template.replace("{type}", name);
     if placeholder.len() > MAX_REDACTION_PLACEHOLDER_BYTES {
         return Err(format!(
-            "ai_prompt_shield: 'redaction_placeholder' rendered for pattern '{name}' must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
+            "ai_prompt_shield: 'redaction_placeholder' rendered for pattern {name:?} must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
         ));
     }
     Ok(placeholder)

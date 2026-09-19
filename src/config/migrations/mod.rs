@@ -120,7 +120,7 @@ impl MigrationConnectionLock {
                     }
                 }
             }
-            other => anyhow::bail!("Unsupported database type for migrations: {other}"),
+            other => anyhow::bail!("Unsupported database type for migrations: {other:?}"),
         }
         Ok(())
     }
@@ -865,7 +865,7 @@ impl MigrationRunner {
             "sqlite" => format!(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1"
             ),
-            other => anyhow::bail!("Unsupported database type for migrations: {other}"),
+            other => anyhow::bail!("Unsupported database type for migrations: {other:?}"),
         };
         Ok(sqlx::query(&sql)
             .fetch_optional(&mut *connection)
@@ -1343,8 +1343,14 @@ impl MigrationRunner {
                 }
 
                 info!(
-                    "Applying plugin '{}' migration V{}: {}",
-                    plugin_name, migration.version, migration.name
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!(
+                            "Applying plugin {:?} migration V\"{}\": {:?}",
+                            plugin_name, migration.version, migration.name
+                        ),
+                        &[]
+                    )
                 );
 
                 let sql = migration.sql_for_db(&self.db_type);
@@ -1356,7 +1362,7 @@ impl MigrationRunner {
                 let statements =
                     split_plugin_migration_statements(sql, &self.db_type).map_err(|err| {
                         anyhow::anyhow!(
-                            "plugin '{}' migration V{} ({}): {}",
+                            "plugin {:?} migration V\"{}\" ({:?}): {}",
                             plugin_name,
                             migration.version,
                             migration.name,
@@ -1482,8 +1488,14 @@ impl MigrationRunner {
                 };
 
                 info!(
-                    "Applied plugin '{}' migration V{}: {} ({}ms)",
-                    plugin_name, record.version, record.name, record.execution_time_ms
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!(
+                            "Applied plugin {:?} migration V\"{}\": {:?} ({}ms)",
+                            plugin_name, record.version, record.name, record.execution_time_ms
+                        ),
+                        &[]
+                    )
                 );
 
                 newly_applied.push(record);

@@ -4688,7 +4688,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
                 }
                 Some(n) if n > MAX_STREAM_WINDOW_TOKENS => {
                     return Err(format!(
-                        "ai_semantic_firewall: streaming.max_window_tokens must be less than or equal to {MAX_STREAM_WINDOW_TOKENS}, got {n}"
+                        "ai_semantic_firewall: streaming.max_window_tokens must be less than or equal to {MAX_STREAM_WINDOW_TOKENS}, got \"{n}\""
                     ));
                 }
                 Some(n) => n,
@@ -4754,7 +4754,7 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         }
         Some(millis) if millis > MAX_STREAM_HOLD_MS => {
             return Err(format!(
-                "ai_semantic_firewall: streaming.max_hold_ms must be less than or equal to {MAX_STREAM_HOLD_MS}, got {millis}"
+                "ai_semantic_firewall: streaming.max_hold_ms must be less than or equal to {MAX_STREAM_HOLD_MS}, got \"{millis}\""
             ));
         }
         Some(millis) => Some(Duration::from_millis(millis)),

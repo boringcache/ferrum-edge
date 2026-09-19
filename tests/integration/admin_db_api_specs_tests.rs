@@ -1603,7 +1603,7 @@ async fn restore_bundle_rejects_intervening_hand_owned_upstream_subset_change() 
         .await
         .expect_err("removed upstream subset must reject compensation");
     assert!(
-        error.to_string().contains("upstream_subset 'blue'"),
+        error.to_string().contains("upstream_subset \"blue\""),
         "unexpected subset validation error: {error:#}"
     );
     assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());

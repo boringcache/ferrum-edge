@@ -562,7 +562,7 @@ fn test_creation_rejects_non_string_content_type() {
     .err()
     .expect("non-string content_type must be rejected");
     assert!(
-        err.contains("'content_type' must be a string"),
+        err.contains("`content_type` must be a string"),
         "got: {err}"
     );
 }

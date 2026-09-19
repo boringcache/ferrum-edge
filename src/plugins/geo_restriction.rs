@@ -404,9 +404,12 @@ impl GeoRestriction {
 }
 
 fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
-    let object = config
-        .as_object()
-        .ok_or_else(|| format!("geo_restriction: config must be an object, got: {config}"))?;
+    let object = config.as_object().ok_or_else(|| {
+        format!(
+            "geo_restriction: config must be an object, got: {config:?}",
+            config = config.to_string()
+        )
+    })?;
     if let Some(unknown) = object
         .keys()
         .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
@@ -466,7 +469,8 @@ fn string_config(config: &Value, key: &str) -> Result<String, String> {
             "geo_restriction: '{key}' is required (path to .mmdb file)"
         )),
         Some(other) => Err(format!(
-            "geo_restriction: '{key}' must be a string, got: {other}"
+            "geo_restriction: `{key}` must be a string, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -489,7 +493,10 @@ fn parse_country_set(config: &Value, key: &str) -> Result<CountrySet, String> {
     let mut countries = CountrySet::default();
     for value in arr {
         let country = value.as_str().ok_or_else(|| {
-            format!("geo_restriction: '{key}' entries must be strings, got: {value}")
+            format!(
+                "geo_restriction: `{key}` entries must be strings, got: {value:?}",
+                value = value.to_string()
+            )
         })?;
         let Some(country_code) = CountryCode::parse(country) else {
             return Err(format!(
@@ -511,7 +518,8 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
         None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "geo_restriction: '{key}' must be a boolean, got: {other}"
+            "geo_restriction: `{key}` must be a boolean, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -522,7 +530,8 @@ fn lookup_failure_action(config: &Value) -> Result<LookupFailureAction, String> 
         Some(Value::String(action)) if action == "allow" => Ok(LookupFailureAction::Allow),
         Some(Value::String(action)) if action == "deny" => Ok(LookupFailureAction::Deny),
         Some(other) => Err(format!(
-            "geo_restriction: 'on_lookup_failure' must be 'allow' or 'deny', got: {other}"
+            "geo_restriction: `on_lookup_failure` must be `allow` or `deny`, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }

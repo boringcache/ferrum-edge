@@ -20,9 +20,10 @@
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
+#   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
-#   --h1-profile calibration|cutoff (separate manual H1 lane; see docs/h1_internal_profile.md)
+#   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -71,9 +72,11 @@ EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
 POOL_PROFILE=""
+H2_GUARD_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --experiment-manifest) EXPERIMENT_MANIFEST="$2"; shift 2 ;;
         --gateways) GATEWAYS="$2"; shift 2 ;;
         --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
@@ -103,7 +106,7 @@ if [[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]; then
     exit 2
 fi
 
-if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]]; then
+if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]] && ! { [ "$H1_PROFILE" = diagnostic ] && [ "$PAIRS" = 1 ]; }; then
     echo "--pairs must be an EVEN integer from 2 through 12 for exact position balance" >&2
     exit 2
 fi
@@ -374,6 +377,7 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    local response_cutoff=0
     case "$PROTOCOL" in
         http3)
             extra_env+=(
@@ -394,7 +398,7 @@ start_ferrum() {
                     -e FERRUM_ADMIN_HTTP_PORT=9000
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
         if [ "$gw" = ferrum-exp-cutoff-one ]; then
-            extra_env+=(-e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1)
+            response_cutoff=1
         fi
     fi
     if [ -n "$POOL_PROFILE" ]; then
@@ -420,7 +424,7 @@ start_ferrum() {
         -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0" \
-        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0" \
+        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=$response_cutoff" \
         -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
@@ -455,7 +459,8 @@ start_ferrum() {
         cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
-                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
+                "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
     fi
     wait_for_gateway
 }
@@ -858,6 +863,9 @@ run_bench() {
             extra_args+=(--ca-cert "$CERT_DIR/ca.pem")
         fi
     fi
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        extra_args+=(--h1-diagnostic)
+    fi
     local effective_concurrency
     effective_concurrency=$(scale_concurrency_for_payload "$payload" "$CONCURRENCY")
 
@@ -885,8 +893,9 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
-    if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
-        sampler_args+=(--h1-profile)
+    if [ -n "$H1_PROFILE" ] && [ "$H1_PROFILE" != diagnostic ] && [ "$target" = gateway ]; then
+        sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
+                      --h1-container-id "$GATEWAY_CID")
     fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
@@ -983,6 +992,11 @@ run_bench() {
         fi
     fi
 
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        # Preserve even partial stdout before error placeholders or stamping.
+        cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"
+        printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
+    fi
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"
@@ -1001,13 +1015,17 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
             "$diagnostics/${gateway}_${payload}_backend.log"
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_observation.py" "$out" "$usage" \
+            "$diagnostics/${gateway}_${payload}.log"
+    fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
 
     # Surface proto_bench stderr (error detail lines) if non-empty.
     local err_file="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"
-    if [ -s "$err_file" ]; then
+    if [ -s "$err_file" ] && [ "$H1_PROFILE" != diagnostic ]; then
         local err_lines
         err_lines=$(wc -l < "$err_file")
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
@@ -1035,7 +1053,7 @@ main() {
     if [ "$H3_BUDGET" -ne 0 ] && [[ " $expected_gateways " == *" envoy "* ]]; then
         expected_gateways+=" envoy-limit-4"
     fi
-    if [ "$H1_PROFILE" = cutoff ]; then
+    if [ "$H1_PROFILE" = cutoff ] || [ "$H1_PROFILE" = diagnostic ]; then
         expected_gateways+=" ferrum-exp-cutoff-one"
     fi
     if [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
@@ -1054,6 +1072,12 @@ main() {
                 "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
             if [ -n "$campaign" ]; then
                 H2_OBSERVE=1
+                H2_GUARD_OBSERVE=$(python3 "$SCRIPT_DIR/experiment_arms.py" guard \
+                    "$EXPERIMENT_MANIFEST" "$PROTOCOL")
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && { [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; }; then
+                    echo "[experiment] guard observation is hosted-only" >&2
+                    exit 2
+                fi
                 PAIRS="${campaign%% *}"
                 PAYLOAD_SIZES="${campaign#* }"
                 if [ "$PROCESS_USAGE" != true ]; then
@@ -1071,13 +1095,22 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
+    local h1_revision=""
+    if [ -n "$H1_PROFILE" ]; then
+        h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
+    fi
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
                "payload_sizes": [int(size) for size in sys.argv[3].split()],
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
                "h2_observation_enabled": sys.argv[6] == "1",
+               **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
+               **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
+                   "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
+                   "h1_revision": sys.argv[11]}
+                  if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -1098,6 +1131,14 @@ PYEOF
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
     if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            local source_identity
+            source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
+            if [ "$source_identity" != "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16" ]; then
+                echo "[experiment] image is not the pinned guard diagnostic build" >&2
+                exit 2
+            fi
+        fi
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
         if [ -n "$BASELINE_IMAGE" ]; then
@@ -1166,6 +1207,10 @@ PYEOF
             done
         done
         OUTPUT_DIR="$root_output"
+        if [ "$H1_PROFILE" = diagnostic ]; then
+            # One pass only: never pair, extend, rerun, or promote a comparison.
+            break
+        fi
         local decision
         decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" summarize "$OUTPUT_DIR" \
             "$PROTOCOL" "$expected_gateways" "$PAYLOAD_SIZES" "$final_pairs")
@@ -1209,6 +1254,9 @@ plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
 with open(path, "w") as f:
     json.dump(plan, f, indent=2)
 PYEOF
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        python3 "$SCRIPT_DIR/h1_internal_profile.py" report-diagnostic "$OUTPUT_DIR"
+    fi
     echo "[main] done. results in $OUTPUT_DIR"
 }
 

@@ -2990,7 +2990,10 @@ fn test_hide_credentials_must_be_a_boolean() {
     let Err(error) = LdapAuth::new(&config, http_client()) else {
         panic!("non-boolean hide_credentials must be rejected");
     };
-    assert!(error.contains("'hide_credentials'"), "unexpected: {error}");
+    assert!(
+        error.contains("`hide_credentials` must be a boolean"),
+        "unexpected: {error}"
+    );
 }
 
 // ─── Service-account password is never trimmed (issue #5039) ─────────────

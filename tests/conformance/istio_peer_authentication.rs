@@ -145,7 +145,7 @@ fn peer_auth_unknown_port_level_mode_fails_closed() {
     .expect_err("unknown portLevelMtls mode should reject the policy");
     let message = err.to_string();
     assert!(
-        message.contains("portLevelMtls[8080].mode") && message.contains("PREMISSIVE"),
+        message.contains("portLevelMtls[\"8080\"].mode") && message.contains("PREMISSIVE"),
         "error should identify the bad port-level mode, got: {message}"
     );
 }

@@ -400,9 +400,12 @@ impl JwksAuth {
         http_client: PluginHttpClient,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
-        let config_obj = config
-            .as_object()
-            .ok_or_else(|| format!("jwks_auth: config must be an object, got: {config}"))?;
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "jwks_auth: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         reject_unknown_fields(config_obj, &root_config_fields(), "config")?;
 
         // A blank id would collapse every jwks_auth config in a namespace onto
@@ -522,7 +525,10 @@ impl JwksAuth {
 
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
-                format!("jwks_auth: provider[{idx}] must be an object, got: {prov_cfg}")
+                format!(
+                    "jwks_auth: provider[{idx}] must be an object, got: {prov_cfg:?}",
+                    prov_cfg = prov_cfg.to_string()
+                )
             })?;
             reject_removed_provider_fields(prov_obj, idx)?;
             reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
@@ -2112,9 +2118,12 @@ fn optional_u64(
     let Some(value) = config.get(field) else {
         return Ok(default_value);
     };
-    value
-        .as_u64()
-        .ok_or_else(|| format!("jwks_auth: '{field}' must be an unsigned integer, got: {value}"))
+    value.as_u64().ok_or_else(|| {
+        format!(
+            "jwks_auth: `{field}` must be an unsigned integer, got: {value:?}",
+            value = value.to_string()
+        )
+    })
 }
 
 fn validate_max_stale_seconds(field: &str, value: u64) -> Result<(), String> {
@@ -2135,9 +2144,12 @@ fn optional_bool(config: &Map<String, Value>, field: &str) -> Result<Option<bool
     config
         .get(field)
         .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| format!("jwks_auth: '{field}' must be a boolean, got: {value}"))
+            value.as_bool().ok_or_else(|| {
+                format!(
+                    "jwks_auth: `{field}` must be a boolean, got: {value:?}",
+                    value = value.to_string()
+                )
+            })
         })
         .transpose()
 }
@@ -2178,7 +2190,10 @@ fn optional_non_empty_string(
         return Ok(None);
     };
     let raw = value.as_str().ok_or_else(|| {
-        format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a string, got: {value}")
+        format!(
+            "jwks_auth: `provider[{provider_idx}].{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
     })?;
     let value = raw.trim();
     if value.is_empty() {
@@ -2198,7 +2213,10 @@ fn parse_url_field(
         return Ok(None);
     };
     let raw = value.as_str().ok_or_else(|| {
-        format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a URL string, got: {value}")
+        format!(
+            "jwks_auth: `provider[{provider_idx}].{field}` must be a URL string, got: {value:?}",
+            value = value.to_string()
+        )
     })?;
     let url = raw.trim();
     if url.is_empty() {
@@ -2224,7 +2242,7 @@ fn parse_url_field(
         }
         scheme => {
             return Err(format!(
-                "jwks_auth: 'provider[{provider_idx}].{field}' must use http or https, got: {scheme}"
+                "jwks_auth: `provider[{provider_idx}].{field}` must use http or https, got: {scheme:?}"
             ));
         }
     }
@@ -2469,7 +2487,8 @@ fn parse_inline_jwks(
             .map(Some)
             .map_err(|e| format!("jwks_auth: 'provider[{provider_idx}].jwks' is invalid: {e}")),
         _ => Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].jwks' must be a JWKS JSON string or object, got: {value}"
+            "jwks_auth: `provider[{provider_idx}].jwks` must be a JWKS JSON string or object, got: {value:?}",
+            value = value.to_string()
         )),
     }
 }
@@ -2500,14 +2519,16 @@ fn parse_string_array(
     };
     let Some(arr) = value.as_array() else {
         return Err(format!(
-            "jwks_auth: 'provider[{provider_idx}].{field}' must be an array of strings, got: {value}"
+            "jwks_auth: `provider[{provider_idx}].{field}` must be an array of strings, got: {value:?}",
+            value = value.to_string()
         ));
     };
     let mut values = Vec::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
         let raw = entry.as_str().ok_or_else(|| {
             format!(
-                "jwks_auth: 'provider[{provider_idx}].{field}[{idx}]' must be a string, got: {entry}"
+                "jwks_auth: `provider[{provider_idx}].{field}[{idx}]` must be a string, got: {entry:?}",
+                entry = entry.to_string()
             )
         })?;
         let value = raw.trim();
@@ -2530,14 +2551,16 @@ fn parse_token_locations(
     if let Some(value) = config.get("from_headers") {
         let headers = value.as_array().ok_or_else(|| {
             format!(
-                "jwks_auth: 'provider[{provider_idx}].from_headers' must be an array of objects, got: {value}"
+                "jwks_auth: `provider[{provider_idx}].from_headers` must be an array of objects, got: {value:?}",
+                value = value.to_string()
             )
         })?;
         locations.reserve(headers.len());
         for (idx, header) in headers.iter().enumerate() {
             let object = header.as_object().ok_or_else(|| {
                 format!(
-                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}]' must be an object, got: {header}"
+                    "jwks_auth: `provider[{provider_idx}].from_headers[{idx}]` must be an object, got: {header:?}",
+                    header = header.to_string()
                 )
             })?;
             reject_unknown_fields(
@@ -2552,7 +2575,8 @@ fn parse_token_locations(
             })?;
             let raw_name = name_value.as_str().ok_or_else(|| {
                 format!(
-                    "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' must be a string, got: {name_value}"
+                    "jwks_auth: `provider[{provider_idx}].from_headers[{idx}].name` must be a string, got: {name_value:?}",
+                    name_value = name_value.to_string()
                 )
             })?;
             let name = raw_name.trim().to_ascii_lowercase();
@@ -2575,7 +2599,8 @@ fn parse_token_locations(
                 Some(Value::Null) | None => None,
                 Some(value) => {
                     return Err(format!(
-                        "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].prefix' must be a string, got: {value}"
+                        "jwks_auth: `provider[{provider_idx}].from_headers[{idx}].prefix` must be a string, got: {value:?}",
+                        value = value.to_string()
                     ));
                 }
             };
@@ -2601,7 +2626,10 @@ fn optional_provider_bool(
     value
         .as_bool()
         .ok_or_else(|| {
-            format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a boolean, got: {value}")
+            format!(
+                "jwks_auth: `provider[{provider_idx}].{field}` must be a boolean, got: {value:?}",
+                value = value.to_string()
+            )
         })
         .map(Some)
 }
@@ -2615,7 +2643,10 @@ fn optional_provider_string(
         return Ok(None);
     };
     let raw = value.as_str().ok_or_else(|| {
-        format!("jwks_auth: 'provider[{provider_idx}].{field}' must be a string, got: {value}")
+        format!(
+            "jwks_auth: `provider[{provider_idx}].{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
     })?;
     if raw.is_empty() {
         return Err(format!(
@@ -2637,7 +2668,8 @@ fn optional_provider_u64(
         .as_u64()
         .ok_or_else(|| {
             format!(
-                "jwks_auth: 'provider[{provider_idx}].{field}' must be an unsigned integer, got: {value}"
+                "jwks_auth: `provider[{provider_idx}].{field}` must be an unsigned integer, got: {value:?}",
+                value = value.to_string()
             )
         })
         .map(Some)

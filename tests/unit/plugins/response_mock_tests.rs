@@ -183,7 +183,7 @@ fn test_creation_rejects_delay_ms_over_cap() {
     }))
     .err()
     .expect("delay_ms over 1h must be rejected");
-    assert!(err.contains("'delay_ms' must be <= 3600000"), "got: {err}");
+    assert!(err.contains("`delay_ms` must be <= 3600000"), "got: {err}");
 }
 
 #[test]

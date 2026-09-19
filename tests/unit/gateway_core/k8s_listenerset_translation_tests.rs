@@ -900,7 +900,9 @@ fn duplicate_gateway_listener_section_fails_closed() {
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
     assert!(translation.warnings.iter().any(|warning| {
-        warning.contains("Gateway default/edge listener b-duplicate rejected: HostnameConflict")
+        warning.contains(
+            r#"Gateway "default"/"edge" listener "b-duplicate" rejected: HostnameConflict"#,
+        )
     }));
     let duplicate_key = GatewayApiListenerKey {
         namespace: "default".to_string(),
@@ -947,10 +949,10 @@ fn incompatible_gateway_listener_protocol_fails_closed() {
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
 
     assert!(translation.warnings.iter().any(|warning| {
-        warning.contains("Gateway default/edge listener b-tcp rejected: ProtocolConflict")
+        warning.contains(r#"Gateway "default"/"edge" listener "b-tcp" rejected: ProtocolConflict"#)
     }));
     assert!(translation.warnings.iter().any(|warning| {
-        warning.contains("Gateway default/edge listener a-http rejected: ProtocolConflict")
+        warning.contains(r#"Gateway "default"/"edge" listener "a-http" rejected: ProtocolConflict"#)
     }));
     assert!(
         translation
@@ -981,7 +983,7 @@ fn incompatible_gateway_listener_protocol_fails_closed() {
         assert_eq!(conflict.reason, "ProtocolConflict");
         assert_eq!(
             conflict.message,
-            "Port 80 is claimed by incompatible protocol families on the same TCP \
+            "Port \"80\" is claimed by incompatible protocol families on the same TCP \
              transport (HTTP-family vs raw stream), so every conflicting claim on this \
              port is refused (Conflicted)."
         );
@@ -1039,14 +1041,14 @@ fn three_claim_http_tcp_http_protocol_conflict_is_order_independent() {
             assert_eq!(conflict.reason, "ProtocolConflict");
             assert_eq!(
                 conflict.message,
-                "Port 8080 is claimed by incompatible protocol families on the same TCP \
+                "Port \"8080\" is claimed by incompatible protocol families on the same TCP \
                  transport (HTTP-family vs raw stream), so every conflicting claim on this \
                  port is refused (Conflicted)."
             );
             assert!(
                 translation.warnings.iter().any(|warning| {
                     warning.contains(&format!(
-                        "Gateway default/edge listener {name} rejected: ProtocolConflict"
+                        r#"Gateway "default"/"edge" listener {name:?} rejected: ProtocolConflict"#
                     ))
                 }),
                 "order {:?} warnings must refuse {name}: {:?}",
@@ -1147,7 +1149,7 @@ fn cross_gateway_http_and_tcp_on_same_port_protocol_conflict() {
         let translation =
             translate_k8s_objects(&objects, options().with_source_namespaces(Vec::new()))
                 .expect("translate");
-        let expected_message = "Port 8080 is claimed by incompatible protocol families on the \
+        let expected_message = "Port \"8080\" is claimed by incompatible protocol families on the \
              same TCP transport (HTTP-family vs raw stream), so every conflicting claim on this \
              port is refused (Conflicted).";
 
@@ -1280,7 +1282,8 @@ fn udp_coexists_when_http_and_tcp_protocol_conflict_on_same_port() {
     );
     assert!(
         !translation.warnings.iter().any(|warning| {
-            warning.contains("Gateway default/edge listener udp rejected: ProtocolConflict")
+            warning
+                .contains(r#"Gateway "default"/"edge" listener "udp" rejected: ProtocolConflict"#)
         }),
         "UDP must not receive ProtocolConflict warnings: {:?}",
         translation.warnings
@@ -1634,7 +1637,7 @@ fn delegated_udp_listenerset_cannot_withdraw_parent_secure_http_listener() {
 fn secure_http_udp_and_tcp_protocol_conflicts_are_candidate_accurate() {
     const PORT: u64 = 9443;
     let tcp_family_message = format!(
-        "Port {PORT} is claimed by incompatible protocol families on the same TCP \
+        "Port \"{PORT}\" is claimed by incompatible protocol families on the same TCP \
          transport (HTTP-family vs raw stream), so every conflicting claim on this \
          port is refused (Conflicted)."
     );

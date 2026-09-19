@@ -45,6 +45,7 @@ use crate::config::types::{
     validate_system_trust_roots_skip_verify_pairing, validate_tls_material_source_field,
 };
 use crate::plugins::mesh::workload_metrics::validate_istio_telemetry_config;
+use crate::startup::sanitize_startup_cause;
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -141,7 +142,7 @@ fn authorization_policy(
         other => {
             return Err(invalid_resource(
                 object,
-                format!("AuthorizationPolicy action '{other}' is unsupported"),
+                format!("AuthorizationPolicy action {other:?} is unsupported"),
             ));
         }
     };
@@ -192,8 +193,14 @@ fn authorization_policy(
     }
     if rules.is_empty() && action == PolicyAction::Allow {
         tracing::warn!(
-            namespace = %object.metadata.namespace,
-            policy = %object.metadata.name,
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            policy = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.name.to_string()),
+                &[]
+            ),
             "Istio ALLOW AuthorizationPolicy has no rules; emitting synthetic never-match allow rule to preserve allow-nothing semantics",
         );
         rules.push(allow_nothing_rule());
@@ -247,7 +254,7 @@ fn resolve_custom_action_provider(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "AuthorizationPolicy provider does not support field '{}'",
+                    "AuthorizationPolicy provider does not support field {:?}",
                     sanitize_mesh_ext_authz_diagnostic(key)
                 ),
             ));
@@ -295,7 +302,9 @@ fn resolve_custom_action_provider(
         return Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy provider.name '{display}' is declared in meshConfig as an external authorization provider variant Ferrum does not implement (only envoyExtAuthzHttp is supported)"
+                "AuthorizationPolicy provider.name {display:?} is declared in meshConfig as an \
+                 external authorization provider variant Ferrum does not implement (only \
+                 envoyExtAuthzHttp is supported)"
             ),
         ));
     }
@@ -305,14 +314,16 @@ fn resolve_custom_action_provider(
         return Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy provider.name '{display}' is declared in meshConfig but is not an external authorization provider"
+                "AuthorizationPolicy provider.name {display:?} is declared in meshConfig but is \
+                 not an external authorization provider"
             ),
         ));
     }
     Err(invalid_resource(
         object,
         format!(
-            "AuthorizationPolicy provider.name '{display}' is not declared in meshConfig.extensionProviders in the Istio root namespace '{root_namespace}'"
+            "AuthorizationPolicy provider.name {display:?} is not declared in \
+             meshConfig.extensionProviders in the Istio root namespace {root_namespace:?}"
         ),
     ))
 }
@@ -508,7 +519,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{kind_label} {path} Service '{target_namespace}/{name}' was not found; \
+                        "{kind_label} {path} Service {target_namespace:?}/{name:?} was not found; \
                          targeted policies fail closed when the target is missing"
                     ),
                 ));
@@ -531,7 +542,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{kind_label} {path} Gateway '{target_namespace}/{name}' was not found \
+                        "{kind_label} {path} Gateway {target_namespace:?}/{name:?} was not found \
                          or is not a waypoint Gateway (istio-waypoint/ferrum-waypoint); \
                          targeted policies fail closed when the target is missing"
                     ),
@@ -548,7 +559,7 @@ fn resolve_one_authorization_policy_target_ref(
                     object,
                     format!(
                         "{kind_label} {path} GatewayClass attachments must live in the Istio \
-                         root namespace ('{}')",
+                         root namespace ({:?})",
                         acc.options.istio_root_namespace
                     ),
                 ));
@@ -572,7 +583,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{kind_label} {path} GatewayClass '{name}' is unsupported; \
+                        "{kind_label} {path} GatewayClass {name:?} is unsupported; \
                          Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
                     ),
                 ));
@@ -585,7 +596,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{kind_label} {path} GatewayClass '{name}' was not found; \
+                        "{kind_label} {path} GatewayClass {name:?} was not found; \
                          targeted policies fail closed when the target is missing"
                     ),
                 ));
@@ -613,7 +624,7 @@ fn resolve_one_authorization_policy_target_ref(
         (group, kind) => Err(invalid_resource(
             object,
             format!(
-                "{kind_label} {path} group '{group}' kind '{kind}' is unsupported; \
+                "{kind_label} {path} group {group:?} kind {kind:?} is unsupported; \
                  supported attachments are Service (core) and Gateway/GatewayClass \
                  (gateway.networking.k8s.io)"
             ),
@@ -658,9 +669,9 @@ fn ensure_authz_target_ref_same_namespace(
     Err(invalid_resource(
         object,
         format!(
-            "{kind} {path} references {to_kind} '{target_namespace}/{to_name}' in \
+            "{kind} {path} references {to_kind} {target_namespace:?}/{to_name:?} in \
              another namespace; Istio {kind} targetRefs to {to_kind} are \
-             same-namespace only (policy namespace '{}')",
+             same-namespace only (policy namespace {:?})",
             object.metadata.namespace
         ),
     ))
@@ -838,7 +849,7 @@ fn service_account_principal_pattern(
     if service_account.contains('*') {
         return Err(invalid_resource(
             object,
-            format!("rules[].from[].source.{field} '{service_account}' must not contain wildcards"),
+            format!("rules[].from[].source.{field} {service_account:?} must not contain wildcards"),
         ));
     }
 
@@ -850,7 +861,8 @@ fn service_account_principal_pattern(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "rules[].from[].source.{field} '{service_account}' must be '<serviceaccount>' or '<namespace>/<serviceaccount>'"
+                    "rules[].from[].source.{field} {service_account:?} must be \
+                     `<serviceaccount>` or `<namespace>/<serviceaccount>`"
                 ),
             ));
         }
@@ -861,7 +873,8 @@ fn service_account_principal_pattern(
         return Err(invalid_resource(
             object,
             format!(
-                "rules[].from[].source.{field} '{service_account}' must include a non-empty namespace and service account"
+                "rules[].from[].source.{field} {service_account:?} must include a non-empty \
+                 namespace and service account"
             ),
         ));
     }
@@ -885,7 +898,7 @@ fn source_negation_match(
                     crate::modes::mesh::config::ParsedCidr::parse(&block).map_err(|reason| {
                         invalid_resource(
                             object,
-                            format!("rules[].from[].source.{field} '{block}' is invalid: {reason}"),
+                            format!("rules[].from[].source.{field} {block:?} is invalid: {reason}"),
                         )
                     })
                 })
@@ -940,7 +953,7 @@ fn validate_supported_source_fields(
             _ => {
                 return Err(invalid_resource(
                     object,
-                    format!("rules[].from[].source.{key} is unsupported"),
+                    format!("rules[].from[].source[{key:?}] is unsupported"),
                 ));
             }
         }
@@ -983,7 +996,7 @@ fn validate_supported_operation_fields(
             _ => {
                 return Err(invalid_resource(
                     object,
-                    format!("rules[].to[].operation.{key} is unsupported"),
+                    format!("rules[].to[].operation[{key:?}] is unsupported"),
                 ));
             }
         }
@@ -1110,7 +1123,7 @@ fn peer_authentication(
         let port = port_from_string(object, port, "portLevelMtls")?;
         let mode =
             mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE")).map_err(|message| {
-                invalid_resource(object, format!("portLevelMtls[{port}].mode {message}"))
+                invalid_resource(object, format!("portLevelMtls[\"{port}\"].mode {message}"))
             })?;
         port_overrides.insert(port, mode);
     }
@@ -1396,8 +1409,14 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
     for field in ["outputPayloadToHeader", "fromCookies"] {
         if rule.get(field).is_some() {
             tracing::warn!(
-                namespace = %object.metadata.namespace,
-                resource = %object.metadata.name,
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.namespace.to_string()),
+                    &[]
+                ),
+                resource = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.name.to_string()),
+                    &[]
+                ),
                 field = field,
                 "RequestAuthentication jwtRules[] field is recognized but not enforced; \
                  surfaced in status deferred_fields",
@@ -1460,7 +1479,7 @@ fn jwt_output_claim_to_headers(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "{path} does not support field '{}'",
+                        "{path} does not support field {:?}",
                         crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(key)
                     ),
                 ));
@@ -1477,7 +1496,7 @@ fn jwt_output_claim_to_headers(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "{path} declares header '{header}' more than once; a destination may be \
+                    "{path} declares header {header:?} more than once; a destination may be \
                      asserted from exactly one claim"
                 ),
             ));
@@ -1631,7 +1650,7 @@ fn port_from_string(object: &K8sObject, raw: &str, field: &str) -> Result<u16, K
     let parsed = raw.parse::<u64>().map_err(|_| {
         invalid_resource(
             object,
-            format!("{field} must be a numeric port between 1 and 65535 (got {raw})"),
+            format!("{field} must be a numeric port between 1 and 65535 (got {raw:?})"),
         )
     })?;
     port_from_u64(object, parsed, field)
@@ -1749,20 +1768,16 @@ fn translate_port_level_settings(
                 "trafficPolicy.portLevelSettings[].port.number must be an integer",
             )
         })?;
-        if port_u64 == 0 || port_u64 > u16::MAX as u64 {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "trafficPolicy.portLevelSettings[].port.number must be 1-65535 (got {port_u64})"
-                ),
-            ));
-        }
-        let port = port_u64 as u16;
+        let port = port_from_u64(
+            object,
+            port_u64,
+            "trafficPolicy.portLevelSettings[].port.number",
+        )?;
 
         if !seen_ports.insert(port) {
             return Err(invalid_resource(
                 object,
-                format!("trafficPolicy.portLevelSettings has duplicate port {port}"),
+                format!("trafficPolicy.portLevelSettings has duplicate port \"{port}\""),
             ));
         }
         let policy =
@@ -1892,13 +1907,13 @@ fn translate_tcp_max_connections(
     if raw <= 0 {
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.tcp.maxConnections must be positive, got {raw}"),
+            "trafficPolicy.connectionPool.tcp.maxConnections must be positive".to_string(),
         ));
     }
     if raw > i64::from(u32::MAX) {
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.tcp.maxConnections ({raw}) exceeds u32::MAX"),
+            format!("trafficPolicy.connectionPool.tcp.maxConnections (\"{raw}\") exceeds u32::MAX"),
         ));
     }
     Ok(Some(raw as u32))
@@ -1941,7 +1956,7 @@ fn translate_tcp_keepalive(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes ({raw}) exceeds u32::MAX"
+                        "trafficPolicy.connectionPool.tcp.tcpKeepalive.probes (\"{raw}\") exceeds u32::MAX"
                     ),
                 ));
             }
@@ -1969,7 +1984,8 @@ fn parse_keepalive_duration_seconds(
         invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} '{raw}' is not a valid Istio duration"
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} {raw:?} is not a valid \
+                 Istio duration"
             ),
         )
     })?;
@@ -1977,7 +1993,8 @@ fn parse_keepalive_duration_seconds(
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} must be at least 1s, got '{raw}'"
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} must be at least 1s, got \
+                 {raw:?}"
             ),
         ));
     }
@@ -1985,7 +2002,9 @@ fn parse_keepalive_duration_seconds(
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} '{raw}' must be a whole number of seconds (sub-second precision is not supported by TCP keepalive socket options)"
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} {raw:?} must be a whole \
+                 number of seconds (sub-second precision is not supported by TCP keepalive \
+                 socket options)"
             ),
         ));
     }
@@ -1994,7 +2013,8 @@ fn parse_keepalive_duration_seconds(
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} '{raw}' exceeds u32::MAX seconds"
+                "trafficPolicy.connectionPool.tcp.tcpKeepalive.{field} {raw:?} exceeds u32::MAX \
+                 seconds"
             ),
         ));
     }
@@ -2057,7 +2077,10 @@ fn translate_connection_pool_http(
     if let Some(v) = http.get("maxRequestsPerConnection") {
         let _ = translate_http_uint32(object, "maxRequestsPerConnection", v, true)?;
         acc.warnings.push(format!(
-            "DestinationRule {}/{}: connectionPool.http.maxRequestsPerConnection is parsed and validated but not applied (backend close-after-N-requests is unsupported); use maxConcurrentStreams for per-connection HTTP/2 stream concurrency or http2MaxRequests for the destination-wide active-request budget instead",
+            "DestinationRule {:?}/{:?}: connectionPool.http.maxRequestsPerConnection is parsed \
+             and validated but not applied (backend close-after-N-requests is unsupported); use \
+             maxConcurrentStreams for per-connection HTTP/2 stream concurrency or \
+             http2MaxRequests for the destination-wide active-request budget instead",
             object.metadata.namespace, object.metadata.name
         ));
     }
@@ -2219,7 +2242,8 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
         invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.http.idleTimeout '{raw}' is not a valid Istio duration"
+                "trafficPolicy.connectionPool.http.idleTimeout {raw:?} is not a valid Istio \
+                 duration"
             ),
         )
     })?;
@@ -2227,7 +2251,7 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.http.idleTimeout must be at least 1s, got '{raw}'"
+                "trafficPolicy.connectionPool.http.idleTimeout must be at least 1s, got {raw:?}"
             ),
         ));
     }
@@ -2235,7 +2259,8 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.http.idleTimeout '{raw}' must be a whole number of seconds (sub-second precision is not supported by the proxy idle-timeout field)"
+                "trafficPolicy.connectionPool.http.idleTimeout {raw:?} must be a whole number of \
+                 seconds (sub-second precision is not supported by the proxy idle-timeout field)"
             ),
         ));
     }
@@ -2244,7 +2269,8 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.http.idleTimeout '{raw}' exceeds the proxy idle-timeout cap of {}s",
+                "trafficPolicy.connectionPool.http.idleTimeout {raw:?} exceeds the proxy \
+                 idle-timeout cap of {}s",
                 crate::config::types::MAX_POOL_IDLE_TIMEOUT
             ),
         ));
@@ -2265,7 +2291,7 @@ fn parse_tcp_idle_timeout_seconds(object: &K8sObject, raw: &str) -> Result<u64, 
         invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.idleTimeout '{raw}' is not a valid Istio duration"
+                "trafficPolicy.connectionPool.tcp.idleTimeout {raw:?} is not a valid Istio duration"
             ),
         )
     })?;
@@ -2276,7 +2302,8 @@ fn parse_tcp_idle_timeout_seconds(object: &K8sObject, raw: &str) -> Result<u64, 
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.idleTimeout '{raw}' must be a whole number of seconds (sub-second precision is not supported by the proxy idle-timeout field)"
+                "trafficPolicy.connectionPool.tcp.idleTimeout {raw:?} must be a whole number of \
+                 seconds (sub-second precision is not supported by the proxy idle-timeout field)"
             ),
         ));
     }
@@ -2285,7 +2312,8 @@ fn parse_tcp_idle_timeout_seconds(object: &K8sObject, raw: &str) -> Result<u64, 
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.connectionPool.tcp.idleTimeout '{raw}' exceeds the proxy idle-timeout cap of {}s",
+                "trafficPolicy.connectionPool.tcp.idleTimeout {raw:?} exceeds the proxy \
+                 idle-timeout cap of {}s",
                 crate::config::types::MAX_TCP_IDLE_TIMEOUT
             ),
         ));
@@ -2339,7 +2367,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].from \
-                         '{from}' is not a valid region[/zone[/subzone]] locality"
+                         {from:?} is not a valid region[/zone[/subzone]] locality"
                     ),
                 ));
             }
@@ -2358,7 +2386,7 @@ fn translate_locality_lb_setting(
                         object,
                         format!(
                             "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
-                             key '{locality}' is not a valid region[/zone[/subzone]] locality"
+                             key {locality:?} is not a valid region[/zone[/subzone]] locality"
                         ),
                     ));
                 }
@@ -2367,7 +2395,7 @@ fn translate_locality_lb_setting(
                         object,
                         format!(
                             "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
-                             value for '{locality}' must be a non-negative integer"
+                             value for {locality:?} must be a non-negative integer"
                         ),
                     )
                 })?;
@@ -2376,7 +2404,7 @@ fn translate_locality_lb_setting(
                         object,
                         format!(
                             "trafficPolicy.loadBalancer.localityLbSetting.distribute[{idx}].to \
-                             value for '{locality}' exceeds u32::MAX"
+                             value for {locality:?} exceeds u32::MAX"
                         ),
                     ));
                 }
@@ -2422,7 +2450,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].from \
-                         '{from}' is not a valid region name"
+                         {from:?} is not a valid region name"
                     ),
                 ));
             }
@@ -2441,7 +2469,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}].to \
-                         '{to}' is not a valid region name"
+                         {to:?} is not a valid region name"
                     ),
                 ));
             }
@@ -2450,7 +2478,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.failover[{idx}] cannot fail \
-                         over a region to itself ('{from}')"
+                         over a region to itself ({from:?})"
                     ),
                 ));
             }
@@ -2506,9 +2534,15 @@ fn translate_locality_lb_setting(
             // trip this raw-string dedupe.
             if !seen.insert(raw.to_string()) {
                 tracing::warn!(
-                    resource = %object.metadata.name,
-                    namespace = %object.metadata.namespace,
-                    key = %key,
+                    resource = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.namespace.to_string()),
+                        &[]
+                    ),
+                    key = %sanitize_startup_cause(format!("{:?}", key.to_string()), &[]),
                     index = idx,
                     "DestinationRule localityLbSetting.failoverPriority contains a duplicate \
                      identical entry; each list position remains a match step (expected values \
@@ -2606,7 +2640,7 @@ fn translate_client_tls_settings(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "trafficPolicy.tls.mode '{other}' is unsupported (expected one of \
+                    "trafficPolicy.tls.mode {other:?} is unsupported (expected one of \
                      DISABLE, SIMPLE, MUTUAL, ISTIO_MUTUAL)"
                 ),
             ));
@@ -2622,7 +2656,7 @@ fn translate_client_tls_settings(
         return Err(invalid_resource(
             object,
             format!(
-                "trafficPolicy.tls.subjectAltNames must not have more than {} entries (got {})",
+                "trafficPolicy.tls.subjectAltNames must not have more than {} entries (got \"{}\")",
                 MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
                 subject_alt_names.len()
             ),
@@ -2633,7 +2667,8 @@ fn translate_client_tls_settings(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "trafficPolicy.tls.subjectAltNames[{idx}] must not exceed {} characters (got {})",
+                    "trafficPolicy.tls.subjectAltNames[{idx}] must not exceed {} characters (got \
+                     \"{}\")",
                     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
                     san.len()
                 ),
@@ -2703,7 +2738,7 @@ fn translate_client_tls_settings(
         MtlsMode::Strict | MtlsMode::Permissive => {
             return Err(invalid_resource(
                 object,
-                format!("trafficPolicy.tls.mode '{mode_raw}' is not a client-side TLS mode"),
+                format!("trafficPolicy.tls.mode {mode_raw:?} is not a client-side TLS mode"),
             ));
         }
     }
@@ -2807,8 +2842,14 @@ fn translate_outlier_detection(
     for field in DEFERRED_OUTLIER_DETECTION_FIELDS {
         if value.get(field).is_some() {
             tracing::warn!(
-                namespace = %object.metadata.namespace,
-                resource = %object.metadata.name,
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.namespace.to_string()),
+                    &[]
+                ),
+                resource = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.name.to_string()),
+                    &[]
+                ),
                 field = field,
                 "DestinationRule outlierDetection field is parsed but not applied; surfaced in \
                  status deferred_fields",
@@ -2836,7 +2877,10 @@ fn translate_load_balancer(
             "RANDOM" => MeshSimpleLb::Random,
             "PASSTHROUGH" => {
                 acc.warnings.push(format!(
-                    "DestinationRule {}/{} loadBalancer.simple=PASSTHROUGH dials the captured original destination when it matches a configured upstream target; requests with no captured original destination (e.g. non-mesh / non-captured paths) or one that matches no target fall back to round-robin",
+                    "DestinationRule {:?}/{:?} loadBalancer.simple=PASSTHROUGH dials the \
+                     captured original destination when it matches a configured upstream target; \
+                     requests with no captured original destination (e.g. non-mesh / \
+                     non-captured paths) or one that matches no target fall back to round-robin",
                     object.metadata.namespace, object.metadata.name
                 ));
                 MeshSimpleLb::Passthrough
@@ -2844,7 +2888,7 @@ fn translate_load_balancer(
             other => {
                 return Err(invalid_resource(
                     object,
-                    format!("loadBalancer.simple '{other}' is unsupported"),
+                    format!("loadBalancer.simple {other:?} is unsupported"),
                 ));
             }
         };
@@ -2909,7 +2953,7 @@ fn translate_subset(
         .is_some_and(|entries| !entries.is_empty())
     {
         acc.warnings.push(format!(
-            "DestinationRule {}/{}: subsets[].trafficPolicy.portLevelSettings is not applied \
+            "DestinationRule {:?}/{:?}: subsets[].trafficPolicy.portLevelSettings is not applied \
              (subset-scoped port-level settings are unsupported); express per-port policy at \
              top-level trafficPolicy.portLevelSettings or use subset connectionPool fields",
             object.metadata.namespace, object.metadata.name
@@ -2957,7 +3001,7 @@ fn mtls_mode(value: &str) -> Result<MtlsMode, String> {
         "PERMISSIVE" | "UNSET" => Ok(MtlsMode::Permissive),
         "DISABLE" => Ok(MtlsMode::Disable),
         other => Err(format!(
-            "unsupported value '{other}' (expected one of UNSET, DISABLE, PERMISSIVE, STRICT)"
+            "unsupported value {other:?} (expected one of UNSET, DISABLE, PERMISSIVE, STRICT)"
         )),
     }
 }
@@ -3066,7 +3110,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         service_account_raw.unwrap_or("default")
     );
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
-        .map_err(|e| invalid_resource(object, format!("invalid workload SPIFFE ID: {e}")))?;
+        .map_err(|_| invalid_resource(object, "invalid workload SPIFFE ID"))?;
 
     let weight = object
         .spec
@@ -3081,7 +3125,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
             if raw > u64::from(MAX_TARGET_WEIGHT) {
                 return Err(invalid_resource(
                     object,
-                    format!("WorkloadEntry.weight must be 0..={MAX_TARGET_WEIGHT} (got {raw})"),
+                    format!("WorkloadEntry.weight must be 0..={MAX_TARGET_WEIGHT}"),
                 ));
             }
             Ok(raw as u32)
@@ -3299,7 +3343,7 @@ fn validate_vs_header_block(
             return Err(invalid_resource(
                 object,
                 format!(
-                    "VirtualService {path} does not support field '{}'",
+                    "VirtualService {path} does not support field {:?}",
                     crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(key)
                 ),
             ));
@@ -3320,7 +3364,7 @@ fn validate_vs_header_block(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "VirtualService {path}.{direction} does not support field '{}'",
+                        "VirtualService {path}.{direction} does not support field {:?}",
                         crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(key)
                     ),
                 ));
@@ -3350,7 +3394,7 @@ fn validate_vs_header_block(
                         object,
                         format!(
                             "VirtualService {field} cannot write framing or hop-by-hop header \
-                             '{normalized}'"
+                             {normalized:?}"
                         ),
                     ));
                 }
@@ -3373,21 +3417,21 @@ fn validate_vs_header_block(
                         object,
                         format!(
                             "VirtualService {field} cannot write framing or hop-by-hop header \
-                             '{normalized}'"
+                             {normalized:?}"
                         ),
                     ));
                 }
                 let value = value.as_str().ok_or_else(|| {
                     invalid_resource(
                         object,
-                        format!("VirtualService {field}['{normalized}'] must be a string"),
+                        format!("VirtualService {field}[{normalized:?}] must be a string"),
                     )
                 })?;
                 if http::header::HeaderValue::from_str(value).is_err() {
                     return Err(invalid_resource(
                         object,
                         format!(
-                            "VirtualService {field}['{normalized}'] is not a valid HTTP header \
+                            "VirtualService {field}[{normalized:?}] is not a valid HTTP header \
                              value"
                         ),
                     ));
@@ -3397,7 +3441,7 @@ fn validate_vs_header_block(
                     return Err(invalid_resource(
                         object,
                         format!(
-                            "VirtualService {field}['{normalized}'] must be a non-empty authority \
+                            "VirtualService {field}[{normalized:?}] must be a non-empty authority \
                              without whitespace"
                         ),
                     ));
@@ -3438,7 +3482,7 @@ fn validate_vs_header_name(
             invalid_resource(
                 object,
                 format!(
-                    "VirtualService {field} header name '{}' is not a valid HTTP header name",
+                    "VirtualService {field} header name {:?} is not a valid HTTP header name",
                     crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(name)
                 ),
             )
@@ -3910,13 +3954,15 @@ fn l4_route_backends(
             // with a deterministic unreachable backend (Gateway API parity).
             let blackhole = l4_all_zero_blackhole_backends(object, routes, kind, acc)?;
             acc.warnings.push(format!(
-                "VirtualService '{}' {kind}[] route {block_index} has only zero-weight split destinations; materializing blackhole backend",
+                "VirtualService {:?} {kind}[] route {block_index} has only zero-weight split \
+                 destinations; materializing blackhole backend",
                 object.metadata.name
             ));
             return Ok(blackhole);
         }
         acc.warnings.push(format!(
-            "VirtualService '{}' {kind}[] route {block_index} skipped {skipped_zero} zero-weight split destination(s)",
+            "VirtualService {:?} {kind}[] route {block_index} skipped {skipped_zero} zero-weight \
+             split destination(s)",
             object.metadata.name
         ));
     }
@@ -5009,20 +5055,33 @@ fn virtual_service_routes(
                 .filter(|delay| delay.was_clamped())
             {
                 let warning = format!(
-                    "VirtualService {}/{} http[{index}].fault.delay.fixedDelay is {} ms; \
-                     clamping to Ferrum's {} ms fault-delay cap",
+                    "VirtualService {:?}/{:?} http[{index}].fault.delay.fixedDelay is \"{}\" ms; \
+                     clamping to the Ferrum {} ms fault-delay cap",
                     object.metadata.namespace,
                     object.metadata.name,
                     delay.requested_ms,
                     delay.applied_ms,
                 );
                 tracing::warn!(
-                    resource = %object.metadata.name,
-                    namespace = %object.metadata.namespace,
+                    resource = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.name.to_string()),
+                        &[]
+                    ),
+                    namespace = %sanitize_startup_cause(
+                        format!("{:?}", object.metadata.namespace.to_string()),
+                        &[]
+                    ),
                     http_route_index = index,
-                    requested_delay_ms = delay.requested_ms,
-                    applied_delay_ms = delay.applied_ms,
-                    "{warning}"
+                    requested_delay_ms = %sanitize_startup_cause(
+                        format!("{:?}", delay.requested_ms.to_string()),
+                        &[]
+                    ),
+                    applied_delay_ms = %sanitize_startup_cause(
+                        format!("{:?}", delay.applied_ms.to_string()),
+                        &[]
+                    ),
+                    "{}",
+                    sanitize_startup_cause(&warning, &[])
                 );
                 acc.warnings.push(warning);
             }
@@ -5406,12 +5465,13 @@ fn route_backends(
     if skipped_zero > 0 {
         if backends.is_empty() && !active_route_without_backend {
             acc.warnings.push(format!(
-                "VirtualService '{}' HTTP route {} has only zero-weight split destinations; no proxy was materialized",
+                "VirtualService {:?} HTTP route {} has only zero-weight split destinations; no \
+                 proxy was materialized",
                 object.metadata.name, route_index
             ));
         } else {
             acc.warnings.push(format!(
-                "VirtualService '{}' HTTP route {} skipped {} zero-weight split destination(s)",
+                "VirtualService {:?} HTTP route {} skipped {} zero-weight split destination(s)",
                 object.metadata.name, route_index, skipped_zero
             ));
         }
@@ -5447,9 +5507,10 @@ fn resolve_destination_port(
         return Err(invalid_resource(
             object,
             format!(
-                "VirtualService route.destination.host '{}' is not a recognized in-cluster service form; \
+                "VirtualService route.destination.host {:?} is not a recognized in-cluster \
+                 service form; \
                  port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or \
-                 <svc>.<ns>.svc.{} (optional trailing dot)",
+                 <svc>.<ns>.svc.{:?} (optional trailing dot)",
                 host, cluster_domain
             ),
         ));
@@ -5459,7 +5520,8 @@ fn resolve_destination_port(
         None => Err(invalid_resource(
             object,
             format!(
-                "VirtualService route.destination.port.name '{}' did not match any port on Service {}/{}",
+                "VirtualService route.destination.port.name {:?} did not match any port on \
+                 Service {:?}/{:?}",
                 name, ns, svc
             ),
         )),
@@ -5757,9 +5819,8 @@ fn route_redirect_value(
         if !(300..=399).contains(&code) {
             return Err(invalid_resource(
                 object,
-                format!(
-                    "VirtualService http[].redirect.redirectCode must be in the 300-399 range, got {code}"
-                ),
+                "VirtualService http[].redirect.redirectCode must be in the 300-399 range"
+                    .to_string(),
             ));
         }
         out.insert("redirect_code".to_string(), serde_json::json!(code));
@@ -6247,8 +6308,11 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
     // predicate and the emitted config can never disagree on representability.
     if !cors_policy_translatable(cors) {
         tracing::warn!(
-            namespace = %object.metadata.namespace,
-            name = %object.metadata.name,
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            name = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch, or the legacy allowOrigin exact list, \
              within the bounded matcher count/size and with a compilable, bounded-complexity \
@@ -7069,7 +7133,8 @@ fn telemetry(
                                 return Err(invalid_resource(
                                     object,
                                     format!(
-                                        "Telemetry tracing customTags.{key}.environment.name is required"
+                                        "Telemetry tracing customTags[{key:?}].environment.name \
+                                         is required"
                                     ),
                                 ));
                             };
@@ -7077,9 +7142,8 @@ fn telemetry(
                             // controller-host environment here — sidecar env is
                             // only known on the target data plane.
                             custom_env_tags.insert(key.clone(), name.to_string());
-                            if let Some(default_value) = env_tag
-                                .get("defaultValue")
-                                .and_then(Value::as_str)
+                            if let Some(default_value) =
+                                env_tag.get("defaultValue").and_then(Value::as_str)
                             {
                                 custom_tags.insert(key.clone(), default_value.to_string());
                             }
@@ -7165,7 +7229,8 @@ fn telemetry(
                                     return Err(invalid_resource(
                                         object,
                                         format!(
-                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
+                                            "Telemetry \
+                                             metrics.overrides[].tagOverrides[{tag_name:?}].operation is required"
                                         ),
                                     ));
                                 }
@@ -7173,7 +7238,8 @@ fn telemetry(
                                     return Err(invalid_resource(
                                         object,
                                         format!(
-                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
+                                            "Telemetry \
+                                             metrics.overrides[].tagOverrides[{tag_name:?}].operation {op:?} is unsupported"
                                         ),
                                     ));
                                 }
@@ -7266,7 +7332,8 @@ fn telemetry_metric_upsert_operation(
             invalid_resource(
                 object,
                 format!(
-                    "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value is required"
+                    "Telemetry metrics.overrides[].tagOverrides[{tag_name:?}].UPSERT value is \
+                     required"
                 ),
             )
         })?;
@@ -7279,7 +7346,7 @@ fn telemetry_metric_upsert_operation(
             object,
             message.replace(
                 "Telemetry metrics.overrides[].tagOverrides UPSERT",
-                &format!("Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT"),
+                &format!("Telemetry metrics.overrides[].tagOverrides[{tag_name:?}].UPSERT"),
             ),
         )
     })?;
@@ -7289,7 +7356,7 @@ fn telemetry_metric_upsert_operation(
             object,
             message.replace(
                 "Telemetry metrics.overrides[].tagOverrides UPSERT",
-                &format!("Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT"),
+                &format!("Telemetry metrics.overrides[].tagOverrides[{tag_name:?}].UPSERT"),
             ),
         )
     })?;
@@ -7319,9 +7386,7 @@ fn telemetry_sampling_percentage(
     if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
         return Err(invalid_resource(
             object,
-            format!(
-                "Telemetry tracing.randomSamplingPercentage must be between 0 and 100 (got {sampling})"
-            ),
+            "Telemetry tracing.randomSamplingPercentage must be between 0 and 100".to_string(),
         ));
     }
     Ok(Some(sampling))
@@ -7449,17 +7514,24 @@ fn telemetry_tracing_provider(
         }
         other => {
             let warning = format!(
-                "Telemetry {}/{} tracing.providers[] name '{}' is not a recognised inline \
+                "Telemetry {:?}/{:?} tracing.providers[] name {:?} is not a recognised inline \
                  provider type (supported: zipkin/datadog/lightstep/opentelemetry); \
                  meshConfig.extensionProviders lookup only resolves entries shaped as \
                  `{{name: \"...\"}}` (no extra fields) — provider skipped",
                 object.metadata.namespace, object.metadata.name, other
             );
             tracing::warn!(
-                resource = %object.metadata.name,
-                namespace = %object.metadata.namespace,
-                provider_name = other,
-                "{warning}"
+                resource = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.name.to_string()),
+                    &[]
+                ),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", object.metadata.namespace.to_string()),
+                    &[]
+                ),
+                provider_name = %sanitize_startup_cause(format!("{:?}", other.to_string()), &[]),
+                "{}",
+                sanitize_startup_cause(&warning, &[])
             );
             acc.warnings.push(warning);
             return Ok(None);
@@ -7490,22 +7562,28 @@ fn default_telemetry_tracing_providers(
 fn warn_missing_mesh_config_provider(acc: &mut K8sAccumulator, object: &K8sObject, name: &str) {
     let warning = if acc.mesh_config_registry.is_known_non_tracing_provider(name) {
         format!(
-            "Telemetry {}/{} references meshConfig extensionProvider '{}' which is declared but \
+            "Telemetry {:?}/{:?} references meshConfig extensionProvider {:?} which is \
+             declared but \
              not a tracing provider type Ferrum supports (zipkin/datadog/lightstep/opentelemetry); \
              provider skipped",
             object.metadata.namespace, object.metadata.name, name
         )
     } else {
         format!(
-            "Telemetry {}/{} references unknown meshConfig extensionProvider '{}'; provider skipped",
+            "Telemetry {:?}/{:?} references unknown meshConfig extensionProvider {:?}; \
+             provider skipped",
             object.metadata.namespace, object.metadata.name, name
         )
     };
     tracing::warn!(
-        resource = %object.metadata.name,
-        namespace = %object.metadata.namespace,
-        provider_name = name,
-        "{warning}"
+        resource = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
+        namespace = %sanitize_startup_cause(
+            format!("{:?}", object.metadata.namespace.to_string()),
+            &[]
+        ),
+        provider_name = %sanitize_startup_cause(format!("{:?}", name.to_string()), &[]),
+        "{}",
+        sanitize_startup_cause(&warning, &[])
     );
     acc.warnings.push(warning);
 }
@@ -7529,7 +7607,7 @@ fn telemetry_tracing_mode(
         "CLIENT" | "client" => Ok(Some(TelemetryTracingMode::Client)),
         other => Err(invalid_resource(
             object,
-            format!("Telemetry tracing.match.mode '{other}' is unsupported"),
+            format!("Telemetry tracing.match.mode {other:?} is unsupported"),
         )),
     }
 }
@@ -7568,7 +7646,8 @@ fn telemetry_provider_string_field_aliased(
             invalid_resource(
                 object,
                 format!(
-                    "Telemetry tracing.providers[] '{provider_name}' is missing required field '{field}'"
+                    "Telemetry tracing.providers[] {provider_name:?} is missing required field \
+                     `{field}`"
                 ),
             )
         })
@@ -7611,16 +7690,14 @@ fn proxy_config(
             let raw = value.as_u64().ok_or_else(|| {
                 invalid_resource(
                     object,
-                    format!(
-                        "ProxyConfig spec.concurrency must be a non-negative integer (got {value})"
-                    ),
+                    "ProxyConfig spec.concurrency must be a non-negative integer".to_string(),
                 )
             })?;
             Some(u32::try_from(raw).map_err(|_| {
                 invalid_resource(
                     object,
                     format!(
-                        "ProxyConfig spec.concurrency must fit in u32 (0..={}), got {raw}",
+                        "ProxyConfig spec.concurrency must fit in u32 (0..={})",
                         u32::MAX
                     ),
                 )
@@ -7668,19 +7745,14 @@ fn proxy_config(
             let sampling = value.as_f64().ok_or_else(|| {
                 invalid_resource(
                     object,
-                    format!(
-                        "ProxyConfig spec.tracing.sampling must be a number between 0 and 100 \
-                         (got {value})"
-                    ),
+                    "ProxyConfig spec.tracing.sampling must be a number between 0 and 100"
+                        .to_string(),
                 )
             })?;
             if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
                 return Err(invalid_resource(
                     object,
-                    format!(
-                        "ProxyConfig spec.tracing.sampling must be between 0 and 100 \
-                         (got {sampling})"
-                    ),
+                    "ProxyConfig spec.tracing.sampling must be between 0 and 100".to_string(),
                 ));
             }
             Some(sampling)
@@ -8867,7 +8939,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("rules[].to[].operation.someUnsupportedField")
+                .contains("rules[].to[].operation[\"someUnsupportedField\"]")
         );
         assert!(err.to_string().contains("unsupported"));
     }
@@ -8893,7 +8965,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("rules[].when[0].key 'destination.labels[app]'")
+                .contains("rules[].when[0].key \"destination.labels[app]\" is unsupported")
         );
         assert!(err.to_string().contains("unsupported"));
     }
@@ -11853,10 +11925,9 @@ mod tests {
             "name-only reference should be skipped when extensionProviders lookup misses"
         );
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("unknown meshConfig extensionProvider 'zipkin'")),
+            result.warnings.iter().any(|warning| {
+                warning.contains("unknown meshConfig extensionProvider \"zipkin\"")
+            }),
             "unknown name-only provider should produce an operator-visible warning"
         );
     }
@@ -17997,7 +18068,7 @@ extensionProviders:
         let err = result.expect_err("unsupported source field must reject the resource");
         assert!(
             err.to_string()
-                .contains("source.someFutureField is unsupported"),
+                .contains("source[\"someFutureField\"] is unsupported"),
             "error should name the unsupported field, got: {err}"
         );
     }
@@ -19275,7 +19346,7 @@ extensionProviders:
         .expect_err("a system trust source with a path suffix must fail translation");
 
         assert!(
-            error.to_string().contains("must be exactly 'system://'"),
+            error.to_string().contains("must be exactly `system://`"),
             "{error}"
         );
     }
@@ -19322,7 +19393,7 @@ extensionProviders:
         .expect_err("unsupported TLS mode must fail");
         assert!(
             err.to_string()
-                .contains("trafficPolicy.tls.mode 'BANANA' is unsupported"),
+                .contains("trafficPolicy.tls.mode \"BANANA\" is unsupported"),
             "got: {err}"
         );
     }
@@ -19804,11 +19875,11 @@ extensionProviders:
             );
             let err = translate_k8s_objects(&[svc.clone(), vs], options())
                 .err()
-                .unwrap_or_else(|| panic!("host '{host}' must be rejected"));
+                .unwrap_or_else(|| panic!("host {host:?} must be rejected"));
             assert!(
                 err.to_string()
                     .contains("not a recognized in-cluster service form"),
-                "host '{host}' must hit shape rejection: {err}"
+                "host {host:?} must hit shape rejection: {err}"
             );
         }
     }
@@ -19832,7 +19903,7 @@ extensionProviders:
             assert!(
                 err.to_string()
                     .contains("not a recognized in-cluster service form"),
-                "host '{host}' must hit shape rejection: {err}"
+                "host {host:?} must hit shape rejection: {err}"
             );
         }
     }
@@ -19857,7 +19928,7 @@ extensionProviders:
                 }),
             );
             let result = translate_k8s_objects(&[svc.clone(), vs], options())
-                .unwrap_or_else(|e| panic!("trailing-dot host '{host}' must resolve: {e}"));
+                .unwrap_or_else(|e| panic!("trailing-dot host {host:?} must resolve: {e}"));
             assert_eq!(result.config.proxies[0].backend_port, 8080);
         }
     }
@@ -19878,7 +19949,7 @@ extensionProviders:
                 }),
             );
             let result = translate_k8s_objects(&[svc.clone(), vs], opts.clone())
-                .unwrap_or_else(|e| panic!("custom domain host '{host}' must resolve: {e}"));
+                .unwrap_or_else(|e| panic!("custom domain host {host:?} must resolve: {e}"));
             assert_eq!(result.config.proxies[0].backend_port, 8080);
         }
     }
@@ -20406,7 +20477,7 @@ extensionProviders:
         .expect_err("port out of range must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("portLevelSettings") && msg.contains("1-65535"),
+            msg.contains("portLevelSettings") && msg.contains("between 1 and 65535"),
             "expected port out-of-range error, got {msg}"
         );
 
@@ -20429,7 +20500,7 @@ extensionProviders:
         )
         .expect_err("port zero must fail");
         assert!(
-            err.to_string().contains("1-65535"),
+            err.to_string().contains("between 1 and 65535"),
             "expected port zero error, got {err}"
         );
     }
@@ -20744,7 +20815,7 @@ extensionProviders:
         .expect_err("duplicate port must still fail");
 
         assert!(
-            err.to_string().contains("duplicate port 8080"),
+            err.to_string().contains("duplicate port \"8080\""),
             "unexpected duplicate-port error: {err}"
         );
     }

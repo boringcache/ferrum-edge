@@ -811,7 +811,10 @@ impl OidcRelyingParty {
         start_background_tasks: bool,
     ) -> Result<Self, String> {
         let config_obj = config.as_object().ok_or_else(|| {
-            format!("oidc_relying_party: config must be an object, got: {config}")
+            format!(
+                "oidc_relying_party: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
         })?;
         reject_unknown_fields(config_obj, CONFIG_FIELDS, "config")?;
         let providers = config_obj
@@ -3612,7 +3615,7 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
         }
         scheme => {
             return Err(format!(
-                "oidc_relying_party: redirect_uri must use http or https, got {scheme}"
+                "oidc_relying_party: redirect_uri must use http or https, got {scheme:?}"
             ));
         }
     }
@@ -3679,7 +3682,7 @@ fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
         }
         scheme => {
             return Err(format!(
-                "oidc_relying_party: {field} must use http or https, got {scheme}"
+                "oidc_relying_party: {field} must use http or https, got {scheme:?}"
             ));
         }
     }
@@ -3704,7 +3707,7 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
         }
         scheme => {
             return Err(format!(
-                "oidc_relying_party: discovery {field} must use http or https, got {scheme}"
+                "oidc_relying_party: discovery {field} must use http or https, got {scheme:?}"
             ));
         }
     }

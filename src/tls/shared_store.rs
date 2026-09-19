@@ -589,7 +589,7 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         // A document that does not parse is an error. A partially written one
         // cannot be observed (rename is atomic), so this is real corruption and
         // must never degrade to an empty local map.
-        let parsed = serde_json::from_slice::<T>(&bytes)
+        let parsed = crate::util::deserialization::from_json_slice::<T>(&bytes)
             .map_err(|error| SharedStoreError::parse(&self.path, error))?;
         let value = Arc::new(parsed);
         record_store_document_bytes(self.store_kind, bytes.len() as u64);

@@ -369,7 +369,9 @@ fn resolve_target_port_scope(
         return TargetPortScope {
             scope: PolicyPortScope::AllPorts,
             rejection: Some(BackendTlsPolicyError::invalid(format!(
-                "Service '{service_namespace}/{service_name}' declares more than {MAX_INDEXED_SERVICE_PORTS} ports, so Ferrum cannot determine the transport of the targeted port"
+                "Service {service_namespace:?}/{service_name:?} declares more than \
+                 {MAX_INDEXED_SERVICE_PORTS} ports, so Ferrum cannot determine the transport of \
+                 the targeted port"
             ))),
             warning: None,
         };
@@ -382,7 +384,9 @@ fn resolve_target_port_scope(
                 rejection: Some(BackendTlsPolicyError::of(
                     BackendTlsPolicyRejection::TargetNotFound,
                     format!(
-                        "spec.targetRefs[].sectionName '{section_name}' does not name a port on Service '{service_namespace}/{service_name}', so this BackendTLSPolicy attaches to nothing"
+                        "spec.targetRefs[].sectionName {section_name:?} does not name a port on \
+                         Service {service_namespace:?}/{service_name:?}, so this \
+                         BackendTLSPolicy attaches to nothing"
                     ),
                 )),
                 warning: None,
@@ -394,7 +398,9 @@ fn resolve_target_port_scope(
         // transport means the policy can never be effective.
         let rejection = (!entry.transport.is_tcp()).then(|| {
             BackendTlsPolicyError::invalid(format!(
-                "spec.targetRefs[].sectionName '{section_name}' names port {} on Service '{service_namespace}/{service_name}', whose protocol is {}; BackendTLSPolicy applies only to TCP traffic",
+                "spec.targetRefs[].sectionName {section_name:?} names port \"{}\" on Service \
+                 {service_namespace:?}/{service_name:?}, whose protocol is {:?}; \
+                 BackendTLSPolicy applies only to TCP traffic",
                 entry.port,
                 entry.transport.label()
             ))
@@ -429,7 +435,8 @@ fn resolve_target_port_scope(
             // closed so no port match can narrow the rejection away.
             scope: PolicyPortScope::AllPorts,
             rejection: Some(BackendTlsPolicyError::invalid(format!(
-                "Service '{service_namespace}/{service_name}' declares no TCP ports ({} non-TCP port(s)); BackendTLSPolicy applies only to TCP traffic",
+                "Service {service_namespace:?}/{service_name:?} declares no TCP ports ({} \
+                 non-TCP port(s)); BackendTLSPolicy applies only to TCP traffic",
                 index.ports.len()
             ))),
             warning: None,
@@ -439,7 +446,8 @@ fn resolve_target_port_scope(
         scope: PolicyPortScope::TcpPortsOnly,
         rejection: None,
         warning: Some(format!(
-            "Service '{service_namespace}/{service_name}' mixes TCP and non-TCP ports; this BackendTLSPolicy is effective only for its TCP ports"
+            "Service {service_namespace:?}/{service_name:?} mixes TCP and non-TCP ports; this \
+             BackendTLSPolicy is effective only for its TCP ports"
         )),
     }
 }
@@ -551,7 +559,7 @@ pub(super) fn collect(
     let Some(target_refs) = object.spec.get("targetRefs").and_then(Value::as_array) else {
         let message = "spec.targetRefs is required".to_string();
         acc.warnings.push(format!(
-            "Gateway API BackendTLSPolicy {}/{} is invalid: {message}",
+            "Gateway API BackendTLSPolicy {:?}/{:?} is invalid: {message}",
             object.metadata.namespace, object.metadata.name
         ));
         record_status(
@@ -568,7 +576,7 @@ pub(super) fn collect(
     if target_refs.is_empty() {
         let message = "spec.targetRefs must contain at least one entry".to_string();
         acc.warnings.push(format!(
-            "Gateway API BackendTLSPolicy {}/{} is invalid: {message}",
+            "Gateway API BackendTLSPolicy {:?}/{:?} is invalid: {message}",
             object.metadata.namespace, object.metadata.name
         ));
         record_status(
@@ -605,7 +613,7 @@ pub(super) fn collect(
     };
     if let Err(error) = &parsed {
         acc.warnings.push(format!(
-            "Gateway API BackendTLSPolicy {}/{} is invalid: {}",
+            "Gateway API BackendTLSPolicy {:?}/{:?} is invalid: {}",
             object.metadata.namespace, object.metadata.name, error.message
         ));
     }
@@ -642,7 +650,7 @@ pub(super) fn collect(
                 );
                 if let Some(warning) = &port_scope.warning {
                     acc.warnings.push(format!(
-                        "Gateway API BackendTLSPolicy {}/{}: {warning}",
+                        "Gateway API BackendTLSPolicy {:?}/{:?}: {warning}",
                         object.metadata.namespace, object.metadata.name
                     ));
                     if accepted_warning.is_none() {
@@ -651,7 +659,7 @@ pub(super) fn collect(
                 }
                 if let Some(error) = &port_scope.rejection {
                     acc.warnings.push(format!(
-                        "Gateway API BackendTLSPolicy {}/{} is invalid: {}",
+                        "Gateway API BackendTLSPolicy {:?}/{:?} is invalid: {}",
                         object.metadata.namespace, object.metadata.name, error.message
                     ));
                     if target_error.is_none() {
@@ -685,7 +693,7 @@ pub(super) fn collect(
             }
             Err(error) => {
                 acc.warnings.push(format!(
-                    "Gateway API BackendTLSPolicy {}/{} targetRef skipped: {}",
+                    "Gateway API BackendTLSPolicy {:?}/{:?} targetRef skipped: {}",
                     object.metadata.namespace, object.metadata.name, error.message
                 ));
                 if target_error.is_none() {
@@ -1009,7 +1017,8 @@ fn parse_validation(
         }
         if value != "System" {
             return Err(BackendTlsPolicyError::invalid(format!(
-                "spec.validation.wellKnownCACertificates value '{value}' is unsupported (only System)"
+                "spec.validation.wellKnownCACertificates value {value:?} is unsupported (only \
+                 System)"
             )));
         }
         // `System` is a distinct trust posture, not "unset". Projecting `None`
@@ -1087,7 +1096,7 @@ fn resolve_ca_certificate_ref(
     if !group.is_empty() {
         return Err(BackendTlsPolicyError::of(
             BackendTlsPolicyRejection::InvalidKind,
-            format!("group '{group}' is unsupported (only core ConfigMap/Secret)"),
+            format!("group {group:?} is unsupported (only core ConfigMap/Secret)"),
         ));
     }
     let kind = strict_optional_string(
@@ -1129,30 +1138,36 @@ fn resolve_ca_certificate_ref(
 
     match kind {
         "ConfigMap" => {
-            let pem = acc.configmap_ca_bundle_pem(namespace, name).ok_or_else(|| {
-                BackendTlsPolicyError::of(
-                    BackendTlsPolicyRejection::InvalidCaCertificateRef,
-                    format!(
-                        "ConfigMap '{namespace}/{name}' is missing or has no usable data.ca.crt PEM bundle"
-                    ),
-                )
-            })?;
+            let pem = acc
+                .configmap_ca_bundle_pem(namespace, name)
+                .ok_or_else(|| {
+                    BackendTlsPolicyError::of(
+                        BackendTlsPolicyRejection::InvalidCaCertificateRef,
+                        format!(
+                            "ConfigMap {namespace:?}/{name:?} is missing or has no usable \
+                         data.ca.crt PEM bundle"
+                        ),
+                    )
+                })?;
             Ok(pem.to_string())
         }
         "Secret" => {
-            let digest = acc.secret_ca_bundle_digest(namespace, name).ok_or_else(|| {
-                BackendTlsPolicyError::of(
-                    BackendTlsPolicyRejection::InvalidCaCertificateRef,
-                    format!(
-                        "Secret '{namespace}/{name}' is missing or has no usable data.ca.crt PEM bundle"
-                    ),
-                )
-            })?;
+            let digest = acc
+                .secret_ca_bundle_digest(namespace, name)
+                .ok_or_else(|| {
+                    BackendTlsPolicyError::of(
+                        BackendTlsPolicyRejection::InvalidCaCertificateRef,
+                        format!(
+                            "Secret {namespace:?}/{name:?} is missing or has no usable data.ca.crt \
+                         PEM bundle"
+                        ),
+                    )
+                })?;
             Ok(format!("k8s://{namespace}/{name}#ca.crt?sha256={digest}"))
         }
         other => Err(BackendTlsPolicyError::of(
             BackendTlsPolicyRejection::InvalidKind,
-            format!("kind '{other}' is unsupported (only ConfigMap or Secret)"),
+            format!("kind {other:?} is unsupported (only ConfigMap or Secret)"),
         )),
     }
 }
@@ -1210,7 +1225,7 @@ fn parse_subject_alt_names(validation: &Value) -> Result<Vec<String>, BackendTls
             .to_string(),
             other => {
                 return Err(BackendTlsPolicyError::invalid(format!(
-                    "spec.validation.subjectAltNames[{index}].type '{other}' is unsupported"
+                    "spec.validation.subjectAltNames[{index}].type {other:?} is unsupported"
                 )));
             }
         };
@@ -1318,7 +1333,7 @@ pub(super) fn lookup_for_service(
         BackendTlsPolicyRecord::Valid(overlay) => BackendTlsPolicyLookup::Apply(overlay.clone()),
         BackendTlsPolicyRecord::Invalid(error) => BackendTlsPolicyLookup::Fault {
             reason: format!(
-                "BackendTLSPolicy {}/{}: {}",
+                "BackendTLSPolicy {:?}/{:?}: {}",
                 winner.policy_namespace, winner.policy_name, error.message
             ),
         },
@@ -1335,10 +1350,10 @@ fn backend_target_label(backend: &RouteBackend) -> String {
         backend.service_name.as_deref(),
     ) {
         (Some(namespace), Some(name)) => match backend.service_port {
-            Some(port) => format!("Service {namespace}/{name}:{port}"),
-            None => format!("Service {namespace}/{name}"),
+            Some(port) => format!("Service {namespace:?}/{name:?}:\"{port}\""),
+            None => format!("Service {namespace:?}/{name:?}"),
         },
-        _ => format!("backend {}:{}", backend.host, backend.port),
+        _ => format!("backend {:?}:\"{}\"", backend.host, backend.port),
     }
 }
 

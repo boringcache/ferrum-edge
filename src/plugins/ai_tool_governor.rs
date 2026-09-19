@@ -7128,7 +7128,7 @@ fn parse_inspect(config: &Value) -> Result<InspectConfig, String> {
 fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     let obj = spec
         .as_object()
-        .ok_or_else(|| format!("ai_tool_governor: tool '{name}' policy must be an object"))?;
+        .ok_or_else(|| format!("ai_tool_governor: tool {name:?} policy must be an object"))?;
     let tool_path = format!("config.tools.{name}");
     reject_unknown_keys(
         obj,
@@ -7144,13 +7144,13 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     let spelled_action = match obj.get("action") {
         None => {
             return Err(format!(
-                "ai_tool_governor: tool '{name}' is missing required 'action'"
+                "ai_tool_governor: tool {name:?} is missing required `action`"
             ));
         }
         Some(value) => value.as_str().ok_or_else(|| {
             let kind = json_kind(value);
             format!(
-                "ai_tool_governor: tool '{name}' 'action' must be a string (expected allow, deny, redact_args, require_approval, or dry_run), got {kind}"
+                "ai_tool_governor: tool {name:?} `action` must be a string (expected allow, deny, redact_args, require_approval, or dry_run), got {kind}"
             )
         })?,
     };
@@ -7162,7 +7162,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         "dry_run" => ToolAction::DryRun,
         other => {
             return Err(format!(
-                "ai_tool_governor: tool '{name}' has invalid action {other:?} (expected allow, deny, redact_args, require_approval, or dry_run)"
+                "ai_tool_governor: tool {name:?} has invalid action {other:?} (expected allow, deny, redact_args, require_approval, or dry_run)"
             ));
         }
     };
@@ -7176,7 +7176,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
             let spelled = value.as_str().ok_or_else(|| {
                 let kind = json_kind(value);
                 format!(
-                    "ai_tool_governor: tool '{name}' 'risk' must be a string (expected low, medium, high, or critical), got {kind}"
+                    "ai_tool_governor: tool {name:?} `risk` must be a string (expected low, medium, high, or critical), got {kind}"
                 )
             })?;
             match spelled {
@@ -7186,7 +7186,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 "critical" => RiskLevel::Critical,
                 other => {
                     return Err(format!(
-                        "ai_tool_governor: tool '{name}' has invalid risk {other:?} (expected low, medium, high, or critical)"
+                        "ai_tool_governor: tool {name:?} has invalid risk {other:?} (expected low, medium, high, or critical)"
                     ));
                 }
             }
@@ -7198,11 +7198,11 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         Some(v) => {
             let n = v.as_u64().ok_or_else(|| {
                 format!(
-                    "ai_tool_governor: tool '{name}' 'max_arg_bytes' must be a non-negative integer"
+                    "ai_tool_governor: tool {name:?} `max_arg_bytes` must be a non-negative integer"
                 )
             })?;
             Some(usize::try_from(n).map_err(|_| {
-                format!("ai_tool_governor: tool '{name}' 'max_arg_bytes' is too large")
+                format!("ai_tool_governor: tool {name:?} `max_arg_bytes` is too large")
             })?)
         }
     };
@@ -7210,15 +7210,15 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     let mut required_args = Vec::new();
     if let Some(v) = obj.get("required_args") {
         let arr = v.as_array().ok_or_else(|| {
-            format!("ai_tool_governor: tool '{name}' 'required_args' must be an array of strings")
+            format!("ai_tool_governor: tool {name:?} `required_args` must be an array of strings")
         })?;
         for (idx, entry) in arr.iter().enumerate() {
             let s = entry.as_str().ok_or_else(|| {
-                format!("ai_tool_governor: tool '{name}' 'required_args[{idx}]' must be a string")
+                format!("ai_tool_governor: tool {name:?} `required_args[{idx}]` must be a string")
             })?;
             if s.is_empty() {
                 return Err(format!(
-                    "ai_tool_governor: tool '{name}' 'required_args[{idx}]' must not be empty"
+                    "ai_tool_governor: tool {name:?} `required_args[{idx}]` must not be empty"
                 ));
             }
             required_args.push(s.to_string());
@@ -7228,17 +7228,17 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     let mut blocked_arg_patterns = Vec::new();
     if let Some(v) = obj.get("blocked_arg_patterns") {
         let arr = v.as_array().ok_or_else(|| {
-            format!("ai_tool_governor: tool '{name}' 'blocked_arg_patterns' must be an array")
+            format!("ai_tool_governor: tool {name:?} `blocked_arg_patterns` must be an array")
         })?;
         if arr.len() > MAX_BLOCKED_ARG_PATTERNS {
             return Err(format!(
-                "ai_tool_governor: tool '{name}' 'blocked_arg_patterns' must have at most {MAX_BLOCKED_ARG_PATTERNS} entries"
+                "ai_tool_governor: tool {name:?} `blocked_arg_patterns` must have at most {MAX_BLOCKED_ARG_PATTERNS} entries"
             ));
         }
         for (idx, entry) in arr.iter().enumerate() {
             let entry_obj = entry.as_object().ok_or_else(|| {
                 format!(
-                    "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}]' must be an object"
+                    "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}]` must be an object"
                 )
             })?;
             reject_unknown_keys(
@@ -7253,12 +7253,12 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
                     format!(
-                        "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].name' is required"
+                        "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}].name` is required"
                     )
                 })?;
             if pattern_name.len() > MAX_BLOCKED_ARG_PATTERN_NAME_BYTES {
                 return Err(format!(
-                    "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].name' must be <= {MAX_BLOCKED_ARG_PATTERN_NAME_BYTES} UTF-8 bytes"
+                    "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}].name` must be <= {MAX_BLOCKED_ARG_PATTERN_NAME_BYTES} UTF-8 bytes"
                 ));
             }
             let regex_str = entry_obj
@@ -7267,19 +7267,19 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
                     format!(
-                        "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].regex' is required"
+                        "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}].regex` is required"
                     )
                 })?;
-            let regex = Regex::new(regex_str).map_err(|e| {
+            let regex = Regex::new(regex_str).map_err(|_| {
                 format!(
-                    "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}]' invalid regex: {e}"
+                    "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}]` invalid regex or complexity limit exceeded"
                 )
             })?;
             // Zero-width matches let `replace_all` insert the placeholder at
             // every position and amplify a bounded argument into gigabytes.
             if regex.is_match("") {
                 return Err(format!(
-                    "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].regex' must not match the empty string (zero-width redaction is rejected)"
+                    "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}].regex` must not match the empty string (zero-width redaction is rejected)"
                 ));
             }
             blocked_arg_patterns.push(BlockedArgPattern {
@@ -7290,7 +7290,7 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     }
     if action == ToolAction::RedactArgs && blocked_arg_patterns.is_empty() {
         return Err(format!(
-            "ai_tool_governor: tool '{name}' action 'redact_args' requires at least one 'blocked_arg_patterns' entry"
+            "ai_tool_governor: tool {name:?} action `redact_args` requires at least one `blocked_arg_patterns` entry"
         ));
     }
 
@@ -7299,13 +7299,11 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         Some(schema) => {
             if !schema.is_object() {
                 return Err(format!(
-                    "ai_tool_governor: tool '{name}' 'json_schema' must be an object"
+                    "ai_tool_governor: tool {name:?} `json_schema` must be an object"
                 ));
             }
-            Some(jsonschema::validator_for(schema).map_err(|e| {
-                format!(
-                    "ai_tool_governor: tool '{name}' 'json_schema' is not a valid JSON Schema: {e}"
-                )
+            Some(jsonschema::validator_for(schema).map_err(|_| {
+                format!("ai_tool_governor: tool {name:?} `json_schema` is not a valid JSON Schema")
             })?)
         }
     };

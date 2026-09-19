@@ -111,9 +111,11 @@ pub struct MeshRouteDispatchConfig {
 
 impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
-        serde_json::from_value::<crate::util::json_object::JsonObject<Self>>(config.clone())
-            .map(|object| object.0)
-            .map_err(|e| format!("mesh_route_dispatch config: {e}"))
+        crate::util::deserialization::from_json_value::<crate::util::json_object::JsonObject<Self>>(
+            config.clone(),
+        )
+        .map(|object| object.0)
+        .map_err(|e| format!("mesh_route_dispatch config: {e}"))
     }
 
     pub fn from_value_normalized(config: &Value) -> Result<Self, String> {
@@ -346,7 +348,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         if delay.duration_ms > MAX_FAULT_DELAY_MS {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be \
-                 <= {MAX_FAULT_DELAY_MS} (1 minute), got {}",
+                 <= {MAX_FAULT_DELAY_MS} (1 minute), got \"{}\"",
                 delay.duration_ms
             ));
         }
@@ -356,7 +358,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         if !(200..=599).contains(&abort.status_code) {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.abort.status_code must be \
-                 200-599, got {}",
+                 200-599, got \"{}\"",
                 abort.status_code
             ));
         }
@@ -366,7 +368,7 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.abort.grpc_status must be \
-                 0-16, got {code}"
+                 0-16, got \"{code}\""
             ));
         }
     }
@@ -386,7 +388,7 @@ fn validate_fault_percentage(
     if !(0.0..=100.0).contains(&percentage) {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be in [0.0, 100.0], \
-             got {percentage}"
+             got \"{percentage}\""
         ));
     }
     if percentage == 0.0 {
@@ -469,7 +471,7 @@ fn validate_and_normalize_redirect(
 ) -> Result<(), String> {
     if !(300..=399).contains(&redirect.redirect_code) {
         return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got {}",
+            "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got \"{}\"",
             redirect.redirect_code
         ));
     }
@@ -1687,9 +1689,9 @@ fn compile_authority_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex must not be empty"
                 ));
             }
-            let re = compile_full_match_regex(pattern).map_err(|e| {
+            let re = compile_full_match_regex(pattern).map_err(|_| {
                 format!(
-                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid: {e}"
+                    "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid or too complex"
                 )
             })?;
             AuthorityMatcher::Regex(re)
@@ -1771,8 +1773,10 @@ fn compile_uri_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
                 ));
             }
-            let re = compile_full_match_regex(pattern).map_err(|e| {
-                format!("mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid: {e}")
+            let re = compile_full_match_regex(pattern).map_err(|_| {
+                format!(
+                    "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid or too complex"
+                )
             })?;
             UriMatcher::Regex(re)
         }
@@ -1899,10 +1903,10 @@ fn compile_method_matchers(
                          must not be empty"
                     ));
                 }
-                let re = compile_full_match_regex(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
-                         is invalid: {e}"
+                         is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
                 MethodMatcher::Regex(re)
@@ -1946,10 +1950,10 @@ fn compile_header_matchers(
                          must not be empty"
                     ));
                 }
-                let re = compile_full_match_regex(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
-                         is invalid: {e}"
+                         is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
                 HeaderMatcher::Regex(re)

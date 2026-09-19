@@ -1,7 +1,7 @@
 # Hosted H1 internal profiling foundation (#5588)
 
-`bench-h1-profile` is a **default-off diagnostic feature**. This change adds
-measurement only. It does not change coalescing, Content-Length, body limits,
+`bench-h1-profile` is a **default-off diagnostic feature**, accompanied by
+hosted regression fixtures. It does not change coalescing, Content-Length, body limits,
 timeouts, retries, offered load, TLS verification, release optimization settings,
 or forwarding policy. #5600's client frame/chunk/TLS observations and `/proc/io`
 remain distinct sources. This branch starts at #5602 head
@@ -131,7 +131,8 @@ was executed locally for this implementation. Static inspection and
 feature-enabled clippy/binary compilation, registered external observer tests,
 private publication-seam tests located under `tests/unit/gateway_core/`, existing
 coalescer contracts with observers on/off, existing live functional streaming
-contracts, and H1 schema/completeness tests. The independent Benchmark Harness
+contracts, the explicit H1 cadence/safety matrix below, supported-protocol
+trailer gates, and H1 schema/completeness tests. The independent Benchmark Harness
 Tests discovery also runs the new Python tests. These are registrations, not
 claims of passing execution.
 
@@ -140,12 +141,17 @@ does not dispatch). Once the workflow is available to GitHub Actions:
 
 ```sh
 gh workflow run h1-internal-profile.yml \
-  --ref codex/20260918-5588-h1-profile -f payloads=all
+  --ref codex/20260918-5588-h1-profile -f payloads=all -f diagnostic_only=true
 ```
 
-The sole input is `payloads`: `all` (default), `10240`, `71680`, `512000`,
-`1048576`, or `5242880`. Root can budget separate size dispatches; all five remain
-required. Each comparison's two arms and repeated direct controls share one VM.
+`diagnostic_only=true` is the default: it runs the bounded slice below, then
+stops. Root must pin and verify the dispatched head against the pushed branch
+before interpreting artifacts; the command selects a ref, not an immutable SHA.
+For full profiles after reviewing the slice, root uses the same command with
+`-f diagnostic_only=false`. That dispatch includes its own diagnostic slice;
+there is no automatic rerun. `payloads` is `all` (default), `10240`, `71680`,
+`512000`, `1048576`, or `5242880` and applies only to full profiles. Root can
+budget separate size dispatches; all five remain required. Each comparison's two arms and repeated direct controls share one VM.
 No worker dispatch, PR, review, merge or issue write is part of this task.
 
 The manual job builds observer-off/on binaries at the **same checked-out SHA**,
@@ -168,17 +174,284 @@ Shared runner/sampler edits are isolated behind `--h1-profile`; root should
 coordinate those two file overlaps with #5602. The frozen benchmark job and its
 policy verifier are untouched.
 
-`h1_internal_profile.py` retains bounded integer-only snapshots with sample IDs,
-timestamps, scrape duration/CPU, process identity and measurement boundary slack.
-It rejects missing/malformed/decreasing counters, reused process identities,
-missing slots, loss and overflow. Idle-thread tails explicitly prevent complete
-allocation coverage. Useful traffic validity is separate from profile
-completeness. Every expected arm/pair/size is retained, including missing samples
-and failed 5 MiB observations. No surviving-worker average, guessed observer
+`h1_internal_profile.py` requires schema-2 traffic samples bound to the expected
+pair, gateway, payload and nonempty campaign host ID. The runner manifest records
+the H1 mode, `http1-tls` selection, 15-second duration and base 200 workers; each
+sample must carry the producer's `HTTP/1.1+TLS` protocol, 15-second measurement
+phase and both worker fields matching the committed 200/200/200/100/50 size table.
+Legacy samples, copied rows, aggregate samples, wrong-host samples and substituted
+workloads remain failed observations. Invalid/missing manifest selections retain
+the full expected matrix; valid budgeted payload subsets retain every selected
+pair/arm/size and do not satisfy the separate all-five-size campaign obligation.
+
+Every gateway arm also requires a versioned runtime record with embedded
+pair/arm/host/mode identity, including calibration's observer-off control. The
+runner records its full checked-out revision in the campaign manifest and
+captures the two fixed revision/observer labels from both `docker inspect` and
+`docker image inspect` of the container's immutable `sha256:` image ID. Image
+inspection has a 10-second bound. Both label sets must identify the manifest's
+full 40-hex revision and the expected `ferrum.h1-profile=off` or `on` build.
+Missing labels, overridden container labels, mutable tags, malformed metadata,
+missing runtimes and stale cross-pair records fail validation. Calibration may
+use distinct off/on images, but each arm's image ID must stay fixed across all
+four pairs. Cutoff 0/1 must use exactly one observer-on image ID across all pairs.
+
+The collector verifies the running container's command (`/app/ferrum-edge run`
+without config overrides), working directory, and the read-only bind from the
+hashed source file to `/etc/ferrum/config.yaml`. The report recomputes SHA-256
+from **each retained config file**, then requires identical config hashes across
+all gateway arms and pairs. The current runner selects cutoff in the environment,
+so **no config-file difference is permitted**, even if its new hash is valid.
+Each launch now supplies the cutoff setting exactly once; ambiguous duplicate
+environment entries fail capture. The exact safe `FERRUM_*` settings from the
+release image and runner must be present with valid values, including fixed
+file/metrics bindings and the arm's declared cutoff. Unknown settings and secret
+provider overrides fail capture without recording their names or values. Every
+other safe setting must agree across arms/pairs; only cutoff 0 versus 1 differs
+in the cutoff campaign. Other environment values and other mounts are retained
+as canonical hashes and must also agree. Only Docker's generated short-ID
+`HOSTNAME`, if present, is normalized; arbitrary hostname overrides fail.
+
+For observer-off controls, the raw process timeline must continuously bracket
+measurement with the runtime's owned host PID/start ticks, and its retained
+`h1_gateway` and embedded measurement PID must agree. Missing observer counters
+in that build are expected; missing runtime/process ownership is not. Runtime
+failures appear in each affected observation's `runtime_issues` and make
+`runtime_complete`, `traffic_complete`, `profiles_complete`, and comparison
+eligibility false. Available profile deltas and the entire declared matrix are
+still retained. These checks validate retained Docker evidence, not signed
+binary provenance, and do not retroactively certify older artifacts.
+
+Profile brackets have a **two-second total boundary-slack limit**, including the
+last scrape's duration, and a **one-second maximum start-to-start sampling gap**
+for the fixed 500 ms sampler / 200 ms HTTP timeout. They require an observation
+inside measurement, nonnegative integer sample IDs increasing consecutively,
+strictly increasing finite wall/monotonic timestamps, nonoverlapping captures,
+and wall/monotonic elapsed agreement within **50 ms of the first bracket sample**.
+Process observations must precede their scrape by at most one second. These are
+fixed acceptance limits, not bounds enlarged to rescue scheduling stalls. Excess
+slack, skipped samples and discontinuities retain available published deltas as
+partial evidence. Each accepted row needs present, finite, nonnegative numeric
+sampler CPU (booleans excluded); invalid overhead remains null with an issue,
+never silently zero. A measured zero CPU value is valid.
+
+The runner retains the owned container's full ID, host init PID/start ticks,
+host-network mode and fixed `http://127.0.0.1:9000/metrics` endpoint. The sampler
+checks that record against the selected container ID. Before **and** after each
+scrape it rereads `/proc` start ticks and `NSpid`, requires exactly one observed
+gateway, and joins the unique IPv4 loopback port-9000 LISTEN inode to that
+process's fd table. The stored namespace PID must equal the exported metrics PID
+at every accepted row; before/after and successive bindings must agree with the
+retained runtime. This distinguishes unrelated containers exporting PID 1.
+Missing permissions/ownership records, reuse, restarts, stale mappings and
+ambiguous listeners produce partial profiles. This is bounded listener ownership
+evidence, not a new syscall/connection tracing facility or a cryptographic artifact
+attestation. Older captures without the binding cannot become complete retroactively.
+
+The fixed export remains **206 counters + eight metadata fields (214 total)**.
+The consumer requires positive metrics PID, capacity 128, and 1–128 registered
+slots that never decrease. Successful traffic requires positive advancement of
+`body_proxy_output_all_data_bytes`, the guaranteed response DATA boundary for
+this H1 workload. It does not require optional coalescing, copy, vectored-write
+or EOF counters to advance, nor equate bracket bytes with measured client bytes.
+Missing/malformed/decreasing counters, missing slots, loss and overflow remain
+failures. Idle-thread tails explicitly prevent complete allocation coverage.
+Useful traffic validity is separate from profile completeness. Every expected
+arm/pair/size is retained, including missing samples and failed 5 MiB observations.
+The hosted H1 Python suite exercises complete producer-shaped campaigns and
+negative campaign, timing, identity, metadata/work and CPU cases, including
+written full-matrix reports and the capture-to-sampler ownership path. Runtime
+fixtures pass Docker-shaped inputs through the actual collector with only Docker
+inspection and `/proc` reads mocked. Hosted regressions cover missing/malformed
+image/container labels, revisions, environment/command/mount evidence, retained
+config tampering, image/config/environment drift in later pairs, and observer-off
+process ownership. The pool collector is a sibling with its own review/fix; this
+change is confined to H1 collection/reporting. No local execution was performed.
+No surviving-worker average, guessed observer
 overhead subtraction, or gain claim is produced. Raw on/off measurements are the
 overhead calibration; shared-host process CPU is not isolated proxy cost, and RSS
 is not allocation traffic. Scrape overhead is included in the gateway process and
 sampler timings, not analytically subtracted.
+
+## Bounded H1 request-drain diagnostic
+
+The retained three 5 MiB drain failures and slow 1 MiB tails still have **no
+proven cause or repair**. Process write accounting near 79 kB/s does not identify
+socket throughput, TCP pacing, a TLS flush, or an HTTP body boundary. This mode
+adds evidence at the client boundary; a clean run alone cannot resolve those
+failures. No production `src/`, allocator, body/counter, H3 observer or global
+clock implementation is changed by this diagnostic addition. Backend upload EOF,
+upstream identity joins, syscall and CPU traces remain later observations; no
+cross-hop request identity is inferred from the client IDs.
+
+`proto_bench http1 --h1-diagnostic` is default off. It wraps the existing
+`ObservedBody` admission and response `collect()` with last-state observations;
+the first transport body poll still admits work, and the existing status/exact
+bytes/content check still determines useful completion. It adds no warmup,
+retry, request deadline, flush or measurement extension. The existing `Phases`
+coordinator (the harness phase coordinator) supplies the narrow phase/snapshot
+hooks; the real connection still owns the existing `ConnectionGuard`.
+
+The parent-owned registry survives cancelled worker futures. Each registered
+worker has a numeric worker ID and one latest request record, with globally
+increasing numeric request and connection IDs within that diagnostic session.
+Connection records retain numeric local/peer socket tuples when available;
+missing tuples are null, never fabricated. Request-body first poll, accepted
+body bytes, last progress and body end; response status/version, parsed
+Content-Length and framing flags; response DATA bytes, last progress, end/error
+class and validation completion are separate observations. No paths, arbitrary
+header values, payloads or credentials enter this registry. Header flags are
+meaningful only when the headers timestamp is present. Null completion/end/error
+means unobserved, not success. Errors use bounded classes, not arbitrary error
+strings. Lifetime offered/admitted/completion/error counters survive cancellation;
+they do not reconstruct the lost worker's measured histogram or silently replace
+useful-work totals. A stale body cannot update a newer request's record: that
+update is counted as capture loss.
+
+Every timestamp carries session microseconds plus phase name and phase-relative
+microseconds in `client_process_diagnostic_session_instant_microseconds`, from
+one client `std::time::Instant` epoch. Snapshots and the final report name that
+clock domain and client PID explicitly. This is **not host CLOCK_MONOTONIC** and
+cannot be directly compared with backend, BPF, perf or another process's times.
+Measurement/drain classification follows the existing fixed deadline. Session
+origin is diagnostic creation, not the generic harness monotonic origin; existing
+wall timestamps remain approximate cross-process context only. Generic clocks
+are left for root and the separate H3 repair.
+
+At warmup +10 seconds, if workers have not reached the barrier, the coordinator
+captures one `delayed_warmup` snapshot without extending its existing preflight
+bound. It snapshots immediately before preflight/drain worker abortion, then
+after request collection and after separate driver retirement. Last await and
+stage-entry time remain intact on worker drop; lifecycle becomes
+`dropped_without_return`, which deliberately does not guess cancellation versus
+panic. Snapshot copying briefly serializes diagnostic updates, so this mode is
+intrusive and is excluded from the full off/on performance comparison.
+
+Bounds per client invocation: 256 worker records, 512 connection records, four
+snapshots, fixed-size fields and no per-packet/request history. Omitted records,
+stale/unrecordable updates, snapshot overflow and poisoned locks are explicit
+loss counters; any loss makes diagnostic completeness fail. Numeric socket
+addresses and static enums bound strings. Compact serialized diagnostic state is bounded below 4 MiB at these capacities;
+the hosted capacity regression checks the compact report. Budget up to 16 MiB
+for the pretty-printed diagnostic report in stdout and 4 MiB for the four compact
+stderr snapshots per invocation; the single slice has three client invocations. Existing process/startup logs and build/debug artifacts retain their
+existing bounds and are not covered by that diagnostic byte budget. Snapshots
+are emitted immediately as `H1_DIAGNOSTIC` JSON lines, then included in
+`phases.h1_diagnostic`, so an outer timeout need not erase pre-abort evidence.
+
+Only when enabled, driver handles are owned in a bounded `JoinSet`, finished
+handles are reaped during connection registration, and remaining handles are
+reaped **after all request workers join**. At most 512 live/unreaped driver
+handles are accepted; capacity rejection is an explicit failed worker and a
+retirement error, never a silent detach or a valid workload sample. Connection
+metadata overflow alone does not stop admission. The declared 50-worker slice
+fits both capacities; the bounds are diagnostic resource guards, not tuning.
+Retirement allows 5 seconds, then requests abort and allows 1 second to reap;
+any remaining handles are counted `unreaped_after_abort` and dropped with abort
+requested. Normal completion, Hyper error, cancellation, panic, pending/aborted
+and unreaped counts are distinct. `completed_ok` means the Hyper driver returned
+`Ok`, not peer FIN, TLS close_notify or successful request completion. In
+[Hyper 1.8.1's dispatcher](https://github.com/hyperium/hyper/blob/v1.8.1/src/proto/h1/dispatch.rs#L306),
+a response parse error delivered to `SendRequest` can be followed by driver
+`Ok`; the malformed-header regression asserts both observations separately. The old
+H1 `transport_close_secs=0`/false defaults are still **unobserved** when this mode
+is off. They must never be interpreted as successful transport closure. The
+new retirement report is authoritative only when present; driver retirement
+never increments useful request completions or replaces request-drain timing.
+
+The existing manual workflow builds its same-revision twins and common harness,
+then runs exactly one direct/cutoff-0/cutoff-1 pass using the observer-off gateway
+image and diagnostic-on client. Each arm uses 5 MiB, 50 workers (the unchanged
+200-base scaling), one full-payload warmup, 30-second measurement, 30-second
+request drain, and unchanged timeout/guard/TLS policies. Preflight remains
+70 seconds and the runner's existing outer bound remains 190 seconds per arm;
+the selected campaign budget is 900 seconds. No optional 1 MiB control, automatic
+retry or adaptive extension is added. Failed diagnostics block full profiles on
+that dispatch. The runner retains original/partial client stdout as
+`diagnostics/<arm>_5242880_client.raw.json` and exit status before writing any
+error placeholder or metadata; stderr, each sample, runtime config, process
+usage, image identity, gateway/backend logs, and the diagnostic report are all
+retained in `h1-profile-evidence/diagnostic/`. Upload remains unconditional,
+14 days, in `h1-internal-profile-<sha>-<payloads>`. The three-arm report includes
+missing/failed arms and always sets `comparison_eligible=false`.
+
+Hosted registration: `metrics_tests::h1_diagnostic_tests` exercises actual plain
+and rustls H1 worker paths, opt-in/off useful-work parity, clean responses,
+length/chunk truncation, malformed headers, the unchanged delayed warmup and
+30-second pre-abort hooks, cancellation-preserved counters, capacity/stale-update
+loss and separately timed driver cancellation. It is selected explicitly in the
+existing H1 checks job and included by the existing Benchmark Harness Tests
+`metrics_tests` target. Python selection/report/registration regressions run in
+both existing Python discovery gates. All cadence and supported-trailer gates
+remain registered unchanged. These are registrations only: no repository code,
+formatter, linter, test, build or benchmark was executed locally.
+
+## Live cadence and safety gate
+
+`tests/functional/h1_cadence_tests.rs` is registered in the functional binary on
+Linux and explicitly selected by the dedicated `cadence` job. The existing
+`functional_streaming` filter does not select it. Each observer-off/on matrix
+job compiles and lints the functional target, builds and copies its external
+binary, pins `FERRUM_EDGE_TEST_BIN`, and retains the revision, binary SHA-256,
+test output and failures in `h1-cadence-{off,on}-<sha>` artifacts. No implicit
+harness rebuild is allowed. Measurement now depends on both cadence jobs as
+well as the existing checks. PR events run these gates without measurements;
+manual dispatch uses the inputs and command above. Full calibration/measurement
+requires `diagnostic_only=false` and a successful diagnostic slice. These are hosted registrations;
+no passing execution is claimed by this implementation.
+
+Each of five tests runs cutoffs **0 and 1**, with cleartext H1 on both hops and
+with **verified TLS on both hops**. The TLS backend uses the existing `TestCa`
+and scripted `TlsConfig` with H1-only ALPN; the client trusts only that CA.
+Leased sockets and `TestGateway` supply listener ownership, child-authenticated
+readiness and cleanup. The existing scripted steps have no release barrier, so
+this module owns a small channel-driven script without changing shared runners.
+
+| Contract | Observable assertion |
+| --- | --- |
+| Tiny/delayed ordinary DATA and mixed tiny/256 KiB/tiny body | Exact ordered bytes for every released marker before the next release; first DATA and complete-marker arrival recorded |
+| One tiny frame followed by idle | Complete DATA arrives with backend EOF still withheld; no extra bytes or terminal event during the idle gate |
+| Declared-length and chunked truncation | After observed prefix, clean transport shutdown with incomplete HTTP framing causes a body error; clean EOF and client timeout cannot pass |
+| Cancellation after observed DATA | Active request count is first 1; dropping the response yields backend peer EOF/reset and a joined task within 10 seconds, followed by accounting returning to 0 within 10 seconds |
+| Delayed allowed-prefix/blocked policy window | Exact allowed SSE prefix arrives first; the later lexical leakage window yields only the exact policy error event and its `[DONE]` marker, clean downstream EOF, backend cessation and accounting release |
+
+There are 24 scenarios per observer build (truncation has two framing cases).
+All release/readiness/terminal waits are bounded. A sequence-numbered backend
+notification follows each flushed write, and only client-observed exact bytes
+authorize the next release or EOF. A **5-second** release-to-client scheduling
+tolerance covers both the write acknowledgement and complete marker; explicit
+elapsed checks complement async timeouts. The **200 ms** idle dwell starts only
+after readiness or observed DATA. The backend read timeout is **60 seconds**,
+so it cannot satisfy the cancellation bound. These are progress guards, not
+latency benchmarks. HTTP-decoded bytes may split or combine arbitrarily across
+TCP reads, TLS records and DATA callbacks.
+
+The lane checks the child executable through `/proc/<pid>/exe`, safe selected
+environment values, the exact file config, the authenticated effective route,
+and presence/absence of observer schema metrics (including child PID when on).
+An empty settings file and cleared child environment prevent inherited config
+from selecting another path. Size limiting and latency tracking are disabled.
+The fixture uses one gateway runtime worker so the existing metrics publication
+seam exposes positive direct/coalesced input evidence after completion; the
+opposite branch must stay unused. This proves branch selection, not complete
+profile accounting or coverage of multithreaded scheduling. Observer-off uses
+the same pinned source/config and direct/coalescing selection predicates.
+
+The policy case exercises `inspected_streaming_body`, which intentionally
+bypasses coalescing. It reuses the existing semantic-firewall lexical leakage
+policy and `on_error: warn` with a leased unavailable embedding provider for
+the allowed prefix; it does not establish successful embedding-provider
+inspection or ordinary-body policy semantics. The configured lexical violation
+must still block the later window. No production behavior is changed.
+
+H1 trailer preservation remains **unproven and unsupported by this adapter**:
+`body.rs::{direct_streaming_body,coalescing_body}` map reqwest `bytes_stream()`
+items to `Frame::data`; they cannot forward trailer frames. No H1 trailer pass
+is claimed. The lane explicitly retains the existing H2/gRPC hop-by-hop trailer
+filter, H2-frontend/H3-backend streaming trailer policy, and delayed-FIN trailer
+forwarding cases with both builds. These supported-protocol gates remain
+necessary for future shared-coalescer work; root must disposition the H1
+adapter limitation separately.
 
 ## Open obligations before any optimization
 
@@ -191,10 +464,11 @@ write/writev/send* returns, lost events and measured tracing overhead. No infere
 from a zero field or missing trace closes that obligation. Sampled CPU stacks and
 native/hidden copy completeness also remain open.
 
-The new lane runs existing live streaming regressions; it does **not** establish
-the full proposed tiny/delayed-frame first-byte/inter-frame latency, truncation,
-trailers, cancellation and late-policy-failure fixture. That stronger live
-regression remains a prerequisite to any later aggregation/adapter optimization.
+The live cadence/safety gates above must pass on the exact reviewed head before
+any later aggregation/adapter optimization. They cover only their declared
+contracts, not H1 trailers, all policy modes, full native memory/copy coverage,
+syscalls, sampled CPU, backpressure saturation or performance. Syscall/CPU
+tracing remains later work after the H3 foundation settles.
 Review allocator safety/publication, the nondefault feature's hosted results,
 calibration, partial-profile residuals, all-size traffic failures and source
 coverage before interpreting measurements. #5588 is not closed by instrumentation.
