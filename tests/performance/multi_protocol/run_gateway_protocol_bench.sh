@@ -20,6 +20,7 @@
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
+#   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
@@ -66,9 +67,12 @@ ORDER_POSITION=0
 HOST_ID=""
 EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
+H2_OBSERVE=0
+H2_GUARD_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --experiment-manifest) EXPERIMENT_MANIFEST="$2"; shift 2 ;;
         --gateways) GATEWAYS="$2"; shift 2 ;;
         --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
@@ -107,7 +111,7 @@ fi
 if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
     PROCESS_USAGE=false
 fi
-if ! $PROCESS_USAGE; then
+if [ "$PROCESS_USAGE" != true ]; then
     echo "[warn] process_usage unavailable; samples are diagnostic and invalid for paired comparisons" >&2
 fi
 
@@ -296,7 +300,8 @@ start_backend() {
     local saved_pwd
     saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
-    H3_PROFILE="$H3_BUDGET" ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
+    BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
+        ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
@@ -333,6 +338,12 @@ start_ferrum() {
     local config_src="$SCRIPT_DIR/configs/$(ferrum_config_name)"
     local config_file
     config_file=$(prepare_ferrum_config "$config_src" "/etc/ferrum/tls/ca.pem")
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        config_file="$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        python3 "$SCRIPT_DIR/experiment_arms.py" materialize "$EXPERIMENT_MANIFEST" \
+            "$PROTOCOL" "$gw" "$config_src" "$config_file" "$root_output/manifest.json" || return 2
+    fi
     echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_src")..."
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
@@ -352,7 +363,6 @@ start_ferrum() {
             extra_env+=(-e "$pair")
         done
     fi
-
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \
         -v "$CERT_DIR:/etc/ferrum/tls:ro" \
@@ -391,6 +401,11 @@ start_ferrum() {
         "${extra_env[@]}" \
         "$FERRUM_IMAGE")
 
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+            python3 "$SCRIPT_DIR/experiment_arms.py" verify-runtime \
+                "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$gw" "$root_output/manifest.json" || return 2
+    fi
     wait_for_gateway
 }
 
@@ -786,6 +801,12 @@ run_bench() {
         bench_target="${params[1]}"
     fi
     local extra_args=("${params[@]:3}")
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        extra_args+=(--h2-observe)
+        if [ "$PROTOCOL" = http2 ]; then
+            extra_args+=(--ca-cert "$CERT_DIR/ca.pem")
+        fi
+    fi
     local effective_concurrency
     effective_concurrency=$(scale_concurrency_for_payload "$payload" "$CONCURRENCY")
 
@@ -813,11 +834,14 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
+    if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
+        sampler_args+=(--h2-gauges)
+    fi
     if [ "$PROTOCOL" = http3 ] && [ "$H3_BUDGET" -ne 0 ]; then
         sampler_args+=(--http3)
         case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
     fi
-    if $PROCESS_USAGE; then
+    if [ "$PROCESS_USAGE" = true ]; then
         : > "$usage"
         # /proc/<container-pid>/io requires ptrace read permission across UIDs.
         # Elevate ONLY the passive reader. A stop file avoids signalling sudo's
@@ -914,6 +938,14 @@ run_bench() {
     python3 "$SCRIPT_DIR/benchmark_plan.py" stamp \
         "$out" "$gateway" "$payload" "$effective_concurrency" \
         "$PAIR" "$ORDER_POSITION" "$HOST_ID" "$usage" "$GATEWAY_ORDER"
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
+            "$diagnostics/${gateway}_${payload}_backend.log"
+    fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_observation.py" "$out" "$usage" \
+            "$diagnostics/${gateway}_${payload}.log"
+    fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
@@ -958,6 +990,25 @@ main() {
             fi
             expected_gateways+=" $EXPERIMENT_ARMS"
             cp "$EXPERIMENT_MANIFEST" "$OUTPUT_DIR/experiment.json"
+            local campaign
+            campaign=$(python3 "$SCRIPT_DIR/experiment_arms.py" campaign \
+                "$EXPERIMENT_MANIFEST" "$PROTOCOL" "$DURATION" "$CONCURRENCY" \
+                "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
+            if [ -n "$campaign" ]; then
+                H2_OBSERVE=1
+                H2_GUARD_OBSERVE=$(python3 "$SCRIPT_DIR/experiment_arms.py" guard \
+                    "$EXPERIMENT_MANIFEST" "$PROTOCOL")
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && { [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; }; then
+                    echo "[experiment] guard observation is hosted-only" >&2
+                    exit 2
+                fi
+                PAIRS="${campaign%% *}"
+                PAYLOAD_SIZES="${campaign#* }"
+                if [ "$PROCESS_USAGE" != true ]; then
+                    echo "[experiment] H2 campaign requires process observations" >&2
+                    exit 2
+                fi
+            fi
         else
             EXPERIMENT_ARMS=""
         fi
@@ -968,12 +1019,13 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
                "payload_sizes": [int(size) for size in sys.argv[3].split()],
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
+               "h2_observation_enabled": sys.argv[6] == "1",
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -985,6 +1037,18 @@ PYEOF
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
+    if [ "$H2_OBSERVE" -eq 1 ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            local source_identity
+            source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
+            if [ "$source_identity" != "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16" ]; then
+                echo "[experiment] image is not the pinned guard diagnostic build" >&2
+                exit 2
+            fi
+        fi
+        # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
+        FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
+    fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"

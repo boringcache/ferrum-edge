@@ -22,6 +22,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::{TcpListener, UdpSocket};
 
+use multi_protocol_perf::h2_observation::Observer;
 use multi_protocol_perf::tls_utils;
 
 // ── gRPC service ─────────────────────────────────────────────────────────────
@@ -162,15 +163,23 @@ async fn run_http1_health_server(addr: SocketAddr) -> anyhow::Result<()> {
 }
 
 async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
+    let observer = Observer::new(
+        std::env::var("BENCH_H2_OBSERVE").as_deref() == Ok("1"),
+        "backend_h2c",
+        true,
+    );
     let listener = TcpListener::bind(addr)
         .await
         .context("binding h2c listener")?;
     loop {
         let (stream, _) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
+        let observer = observer.clone();
+        let connection_id = observer.connection_id();
         tokio::spawn(async move {
+            observer.record(connection_id, None, None, "connection_opened", None);
             let io = TokioIo::new(stream);
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .initial_stream_window_size(8_388_608) // 8 MiB
                 .initial_connection_window_size(33_554_432) // 32 MiB
                 .adaptive_window(true)
@@ -178,6 +187,13 @@ async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
                 .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
                 .await;
+            observer.record(
+                connection_id,
+                None,
+                None,
+                "driver_terminated",
+                result.as_ref().err().map(|e| e as &dyn std::error::Error),
+            );
         });
     }
 }
@@ -210,6 +226,11 @@ async fn run_h2_tls_server(
     addr: SocketAddr,
     tls_cfg: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<()> {
+    let observer = Observer::new(
+        std::env::var("BENCH_H2_OBSERVE").as_deref() == Ok("1"),
+        "backend_h2_tls",
+        true,
+    );
     let listener = TcpListener::bind(addr)
         .await
         .context("binding h2-tls listener")?;
@@ -218,12 +239,15 @@ async fn run_h2_tls_server(
         let (stream, _) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
+        let observer = observer.clone();
+        let connection_id = observer.connection_id();
         tokio::spawn(async move {
             let Ok(tls_stream) = acceptor.accept(stream).await else {
                 return;
             };
+            observer.record(connection_id, None, None, "connection_opened", None);
             let io = TokioIo::new(tls_stream);
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .initial_stream_window_size(8_388_608) // 8 MiB
                 .initial_connection_window_size(33_554_432) // 32 MiB
                 .adaptive_window(true)
@@ -231,6 +255,13 @@ async fn run_h2_tls_server(
                 .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
                 .await;
+            observer.record(
+                connection_id,
+                None,
+                None,
+                "driver_terminated",
+                result.as_ref().err().map(|e| e as &dyn std::error::Error),
+            );
         });
     }
 }
