@@ -6,6 +6,7 @@ benchmark's stdout. Every subprocess uses the literal, policy-visible inventory.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -23,12 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_plan import gateway_order, paired_comparison
 from benchmark_validity import sample_issues
 from h3_experiment import envoy_config
-from process_usage import capture, measurement_usage, parse_stat
-from transport_diagnostics import (backend_distribution, bracket, counter_delta,
+from process_usage import IO_FIELDS, capture, parse_stat
+from transport_diagnostics import (backend_distribution, counter_delta,
                                    snapshot, thread_snapshot, envoy_counter_provenance)
 from live_contract import (ARMS, PAYLOADS, ENVOY, FAMILIES, assert_upstream_only, calibration,
                            manifest, owned_role, group_history, socket_lifetimes,
                            measurement_window, measurement_position, provenance_issues,
+                           capture_interval, passive_bracket, natural,
                            validate_observer_record, observer_issues, smoke_issues,
                            sample_admission_issues, envoy_protocol_evidence)
 from evidence import LOSSES
@@ -115,6 +117,8 @@ class Passive:
 
     def run(self):
         while not self.stop.is_set():
+            # This clock read precedes every resource read. Only the entire
+            # [start, capture_end_ns] interval may authorize passive boundaries.
             start = time.monotonic_ns()
             clock = dict(before_ns=start, unix_ns=time.time_ns(), after_ns=time.monotonic_ns())
             sample = dict(unix_secs=clock['unix_ns'] / 1e9, monotonic_ns=start, clock=clock,
@@ -268,14 +272,66 @@ class Observer:
                     termination=next((r for r in self.rows if r.get('phase') == 'termination'), None))
 
 
+def live_measurement_usage(usage, phases):
+    """Strict live H3 CPU/I/O brackets; historical point-sampled callers stay separate."""
+    timeline = usage.get('timeline', [])
+    window = measurement_window(phases, timeline)
+    by_process = {}
+    for index, row in enumerate(timeline):
+        for process in row.get('processes', []):
+            if process['role'] == 'client':
+                continue  # the client's own boundary snapshots remain authoritative
+            key = (process['pid'], process['start_ticks'])
+            by_process.setdefault(key, []).append((index, process))
+    result = []
+    for (pid, generation), values in by_process.items():
+        bounds = passive_bracket(timeline, [i for i, _ in values], window)
+        record = dict(pid=pid, start_ticks=generation, role=values[0][1]['role'],
+                      complete_bracket=False, capture_bracket=bounds, peak_rss_bytes=None)
+        if window.get('valid'):
+            # RSS observations whose read intervals may overlap measurement;
+            # no point timestamp or exact measurement-only peak is implied.
+            within = [p['rss_bytes'] for i, p in values
+                      if capture_interval(timeline[i])[1] >= window['start_bounds_ns'][0]
+                      and capture_interval(timeline[i])[0] <= window['end_bounds_ns'][1]]
+            record['peak_rss_bytes'] = max(within, default=None)
+        record['rss_scope'] = 'passive_captures_possibly_overlapping_measurement'
+        if bounds['complete_bracket']:
+            left, right = bounds['left_sample_index'], bounds['right_sample_index']
+            selected = [(i, p) for i, p in values if left <= i <= right]
+            continuous = ([i for i, _ in selected] == list(range(left, right + 1))
+                          and all(p['role'] == record['role'] for _, p in selected))
+            counters = [p.get('cpu_seconds') for _, p in selected]
+            monotonic = (all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in counters)
+                         and all(b >= a for a, b in zip(counters, counters[1:])))
+            record['complete_bracket'] = continuous and monotonic
+            if record['complete_bracket']:
+                record['cpu_seconds'] = counters[-1] - counters[0]
+                io = [p.get('io') for _, p in selected]
+                if all(isinstance(v, dict) and all(natural(v.get(k)) for k in IO_FIELDS) for v in io):
+                    if all(b[k] >= a[k] for a, b in zip(io, io[1:]) for k in IO_FIELDS):
+                        record['io'] = {k: io[-1][k] - io[0][k] for k in IO_FIELDS}
+                    else:
+                        record['io_error'] = 'I/O counter decreased inside capture bracket'
+                else:
+                    record['io_error'] = 'I/O unavailable at one or more bracket samples'
+            else:
+                record['reason'] = 'process_generation_gap_or_invalid_cpu_counter'
+        if not record['complete_bracket']:
+            record['io_error'] = 'process capture bracket incomplete'
+        result.append(record)
+    client = phases.get('client_usage')
+    if isinstance(client, dict):
+        result.append(dict(client))
+    return result
+
+
 def passive_roles(usage, distribution, arm, phases):
-    start = phases.get('measurement_start_unix_secs')
-    if start is None:
-        return dict(equal_socket_budget_verified=False, reason='missing_measurement')
-    end = start + phases['measurement_secs']
+    timeline = usage['timeline']
+    window = measurement_window(phases, timeline)
     peers = {tuple((p['peer'].rsplit(':', 1)[0], int(p['peer'].rsplit(':', 1)[1]))) for p in distribution}
     records = {}
-    for row in usage['timeline']:
+    for index, row in enumerate(timeline):
         for sk in row.get('transport', {}).get('sockets', []):
             cookie = sk['cookie'][0] | sk['cookie'][1] << 32
             roles = set()
@@ -292,23 +348,34 @@ def passive_roles(usage, distribution, arm, phases):
             if len(roles) != 1 or not cookie or sk['family'] != socket.AF_INET:
                 continue
             key = (cookie, next(iter(roles)))
-            records.setdefault(key, []).append(dict(sk, unix_secs=row['unix_secs']))
+            records.setdefault(key, []).append((index, sk))
     rows, probes = [], []
     for (cookie, role), values in records.items():
-        bounds = bracket(values, start, end)
-        if values[-1]['unix_secs'] < start or values[0]['unix_secs'] > end:
-            probes.append(dict(cookie=cookie, role=role, first_unix_secs=values[0]['unix_secs'],
-                               last_unix_secs=values[-1]['unix_secs'], disposition='outside_measurement'))
+        bounds = passive_bracket(timeline, [i for i, _ in values], window)
+        first, last = timeline[values[0][0]], timeline[values[-1][0]]
+        observation = dict(cookie=cookie, role=role,
+                           first_capture_bounds_ns=capture_interval(first),
+                           last_capture_bounds_ns=capture_interval(last))
+        if window.get('valid') and (capture_interval(last)[1] < window['start_bounds_ns'][0]
+                or capture_interval(first)[0] > window['end_bounds_ns'][1]):
+            probes.append(dict(observation, disposition='outside_measurement'))
             continue
-        rows.append(dict(cookie=cookie, role=role, first_unix_secs=values[0]['unix_secs'],
-                         last_unix_secs=values[-1]['unix_secs'], complete_bracket=bounds is not None,
-                         equal_buffers=all(v.get('so_rcvbuf') == v.get('so_sndbuf') == 4194304 for v in values),
-                         drops=counter_delta({'socket_drops': bounds[0]['socket_drops']}, bounds[1]) if bounds else None))
+        complete, drops = False, None
+        if bounds['complete_bracket']:
+            left, right = bounds['left_sample_index'], bounds['right_sample_index']
+            selected = [(i, sk) for i, sk in values if left <= i <= right]
+            complete = [i for i, _ in selected] == list(range(left, right + 1))
+            if complete:
+                drops = counter_delta({'socket_drops': selected[0][1]['socket_drops']}, selected[-1][1])
+        rows.append(dict(observation, complete_bracket=complete, capture_bracket=bounds,
+                         equal_buffers=all(v.get('so_rcvbuf') == v.get('so_sndbuf') == 4194304 for _, v in values),
+                         drops=drops))
     required = {'backend', 'client'} | (set() if arm == 'direct' else {'gateway_frontend', 'gateway_upstream'})
     return dict(sockets=rows, probe_or_retired_outside_measurement=probes, role_join='owned_process_generation_full_endpoint_and_backend_peer',
-                equal_socket_budget_verified=required <= {r['role'] for r in rows}
+                measurement_clock=window,
+                equal_socket_budget_verified=window.get('valid') is True and required <= {r['role'] for r in rows}
                 and all(r['complete_bracket'] and r['equal_buffers'] for r in rows),
-                uncertainty='sockets born/retired between passive samples remain unobserved')
+                uncertainty='whole_capture_intervals_bound_reads;_sockets_born/retired_between_samples_remain_unobserved')
 
 
 def proof(observers, usage, distribution, sample, provenance, namespace_lifetime, arm):
@@ -579,7 +646,7 @@ def sample(out, arm, payload, pair, position, traced, duration, provenance):
         except (OSError, ValueError, KeyError, TypeError) as error: record['backend_distribution_error'] = str(error)
         derived = dict(raw, gateway=arm, payload_size=payload, effective_concurrency=[200, 200, 200, 100, 50][PAYLOADS.index(payload)],
                        sample_schema=2, pair=pair, order_position=position, host_id=provenance['boot_id'])
-        usage['measurement'] = measurement_usage(usage, raw.get('phases') or {})
+        usage['measurement'] = live_measurement_usage(usage, raw.get('phases') or {})
         derived['process_usage'] = {k: v for k, v in usage.items() if k != 'timeline'}
         budgets = passive_roles(usage, distribution, arm, raw.get('phases') or {})
         derived['transport_diagnostics'] = budgets
