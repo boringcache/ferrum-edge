@@ -1,6 +1,7 @@
 """Consumer regressions; the workflow separately exercises the real C producers."""
 import copy
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -41,6 +42,213 @@ def producer_records():
                                cookie=55, netns=1, role=1, outcome=1, direction=1)]),
             dict(phase='termination', requested_stop=True, lifecycle_omitted=0,
                  checkpoints_omitted=0, snapshot_failures=0)]
+
+
+class H1CPUAttributeTests(unittest.TestCase):
+    # Verbatim cpu/perf-attributes.txt, hosted run 35422193763, artifact
+    # 10577439767, head 61e5dbd46197c3dca06e46585d2ad19a1309569c.
+    def setUp(self):
+        self.raw = (HERE / 'tests/fixtures/h1-perf-evlist-6.8.0-139.txt').read_bytes()
+        self.cpu, self.dummy = self.raw.decode('ascii').splitlines()
+
+    def verify(self, raw=None, *, status_changes=None):
+        raw = self.raw if raw is None else raw
+        if isinstance(raw, str):
+            raw = raw.encode('ascii')
+        status = dict(returncode=0, forced=False, incomplete=None,
+                      stdout_sha256=hashlib.sha256(raw).hexdigest())
+        status.update(status_changes or {})
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'perf-attributes.txt'
+            path.write_bytes(raw)
+            result = trace.read_cpu_attributes(path, status)
+            self.assertEqual(path.read_bytes(), raw)
+            return result
+
+    def rejected(self, raw, reason, **kwargs):
+        result = self.verify(raw, **kwargs)
+        self.assertFalse(result['verified'], result)
+        self.assertIn(reason, '\n'.join(result['issues']))
+        return result
+
+    def test_retained_union_attributes_bind_one_event_in_either_order(self):
+        self.assertEqual(hashlib.sha256(self.raw).hexdigest(),
+                         '98b167836e2d3c96c808a5291676c0e8ae6eae35e651a9dcea63e8c085b6f5db')
+        for raw, line in [(self.raw, 1), (self.dummy + '\n' + self.cpu + '\n', 2),
+                          (self.cpu + '\n', 1)]:
+            with self.subTest(line=line, raw=raw):
+                result = self.verify(raw)
+                self.assertTrue(result['verified'], result)
+                self.assertEqual(result['issues'], [])
+                self.assertEqual(result['event'], 'cpu-clock:uS')
+                self.assertEqual(result['line'], line)
+                self.assertEqual(result['fields']['{ sample_period, sample_freq }'], '99')
+                self.assertEqual(result['fields']['config'], '0 (PERF_COUNT_SW_CPU_CLOCK)')
+                self.assertNotIn('mmap', result['fields'])
+
+    def test_numeric_spellings_and_union_spacing_preserve_semantics(self):
+        raw = self.cpu.replace('type: 1 (software)', 'type: 0x1')
+        raw = raw.replace('config: 0 (PERF_COUNT_SW_CPU_CLOCK)', 'config: 0x0')
+        raw = raw.replace('{ sample_period, sample_freq }: 99', '{sample_period,\tsample_freq}: 0x63')
+        raw = raw.replace('sample_regs_user: 0xff0fff', 'sample_regs_user: 16715775')
+        raw = raw.replace('sample_stack_user: 8192', 'sample_stack_user: 0x2000')
+        self.assertTrue(self.verify(raw)['verified'])
+
+    def test_missing_attributes_are_not_borrowed_from_dummy(self):
+        fragments = {
+            'type': 'type: 1 (software), ',
+            'config': 'config: 0 (PERF_COUNT_SW_CPU_CLOCK), ',
+            '{ sample_period, sample_freq }': '{ sample_period, sample_freq }: 99, ',
+            'freq': 'freq: 1, ', 'inherit': 'inherit: 1, ',
+            'exclude_kernel': 'exclude_kernel: 1, ', 'use_clockid': 'use_clockid: 1, ',
+            'clockid': ', clockid: 1', 'sample_stack_user': 'sample_stack_user: 8192, ',
+            'sample_regs_user': 'sample_regs_user: 0xff0fff, ',
+            'sample_type': 'sample_type: IP|TID|TIME|ADDR|READ|CALLCHAIN|CPU|PERIOD|REGS_USER|STACK_USER|IDENTIFIER|DATA_SRC, ',
+            'read_format': 'read_format: TOTAL_TIME_ENABLED|TOTAL_TIME_RUNNING|ID|LOST, ',
+        }
+        for key, fragment in fragments.items():
+            with self.subTest(field=key):
+                self.assertIn(fragment, self.cpu)
+                bad = self.cpu.replace(fragment, '', 1)
+                for donor in (self.dummy, self.cpu.replace('cpu-clock:uS:', 'task-clock:uS:', 1)):
+                    for raw in (bad + '\n' + donor, donor + '\n' + bad):
+                        self.rejected(raw, key)
+
+    def test_wrong_values_and_period_mode_cannot_pass(self):
+        cases = [
+            ('type: 1 (software)', 'type: 0 (hardware)', 'type'),
+            ('type: 1 (software)', 'type: 0 (software)', 'type'),
+            ('config: 0 (PERF_COUNT_SW_CPU_CLOCK)', 'config: 0x9 (PERF_COUNT_SW_DUMMY)', 'config'),
+            ('config: 0 (PERF_COUNT_SW_CPU_CLOCK)', 'config: 1 (PERF_COUNT_SW_CPU_CLOCK)', 'config'),
+            ('{ sample_period, sample_freq }: 99', '{ sample_period, sample_freq }: 100', 'expected 99'),
+            ('{ sample_period, sample_freq }: 99', '{ sample_period, sample_freq }: 990', 'expected 99'),
+            ('{ sample_period, sample_freq }: 99', 'sample_period: 99', 'missing attribute { sample_period, sample_freq }'),
+            ('freq: 1', 'freq: 0', 'freq: expected 1'),
+            ('inherit: 1', 'inherit: 0', 'inherit: expected 1'),
+            ('exclude_kernel: 1', 'exclude_kernel: 0', 'exclude_kernel: expected 1'),
+            ('use_clockid: 1', 'use_clockid: 0', 'use_clockid: expected 1'),
+            (', clockid: 1', ', clockid: 0', 'clockid: expected 1'),
+            (', clockid: 1', ', clockid: 11', 'clockid: expected 1'),
+            ('sample_stack_user: 8192', 'sample_stack_user: 4096', 'expected 8192'),
+            ('sample_stack_user: 8192', 'sample_stack_user: 81920', 'expected 8192'),
+            ('sample_stack_user: 8192', 'sample_stack_user: 8192junk', 'invalid numeric'),
+            ('sample_regs_user: 0xff0fff', 'sample_regs_user: 0', 'empty register mask'),
+            ('sample_regs_user: 0xff0fff', 'sample_regs_user: 0xgarbage', 'invalid numeric'),
+            ('freq: 1', 'freq: -1', 'invalid numeric'),
+            ('freq: 1', 'freq: 18446744073709551616', 'invalid numeric'),
+        ]
+        for before, after, reason in cases:
+            with self.subTest(change=after):
+                self.assertIn(before, self.cpu)
+                self.rejected(self.cpu.replace(before, after, 1) + '\n' + self.dummy, reason)
+        self.rejected(self.cpu + ', exclude_user: 1\n' + self.dummy, 'exclude_user')
+
+    def test_required_bits_must_belong_to_the_correct_cpu_field(self):
+        for bit in ('IP', 'TID', 'TIME', 'READ', 'REGS_USER', 'STACK_USER',
+                    'TOTAL_TIME_ENABLED', 'TOTAL_TIME_RUNNING'):
+            for replacement in ('', 'NOT_' + bit + '|'):
+                with self.subTest(bit=bit, replacement=replacement):
+                    cpu = self.cpu.replace(bit + '|', replacement, 1)
+                    self.assertNotEqual(cpu, self.cpu)
+                    self.rejected(cpu + '\n' + self.dummy, bit)
+        self.rejected(self.cpu.replace('READ|', '', 1) + ', note: READ\n' + self.dummy, 'READ')
+        self.rejected(self.cpu.replace('TOTAL_TIME_RUNNING|', '', 1) +
+                      ', note: TOTAL_TIME_RUNNING\n' + self.dummy, 'TOTAL_TIME_RUNNING')
+
+    def test_unrelated_and_duplicate_events_cannot_supply_cpu_evidence(self):
+        for name in ('dummy:u', 'task-clock:uS', 'cycles:uS', 'cpu-clock:u', 'cpu-clock:kS'):
+            with self.subTest(event=name):
+                unrelated = self.cpu.replace('cpu-clock:uS:', name + ':', 1)
+                self.rejected(unrelated + '\n' + self.dummy, 'found 0')
+                # Even a completely valid unrelated row cannot repair one bad
+                # field on the selected CPU event, in either physical order.
+                bad = self.cpu.replace('freq: 1', 'freq: 0', 1)
+                for raw in (bad + '\n' + unrelated, unrelated + '\n' + bad):
+                    self.rejected(raw, 'freq: expected 1')
+        self.rejected(self.raw + self.cpu.encode('ascii'), 'found 2')
+        split = self.cpu.replace('sample_stack_user: 8192, ', '', 1)
+        other = self.cpu.replace('freq: 1, ', '', 1)
+        self.rejected(split + '\n' + other, 'found 2')
+
+    def test_corrupt_empty_duplicate_and_oversized_records_fail(self):
+        for raw, reason in [
+                ('', 'found 0'), ('not perf attributes', 'malformed event'),
+                (self.cpu.replace('{ sample_period, sample_freq }', '{ sample_period, BROKEN }'), 'malformed attribute'),
+                (self.cpu.replace(', inherit:', ' inherit:', 1), 'malformed attribute'),
+                (self.cpu + ', freq: 1', 'duplicate attribute freq'),
+                (self.cpu + ', freq: 0', 'duplicate attribute freq'),
+                (self.cpu + ', {sample_period,sample_freq}: 99', 'duplicate attribute'),
+                (self.cpu + ', sample_freq: 100', 'unexpected standalone union attribute'),
+                (self.cpu + ', sample_period: 100', 'unexpected standalone union attribute'),
+                (self.cpu + ',', 'trailing field separator'),
+                (self.cpu.replace(', sample_stack_user:', '\nsample_stack_user:', 1), 'malformed attribute'),
+                (self.raw + b'\xff', 'unavailable/invalid'),
+                (self.raw + b'\0', 'non-text control bytes'),
+                (self.cpu.replace('READ|', 'READ||', 1), 'missing/invalid bit field'),
+                (self.cpu.replace('sample_type: IP|', 'sample_type: 0x1|', 1), 'missing/invalid bit field'),
+                (b'x' * (2 * 1024**2 + 1), '2 MiB metadata cap'),
+                ('x' * 16385, 'event/line bound'),
+                ((self.dummy + '\n') * 33, 'event/line bound')]:
+            with self.subTest(reason=reason):
+                self.rejected(raw, reason)
+
+    def test_missing_file_command_failure_and_hash_mismatch_fail_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = trace.read_cpu_attributes(Path(folder) / 'absent.txt', {})
+            self.assertFalse(result['verified'])
+            self.assertIn('unavailable/invalid', '\n'.join(result['issues']))
+        for changes in ({'returncode': 1}, {'returncode': None}, {'returncode': False},
+                        {'forced': True}, {'incomplete': 'deadline_or_output_cap'}):
+            with self.subTest(status=changes):
+                self.rejected(self.raw, 'command failed/incomplete', status_changes=changes)
+        for digest in (None, '0' * 64):
+            self.rejected(self.raw, 'hash missing/mismatched', status_changes={'stdout_sha256': digest})
+
+    def test_cpu_decode_retains_attribute_reasons_and_unknown_unwinding(self):
+        stacks = ('fixture 7/8 12.000000000: cpu-clock:uS:\n'
+                  '        1234 fixture_leaf (/fixture)\n'
+                  '        2345 fixture_middle (/fixture)\n'
+                  '        3456 fixture_outer (/fixture)\n'
+                  '        4567 [unknown] (/fixture)\n\n')
+        records = b'PERF_RECORD_SAMPLE\nPERF_RECORD_MMAP2\nPERF_RECORD_COMM\n'
+        for valid in (True, False):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as folder:
+                out = Path(folder)
+                raw = self.raw if valid else self.raw.replace(b'freq: 1', b'freq: 0', 1)
+
+                def metadata(action, destination, **kwargs):
+                    content = {'perf-script': stacks.encode('ascii'), 'perf-attributes': raw,
+                               'perf-buildids': b'12345678 /fixture\n', 'perf-header': b'header\n'}[action]
+                    destination.write_bytes(content)
+                    return dict(returncode=0, forced=False, incomplete=None,
+                                stdout_sha256=hashlib.sha256(content).hexdigest())
+
+                process = Mock()
+                process.poll.return_value = 0
+                process.wait.return_value = 0
+                dsos = dict(complete=False, dsos=[dict(path='/fixture', eh_frame=False,
+                                                      build_id_lines=['Build ID: 12345678'])])
+                with patch.object(trace, 'command', side_effect=metadata), \
+                        patch.object(trace, 'launch', return_value=process), \
+                        patch.object(trace.os, 'set_blocking'), \
+                        patch.object(trace.os, 'read', side_effect=[records, b'']):
+                    result = trace.cpu_decode(out, {7}, dsos)
+                self.assertEqual(result['attributes_verified'], valid)
+                self.assertEqual(result['attribute_validation']['verified'], valid)
+                self.assertEqual((out / 'perf-attributes.txt').read_bytes(), raw)
+                self.assertEqual(result['samples'], 1)
+                self.assertTrue(nested_fixture_proof(result['callchains'])['proven'])
+                self.assertFalse(result['unwind_complete'])
+                self.assertFalse(result['samples_complete'])
+                self.assertIn('missing matching ELF/build IDs/CFI', result['issues'])
+                self.assertIn('partial unwinding/unresolved samples', result['issues'])
+                saved = json.loads((out / 'cpu-coverage.json').read_text())
+                self.assertEqual(saved['attribute_validation'], result['attribute_validation'])
+                if valid:
+                    self.assertEqual(len(result['issues']), 2)
+                else:
+                    self.assertIn('actual software sample attributes not verified', result['issues'])
+                    self.assertIn('CPU attributes: cpu-clock:uS freq: expected 1, got 0', result['issues'])
 
 
 class H1ArtifactTests(unittest.TestCase):

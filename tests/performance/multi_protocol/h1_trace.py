@@ -710,6 +710,120 @@ class CPU:
         return status
 
 
+def read_cpu_attributes(path, status):
+    """Verify one evlist event, never pool evidence from the metadata dummy.
+
+    perf evlist -v emits one physical line per event. Its period/frequency
+    union contains a comma; only freq=1 makes that value a frequency in Hz.
+    Keep the original file and command receipt, including on parse failure.
+    """
+    result = dict(verified=False, event='cpu-clock:uS', line=None, fields={}, issues=[])
+    issues = result['issues']
+    if (type(status.get('returncode')) is not int or status['returncode'] != 0 or
+            status.get('forced') is not False or 'incomplete' not in status or
+            status['incomplete'] is not None):
+        issues.append('perf evlist command failed/incomplete or missing status')
+    # Match the existing metadata command cap; never read an unbounded file.
+    limit = 2 * 1024**2
+    try:
+        with Path(path).open('rb') as stream:
+            raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError('perf evlist exceeds 2 MiB metadata cap')
+        text = raw.decode('ascii')
+        if any(byte not in (9, 10, 13) and not 32 <= byte <= 126 for byte in raw):
+            raise ValueError('perf evlist contains non-text control bytes')
+    except (OSError, UnicodeError, ValueError) as error:
+        issues.append('perf evlist unavailable/invalid: ' + str(error))
+        return result
+    if hashlib.sha256(raw).hexdigest() != status.get('stdout_sha256'):
+        issues.append('perf evlist retained output hash missing/mismatched')
+    lines = text.split('\n')
+    if len(lines) > 32 or any(len(line) > 16384 for line in lines):
+        issues.append('perf evlist event/line bound exceeded')
+        return result
+    union = '{ sample_period, sample_freq }'
+    field_pattern = re.compile(
+        r'[ \t]*(\{[ \t]*sample_period[ \t]*,[ \t]*sample_freq[ \t]*\}|[a-z][a-z0-9_]*)'
+        r'[ \t]*:[ \t]*([^,{}:\r\n]+)(?:,|$)')
+    selected = []
+    for number, line in enumerate(lines, 1):
+        line = line.strip(' \t\r')
+        if not line:
+            continue
+        event = re.fullmatch(r'([^\s,{}]+):[ \t]+(.+)', line)
+        if not event:
+            issues.append(f'perf evlist line {number}: malformed event record')
+            continue
+        name, payload = event.groups()
+        fields, position = {}, 0
+        if payload.endswith(','):
+            issues.append(f'perf evlist line {number}: trailing field separator')
+        while position < len(payload):
+            field = field_pattern.match(payload, position)
+            if not field:
+                issues.append(f'perf evlist line {number}: malformed attribute at column {position + 1}')
+                break
+            key, value = field.groups()
+            key = union if key.startswith('{') else key
+            if key in fields:
+                issues.append(f'perf evlist line {number}: duplicate attribute {key}')
+                break
+            fields[key] = value.strip()
+            position = field.end()
+        if name == result['event']:
+            selected.append((number, fields))
+    if len(selected) != 1:
+        issues.append(f'expected exactly one cpu-clock:uS event, found {len(selected)}')
+        return result
+    result['line'], result['fields'] = selected[0]
+    fields = result['fields']
+    for alias in ('sample_period', 'sample_freq'):
+        if alias in fields:
+            issues.append('cpu-clock:uS unexpected standalone union attribute ' + alias)
+
+    def numeric(key, annotation=None):
+        value = fields.get(key)
+        if value is None:
+            issues.append('cpu-clock:uS missing attribute ' + key)
+            return None
+        suffix = r'(?:[ \t]+\(' + re.escape(annotation) + r'\))?' if annotation else ''
+        match = re.fullmatch(r'(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})' + suffix, value)
+        if match:
+            token = match[1]
+            parsed = int(token, 16 if token.startswith('0x') else 10)
+            if parsed < 2**64:
+                return parsed
+        issues.append(f'cpu-clock:uS invalid numeric attribute {key}: {value}')
+        return None
+
+    required = {'type': (1, 'software'), 'config': (0, 'PERF_COUNT_SW_CPU_CLOCK'),
+                union: (99, None), 'freq': (1, None), 'inherit': (1, None),
+                'exclude_kernel': (1, None), 'use_clockid': (1, None),
+                'clockid': (1, None), 'sample_stack_user': (8192, None)}
+    for key, (expected, annotation) in required.items():
+        actual = numeric(key, annotation)
+        if actual is not None and actual != expected:
+            issues.append(f'cpu-clock:uS {key}: expected {expected}, got {actual}')
+    if numeric('sample_regs_user') == 0:
+        issues.append('cpu-clock:uS sample_regs_user: empty register mask')
+    # perf omits zero-valued bitfields. Explicit exclusion of users is invalid.
+    if 'exclude_user' in fields and numeric('exclude_user') != 0:
+        issues.append('cpu-clock:uS exclude_user must be zero/absent')
+    for key, required_bits in (
+            ('sample_type', {'IP', 'TID', 'TIME', 'READ', 'REGS_USER', 'STACK_USER'}),
+            ('read_format', {'TOTAL_TIME_ENABLED', 'TOTAL_TIME_RUNNING'})):
+        value = fields.get(key, '')
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*(?:\|[A-Z][A-Z0-9_]*)*', value):
+            issues.append('cpu-clock:uS missing/invalid bit field ' + key)
+            continue
+        missing = required_bits - set(value.split('|'))
+        if missing:
+            issues.append(f'cpu-clock:uS {key} missing bits: ' + '|'.join(sorted(missing)))
+    result['verified'] = not issues
+    return result
+
+
 def cpu_decode(out, owners, dsos, *, symfs=None):
     symfs = out / "symfs" if symfs is None else symfs
     decoded = command('perf-script', out / 'stacks.txt', limit=16 * 1024**2, timeout=30,
@@ -754,17 +868,11 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
     write(out / 'perf-records.json', dict(records=records, status=raw_status, incomplete=raw_error))
     result = decode_cpu((out / 'stacks.txt').read_text(errors='replace'), '\n'.join(records), set(owners))
     issues = []
-    actual_attributes = (out / 'perf-attributes.txt').read_text(errors='replace')
-    attributes_verified = (not attributes['returncode'] and not attributes['incomplete'] and
-        'STACK_USER' in actual_attributes and 'REGS_USER' in actual_attributes and
-        'TOTAL_TIME_ENABLED' in actual_attributes and 'TOTAL_TIME_RUNNING' in actual_attributes and
-        bool(re.search(r'inherit\s*:\s*1\b', actual_attributes)) and
-        bool(re.search(r'exclude_kernel\s*:\s*1\b', actual_attributes)) and
-        bool(re.search(r'sample_(?:freq|period)\s*:\s*99\b', actual_attributes)) and
-        bool(re.search(r'sample_stack_user\s*:\s*8192\b', actual_attributes)) and
-        bool(re.search(r'clockid\s*:\s*1\b', actual_attributes)))
+    attribute_validation = read_cpu_attributes(out / 'perf-attributes.txt', attributes)
+    attributes_verified = attribute_validation['verified']
     if not attributes_verified:
         issues.append('actual software sample attributes not verified')
+        issues.extend('CPU attributes: ' + issue for issue in attribute_validation['issues'])
     build_id_by_path = {}
     for line in (out / 'perf-buildids.txt').read_text(errors='replace').splitlines():
         parts = line.split(None, 1)
@@ -793,6 +901,7 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
         issues.append('partial unwinding/unresolved samples')
     result.update(issues=issues, samples_complete=not issues, decoder_status=decoded,
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
+                  attribute_validation=attribute_validation,
                   raw_decoder_status=raw_status, unwind_complete=False,
                   enabled_running_time='PERF_SAMPLE_READ with TOTAL_TIME_ENABLED/RUNNING in raw perf.data; actual attributes retained',
                   kernel_stacks='not selected; user-mode cpu-clock only')

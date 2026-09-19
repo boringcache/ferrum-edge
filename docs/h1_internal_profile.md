@@ -687,6 +687,23 @@ perf.data. Matching DSO packages are retained once under the corresponding
 `builds/<twin>/symfs`, verified again before reuse, with a separate 512 MiB
 package ceiling; repeat artifacts reference that package.
 
+Attribute verification reads the retained, hash-matched `perf evlist -v` output
+within the existing 2 MiB metadata cap (at most 32 lines, 16 KiB per line).
+It binds fields to exactly one `cpu-clock:uS` event; the separate `dummy:u`
+metadata event or any unrelated event cannot supply missing requirements.
+The actual `{ sample_period, sample_freq }: 99` union is interpreted as 99 Hz
+only with `freq: 1`. Numeric software type 1/config 0, inheritance, kernel
+exclusion, `use_clockid: 1`/monotonic clock ID 1, an 8192-byte user stack dump,
+nonzero user register mask, and exact sample/read-format bits are verified on
+that same event. Missing, malformed, duplicate, ambiguous or wrong-valued fields
+fail with specific reasons in `attribute_validation` and the CPU issues list.
+The original attributes and command status remain retained on failure. The
+consumer fixture retains the verbatim two-event output from hosted run
+`35422193763` (artifact `10577439767`); regressions mutate it to exercise missing
+fields, wrong events, period mode, wrong values and cross-event borrowing.
+Attribute verification alone establishes neither successful capture nor complete
+unwinding; all sample, ownership, loss, symbol/CFI and nested-chain checks remain.
+
 The optimized CPU fixture contains noinline nested functions, sibling threads,
 a post-attach child and a separate busy control. The gate requires actual samples,
 thread/child coverage and **one admitted leaf-to-caller callchain containing
