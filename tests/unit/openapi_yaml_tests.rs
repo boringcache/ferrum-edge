@@ -4779,6 +4779,72 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
 }
 
 #[test]
+fn ai_model_pattern_admission_matches_both_published_schemas() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let cases = [
+        (json!(["*"]), true),
+        (json!(["Org/model.v1_2:chat+fast-*"]), true),
+        (json!(["a".repeat(256)]), true),
+        (json!(vec!["gpt-*"; 128]), true),
+        (json!(["a".repeat(257)]), false),
+        (json!(vec!["gpt-*"; 129]), false),
+        (json!([""]), false),
+        (json!(["gpt-?"]), false),
+        (json!(["gpt-[ab]"]), false),
+        (json!(["gpt-../unsafe"]), false),
+        (json!(["gpt-\\*"]), false),
+        (json!(["gpt-*", "gpt bad"]), false),
+        (json!(["gpt-\n"]), false),
+        (json!(["gpt-é"]), false),
+        (json!(["gpt-*", 123]), false),
+    ];
+    // The router requires an explicit `endpoint`; federation providers derive
+    // the URL from `provider_type` (optional `base_url`) and reject unknown
+    // keys, so each plugin gets its own minimal valid provider shape.
+    let provider_for = |name: &str| {
+        let mut provider = json!({
+            "name": "p", "provider_type": "openai", "api_key": "fixture-key"
+        });
+        if name == "ai_stream_router" {
+            provider["endpoint"] = json!("https://api.example.com/v1/chat/completions");
+        }
+        provider
+    };
+    for (name, schema) in [
+        ("ai_stream_router", "AiStreamRouterConfig"),
+        ("ai_federation", "AiFederationConfig"),
+    ] {
+        for (patterns, valid) in &cases {
+            let mut provider = provider_for(name);
+            provider["model_patterns"] = patterns.clone();
+            let config = json!({"providers": [provider]});
+            assert_component_validity(&spec, schema, &config, *valid);
+            let result = validate_plugin_config(name, &config);
+            assert_eq!(result.is_ok(), *valid, "{name}: {patterns}: {result:?}");
+            if let Err(error) = result {
+                assert!(error.contains("model_patterns"), "{error}");
+            }
+        }
+
+        // Federation keeps its omitted/empty catch-all; the router requires a
+        // nonempty array even though the individual glob contract is shared.
+        for patterns in [None, Some(json!([]))] {
+            let mut provider = provider_for(name);
+            if let Some(patterns) = patterns {
+                provider["model_patterns"] = patterns;
+            }
+            let config = json!({"providers": [provider]});
+            let valid = name == "ai_federation";
+            assert_component_validity(&spec, schema, &config, valid);
+            assert_eq!(validate_plugin_config(name, &config).is_ok(), valid);
+        }
+    }
+}
+
+#[test]
 fn ldap_dial_policy_documentation_matches_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -10893,7 +10959,10 @@ fn assert_proxy_alerts_schema_and_constructor(
         schema_valid,
         "{name}: unexpected schema result for {config}"
     );
-    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(config);
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        config,
+    );
     match (parsed, constructor_valid) {
         (Ok(_), true) | (Err(_), false) => {}
         (Ok(_), false) => panic!("{name}: constructor accepted {config}"),
