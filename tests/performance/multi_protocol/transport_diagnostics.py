@@ -143,6 +143,16 @@ def bracket(values, start, end):
     return (before[-1], after[0]) if before and after else None
 
 
+def envoy_counter_provenance(image=None):
+    if image and image.endswith("@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb"):
+        return dict(semantics="corrected_cumulative_SO_RXQ_OVFL_assignment",
+                    source="d7809ba2b07fd869d49bfb122b27f6a7977b4d94",
+                    kernel_socket_deltas_independent=True, exact_kernel_loss_claim=False)
+    if image and "1.33.5" in image:
+        return dict(semantics="historical_inflated_SO_RXQ_OVFL_totals_38652", exact_kernel_loss_claim=False)
+    return dict(semantics="unverified_image_source", exact_kernel_loss_claim=False)
+
+
 def summarize_transport(timeline, phases):
     start = phases.get("measurement_start_unix_secs")
     if start is None:
@@ -158,7 +168,7 @@ def summarize_transport(timeline, phases):
                   boundary_slack_secs=start - left["unix_secs"] + right["unix_secs"] - end,
                   kernel_scope="shared host network namespace; includes client/backend",
                   udp_snmp_delta=counter_delta(left.get("udp_snmp", {}), right.get("udp_snmp", {})),
-                  envoy_counter_warning="1.33.5 SO_RXQ_OVFL totals are inflated (#38652), not loss",
+                  envoy_counter_provenance=envoy_counter_provenance(),
                   envoy_delta=counter_delta(left.get("envoy_stats", {}), right.get("envoy_stats", {})))
     sockets = []
     for first in left.get("sockets", []):

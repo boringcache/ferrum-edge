@@ -1,0 +1,2415 @@
+{
+  "schema": 1,
+  "scope": "Synthetic IPv4 fixture capability evidence only; no gateway or benchmark ran.",
+  "run_url": "https://github.com/ferrum-edge/ferrum-edge/actions/runs/35403203245",
+  "job_id": 105787388199,
+  "head": "16a981d58c28d509b7b5be210be3271ffa40001b",
+  "base": "ea86b00db1aee93d25db37b7de42666bb04ca34b",
+  "tested_merge_sha": "42a4e305e6250a32b90d8f9bb33fd0ad4a0f2676",
+  "runner": {
+    "GITHUB_RUN_ATTEMPT": "1",
+    "GITHUB_RUN_ID": "35403203245",
+    "GITHUB_SHA": "42a4e305e6250a32b90d8f9bb33fd0ad4a0f2676",
+    "ImageOS": "ubuntu24",
+    "ImageVersion": "20260907.300.1",
+    "RUNNER_ARCH": "X64",
+    "RUNNER_ENVIRONMENT": "github-hosted",
+    "RUNNER_OS": "Linux"
+  },
+  "kernel": {
+    "machine": "x86_64",
+    "node": "runnervmlun5p",
+    "processor": "x86_64",
+    "release": "6.17.0-1022-azure",
+    "system": "Linux",
+    "version": "#22-Ubuntu SMP Mon Jul 27 17:24:03 UTC 2026"
+  },
+  "btf": {
+    "sha256": "95782433dc426daf8ebeb0acc1b04aed8f87168f67c1266f4d267aba7c22a8bf",
+    "size": 6841206
+  },
+  "kernel_build_ids": [
+    "69f86991943f21a6e5450266c913374d52c1dbf3"
+  ],
+  "source_hashes": {
+    "README.md": {
+      "sha256": "b2de4000df993062e9323c165d3d5e8634e867d337a3c5aca5ddaa3554525b81",
+      "size": 16686
+    },
+    "commands.sh": {
+      "sha256": "4b35feac20ba67088726f8da87c191c73480a74af6d3b25ea98b9847209fa716",
+      "size": 3371
+    },
+    "contract.h": {
+      "sha256": "9126bb066a731254c9915f6a57fb94bc81f0a81fbde91cb063258bb5bf46b08e",
+      "size": 690
+    },
+    "core_types.h": {
+      "sha256": "57f3110ef658b537c45d62e9122c771f657273e828ce282c8fc8d1f6455a0f50",
+      "size": 917
+    },
+    "evidence.py": {
+      "sha256": "46aaa35e2634338472b12d963f3fe37b688af8143b684e875fc37f5482741ac0",
+      "size": 5197
+    },
+    "fixture.py": {
+      "sha256": "511b07eaa1719fd6f0aff36aa41762a7858c4280f02ada84a0431e12b324d861",
+      "size": 13021
+    },
+    "hosted.py": {
+      "sha256": "7908896a2b8c0fa3e97e72866f18a7ab7b70dd634afb94b551f8aaf1491ef55f",
+      "size": 18731
+    },
+    "observer.bpf.c": {
+      "sha256": "80350171a315b155dc190464428f38686c08eee430abbe537bfb2c1a9f9f6168",
+      "size": 10448
+    },
+    "observer.c": {
+      "sha256": "2adf0a4e885fd4c6d45c73b0c24c68b45507214d9a7a8b36b374b600c8c62465",
+      "size": 14653
+    },
+    "pmu.c": {
+      "sha256": "f681e2baebb784ad2abe637dbe992f5120727c23c7c40cc76c1bb0b9ebe31c8d",
+      "size": 1843
+    },
+    "test_evidence.py": {
+      "sha256": "62f56d285fbc8470abeb453df4dacedb1a5f36cd0cb900f311a00ea3b82e3c1d",
+      "size": 3728
+    },
+    "test_hosted.py": {
+      "sha256": "ef0e34d660bd543a776dc63ad3043f53ee4f78959338baca9cd382444271f390",
+      "size": 2958
+    }
+  },
+  "object_hashes": {
+    "observer": {
+      "sha256": "1848aaef05a707113efca1ca420985c5c347172b476757ca7cc9231ff54faecf",
+      "size": 58136
+    },
+    "observer.bpf.o": {
+      "sha256": "17aba879c95b3bf81b12a604b433737d8efc309ea83f415cd8eb1366a1745eee",
+      "size": 78640
+    },
+    "pmu": {
+      "sha256": "5d4f0b4c1a3fcc8cb75df77633006123bbbffa38cfd19c97f6d97afb914448b0",
+      "size": 24464
+    }
+  },
+  "summary": {
+    "artifact_bytes_before_summary_update": 925017,
+    "cases": [
+      {
+        "name": "tx-offload-512-normal",
+        "status": "supported"
+      },
+      {
+        "name": "rx-offload-512-normal",
+        "status": "supported"
+      },
+      {
+        "name": "classic-classic-select-512-normal",
+        "status": "unsupported"
+      },
+      {
+        "name": "classic-classic-fallback-512-normal",
+        "status": "unsupported"
+      },
+      {
+        "name": "tx-batches-512-normal",
+        "status": "supported"
+      },
+      {
+        "name": "rx-batches-512-normal",
+        "status": "partial_coverage"
+      },
+      {
+        "name": "rx-read-failure-512-normal",
+        "status": "partial_coverage"
+      },
+      {
+        "name": "rx-offload-1-normal",
+        "status": "partial_coverage"
+      },
+      {
+        "name": "rx-offload-512-missing-btf",
+        "status": "unsupported"
+      },
+      {
+        "name": "rx-offload-512-missing-symbol",
+        "status": "unsupported"
+      },
+      {
+        "name": "rx-offload-512-normal-unprivileged",
+        "status": "unsupported"
+      }
+    ],
+    "fixture_only": true,
+    "issue_5588_closed": false,
+    "pmu_independent_of_socket_probe_status": true,
+    "schema": 1,
+    "status": "partial_coverage",
+    "unimplemented": [
+      "IPv6",
+      "recvmmsg_read_recvfrom_RX_attribution",
+      "compat_syscalls",
+      "gateway_process_lineage_and_socket_retirement",
+      "gateway_role_peer_join",
+      "observer_overhead_calibration",
+      "five_payload_four_pair_campaign"
+    ]
+  },
+  "pmu": {
+    "fixture_privilege": [
+      {
+        "event": "software_cpu_clock",
+        "status": "unsupported",
+        "stage": "open",
+        "errno": 13,
+        "value": null
+      },
+      {
+        "event": "hardware_cycles",
+        "status": "unsupported",
+        "stage": "open",
+        "errno": 13,
+        "value": null
+      }
+    ],
+    "observer_privilege": [
+      {
+        "event": "software_cpu_clock",
+        "status": "supported",
+        "value": 272714,
+        "enabled_ns": 273526,
+        "running_ns": 273526
+      },
+      {
+        "event": "hardware_cycles",
+        "status": "unsupported",
+        "stage": "open",
+        "errno": 2,
+        "value": null
+      }
+    ]
+  },
+  "raw_json_sha256": {
+    "classic-classic-fallback-512-normal.json": "64e317d49930789f8f143340cdc14bfddc8def41b950b55356ba8ac1a2755b66",
+    "classic-classic-select-512-normal.json": "e1d62bcdc50c49f46a4b885e47c50598a4b4491390de3a27480ca464f7877ae3",
+    "isolation-process.json": "62ca8ea029b61c765fc0a2231790b06a6206ede700b84dc8309a7bc1b9f3f4b4",
+    "namespace.json": "89d49e764e5e93dd883f3a1cc2255bbbc7d90aea0638d33e1a81555643cef492",
+    "pmu.json": "feadf191a0f847609b59a883437f63153239bed171e0880910a74fb7bfb191e5",
+    "provenance.json": "546b5b9a201cdb68227503c693b22cbbfaf00f2b5fb2b70c1af6e62f3141057d",
+    "rx-batches-512-normal.json": "0ccc4a9ab2395a09ca0013e5037b69654a72cbb025d98730f81166cccc4b0ae4",
+    "rx-offload-1-normal.json": "82c93654230f2e910d252b27e0d85f46fa9ee6021e985e29304982246af1d2e4",
+    "rx-offload-512-missing-btf.json": "c38a973875081deedefc11a4482c924fdf02a4fae14be290a4f1a9234f73a965",
+    "rx-offload-512-missing-symbol.json": "5b8ad1a6080c2e9e344c2c55a9ffa345777f961c5157845a86e5883429583751",
+    "rx-offload-512-normal-unprivileged.json": "918b5ae7520640bb123e10c6f127c83e8cb3525d17054d0d93d16e2ce6026951",
+    "rx-offload-512-normal.json": "f727acfc5cb3cda53206015a671651152c5315ab751dfe73fd80ae6c3c4d0e17",
+    "rx-read-failure-512-normal.json": "169a3aa62c0b15e70e82f11a83e52f94bd63a34485f5742dcc910352f2106a38",
+    "summary.json": "d1b95c7179809037dafad27b42450072b362f7eeee090ca54e9e96eb205621f9",
+    "tx-batches-512-normal.json": "ebed3242dad20f477ca4ecf4ad54b05ccacae931009e5164fb64c2ba2099dd48",
+    "tx-offload-512-normal.json": "839987f8ee508d3356906821f9a344e0713fefb29c776268f0ae0a3598bed526"
+  },
+  "cases": [
+    {
+      "assessment": {
+        "absence_claim_allowed": false,
+        "exact_totals": false,
+        "fixture_interval_complete": true,
+        "gateway_behavior_proven": false,
+        "loss": {
+          "attempts": 9,
+          "excluded_api": 0,
+          "map_full": 0,
+          "nested": 0,
+          "read_failed": 0,
+          "recorded": 9,
+          "unknown_cookie": 0,
+          "unmatched": 0
+        },
+        "positive": [
+          "tx_gso"
+        ],
+        "routing_distribution_complete": false,
+        "scope": "native_amd64_ipv4_fixture_netns",
+        "status": "supported"
+      },
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1189038582614,
+        "mode": "offload",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1189038311157,
+            "op": "option",
+            "option": "UDP_GRO",
+            "success": true
+          },
+          {
+            "at_ns": 1189038314372,
+            "op": "option",
+            "option": "UDP_SEGMENT",
+            "segment": 1024,
+            "success": true
+          },
+          {
+            "at_ns": 1189038356105,
+            "effective_segment": 1024,
+            "length": 4096,
+            "op": "sendmsg",
+            "returned": 4096,
+            "source": "socket"
+          },
+          {
+            "at_ns": 1189038369986,
+            "flags": 0,
+            "length": 4096,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189038381964,
+            "effective_segment": 512,
+            "length": 2048,
+            "op": "sendmsg",
+            "returned": 2048,
+            "source": "u16_cmsg"
+          },
+          {
+            "at_ns": 1189038388804,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              512
+            ]
+          },
+          {
+            "at_ns": 1189038398598,
+            "effective_segment": 0,
+            "length": 256,
+            "op": "sendmsg",
+            "returned": 256,
+            "source": "u16_cmsg"
+          },
+          {
+            "at_ns": 1189038403476,
+            "flags": 0,
+            "length": 256,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189038412830,
+            "errno": 22,
+            "op": "sendmsg_invalid_u32"
+          },
+          {
+            "at_ns": 1189038429435,
+            "flags": 32,
+            "length": 16,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189038446390,
+            "flags": 8,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189038460221,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 2,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189038465509,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189038472649,
+            "errno": 11,
+            "op": "recvmsg"
+          },
+          {
+            "at_ns": 1189038489294,
+            "cookie": 2,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189038500591,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189038509885,
+            "cookie": 2,
+            "fd": 5,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189038536355,
+            "flags": 0,
+            "length": 256,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189038576445,
+            "cookie": 1,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189038581693,
+            "cookie": 3,
+            "fd": 4,
+            "fd_generation": 2,
+            "op": "close"
+          }
+        ],
+        "pid": 4403,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1189038576896,
+            "cookie": 1,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1189038222955,
+            "role": "receiver"
+          },
+          {
+            "closed_ns": 1189038490196,
+            "cookie": 2,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1189038294092,
+            "role": "sender"
+          },
+          {
+            "closed_ns": 1189038510817,
+            "cookie": 2,
+            "fd": 5,
+            "fd_generation": 1,
+            "opened_ns": 1189038484427,
+            "role": "sender_alias"
+          },
+          {
+            "closed_ns": 1189038582274,
+            "cookie": 3,
+            "fd": 4,
+            "fd_generation": 2,
+            "opened_ns": 1189038519039,
+            "role": "sender_reused_fd"
+          }
+        ],
+        "start_ns": 1189038112600,
+        "start_ticks": "118899",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "tx-offload-512-normal",
+      "ready": {
+        "exercise_verified": false,
+        "family": "tx",
+        "links": 3,
+        "netns": 4026532225,
+        "phase": "ready",
+        "start_ns": 1188995391516,
+        "status": "supported"
+      },
+      "snapshots": [
+        {
+          "end_ns": 1189042822958,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            9,
+            9,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "snapshot",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038396605,
+              "kind": 2,
+              "last_ns": 1189038396605,
+              "length": 256,
+              "peer_cookie": 0,
+              "result": 256,
+              "segment": 0
+            },
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038379900,
+              "kind": 1,
+              "last_ns": 1189038379900,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 512
+            },
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038352499,
+              "kind": 1,
+              "last_ns": 1189038352499,
+              "length": 4096,
+              "peer_cookie": 0,
+              "result": 4096,
+              "segment": 1024
+            },
+            {
+              "cookie": 3,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038530817,
+              "kind": 2,
+              "last_ns": 1189038530817,
+              "length": 256,
+              "peer_cookie": 0,
+              "result": 256,
+              "segment": 0
+            },
+            {
+              "cookie": 2,
+              "count": 4,
+              "cpu": 1,
+              "first_ns": 1189038422975,
+              "kind": 1,
+              "last_ns": 1189038494923,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 1024
+            },
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038408213,
+              "kind": 3,
+              "last_ns": 1189038408213,
+              "length": 512,
+              "peer_cookie": 0,
+              "result": -22,
+              "segment": 0
+            }
+          ],
+          "start_ns": 1188995391516,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        },
+        {
+          "end_ns": 1189083074862,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            9,
+            9,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "final",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038396605,
+              "kind": 2,
+              "last_ns": 1189038396605,
+              "length": 256,
+              "peer_cookie": 0,
+              "result": 256,
+              "segment": 0
+            },
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038379900,
+              "kind": 1,
+              "last_ns": 1189038379900,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 512
+            },
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038352499,
+              "kind": 1,
+              "last_ns": 1189038352499,
+              "length": 4096,
+              "peer_cookie": 0,
+              "result": 4096,
+              "segment": 1024
+            },
+            {
+              "cookie": 3,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038530817,
+              "kind": 2,
+              "last_ns": 1189038530817,
+              "length": 256,
+              "peer_cookie": 0,
+              "result": 256,
+              "segment": 0
+            },
+            {
+              "cookie": 2,
+              "count": 4,
+              "cpu": 1,
+              "first_ns": 1189038422975,
+              "kind": 1,
+              "last_ns": 1189038494923,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 1024
+            },
+            {
+              "cookie": 2,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1189038408213,
+              "kind": 3,
+              "last_ns": 1189038408213,
+              "length": 512,
+              "peer_cookie": 0,
+              "result": -22,
+              "segment": 0
+            }
+          ],
+          "start_ns": 1188995391516,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        }
+      ],
+      "status": "supported",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "offload"
+        },
+        "end_ns": 1189042697640,
+        "returncode": 0,
+        "start_ns": 1188995864545,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "assessment": {
+        "absence_claim_allowed": false,
+        "exact_totals": false,
+        "fixture_interval_complete": true,
+        "gateway_behavior_proven": false,
+        "loss": {
+          "attempts": 10,
+          "excluded_api": 0,
+          "map_full": 0,
+          "nested": 0,
+          "read_failed": 0,
+          "recorded": 10,
+          "unknown_cookie": 0,
+          "unmatched": 0
+        },
+        "positive": [
+          "rx_gro"
+        ],
+        "routing_distribution_complete": false,
+        "scope": "native_amd64_ipv4_fixture_netns",
+        "status": "supported"
+      },
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1189474697027,
+        "mode": "offload",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1189474418329,
+            "op": "option",
+            "option": "UDP_GRO",
+            "success": true
+          },
+          {
+            "at_ns": 1189474421634,
+            "op": "option",
+            "option": "UDP_SEGMENT",
+            "segment": 1024,
+            "success": true
+          },
+          {
+            "at_ns": 1189474453732,
+            "effective_segment": 1024,
+            "length": 4096,
+            "op": "sendmsg",
+            "returned": 4096,
+            "source": "socket"
+          },
+          {
+            "at_ns": 1189474473532,
+            "flags": 0,
+            "length": 4096,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189474483978,
+            "effective_segment": 512,
+            "length": 2048,
+            "op": "sendmsg",
+            "returned": 2048,
+            "source": "u16_cmsg"
+          },
+          {
+            "at_ns": 1189474492971,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              512
+            ]
+          },
+          {
+            "at_ns": 1189474500983,
+            "effective_segment": 0,
+            "length": 256,
+            "op": "sendmsg",
+            "returned": 256,
+            "source": "u16_cmsg"
+          },
+          {
+            "at_ns": 1189474507643,
+            "flags": 0,
+            "length": 256,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189474516246,
+            "errno": 22,
+            "op": "sendmsg_invalid_u32"
+          },
+          {
+            "at_ns": 1189474536106,
+            "flags": 32,
+            "length": 16,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189474553842,
+            "flags": 8,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189474569686,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 2,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189474576536,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189474585189,
+            "errno": 11,
+            "op": "recvmsg"
+          },
+          {
+            "at_ns": 1189474601413,
+            "cookie": 4098,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189474613632,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1189474622866,
+            "cookie": 4098,
+            "fd": 5,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189474649155,
+            "flags": 0,
+            "length": 256,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189474689966,
+            "cookie": 4097,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189474695965,
+            "cookie": 4099,
+            "fd": 4,
+            "fd_generation": 2,
+            "op": "close"
+          }
+        ],
+        "pid": 4405,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1189474690687,
+            "cookie": 4097,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1189474328284,
+            "role": "receiver"
+          },
+          {
+            "closed_ns": 1189474602355,
+            "cookie": 4098,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1189474401834,
+            "role": "sender"
+          },
+          {
+            "closed_ns": 1189474623807,
+            "cookie": 4098,
+            "fd": 5,
+            "fd_generation": 1,
+            "opened_ns": 1189474596857,
+            "role": "sender_alias"
+          },
+          {
+            "closed_ns": 1189474696656,
+            "cookie": 4099,
+            "fd": 4,
+            "fd_generation": 2,
+            "opened_ns": 1189474631759,
+            "role": "sender_reused_fd"
+          }
+        ],
+        "start_ns": 1189474220383,
+        "start_ticks": "118944",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "rx-offload-512-normal",
+      "ready": {
+        "exercise_verified": false,
+        "family": "rx",
+        "links": 3,
+        "netns": 4026532225,
+        "phase": "ready",
+        "start_ns": 1189443972649,
+        "status": "supported"
+      },
+      "snapshots": [
+        {
+          "end_ns": 1189478940215,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            10,
+            10,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "snapshot",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474566862,
+              "kind": 9,
+              "last_ns": 1189474566862,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 2,
+              "cpu": 0,
+              "first_ns": 1189474574663,
+              "kind": 5,
+              "last_ns": 1189474611639,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 1024
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474489446,
+              "kind": 5,
+              "last_ns": 1189474489446,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 512
+            },
+            {
+              "cookie": 4097,
+              "count": 2,
+              "cpu": 0,
+              "first_ns": 1189474505760,
+              "kind": 6,
+              "last_ns": 1189474647593,
+              "length": 256,
+              "peer_cookie": 0,
+              "result": 256,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474582235,
+              "kind": 7,
+              "last_ns": 1189474582235,
+              "length": 0,
+              "peer_cookie": 0,
+              "result": -11,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474467923,
+              "kind": 5,
+              "last_ns": 1189474467923,
+              "length": 4096,
+              "peer_cookie": 0,
+              "result": 4096,
+              "segment": 1024
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474533552,
+              "kind": 8,
+              "last_ns": 1189474533552,
+              "length": 16,
+              "peer_cookie": 0,
+              "result": 16,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474551879,
+              "kind": 8,
+              "last_ns": 1189474551879,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 0
+            }
+          ],
+          "start_ns": 1189443972649,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        },
+        {
+          "end_ns": 1189603103011,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            10,
+            10,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "final",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474566862,
+              "kind": 9,
+              "last_ns": 1189474566862,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 2,
+              "cpu": 0,
+              "first_ns": 1189474574663,
+              "kind": 5,
+              "last_ns": 1189474611639,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 1024
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474489446,
+              "kind": 5,
+              "last_ns": 1189474489446,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 512
+            },
+            {
+              "cookie": 4097,
+              "count": 2,
+              "cpu": 0,
+              "first_ns": 1189474505760,
+              "kind": 6,
+              "last_ns": 1189474647593,
+              "length": 256,
+              "peer_cookie": 0,
+              "result": 256,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474582235,
+              "kind": 7,
+              "last_ns": 1189474582235,
+              "length": 0,
+              "peer_cookie": 0,
+              "result": -11,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474467923,
+              "kind": 5,
+              "last_ns": 1189474467923,
+              "length": 4096,
+              "peer_cookie": 0,
+              "result": 4096,
+              "segment": 1024
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474533552,
+              "kind": 8,
+              "last_ns": 1189474533552,
+              "length": 16,
+              "peer_cookie": 0,
+              "result": 16,
+              "segment": 0
+            },
+            {
+              "cookie": 4097,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1189474551879,
+              "kind": 8,
+              "last_ns": 1189474551879,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 0
+            }
+          ],
+          "start_ns": 1189443972649,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        }
+      ],
+      "status": "supported",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "offload"
+        },
+        "end_ns": 1189478821522,
+        "returncode": 0,
+        "start_ns": 1189444421767,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1189645718433,
+        "mode": "classic-select",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1189645622880,
+            "classic_sha256": "7f5e53f2cea9d846b2cac86bde23c658e4d97ae2c074b3feed1ee47e80239b0a",
+            "disposition": "select_slot_1",
+            "group_generation": 1,
+            "op": "SO_ATTACH_REUSEPORT_CBPF",
+            "returned": 0
+          },
+          {
+            "at_ns": 1189645690110,
+            "flags": 0,
+            "length": 128,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189645693516,
+            "group_generation": 1,
+            "op": "selection",
+            "selected_cookie": 5
+          },
+          {
+            "at_ns": 1189645702960,
+            "cookie": 4,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189645709760,
+            "cookie": 5,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189645717682,
+            "cookie": 6,
+            "fd": 5,
+            "fd_generation": 1,
+            "op": "close"
+          }
+        ],
+        "pid": 4407,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1189645703661,
+            "cookie": 4,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1189645535869,
+            "role": "group_0"
+          },
+          {
+            "closed_ns": 1189645713315,
+            "cookie": 5,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1189645568959,
+            "role": "group_1"
+          },
+          {
+            "closed_ns": 1189645718112,
+            "cookie": 6,
+            "fd": 5,
+            "fd_generation": 1,
+            "opened_ns": 1189645631362,
+            "role": "sender"
+          }
+        ],
+        "start_ns": 1189645428228,
+        "start_ticks": "118961",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "classic-classic-select-512-normal",
+      "ready": {
+        "errno": 2,
+        "phase": "ready",
+        "reason": "btf_symbol_or_prototype",
+        "status": "unsupported",
+        "verifier_log_truncated": false
+      },
+      "reason": "btf_symbol_or_prototype",
+      "status": "unsupported",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "classic-select"
+        },
+        "end_ns": 1189649699368,
+        "returncode": 0,
+        "start_ns": 1189616060463,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1189691169137,
+        "mode": "classic-fallback",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1189691084289,
+            "classic_sha256": "4c1a442c651d8ad73c8a2fc2bd00125c58eab9a6d045547490b1713cc129c5d8",
+            "disposition": "invalid_index_fallback",
+            "group_generation": 1,
+            "op": "SO_ATTACH_REUSEPORT_CBPF",
+            "returned": 0
+          },
+          {
+            "at_ns": 1189691142206,
+            "flags": 0,
+            "length": 128,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1189691145521,
+            "group_generation": 1,
+            "op": "selection",
+            "selected_cookie": 8
+          },
+          {
+            "at_ns": 1189691155987,
+            "cookie": 7,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189691162997,
+            "cookie": 8,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1189691168396,
+            "cookie": 9,
+            "fd": 5,
+            "fd_generation": 1,
+            "op": "close"
+          }
+        ],
+        "pid": 4409,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1189691156688,
+            "cookie": 7,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1189690993053,
+            "role": "group_0"
+          },
+          {
+            "closed_ns": 1189691163779,
+            "cookie": 8,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1189691035857,
+            "role": "group_1"
+          },
+          {
+            "closed_ns": 1189691168846,
+            "cookie": 9,
+            "fd": 5,
+            "fd_generation": 1,
+            "opened_ns": 1189691093073,
+            "role": "sender"
+          }
+        ],
+        "start_ns": 1189690884430,
+        "start_ticks": "118966",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "classic-classic-fallback-512-normal",
+      "ready": {
+        "errno": 2,
+        "phase": "ready",
+        "reason": "btf_symbol_or_prototype",
+        "status": "unsupported",
+        "verifier_log_truncated": false
+      },
+      "reason": "btf_symbol_or_prototype",
+      "status": "unsupported",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "classic-fallback"
+        },
+        "end_ns": 1189695256631,
+        "returncode": 0,
+        "start_ns": 1189661681852,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "assessment": {
+        "absence_claim_allowed": false,
+        "exact_totals": false,
+        "fixture_interval_complete": true,
+        "gateway_behavior_proven": false,
+        "loss": {
+          "attempts": 2,
+          "excluded_api": 0,
+          "map_full": 0,
+          "nested": 0,
+          "read_failed": 0,
+          "recorded": 2,
+          "unknown_cookie": 0,
+          "unmatched": 0
+        },
+        "positive": [
+          "tx_gso"
+        ],
+        "routing_distribution_complete": false,
+        "scope": "native_amd64_ipv4_fixture_netns",
+        "status": "supported"
+      },
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1190088029340,
+        "mode": "batches",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1190087799947,
+            "op": "option",
+            "option": "UDP_GRO",
+            "success": true
+          },
+          {
+            "at_ns": 1190087916852,
+            "errno": null,
+            "first_length": 2048,
+            "op": "sendmmsg",
+            "requested": 2,
+            "returned": 1
+          },
+          {
+            "at_ns": 1190087955890,
+            "first_length": 2048,
+            "flags": 0,
+            "observer_disposition": "unsupported_API",
+            "op": "recvmmsg",
+            "requested": 2,
+            "returned": 1
+          },
+          {
+            "at_ns": 1190088019956,
+            "cookie": 4100,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1190088028058,
+            "cookie": 4101,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          }
+        ],
+        "pid": 4411,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1190088020898,
+            "cookie": 4100,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1190087708520,
+            "role": "receiver"
+          },
+          {
+            "closed_ns": 1190088028960,
+            "cookie": 4101,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1190087784684,
+            "role": "sender"
+          }
+        ],
+        "start_ns": 1190087599967,
+        "start_ticks": "119005",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "tx-batches-512-normal",
+      "ready": {
+        "exercise_verified": false,
+        "family": "tx",
+        "links": 3,
+        "netns": 4026532225,
+        "phase": "ready",
+        "start_ns": 1190057408698,
+        "status": "supported"
+      },
+      "snapshots": [
+        {
+          "end_ns": 1190092207571,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            2,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "snapshot",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 4101,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1190087913176,
+              "kind": 3,
+              "last_ns": 1190087913176,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": -22,
+              "segment": 0
+            },
+            {
+              "cookie": 4101,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1190087910382,
+              "kind": 1,
+              "last_ns": 1190087910382,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 512
+            }
+          ],
+          "start_ns": 1190057408698,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        },
+        {
+          "end_ns": 1190132071494,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            2,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "final",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 4101,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1190087913176,
+              "kind": 3,
+              "last_ns": 1190087913176,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": -22,
+              "segment": 0
+            },
+            {
+              "cookie": 4101,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1190087910382,
+              "kind": 1,
+              "last_ns": 1190087910382,
+              "length": 2048,
+              "peer_cookie": 0,
+              "result": 2048,
+              "segment": 512
+            }
+          ],
+          "start_ns": 1190057408698,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        }
+      ],
+      "status": "supported",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "batches"
+        },
+        "end_ns": 1190092094407,
+        "returncode": 0,
+        "start_ns": 1190057852488,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "assessment": {
+        "absence_claim_allowed": false,
+        "exact_totals": false,
+        "fixture_interval_complete": false,
+        "gateway_behavior_proven": false,
+        "loss": {
+          "attempts": 0,
+          "excluded_api": 2,
+          "map_full": 0,
+          "nested": 0,
+          "read_failed": 0,
+          "recorded": 0,
+          "unknown_cookie": 0,
+          "unmatched": 0
+        },
+        "positive": [],
+        "routing_distribution_complete": false,
+        "scope": "native_amd64_ipv4_fixture_netns",
+        "status": "partial_coverage"
+      },
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1190526385223,
+        "mode": "batches",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1190526179635,
+            "op": "option",
+            "option": "UDP_GRO",
+            "success": true
+          },
+          {
+            "at_ns": 1190526291943,
+            "errno": null,
+            "first_length": 2048,
+            "op": "sendmmsg",
+            "requested": 2,
+            "returned": 1
+          },
+          {
+            "at_ns": 1190526331673,
+            "first_length": 2048,
+            "flags": 0,
+            "observer_disposition": "unsupported_API",
+            "op": "recvmmsg",
+            "requested": 2,
+            "returned": 1
+          },
+          {
+            "at_ns": 1190526376350,
+            "cookie": 10,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1190526383861,
+            "cookie": 11,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          }
+        ],
+        "pid": 4413,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1190526377311,
+            "cookie": 10,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1190526084543,
+            "role": "receiver"
+          },
+          {
+            "closed_ns": 1190526384823,
+            "cookie": 11,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1190526163140,
+            "role": "sender"
+          }
+        ],
+        "start_ns": 1190525959135,
+        "start_ticks": "119049",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "rx-batches-512-normal",
+      "ready": {
+        "exercise_verified": false,
+        "family": "rx",
+        "links": 3,
+        "netns": 4026532225,
+        "phase": "ready",
+        "start_ns": 1190495467009,
+        "status": "supported"
+      },
+      "snapshots": [
+        {
+          "end_ns": 1190530545922,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "snapshot",
+          "ring_drops": null,
+          "rows": [],
+          "start_ns": 1190495467009,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        },
+        {
+          "end_ns": 1190644102175,
+          "losses": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "final",
+          "ring_drops": null,
+          "rows": [],
+          "start_ns": 1190495467009,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        }
+      ],
+      "status": "partial_coverage",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "batches"
+        },
+        "end_ns": 1190530438667,
+        "returncode": 0,
+        "start_ns": 1190495907635,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "assessment": {
+        "absence_claim_allowed": false,
+        "exact_totals": false,
+        "fixture_interval_complete": false,
+        "gateway_behavior_proven": false,
+        "loss": {
+          "attempts": 1,
+          "excluded_api": 0,
+          "map_full": 0,
+          "nested": 0,
+          "read_failed": 1,
+          "recorded": 1,
+          "unknown_cookie": 0,
+          "unmatched": 0
+        },
+        "positive": [],
+        "routing_distribution_complete": false,
+        "scope": "native_amd64_ipv4_fixture_netns",
+        "status": "partial_coverage"
+      },
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1191035366540,
+        "mode": "read-failure",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1191035180021,
+            "op": "option",
+            "option": "UDP_GRO",
+            "success": true
+          },
+          {
+            "at_ns": 1191035238619,
+            "errno": 14,
+            "op": "recvmsg_unreadable_header",
+            "returned": -1
+          },
+          {
+            "at_ns": 1191035300972,
+            "errno": 14,
+            "op": "recvmsg_failed_copyout",
+            "returned": -1
+          },
+          {
+            "at_ns": 1191035357086,
+            "cookie": 4102,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1191035365258,
+            "cookie": 4103,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          }
+        ],
+        "pid": 4415,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1191035357998,
+            "cookie": 4102,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1191035087352,
+            "role": "receiver"
+          },
+          {
+            "closed_ns": 1191035366170,
+            "cookie": 4103,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1191035164638,
+            "role": "sender"
+          }
+        ],
+        "start_ns": 1191034956316,
+        "start_ticks": "119100",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "rx-read-failure-512-normal",
+      "ready": {
+        "exercise_verified": false,
+        "family": "rx",
+        "links": 3,
+        "netns": 4026532225,
+        "phase": "ready",
+        "start_ns": 1191004520035,
+        "status": "supported"
+      },
+      "snapshots": [
+        {
+          "end_ns": 1191039528332,
+          "losses": [
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "snapshot",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 4102,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1191035298138,
+              "kind": 7,
+              "last_ns": 1191035298138,
+              "length": 0,
+              "peer_cookie": 0,
+              "result": -14,
+              "segment": 0
+            }
+          ],
+          "start_ns": 1191004520035,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        },
+        {
+          "end_ns": 1191155086876,
+          "losses": [
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "final",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 4102,
+              "count": 1,
+              "cpu": 0,
+              "first_ns": 1191035298138,
+              "kind": 7,
+              "last_ns": 1191035298138,
+              "length": 0,
+              "peer_cookie": 0,
+              "result": -14,
+              "segment": 0
+            }
+          ],
+          "start_ns": 1191004520035,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        }
+      ],
+      "status": "partial_coverage",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "read-failure"
+        },
+        "end_ns": 1191039416935,
+        "returncode": 0,
+        "start_ns": 1191004978452,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "assessment": {
+        "absence_claim_allowed": false,
+        "exact_totals": false,
+        "fixture_interval_complete": false,
+        "gateway_behavior_proven": false,
+        "loss": {
+          "attempts": 10,
+          "excluded_api": 0,
+          "map_full": 9,
+          "nested": 0,
+          "read_failed": 0,
+          "recorded": 1,
+          "unknown_cookie": 0,
+          "unmatched": 0
+        },
+        "positive": [
+          "rx_gro"
+        ],
+        "routing_distribution_complete": false,
+        "scope": "native_amd64_ipv4_fixture_netns",
+        "status": "partial_coverage"
+      },
+      "diagnostics_truncated": false,
+      "fixture": {
+        "boot_id": "a492e50a-5a35-428f-8221-9fe90371055a",
+        "end_ns": 1191548595814,
+        "mode": "offload",
+        "netns": 4026532225,
+        "operations": [
+          {
+            "at_ns": 1191548307863,
+            "op": "option",
+            "option": "UDP_GRO",
+            "success": true
+          },
+          {
+            "at_ns": 1191548310937,
+            "op": "option",
+            "option": "UDP_SEGMENT",
+            "segment": 1024,
+            "success": true
+          },
+          {
+            "at_ns": 1191548346230,
+            "effective_segment": 1024,
+            "length": 4096,
+            "op": "sendmsg",
+            "returned": 4096,
+            "source": "socket"
+          },
+          {
+            "at_ns": 1191548366421,
+            "flags": 0,
+            "length": 4096,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1191548376806,
+            "effective_segment": 512,
+            "length": 2048,
+            "op": "sendmsg",
+            "returned": 2048,
+            "source": "u16_cmsg"
+          },
+          {
+            "at_ns": 1191548385850,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              512
+            ]
+          },
+          {
+            "at_ns": 1191548393701,
+            "effective_segment": 0,
+            "length": 256,
+            "op": "sendmsg",
+            "returned": 256,
+            "source": "u16_cmsg"
+          },
+          {
+            "at_ns": 1191548400341,
+            "flags": 0,
+            "length": 256,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1191548408494,
+            "errno": 22,
+            "op": "sendmsg_invalid_u32"
+          },
+          {
+            "at_ns": 1191548421764,
+            "flags": 32,
+            "length": 16,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1191548439099,
+            "flags": 8,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1191548453912,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 2,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1191548460822,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1191548471148,
+            "errno": 11,
+            "op": "recvmsg"
+          },
+          {
+            "at_ns": 1191548489195,
+            "cookie": 13,
+            "fd": 4,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1191548501613,
+            "flags": 0,
+            "length": 2048,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": [
+              1024
+            ]
+          },
+          {
+            "at_ns": 1191548510737,
+            "cookie": 13,
+            "fd": 5,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1191548537417,
+            "flags": 0,
+            "length": 256,
+            "op": "recvmsg",
+            "requested_flags": 0,
+            "segments": []
+          },
+          {
+            "at_ns": 1191548589535,
+            "cookie": 12,
+            "fd": 3,
+            "fd_generation": 1,
+            "op": "close"
+          },
+          {
+            "at_ns": 1191548594953,
+            "cookie": 14,
+            "fd": 4,
+            "fd_generation": 2,
+            "op": "close"
+          }
+        ],
+        "pid": 4417,
+        "privileges": [
+          "CapInh:\t0000000000000000",
+          "CapPrm:\t0000000000000000",
+          "CapEff:\t0000000000000000",
+          "CapBnd:\t0000000000000000",
+          "CapAmb:\t0000000000000000",
+          "NoNewPrivs:\t1",
+          "Seccomp:\t0"
+        ],
+        "sockets": [
+          {
+            "closed_ns": 1191548590166,
+            "cookie": 12,
+            "fd": 3,
+            "fd_generation": 1,
+            "opened_ns": 1191548210407,
+            "role": "receiver"
+          },
+          {
+            "closed_ns": 1191548490176,
+            "cookie": 13,
+            "fd": 4,
+            "fd_generation": 1,
+            "opened_ns": 1191548291749,
+            "role": "sender"
+          },
+          {
+            "closed_ns": 1191548511698,
+            "cookie": 13,
+            "fd": 5,
+            "fd_generation": 1,
+            "opened_ns": 1191548484668,
+            "role": "sender_alias"
+          },
+          {
+            "closed_ns": 1191548595504,
+            "cookie": 14,
+            "fd": 4,
+            "fd_generation": 2,
+            "opened_ns": 1191548519630,
+            "role": "sender_reused_fd"
+          }
+        ],
+        "start_ns": 1191548101884,
+        "start_ticks": "119151",
+        "status": "supported",
+        "uid": 65534
+      },
+      "name": "rx-offload-1-normal",
+      "ready": {
+        "exercise_verified": false,
+        "family": "rx",
+        "links": 3,
+        "netns": 4026532225,
+        "phase": "ready",
+        "start_ns": 1191517634942,
+        "status": "supported"
+      },
+      "snapshots": [
+        {
+          "end_ns": 1191552827625,
+          "losses": [
+            9,
+            0,
+            0,
+            0,
+            0,
+            10,
+            1,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "snapshot",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 12,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1191548360372,
+              "kind": 5,
+              "last_ns": 1191548360372,
+              "length": 4096,
+              "peer_cookie": 0,
+              "result": 4096,
+              "segment": 1024
+            }
+          ],
+          "start_ns": 1191517634942,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        },
+        {
+          "end_ns": 1191680089235,
+          "losses": [
+            9,
+            0,
+            0,
+            0,
+            0,
+            10,
+            1,
+            0
+          ],
+          "map_read_failures": 0,
+          "pending_rx": 0,
+          "pending_selector": 0,
+          "pending_tx": 0,
+          "phase": "final",
+          "ring_drops": null,
+          "rows": [
+            {
+              "cookie": 12,
+              "count": 1,
+              "cpu": 1,
+              "first_ns": 1191548360372,
+              "kind": 5,
+              "last_ns": 1191548360372,
+              "length": 4096,
+              "peer_cookie": 0,
+              "result": 4096,
+              "segment": 1024
+            }
+          ],
+          "start_ns": 1191517634942,
+          "stream_reason": "count_maps_no_event_stream",
+          "stream_sequence_gaps": null,
+          "verifier_log_truncated": false
+        }
+      ],
+      "status": "partial_coverage",
+      "fixture_process": {
+        "action": "fixture",
+        "argv": [
+          "bash",
+          "tests/performance/multi_protocol/h3_proof/commands.sh"
+        ],
+        "cwd": "/tmp/ferrum-h3-proof",
+        "data": {
+          "mode": "offload"
+        },
+        "end_ns": 1191552705442,
+        "returncode": 0,
+        "start_ns": 1191518101000,
+        "stderr": "",
+        "truncated": false
+      }
+    },
+    {
+      "diagnostics_truncated": false,
+      "name": "rx-offload-512-missing-btf",
+      "ready": {
+        "errno": 2,
+        "phase": "ready",
+        "reason": "btf_read",
+        "status": "unsupported",
+        "verifier_log_truncated": false
+      },
+      "reason": "btf_read",
+      "status": "unsupported"
+    },
+    {
+      "diagnostics_truncated": false,
+      "name": "rx-offload-512-missing-symbol",
+      "ready": {
+        "errno": 2,
+        "phase": "ready",
+        "reason": "injected_missing_symbol",
+        "status": "unsupported",
+        "verifier_log_truncated": false
+      },
+      "reason": "injected_missing_symbol",
+      "status": "unsupported"
+    },
+    {
+      "diagnostics_truncated": false,
+      "name": "rx-offload-512-normal-unprivileged",
+      "ready": {
+        "errno": 13,
+        "phase": "ready",
+        "reason": "ftrace_function_visibility",
+        "status": "unsupported",
+        "verifier_log_truncated": false
+      },
+      "reason": "ftrace_function_visibility",
+      "status": "unsupported"
+    }
+  ]
+}

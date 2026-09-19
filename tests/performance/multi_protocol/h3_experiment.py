@@ -26,20 +26,26 @@ def topology(workers, limit):
                     for i in range(connections)))
 
 
-def envoy_config(source, limit, budget):
+def envoy_config(source, limit, budget, *, upstream_only=False):
     if limit not in (4, 100) or budget not in (212992, 4194304):
         raise ValueError("unsupported H3 experiment")
     marker = "max_concurrent_streams: { value: 100 }"
     if source.count(marker) != 2:
         raise ValueError("expected exactly two pinned Envoy stream limits")
-    source = source.replace(marker, f"max_concurrent_streams: {{ value: {limit} }}")
+    if upstream_only:
+        # The two occurrences are HCM then upstream. Keep HCM/listener at 100.
+        left, right = source.rsplit(marker, 1)
+        source = left + f"max_concurrent_streams: {{ value: {limit} }}" + right
+    else:
+        source = source.replace(marker, f"max_concurrent_streams: {{ value: {limit} }}")
+    downstream = 100 if upstream_only else limit
     # Downstream QUIC transport parameters come from the UDP listener, not
     # HttpConnectionManager.http3_protocol_options (which does not apply them).
     if source.count("quic_options: {}") != 1:
         raise ValueError("expected one pinned QUIC listener")
     source = source.replace("quic_options: {}", "quic_options:\n"
                             "          quic_protocol_options:\n"
-                            f"            max_concurrent_streams: {{ value: {limit} }}")
+                            f"            max_concurrent_streams: {{ value: {downstream} }}")
     # Linux doubles SO_*BUF requests; kernel defaults are already effective bytes.
     options = ("socket_options:\n"
                f"        - {{ level: 1, name: 8, int_value: {budget // 2}, state: STATE_PREBIND }}\n"

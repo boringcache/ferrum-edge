@@ -255,12 +255,44 @@ pub fn monotonic_secs() -> f64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
+/// Linux host clock shared with bpf_ktime_get_ns, unlike the process-local epoch.
+/// Consumers must verify the boot/time namespace and bound bracket uncertainty.
+#[derive(Clone, Debug, Serialize)]
+pub struct HostClockBracket {
+    pub clock: &'static str,
+    pub before_ns: u64,
+    pub after_ns: u64,
+}
+
+fn host_monotonic_ns() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: value is writable storage for one timespec; no retained pointer.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+            return None;
+        }
+        u64::try_from(value.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(u64::try_from(value.tv_nsec).ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PhaseReport {
     pub setup_start_monotonic_secs: f64,
     pub setup_start_unix_secs: f64,
     pub warmup_start_monotonic_secs: Option<f64>,
     pub measurement_start_monotonic_secs: Option<f64>,
+    pub measurement_start_host_clock: Option<HostClockBracket>,
     pub drain_start_monotonic_secs: Option<f64>,
     pub transport_close_start_monotonic_secs: Option<f64>,
     pub setup_secs: f64,
@@ -472,7 +504,16 @@ impl Phases {
                 .iter()
                 .filter(|slot| slot.state.load(Ordering::Acquire) == BARRIER)
                 .count();
+            let host_before = host_monotonic_ns();
             let start = Instant::now();
+            let host_after = host_monotonic_ns();
+            if let (Some(before_ns), Some(after_ns)) = (host_before, host_after) {
+                phases.measurement_start_host_clock = Some(HostClockBracket {
+                    clock: "CLOCK_MONOTONIC",
+                    before_ns,
+                    after_ns,
+                });
+            }
             let end = start + self.duration;
             phases.barrier_secs = start.duration_since(barrier).as_secs_f64();
             phases.measurement_secs = self.duration.as_secs_f64();
