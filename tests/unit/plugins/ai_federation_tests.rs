@@ -5049,7 +5049,7 @@ fn test_base_url_unsupported_scheme_rejected() {
     let err = test_helpers::validate_base_url_test("openai", "file:///etc/passwd", false, "both")
         .unwrap_err();
     assert!(
-        err.contains("must use a lowercase explicit https:// or http:// scheme"),
+        err.contains("must use a lowercase explicit `https://` or `http://` scheme"),
         "got: {err}"
     );
 }
@@ -5089,7 +5089,7 @@ fn test_construction_uses_resolved_backend_allow_ips_policy() {
         .err()
         .unwrap();
     assert!(err.contains("169.254.169.254"), "got: {err}");
-    assert!(err.contains("public"), "got: {err}");
+    assert!(err.contains("denied by backend egress policy"), "got: {err}");
 }
 
 #[test]
