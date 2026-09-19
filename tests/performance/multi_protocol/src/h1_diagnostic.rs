@@ -500,9 +500,10 @@ impl Observation {
 
 fn header_token(headers: &http::HeaderMap, name: http::header::HeaderName, token: &str) -> bool {
     headers.get_all(name).iter().any(|value| {
-        value
-            .to_str()
-            .is_ok_and(|text| text.split(',').any(|v| v.trim().eq_ignore_ascii_case(token)))
+        value.to_str().is_ok_and(|text| {
+            text.split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case(token))
+        })
     })
 }
 
@@ -588,7 +589,8 @@ struct DriverDrop {
 impl Drop for DriverDrop {
     fn drop(&mut self) {
         if !self.completed {
-            self.diagnostic.driver(self.id, "dropped_without_result", None);
+            self.diagnostic
+                .driver(self.id, "dropped_without_result", None);
         }
     }
 }

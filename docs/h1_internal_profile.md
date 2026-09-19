@@ -263,7 +263,10 @@ Retirement allows 5 seconds, then requests abort and allows 1 second to reap;
 any remaining handles are counted `unreaped_after_abort` and dropped with abort
 requested. Normal completion, Hyper error, cancellation, panic, pending/aborted
 and unreaped counts are distinct. `completed_ok` means the Hyper driver returned
-`Ok`, not peer FIN, TLS close_notify or successful request completion. The old
+`Ok`, not peer FIN, TLS close_notify or successful request completion. In
+[Hyper 1.8.1's dispatcher](https://github.com/hyperium/hyper/blob/v1.8.1/src/proto/h1/dispatch.rs#L306),
+a response parse error delivered to `SendRequest` can be followed by driver
+`Ok`; the malformed-header regression asserts both observations separately. The old
 H1 `transport_close_secs=0`/false defaults are still **unobserved** when this mode
 is off. They must never be interpreted as successful transport closure. The
 new retirement report is authoritative only when present; driver retirement

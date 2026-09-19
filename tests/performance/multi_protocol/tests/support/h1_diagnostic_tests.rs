@@ -221,7 +221,10 @@ async fn truncated_and_invalid_responses_cannot_manufacture_eof_or_success() {
         }
         let retirement = report.retirement.unwrap();
         if matches!(reply, Reply::InvalidHeaders) {
-            assert_eq!(retirement.completed_error, 1);
+            // Hyper delivers the parse error to SendRequest, then its driver
+            // completes Ok. Driver completion cannot validate request success.
+            assert_eq!(retirement.completed_ok, 1);
+            assert_eq!(retirement.completed_error, 0);
             assert_eq!(worker.request.error_class, Some("http_parse"));
         }
         assert_eq!(
@@ -249,7 +252,10 @@ async fn delayed_warmup_snapshot_uses_existing_single_warmup_and_named_phase_clo
     assert_eq!(worker.stage, "response_body");
     assert_eq!(worker.request.response_bytes, 2);
     assert!(worker.request.response_end.is_none());
-    assert_eq!(report.snapshots.last().unwrap().workers[0].requests_offered, 1);
+    assert_eq!(
+        report.snapshots.last().unwrap().workers[0].requests_offered,
+        1
+    );
 }
 
 #[tokio::test]
@@ -354,7 +360,12 @@ async fn bounded_capture_loss_and_stale_body_updates_are_explicit() {
     assert_eq!(report.snapshots[0].workers.len(), MAX_WORKERS);
     assert_eq!(report.snapshots[0].connections.len(), MAX_CONNECTIONS);
     assert_eq!(report.snapshots[0].workers[0].request.response_bytes, 0);
-    assert!(report.snapshots[0].workers[0].request.response_end.is_none());
+    assert!(
+        report.snapshots[0].workers[0]
+            .request
+            .response_end
+            .is_none()
+    );
     assert!(serde_json::to_vec(&report).unwrap().len() < 4 * 1024 * 1024);
 }
 
