@@ -137,6 +137,22 @@ class UDPInternalProfileTests(unittest.TestCase):
             self.assertTrue(result["traffic_complete"])
             self.assertFalse(result["profiles_complete"])
             self.assertFalse(result["fully_measured_comparison_eligible"])
+            self.assertFalse(result["kong_session_comparability"]["complete"])
+            self.assertIsNone(result["kong_session_comparability"]["effective_values"])
+            # Even ideal Ferrum publication and successful traffic cannot
+            # establish native Kong session lifetime from a client gauge.
+            from unittest.mock import patch
+            for pair in range(1, 5):
+                diagnostics = root / "pairs" / f"pair_{pair:03d}" / "diagnostics"
+                diagnostics.mkdir()
+                (diagnostics / "ferrum_1024_process_usage.json").write_text("{}")
+            with patch.object(profile, "profile_bracket", return_value=dict(complete=True)):
+                result = profile.report(root, "profile")
+            self.assertTrue(result["traffic_complete"])
+            self.assertTrue(result["profiles_complete"])
+            self.assertFalse(result["fully_measured_comparison_eligible"])
+            self.assertTrue(all("error" in row["kong_readback"] for row in result["observations"]
+                                if row["gateway"] == "kong"))
 
     def test_partial_retry_error_accounting_and_histograms_are_validated(self):
         counters = values()

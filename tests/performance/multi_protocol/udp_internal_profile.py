@@ -348,8 +348,27 @@ def report(directory, mode):
                         report["profiles_complete"] = False
                 else:
                     row["profile"] = dict(expected=False, reason="direct, Kong, or observer-off control")
+                if gateway == "kong":
+                    readback = folder / "diagnostics/kong-readback/summary.json"
+                    try:
+                        raw = readback.read_bytes()
+                        evidence = json.loads(raw)
+                        if not isinstance(evidence, dict) or evidence.get("schema") != 1:
+                            raise ValueError("unknown Kong readback schema")
+                        row["kong_readback"] = dict(artifact=str(readback.relative_to(directory)),
+                                                   sha256=hashlib.sha256(raw).hexdigest(),
+                                                   evidence=evidence)
+                    except (OSError, ValueError):
+                        row["kong_readback"] = dict(error="missing/malformed Kong readback")
                 report["observations"].append(row)
-    report["fully_measured_comparison_eligible"] = report["traffic_complete"] and report["profiles_complete"]
+    if mode == "profile":
+        # The client gauge measures socket lifetime, not native Kong sessions.
+        # Even successful fixed-file readback requires root's config/Lua review
+        # and exact enterprise native correspondence; never infer defaults here.
+        report["kong_session_comparability"] = dict(complete=False, effective_values=None,
+            reason="root must review rendered includes, runtime Lua timeouts and native vendor correspondence")
+    report["fully_measured_comparison_eligible"] = (
+        report["traffic_complete"] and report["profiles_complete"] and mode != "profile")
     (directory / "udp_profile_report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 

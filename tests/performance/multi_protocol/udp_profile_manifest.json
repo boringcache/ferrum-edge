@@ -31,7 +31,9 @@
   "coverage": "published UDP source-site counters; tails and tracing remain explicit",
   "kong_provenance": {
     "image": "kong/kong-gateway:3.10.0.0",
-    "vendor_correspondence": "unestablished; root investigation",
-    "changelog": "OpenResty connection pooling correction in 3.10.0.2; UDP impact unestablished; no causal attribution"
+    "vendor_correspondence": "exact private patchset unestablished; versions alone do not establish correspondence",
+    "readback": "bounded fixed queries of each ready hosted fixture before measurement; raw commands, hashes, statuses and include gaps retained",
+    "session_comparability": "incomplete until root reviews rendered inheritance and runtime Lua/native timeout evidence; persistent client sockets do not prove persistent Kong sessions",
+    "changelog": "known public OpenResty pooling correction is HTTP-only; no UDP cause proof; baseline unchanged"
   }
 }

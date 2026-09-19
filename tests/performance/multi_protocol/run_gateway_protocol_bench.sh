@@ -606,9 +606,14 @@ start_kong() {
     if [ "$UDP_PROFILE" = profile ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         cp "$cfg_dst" "$OUTPUT_DIR/diagnostics/kong_config.yaml"
-        docker inspect "$GATEWAY_CID" > "$OUTPUT_DIR/diagnostics/kong_container.json"
     fi
-    wait_for_gateway
+    wait_for_gateway || return 1
+    if [ "$UDP_PROFILE" = profile ]; then
+        # Capture the actual ready fixture before any measured traffic. Readback
+        # failures remain in the ledger; this never changes Kong/traffic policy.
+        bash "$SCRIPT_DIR/kong_udp_readback.sh" "$GATEWAY_CID" "$KONG_IMAGE" \
+            "$OUTPUT_DIR/diagnostics/kong-readback" || return 1
+    fi
 }
 
 kong_config_name() {

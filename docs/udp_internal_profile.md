@@ -123,10 +123,122 @@ seeded send schedule, socket creation/retirement hooks, equal offered packet
 counts/rate, and observed socket lifetime requirements. Existing echo does not
 exercise controlled churn or establish a prescribed cache miss rate.
 
-Kong image metadata is retained on the hosted campaign. Exact enterprise
-NGINX/OpenResty vendor correspondence remains unestablished; public Kong tags
-do not establish it. The recorded official changelog correction for .0/.1's
-OpenResty connection pooling bug is in 3.10.0.2, with UDP applicability still
-unestablished. The baseline is unchanged and no causal inference is made.
+## Kong provenance and session comparability
+
+The baseline remains **`kong/kong-gateway:3.10.0.0` Enterprise**. Historical
+hosted jobs [35071334026](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35071334026/job/104713326026)
+and [35195212169](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35195212169/job/105116713056)
+record the following index digest on x86_64 and image ID prefix `68e9b130e6bd`.
+Retained registry response bodies hash to these immutable identities:
+
+| Historical object | SHA-256 |
+|---|---|
+| [OCI index](https://registry-1.docker.io/v2/kong/kong-gateway/manifests/sha256:ad58cd7175a0571b1e7c226f88ade0164e5fd50b12f4da8d373e0acc82547495) | `ad58cd7175a0571b1e7c226f88ade0164e5fd50b12f4da8d373e0acc82547495` |
+| [Linux amd64 manifest](https://registry-1.docker.io/v2/kong/kong-gateway/manifests/sha256:e1967ecf9db5a0a1692ea4f3feb10892b4c4ac1a7878320005add0b1180a6719) | `e1967ecf9db5a0a1692ea4f3feb10892b4c4ac1a7878320005add0b1180a6719` |
+| [Config / Docker image ID](https://registry-1.docker.io/v2/kong/kong-gateway/blobs/sha256:68e9b130e6bddc7f96ef830bcfd4e27eff1def615165404bed0100389f498852) | `68e9b130e6bddc7f96ef830bcfd4e27eff1def615165404bed0100389f498852` |
+
+The config labels declare enterprise revision
+`c63eec2527a05aa87a73ee2debdb18d5bfacc9e2` in `Kong/kong-ee` and creation
+`2025-03-26T03:53:44.644Z`. These are publisher assertions, not build
+attestations. The [official release changelog](https://github.com/Kong/developer.konghq.com/blob/92db4e301277a62218c88d88b24e770e61f5561c/app/_changelogs/gateway.json)
+declares **OpenResty 1.27.1.1**; that upstream release declares
+[NGINX 1.27.1](https://github.com/openresty/openresty/blob/8c37412c31621225e7aa7e825b5b50106c9c71c4/util/ver).
+These are vendor/release declarations, not yet observed executable output.
+
+The [vendor 3.10.0.0 SBOM archive](https://packages.konghq.com/public/gateway-310/raw/versions/3.10.0.0/security-assets.tar.gz)
+was 26,526,982 bytes, SHA-256
+`7cf9d16417b85b265f246b694dc177063a2b30c2e4ae1122340d9c98206b875b`.
+Its amd64 subject is a development image, not the production manifest. Its
+package layer ID matches the production config's second uncompressed layer
+ID; this is partial metadata correspondence. It inventories these useful
+hosted readback targets:
+
+| Inventoried file | SHA-256 |
+|---|---|
+| `/usr/local/openresty/nginx/sbin/nginx` | `a37e42bc2b09e508b76ead4f77966541de629b9308b892bca3694d179b7a7590` |
+| `/usr/local/share/lua/5.1/kong/templates/nginx_kong_stream.lua` | `aaaf8b810e55587686c62be9c0bf0d53dd7e9a52d39c85346892cf976a794819` |
+
+Do not reuse these content claims if the hosted image differs. The exact
+private OpenResty/NGINX/Kong-module patchset, ordered patches, dependency
+archive/commit hashes, build flags and native stream timeout implementation
+remain an **external vendor provenance gap**, bound to that enterprise revision,
+manifest and binary hash. Executable versions and matching file hashes alone
+cannot close it. The [known public pooling correction](https://github.com/openresty/lua-nginx-module/commit/18ce5fbd58171a5faec966a5f7099ce930c812c2)
+changes the HTTP Lua balancer keepalive cache; it is not UDP cause proof and
+does not justify replacing the baseline.
+
+### Bounded hosted readback
+
+After the existing UDP readiness probe succeeds, `start_kong` runs
+`kong_udp_readback.sh` against only the full CID returned by its own `docker run`,
+bound to the pinned image ID. This runs before measurement in each of the four
+profile pairs, with no per-packet observation or workload/config change. It
+requires GitHub-hosted Linux and creates no replacement gateway. The existing
+OCI metadata remains retained; the new container inspection selects identity
+and state fields without dumping environment variables.
+
+Each `pairs/pair_NNN/diagnostics/kong-readback/` contains an initial manifest,
+numbered raw stdout/stderr files and per-command JSON status records, and a
+final summary. The 22 fixed queries retain selected OCI identity fields,
+`kong version -a`, `nginx -V`, package version/inventory, binary SHA-256, seven
+allowlisted generated configs (including stream injection), and eight exact
+template/runtime Lua files. The latter include Kong's handler/balancer and
+`ngx/balancer.lua` timeout paths. Each text-file read has a native full-file
+SHA-256 header, checked against the captured body. The manifest hashes the
+capture scripts, runner, workload YAML and profile manifest as source provenance.
+
+Each command retains at most **256 KiB**, with **2 MiB aggregate raw output per
+fixture** (8 MiB across four pairs), plus bounded fixed-count JSON metadata.
+The include index is capped at 128 candidates and 1024 characters per operand,
+with truncation recorded separately and the raw config retained within its cap.
+Docker transport has a 12-second deadline and two-second kill grace; commands
+inside the container have eight seconds plus one-second grace. Thus the 22
+queries have at most 308 seconds of command deadline/grace per fixture. The
+reader stops after the cap plus one detection byte; the retained hash then
+identifies only the prefix. Exit codes (including timeout/SIGPIPE), reader
+failures, truncation, missing files, hash mismatches and interrupted/unattempted
+queries remain explicit. An identity failure prevents further queries and that
+arm's measurement. Other diagnostic failures stay in the ledger without
+retrying or modifying traffic. Existing always-upload steps preserve partial
+artifacts if the runner stops before a summary is written.
+
+There is no `nginx -T`, directory recursion, arbitrary include following,
+`.kong_env`/secret/certificate-content read, or package-inventory path execution.
+The fixed config set retains the known stream includes; the summary indexes
+include candidates and marks references outside the successfully captured set
+as unresolved. This index is deliberately not an NGINX/Lua parser. Root must
+review the raw main/stream/server config and every relevant include, resolving
+unexpected includes in a subsequent bounded change if necessary. Optional
+absent generated files remain failed queries, never invented empty configs.
+
+The existing hosted `Registered collector, Kong readback and parent measurement
+contracts` step checks shell syntax and discovers `test_kong_udp_readback.py`.
+Contracts exercise the actual reader's byte budgets, failures/interruption,
+identity binding, source-hash mismatch, stream-include gaps and fixed runner
+registration. They do not substitute for the manual campaign's actual image
+readback. Neither tests nor campaign were executed locally or dispatched by
+this implementation.
+
+### Interpretation remains incomplete
+
+The existing four-pair, 200-worker, 1024-byte, one-reply echo uses persistent
+**client sockets**; it does not establish persistent Kong sessions. In reference
+[NGINX 1.27.1](https://github.com/nginx/nginx/blob/e06bdbd4a20912c5223d7c6c6e2b3f0d6086c928/src/stream/ngx_stream_proxy_module.c#L1806),
+`proxy_requests 0` plus `proxy_responses 1` can finish a session after one echo
+and drained buffers. The upstream default for responses is unlimited, not
+zero; `proxy_responses 0` means no expected replies. These reference semantics
+do not establish the enterprise implementation's effective values.
+
+Review exact inherited/server `proxy_requests`, `proxy_responses`,
+`proxy_timeout`, `listen ... udp reuseport`, and runtime Lua timeout overrides.
+The checked-in Kong service's connect/read/write values of 5000/300000/300000 ms
+do not by themselves establish the native session timeout; Ferrum's YAML has
+30 seconds. Inter-packet gaps and actual session retention also remain to be
+established. The report therefore retains readback evidence independently of
+traffic/profile validity, with `kong_session_comparability.complete=false`,
+`effective_values=null`, and no fully measured comparison eligibility for the
+Kong campaign. No inherited effective value, session reuse, native source
+correspondence, or causal performance finding is fabricated.
+
 Root owns final provenance, syscall/CPU tracing, hosted dispatch, parent
 integration, and any subsequent decision about optimization or tracker closure.

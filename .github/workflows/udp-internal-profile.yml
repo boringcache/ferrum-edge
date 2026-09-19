@@ -80,9 +80,11 @@ jobs:
         run: |
           cargo test --locked --test unit_gateway_core_tests udp_
           cargo check --locked --features bench-h1-profile,bench-udp-profile --lib --bin ferrum-edge
-      - name: Registered collector and parent measurement contracts
+      - name: Registered collector, Kong readback and parent measurement contracts
         if: always()
-        run: python3 -m unittest discover --verbose --start-directory tests/performance/multi_protocol/tests
+        run: |
+          bash -n tests/performance/multi_protocol/kong_udp_readback.sh
+          python3 -m unittest discover --verbose --start-directory tests/performance/multi_protocol/tests
 
   measurement:
     name: Hosted UDP same-revision calibration and echo profile
