@@ -28,7 +28,7 @@ class SocketCoverageTests(unittest.TestCase):
         self.usage = dict(timeline=self.timeline)
         birth = dict(phase='lifecycle', cookie=42, at_ns=998 * NS, kind=18,
                      pid=42, tid=42, process_start_ns=70_000_000, thread_start_ns=70_000_000,
-                     cgroup=5, netns=2, family=socket.AF_INET, result=0,
+                     cgroup=5, netns=2, family=int(socket.AF_INET), result=0,
                      local_ipv4=0, local_port=0, peer_ipv4=0, peer_port=0,
                      so_rcvbuf=4194304, so_sndbuf=4194304, drops=0,
                      peer_cookie=0, attachment_generation=0, instruction_digest_fnv1a64=0,

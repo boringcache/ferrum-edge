@@ -140,7 +140,9 @@ async fn request() -> anyhow::Result<()> {
         .await?;
     let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
     let driver =
-        tokio::spawn(async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await });
+        tokio::spawn(
+            async move { futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await },
+        );
     let payload = vec![0x5a; 10240];
     let mut stream = sender
         .send_request(
