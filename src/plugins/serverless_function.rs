@@ -307,7 +307,7 @@ fn parse_invocation_mode(config: &Value) -> Result<InvocationMode, String> {
             "pre_proxy" => Ok(InvocationMode::PreProxy),
             "terminate" => Ok(InvocationMode::Terminate),
             other => Err(format!(
-                "serverless_function: unknown mode '{other}' (expected 'pre_proxy' or 'terminate')"
+                "serverless_function: unknown mode {other:?} (expected `pre_proxy` or `terminate`)"
             )),
         },
         None => Ok(InvocationMode::PreProxy),
@@ -559,7 +559,7 @@ impl ServerlessFunction {
                 "continue" => ErrorAction::Continue,
                 other => {
                     return Err(format!(
-                        "serverless_function: unknown on_error '{other}' (expected 'reject' or 'continue')"
+                        "serverless_function: unknown `on_error` {other:?} (expected `reject` or `continue`)"
                     ));
                 }
             },
@@ -572,7 +572,7 @@ impl ServerlessFunction {
         let raw_status = optional_u64(config, "error_status_code")?.unwrap_or(502);
         if !(400..=599).contains(&raw_status) {
             return Err(format!(
-                "serverless_function: error_status_code must be in range 400-599 (got {raw_status})"
+                "serverless_function: error_status_code must be in range 400-599 (got \"{raw_status}\")"
             ));
         }
         let error_status_code = raw_status as u16;

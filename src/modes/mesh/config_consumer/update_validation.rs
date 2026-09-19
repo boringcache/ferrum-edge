@@ -435,7 +435,10 @@ fn rejected<T>(
     warn!(
         consumer = consumer.as_metric_label(),
         reason = reason.as_metric_label(),
-        detail = %detail,
+        detail = %crate::startup::sanitize_startup_cause(
+            format!("{:?}", detail.to_string()),
+            &[]
+        ),
         "Rejected MeshSubscribe response before applying it"
     );
     Err(MeshUpdateRejection { reason, detail })

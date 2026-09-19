@@ -11,6 +11,7 @@
 //!   control characters to prevent log injection attacks.
 
 use crate::config::plugin_trigger::PluginTrigger;
+use crate::startup::sanitize_startup_cause;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -195,7 +196,7 @@ fn validate_credential_type_name(cred_type: &str) -> Result<(), String> {
     }
     if !cred_type.chars().all(is_path_safe_credential_type_char) {
         return Err(format!(
-            "credential type '{}' must be ASCII letters, digits, underscores, or hyphens",
+            "credential type {:?} must be ASCII letters, digits, underscores, or hyphens",
             cred_type
         ));
     }
@@ -287,7 +288,7 @@ fn basic_auth_credential_error(
     credential: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'static str> {
     if credential.len() != 1 {
-        return Some("must contain exactly one of 'password' or 'password_hash'");
+        return Some("must contain exactly one of `password` or `password_hash`");
     }
 
     if let Some(password) = credential.get("password") {
@@ -320,7 +321,7 @@ fn basic_auth_credential_error(
         );
     }
 
-    Some("must contain exactly one of 'password' or 'password_hash'")
+    Some("must contain exactly one of `password` or `password_hash`")
 }
 /// Maximum number of ACL groups per consumer.
 pub const MAX_ACL_GROUPS_PER_CONSUMER: usize = 500;
@@ -448,7 +449,7 @@ pub fn validate_resource_id(id: &str) -> Result<(), String> {
     }
     if !ID_REGEX.is_match(id) {
         return Err(format!(
-            "ID '{}' is invalid: must start with an alphanumeric character and contain only \
+            "ID {:?} is invalid: must start with an alphanumeric character and contain only \
              alphanumeric characters, dots, underscores, or hyphens",
             id
         ));
@@ -3565,7 +3566,8 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
     }
     if !ID_REGEX.is_match(ns) {
         return Err(format!(
-            "namespace '{}' is invalid: must start with alphanumeric and contain only alphanumeric, dots, underscores, or hyphens",
+            "namespace {:?} is invalid: must start with alphanumeric and contain only \
+             alphanumeric, dots, underscores, or hyphens",
             ns
         ));
     }
@@ -3918,12 +3920,14 @@ impl GatewayConfig {
                     if ambiguous_path_host_overlap(&proxy_a.hosts, &proxy_b.hosts) {
                         if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
                             errors.push(format!(
-                                "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
+                                "Duplicate `listen_path` {:?} found in proxy {:?} (conflicts with \
+                                 {:?})",
                                 path, proxy_b.id, proxy_a.id
                             ));
                         } else {
                             errors.push(format!(
-                                "Overlapping host+listen_path for '{}' in proxy '{}' (conflicts with '{}')",
+                                "Overlapping host+listen_path for {:?} in proxy {:?} (conflicts \
+                                 with {:?})",
                                 path, proxy_b.id, proxy_a.id
                             ));
                         }
@@ -3937,7 +3941,8 @@ impl GatewayConfig {
                 for proxy_b in group.iter().skip(i + 1) {
                     if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
                         errors.push(format!(
-                            "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
+                            "Overlapping host-only proxies {:?} and {:?} — each host can route to \
+                             at most one host-only proxy",
                             proxy_b.id, proxy_a.id
                         ));
                     }
@@ -4044,7 +4049,9 @@ impl GatewayConfig {
             for plugin in effective_plugins {
                 if !proxy.frontend_tls || proxy.passthrough {
                     errors.push(format!(
-                        "Proxy '{}' cannot use mtls_auth PluginConfig '{}': stream mTLS authentication requires frontend_tls=true with TLS/DTLS termination (passthrough=false)",
+                        "Proxy {:?} cannot use `mtls_auth` PluginConfig {:?}: stream mTLS \
+                         authentication requires `frontend_tls=true` with TLS/DTLS termination \
+                         (`passthrough=false`)",
                         proxy.id, plugin.id
                     ));
                 }
@@ -4063,7 +4070,7 @@ impl GatewayConfig {
         for proxy in &self.proxies {
             for host in &proxy.hosts {
                 if let Err(msg) = validate_host_entry(host) {
-                    errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+                    errors.push(format!("Proxy {:?}: {}", proxy.id, msg));
                 }
             }
         }
@@ -4093,16 +4100,16 @@ impl GatewayConfig {
             if let Some(pattern) = path.strip_prefix('~') {
                 if pattern.is_empty() {
                     errors.push(format!(
-                        "Proxy '{}': regex listen_path '~' has empty pattern",
+                        "Proxy {:?}: regex listen_path `~` has empty pattern",
                         proxy.id
                     ));
                     continue;
                 }
                 let anchored = anchor_regex_pattern(pattern);
-                if let Err(e) = Regex::new(&anchored) {
+                if Regex::new(&anchored).is_err() {
                     errors.push(format!(
-                        "Proxy '{}': invalid regex listen_path '{}': {}",
-                        proxy.id, path, e
+                        "Proxy {:?}: invalid regex listen_path or complexity limit exceeded",
+                        proxy.id
                     ));
                 }
             }
@@ -4138,7 +4145,7 @@ impl GatewayConfig {
             };
             if let Some(reason) = non_canonical_listen_path_reason(path) {
                 errors.push(format!(
-                    "Proxy '{}': listen_path '{}' is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
+                    "Proxy {:?}: listen_path {:?} is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
                     proxy.id, path, reason
                 ));
             }
@@ -4610,8 +4617,8 @@ impl GatewayConfig {
             match conflict {
                 Some((field, value, other_id, other_field)) => {
                     messages.push(format!(
-                        "Quarantined consumer '{}': its {} '{}' collides with the {} of \
-                         consumer '{}' — the consumer is excluded from this config load to \
+                        "Quarantined consumer {:?}: its {} {:?} collides with the {} of \
+                         consumer {:?} — the consumer is excluded from this config load to \
                          prevent incorrect JWKS/JWT authentication. Repair the stored \
                          consumer records to restore it.",
                         consumer.id, field, value, other_field, other_id
@@ -4641,7 +4648,7 @@ impl GatewayConfig {
                     && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
                 {
                     duplicates.push(format!(
-                        "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                        "Duplicate mtls_auth identity {:?} in consumer {:?} (conflicts with consumer {:?})",
                         identity, consumer.id, existing_id
                     ));
                 }
@@ -4673,7 +4680,7 @@ impl GatewayConfig {
                     && existing_id != consumer.id
                 {
                     duplicates.push(format!(
-                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}' in namespace '{}')",
+                        "Duplicate hmac_auth shared secret in consumer {:?} (conflicts with consumer {:?} in namespace {:?})",
                         consumer.id, existing_id, consumer.namespace
                     ));
                 }
@@ -4738,7 +4745,7 @@ impl GatewayConfig {
             let Some(secrets) = secrets else {
                 consumer.credentials.remove("hmac_auth");
                 messages.push(format!(
-                    "Quarantined hmac_auth credential of consumer '{}': a stored entry \
+                    "Quarantined hmac_auth credential of consumer {:?}: a stored entry \
                      is malformed or its secret has fewer than {} non-whitespace \
                      characters — the credential is excluded from this config load so \
                      the weak secret cannot authenticate. Repair the stored credential \
@@ -4756,9 +4763,9 @@ impl GatewayConfig {
                     let other_id = other_id.clone();
                     consumer.credentials.remove("hmac_auth");
                     messages.push(format!(
-                        "Quarantined hmac_auth credential of consumer '{}': its shared \
-                         secret is also claimed by consumer '{}' in namespace '{}' — the credential is \
-                         excluded from this config load to prevent cross-Consumer \
+                        "Quarantined hmac_auth credential of consumer {:?}: its shared \
+                         secret is also claimed by consumer {:?} in namespace {:?} — the \
+                         credential is excluded from this config load to prevent cross-Consumer \
                          signature forgery. Rotate one of the secrets to restore it.",
                         consumer.id, other_id, consumer.namespace
                     ));
@@ -4810,7 +4817,7 @@ impl GatewayConfig {
                 {
                     // Do NOT include the API key value in the error message for security
                     duplicates.push(format!(
-                        "Duplicate keyauth API key in consumer '{}' (conflicts with consumer '{}')",
+                        "Duplicate keyauth API key in consumer {:?} (conflicts with consumer {:?})",
                         consumer.id, existing_id
                     ));
                 }
@@ -4821,7 +4828,7 @@ impl GatewayConfig {
                 && let Some(existing_id) = seen_basicauth.insert(&consumer.username, &consumer.id)
             {
                 duplicates.push(format!(
-                    "Duplicate basicauth username '{}' in consumer '{}' (conflicts with consumer '{}')",
+                    "Duplicate basicauth username {:?} in consumer {:?} (conflicts with consumer {:?})",
                     consumer.username, consumer.id, existing_id
                 ));
             }
@@ -4860,7 +4867,7 @@ impl GatewayConfig {
                     seen_dns.insert(identity.to_ascii_lowercase(), &consumer.id)
                 {
                     duplicates.push(format!(
-                        "Duplicate mtls_auth DNS identity '{}' (ASCII case-insensitive) in consumer '{}' (conflicts with consumer '{}')",
+                        "Duplicate mtls_auth DNS identity {:?} (ASCII case-insensitive) in consumer {:?} (conflicts with consumer {:?})",
                         identity, consumer.id, existing_id
                     ));
                 }
@@ -4956,7 +4963,7 @@ impl GatewayConfig {
                 && let Some(existing_id) = seen.insert(name.as_str(), &upstream.id)
             {
                 duplicates.push(format!(
-                    "Duplicate upstream name '{}' in upstream '{}' (conflicts with '{}')",
+                    "Duplicate upstream name {:?} in upstream {:?} (conflicts with {:?})",
                     name, upstream.id, existing_id
                 ));
             }
@@ -4982,7 +4989,7 @@ impl GatewayConfig {
                 && let Some(existing_id) = seen.insert(name.as_str(), &proxy.id)
             {
                 duplicates.push(format!(
-                    "Duplicate proxy name '{}' in proxy '{}' (conflicts with '{}')",
+                    "Duplicate proxy name {:?} in proxy {:?} (conflicts with {:?})",
                     name, proxy.id, existing_id
                 ));
             }
@@ -5033,7 +5040,7 @@ impl GatewayConfig {
                             });
                             if !subset_exists {
                                 errors.push(format!(
-                                    "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
+                                    "Proxy {:?} references upstream_subset {:?} that is not defined on upstream_id {:?}",
                                     proxy.id, subset_name, uid
                                 ));
                             }
@@ -5041,7 +5048,7 @@ impl GatewayConfig {
                     }
                     None => {
                         errors.push(format!(
-                            "Proxy '{}' references non-existent upstream_id '{}'",
+                            "Proxy {:?} references non-existent upstream_id {:?}",
                             proxy.id, uid
                         ));
                     }
@@ -5111,13 +5118,13 @@ impl GatewayConfig {
             if plugin.plugin_name == "transaction_log_schema" && plugin.scope != PluginScope::Global
             {
                 errors.push(format!(
-                    "PluginConfig '{}' (transaction_log_schema) must have scope 'global'",
+                    "PluginConfig {:?} (transaction_log_schema) must have scope `global`",
                     plugin.id
                 ));
             }
             if plugin.plugin_name == "prometheus_metrics" && plugin.scope != PluginScope::Global {
                 errors.push(format!(
-                    "PluginConfig '{}' (prometheus_metrics) must have scope 'global'",
+                    "PluginConfig {:?} (prometheus_metrics) must have scope `global`",
                     plugin.id
                 ));
             }
@@ -5128,13 +5135,13 @@ impl GatewayConfig {
             if let Some(trigger) = plugin.trigger.as_ref()
                 && let Err(error) = trigger.validate()
             {
-                errors.push(format!("PluginConfig '{}': {}", plugin.id, error));
+                errors.push(format!("PluginConfig {:?}: {}", plugin.id, error));
             }
             match plugin.scope {
                 PluginScope::Global => {
                     if plugin.proxy_id.is_some() {
                         errors.push(format!(
-                            "PluginConfig '{}' with scope 'global' must not have proxy_id",
+                            "PluginConfig {:?} with scope `global` must not have proxy_id",
                             plugin.id
                         ));
                     }
@@ -5143,20 +5150,20 @@ impl GatewayConfig {
                     Some(proxy_id) => {
                         if !proxy_keys.contains(&(plugin.namespace.as_str(), proxy_id)) {
                             errors.push(format!(
-                                "PluginConfig '{}' references non-existent proxy_id '{}'",
+                                "PluginConfig {:?} references non-existent proxy_id {:?}",
                                 plugin.id, proxy_id
                             ));
                         }
                     }
                     None => errors.push(format!(
-                        "PluginConfig '{}' with scope 'proxy' must have proxy_id",
+                        "PluginConfig {:?} with scope `proxy` must have proxy_id",
                         plugin.id
                     )),
                 },
                 PluginScope::ProxyGroup => {
                     if plugin.proxy_id.is_some() {
                         errors.push(format!(
-                            "PluginConfig '{}' with scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)",
+                            "PluginConfig {:?} with scope `proxy_group` must not have proxy_id (associations are managed via proxy.plugins)",
                             plugin.id
                         ));
                     }
@@ -5169,7 +5176,7 @@ impl GatewayConfig {
             for assoc in &proxy.plugins {
                 if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
                     errors.push(format!(
-                        "Proxy '{}' references plugin_config '{}' more than once",
+                        "Proxy {:?} references plugin_config {:?} more than once",
                         proxy.id, assoc.plugin_config_id
                     ));
                 }
@@ -5180,14 +5187,14 @@ impl GatewayConfig {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
+                                "Proxy {:?} references plugin_config {:?} with scope `global` — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
                                 proxy.id, plugin.id,
                             ));
                         }
                         PluginScope::Proxy => {
                             if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) {
                                 errors.push(format!(
-                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    "Proxy {:?} references plugin_config {:?} targeted to proxy {:?}",
                                     proxy.id,
                                     plugin.id,
                                     plugin.proxy_id.as_deref().unwrap_or("<none>")
@@ -5200,7 +5207,7 @@ impl GatewayConfig {
                         }
                     },
                     None => errors.push(format!(
-                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        "Proxy {:?} references non-existent plugin_config {:?}",
                         proxy.id, assoc.plugin_config_id
                     )),
                 }
@@ -5230,7 +5237,7 @@ impl GatewayConfig {
                 errors.push(format!("Proxy ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&proxy.namespace) {
-                errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+                errors.push(format!("Proxy {:?}: {}", proxy.id, msg));
             }
         }
         for consumer in &self.consumers {
@@ -5238,7 +5245,7 @@ impl GatewayConfig {
                 errors.push(format!("Consumer ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&consumer.namespace) {
-                errors.push(format!("Consumer '{}': {}", consumer.id, msg));
+                errors.push(format!("Consumer {:?}: {}", consumer.id, msg));
             }
         }
         for pc in &self.plugin_configs {
@@ -5246,7 +5253,7 @@ impl GatewayConfig {
                 errors.push(format!("PluginConfig ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&pc.namespace) {
-                errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+                errors.push(format!("PluginConfig {:?}: {}", pc.id, msg));
             }
         }
         for upstream in &self.upstreams {
@@ -5254,7 +5261,7 @@ impl GatewayConfig {
                 errors.push(format!("Upstream ID: {}", msg));
             }
             if let Err(msg) = validate_namespace(&upstream.namespace) {
-                errors.push(format!("Upstream '{}': {}", upstream.id, msg));
+                errors.push(format!("Upstream {:?}: {}", upstream.id, msg));
             }
         }
 
@@ -5279,7 +5286,7 @@ impl GatewayConfig {
         for proxy in &self.proxies {
             if !seen_proxy_ids.insert((&proxy.namespace, &proxy.id)) {
                 errors.push(format!(
-                    "Duplicate proxy ID '{}' in namespace '{}'",
+                    "Duplicate proxy ID {:?} in namespace {:?}",
                     proxy.id, proxy.namespace
                 ));
             }
@@ -5289,7 +5296,7 @@ impl GatewayConfig {
         for consumer in &self.consumers {
             if !seen_consumer_ids.insert((&consumer.namespace, &consumer.id)) {
                 errors.push(format!(
-                    "Duplicate consumer ID '{}' in namespace '{}'",
+                    "Duplicate consumer ID {:?} in namespace {:?}",
                     consumer.id, consumer.namespace
                 ));
             }
@@ -5299,7 +5306,7 @@ impl GatewayConfig {
         for pc in &self.plugin_configs {
             if !seen_plugin_ids.insert((&pc.namespace, &pc.id)) {
                 errors.push(format!(
-                    "Duplicate plugin_config ID '{}' in namespace '{}'",
+                    "Duplicate plugin_config ID {:?} in namespace {:?}",
                     pc.id, pc.namespace
                 ));
             }
@@ -5309,7 +5316,7 @@ impl GatewayConfig {
         for upstream in &self.upstreams {
             if !seen_upstream_ids.insert((&upstream.namespace, &upstream.id)) {
                 errors.push(format!(
-                    "Duplicate upstream ID '{}' in namespace '{}'",
+                    "Duplicate upstream ID {:?} in namespace {:?}",
                     upstream.id, upstream.namespace
                 ));
             }
@@ -5349,14 +5356,14 @@ impl GatewayConfig {
                 match proxy.listen_port {
                     None => {
                         errors.push(format!(
-                            "Stream proxy '{}' (scheme {}) must have a listen_port",
+                            "Stream proxy {:?} (scheme {}) must have a listen_port",
                             proxy.id,
                             proxy.scheme_display()
                         ));
                     }
                     Some(port) if port < 1 => {
                         errors.push(format!(
-                            "Stream proxy '{}' has invalid listen_port {} (must be >= 1)",
+                            "Stream proxy {:?} has invalid listen_port \"{}\" (must be >= 1)",
                             proxy.id, port
                         ));
                     }
@@ -5372,7 +5379,7 @@ impl GatewayConfig {
                 // the port. Reject with a field-specific diagnostic instead.
                 if !proxy.hosts.is_empty() && !proxy.joins_opaque_tls_sni_plane() {
                     errors.push(format!(
-                        "Stream proxy '{}' (scheme {}) sets hosts but cannot route by SNI — \
+                        "Stream proxy {:?} (scheme {}) sets hosts but cannot route by SNI — \
                          hosts is a TLS server_name predicate and requires an opaque listener \
                          (passthrough: true, or backend_scheme tcp with frontend_tls: false)",
                         proxy.id,
@@ -5383,7 +5390,7 @@ impl GatewayConfig {
                 && port == 0
             {
                 errors.push(format!(
-                    "HTTP proxy '{}' has invalid listen_port {} (must be >= 1)",
+                    "HTTP proxy {:?} has invalid listen_port \"{}\" (must be >= 1)",
                     proxy.id, port
                 ));
             }
@@ -5394,7 +5401,7 @@ impl GatewayConfig {
             // still rejected.
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
-                    "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
+                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
                      valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
                      the client IP from X-Forwarded-For",
                     proxy.id,
@@ -5409,7 +5416,7 @@ impl GatewayConfig {
                 );
                 if !is_tcp_stream {
                     errors.push(format!(
-                        "Proxy '{}' (scheme {}) sets backend_proxy_protocol but outbound PROXY \
+                        "Proxy {:?} (scheme {}) sets backend_proxy_protocol but outbound PROXY \
                          protocol is only valid for tcp/tcps stream proxies",
                         proxy.id,
                         proxy.scheme_display()
@@ -5467,7 +5474,8 @@ impl GatewayConfig {
                 let mixed_passthrough = proxies_on_port.iter().any(|p| p.passthrough);
                 if mixed_passthrough {
                     errors.push(format!(
-                        "Duplicate listen_port {} mixes passthrough and non-passthrough proxies — \
+                        "Duplicate listen_port \"{}\" mixes passthrough and non-passthrough \
+                         proxies — \
                          a shared stream listener is built from one representative before any route \
                          is selected, so every candidate on a port must agree on passthrough",
                         port
@@ -5480,14 +5488,19 @@ impl GatewayConfig {
                     .map(|p| p.id.as_str())
                     .collect();
                 errors.push(format!(
-                    "Duplicate listen_port {} — proxies sharing a port must form one shared listener: \
+                    "Duplicate listen_port \"{}\" — proxies sharing a port must form one shared \
+                     listener: \
                      all passthrough: true, all opaque tcp listeners with at least one declaring hosts \
                      (SNI routing), or an L4 stream_match group. Offending: {}",
                     port,
                     if non_sni.is_empty() {
                         "no candidate declares hosts or stream_match".to_string()
                     } else {
-                        non_sni.join(", ")
+                        non_sni
+                            .iter()
+                            .map(|id| format!("{id:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 ));
                 continue;
@@ -5504,11 +5517,16 @@ impl GatewayConfig {
                 .collect();
             if !pp_enabled.is_empty() && pp_enabled.len() != proxies_on_port.len() {
                 errors.push(format!(
-                    "Shared listen_port {} mixes stream_proxy_protocol settings ({} enable it) — \
+                    "Shared listen_port \"{}\" mixes stream_proxy_protocol settings \
+                     ({} enable it) — \
                      the PROXY header is parsed before SNI/L4 match resolution, so every proxy sharing a \
                      port must agree on stream_proxy_protocol",
                     port,
-                    pp_enabled.join(", ")
+                    pp_enabled
+                        .iter()
+                        .map(|id| format!("{id:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
 
@@ -5524,7 +5542,8 @@ impl GatewayConfig {
                 .any(|p| p.effective_scheme() != representative.effective_scheme());
             if mixed_scheme {
                 errors.push(format!(
-                    "Shared listen_port {} mixes backend schemes — every candidate must use the same tcp/tcps listener scheme",
+                    "Shared listen_port \"{}\" mixes backend schemes — every candidate must use \
+                     the same tcp/tcps listener scheme",
                     port
                 ));
             }
@@ -5533,7 +5552,8 @@ impl GatewayConfig {
                 .any(|p| p.frontend_tls != representative.frontend_tls);
             if mixed_frontend_tls {
                 errors.push(format!(
-                    "Shared listen_port {} mixes frontend_tls settings — every candidate must agree before route resolution",
+                    "Shared listen_port \"{}\" mixes frontend_tls settings — every candidate \
+                     must agree before route resolution",
                     port
                 ));
             }
@@ -5551,7 +5571,8 @@ impl GatewayConfig {
                 });
                 if mixed_backend_tls {
                     errors.push(format!(
-                        "Shared listen_port {} mixes backend TLS listener settings — every tcps candidate must use the same verifier and client identity sources",
+                        "Shared listen_port \"{}\" mixes backend TLS listener settings — every \
+                         tcps candidate must use the same verifier and client identity sources",
                         port
                     ));
                 }
@@ -5571,7 +5592,8 @@ impl GatewayConfig {
                     .count();
                 if catch_all > 1 {
                     errors.push(format!(
-                        "L4 stream_match port {} has {catch_all} catch-all proxies — at most one unconstrained match is allowed",
+                        "L4 stream_match port \"{}\" has {catch_all} catch-all proxies — at most \
+                         one unconstrained match is allowed",
                         port
                     ));
                 }
@@ -5596,7 +5618,8 @@ impl GatewayConfig {
                 .count();
             if catch_all_count > 1 {
                 errors.push(format!(
-                    "SNI-routed port {} has {} proxies with empty hosts — at most one catch-all is allowed",
+                    "SNI-routed port \"{}\" has {} proxies with empty hosts — at most one \
+                     catch-all is allowed",
                     port, catch_all_count
                 ));
             }
@@ -5614,7 +5637,7 @@ impl GatewayConfig {
                         continue;
                     }
                     errors.push(format!(
-                        "SNI-routed proxies '{}' and '{}' on port {} have overlapping hosts — \
+                        "SNI-routed proxies {:?} and {:?} on port \"{}\" have overlapping hosts — \
                          each SNI hostname must route to exactly one matcher-free proxy (or ordered stream_match criteria)",
                         a.id, b.id, port
                     ));
@@ -5645,7 +5668,8 @@ impl GatewayConfig {
                 && reserved_ports.contains(&port)
             {
                 errors.push(format!(
-                    "Stream proxy '{}' listen_port {} conflicts with a gateway reserved port \
+                    "Stream proxy {:?} `listen_port` \"{}\" conflicts with a gateway \
+                     reserved port \
                      (proxy/admin/gRPC listener)",
                     proxy.id, port
                 ));
@@ -5690,7 +5714,7 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     }
     if host.len() > MAX_HOST_LENGTH {
         return Err(format!(
-            "host '{}' must not exceed {} characters (got {})",
+            "host {:?} must not exceed {} characters (got {})",
             host,
             MAX_HOST_LENGTH,
             host.len()
@@ -5698,44 +5722,44 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     }
     if host.trim() != host {
         return Err(format!(
-            "host '{}' must not have leading or trailing whitespace",
+            "host {:?} must not have leading or trailing whitespace",
             host
         ));
     }
     if host.contains("://") {
         return Err(format!(
-            "host '{}' must not contain a scheme (e.g., 'http://')",
+            "host {:?} must not contain a scheme (e.g., `http://`)",
             host
         ));
     }
     if host.contains(':') && !host.starts_with('*') {
-        return Err(format!("host '{}' must not contain a port number", host));
+        return Err(format!("host {:?} must not contain a port number", host));
     }
     if host.contains('/') {
-        return Err(format!("host '{}' must not contain a path", host));
+        return Err(format!("host {:?} must not contain a path", host));
     }
     if host != host.to_lowercase() {
         return Err(format!(
-            "host '{}' must be lowercase (got mixed case)",
+            "host {:?} must be lowercase (got mixed case)",
             host
         ));
     }
     if let Some(wildcard_suffix) = host.strip_prefix("*.") {
         if !WILDCARD_HOST_REGEX.is_match(host) {
             return Err(format!(
-                "wildcard host '{}' is invalid: must be '*.domain.tld' format",
+                "wildcard host {:?} is invalid: must be `*.domain.tld` format",
                 host
             ));
         }
         validate_hostname_labels(wildcard_suffix, host)?;
     } else if host.contains('*') {
         return Err(format!(
-            "host '{}' has invalid wildcard: '*' is only allowed as prefix '*.domain'",
+            "host {:?} has invalid wildcard: `*` is only allowed as prefix `*.domain`",
             host
         ));
     } else if !HOST_REGEX.is_match(host) {
         return Err(format!(
-            "host '{}' is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
+            "host {:?} is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
             host
         ));
     } else {
@@ -5747,11 +5771,11 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
 fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String> {
     for label in hostname.split('.') {
         if label.is_empty() {
-            return Err(format!("host '{}' must not contain empty labels", original));
+            return Err(format!("host {:?} must not contain empty labels", original));
         }
         if label.len() > 63 {
             return Err(format!(
-                "host '{}' contains a label longer than 63 characters",
+                "host {:?} contains a label longer than 63 characters",
                 original
             ));
         }
@@ -5765,7 +5789,7 @@ fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String
             .is_some_and(|b| b.is_ascii_alphanumeric());
         if !starts_alnum || !ends_alnum {
             return Err(format!(
-                "host '{}' labels must start and end with an alphanumeric character",
+                "host {:?} labels must start and end with an alphanumeric character",
                 original
             ));
         }
@@ -5988,11 +6012,11 @@ fn validate_hash_on_field(field_name: &str, value: &str, errors: &mut Vec<String
 
     if name.is_empty() {
         errors.push(format!(
-            "{field_name} '{kind}:' requires a non-empty {kind} name"
+            "{field_name} `{kind}:` requires a non-empty {kind} name"
         ));
     } else if !is_valid_http_token(name) {
         errors.push(format!(
-            "{field_name} '{kind}:' name must contain only ASCII HTTP token characters"
+            "{field_name} `{kind}:` name must contain only ASCII HTTP token characters"
         ));
     }
 }
@@ -6065,13 +6089,15 @@ fn validate_system_trust_roots_source_field(
 ) -> Result<(), String> {
     if kind != crate::tls::source::MaterialKind::CaBundle {
         return Err(format!(
-            "{field_name} must not be '{}': the system trust-roots source selects CA trust anchors and is only valid on a CA bundle field",
+            "`{field_name}` must not be `{}`: the system trust-roots source selects CA trust \
+             anchors and is only valid on a CA bundle field",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
         ));
     }
     if value != crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE {
         return Err(format!(
-            "{field_name} system trust-roots source must be exactly '{}' with no path or query options (got '{value}')",
+            "`{field_name}` system trust-roots source must be exactly `{}` with no path or query \
+             options (got {value:?})",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
         ));
     }
@@ -6091,7 +6117,8 @@ pub(crate) fn validate_system_trust_roots_verify_pairing(
     let selects_system = ca_value.is_some_and(crate::tls::source::is_system_trust_roots_source);
     if selects_system && !verify_server_cert {
         return Some(format!(
-            "{verify_field} cannot be false when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
+            "`{verify_field}` cannot be false when `{ca_field}` is `{}` — the system trust-roots \
+             source requires server certificate verification",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
         ));
     }
@@ -6130,7 +6157,8 @@ pub(crate) fn validate_system_trust_roots_skip_verify_pairing(
     let selects_system = ca_value.is_some_and(crate::tls::source::is_system_trust_roots_source);
     if selects_system && insecure_skip_verify {
         return Some(format!(
-            "{skip_verify_field} cannot be true when {ca_field} is '{}' — the system trust-roots source requires server certificate verification",
+            "`{skip_verify_field}` cannot be true when `{ca_field}` is `{}` — the system \
+             trust-roots source requires server certificate verification",
             crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE
         ));
     }
@@ -6150,7 +6178,7 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
         Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
         Err(e) => {
             return Err(format!(
-                "{}: failed to load certificate source '{}': {}",
+                "`{}`: failed to load certificate source {:?}: {}",
                 field_name,
                 source.redacted_source_id(),
                 e
@@ -6180,7 +6208,7 @@ pub fn validate_pem_ca_file(field_name: &str, path: &str) -> Result<(), String> 
         Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
         Err(e) => {
             return Err(format!(
-                "{}: failed to load CA source '{}': {}",
+                "`{}`: failed to load CA source {:?}: {}",
                 field_name,
                 source.redacted_source_id(),
                 e
@@ -6215,7 +6243,7 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
         Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
         Err(e) => {
             return Err(format!(
-                "{}: failed to load key source '{}': {}",
+                "`{}`: failed to load key source {:?}: {}",
                 field_name,
                 source.redacted_source_id(),
                 e
@@ -6242,7 +6270,7 @@ fn validate_pkcs11_key_source(
 ) -> Result<(), String> {
     crate::tls::pkcs11::validate_key_source_uri(uri).map_err(|error| {
         format!(
-            "{}: failed to validate PKCS#11 key source '{}': {}",
+            "`{}`: failed to validate PKCS#11 key source {:?}: {}",
             field_name,
             uri.source_id(),
             error
@@ -6256,7 +6284,8 @@ fn validate_pkcs11_key_source(
     uri: &crate::tls::source::CertSourceUri,
 ) -> Result<(), String> {
     Err(format!(
-        "{}: PKCS#11 key source '{}' requires building ferrum-edge with the 'pkcs11' Cargo feature",
+        "`{}`: PKCS#11 key source {:?} requires building ferrum-edge with the `pkcs11` Cargo \
+         feature",
         field_name,
         uri.source_id()
     ))
@@ -6359,18 +6388,21 @@ impl CountryMmdbAggregateBudget {
                 return Ok(());
             }
             return Err(CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database content for '{path}' changed size from {admitted_size} to {size} bytes during aggregate admission"
+                "MaxMind database content for {path:?} changed size from {admitted_size} to \
+                 {size} bytes during aggregate admission"
             )));
         }
 
         let next_bytes = self.admitted_bytes.checked_add(size).ok_or_else(|| {
             CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database aggregate snapshot size overflow while admitting '{path}'"
+                "MaxMind database aggregate snapshot size overflow while admitting {path:?}"
             ))
         })?;
         if next_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
             return Err(CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database aggregate snapshot budget exceeded: loading '{path}' ({size} bytes) would bring this generation/load session to {next_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes"
+                "MaxMind database aggregate snapshot budget exceeded: loading {path:?} ({size} \
+                 bytes) would bring this generation/load session to {next_bytes} bytes; maximum \
+                 aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes"
             )));
         }
 
@@ -6393,12 +6425,18 @@ fn validate_country_mmdb_snapshot_peak(
     })?;
     let peak_bytes = retained_bytes.checked_add(candidate_bytes).ok_or_else(|| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database peak snapshot size overflow while admitting '{path}'"
+            "MaxMind database peak snapshot size overflow while admitting {path:?}"
         ))
     })?;
     if peak_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database peak snapshot budget exceeded: loading '{path}' ({candidate_bytes} bytes) while retaining {live_bytes} live and {inflight_bytes} in-flight bytes would require {peak_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes. If this changes a live database, it cannot be hot-replaced under the bounded overlap budget and requires a gateway restart after the replacement is installed; otherwise the resulting configuration itself exceeds the aggregate budget"
+            "MaxMind database peak snapshot budget exceeded: loading {path:?} ({candidate_bytes} \
+             bytes) while retaining {live_bytes} live and {inflight_bytes} in-flight bytes would \
+             require {peak_bytes} bytes; maximum aggregate size is \
+             {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes. If this changes a live database, it \
+             cannot be hot-replaced under the bounded overlap budget and requires a gateway \
+             restart after the replacement is installed; otherwise the resulting configuration \
+             itself exceeds the aggregate budget"
         )));
     }
     Ok(peak_bytes)
@@ -6808,7 +6846,8 @@ impl CountryMmdbLoadSession {
         }
         if !self.allow_synchronous_load {
             return Err(CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database file '{path}' was not preloaded before incremental plugin-cache staging"
+                "MaxMind database file {path:?} was not preloaded before incremental plugin-cache \
+                 staging"
             )));
         }
 
@@ -6851,8 +6890,8 @@ impl CountryMmdbLoadSession {
         }
         let retained = self.retained_snapshots.get(path_key)?;
         tracing::warn!(
-            db_path = %path,
-            error = %error,
+            db_path = %sanitize_startup_cause(format!("{:?}", path.to_string()), &[]),
+            error = %sanitize_startup_cause(error, &[]),
             plugin = "geo_restriction",
             retained_snapshot_bytes = retained.size_bytes(),
             "MaxMind database temporarily unavailable during node-local refresh; retaining the last known good snapshot so geo enforcement is not downgraded to the on_lookup_failure fallback"
@@ -6924,13 +6963,13 @@ fn verify_country_mmdb_path_still_matches(
 ) -> Result<(), CountryMmdbLoadError> {
     let path_metadata = std::fs::metadata(path).map_err(|error| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path '{path}' could not be re-statted after loading: {error}"
+            "MaxMind database path {path:?} could not be re-statted after loading: {error}"
         ))
     })?;
     let path_version = CountryMmdbFileVersion::from_metadata(path, &path_metadata);
     if !path_metadata.is_file() || &path_version != opened_version {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path target '{path}' changed while it was being loaded"
+            "MaxMind database path target {path:?} changed while it was being loaded"
         )));
     }
     Ok(())
@@ -6951,18 +6990,19 @@ fn verify_country_mmdb_path_digest(
 
     let mut path_file = std::fs::File::open(path).map_err(|error| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path '{path}' could not be re-opened after loading: {error}"
+            "MaxMind database path {path:?} could not be re-opened after loading: {error}"
         ))
     })?;
     let metadata_before = path_file.metadata().map_err(|error| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path '{path}' metadata not readable during portable identity verification: {error}"
+            "MaxMind database path {path:?} metadata not readable during portable identity \
+             verification: {error}"
         ))
     })?;
     let path_version_before = CountryMmdbFileVersion::from_metadata(path, &metadata_before);
     if !metadata_before.is_file() || &path_version_before != opened_version {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path target '{path}' changed before portable identity verification"
+            "MaxMind database path target {path:?} changed before portable identity verification"
         )));
     }
 
@@ -6974,7 +7014,8 @@ fn verify_country_mmdb_path_digest(
         loop {
             let read = bounded_reader.read(&mut buffer).map_err(|error| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database path '{path}' not readable during portable identity verification: {error}"
+                    "MaxMind database path {path:?} not readable during portable identity \
+                     verification: {error}"
                 ))
             })?;
             if read == 0 {
@@ -6982,12 +7023,14 @@ fn verify_country_mmdb_path_digest(
             }
             total_bytes = total_bytes.checked_add(read as u64).ok_or_else(|| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database path '{path}' size overflow during portable identity verification"
+                    "MaxMind database path {path:?} size overflow during portable identity \
+                     verification"
                 ))
             })?;
             if total_bytes > opened_version.len {
                 return Err(CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database path target '{path}' grew during portable identity verification"
+                    "MaxMind database path target {path:?} grew during portable identity \
+                     verification"
                 )));
             }
             hasher.update(&buffer[..read]);
@@ -6995,19 +7038,21 @@ fn verify_country_mmdb_path_digest(
     }
     if total_bytes != opened_version.len {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path target '{path}' changed size during portable identity verification"
+            "MaxMind database path target {path:?} changed size during portable identity \
+             verification"
         )));
     }
 
     let metadata_after = path_file.metadata().map_err(|error| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path '{path}' metadata not readable after portable identity verification: {error}"
+            "MaxMind database path {path:?} metadata not readable after portable identity \
+             verification: {error}"
         ))
     })?;
     let path_version_after = CountryMmdbFileVersion::from_metadata(path, &metadata_after);
     if &path_version_after != opened_version {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path target '{path}' changed during portable identity verification"
+            "MaxMind database path target {path:?} changed during portable identity verification"
         )));
     }
     verify_country_mmdb_path_still_matches(path, opened_version)?;
@@ -7015,7 +7060,7 @@ fn verify_country_mmdb_path_digest(
     let observed_digest: CountryMmdbDigest = hasher.finalize();
     if &observed_digest != expected_digest {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path target '{path}' was replaced while it was being loaded"
+            "MaxMind database path target {path:?} was replaced while it was being loaded"
         )));
     }
     Ok(())
@@ -7050,12 +7095,12 @@ fn load_validated_country_mmdb_inner(
     // this check cannot wedge startup/reload before the opened-handle fstat.
     let path_metadata_before_open = std::fs::metadata(path).map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
-            "MaxMind database file '{path}' not accessible before open: {e}"
+            "MaxMind database file {path:?} not accessible before open: {e}"
         ))
     })?;
     if !path_metadata_before_open.is_file() {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "'{path}' exists but is not a regular file"
+            "{path:?} exists but is not a regular file"
         )));
     }
     let path_version_before_open =
@@ -7063,29 +7108,29 @@ fn load_validated_country_mmdb_inner(
 
     let mut file = open_country_mmdb_path(path).map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
-            "MaxMind database file '{path}' not accessible: {e}"
+            "MaxMind database file {path:?} not accessible: {e}"
         ))
     })?;
     let metadata = file.metadata().map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
-            "MaxMind database file '{path}' metadata not readable: {e}"
+            "MaxMind database file {path:?} metadata not readable: {e}"
         ))
     })?;
     if !metadata.is_file() {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "'{path}' exists but is not a regular file"
+            "{path:?} exists but is not a regular file"
         )));
     }
     let file_version = CountryMmdbFileVersion::from_metadata(path, &metadata);
     if file_version != path_version_before_open {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database path target '{path}' changed before it was opened"
+            "MaxMind database path target {path:?} changed before it was opened"
         )));
     }
 
     if metadata.len() > MAX_COUNTRY_MMDB_SIZE_BYTES {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' is {} bytes; maximum supported size is {} bytes",
+            "MaxMind database file {path:?} is {} bytes; maximum supported size is {} bytes",
             metadata.len(),
             MAX_COUNTRY_MMDB_SIZE_BYTES
         )));
@@ -7102,7 +7147,7 @@ fn load_validated_country_mmdb_inner(
         loop {
             let read = bounded_reader.read(&mut digest_buffer).map_err(|e| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' could not be hashed consistently: {e}"
+                    "MaxMind database file {path:?} could not be hashed consistently: {e}"
                 ))
             })?;
             if read == 0 {
@@ -7110,12 +7155,12 @@ fn load_validated_country_mmdb_inner(
             }
             digested_bytes = digested_bytes.checked_add(read as u64).ok_or_else(|| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' size overflow while hashing"
+                    "MaxMind database file {path:?} size overflow while hashing"
                 ))
             })?;
             if digested_bytes > metadata.len() {
                 return Err(CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' grew while it was being hashed"
+                    "MaxMind database file {path:?} grew while it was being hashed"
                 )));
             }
             hasher.update(&digest_buffer[..read]);
@@ -7123,17 +7168,17 @@ fn load_validated_country_mmdb_inner(
     }
     if digested_bytes != metadata.len() {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' changed size while it was being hashed"
+            "MaxMind database file {path:?} changed size while it was being hashed"
         )));
     }
     let metadata_after_digest = file.metadata().map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' metadata not readable after hashing: {e}"
+            "MaxMind database file {path:?} metadata not readable after hashing: {e}"
         ))
     })?;
     if CountryMmdbFileVersion::from_metadata(path, &metadata_after_digest) != file_version {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' changed while it was being hashed"
+            "MaxMind database file {path:?} changed while it was being hashed"
         )));
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
@@ -7171,41 +7216,41 @@ fn load_validated_country_mmdb_inner(
         CountryMmdbAllocationReservation::reserve(path, metadata.len())?;
     let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' is too large for this platform"
+            "MaxMind database file {path:?} is too large for this platform"
         ))
     })?;
     file.seek(SeekFrom::Start(0)).map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' could not be rewound after hashing: {e}"
+            "MaxMind database file {path:?} could not be rewound after hashing: {e}"
         ))
     })?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(initial_capacity).map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' cannot reserve its bounded snapshot buffer: {e}"
+            "MaxMind database file {path:?} cannot reserve its bounded snapshot buffer: {e}"
         ))
     })?;
     {
         let mut bounded_reader = (&mut file).take(metadata.len() + 1);
         bounded_reader.read_to_end(&mut bytes).map_err(|e| {
             CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database file '{path}' could not be read consistently: {e}"
+                "MaxMind database file {path:?} could not be read consistently: {e}"
             ))
         })?;
     }
     if bytes.len() as u64 != metadata.len() {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' changed size while it was being loaded"
+            "MaxMind database file {path:?} changed size while it was being loaded"
         )));
     }
     let metadata_after_read = file.metadata().map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' metadata not readable after load: {e}"
+            "MaxMind database file {path:?} metadata not readable after load: {e}"
         ))
     })?;
     if CountryMmdbFileVersion::from_metadata(path, &metadata_after_read) != file_version {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' changed while it was being loaded"
+            "MaxMind database file {path:?} changed while it was being loaded"
         )));
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
@@ -7213,67 +7258,69 @@ fn load_validated_country_mmdb_inner(
     let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes);
     if loaded_digest != digest {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' changed between identity and snapshot reads"
+            "MaxMind database file {path:?} changed between identity and snapshot reads"
         )));
     }
     #[cfg(not(unix))]
     verify_country_mmdb_path_digest(path, &file_version, &digest)?;
 
-    let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
+    let reader = maxminddb::Reader::from_source(bytes).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' is not a valid readable .mmdb: {e}"
+            "MaxMind database file {path:?} is not a valid readable .mmdb"
         ))
     })?;
 
-    reader.verify().map_err(|e| {
+    reader.verify().map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' failed comprehensive verification: {e}"
+            "MaxMind database file {path:?} failed comprehensive verification"
         ))
     })?;
 
     if !is_supported_country_mmdb_type(&reader.metadata.database_type) {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' has unsupported database type '{}'; expected a GeoIP2/GeoLite2 Country or City database, or GeoIP2 Enterprise",
+            "MaxMind database file {path:?} has unsupported database type {:?}; expected a \
+             GeoIP2/GeoLite2 Country or City database, or GeoIP2 Enterprise",
             reader.metadata.database_type
         )));
     }
 
     let mut found_country_code = false;
-    let networks = reader.networks(Default::default()).map_err(|e| {
+    let networks = reader.networks(Default::default()).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' cannot enumerate country records: {e}"
+            "MaxMind database file {path:?} cannot enumerate country records"
         ))
     })?;
     for network in networks {
-        let lookup = network.map_err(|e| {
+        let lookup = network.map_err(|_| {
             CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database file '{path}' contains an invalid network record: {e}"
+                "MaxMind database file {path:?} contains an invalid network record"
             ))
         })?;
         let country: Option<&str> = lookup
             .decode_path(&maxminddb::path!["country", "iso_code"])
-            .map_err(|e| {
+            .map_err(|_| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' has an incompatible country record: {e}"
+                    "MaxMind database file {path:?} has an incompatible country record"
                 ))
             })?;
         let registered_country: Option<&str> = lookup
             .decode_path(&maxminddb::path!["registered_country", "iso_code"])
-            .map_err(|e| {
+            .map_err(|_| {
                 CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' has an incompatible registered-country record: {e}"
+                    "MaxMind database file {path:?} has an incompatible registered-country \
+                     record"
                 ))
             })?;
 
         for code in [country, registered_country].into_iter().flatten() {
             if !is_mmdb_country_code(code) {
                 return Err(CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' contains an invalid country code {code:?}"
+                    "MaxMind database file {path:?} contains an invalid country code {code:?}"
                 )));
             }
             if !is_supported_mmdb_country_code(code) {
                 return Err(CountryMmdbLoadError::Invalid(format!(
-                    "MaxMind database file '{path}' contains unsupported country code {code:?}"
+                    "MaxMind database file {path:?} contains unsupported country code {code:?}"
                 )));
             }
             found_country_code = true;
@@ -7282,7 +7329,7 @@ fn load_validated_country_mmdb_inner(
 
     if !found_country_code {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' contains no country or registered-country ISO codes"
+            "MaxMind database file {path:?} contains no country or registered-country ISO codes"
         )));
     }
 
@@ -7479,7 +7526,7 @@ mod country_mmdb_admission_tests {
 fn validate_u64_range(field_name: &str, value: u64, min: u64, max: u64) -> Result<(), String> {
     if value < min || value > max {
         return Err(format!(
-            "{} must be between {} and {} (got {})",
+            "`{}` must be between {} and {} (got \"{}\")",
             field_name, min, max, value
         ));
     }
@@ -7490,11 +7537,26 @@ fn validate_u64_range(field_name: &str, value: u64, min: u64, max: u64) -> Resul
 fn validate_u32_range(field_name: &str, value: u32, min: u32, max: u32) -> Result<(), String> {
     if value < min || value > max {
         return Err(format!(
-            "{} must be between {} and {} (got {})",
+            "`{}` must be between {} and {} (got \"{}\")",
             field_name, min, max, value
         ));
     }
     Ok(())
+}
+
+/// Nest a child validator diagnostic under its parent field path.
+///
+/// Child validators render their own field name in backticks
+/// (`` `max_retries` must be between ... ``). The parent path is spliced
+/// inside that span so the rendered diagnostic names the full schema path
+/// (`` `retry.max_retries` ``) instead of splitting it around the backtick
+/// (`` retry.`max_retries` ``). Diagnostics that do not open with a
+/// backticked field name are prefixed verbatim.
+fn nest_field_diagnostic(parent: &str, diagnostic: &str) -> String {
+    match diagnostic.strip_prefix('`') {
+        Some(rest) => format!("`{}.{}", parent, rest),
+        None => format!("{}.{}", parent, diagnostic),
+    }
 }
 
 /// Validate a list of HTTP status codes.
@@ -7510,7 +7572,7 @@ fn validate_status_codes(field_name: &str, codes: &[u16]) -> Result<(), String> 
     for &code in codes {
         if !(100..=599).contains(&code) {
             return Err(format!(
-                "{} contains invalid HTTP status code {} (must be 100-599)",
+                "`{}` contains invalid HTTP status code \"{}\" (must be 100-599)",
                 field_name, code
             ));
         }
@@ -7722,7 +7784,8 @@ impl Proxy {
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
-                "backend_host IP {ip} denied by backend egress policy: {reason}"
+                "`backend_host` IP {ip:?} denied by backend egress policy: {reason}",
+                ip = ip.to_string(),
             ));
         }
         if let Some(ref dns_override) = self.dns_override
@@ -7730,7 +7793,8 @@ impl Proxy {
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
-                "dns_override IP {ip} denied by backend egress policy: {reason}"
+                "`dns_override` IP {ip:?} denied by backend egress policy: {reason}",
+                ip = ip.to_string(),
             ));
         }
         if errors.is_empty() {
@@ -7799,13 +7863,18 @@ impl Proxy {
             return;
         }
         tracing::warn!(
-            proxy = %self.id,
-            namespace = %self.namespace,
-            "Proxy '{}' allowed_ws_origins contains '*' or a non-origin entry; {}; \
-             existing config is still loaded. Admin API writes and `ferrum-edge validate` \
-             reject this value.",
-            self.id,
-            ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+            proxy = %crate::startup::sanitize_startup_scalar(&self.id),
+            namespace = %crate::startup::sanitize_startup_scalar(&self.namespace),
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "Proxy {:?} `allowed_ws_origins` contains `*` or a non-origin entry; {}; \
+                     existing config is still loaded. Admin API writes and `ferrum-edge validate` \
+                     reject this value.",
+                    self.id, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
+                ),
+                &[]
+            )
         );
     }
 
@@ -7926,7 +7995,7 @@ impl Proxy {
         for host in &self.hosts {
             if host.len() > MAX_HOST_LENGTH {
                 errors.push(format!(
-                    "host entry '{}...' must not exceed {} characters",
+                    "host entry {:?} (truncated) must not exceed {} characters",
                     host.chars().take(40).collect::<String>(),
                     MAX_HOST_LENGTH
                 ));
@@ -7943,7 +8012,8 @@ impl Proxy {
         if is_stream_proxy {
             if self.listen_path.is_some() {
                 errors.push(format!(
-                    "Stream proxy '{}' (scheme {}) must not set listen_path — stream proxies route on listen_port",
+                    "Stream proxy {:?} (scheme {:?}) must not set `listen_path` — stream proxies \
+                     route on `listen_port`",
                     self.id,
                     self.scheme_display()
                 ));
@@ -7975,7 +8045,7 @@ impl Proxy {
                         );
                     } else if let Some(pattern) = path.strip_prefix('~') {
                         if pattern.is_empty() {
-                            errors.push("regex listen_path '~' has empty pattern".to_string());
+                            errors.push("regex listen_path `~` has empty pattern".to_string());
                         }
                     } else if let Some(exact) = path.strip_prefix('=') {
                         if !exact.starts_with('/') {
@@ -8008,7 +8078,7 @@ impl Proxy {
             errors.push(e);
         }
         if self.backend_host.contains("://") {
-            errors.push("backend_host must not contain a scheme (e.g., 'http://')".to_string());
+            errors.push("backend_host must not contain a scheme (e.g., `http://`)".to_string());
         }
         if self.upstream_id.is_none() && self.backend_host.is_empty() {
             errors.push("backend_host must be non-empty (or set upstream_id)".to_string());
@@ -8106,7 +8176,7 @@ impl Proxy {
             && v > MAX_TCP_IDLE_TIMEOUT
         {
             errors.push(format!(
-                "tcp_idle_timeout_seconds must be between 0 and {} (got {})",
+                "`tcp_idle_timeout_seconds` must be between 0 and {} (got \"{}\")",
                 MAX_TCP_IDLE_TIMEOUT, v
             ));
         }
@@ -8116,7 +8186,7 @@ impl Proxy {
             && v > MAX_WEBSOCKET_IDLE_TIMEOUT
         {
             errors.push(format!(
-                "websocket_idle_timeout_seconds must be between 0 and {} (got {})",
+                "`websocket_idle_timeout_seconds` must be between 0 and {} (got \"{}\")",
                 MAX_WEBSOCKET_IDLE_TIMEOUT, v
             ));
         }
@@ -8126,7 +8196,7 @@ impl Proxy {
             && !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&v)
         {
             errors.push(format!(
-                "pool_http2_initial_stream_window_size must be between {} and {} (got {})",
+                "`pool_http2_initial_stream_window_size` must be between {} and {} (got \"{}\")",
                 MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE, v
             ));
         }
@@ -8134,7 +8204,8 @@ impl Proxy {
             && !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&v)
         {
             errors.push(format!(
-                "pool_http2_initial_connection_window_size must be between {} and {} (got {})",
+                "`pool_http2_initial_connection_window_size` must be between {} and {} (got \
+                 \"{}\")",
                 MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE, v
             ));
         }
@@ -8142,7 +8213,7 @@ impl Proxy {
             && !(MIN_HTTP2_MAX_FRAME_SIZE..=MAX_HTTP2_MAX_FRAME_SIZE).contains(&v)
         {
             errors.push(format!(
-                "pool_http2_max_frame_size must be between {} and {} (got {})",
+                "`pool_http2_max_frame_size` must be between {} and {} (got \"{}\")",
                 MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE, v
             ));
         }
@@ -8150,7 +8221,7 @@ impl Proxy {
             && (v == 0 || u64::from(v) > MAX_POOL_SQL_INTEGER_VALUE)
         {
             errors.push(format!(
-                "pool_http2_max_concurrent_streams must be between 1 and {} (got {})",
+                "`pool_http2_max_concurrent_streams` must be between 1 and {} (got \"{}\")",
                 MAX_POOL_SQL_INTEGER_VALUE, v
             ));
         }
@@ -8158,7 +8229,7 @@ impl Proxy {
             && v > MAX_POOL_SQL_INTEGER_VALUE
         {
             errors.push(format!(
-                "pool_max_requests_per_connection must be between 0 and {} (got {})",
+                "`pool_max_requests_per_connection` must be between 0 and {} (got \"{}\")",
                 MAX_POOL_SQL_INTEGER_VALUE, v
             ));
         }
@@ -8168,7 +8239,7 @@ impl Proxy {
             && (v == 0 || v > MAX_HTTP3_CONNECTIONS_PER_BACKEND)
         {
             errors.push(format!(
-                "pool_http3_connections_per_backend must be between 1 and {} (got {})",
+                "`pool_http3_connections_per_backend` must be between 1 and {} (got \"{}\")",
                 MAX_HTTP3_CONNECTIONS_PER_BACKEND, v
             ));
         }
@@ -8206,22 +8277,27 @@ impl Proxy {
             let scheme = self.scheme_display();
             if self.backend_tls_client_cert_path.is_some() {
                 errors.push(format!(
-                    "backend_tls_client_cert_path cannot be set when backend_scheme is '{scheme}' — TLS client certs are only used with TLS-enabled schemes (https, tcps, dtls)"
+                    "backend_tls_client_cert_path cannot be set when backend_scheme is {scheme:?} \
+                     — TLS client certs are only used with TLS-enabled schemes (https, tcps, dtls)"
                 ));
             }
             if self.backend_tls_client_key_path.is_some() {
                 errors.push(format!(
-                    "backend_tls_client_key_path cannot be set when backend_scheme is '{scheme}' — TLS client keys are only used with TLS-enabled schemes (https, tcps, dtls)"
+                    "backend_tls_client_key_path cannot be set when backend_scheme is {scheme:?} \
+                     — TLS client keys are only used with TLS-enabled schemes (https, tcps, dtls)"
                 ));
             }
             if self.backend_tls_server_ca_cert_path.is_some() {
                 errors.push(format!(
-                    "backend_tls_server_ca_cert_path cannot be set when backend_scheme is '{scheme}' — CA certs are only used with TLS-enabled schemes (https, tcps, dtls)"
+                    "backend_tls_server_ca_cert_path cannot be set when backend_scheme is \
+                     {scheme:?} — CA certs are only used with TLS-enabled schemes (https, tcps, \
+                     dtls)"
                 ));
             }
             if !self.backend_tls_verify_server_cert {
                 errors.push(format!(
-                    "backend_tls_verify_server_cert cannot be set to false when backend_scheme is '{scheme}' — there is no TLS to verify on plaintext schemes"
+                    "backend_tls_verify_server_cert cannot be set to false when backend_scheme is \
+                     {scheme:?} — there is no TLS to verify on plaintext schemes"
                 ));
             }
         }
@@ -8229,7 +8305,8 @@ impl Proxy {
         // Stream proxies must declare an explicit scheme (no HTTP default).
         if self.listen_port.is_some() && self.backend_scheme.is_none() {
             errors.push(format!(
-                "Stream proxy '{}' must set backend_scheme explicitly (tcp, tcps, udp, dtls) — no default is applied to stream proxies",
+                "Stream proxy {:?} must set backend_scheme explicitly (tcp, tcps, udp, dtls) — no \
+                 default is applied to stream proxies",
                 self.id
             ));
         }
@@ -8380,7 +8457,7 @@ impl Proxy {
                 let upper = normalize_http_method_token(method);
                 if !VALID_HTTP_METHODS.contains(&upper.as_str()) {
                     errors.push(format!(
-                        "allowed_methods contains invalid HTTP method: {}",
+                        "`allowed_methods` contains invalid HTTP method: {:?}",
                         method
                     ));
                 }
@@ -8443,8 +8520,11 @@ impl Proxy {
                         && target_ip != override_ip
                     {
                         errors.push(format!(
-                            "dns_override IP {override_ip} differs from literal backend_host IP \
-                             {target_ip}; reqwest cannot apply DNS overrides to literal targets"
+                            "`dns_override` IP {override_ip:?} differs from literal `backend_host` \
+                             IP {target_ip:?}; reqwest cannot apply DNS overrides to literal \
+                             targets",
+                            override_ip = override_ip.to_string(),
+                            target_ip = target_ip.to_string(),
                         ));
                     }
                 }
@@ -8459,7 +8539,7 @@ impl Proxy {
             && let Err(cb_errors) = cb.validate_fields()
         {
             for e in cb_errors {
-                errors.push(format!("circuit_breaker.{}", e));
+                errors.push(nest_field_diagnostic("circuit_breaker", &e));
             }
         }
 
@@ -8468,7 +8548,7 @@ impl Proxy {
             && let Err(retry_errors) = retry.validate_fields()
         {
             for e in retry_errors {
-                errors.push(format!("retry.{}", e));
+                errors.push(nest_field_diagnostic("retry", &e));
             }
         }
 
@@ -8653,7 +8733,7 @@ impl Consumer {
                 if cred_type == "mtls_auth" {
                     if obj.len() != 1 || !obj.contains_key("identity") {
                         errors.push(format!(
-                            "{} must contain exactly one field named 'identity'",
+                            "{} must contain exactly one field named `identity`",
                             prefix
                         ));
                     }
@@ -8670,7 +8750,7 @@ impl Consumer {
                 if cred_type == "hmac_auth" {
                     if obj.len() != 1 || !obj.contains_key("secret") {
                         errors.push(format!(
-                            "{} must contain exactly one field named 'secret'",
+                            "{} must contain exactly one field named `secret`",
                             prefix
                         ));
                     }
@@ -8696,7 +8776,7 @@ impl Consumer {
                 if cred_type == "jwt" {
                     if obj.len() != 1 || !obj.contains_key("secret") {
                         errors.push(format!(
-                            "{} must contain exactly one field named 'secret'",
+                            "{} must contain exactly one field named `secret`",
                             prefix
                         ));
                     }
@@ -8789,19 +8869,19 @@ fn record_consumer_identity<'a>(
 
     let message = match (field, existing_field) {
         ("id", "id") => format!(
-            "Duplicate consumer id '{}' in consumer '{}' (conflicts with '{}')",
+            "Duplicate consumer id {:?} in consumer {:?} (conflicts with {:?})",
             value, consumer_id, existing_id
         ),
         ("username", "username") => format!(
-            "Duplicate consumer username '{}' in consumer '{}' (conflicts with '{}')",
+            "Duplicate consumer username {:?} in consumer {:?} (conflicts with {:?})",
             value, consumer_id, existing_id
         ),
         ("custom_id", "custom_id") => format!(
-            "Duplicate consumer custom_id '{}' in consumer '{}' (conflicts with '{}')",
+            "Duplicate consumer custom_id {:?} in consumer {:?} (conflicts with {:?})",
             value, consumer_id, existing_id
         ),
         _ => format!(
-            "Consumer '{}' {} '{}' collides with {} of consumer '{}' \
+            "Consumer {:?} {} {:?} collides with {} of consumer {:?} \
              — this will cause incorrect JWKS/JWT authentication",
             consumer_id, field, value, existing_field, existing_id
         ),
@@ -9153,7 +9233,8 @@ impl Upstream {
                 && let Some(reason) = backend_allow_ips.deny_reason(&ip)
             {
                 errors.push(format!(
-                    "targets[{i}].host IP {ip} denied by backend egress policy: {reason}"
+                    "`targets[{i}].host` IP {ip:?} denied by backend egress policy: {reason}",
+                    ip = ip.to_string(),
                 ));
             }
         }
@@ -9262,7 +9343,7 @@ impl Upstream {
             }
             if cc.ttl_seconds > MAX_TIMEOUT_SECONDS {
                 errors.push(format!(
-                    "hash_on_cookie_config.ttl_seconds must not exceed {} (got {})",
+                    "`hash_on_cookie_config.ttl_seconds` must not exceed {} (got \"{}\")",
                     MAX_TIMEOUT_SECONDS, cc.ttl_seconds
                 ));
             }
@@ -9309,7 +9390,7 @@ impl Upstream {
             }
             if target.weight == 0 || target.weight > MAX_TARGET_WEIGHT {
                 errors.push(format!(
-                    "targets[{}].weight must be between 1 and {} (got {})",
+                    "`targets[{}].weight` must be between 1 and {} (got \"{}\")",
                     i, MAX_TARGET_WEIGHT, target.weight
                 ));
             }
@@ -9360,7 +9441,7 @@ impl Upstream {
                 }
                 if LocalityPreference::parse(locality).is_none() {
                     errors.push(format!(
-                        "targets[{}].locality '{}' is not a valid \
+                        "`targets[{}].locality` {:?} is not a valid \
                          region[/zone[/subzone]] string",
                         i, locality
                     ));
@@ -9373,7 +9454,7 @@ impl Upstream {
             && let Err(hc_errors) = hc.validate_fields()
         {
             for e in hc_errors {
-                errors.push(format!("health_checks.{}", e));
+                errors.push(nest_field_diagnostic("health_checks", &e));
             }
         }
 
@@ -9382,7 +9463,7 @@ impl Upstream {
             && let Err(sd_errors) = sd.validate_fields(&self.namespace)
         {
             for e in sd_errors {
-                errors.push(format!("service_discovery.{}", e));
+                errors.push(nest_field_diagnostic("service_discovery", &e));
             }
         }
 
@@ -9409,11 +9490,12 @@ impl Upstream {
                 if let Err(e) =
                     validate_string_field("subsets.name", &subset.name, MAX_SUBSET_NAME_LENGTH)
                 {
-                    errors.push(format!("subsets[{}].{}", i, e));
+                    errors.push(nest_field_diagnostic(&format!("subsets[{}]", i), &e));
                 }
                 if !seen_names.insert(&subset.name) {
                     errors.push(format!(
-                        "subsets[{}].name '{}' is a duplicate — subset names must be unique within an upstream",
+                        "`subsets[{}].name` {:?} is a duplicate — subset names must be unique \
+                         within an upstream",
                         i, subset.name
                     ));
                 }
@@ -9501,7 +9583,10 @@ impl Upstream {
         }
         for (i, san) in self.backend_tls_san_allow_list.iter().enumerate() {
             if let Err(e) = validate_backend_tls_san_allow_list_entry(san) {
-                errors.push(format!("backend_tls_san_allow_list[{}].{}", i, e));
+                errors.push(nest_field_diagnostic(
+                    &format!("backend_tls_san_allow_list[{}]", i),
+                    &e,
+                ));
             }
         }
 
@@ -9652,7 +9737,7 @@ impl Upstream {
                     continue;
                 };
                 let field_prefix =
-                    format!("subsets[{index}].traffic_policy (subset '{}')", subset.name);
+                    format!("subsets[{index}].traffic_policy (subset {:?})", subset.name);
 
                 if policy.tls.is_some() {
                     errors.push(format!(
@@ -9888,16 +9973,16 @@ impl PluginConfig {
                         errors.push(format!("proxy_id {}", e));
                     }
                 }
-                None => errors.push("scope 'proxy' requires proxy_id".to_string()),
+                None => errors.push("scope `proxy` requires proxy_id".to_string()),
             },
             PluginScope::Global => {
                 if self.proxy_id.is_some() {
-                    errors.push("scope 'global' must not have proxy_id".to_string());
+                    errors.push("scope `global` must not have proxy_id".to_string());
                 }
             }
             PluginScope::ProxyGroup => {
                 if self.proxy_id.is_some() {
-                    errors.push("scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)".to_string());
+                    errors.push("scope `proxy_group` must not have proxy_id (associations are managed via proxy.plugins)".to_string());
                 }
             }
         }
@@ -9913,13 +9998,13 @@ impl PluginConfig {
         // `db_available=false` and wedges the whole admin API read-only).
         if self.plugin_name == "transaction_log_schema" && self.scope != PluginScope::Global {
             errors.push(
-                "transaction_log_schema must have scope 'global' (it registers process-global named schemas)"
+                "transaction_log_schema must have scope `global` (it registers process-global named schemas)"
                     .to_string(),
             );
         }
         if self.plugin_name == "prometheus_metrics" && self.scope != PluginScope::Global {
             errors.push(
-                "prometheus_metrics must have scope 'global' (it owns one process-wide registry)"
+                "prometheus_metrics must have scope `global` (it owns one process-wide registry)"
                     .to_string(),
             );
         }
@@ -9957,7 +10042,7 @@ impl PluginConfig {
             && p > 10000
         {
             errors.push(format!(
-                "priority_override must be between 0 and 10000 (got {})",
+                "`priority_override` must be between 0 and 10000 (got \"{}\")",
                 p
             ));
         }
@@ -10043,7 +10128,7 @@ impl RetryConfig {
             let upper = method.to_uppercase();
             if !VALID_HTTP_METHODS.contains(&upper.as_str()) {
                 errors.push(format!(
-                    "retryable_methods contains invalid HTTP method: {}",
+                    "`retryable_methods` contains invalid HTTP method: {:?}",
                     method
                 ));
             }
@@ -10054,7 +10139,7 @@ impl RetryConfig {
             BackoffStrategy::Fixed { delay_ms } => {
                 if *delay_ms > MAX_BACKOFF_MS {
                     errors.push(format!(
-                        "backoff.delay_ms must not exceed {} (got {})",
+                        "`backoff.delay_ms` must not exceed {} (got \"{}\")",
                         MAX_BACKOFF_MS, delay_ms
                     ));
                 }
@@ -10062,19 +10147,19 @@ impl RetryConfig {
             BackoffStrategy::Exponential { base_ms, max_ms } => {
                 if *base_ms > MAX_BACKOFF_MS {
                     errors.push(format!(
-                        "backoff.base_ms must not exceed {} (got {})",
+                        "`backoff.base_ms` must not exceed {} (got \"{}\")",
                         MAX_BACKOFF_MS, base_ms
                     ));
                 }
                 if *max_ms > MAX_BACKOFF_MS {
                     errors.push(format!(
-                        "backoff.max_ms must not exceed {} (got {})",
+                        "`backoff.max_ms` must not exceed {} (got \"{}\")",
                         MAX_BACKOFF_MS, max_ms
                     ));
                 }
                 if *base_ms > *max_ms {
                     errors.push(format!(
-                        "backoff.base_ms ({}) must not exceed backoff.max_ms ({})",
+                        "`backoff.base_ms` (\"{}\") must not exceed `backoff.max_ms` (\"{}\")",
                         base_ms, max_ms
                     ));
                 }
@@ -10180,7 +10265,7 @@ impl HealthCheckConfig {
                 && pct > 100
             {
                 errors.push(format!(
-                    "passive.max_ejection_percent must be between 0 and 100 (got {})",
+                    "`passive.max_ejection_percent` must be between 0 and 100 (got \"{}\")",
                     pct
                 ));
             }
@@ -10210,7 +10295,7 @@ impl ServiceDiscoveryConfig {
 
         if self.default_weight == 0 || self.default_weight > MAX_TARGET_WEIGHT {
             errors.push(format!(
-                "default_weight must be between 1 and {} (got {})",
+                "`default_weight` must be between 1 and {} (got \"{}\")",
                 MAX_TARGET_WEIGHT, self.default_weight
             ));
         }
@@ -10377,7 +10462,7 @@ impl ServiceDiscoveryConfig {
                             errors.push("mesh.namespace must not be empty".to_string());
                         } else if namespace != upstream_namespace {
                             errors.push(format!(
-                                "mesh.namespace '{}' must match the upstream's namespace '{}' \
+                                "`mesh.namespace` {:?} must match the upstream namespace {:?} \
                                  to prevent cross-namespace workload reference",
                                 namespace, upstream_namespace
                             ));
@@ -10418,7 +10503,7 @@ impl GatewayConfig {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
             for e in proxy.allowed_ws_origins_admission_errors() {
-                errors.push(format!("Proxy '{}': {}", proxy.id, e));
+                errors.push(format!("Proxy {:?}: {}", proxy.id, e));
             }
         }
         errors
@@ -10471,7 +10556,9 @@ impl GatewayConfig {
             *count += 1;
             if *count == MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1 {
                 errors.push(format!(
-                    "Gateway frontend TLS certificate source set for namespace '{}' exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
+                    "Gateway frontend TLS certificate source set for namespace {:?} exceeds the \
+                     {} source admission limit; refusing the snapshot rather than serving a \
+                     partial listener set",
                     source.namespace, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
                 ));
             }
@@ -10485,7 +10572,7 @@ impl GatewayConfig {
                 proxy.validate_fields_with_cache(&mut validated_tls_paths, cert_expiry_warning_days)
             {
                 for e in errs {
-                    errors.push(format!("Proxy '{}': {}", proxy.id, e));
+                    errors.push(format!("Proxy {:?}: {}", proxy.id, e));
                 }
             }
             // Grandfather existing `"*"` / non-origin rows: never fail a
@@ -10496,7 +10583,7 @@ impl GatewayConfig {
         for consumer in &self.consumers {
             if let Err(errs) = consumer.validate_fields() {
                 for e in errs {
-                    errors.push(format!("Consumer '{}': {}", consumer.id, e));
+                    errors.push(format!("Consumer {:?}: {}", consumer.id, e));
                 }
             }
         }
@@ -10505,14 +10592,14 @@ impl GatewayConfig {
                 .validate_fields_with_cache(&mut validated_tls_paths, cert_expiry_warning_days)
             {
                 for e in errs {
-                    errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                    errors.push(format!("Upstream {:?}: {}", upstream.id, e));
                 }
             }
         }
         for pc in &self.plugin_configs {
             if let Err(errs) = pc.validate_fields() {
                 for e in errs {
-                    errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    errors.push(format!("PluginConfig {:?}: {}", pc.id, e));
                 }
             }
         }
@@ -10523,14 +10610,14 @@ impl GatewayConfig {
             for proxy in &self.proxies {
                 if let Err(errs) = proxy.validate_backend_egress_ips(backend_allow_ips) {
                     for e in errs {
-                        errors.push(format!("Proxy '{}': {}", proxy.id, e));
+                        errors.push(format!("Proxy {:?}: {}", proxy.id, e));
                     }
                 }
             }
             for upstream in &self.upstreams {
                 if let Err(errs) = upstream.validate_backend_egress_ips(backend_allow_ips) {
                     for e in errs {
-                        errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                        errors.push(format!("Upstream {:?}: {}", upstream.id, e));
                     }
                 }
             }
@@ -10543,7 +10630,7 @@ impl GatewayConfig {
                     backend_allow_ips,
                 ) {
                     for e in errs {
-                        errors.push(format!("PluginConfig '{}' {}", plugin.id, e));
+                        errors.push(format!("PluginConfig {:?} {}", plugin.id, e));
                     }
                 }
             }
@@ -10580,7 +10667,7 @@ impl GatewayConfig {
         for upstream in &self.upstreams {
             if let Err(errs) = upstream.validate_operator_provided_fields() {
                 for e in errs {
-                    errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                    errors.push(format!("Upstream {:?}: {}", upstream.id, e));
                 }
             }
         }
@@ -10707,7 +10794,7 @@ impl GatewayConfig {
                     None => validate_mmdb_file("geo_restriction.db_path", db_path),
                 }
             {
-                errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                errors.push(format!("PluginConfig {:?}: {}", pc.id, e));
             }
             if pc.plugin_name == "body_validator" {
                 match crate::plugins::body_validator::protobuf_descriptor_path(&pc.config) {
@@ -10723,14 +10810,14 @@ impl GatewayConfig {
                                         pool,
                                     )
                                 {
-                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                    errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                                 }
                             }
                             Err(error)
                                 if reported_body_validator_path_errors.insert(path.to_string()) =>
                             {
                                 errors.push(format!(
-                                    "PluginConfig '{}': {}",
+                                    "PluginConfig {:?}: {}",
                                     pc.id,
                                     error.body_validator_message()
                                 ));
@@ -10740,7 +10827,7 @@ impl GatewayConfig {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                        errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                     }
                 }
             }
@@ -10756,12 +10843,12 @@ impl GatewayConfig {
                                 if let Err(error) =
                                     guard::validate_grpc_descriptor_config(&pc.config, pool)
                                 {
-                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                    errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                                 }
                             }
                             Err(error) if reported_guard_path_errors.insert(path.clone()) => {
                                 errors.push(format!(
-                                    "PluginConfig '{}': {}",
+                                    "PluginConfig {:?}: {}",
                                     pc.id,
                                     error.ai_response_guard_message()
                                 ));
@@ -10771,7 +10858,7 @@ impl GatewayConfig {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                        errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                     }
                 }
             }
@@ -10787,14 +10874,14 @@ impl GatewayConfig {
                                 if let Err(error) =
                                     audit::validate_grpc_descriptor_config(&pc.config, pool)
                                 {
-                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                    errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                                 }
                             }
                             Err(error)
                                 if reported_transcript_audit_path_errors.insert(path.clone()) =>
                             {
                                 errors.push(format!(
-                                    "PluginConfig '{}': {}",
+                                    "PluginConfig {:?}: {}",
                                     pc.id,
                                     error.ai_transcript_audit_message()
                                 ));
@@ -10804,7 +10891,7 @@ impl GatewayConfig {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                        errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
                     }
                 }
             }
@@ -10835,7 +10922,9 @@ impl GatewayConfig {
                     ] {
                         if path.is_some_and(str::is_empty) {
                             errors.push(format!(
-                                "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.{} must not be empty",
+                                "PluginConfig {:?}: \
+                                 mesh_route_dispatch.rules[{}].destination.backend_tls.{} must \
+                                 not be empty",
                                 pc.id, rule_idx, field
                             ));
                         }
@@ -10844,11 +10933,15 @@ impl GatewayConfig {
                     let client_key = client_key.filter(|path| !path.is_empty());
                     match (client_cert, client_key) {
                         (Some(_), None) => errors.push(format!(
-                            "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.client_cert_path is set but client_key_path is missing",
+                            "PluginConfig {:?}: \
+                             mesh_route_dispatch.rules[{}].destination.backend_tls.\
+                             client_cert_path is set but client_key_path is missing",
                             pc.id, rule_idx
                         )),
                         (None, Some(_)) => errors.push(format!(
-                            "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.client_key_path is set but client_cert_path is missing",
+                            "PluginConfig {:?}: \
+                             mesh_route_dispatch.rules[{}].destination.backend_tls.\
+                             client_key_path is set but client_cert_path is missing",
                             pc.id, rule_idx
                         )),
                         _ => {}
@@ -10862,7 +10955,7 @@ impl GatewayConfig {
                                 path,
                             )
                         {
-                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                            errors.push(format!("PluginConfig {:?}: {}", pc.id, e));
                         }
                     }
                     if let Some(path) = client_key {
@@ -10874,7 +10967,7 @@ impl GatewayConfig {
                                 path,
                             )
                         {
-                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                            errors.push(format!("PluginConfig {:?}: {}", pc.id, e));
                         }
                     }
                     if let Some(path) = server_ca.filter(|path| !path.is_empty()) {
@@ -10888,7 +10981,7 @@ impl GatewayConfig {
                                 path,
                             )
                         {
-                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                            errors.push(format!("PluginConfig {:?}: {}", pc.id, e));
                         }
                     }
                 }
@@ -10901,7 +10994,7 @@ impl GatewayConfig {
                 )
             {
                 // Attach the (possibly cached) error to each PluginConfig row.
-                let message = format!("PluginConfig '{}': {}", pc.id, e);
+                let message = format!("PluginConfig {:?}: {}", pc.id, e);
                 if !errors.iter().any(|existing| existing == &message) {
                     errors.push(message);
                 }
@@ -10949,6 +11042,6 @@ mod pkcs11_key_validation_tests {
         )
         .expect_err("pkcs11 key sources require the feature");
 
-        assert!(error.contains("'pkcs11' Cargo feature"));
+        assert!(error.contains("`pkcs11` Cargo feature"));
     }
 }

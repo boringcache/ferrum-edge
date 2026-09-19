@@ -443,7 +443,8 @@ fn test_invalid_custom_regex_rejected_at_construction() {
     }));
     assert!(result.is_err());
     let err = result.err().unwrap();
-    assert!(err.contains("failed to compile custom pattern"));
+    assert!(err.contains("custom_patterns[0].regex"));
+    assert!(err.contains("invalid or too complex"));
 }
 
 // ─── Exclude roles ──────────────────────────────────────────────────────

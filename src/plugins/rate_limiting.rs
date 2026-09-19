@@ -194,9 +194,12 @@ impl RateLimiting {
         namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
-        let object = config
-            .as_object()
-            .ok_or_else(|| format!("rate_limiting: config must be an object, got: {config}"))?;
+        let object = config.as_object().ok_or_else(|| {
+            format!(
+                "rate_limiting: config must be an object, got: {config:?}",
+                config = config.to_string()
+            )
+        })?;
         // Legacy root window fields get their own actionable diagnostic before
         // the closed-key sweep would report them as merely "unknown".
         reject_legacy_window_fields(object)?;
@@ -954,11 +957,12 @@ fn parse_limit_by(object: &serde_json::Map<String, Value>) -> Result<LimitBy, St
             "consumer" => Ok(LimitBy::Consumer),
             "spiffe" | "spiffe_identity" => Ok(LimitBy::SpiffeIdentity),
             _ => Err(format!(
-                "rate_limiting: 'limit_by' must be one of 'ip', 'consumer', or 'spiffe_identity', got: {value:?}"
+                "rate_limiting: `limit_by` must be one of `ip`, `consumer`, or `spiffe_identity`, got: {value:?}"
             )),
         },
         Some(other) => Err(format!(
-            "rate_limiting: 'limit_by' must be a string, got: {other}"
+            "rate_limiting: `limit_by` must be a string, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -1188,7 +1192,7 @@ fn parse_limit_scope(
             Ok(LimitScope::Consumers(parsed))
         }
         other => Err(format!(
-            "{label}: 'scope' must be 'default' or 'consumers', got: {other:?}"
+            "{label}: `scope` must be `default` or `consumers`, got: {other:?}"
         )),
     }
 }

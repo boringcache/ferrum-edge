@@ -23,6 +23,11 @@ followed by a subsequent structured exact-node `Tenant subscription accepted`
 audit (`audit.event=tenant_subscription`, `surface=MeshConfigSync.MeshSubscribe`,
 `result=success`). Reload publications are temporal generation anchors only
 and are never proof by themselves. Reconnect-attempt logs are not proof.
+
+The client withholds its configured node_id. Rotation captures its logs from
+the exact baseline pod with kubectl --prefix=true, binding each event and
+reload anchor to [pod/<name>/ferrum-edge]. A redacted node_id without that
+Kubernetes source identity is never connect evidence.
 """
 
 from __future__ import annotations
@@ -282,16 +287,38 @@ def cp_subscribe_accepted_count(cp_logs: str, node_id: str) -> int:
     return sum(1 for line in cp_logs.splitlines() if _cp_subscribe_accepted_line(line, node_id))
 
 
+def _rotation_client_payload(line: str, node_id: str) -> tuple[str | None, bool]:
+    """Unwrap kubectl provenance only for the exact pod and gateway container.
+
+    Unprefixed logs still need their own exact node_id. Never search for a
+    matching prefix inside another pod's payload or accept a pod-name prefix.
+    """
+    if not line.startswith("[pod/"):
+        return line, False
+    prefix = f"[pod/{node_id}/ferrum-edge] "
+    if not line.startswith(prefix):
+        return None, False
+    return line[len(prefix):], True
+
+
 def _client_tls_connected_line(line: str, node_id: str) -> bool:
     """True for a Connected-to-CP marker bound to this exact node_id."""
+    line, pod_bound = _rotation_client_payload(line, node_id)
+    if line is None:
+        return False
+    # Withholding is not an identity. Only kubectl's exact-pod provenance can
+    # bind the fixed placeholder to the running capp; a conflicting visible
+    # node_id remains a failure even when the pod prefix matches.
+    allowed_ids = (node_id, "<redacted scalar>") if pod_bound else (node_id,)
     fields = json_fields(line)
     if fields is not None:
         return (
-            fields.get("message") == CONNECTED_MARKER and fields.get("node_id") == node_id
+            fields.get("message") == CONNECTED_MARKER
+            and fields.get("node_id") in allowed_ids
         )
     if CONNECTED_MARKER not in line:
         return False
-    return exact_field_equals(line, "node_id", node_id)
+    return any(exact_field_equals(line, "node_id", value) for value in allowed_ids)
 
 
 def client_tls_connected_count(client_logs: str, node_id: str) -> int:
@@ -306,7 +333,7 @@ def client_tls_connected_count(client_logs: str, node_id: str) -> int:
     return sum(1 for line in client_logs.splitlines() if _client_tls_connected_line(line, node_id))
 
 
-def _tls_reload_line(line: str, surface: str) -> bool:
+def _tls_reload_line(line: str, surface: str, client_node_id: str | None = None) -> bool:
     """True for a successful TLS material reload publication of this surface.
 
     Matches the production info-level success log only. Rebuild failures use a
@@ -315,6 +342,10 @@ def _tls_reload_line(line: str, surface: str) -> bool:
     """
     if not surface:
         return False
+    if client_node_id is not None:
+        line, _ = _rotation_client_payload(line, client_node_id)
+        if line is None:
+            return False
     fields = json_fields(line)
     if fields is not None:
         return (
@@ -413,7 +444,7 @@ def rotation_fresh_evidence(
         dp_anchor, client_post_anchor = _event_after_reload(
             client_lines,
             client_start,
-            lambda line: _tls_reload_line(line, TLS_RELOAD_SURFACE_DP),
+            lambda line: _tls_reload_line(line, TLS_RELOAD_SURFACE_DP, node_id),
             lambda line: _client_tls_connected_line(line, node_id),
         )
     if cp_start is not None:
@@ -711,6 +742,85 @@ def _assert_class(
         raise AssertionError(
             f"{case}: evidence {evidence!r} missing {want_evidence_substr!r}"
         )
+
+
+def self_test_redacted_rotation() -> None:
+    """Use the production withholding shape, with Kubernetes log provenance."""
+    node = "capp-7b8c9d6f5e-klmno"
+    other = "capp-7b8c9d6f5e-klmnp"
+    prefix = f"[pod/{node}/ferrum-edge] "
+    other_prefix = f"[pod/{other}/ferrum-edge] "
+    redacted_json = json.loads(_json_client_connected_line("<redacted scalar>"))
+    redacted_json["fields"]["namespace"] = "<redacted scalar>"
+    missing_id = json.loads(json.dumps(redacted_json))
+    del missing_id["fields"]["node_id"]
+    wrong_message = json.loads(json.dumps(redacted_json))
+    wrong_message["fields"]["message"] = "reconnecting native MeshSubscribe stream"
+    cp_event = _json_subscribe_accepted_line(node) + "\n"
+    cp_reload = _json_tls_reload_line(TLS_RELOAD_SURFACE_CP) + "\n"
+    fresh_cp = cp_event + cp_reload + cp_event
+
+    for connected, reload in (
+        (json.dumps(redacted_json), _json_tls_reload_line(TLS_RELOAD_SURFACE_DP)),
+        (
+            f"node_id=<redacted scalar> namespace=<redacted scalar> {CONNECTED_MARKER}",
+            f"surface={TLS_RELOAD_SURFACE_DP} revision=2 {TLS_RELOAD_MESSAGE}",
+        ),
+    ):
+        event = prefix + connected + "\n"
+        anchor = prefix + reload + "\n"
+        fresh_client = event + anchor + event
+        counts = rotation_observation_counts(event, cp_event, node)
+        if counts != (1, 1):
+            raise AssertionError(f"pod-bound redacted baseline: {counts!r}")
+        ok, evidence = rotation_fresh_evidence(fresh_client, fresh_cp, node, *counts)
+        if not ok or "client_tls_connect before=1 after=2" not in evidence:
+            raise AssertionError(f"pod-bound redacted rotation: {evidence!r}")
+
+        for rejected in (
+            connected,
+            other_prefix + connected,
+            f"[pod/{node}extra/ferrum-edge] " + connected,
+            f"[pod/{node}/curl] " + connected,
+            other_prefix + prefix + connected,
+            other_prefix + _json_client_connected_line(node),
+            prefix + _json_client_connected_line(other),
+            prefix + _json_client_connected_line("<redacted diagnostic>"),
+            prefix + json.dumps(missing_id),
+            prefix + json.dumps(wrong_message),
+        ):
+            if client_tls_connected_count(rejected, node) != 0:
+                raise AssertionError(f"unbound-or-conflicting-redaction-is-not-proof: {rejected}")
+
+        for client_logs, cp_logs, baseline in (
+            (event, fresh_cp, 1),
+            (event + anchor, fresh_cp, 1),
+            (event + event + anchor, fresh_cp, 1),
+            (event + other_prefix + reload + "\n" + event, fresh_cp, 1),
+            (
+                event + prefix + _json_tls_reload_line(TLS_RELOAD_SURFACE_CP)
+                + "\n" + event,
+                fresh_cp,
+                1,
+            ),
+            (event + anchor + other_prefix + connected + "\n", fresh_cp, 1),
+            (fresh_client, cp_event, 1),
+            (fresh_client, cp_event + cp_reload, 1),
+            (fresh_client, cp_event + cp_event + cp_reload, 1),
+            (fresh_client, cp_event + cp_reload + _json_subscribe_accepted_line(other), 1),
+            (
+                fresh_client,
+                cp_event + cp_reload + _json_subscribe_accepted_line("<redacted scalar>"),
+                1,
+            ),
+            (fresh_client, fresh_cp, 0),
+            (fresh_client, fresh_cp, 3),
+        ):
+            ok, evidence = rotation_fresh_evidence(
+                client_logs, cp_logs, node, baseline, baseline
+            )
+            if ok:
+                raise AssertionError(f"pod-bound rotation still requires fresh paired proof: {evidence}")
 
 
 def self_test() -> None:
@@ -1198,6 +1308,7 @@ def self_test() -> None:
     if ok:
         raise AssertionError("truncated baseline events must fail closed")
 
+    self_test_redacted_rotation()
     print("native_probe_classify.py --self-test: ok")
 
 

@@ -13377,7 +13377,7 @@ fn charge_event_schema_rejects_unrepresentable_shapes() {
         ),
         (
             json!({ "omit": ["latency_total_ms"] }),
-            "schema omit references unknown field 'latency_total_ms'",
+            "schema omit references unknown field \"latency_total_ms\"",
         ),
         (
             json!({ "rename": { "consumer_id": "api_secret" } }),
@@ -13414,7 +13414,7 @@ fn charge_event_dangling_schema_ref_fails_closed() {
     .err()
     .unwrap();
     assert!(
-        err.contains("references unknown schema 'definitely-not-defined'"),
+        err.contains("references unknown schema \"definitely-not-defined\""),
         "got: {err}"
     );
 }

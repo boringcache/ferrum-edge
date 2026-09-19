@@ -139,14 +139,15 @@ fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
         Some(value) => {
             let Some(code) = json_u64(value) else {
                 return Err(format!(
-                    "request_termination: 'status_code' must be an integer from 200 to 599, \
-                     got: {value}"
+                    "request_termination: `status_code` must be an integer from 200 to 599, \
+                     got: {value:?}",
+                    value = value.to_string()
                 ));
             };
             if !(200..=599).contains(&code) {
                 return Err(format!(
                     "request_termination: 'status_code' must be a final response from 200 to 599 \
-                     (informational statuses including 101 are rejected), got {code}"
+                     (informational statuses including 101 are rejected), got \"{code}\""
                 ));
             }
             u16::try_from(code)
@@ -172,7 +173,8 @@ fn parse_content_type(config: &Map<String, Value>) -> Result<String, String> {
             Ok(trimmed.to_string())
         }
         Some(other) => Err(format!(
-            "request_termination: 'content_type' must be a string, got: {other}"
+            "request_termination: `content_type` must be a string, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -182,7 +184,8 @@ fn optional_string(config: &Map<String, Value>, key: &str) -> Result<Option<Stri
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(format!(
-            "request_termination: '{key}' must be a string, got: {other}"
+            "request_termination: `{key}` must be a string, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -219,7 +222,10 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
 
     if let Some(value) = trigger.get("path_prefix") {
         let path = value.as_str().ok_or_else(|| {
-            format!("request_termination: 'trigger.path_prefix' must be a string, got: {value}")
+            format!(
+                "request_termination: `trigger.path_prefix` must be a string, got: {value:?}",
+                value = value.to_string()
+            )
         })?;
         if path.is_empty() {
             return Err(
@@ -272,7 +278,10 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
 
     if let Some(value) = trigger.get("header") {
         let header = value.as_str().ok_or_else(|| {
-            format!("request_termination: 'trigger.header' must be a string, got: {value}")
+            format!(
+                "request_termination: `trigger.header` must be a string, got: {value:?}",
+                value = value.to_string()
+            )
         })?;
         let header = header.trim();
         if header.is_empty() {
@@ -292,7 +301,8 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
             Some(Value::String(value)) => value.clone(),
             Some(other) => {
                 return Err(format!(
-                    "request_termination: 'trigger.header_value' must be a string, got: {other}"
+                    "request_termination: `trigger.header_value` must be a string, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };

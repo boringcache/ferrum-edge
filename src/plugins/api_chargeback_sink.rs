@@ -5430,7 +5430,7 @@ fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "{PLUGIN_NAME}: clickhouse.url must use http:// or https:// (got {scheme})"
+                "{PLUGIN_NAME}: clickhouse.url must use http:// or https:// (got {scheme:?})"
             ));
         }
     }

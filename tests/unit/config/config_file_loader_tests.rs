@@ -2609,7 +2609,7 @@ plugin_configs: []
     .expect_err("absent version must still fail");
     let msg = err.to_string();
     assert!(
-        msg.contains("missing required 'version' field"),
+        msg.contains("missing required `version` field"),
         "expected missing-field diagnostic, got: {msg}"
     );
 }
@@ -2698,7 +2698,7 @@ fn test_torn_trailing_plugin_configs_rejected_by_resource_counts() {
         "expected resource_counts diagnostic, got: {message}"
     );
     assert!(
-        message.contains("plugin_configs=2") && message.contains("plugin_configs=1"),
+        message.contains(r#"plugin_configs="2""#) && message.contains("plugin_configs=1"),
         "diagnostic should show declared vs observed plugin counts: {message}"
     );
 }
@@ -2927,7 +2927,7 @@ fn file_loader_normalizes_mixed_case_hosts_sni_san_and_blank_optional_ids() {
     // File mode intentionally validates fields BEFORE normalize_fields() (see
     // file_loader::load_config_from_file and Proxy::validate_fields_inner). A
     // wire `proxy_id: ""` on a global plugin is therefore Some("") at field
-    // validation and fails with "scope 'global' must not have proxy_id" before
+    // validation and fails with "scope `global` must not have proxy_id" before
     // PluginConfig::normalize_fields can clear blank → None. Omit proxy_id here
     // (the admitted form); blank custom_id still proves optional-id clearing
     // because validate_string_field accepts whitespace-only values.
@@ -3117,4 +3117,38 @@ fn unknown_extension_loader_rejects_alias_before_later_malformation() {
     );
     assert!(!rendered.contains("private-version"));
     assert!(!rendered.contains("loader-secret"));
+}
+
+#[test]
+fn file_wrong_type_version_keeps_schema_name_when_rendered() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    for extension in [".json", ".yaml"] {
+        let content = if extension == ".json" {
+            "{\"version\":false}"
+        } else {
+            "version: false\n"
+        };
+        let mut file = NamedTempFile::with_suffix(extension).unwrap();
+        write!(file, "{content}").unwrap();
+        let path = file.path().to_str().unwrap();
+        let error = load_config_from_file(path, 30, &policy, "ferrum").unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+        assert!(rendered.contains("field `version` must be a string or non-negative integer"));
+        assert!(rendered.contains("got boolean"), "{rendered}");
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+#[test]
+fn memory_wrong_type_version_keeps_schema_name_when_rendered() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    for content in ["{\"version\":false}", "version: false\n"] {
+        let error = ferrum_edge::config::file_loader::decode_and_validate_config_document(
+            content, 30, &policy,
+        )
+        .unwrap_err();
+        let rendered = ferrum_edge::startup::render_startup_error(error, &[]);
+        assert!(rendered.contains("field `version` must be a string or non-negative integer"));
+        assert!(rendered.contains("got boolean"), "{rendered}");
+    }
 }

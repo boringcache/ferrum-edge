@@ -820,11 +820,11 @@ impl VersionCompatError {
             ),
             VersionCompatError::Malformed { peer } => format!(
                 "Unable to parse {peer_role} version for compatibility check \
-                 ({local_role}={local_version}, {peer_role}={peer}). \
+                 ({local_role}={local_version}, {peer_role}={peer:?}). \
                  Versions must be valid SemVer (major.minor.patch with optional prerelease/build)."
             ),
             VersionCompatError::Incompatible { local, peer } => format!(
-                "Version mismatch: {local_role} is v{local} but {peer_role} is v{peer}. \
+                "Version mismatch: {local_role} is v{local} but {peer_role} is v{peer:?}. \
                  Major and minor versions must match. \
                  Upgrade the CP first, then upgrade DPs to the same major.minor version."
             ),

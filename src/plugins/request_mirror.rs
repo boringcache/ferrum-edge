@@ -1616,7 +1616,7 @@ impl RequestMirror {
             .map(|p| {
                 if p == 0 || p > 65535 {
                     Err(format!(
-                        "request_mirror: 'mirror_port' must be 1–65535 (got {})",
+                        "request_mirror: `mirror_port` must be 1–65535 (got \"{}\")",
                         p
                     ))
                 } else {
@@ -1643,7 +1643,7 @@ impl RequestMirror {
         let percentage = optional_f64(config, "percentage")?.unwrap_or(100.0);
         if !(0.0..=100.0).contains(&percentage) {
             return Err(format!(
-                "request_mirror: 'percentage' must be 0.0–100.0 (got {})",
+                "request_mirror: `percentage` must be 0.0–100.0 (got \"{}\")",
                 percentage
             ));
         }
@@ -1667,7 +1667,8 @@ impl RequestMirror {
                 })?;
                 if v > MAX_MAX_IN_FLIGHT_MIRRORS {
                     return Err(format!(
-                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS} (got {v})"
+                        "request_mirror: `max_in_flight` must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS} (got {v:?})",
+                        v = v.to_string()
                     ));
                 }
                 Ok(v)
@@ -1720,7 +1721,7 @@ impl RequestMirror {
             Some(configured) => {
                 if configured > max_retained_request_body_bytes {
                     return Err(format!(
-                        "request_mirror: 'max_mirrored_request_body_bytes' ({configured}) must not exceed 'max_retained_request_body_bytes' ({max_retained_request_body_bytes})"
+                        "request_mirror: `max_mirrored_request_body_bytes` (\"{configured}\") must not exceed `max_retained_request_body_bytes` (\"{max_retained_request_body_bytes}\")"
                     ));
                 }
                 configured
@@ -1734,7 +1735,8 @@ impl RequestMirror {
             .map(|v| {
                 if v == 0 || v > MAX_MIRROR_TIMEOUT_MS {
                     Err(format!(
-                        "request_mirror: 'mirror_timeout_ms' must be 1–{MAX_MIRROR_TIMEOUT_MS} (got {v})"
+                        "request_mirror: `mirror_timeout_ms` must be 1–{MAX_MIRROR_TIMEOUT_MS} (got {v:?})",
+                        v = v.to_string()
                     ))
                 } else {
                     Ok(v)

@@ -216,8 +216,10 @@ impl ResponseMock {
                     ));
                 }
                 let anchored = crate::config::types::anchor_regex_pattern(pattern);
-                let re = Regex::new(&anchored).map_err(|e| {
-                    format!("response_mock: rule[{i}] invalid regex '{pattern}': {e}")
+                let re = Regex::new(&anchored).map_err(|_| {
+                    format!(
+                        "response_mock: rule[{i}].path: invalid regex or complexity limit exceeded"
+                    )
                 })?;
                 PathMatcher::Regex(re)
             } else {
@@ -276,7 +278,7 @@ impl ResponseMock {
             let delay_ms = optional_u64(rule_obj, "delay_ms", i)?.unwrap_or(0);
             if delay_ms > MAX_DELAY_MS {
                 return Err(format!(
-                    "response_mock: rule[{i}] 'delay_ms' must be <= {MAX_DELAY_MS}, got {delay_ms}"
+                    "response_mock: rule[{i}] `delay_ms` must be <= {MAX_DELAY_MS}, got \"{delay_ms}\""
                 ));
             }
 

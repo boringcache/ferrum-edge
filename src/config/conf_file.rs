@@ -100,7 +100,10 @@ impl ConfFile {
         let options = StableFileReadOptions::new(MAX_FERRUM_CONF_BYTES, "ferrum.conf");
         match read_stable_file(path, options) {
             Ok(contents) => {
-                info!("Loading configuration from {}", path.display());
+                info!(
+                    "Loading configuration from {}",
+                    crate::startup::sanitize_startup_cause(format!("{path:?}"), &[])
+                );
                 Self::parse(&contents)
             }
             Err(StableFileError::NotFound) if absent_ok => Ok(Self::default()),
@@ -166,13 +169,13 @@ impl ConfFile {
                     });
                 return Err(if secret_suffix {
                     format!(
-                        "Invalid ferrum.conf key '{display_key}' at line {}: external secret \
+                        "Invalid ferrum.conf key `{display_key}` at line {}: external secret \
                          suffixes are environment-only; set this key in the environment",
                         line_num + 1
                     )
                 } else {
                     format!(
-                        "Unknown ferrum.conf key '{display_key}' at line {}",
+                        "Unknown ferrum.conf key `{display_key}` at line {}",
                         line_num + 1
                     )
                 });
@@ -184,7 +187,7 @@ impl ConfFile {
                 let quoted = &value[1..];
                 let Some(end) = quoted.find(quote) else {
                     return Err(format!(
-                        "Invalid conf file syntax at line {}: unclosed quote for key '{key}'",
+                        "Invalid conf file syntax at line {}: unclosed quote for key `{key}`",
                         line_num + 1
                     ));
                 };
@@ -192,7 +195,7 @@ impl ConfFile {
                 if !trailing.is_empty() && !trailing.starts_with('#') {
                     return Err(format!(
                         "Invalid conf file syntax at line {}: \
-                         unexpected text after closing quote for key '{key}'",
+                         unexpected text after closing quote for key `{key}`",
                         line_num + 1
                     ));
                 }

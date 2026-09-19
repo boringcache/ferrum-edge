@@ -3010,7 +3010,7 @@ fn u64_config_range(
     };
     if value < min || value > max {
         return Err(format!(
-            "otel_tracing: '{key}' must be between {min} and {max}, got: {value}"
+            "otel_tracing: '{key}' must be between {min} and {max}, got: \"{value}\""
         ));
     }
     Ok(value)
@@ -3048,7 +3048,8 @@ fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String
             "untrusted" => Ok(TraceContextTrust::Untrusted),
             "trusted" => Ok(TraceContextTrust::Trusted),
             other => Err(format!(
-                "otel_tracing: 'trace_context_trust' must be 'trusted' or 'untrusted', got: {other}"
+                "otel_tracing: `trace_context_trust` must be `trusted` or `untrusted`, got: {other:?}",
+                other = other.to_string()
             )),
         },
         Some(other) => Err(format!(
@@ -3086,7 +3087,7 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
             })?;
             if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
                 return Err(format!(
-                    "otel_tracing: 'root_sampling_ratio' must be between 0.0 and 1.0, got: {ratio}"
+                    "otel_tracing: `root_sampling_ratio` must be between 0.0 and 1.0, got: \"{ratio}\""
                 ));
             }
             Some(ratio)
@@ -3115,7 +3116,8 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
             Ok(RootSampling::Ratio(ratio))
         }
         other => Err(format!(
-            "otel_tracing: 'root_sampling' must be always_on, always_off, or ratio, got: {other}"
+            "otel_tracing: `root_sampling` must be always_on, always_off, or ratio, got: {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -3127,7 +3129,7 @@ fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "{provider_name}: 'endpoint' scheme must be http or https, got: {scheme}"
+                "{provider_name}: `endpoint` scheme must be http or https, got: {scheme:?}"
             ));
         }
     }
@@ -3152,7 +3154,7 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
         "http" | "https" => {}
         scheme => {
             return Err(format!(
-                "Datadog: 'agent_url' scheme must be http or https, got: {scheme}"
+                "Datadog: `agent_url` scheme must be http or https, got: {scheme:?}"
             ));
         }
     }

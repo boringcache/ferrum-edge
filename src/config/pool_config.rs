@@ -140,7 +140,7 @@ fn invalid_pool_value(key: &str, raw: &str, expected: &str) -> String {
             crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
         );
     }
-    format!("Invalid {key} value '{raw}'. Expected {expected}")
+    format!("Invalid {key} value {raw:?}. Expected {expected}")
 }
 
 fn parse_pool_int<T: std::str::FromStr>(key: &str, raw: &str, expected: &str) -> Result<T, String> {
@@ -181,11 +181,11 @@ fn range_err(
     min: impl std::fmt::Display,
     max: impl std::fmt::Display,
 ) -> String {
-    format!("{key} must be between {min} and {max} (got {value})")
+    format!("{key} must be between {min} and {max} (got \"{value}\")")
 }
 
 fn min_err(key: &str, value: impl std::fmt::Display, min: impl std::fmt::Display) -> String {
-    format!("{key} must be at least {min} (got {value})")
+    format!("{key} must be at least {min} (got \"{value}\")")
 }
 
 impl PoolConfig {
@@ -362,10 +362,7 @@ impl PoolConfig {
         // Advisory only: any valid u64 is accepted. Sub-10s is unusually low
         // next to the HTTP read timeout, but it is a deliberate operator value.
         if config.http2_keep_alive_timeout_seconds < 10 {
-            tracing::warn!(
-                "HTTP/2 keep-alive timeout ({}s) is very low, consider increasing to 30-45s",
-                config.http2_keep_alive_timeout_seconds
-            );
+            tracing::warn!("HTTP/2 keep-alive timeout is below 10s, consider increasing to 30-45s");
         }
 
         Ok(config)
@@ -588,24 +585,29 @@ impl PoolConfig {
     pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
         if value < MIN_IDLE_PER_HOST {
             tracing::warn!(
-                "pool_max_idle_per_host={} for '{}' is below the minimum ({}). \
-                 Values this low cause excessive connection churn under load, \
-                 leading to high latency and errors. Clamping to {}.",
-                value,
-                source,
-                MIN_IDLE_PER_HOST,
-                MIN_IDLE_PER_HOST,
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!(
+                        "pool_max_idle_per_host=\"{value}\" for {source:?} is below the minimum \
+                         ({MIN_IDLE_PER_HOST}). Values this low cause excessive connection churn \
+                         under load, leading to high latency and errors. Clamping to \
+                         {MIN_IDLE_PER_HOST}."
+                    ),
+                    &[]
+                )
             );
             MIN_IDLE_PER_HOST
         } else if value > MAX_IDLE_PER_HOST {
             tracing::warn!(
-                "pool_max_idle_per_host={} for '{}' exceeds the maximum ({}). \
-                 Very high values waste file descriptors and memory without \
-                 improving performance. Clamping to {}.",
-                value,
-                source,
-                MAX_IDLE_PER_HOST,
-                MAX_IDLE_PER_HOST,
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!(
+                        "pool_max_idle_per_host=\"{value}\" for {source:?} exceeds the maximum \
+                         ({MAX_IDLE_PER_HOST}). Very high values waste file descriptors and \
+                         memory without improving performance. Clamping to {MAX_IDLE_PER_HOST}."
+                    ),
+                    &[]
+                )
             );
             MAX_IDLE_PER_HOST
         } else {

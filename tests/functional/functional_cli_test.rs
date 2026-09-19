@@ -10,6 +10,7 @@ use crate::common::GatewayChildGuard;
 use crate::scaffolding::harness::wait_for_spawned_gateway;
 use crate::scaffolding::port_registry::TestSocket;
 
+use ferrum_edge::grpc::proto::ConfigUpdate;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -1040,24 +1041,19 @@ async fn functional_cli_validate_withholds_secret_backed_scalar_in_range_error()
     );
 }
 
-/// Non-vacuity control for the test above: an ordinary, non-secret-backed value
-/// stays visible in the same diagnostic.
-///
-/// Key-tied withholding is scoped to variables that were externally resolved.
-/// Without this control, a site that withheld the value unconditionally — or one
-/// that simply stopped printing it — would satisfy the redaction assertion while
-/// making an ordinary misconfiguration undiagnosable.
+/// A directly configured scalar is withheld at the final emission boundary too.
+/// Keep the field and fixed legal bounds so the failure remains actionable;
+/// a possessive apostrophe must not consume the rest of the diagnostic.
 #[ignore]
 #[tokio::test]
-async fn functional_cli_validate_shows_ordinary_scalar_in_range_error() {
+async fn functional_cli_validate_keeps_range_context_while_withholding_scalar() {
     let temp_dir = TempDir::new().unwrap();
     let jwt_path = temp_dir.path().join("jwt-secret");
     std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
 
     let output = validate_database_mode_command(&temp_dir)
         .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
-        // Set directly rather than through a `_FILE` suffix: this variable was
-        // not externally resolved, so the value must survive.
+        // Direct input still follows the document-scalar withholding contract.
         .env("FERRUM_HTTP3_INITIAL_MTU", "1199")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1072,9 +1068,18 @@ async fn functional_cli_validate_shows_ordinary_scalar_in_range_error() {
         "an out-of-range MTU must fail validation: stdout={stdout}, stderr={stderr}"
     );
     assert!(
-        stderr.contains("FERRUM_HTTP3_INITIAL_MTU (1199)"),
-        "an ordinary configuration value must stay diagnosable, got: {stderr}"
+        stderr.contains("FERRUM_HTTP3_INITIAL_MTU (<redacted scalar>)")
+            && stderr.contains("is outside the legal QUIC range [1200, 65527]"),
+        "the field and fixed legal bounds must stay diagnosable, got: {stderr}"
     );
+    for output in [stdout.as_ref(), stderr.as_ref()] {
+        assert!(
+            !output
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|token| token == "1199"),
+            "the rejected scalar must be withheld: {output}"
+        );
+    }
 }
 
 /// Redaction must read the original diagnostic only, never the text it just
@@ -3407,7 +3412,7 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
     for (contents, expected) in [
         (None, "Configuration file not found"),
         (Some("version: ["), "Migration config validation failed"),
-        (Some("proxies: []"), "missing required 'version' field"),
+        (Some("proxies: []"), "missing required `version` field"),
         (Some("version: \"1\"\nproxies: []\n"), "Validation passed."),
     ] {
         if let Some(contents) = contents {
@@ -3580,6 +3585,561 @@ fn cli_contract_diagnostic(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[derive(Clone)]
+struct RejectedSnapshotCp {
+    update: ferrum_edge::grpc::proto::ConfigUpdate,
+}
+
+#[tonic::async_trait]
+impl ferrum_edge::grpc::proto::config_sync_server::ConfigSync for RejectedSnapshotCp {
+    type SubscribeStream = futures::stream::BoxStream<'static, Result<ConfigUpdate, tonic::Status>>;
+
+    async fn subscribe(
+        &self,
+        _request: tonic::Request<ferrum_edge::grpc::proto::SubscribeRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeStream>, tonic::Status> {
+        use futures::StreamExt;
+
+        // Hold the stream open after delivery. Reconnection must be the DP's
+        // explicit snapshot refusal, never a fixture-induced EOF.
+        let update = self.update.clone();
+        let stream =
+            futures::stream::once(async move { Ok(update) }).chain(futures::stream::pending());
+        Ok(tonic::Response::new(Box::pin(stream)))
+    }
+
+    async fn get_full_config(
+        &self,
+        _request: tonic::Request<ferrum_edge::grpc::proto::FullConfigRequest>,
+    ) -> Result<tonic::Response<ferrum_edge::grpc::proto::FullConfigResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture uses Subscribe"))
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_dp_initial_snapshot_rejection_withholds_document_values() {
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSyncServer;
+
+    let directory = TempDir::new().unwrap();
+    let proxy_token = "UNREGISTERED_PROXY5591";
+    let upstream_token = "UNREGISTERED_UPSTREAM5591";
+    let proxy = serde_json::from_value(serde_json::json!({
+        "id": proxy_token, "namespace": "ferrum", "listen_path": "/",
+        "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080,
+        "upstream_id": upstream_token
+    }))
+    .unwrap();
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    let cp = RejectedSnapshotCp {
+        update: ferrum_edge::grpc::proto::ConfigUpdate {
+            update_type: 0,
+            config_json: serde_json::to_string(&config).unwrap(),
+            version: config.loaded_at.to_rfc3339(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            ..Default::default()
+        },
+    };
+    let reservation = reserve_port().await.unwrap();
+    let address = format!("http://127.0.0.1:{}", reservation.port);
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(reservation.into_listener());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(ConfigSyncServer::new(cp))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let stdout = directory.path().join("stdout");
+    let stderr = directory.path().join("stderr");
+    let mut command = installed_cli_command(&directory, &["run", "-m", "dp"]);
+    command
+        .env("FERRUM_NAMESPACE", "ferrum")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "synthetic-admin-secret-at-least-32-characters",
+        )
+        .env("FERRUM_DP_CP_GRPC_URLS", address)
+        .env(
+            "FERRUM_CP_DP_GRPC_JWT_SECRET",
+            "synthetic-dp-secret-at-least-32-characters",
+        )
+        .env("FERRUM_PROXY_HTTP_PORT", "0")
+        .env("FERRUM_PROXY_HTTPS_PORT", "0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    let mut gateway = GatewayChildGuard::new(command.spawn().unwrap());
+    let combined = || {
+        format!(
+            "{}{}",
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let output = combined();
+            assert!(
+                !gateway.has_exited(),
+                "DP exited before snapshot refusal: {output}"
+            );
+            if output.contains("Ignoring config update with invalid upstream references") {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("DP did not refuse the delivered snapshot: {}", combined()));
+    gateway.shutdown();
+    let output = combined();
+    assert!(
+        output.contains("references non-existent upstream"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("Full configuration snapshot accepted"),
+        "{output}"
+    );
+    for token in [proxy_token, upstream_token] {
+        assert!(!output.contains(token), "{output}");
+    }
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_startup_reports_validation_cause_chain() {
+    let directory = TempDir::new().unwrap();
+    let mesh_path = directory.path().join("mesh-invalid.yaml");
+    // Exact three-line reproduction from #5589; position is part of the diagnostic.
+    let document =
+        "mesh:\n  workloads:\n    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/qa-svc\n";
+    std::fs::write(&mesh_path, document).unwrap();
+
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh", "-v"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
+        assert!(
+            stderr.contains("invalid mesh configuration document: mesh.workloads[0]: "),
+            "{subcommand}: {diagnostic}"
+        );
+        assert!(
+            stderr.contains("missing field `selector` at line 3 column 7"),
+            "{subcommand}: {diagnostic}"
+        );
+        if subcommand == "run" {
+            assert!(
+                stderr.contains(
+                    "Fatal error: failed to load localized mesh config from <redacted scalar>"
+                ),
+                "{diagnostic}"
+            );
+        }
+        assert!(!diagnostic.contains("spiffe://cluster.local/ns/ferrum/sa/qa-svc"));
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_startup_redacts_secret_in_inner_cause() {
+    let directory = TempDir::new().unwrap();
+    let mesh_path = directory.path().join("mesh-invalid-version.yaml");
+    let secret_path = directory.path().join("synthetic-secret.txt");
+    let secret = "synthetic-startup-chain-secret";
+    std::fs::write(&secret_path, secret).unwrap();
+    std::fs::write(&mesh_path, format!("version: {secret}\nmesh: {{}}\n")).unwrap();
+
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_STARTUP_DIAGNOSTIC_FIXTURE_FILE", &secret_path)
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
+        assert!(!diagnostic.contains(secret), "{subcommand}: {diagnostic}");
+        assert!(
+            diagnostic.contains("unsupported mesh document version"),
+            "{subcommand}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(ferrum_edge::util::deserialization::REDACTED_SCALAR),
+            "{subcommand}: {diagnostic}"
+        );
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_versions_are_redacted_without_registration() {
+    let secret = "UNREGISTERED_VERSION_TOKEN_5589";
+    let document = serde_json::json!({"version": secret, "mesh": {}});
+    for extension in ["yaml", "json"] {
+        let directory = TempDir::new().unwrap();
+        let mesh_path = directory
+            .path()
+            .join(format!("mesh-invalid-version.{extension}"));
+        let content = if extension == "yaml" {
+            serde_yaml::to_string(&document).unwrap()
+        } else {
+            serde_json::to_string_pretty(&document).unwrap()
+        };
+        std::fs::write(&mesh_path, content).unwrap();
+        for protocol in ["file", "stock_xds"] {
+            for subcommand in ["run", "validate"] {
+                let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+                command
+                    .env("FERRUM_MESH_CONFIG_PROTOCOL", protocol)
+                    .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+                    .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+                    .env("FERRUM_MESH_STOCK_XDS_URLS", "https://127.0.0.1:1")
+                    .env("FERRUM_MESH_STOCK_XDS_NODE_ID", "diagnostic-fixture")
+                    .env("FERRUM_PROXY_HTTP_PORT", "0")
+                    .env("FERRUM_ADMIN_HTTP_PORT", "0");
+                let output = cli_contract_output(command).await;
+                let diagnostic = cli_contract_diagnostic(&output);
+                assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+                assert!(!diagnostic.contains(secret), "{diagnostic}");
+                for required in [
+                    "unsupported mesh document version (<redacted scalar>)",
+                    "supported: 1",
+                    "the mesh model has no file migrations",
+                ] {
+                    assert!(diagnostic.contains(required), "{diagnostic}");
+                }
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_semantic_values_are_redacted_without_registration() {
+    for secret in [
+        "UNREGISTERED_TOKEN_5589",
+        "prefix'\"UNREGISTERED_TOKEN_5589\\tail",
+    ] {
+        let documents = [
+            (
+                serde_json::json!({"mesh": {"services": [{
+                    "name": secret, "namespace": "ferrum", "cluster_ips": [secret]
+                }]}}),
+                "cluster_ips[0]",
+                "is not a valid IP address",
+            ),
+            (
+                serde_json::json!({"mesh": {"virtual_service_cors_policies": [{
+                    "name": secret, "namespace": "ferrum", "host": "svc",
+                    "cors": {"allowed_origins": [{"regex": format!("{secret}[")}]}
+                }]}}),
+                "cors.allowed_origins[0]",
+                "regex matcher is invalid or exceeds",
+            ),
+        ];
+        for (document, field, reason) in documents {
+            for extension in ["yaml", "json"] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join(format!("mesh-semantic.{extension}"));
+                let content = if extension == "yaml" {
+                    serde_yaml::to_string(&document).unwrap()
+                } else {
+                    serde_json::to_string(&document).unwrap()
+                };
+                std::fs::write(&path, content).unwrap();
+                for subcommand in ["run", "validate"] {
+                    let mut command =
+                        installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+                    command
+                        .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+                        .env("FERRUM_MESH_FILE_CONFIG_PATH", &path)
+                        .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+                        .env("FERRUM_PROXY_HTTP_PORT", "0")
+                        .env("FERRUM_ADMIN_HTTP_PORT", "0");
+                    let output = cli_contract_output(command).await;
+                    let diagnostic = cli_contract_diagnostic(&output);
+                    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+                    assert!(diagnostic.contains(field), "{diagnostic}");
+                    assert!(diagnostic.contains(reason), "{diagnostic}");
+                    assert!(
+                        !diagnostic
+                            .to_ascii_lowercase()
+                            .contains("unregistered_token_5589"),
+                        "{diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_gateway_versions_are_redacted_without_registration() {
+    let secret = "UNREGISTERED_GATEWAY_VERSION_5589";
+    for extension in ["yaml", "json"] {
+        let directory = TempDir::new().unwrap();
+        let path = directory
+            .path()
+            .join(format!("invalid-version.{extension}"));
+        let document = serde_json::json!({"version": secret});
+        let content = if extension == "yaml" {
+            serde_yaml::to_string(&document).unwrap()
+        } else {
+            serde_json::to_string(&document).unwrap()
+        };
+        std::fs::write(&path, content).unwrap();
+        for subcommand in ["run", "validate"] {
+            let command = installed_cli_command(
+                &directory,
+                &[subcommand, "-m", "file", "-c", path.to_str().unwrap()],
+            );
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+            assert!(
+                diagnostic.contains("No config migration path from version"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("Migrating in memory"), "{diagnostic}");
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_backup_versions_are_redacted_without_registration() {
+    let directory = TempDir::new().unwrap();
+    // Backups are JSON-only. Retain a real held port so no other fixture can
+    // answer the database dial. Pool deadlines also bound Darwin's black hole.
+    let refused = crate::scaffolding::ports::reserve_refused_tcp_port().unwrap();
+    let path = directory.path().join("backup.json");
+    let secret = "UNREGISTERED_BACKUP_VERSION_5589";
+    std::fs::write(&path, serde_json::json!({"version": secret}).to_string()).unwrap();
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "database"]);
+        command
+            .env("FERRUM_DB_TYPE", "postgres")
+            .env(
+                "FERRUM_DB_URL",
+                format!("postgres://fixture@127.0.0.1:{}/fixture", refused.port),
+            )
+            .env("FERRUM_DB_CONFIG_BACKUP_PATH", &path)
+            .env("FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS", "1")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "1")
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-for-backup-test-5589",
+            )
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        for required in [
+            "Config backup",
+            "version migration",
+            "No config migration path",
+        ] {
+            assert!(diagnostic.contains(required), "{diagnostic}");
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_yaml_duplicate_version_keeps_field_name() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("duplicate.yaml");
+    std::fs::write(&path, "version: \"1\"\nversion: \"1\"\nmesh: {}\n").unwrap();
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+        assert!(
+            diagnostic.contains("duplicate field `version`"),
+            "{diagnostic}"
+        );
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_document_scalars_are_redacted_without_registration() {
+    let secrets = [
+        "-----BEGIN PRIVATE KEY-----\nUNREGISTERED-PEM-MATERIAL-5589\n-----END PRIVATE KEY-----",
+        "unregistered.synthetic.token.5589",
+    ];
+    for secret in secrets {
+        for (field, expected) in [
+            ("tls", "expected a"),
+            ("connect_timeout_ms", "expected u64"),
+        ] {
+            let mut policy = serde_json::Map::new();
+            policy.insert(field.to_string(), serde_json::json!(secret));
+            let document = serde_json::json!({
+                "mesh": {
+                    "destination_rules": [{
+                        "name": "diagnostic-fixture",
+                        "namespace": "ferrum",
+                        "host": "fixture.ferrum.svc.cluster.local",
+                        "traffic_policy": policy
+                    }]
+                }
+            });
+            for extension in ["yaml", "json"] {
+                let directory = TempDir::new().unwrap();
+                let mesh_path = directory.path().join(format!("mesh-invalid.{extension}"));
+                let content = if extension == "yaml" {
+                    serde_yaml::to_string(&document).unwrap()
+                } else {
+                    serde_json::to_string_pretty(&document).unwrap()
+                };
+                std::fs::write(&mesh_path, content).unwrap();
+                for protocol in ["file", "stock_xds"] {
+                    for subcommand in ["run", "validate"] {
+                        let mut command =
+                            installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+                        command
+                            .env("FERRUM_MESH_CONFIG_PROTOCOL", protocol)
+                            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+                            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+                            // The local policy must fail BEFORE any ADS dial.
+                            .env("FERRUM_MESH_STOCK_XDS_URLS", "https://127.0.0.1:1")
+                            .env("FERRUM_MESH_STOCK_XDS_NODE_ID", "diagnostic-fixture")
+                            .env("FERRUM_PROXY_HTTP_PORT", "0")
+                            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+                        // No external-secret suffix or registry fixture is set.
+                        let output = cli_contract_output(command).await;
+                        let diagnostic = cli_contract_diagnostic(&output);
+                        let context = format!("{subcommand}/{protocol}/{extension}/{field}");
+                        assert_eq!(output.status.code(), Some(1), "{context}: {diagnostic}");
+                        for fragment in [
+                            "UNREGISTERED-PEM-MATERIAL-5589",
+                            "BEGIN PRIVATE KEY",
+                            "END PRIVATE KEY",
+                            "unregistered.synthetic.token.5589",
+                        ] {
+                            assert!(!diagnostic.contains(fragment), "{context}: {diagnostic}");
+                        }
+                        let path = format!("mesh.destination_rules[0].traffic_policy.{field}");
+                        for required in [
+                            "invalid mesh configuration document",
+                            &path,
+                            "line ",
+                            "column ",
+                            expected,
+                            ferrum_edge::util::deserialization::REDACTED_SCALAR,
+                        ] {
+                            assert!(diagnostic.contains(required), "{context}: {diagnostic}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_mesh_diagnostics_do_not_materialize_dormant_database_tls() {
+    for subcommand in ["run", "validate"] {
+        let directory = TempDir::new().unwrap();
+        let pem_directory = directory.path().join("temp-pem-inventory");
+        std::fs::create_dir(&pem_directory).unwrap();
+        let mesh_path = directory.path().join("mesh-invalid.yaml");
+        std::fs::write(
+            &mesh_path,
+            "mesh:\n  workloads:\n    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/fixture\n",
+        )
+        .unwrap();
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "mesh"]);
+        command
+            .env("FERRUM_MESH_CONFIG_PROTOCOL", "file")
+            .env("FERRUM_MESH_FILE_CONFIG_PATH", &mesh_path)
+            .env("FERRUM_MESH_ALLOW_NO_CA", "true")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_DB_TYPE", "postgres")
+            .env("FERRUM_DB_URL", "postgres://fixture@localhost/primary")
+            .env(
+                "FERRUM_DB_READ_REPLICA_URL",
+                "postgres://fixture@localhost/replica",
+            )
+            .env(
+                "FERRUM_DB_FAILOVER_URLS",
+                "postgres://fixture@localhost/failover",
+            )
+            .env("FERRUM_DB_TLS_MODE", "require")
+            .env(
+                "FERRUM_DB_TLS_CLIENT_CERT_SOURCE",
+                "-----BEGIN CERTIFICATE-----\nSYNTHETIC-DORMANT-CERT\n-----END CERTIFICATE-----",
+            )
+            .env(
+                "FERRUM_DB_TLS_CLIENT_KEY_SOURCE",
+                "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-DORMANT-KEY\n-----END PRIVATE KEY-----",
+            )
+            .env("TMPDIR", &pem_directory)
+            .env("TMP", &pem_directory)
+            .env("TEMP", &pem_directory);
+        let before: Vec<_> = std::fs::read_dir(&pem_directory).unwrap().collect();
+        assert!(before.is_empty());
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {diagnostic}");
+        assert!(
+            diagnostic.contains("missing field `selector`"),
+            "{diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("SYNTHETIC-DORMANT-KEY"),
+            "{diagnostic}"
+        );
+        let after: Vec<_> = std::fs::read_dir(&pem_directory).unwrap().collect();
+        assert!(
+            after.is_empty(),
+            "dormant database TLS created files: {after:?}"
+        );
+    }
 }
 
 #[ignore]
@@ -3969,4 +4529,361 @@ async fn functional_cli_health_uses_secret_endpoint_for_tls_gateway() {
         "{}",
         cli_contract_diagnostic(&output)
     );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_plugin_diagnostics_withhold_all_supplied_values() {
+    let token = "'UNREGISTERED_REVIEW_TOKEN_5589";
+    let cases = [
+        (token, serde_json::json!({}), "Unknown plugin"),
+        (
+            "waf",
+            serde_json::json!({"include_default_rules": false, "custom_rules": [{
+                "id": "fixture", "category": "test", "target": "body_text",
+                "pattern": "UNREGISTERED_REVIEW_TOKEN_5589["
+            }]}),
+            "`pattern` set for `body_bytes` at rule indexes [0] is invalid or too complex",
+        ),
+        (
+            "waf",
+            serde_json::json!({"include_default_rules": false, "custom_rules": [{
+                "id": "fixture", "category": "test", "target": "url_path",
+                "pattern": "UNREGISTERED_REVIEW_TOKEN_5589["
+            }]}),
+            "`pattern` set for `url_path` at rule indexes [0] is invalid or too complex",
+        ),
+        (
+            "waf",
+            serde_json::json!({"stream": {"signatures": [{"id": token}]}}),
+            "requires `pattern`",
+        ),
+        (
+            "waf",
+            serde_json::json!({"stream": {"signatures": [
+                {"id": token, "pattern": "ok"}, {"id": token, "pattern": "ok"}
+            ]}}),
+            "duplicate stream signature id",
+        ),
+        (
+            "waf",
+            serde_json::json!({"stream": {"signatures": [
+                {"id": token, "pattern": "ok", "severity": token}
+            ]}}),
+            "invalid `severity`",
+        ),
+        (
+            "waf",
+            serde_json::json!({"global_exemptions": {"fp_capture_filters": [format!("{token}[")]}}),
+            "`global_exemptions.fp_capture_filters` pattern set is invalid",
+        ),
+        (
+            "waf",
+            serde_json::json!({"global_exemptions": {"paths": [format!("~{token}[")]}}),
+            "`global_exemptions.paths` pattern set is invalid",
+        ),
+        (
+            "bot_detection",
+            serde_json::json!({"custom_response_code": 918273641}),
+            "`custom_response_code` must be from 400 to 599",
+        ),
+        (
+            "grpc_web",
+            serde_json::json!({"expose_headers": [918273641]}),
+            "`expose_headers[0]` must be a string",
+        ),
+        (
+            "grpc_web",
+            serde_json::json!({"expose_headers": [{"nested": [token, 918273641]}]}),
+            "`expose_headers[0]` must be a string",
+        ),
+    ];
+    for (plugin, config, reason) in cases {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("plugin.json");
+        let document = serde_json::json!({
+            "version": "1", "proxies": [], "plugin_configs": [{
+                "id": "diagnostic-fixture", "plugin_name": plugin,
+                "scope": "global", "config": config
+            }]
+        });
+        std::fs::write(&path, document.to_string()).unwrap();
+        for subcommand in ["run", "validate"] {
+            let command = installed_cli_command(
+                &directory,
+                &[subcommand, "-m", "file", "-c", path.to_str().unwrap()],
+            );
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+            assert!(diagnostic.contains(reason), "{reason}: {diagnostic}");
+            for withheld in ["UNREGISTERED_REVIEW_TOKEN_5589", "918273641"] {
+                assert!(!diagnostic.contains(withheld), "{diagnostic}");
+            }
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_plaintext_basic_auth_withholds_consumer_ids() {
+    // Consumer ids must start alphanumeric and contain only [A-Za-z0-9._-], so a
+    // quote-bearing id is refused by ID validation before the Basic-auth check;
+    // the id itself must still be withheld from the rendered rejection.
+    for token in [
+        "UNREGISTERED_CONSUMER_5589",
+        "UNREGISTERED-CONSUMER.5589_tail",
+    ] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("consumer.json");
+        let document = serde_json::json!({
+            "version": "1", "proxies": [], "plugin_configs": [], "consumers": [{
+                "id": token, "username": "fixture",
+                "credentials": {"basicauth": [{"password": "synthetic-password"}]}
+            }]
+        });
+        std::fs::write(&path, document.to_string()).unwrap();
+        for subcommand in ["run", "validate"] {
+            let command = installed_cli_command(
+                &directory,
+                &[subcommand, "-m", "file", "-c", path.to_str().unwrap()],
+            );
+            let output = cli_contract_output(command).await;
+            let diagnostic = cli_contract_diagnostic(&output);
+            assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+            assert!(
+                diagnostic.contains("file-mode Basic-auth credentials"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("`password_hash`"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("consumer IDs: <redacted scalar>"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains(token), "{diagnostic}");
+            assert!(!diagnostic.contains("synthetic-password"), "{diagnostic}");
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_backup_validation_sanitizes_early_emissions() {
+    let directory = TempDir::new().unwrap();
+    let refused = crate::scaffolding::ports::reserve_refused_tcp_port().unwrap();
+    let path = directory.path().join("backup.json");
+    let token = "UNREGISTERED_UPSTREAM_5589";
+    let document = serde_json::json!({
+        "version": "1", "plugin_configs": [], "proxies": [{
+            "id": "fixture", "listen_path": "/", "backend_scheme": "http",
+            "backend_host": "localhost", "backend_port": 8080, "upstream_id": token
+        }]
+    });
+    std::fs::write(&path, document.to_string()).unwrap();
+    for subcommand in ["run", "validate"] {
+        let mut command = installed_cli_command(&directory, &[subcommand, "-m", "database"]);
+        command
+            .env("FERRUM_DB_TYPE", "postgres")
+            .env(
+                "FERRUM_DB_URL",
+                format!("postgres://fixture@127.0.0.1:{}/fixture", refused.port),
+            )
+            .env("FERRUM_DB_CONFIG_BACKUP_PATH", &path)
+            .env("FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS", "1")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "1")
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-for-backup-test-5589",
+            )
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", "0");
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+        assert!(
+            diagnostic.contains("Config backup rejected"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("references non-existent upstream"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains(token), "{diagnostic}");
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_cp_startup_withholds_apostrophe_leading_trust_kid() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("'UNREGISTERED_TRUST_PATH_5591.json");
+    let document = serde_json::json!({"version": 1, "keys": [{
+        "kid": "'UNREGISTERED_TRUST_KID_5591", "algorithm": "bogus",
+        "secret": "synthetic-trust-secret-at-least-32-characters", "namespaces": ["ferrum"]
+    }]});
+    std::fs::write(&path, document.to_string()).unwrap();
+    // A file keeps every connection in the CP pool on the same schema.
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("control-plane.db").display()
+    );
+    let mut command = installed_cli_command(&directory, &["run", "-m", "cp"]);
+    command
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", &db_url)
+        .env("FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH", &path)
+        .env("FERRUM_CP_GRPC_LISTEN_ADDR", "127.0.0.1:0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "synthetic-admin-secret-at-least-32-characters",
+        );
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(diagnostic.contains("unsupported algorithm"), "{diagnostic}");
+    for token in [
+        "UNREGISTERED_TRUST_KID_5591",
+        "UNREGISTERED_TRUST_PATH_5591",
+        "synthetic-trust-secret-at-least-32-characters",
+    ] {
+        assert!(!diagnostic.contains(token), "{diagnostic}");
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_sql_row_rejection_withholds_every_resource_id() {
+    use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+
+    let directory = TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("rows.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let token = "UNREGISTERED_ROW_5591";
+    let proxy = serde_json::from_value(serde_json::json!({
+        "id": token, "listen_path": "/", "backend_scheme": "http",
+        "backend_host": "localhost", "backend_port": 8080
+    }))
+    .unwrap();
+    store.create_proxy(&proxy).await.unwrap();
+    sqlx::query("UPDATE proxies SET hosts = ? WHERE id = ?")
+        .bind("[7]")
+        .bind(token)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    let mut command = installed_cli_command(&directory, &["run", "-m", "database"]);
+    command
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", &db_url)
+        .env("FERRUM_PROXY_HTTP_PORT", "0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "synthetic-admin-secret-at-least-32-characters",
+        );
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(
+        diagnostic.contains("SQL row decode rejected"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("failed to parse hosts JSON"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains(token), "{diagnostic}");
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_stream_port_rejection_sanitizes_early_emissions() {
+    use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+
+    for mode in ["file", "database"] {
+        let directory = TempDir::new().unwrap();
+        // Hold the reservation: rejection must precede any listener bind.
+        let reservation = reserve_port().await.unwrap();
+        let port = reservation.port;
+        let token = "UNREGISTERED_PROXY5591";
+        let proxy = serde_json::json!({
+            "id": token, "listen_port": port, "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1", "backend_port": 8080
+        });
+        let mut command = installed_cli_command(&directory, &["run", "-m", mode]);
+        command
+            .env("FERRUM_PROXY_HTTP_PORT", port.to_string())
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_LOG_LEVEL", "warn")
+            .env(
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-at-least-32-characters",
+            );
+        if mode == "file" {
+            let path = directory.path().join("UNREGISTERED_STREAM_PATH_5591.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "version": "1", "proxies": [proxy], "plugin_configs": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+            command.env("FERRUM_FILE_CONFIG_PATH", path);
+        } else {
+            let db_url = format!(
+                "sqlite:{}?mode=rwc",
+                directory.path().join("stream.db").display()
+            );
+            let store =
+                DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                    .await
+                    .unwrap();
+            store
+                .create_proxy(&serde_json::from_value(proxy).unwrap())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE proxies SET created_at = ? WHERE id = ?")
+                .bind("UNREGISTERED_TIMESTAMP_5591")
+                .bind(token)
+                .execute(&store.pool())
+                .await
+                .unwrap();
+            store.pool().close().await;
+            command
+                .env("FERRUM_DB_TYPE", "sqlite")
+                .env("FERRUM_DB_URL", db_url);
+        }
+        let output = cli_contract_output(command).await;
+        let diagnostic = cli_contract_diagnostic(&output);
+        assert_eq!(output.status.code(), Some(1), "{mode}: {diagnostic}");
+        assert!(
+            diagnostic.contains("conflicts with a gateway reserved port"),
+            "{mode}: {diagnostic}"
+        );
+        assert!(!diagnostic.contains(token), "{mode}: {diagnostic}");
+        for withheld in [
+            "UNREGISTERED_STREAM_PATH_5591",
+            "UNREGISTERED_TIMESTAMP_5591",
+        ] {
+            assert!(!diagnostic.contains(withheld), "{mode}: {diagnostic}");
+        }
+        if mode == "database" {
+            assert!(
+                diagnostic.contains("Could not parse datetime column"),
+                "{diagnostic}"
+            );
+        }
+        assert!(
+            diagnostic.contains("`listen_port` <redacted scalar>"),
+            "{mode}: {diagnostic}"
+        );
+    }
 }

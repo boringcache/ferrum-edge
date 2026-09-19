@@ -177,7 +177,7 @@ fn test_invalid_inner_schema_unknown_field_rejected() {
     // The compile error is prefixed with the schema entry label.
     assert!(err.contains("[bad]"), "got: {err}");
     assert!(
-        err.contains("unknown field 'not_a_real_field'"),
+        err.contains("unknown field \"not_a_real_field\""),
         "got: {err}"
     );
 }

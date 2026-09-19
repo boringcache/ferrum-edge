@@ -20,6 +20,7 @@
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
+#   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
@@ -81,9 +82,11 @@ H1_TRACE=none
 H1_TRACE_BUILDS=""
 h1_trace_pid=""
 h1_trace_output=""
+H2_GUARD_OBSERVE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --experiment-manifest) EXPERIMENT_MANIFEST="$2"; shift 2 ;;
         --gateways) GATEWAYS="$2"; shift 2 ;;
         --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
@@ -380,6 +383,7 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    local response_cutoff=0
     case "$PROTOCOL" in
         http3)
             extra_env+=(
@@ -400,7 +404,7 @@ start_ferrum() {
                     -e FERRUM_ADMIN_HTTP_PORT=9000
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
         if [ "$gw" = ferrum-exp-cutoff-one ]; then
-            extra_env+=(-e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1)
+            response_cutoff=1
         fi
     fi
     GATEWAY_CID=$(docker run -d --rm --network host \
@@ -420,7 +424,7 @@ start_ferrum() {
         -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0" \
-        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0" \
+        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=$response_cutoff" \
         -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
@@ -451,7 +455,8 @@ start_ferrum() {
         cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
-                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
+                "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
     fi
     if [ "$H1_TRACE" != none ]; then
         python3 - "$h1_trace_output/bind.json" "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
@@ -939,7 +944,8 @@ run_bench() {
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
     if [ -n "$H1_PROFILE" ] && [ "$H1_PROFILE" != diagnostic ] && [ "$target" = gateway ]; then
-        sampler_args+=(--h1-profile)
+        sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
+                      --h1-container-id "$GATEWAY_CID")
     fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
         sampler_args+=(--h2-gauges)
@@ -1054,6 +1060,10 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
             "$diagnostics/${gateway}_${payload}_backend.log"
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_observation.py" "$out" "$usage" \
+            "$diagnostics/${gateway}_${payload}.log"
+    fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
@@ -1115,6 +1125,12 @@ main() {
                 "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
             if [ -n "$campaign" ]; then
                 H2_OBSERVE=1
+                H2_GUARD_OBSERVE=$(python3 "$SCRIPT_DIR/experiment_arms.py" guard \
+                    "$EXPERIMENT_MANIFEST" "$PROTOCOL")
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && { [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; }; then
+                    echo "[experiment] guard observation is hosted-only" >&2
+                    exit 2
+                fi
                 PAIRS="${campaign%% *}"
                 PAYLOAD_SIZES="${campaign#* }"
                 if [ "$PROCESS_USAGE" != true ]; then
@@ -1132,7 +1148,11 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" <<'PYEOF'
+    local h1_revision=""
+    if [ -n "$H1_PROFILE" ]; then
+        h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
+    fi
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1140,6 +1160,10 @@ with open(sys.argv[1], "w") as manifest:
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
                "h2_observation_enabled": sys.argv[6] == "1",
                **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
+               **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
+                   "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
+                   "h1_revision": sys.argv[11]}
+                  if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -1156,6 +1180,14 @@ PYEOF
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
     if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            local source_identity
+            source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
+            if [ "$source_identity" != "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16" ]; then
+                echo "[experiment] image is not the pinned guard diagnostic build" >&2
+                exit 2
+            fi
+        fi
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
         if [ -n "$BASELINE_IMAGE" ]; then

@@ -4472,7 +4472,7 @@ fn test_charges_schema_rejects_unrepresentable_shapes() {
         ),
         (
             json!({ "omit": ["latency_total_ms"] }),
-            "schema omit references unknown field 'latency_total_ms'",
+            "schema omit references unknown field \"latency_total_ms\"",
         ),
         (
             json!({ "static_fields": { "api_secret": "x" } }),

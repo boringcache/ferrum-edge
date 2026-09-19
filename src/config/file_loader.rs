@@ -48,6 +48,7 @@ use crate::config::validation_pipeline::{
     ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
 };
 use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
+use crate::util::deserialization as config_decode;
 use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
@@ -86,7 +87,7 @@ fn take_resource_counts_from_json(
     let Some(raw) = object.remove("resource_counts") else {
         return Ok(None);
     };
-    serde_json::from_value(raw)
+    config_decode::from_json_value(raw)
         .map(Some)
         .map_err(|error| anyhow::anyhow!("invalid resource_counts: {error}"))
 }
@@ -111,8 +112,9 @@ fn validate_resource_counts(
         return Ok(());
     }
     anyhow::bail!(
-        "resource_counts mismatch: declared proxies={}, consumers={}, plugin_configs={}, \
-         upstreams={} but file contains proxies={}, consumers={}, plugin_configs={}, \
+        "resource_counts mismatch: declared proxies=\"{}\", consumers=\"{}\", \
+         plugin_configs=\"{}\", \
+         upstreams=\"{}\" but file contains proxies={}, consumers={}, plugin_configs={}, \
          upstreams={}. A torn or truncated trailing section (commonly plugin_configs) \
          can parse as valid YAML while silently dropping resources; refuse the candidate.",
         expected.proxies,
@@ -140,7 +142,7 @@ pub fn load_config_from_file(
 ) -> Result<GatewayConfig, anyhow::Error> {
     let file_path = Path::new(path);
     if !file_path.exists() {
-        anyhow::bail!("Configuration file not found: {}", file_path.display());
+        anyhow::bail!("Configuration file not found: {:?}", file_path.display());
     }
 
     // Warn if the config file is world-readable (may contain credentials)
@@ -152,7 +154,7 @@ pub fn load_config_from_file(
             if mode & 0o004 != 0 {
                 warn!(
                     "Config file {} is world-readable (mode {:o}). Consider restricting permissions as it may contain credentials.",
-                    file_path.display(),
+                    crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[]),
                     mode & 0o777
                 );
             }
@@ -165,9 +167,15 @@ pub fn load_config_from_file(
     let is_yaml = detect_json_or_yaml_extension(file_path);
 
     if is_yaml {
-        info!("Loading YAML configuration from {}", file_path.display());
+        info!(
+            "Loading YAML configuration from {}",
+            crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[])
+        );
     } else {
-        info!("Loading JSON configuration from {}", file_path.display());
+        info!(
+            "Loading JSON configuration from {}",
+            crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[])
+        );
     }
 
     // For version detection and migration, parse to serde_json::Value. Retain
@@ -176,10 +184,10 @@ pub fn load_config_from_file(
     // YAML-specific tags.
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
         admit_yaml_alias_expansion(&content)?;
-        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(&content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
-        (serde_json::from_str(&content)?, None)
+        (config_decode::from_json_str(&content)?, None)
     };
     // The parsed trees own every retained value; release the bounded source
     // buffer before migration/validation allocates any additional structures.
@@ -203,7 +211,7 @@ pub fn load_config_from_file(
     // migration value and, for YAML, in the retained YAML tree before
     // `GatewayConfig` deserialization (which expects `version: String`).
     let file_version = match value.get_mut("version") {
-        None => anyhow::bail!("Configuration file missing required 'version' field"),
+        None => anyhow::bail!("Configuration file missing required `version` field"),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => {
             if let Some(n) = other.as_u64() {
@@ -227,7 +235,7 @@ pub fn load_config_from_file(
                     serde_json::Value::String(_) => "string",
                 };
                 anyhow::bail!(
-                    "field 'version' must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
+                    "field `version` must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
                 );
             }
         }
@@ -235,8 +243,9 @@ pub fn load_config_from_file(
 
     if file_version != CURRENT_CONFIG_VERSION {
         warn!(
-            "Config file is at version {}, current is {}. Migrating in memory.",
-            file_version, CURRENT_CONFIG_VERSION
+            "Config file has a non-current `version` (<redacted scalar>), current is {}. \
+             Migrating in memory.",
+            CURRENT_CONFIG_VERSION
         );
         ConfigMigrator::migrate_in_memory(&mut value)?;
     }
@@ -247,11 +256,11 @@ pub fn load_config_from_file(
     // optional resource_counts strip above. Migrations still operate on
     // serde_json::Value, which remains authoritative for older versions.
     let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        serde_yaml::from_value(yaml_value.ok_or_else(|| {
+        config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
             anyhow::anyhow!("internal error: parsed YAML value was not retained")
         })?)?
     } else {
-        serde_json::from_value(value)?
+        config_decode::from_json_value(value)?
     };
 
     if let Some(ref expected) = resource_counts {
@@ -285,7 +294,7 @@ pub fn load_config_from_file(
         ))
         .run()?;
 
-    let plaintext_basic_auth_consumers: Vec<&str> = config
+    let plaintext_basic_auth_consumers: Vec<String> = config
         .consumers
         .iter()
         .filter(|consumer| {
@@ -295,12 +304,12 @@ pub fn load_config_from_file(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
         })
-        .map(|consumer| consumer.id.as_str())
+        .map(|consumer| format!("{:?}", consumer.id))
         .collect();
     if !plaintext_basic_auth_consumers.is_empty() {
         anyhow::bail!(
             "Configuration validation failed: file-mode Basic-auth credentials must use \
-             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             `password_hash`; plaintext `password` is accepted only by Admin API writes \
              (consumer IDs: {})",
             plaintext_basic_auth_consumers.join(", ")
         );
@@ -390,8 +399,14 @@ pub fn load_config_from_file(
         - config.upstreams.len();
     if filtered_out > 0 {
         info!(
-            "Namespace filter '{}': excluded {} resources from other namespaces",
-            namespace, filtered_out
+            "{}",
+            crate::startup::sanitize_startup_cause(
+                format!(
+                    "Namespace filter {:?}: excluded {} resources from other namespaces",
+                    namespace, filtered_out
+                ),
+                &[]
+            )
         );
     }
 
@@ -451,11 +466,17 @@ pub fn load_config_from_file(
         .run()?;
 
     info!(
-        "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
-        config.version,
-        config.proxies.len(),
-        config.consumers.len(),
-        config.plugin_configs.len()
+        "{}",
+        crate::startup::sanitize_startup_cause(
+            format!(
+                "Configuration loaded (version {:?}): {} proxies, {} consumers, {} plugin configs",
+                config.version,
+                config.proxies.len(),
+                config.consumers.len(),
+                config.plugin_configs.len()
+            ),
+            &[]
+        )
     );
 
     Ok(config)
@@ -478,24 +499,24 @@ pub fn decode_and_validate_config_document(
     }
 
     // Admit YAML alias expansion before the detection parse. The detector uses
-    // `serde_yaml::from_str`, which would otherwise materialize aliases first.
+    // `config_decode::from_yaml_str`, which would otherwise materialize aliases first.
     admit_yaml_alias_expansion(content)?;
 
-    let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
+    let is_yaml = config_decode::from_yaml_str::<serde_yaml::Value>(content).is_ok()
         && !content.trim_start().starts_with('{');
 
     let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
-        let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
+        let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
-        (serde_json::from_str(content)?, None)
+        (config_decode::from_json_str(content)?, None)
     };
 
     let resource_counts = take_resource_counts_from_json(&mut value)?;
     strip_resource_counts_from_yaml(&mut yaml_value);
 
     let file_version = match value.get_mut("version") {
-        None => anyhow::bail!("Configuration file missing required 'version' field"),
+        None => anyhow::bail!("Configuration file missing required `version` field"),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => {
             if let Some(n) = other.as_u64() {
@@ -519,7 +540,7 @@ pub fn decode_and_validate_config_document(
                     serde_json::Value::String(_) => "string",
                 };
                 anyhow::bail!(
-                    "field 'version' must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
+                    "field `version` must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
                 );
             }
         }
@@ -530,11 +551,11 @@ pub fn decode_and_validate_config_document(
     }
 
     let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        serde_yaml::from_value(yaml_value.ok_or_else(|| {
+        config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
             anyhow::anyhow!("internal error: parsed YAML value was not retained")
         })?)?
     } else {
-        serde_json::from_value(value)?
+        config_decode::from_json_value(value)?
     };
 
     if let Some(ref expected) = resource_counts {
@@ -568,7 +589,7 @@ pub fn decode_and_validate_config_document(
         ))
         .run()?;
 
-    let plaintext_basic_auth_consumers: Vec<&str> = config
+    let plaintext_basic_auth_consumers: Vec<String> = config
         .consumers
         .iter()
         .filter(|consumer| {
@@ -578,12 +599,12 @@ pub fn decode_and_validate_config_document(
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
         })
-        .map(|consumer| consumer.id.as_str())
+        .map(|consumer| format!("{:?}", consumer.id))
         .collect();
     if !plaintext_basic_auth_consumers.is_empty() {
         anyhow::bail!(
             "Configuration validation failed: file-mode Basic-auth credentials must use \
-             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             `password_hash`; plaintext `password` is accepted only by Admin API writes \
              (consumer IDs: {})",
             plaintext_basic_auth_consumers.join(", ")
         );
@@ -665,7 +686,10 @@ pub fn reload_config_from_file(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
     namespace: &str,
 ) -> Result<GatewayConfig, anyhow::Error> {
-    info!("Reloading configuration from file: {}", path);
+    info!(
+        "Reloading configuration from file: {}",
+        crate::startup::sanitize_startup_cause(format!("{path:?}"), &[])
+    );
     load_config_from_file(path, cert_expiry_warning_days, backend_allow_ips, namespace)
 }
 

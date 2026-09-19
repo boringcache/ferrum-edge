@@ -103,6 +103,7 @@ mod unit {
         mod udp_endpoint_tests;
         mod udp_logging_tests;
         mod udp_rate_limiting_tests;
+        mod validation_diagnostics_tests;
         mod validator_diagnostic_redaction_tests;
         mod waf_body_charset_parity_tests;
         mod waf_tests;

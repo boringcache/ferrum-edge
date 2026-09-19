@@ -131,7 +131,7 @@ Validation passed.
 
 The report lines are sorted by base variable name. Candidate sources are discovered by iterating the environment into a hash map, so without an explicit sort two runs on identical input could list them in different orders; sorting keeps `validate` output diffable between machines and CI runs.
 
-Failures are held to the same disclosure rule as the success report. A failed fetch names the base variable, the provider, and the failure reason — an absent `_FILE` source reports `Failed to read FERRUM_X_FILE: credential path not found` — but never the source reference itself, even when a provider SDK echoes the resource it was asked for. A one- or two-byte source reference cannot be removed selectively without corrupting arbitrary words, so if it appears in provider-controlled detail that detail is replaced by a fixed key-level failure instead of being echoed. Once external values are materialized into the environment they are also withheld from *subsequent* settings and spec diagnostics: a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer` rather than printing the fetched secret. Variables that were not resolved from an external source are unaffected and still show their value, which is usually the fastest way to spot a typo.
+Failures are held to the same disclosure rule as the success report. A failed fetch names the base variable, the provider, and the failure reason — an absent `_FILE` source reports `Failed to read FERRUM_X_FILE: credential path not found` — but never the source reference itself, even when a provider SDK echoes the resource it was asked for. A one- or two-byte source reference cannot be removed selectively without corrupting arbitrary words, so if it appears in provider-controlled detail that detail is replaced by a fixed key-level failure instead of being echoed. Once external values are materialized into the environment they are also withheld from *subsequent* settings and spec diagnostics: a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer` rather than printing the fetched secret. Normal validation-report facts may still show directly configured values. Rejection and startup diagnostics instead withhold supplied scalar values regardless of whether they came from an external secret source, while retaining field names, failure reasons, allowed bounds, and recovery guidance.
 
 The same rule holds for diagnostics that are *not* failures. A warning raised while settings are parsed — `FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '...'`, say — is emitted directly to the log sink and never passes through the command's exit status, so it is filtered at the point every record is serialized rather than only on the error path. Values are matched in the forms a validator can actually print them in, not just verbatim: trimmed, per-entry for comma-separated lists, case-normalized, and JSON-escaped. A run whose only externally resolved variable is a valid one therefore still succeeds, prints `External secrets: OK`, and shows `<redacted: value from external secret source>` in place of the value in any warning about it.
 
@@ -272,6 +272,68 @@ Spec (/etc/ferrum/resources.yaml): OK
   Plugin configs: 0
 Error: Startup security validation failed: Invalid TLS configuration: ...
 ```
+
+Startup and validation failures include the full cause chain, from the outer
+operation to the underlying failure. Configuration deserialization withholds
+offending document scalars (including unregistered inline PEM and tokens) before
+retaining the error. Serde families are sanitized structurally: the path is kept
+separate and only the bare inner diagnostic's exact leading family is classified.
+Diagnostics keep field paths, available line/column positions, expected types,
+and missing/unknown/duplicate field names. Paths and unknown-field messages echo
+document **keys**; they are diagnostic context, not confidential value storage.
+The second layer is render-time withholding: **each original cause** in both
+`run` and `validate` first passes through the configured-URL and registered-secret
+scrubbers, then the custom quoted-span sanitizer, before the causes are joined.
+If credential scrubbing changes quote or escape syntax, that cause is withheld
+in full as `<redacted diagnostic>` so removing a secret delimiter cannot expose
+another value. Every double- or single-quoted span is withheld, through the end
+of that cause if unterminated; backticks remain. An unmatched quote cannot consume
+the next cause's field path or reason. Backup, validation-pipeline, SQL/Mongo rejection
+and unknown-plugin log records use the same sanitizer before emission.
+Validators must use backticks for schema names and Debug-escaped double quotes
+(`{value:?}` for strings) for document values, or omit the values. A validator
+following this convention is safe by construction
+at rendering; interpolating a document scalar bare is a defect, not an exception
+to the convention. Parser errors use custom sanitization; the exact bare YAML
+`duplicate entry with key` family preserves its key as a backticked duplicate
+field, without classifying path-prefixed text.
+For withheld CIDRs, use the field path to locate the value; the reason and allowed
+prefix-length bounds remain visible, while the supplied prefix is withheld.
+Capture settings and annotation overrides follow the same convention: boolean,
+port, mark, UID, and CIDR rejections retain their field and allowed bounds without
+echoing the supplied value. Capture warnings use sanitized causes before emission.
+Localized mesh, stock-xDS, gateway migration, and backup
+version rejections withhold the supplied `version` and retain the supported
+version and reason, including migration warnings. Database-mode `validate`
+checks a configured JSON backup through the same loader without a database dial.
+The semantic audit converted mesh service IPs, resource names, hosts, target
+references, CIDRs, ext-authz/JWT-header diagnostics, gateway host/reference
+diagnostics, plugin provider/schema/tag names and numeric bounds. Audited plugin type
+rejections Debug-escape the complete JSON rendering, including numbers, arrays
+and objects, so embedded values cannot escape through another shape. CORS and
+sibling regex validators omit library errors that reproduce patterns; OpenAPI
+and AI tool JSON Schema admission also uses fixed rejection reasons. The owning
+field/index and the fixed rejection reason remain visible.
+Generic object visitors enforce shape; their document/value adapters own error
+sanitization. YAML preserves native admission and original error positions, then
+replays failed typed deserialization through a value tree to separate the error
+from its path. In-memory trees have no original source position to recover.
+The final rendering also redacts credentials in exact configured
+primary/replica/failover database URLs and registered resolved external-secret
+values and their bounded derived forms.
+The URL inventory reads raw settings only: it never fetches database TLS sources
+or materializes temporary PEM files. Owning loaders must sanitize TLS-augmented
+or differently normalized URLs, password-only fragments, provider references,
+and arbitrary provider/driver/custom-validation payloads; the final renderer is
+not a general secret detector.
+
+For example, `run -m mesh` with a localized mesh file missing a workload
+selector reports the file-loading context followed by
+`invalid mesh configuration document: mesh.workloads[0]`, the missing `selector`
+field, and `at line 3 column 7`.
+`validate -m mesh` reports the same field and position under its validation
+context. The diagnostic includes neither the configuration document nor a
+backtrace; `-v` is not required to see the causes and still selects log verbosity.
 
 ## reload
 

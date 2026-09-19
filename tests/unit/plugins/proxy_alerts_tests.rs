@@ -79,7 +79,7 @@ fn rejects_non_object_config() {
 #[test]
 fn rejects_missing_channels() {
     let err = ProxyAlerts::new(&json!({ "rules": [] }), http_client()).unwrap_err();
-    assert!(err.contains("'channels' is required"), "got: {err}");
+    assert!(err.contains("`channels` is required"), "got: {err}");
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn rejects_window_seconds_out_of_range() {
     let mut cfg = minimal_config();
     cfg["rules"][0]["window_seconds"] = json!(2);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("'window_seconds' must be"), "got: {err}");
+    assert!(err.contains("`window_seconds` must be"), "got: {err}");
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn rejects_threshold_percent_out_of_range() {
     let mut cfg = minimal_config();
     cfg["rules"][0]["threshold_percent"] = json!(150.0);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("'threshold_percent' must be"), "got: {err}");
+    assert!(err.contains("`threshold_percent` must be"), "got: {err}");
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn rejects_zero_threshold_percent() {
     cfg["rules"][0]["threshold_percent"] = json!(0.0);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
     assert!(
-        err.contains("'threshold_percent' must be in (0.0, 100.0]"),
+        err.contains("`threshold_percent` must be in (0.0, 100.0]"),
         "got: {err}"
     );
 }
@@ -262,7 +262,7 @@ fn rejects_latency_threshold_above_histogram_range() {
         ]
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("'threshold_ms' must be <="), "got: {err}");
+    assert!(err.contains("`threshold_ms` must be <="), "got: {err}");
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn rejects_invalid_quiet_hours_time() {
     let mut cfg = minimal_config();
     cfg["quiet_hours_utc"] = json!([{ "from": "25:00", "to": "06:00" }]);
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("hour 25"), "got: {err}");
+    assert!(err.contains("hour \"25\""), "got: {err}");
 }
 
 #[test]
@@ -612,7 +612,7 @@ fn rejects_unknown_rule_type_with_variant_fields_reports_type() {
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
     assert!(
-        err.contains("unknown type 'error_ratee'"),
+        err.contains("unknown type \"error_ratee\""),
         "unknown discriminator must be the primary error: {err}"
     );
     assert!(
@@ -632,7 +632,7 @@ fn rejects_typo_required_name_and_type_keys_with_suggestions() {
                 "threshold_percent": 5.0,
                 "channels": ["ops"]
             }),
-            "did you mean 'name' instead of 'namee'",
+            "did you mean `name` instead of \"namee\"",
         ),
         (
             json!({
@@ -642,7 +642,7 @@ fn rejects_typo_required_name_and_type_keys_with_suggestions() {
                 "threshold_percent": 5.0,
                 "channels": ["ops"]
             }),
-            "did you mean 'type' instead of 'typee'",
+            "did you mean `type` instead of \"typee\"",
         ),
     ] {
         let err = ProxyAlerts::new(
@@ -714,7 +714,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'enabled' must be a boolean",
+            "`enabled` must be a boolean",
         ),
         (
             json!({
@@ -733,7 +733,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'enabled' must be a boolean",
+            "`enabled` must be a boolean",
         ),
         (
             json!({
@@ -771,7 +771,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'max_concurrent_dispatches' must be an unsigned integer",
+            "`max_concurrent_dispatches` must be an unsigned integer",
         ),
         (
             json!({
@@ -790,7 +790,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'max_concurrent_dispatches' must be an unsigned integer",
+            "`max_concurrent_dispatches` must be an unsigned integer",
         ),
         (
             json!({
@@ -866,7 +866,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'min_request_count' must be an unsigned integer",
+            "`min_request_count` must be an unsigned integer",
         ),
         (
             json!({
@@ -886,7 +886,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
                     "channels": ["ops"]
                 }]
             }),
-            "'min_request_count' must be an unsigned integer",
+            "`min_request_count` must be an unsigned integer",
         ),
     ] {
         let err = ProxyAlerts::new(&config, http_client())
@@ -901,12 +901,12 @@ fn rejects_invalid_top_level_defaults_even_when_rules_override_them() {
         (
             "default_cooldown_seconds",
             json!(0),
-            "'default_cooldown_seconds' must be in [1, 86400]",
+            "`default_cooldown_seconds` must be in [1, 86400]",
         ),
         (
             "default_cooldown_seconds",
             json!(86_401),
-            "'default_cooldown_seconds' must be in [1, 86400]",
+            "`default_cooldown_seconds` must be in [1, 86400]",
         ),
         (
             "default_min_request_count",
@@ -916,22 +916,22 @@ fn rejects_invalid_top_level_defaults_even_when_rules_override_them() {
         (
             "default_window_seconds",
             json!(4),
-            "'default_window_seconds' must be in [5, 3600]",
+            "`default_window_seconds` must be in [5, 3600]",
         ),
         (
             "default_window_seconds",
             json!(3_601),
-            "'default_window_seconds' must be in [5, 3600]",
+            "`default_window_seconds` must be in [5, 3600]",
         ),
         (
             "default_resolved_window_seconds",
             json!(4),
-            "'default_resolved_window_seconds' must be in [5, 86400]",
+            "`default_resolved_window_seconds` must be in [5, 86400]",
         ),
         (
             "default_resolved_window_seconds",
             json!(86_401),
-            "'default_resolved_window_seconds' must be in [5, 86400]",
+            "`default_resolved_window_seconds` must be in [5, 86400]",
         ),
     ] {
         let mut config = minimal_config();
@@ -968,7 +968,7 @@ fn shared_validator_rejects_malformed_optional_proxy_alerts_values() {
     )
     .expect_err("shared validation must reject malformed enabled");
     assert!(
-        err.contains("'enabled' must be a boolean"),
+        err.contains("`enabled` must be a boolean"),
         "shared validator path missing: {err}"
     );
 }
@@ -2350,7 +2350,7 @@ fn rejects_unknown_grpc_status_selector_string() {
         }]
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("unknown 'grpc_statuses' entry"), "got: {err}");
+    assert!(err.contains("unknown `grpc_statuses` entry"), "got: {err}");
 }
 
 #[test]
@@ -2368,7 +2368,7 @@ fn rejects_lowercase_other_grpc_status_selector_to_match_openapi() {
         }]
     });
     let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
-    assert!(err.contains("unknown 'grpc_statuses' entry"), "got: {err}");
+    assert!(err.contains("unknown `grpc_statuses` entry"), "got: {err}");
 }
 
 #[test]

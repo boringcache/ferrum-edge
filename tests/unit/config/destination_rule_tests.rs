@@ -439,7 +439,7 @@ fn passive_health_check_validates_ejection_percent_over_100() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("max_ejection_percent must be between")),
+            .any(|e| e.contains("`passive.max_ejection_percent` must be between 0 and 100")),
         "Expected max_ejection_percent validation error, got: {:?}",
         errors
     );
@@ -614,9 +614,9 @@ fn gateway_config_validates_proxy_subset_reference() {
 
     let errors = config.validate_upstream_references().unwrap_err();
     assert!(
-        errors
-            .iter()
-            .any(|e| { e.contains("upstream_subset 'missing'") && e.contains("upstream_id 'u1'") }),
+        errors.iter().any(|e| {
+            e.contains("upstream_subset \"missing\"") && e.contains("upstream_id \"u1\"")
+        }),
         "Expected missing subset reference error, got: {:?}",
         errors
     );

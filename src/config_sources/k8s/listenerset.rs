@@ -206,7 +206,8 @@ fn collect_one_listenerset(
             .filter(|name| !name.is_empty() && gateway_api_section_name_is_valid(name))
         else {
             acc.warnings.push(format!(
-                "Gateway API ListenerSet {}/{} listener rejected: spec.listeners[].name is required and must be a valid SectionName",
+                "Gateway API ListenerSet {:?}/{:?} listener rejected: spec.listeners[].name is \
+                 required and must be a valid SectionName",
                 object.metadata.namespace, object.metadata.name
             ));
             continue;
@@ -219,7 +220,7 @@ fn collect_one_listenerset(
             },
             Err(error) => {
                 acc.warnings.push(format!(
-                    "Gateway API ListenerSet {}/{} listener {} rejected: {}",
+                    "Gateway API ListenerSet {:?}/{:?} listener {:?} rejected: {}",
                     object.metadata.namespace, object.metadata.name, listener_name, error
                 ));
                 (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
@@ -227,7 +228,8 @@ fn collect_one_listenerset(
         };
         if !listener_protocol_mode_is_supported(listener) {
             acc.warnings.push(format!(
-                "Gateway API ListenerSet {}/{} listener {} rejected: spec.listeners[].tls.mode must be Passthrough for protocol TLS",
+                "Gateway API ListenerSet {:?}/{:?} listener {:?} rejected: \
+                 spec.listeners[].tls.mode must be Passthrough for protocol TLS",
                 object.metadata.namespace, object.metadata.name, listener_name
             ));
         }
@@ -445,7 +447,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             policy.routes_materializable = false;
         }
         acc.warnings.push(format!(
-            "Gateway API {} {}/{} listener {} rejected: {reason}",
+            "Gateway API {} {:?}/{:?} listener {:?} rejected: {reason}",
             key.parent_kind.as_str(),
             key.namespace,
             key.gateway,
@@ -464,7 +466,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                 // Deterministic bounded wording: numeric port + families only.
                 // Never echo object/listener/hostname names (cross-tenant risk).
                 format!(
-                    "Port {port} is claimed by incompatible protocol families on the same TCP \
+                    "Port \"{port}\" is claimed by incompatible protocol families on the same TCP \
                      transport (HTTP-family vs raw stream), so every conflicting claim on this \
                      port is refused (Conflicted)."
                 )
@@ -533,7 +535,8 @@ pub(crate) fn materialize_listenerset_mesh_services(
             && !listener_is_materializable(acc, object, listener)
         {
             acc.warnings.push(format!(
-                "Gateway API ListenerSet {}/{} listener {} has unresolved TLS material and will not be exposed",
+                "Gateway API ListenerSet {:?}/{:?} listener {:?} has unresolved TLS material and \
+                 will not be exposed",
                 object.metadata.namespace, object.metadata.name, listener_name
             ));
             continue;

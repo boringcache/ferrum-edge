@@ -1031,6 +1031,35 @@ fn stream_proxy(id: &str, scheme: BackendScheme, frontend_tls: bool) -> Proxy {
 }
 
 #[test]
+fn mtls_auth_compatibility_escapes_document_ids() {
+    let proxy_id = "unregistered'proxy\"\\tail";
+    let plugin_id = "unregistered'plugin\"\\tail";
+    let config = GatewayConfig {
+        proxies: vec![stream_proxy(proxy_id, BackendScheme::Tcp, false)],
+        plugin_configs: vec![mtls_plugin(
+            plugin_id,
+            PluginScope::Global,
+            None,
+            serde_json::json!({}),
+        )],
+        ..empty_config()
+    };
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    let error = &errors[0];
+    assert!(error.contains(&format!("Proxy {proxy_id:?}")), "{error}");
+    assert!(
+        error.contains(&format!("PluginConfig {plugin_id:?}")),
+        "{error}"
+    );
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error.clone()), &[]);
+    assert!(rendered.contains("`mtls_auth`"), "{rendered}");
+    assert!(rendered.contains("`frontend_tls=true`"), "{rendered}");
+    assert!(rendered.contains("`passthrough=false`"), "{rendered}");
+    assert!(!rendered.contains("unregistered"), "{rendered}");
+}
+
+#[test]
 fn mtls_auth_compatibility_rejects_plaintext_and_passthrough_streams() {
     let plaintext = stream_proxy("plain", BackendScheme::Tcp, false);
     let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, false);
@@ -1048,7 +1077,7 @@ fn mtls_auth_compatibility_rejects_plaintext_and_passthrough_streams() {
 
     let errors = config.validate_mtls_auth_compatibility().unwrap_err();
     assert_eq!(errors.len(), 2);
-    assert!(errors.iter().any(|error| error.contains("Proxy 'plain'")));
+    assert!(errors.iter().any(|error| error.contains("Proxy \"plain\"")));
     assert!(
         errors
             .iter()
@@ -1203,7 +1232,7 @@ fn global_mtls_auth_is_screened_across_namespaces() {
 
     let errors = config.validate_mtls_auth_compatibility().unwrap_err();
     assert!(
-        errors.iter().any(|error| error.contains("Proxy 'plain'")),
+        errors.iter().any(|error| error.contains("Proxy \"plain\"")),
         "a cross-namespace global plugin still applies at runtime and must be screened: {errors:?}"
     );
 }
@@ -1732,7 +1761,7 @@ fn test_quarantine_hmac_strips_weak_secret_and_keeps_strong() {
 
     let messages = config.quarantine_invalid_hmac_credentials();
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(messages[0].contains("consumer \"c1\""));
     assert!(!messages[0].contains(weak));
     assert!(!config.consumers[0].has_credential("hmac_auth"));
     assert!(config.consumers[1].has_credential("hmac_auth"));
@@ -1804,8 +1833,8 @@ fn test_quarantine_hmac_duplicate_secret_first_loaded_consumer_wins() {
 
     let messages = config.quarantine_invalid_hmac_credentials();
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("consumer 'c2'"));
-    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(messages[0].contains("consumer \"c2\""));
+    assert!(messages[0].contains("consumer \"c1\""));
     assert!(!messages[0].contains(secret));
     assert!(config.consumers[0].has_credential("hmac_auth"));
     assert!(!config.consumers[1].has_credential("hmac_auth"));
@@ -2585,8 +2614,8 @@ fn test_quarantine_colliding_consumers_keeps_first_loaded() {
     let messages = config.quarantine_colliding_consumer_identities();
 
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("Quarantined consumer 'c2'"));
-    assert!(messages[0].contains("custom_id 'alice'"));
+    assert!(messages[0].contains("Quarantined consumer \"c2\""));
+    assert!(messages[0].contains("custom_id \"alice\""));
     assert_eq!(config.consumers.len(), 1);
     assert_eq!(config.consumers[0].id, "c1");
 }
@@ -2642,7 +2671,7 @@ fn test_quarantine_id_vs_username_collision() {
     let messages = config.quarantine_colliding_consumer_identities();
 
     assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("Quarantined consumer 'c2'"));
+    assert!(messages[0].contains("Quarantined consumer \"c2\""));
     assert_eq!(config.consumers.len(), 1);
 }
 
@@ -2669,7 +2698,7 @@ fn test_unique_upstream_names_duplicate() {
     config.upstreams = vec![u1, u2];
     let err = config.validate_unique_upstream_names().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate upstream name 'backend-api'"));
+    assert!(err[0].contains("Duplicate upstream name \"backend-api\""));
 }
 
 #[test]
@@ -2705,7 +2734,7 @@ fn test_unique_proxy_names_duplicate() {
     config.proxies = vec![p1, p2];
     let err = config.validate_unique_proxy_names().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate proxy name 'my-proxy'"));
+    assert!(err[0].contains("Duplicate proxy name \"my-proxy\""));
 }
 
 #[test]
@@ -2738,7 +2767,7 @@ fn test_upstream_references_missing() {
     config.proxies = vec![p1];
     let err = config.validate_upstream_references().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("non-existent upstream_id 'nonexistent'"));
+    assert!(err[0].contains("non-existent upstream_id \"nonexistent\""));
 }
 
 #[test]
@@ -4099,7 +4128,7 @@ fn test_plugin_config_priority_override_too_high() {
         updated_at: Utc::now(),
     };
     let err = pc.validate_fields().unwrap_err();
-    assert!(err[0].contains("priority_override must be between 0 and 10000"));
+    assert!(err[0].contains("`priority_override` must be between 0 and 10000"));
 }
 
 #[test]
@@ -4252,7 +4281,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
     let errs = config.validate_plugin_references().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("targeted to proxy 'other-proxy'"))
+            .any(|e| e.contains("targeted to proxy \"other-proxy\""))
     );
 }
 
@@ -4516,7 +4545,7 @@ fn test_validate_unique_resource_ids_duplicate_proxy() {
     config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p1", "/web")];
     let err = config.validate_unique_resource_ids().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate proxy ID 'p1'"));
+    assert!(err[0].contains("Duplicate proxy ID \"p1\""));
     assert!(err[0].contains("namespace"));
 }
 
@@ -4526,7 +4555,7 @@ fn test_validate_unique_resource_ids_duplicate_consumer() {
     config.consumers = vec![make_consumer("c1", "alice"), make_consumer("c1", "bob")];
     let err = config.validate_unique_resource_ids().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate consumer ID 'c1'"));
+    assert!(err[0].contains("Duplicate consumer ID \"c1\""));
 }
 
 #[test]
@@ -4593,7 +4622,7 @@ fn test_validate_upstream_references_rejects_cross_namespace_same_id() {
     let err = config.validate_upstream_references().unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.contains("non-existent upstream_id 'u1'")),
+            .any(|e| e.contains("non-existent upstream_id \"u1\"")),
         "expected dangling same-namespace upstream rejection, got {err:?}"
     );
 }
@@ -5102,7 +5131,7 @@ fn test_unique_listen_paths_same_path_catchall_conflict() {
     config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/api")];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
-    assert!(err[0].contains("Duplicate listen_path"));
+    assert!(err[0].contains("Duplicate `listen_path`"));
 }
 
 #[test]
@@ -6161,7 +6190,7 @@ fn transaction_log_schema_proxy_group_scope_rejected_by_both_surfaces() {
     assert!(
         field_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_fields errors: {field_errors:?}"
     );
 
@@ -6173,7 +6202,7 @@ fn transaction_log_schema_proxy_group_scope_rejected_by_both_surfaces() {
     assert!(
         ref_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_plugin_references errors: {ref_errors:?}"
     );
 }
@@ -6190,7 +6219,7 @@ fn transaction_log_schema_proxy_scope_rejected_by_both_surfaces() {
     assert!(
         field_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_fields errors: {field_errors:?}"
     );
 
@@ -6203,7 +6232,7 @@ fn transaction_log_schema_proxy_scope_rejected_by_both_surfaces() {
     assert!(
         ref_errors
             .iter()
-            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope `global`")),
         "unexpected validate_plugin_references errors: {ref_errors:?}"
     );
 }
@@ -6219,7 +6248,7 @@ fn prometheus_metrics_requires_global_scope_on_both_validation_surfaces() {
             .validate_fields()
             .expect_err("admin validation must reject scoped prometheus_metrics");
         assert!(field_errors.iter().any(|error| {
-            error.contains("prometheus_metrics") && error.contains("scope 'global'")
+            error.contains("prometheus_metrics") && error.contains("scope `global`")
         }));
 
         let mut config = empty_config();
@@ -6229,9 +6258,34 @@ fn prometheus_metrics_requires_global_scope_on_both_validation_surfaces() {
             .validate_plugin_references()
             .expect_err("runtime validation must reject scoped prometheus_metrics");
         assert!(reference_errors.iter().any(|error| {
-            error.contains("prometheus_metrics") && error.contains("scope 'global'")
+            error.contains("prometheus_metrics") && error.contains("scope `global`")
         }));
     }
+}
+
+#[test]
+fn rendered_configuration_guidance_retains_scope_and_wildcard_examples() {
+    let sensitive_id = "'SENSITIVE_PLUGIN_ID\"";
+    let pc = prometheus_metrics_pc(sensitive_id, PluginScope::ProxyGroup, None);
+    let mut config = empty_config();
+    config.plugin_configs = vec![pc.clone()];
+    for errors in [
+        pc.validate_fields().expect_err("invalid plugin scope"),
+        config
+            .validate_plugin_references()
+            .expect_err("invalid runtime plugin scope"),
+    ] {
+        let rendered =
+            ferrum_edge::startup::render_startup_error(anyhow::anyhow!(errors.join("; ")), &[]);
+        assert!(rendered.contains("scope `global`"), "{rendered}");
+        assert!(!rendered.contains("SENSITIVE_PLUGIN_ID"), "{rendered}");
+    }
+
+    let error = ferrum_edge::config::types::validate_host_entry("bad*private_host_token")
+        .expect_err("invalid wildcard host");
+    let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
+    assert!(rendered.contains("prefix `*.domain`"), "{rendered}");
+    assert!(!rendered.contains("private_host_token"), "{rendered}");
 }
 
 #[test]

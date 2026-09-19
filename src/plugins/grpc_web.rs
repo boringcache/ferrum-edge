@@ -1218,15 +1218,21 @@ fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let headers = value
-        .as_array()
-        .ok_or_else(|| format!("grpc_web: 'expose_headers' must be an array, got: {value}"))?;
+    let headers = value.as_array().ok_or_else(|| {
+        format!(
+            "grpc_web: `expose_headers` must be an array, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
 
     let mut seen = HashSet::with_capacity(headers.len());
     let mut parsed = Vec::with_capacity(headers.len());
     for (idx, raw) in headers.iter().enumerate() {
         let header = raw.as_str().ok_or_else(|| {
-            format!("grpc_web: 'expose_headers[{idx}]' must be a string, got: {raw}")
+            format!(
+                "grpc_web: `expose_headers[{idx}]` must be a string, got: {raw:?}",
+                raw = raw.to_string()
+            )
         })?;
         let header = header.trim_matches(|ch| ch == ' ' || ch == '\t');
         if header.is_empty() {

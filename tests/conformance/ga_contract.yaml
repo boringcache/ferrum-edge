@@ -251,6 +251,11 @@ capabilities:
     # Tenant subscription accepted audit. Those accepted events must be
     # strictly newer than the pre-swap baseline and ordered after their
     # reload anchors. Reload and reconnect-attempt logs are not proof.
+    # Client node_id remains withheld. Fetch the original capp pod's current
+    # ferrum-edge container logs with kubectl --prefix=true; require its exact
+    # [pod/<name>/ferrum-edge] provenance on redacted Connected-to-CP events
+    # and match that pod on prefixed dp_grpc reload anchors. Unbound redaction,
+    # another pod/container, and a redacted CP acceptance are never proof.
     live_assertions:
       - sidecar.config.native_subscribe_delivered
       - sidecar.config.native_subscribe_mtls_omitted_client_rejected

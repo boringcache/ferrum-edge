@@ -468,7 +468,7 @@ fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
     {
         let port = token
             .parse::<u16>()
-            .map_err(|e| format!("port '{token}': {e}"))?;
+            .map_err(|e| format!("port {token:?}: {e}"))?;
         if port == 0 {
             return Err("port '0': port must be 1-65535".to_string());
         }
@@ -489,7 +489,7 @@ fn parse_injector_proxy_uid(value: Option<String>) -> Result<Option<u32>, String
 
     let uid = value
         .parse::<u32>()
-        .map_err(|e| format!("Invalid FERRUM_MESH_PROXY_UID '{value}': {e}"))?;
+        .map_err(|e| format!("Invalid FERRUM_MESH_PROXY_UID {value:?}: {e}"))?;
     if uid == 0 {
         return Err(
             "Invalid FERRUM_MESH_PROXY_UID: injected sidecars set runAsNonRoot=true, so the proxy UID must be non-zero"
@@ -564,7 +564,7 @@ fn resolve_resource_quantity(key: &str, default: &str) -> Result<String, String>
         Ok(value)
     } else {
         Err(format!(
-            "Invalid {key}: '{value}' is not a valid Kubernetes resource quantity"
+            "Invalid {key}: {value:?} is not a valid Kubernetes resource quantity"
         ))
     }
 }
@@ -753,14 +753,14 @@ pub async fn run(
     let listener = TcpListener::bind(config.listen_addr).await?;
     if tls_acceptor.is_none() {
         warn!(
-            listen_addr = %config.listen_addr,
+            listen_addr = %crate::startup::sanitize_startup_scalar(config.listen_addr),
             "Ferrum injector serving PLAINTEXT HTTP (FERRUM_INJECTOR_ALLOW_PLAINTEXT=true). \
              Kubernetes requires HTTPS for admission webhooks; this is for local development only"
         );
     }
     info!(
-        listen_addr = %config.listen_addr,
-        namespace = %config.namespace,
+        listen_addr = %crate::startup::sanitize_startup_scalar(config.listen_addr),
+        namespace = %crate::startup::sanitize_startup_scalar(config.namespace.as_str()),
         tls = tls_acceptor.is_some(),
         "Ferrum injector admission webhook listening"
     );
@@ -1004,8 +1004,8 @@ fn admission_review_body_limit_display(max_body_bytes: usize) -> String {
 }
 
 pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value, String> {
-    let review: AdmissionReview =
-        serde_json::from_slice(body).map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
+    let review: AdmissionReview = crate::util::deserialization::from_json_slice(body)
+        .map_err(|e| format!("invalid AdmissionReview JSON: {e}"))?;
     let api_version = review
         .api_version
         .unwrap_or_else(|| "admission.k8s.io/v1".to_string());
@@ -2232,14 +2232,14 @@ fn resolve_probe_handler_port(
 ) -> Result<u16, String> {
     let Some(port) = handler_value.get("port") else {
         return Err(format!(
-            "container '{container_name}' {probe_field}.{handler} is missing port; \
+            "container {container_name:?} {probe_field}.{handler} is missing port; \
 refusing injection"
         ));
     };
     match port {
         Value::Number(number) => json_u16_port(number).ok_or_else(|| {
             format!(
-                "container '{container_name}' {probe_field}.{handler} port is not \
+                "container {container_name:?} {probe_field}.{handler} port is not \
 an integer in 1-65535; refusing injection"
             )
         }),
@@ -2247,15 +2247,15 @@ an integer in 1-65535; refusing injection"
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 return Err(format!(
-                    "container '{container_name}' {probe_field}.{handler} port is \
+                    "container {container_name:?} {probe_field}.{handler} port is \
 empty; refusing injection"
                 ));
             }
             if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
                 parse_numeric_probe_port(trimmed).ok_or_else(|| {
                     format!(
-                        "container '{container_name}' {probe_field}.{handler} port \
-'{trimmed}' is not an integer in 1-65535; refusing injection"
+                        "container {container_name:?} {probe_field}.{handler} port \
+{trimmed:?} is not an integer in 1-65535; refusing injection"
                     )
                 })
             } else {
@@ -2263,7 +2263,7 @@ empty; refusing injection"
             }
         }
         _ => Err(format!(
-            "container '{container_name}' {probe_field}.{handler} port must be a \
+            "container {container_name:?} {probe_field}.{handler} port must be a \
 number or name; refusing injection"
         )),
     }
@@ -2288,8 +2288,8 @@ fn resolve_named_container_port(
 ) -> Result<u16, String> {
     let unresolved = || {
         format!(
-            "container '{container_name}' {probe_field} names port '{port_name}' \
-which is not declared in that container's ports; refusing injection so the \
+            "container {container_name:?} {probe_field} names port {port_name:?} \
+which is not declared in the container ports; refusing injection so the \
 kubelet probe is not captured by inbound mesh redirect"
         )
     };
@@ -2306,14 +2306,14 @@ kubelet probe is not captured by inbound mesh redirect"
             .and_then(json_value_port_number)
         else {
             return Err(format!(
-                "container '{container_name}' port '{port_name}' has a \
+                "container {container_name:?} port {port_name:?} has a \
 containerPort that is not an integer in 1-65535; refusing injection"
             ));
         };
         match resolved {
             Some(existing) if existing != container_port => {
                 return Err(format!(
-                    "container '{container_name}' declares port name '{port_name}' \
+                    "container {container_name:?} declares port name {port_name:?} \
 on more than one containerPort; refusing injection"
                 ));
             }
@@ -3593,7 +3593,7 @@ mod tests {
             .expect_err("mixed wildcard annotation rejected");
 
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
-        assert!(err.contains("wildcard '*' must be the only includeOutboundPorts token"));
+        assert!(err.contains("wildcard `*` must be the only includeOutboundPorts token"));
     }
 
     #[test]
@@ -4654,7 +4654,7 @@ mod tests {
         )
         .expect_err("unresolved named probe port must fail closed");
         assert!(
-            err.contains("names port 'metrics'"),
+            err.contains("names port \"metrics\""),
             "error must name the unresolved probe port: {err}"
         );
         assert!(
@@ -5121,7 +5121,7 @@ mod tests {
 
         assert!(err.contains("ferrum.io/includeOutboundPorts"));
         assert!(err.contains("traffic.sidecar.istio.io/includeOutboundPorts"));
-        assert!(err.contains("cannot be combined with wildcard '*'"));
+        assert!(err.contains("cannot be combined with wildcard `*`"));
     }
 
     // Deduplication on the exclude-CIDR path: a CIDR repeated across env and

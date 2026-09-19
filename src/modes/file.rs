@@ -53,7 +53,7 @@ use crate::proxy::gateway_listener::{
     GatewayListenerHttp3, GatewayListenerManager, GatewayListenerTls,
 };
 use crate::proxy::{self, ProxyState};
-use crate::startup::wait_for_start_signals;
+use crate::startup::{sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls;
 
 /// Pre-bound TCP listeners + admin overrides that callers of [`serve`] can
@@ -170,7 +170,7 @@ pub fn apply_file_config_candidate(
         Err(e) => {
             error!(
                 "Configuration reload failed, keeping previous config: {}",
-                e
+                crate::startup::sanitize_startup_cause(&e, &[])
             );
             config_rejected.store(true, Ordering::Relaxed);
         }
@@ -413,7 +413,7 @@ pub(crate) async fn await_listener_handles(
     let mut shutdown_on_panic = Some(shutdown_on_panic);
     while let Some(result) = futures.next().await {
         if let Err(err) = result {
-            error!("Gateway listener task failed: {}", err);
+            error!("Gateway listener task failed to join");
             if first_error.is_none() {
                 first_error = Some(err);
                 if let Some(trigger) = shutdown_on_panic.take() {
@@ -426,6 +426,23 @@ pub(crate) async fn await_listener_handles(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+// OS kinds retain actionable bind/permission diagnostics without trusting the
+// Display payload of an I/O error (which can wrap arbitrary provider text).
+pub(super) fn listener_failure_for_log(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            let kind = io_error.kind();
+            // Construct from the kind alone: this preserves the address-in-use
+            // spelling used by bind-race classifiers without the original payload.
+            return format!(
+                "listener I/O failed: {} ({kind:?})",
+                std::io::Error::from(kind)
+            );
+        }
+    }
+    "listener operation failed".to_string()
 }
 
 /// Await fallible listener handles concurrently. Logs every task failure and
@@ -448,12 +465,13 @@ pub(crate) async fn await_fallible_listener_handles(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                // Include the anyhow source chain. A top-level listener context
-                // such as `HTTP proxy listener failed` otherwise erases the OS
-                // `AddrInUse` cause that hosted test harnesses need to classify
-                // the one retryable ephemeral-port race. The chain contains no
-                // request/config payload, only gateway-authored listener errors.
-                error!("Gateway listener task '{}' failed: {:#}", name, err);
+                // Preserve the OS failure classification, but do not emit
+                // arbitrary provider or panic payloads from the source chain.
+                error!(
+                    "Gateway listener task `{}` failed: {}",
+                    name,
+                    listener_failure_for_log(&err)
+                );
                 if first_error.is_none() {
                     first_error = Some(err.context(format!("{name} failed")));
                     if let Some(trigger) = shutdown_on_failure.take() {
@@ -462,7 +480,7 @@ pub(crate) async fn await_fallible_listener_handles(
                 }
             }
             Err(err) => {
-                error!("Gateway listener task '{}' failed: {}", name, err);
+                error!("Gateway listener task `{}` failed to join", name);
                 if first_error.is_none() {
                     first_error = Some(if err.is_panic() {
                         anyhow::anyhow!("{name} panicked: {err}")
@@ -579,24 +597,24 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     info!(
         "Starting in file mode with log level: {}",
-        env_config.log_level
+        sanitize_startup_scalar(&env_config.log_level)
     );
     if env_config.proxy_https_port != 8443 {
         info!(
             "Custom HTTPS port configured: {}",
-            crate::secrets::report_env_field(
+            sanitize_startup_scalar(crate::secrets::report_env_field(
                 "FERRUM_PROXY_HTTPS_PORT",
-                &env_config.proxy_https_port.to_string()
-            )
+                &env_config.proxy_https_port.to_string(),
+            ))
         );
     }
     if env_config.admin_https_port != 9443 {
         info!(
             "Custom admin HTTPS port configured: {}",
-            crate::secrets::report_env_field(
+            sanitize_startup_scalar(crate::secrets::report_env_field(
                 "FERRUM_ADMIN_HTTPS_PORT",
-                &env_config.admin_https_port.to_string()
-            )
+                &env_config.admin_https_port.to_string(),
+            ))
         );
     }
     if env_config.admin_tls_cert_path.is_some() || env_config.admin_tls_key_path.is_some() {
@@ -765,8 +783,9 @@ pub async fn serve(
     if !admin_tls_paths_ready && let Some(listener) = prebound.admin_https.take() {
         match listener.local_addr() {
             Ok(addr) => info!(
-                "Dropping unused pre-bound admin HTTPS listener on {addr} — \
-                 admin TLS cert/key paths are not both configured"
+                "Dropping unused pre-bound admin HTTPS listener on {} — \
+                 admin TLS cert/key paths are not both configured",
+                sanitize_startup_scalar(addr)
             ),
             Err(_) => info!(
                 "Dropping unused pre-bound admin HTTPS listener — \
@@ -796,7 +815,7 @@ pub async fn serve(
         effective_reserved_ports(&env_config, &prebound, suppress_env_admin_https_reservation);
     if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
         for msg in &errors {
-            error!("{}", msg);
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
         }
         return Err(anyhow::anyhow!(
             "Stream proxy port conflicts with gateway reserved ports"
@@ -958,29 +977,30 @@ pub async fn serve(
     // The candidate carries the client-certificate verifier and trust identity
     // of this same load, so the client-trust baseline armed below describes
     // exactly the material these listeners serve (issue #3857).
-    let tls_startup =
-        match startup_security::try_load_frontend_tls_candidate(&env_config, &tls_policy, &crls) {
-            Ok(Some(candidate)) => {
-                let mut config = candidate.config;
-                info!("Loading TLS configuration with client certificate verification...");
-                tls::enable_early_data(&mut config, &tls_policy);
-                if env_config.ktls_enabled.could_be_enabled() {
-                    tls::enable_secret_extraction_for_ktls(&mut config);
-                }
-                Some((config, candidate.client_trust))
+    let tls_startup = match startup_security::try_load_frontend_tls_candidate(
+        &env_config,
+        &tls_policy,
+        &crls,
+    ) {
+        Ok(Some(candidate)) => {
+            let mut config = candidate.config;
+            info!("Loading TLS configuration with client certificate verification...");
+            tls::enable_early_data(&mut config, &tls_policy);
+            if env_config.ktls_enabled.could_be_enabled() {
+                tls::enable_secret_extraction_for_ktls(&mut config);
             }
-            Ok(None) => None,
-            Err(e) => {
-                error!("TLS configuration validation failed: {:#}", e);
-                shutdown_file_background_startup_tasks(
-                    &shutdown_tx,
-                    &proxy_state,
-                    background_handles,
-                )
+            Some((config, candidate.client_trust))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(
+                "TLS configuration validation failed: frontend certificate, key, or client trust material could not be loaded"
+            );
+            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
                 .await;
-                return Err(e);
-            }
-        };
+            return Err(e);
+        }
+    };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
     // rationale). File-mode listeners participate identically: live reload is
@@ -1004,7 +1024,7 @@ pub async fn serve(
         && handles.watcher_handle.is_some()
     {
         info!(
-            interval_secs = env_config.frontend_tls_watch_interval_seconds,
+            interval_secs = %sanitize_startup_scalar(env_config.frontend_tls_watch_interval_seconds),
             "Frontend TLS live reload enabled for file-mode proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
@@ -1166,7 +1186,9 @@ pub async fn serve(
         ) {
             Ok(candidate) => candidate,
             Err(e) => {
-                error!("Admin TLS configuration failed: {:#}", e);
+                error!(
+                    "Admin TLS configuration failed: certificate, key, or client trust material could not be loaded"
+                );
                 shutdown_file_background_startup_tasks(
                     &shutdown_tx,
                     &proxy_state,
@@ -1234,11 +1256,11 @@ pub async fn serve(
         let h = tokio::spawn(async move {
             info!(
                 "Starting admin HTTP listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
-                    &admin_http_addr.to_string()
-                )
+                    &admin_http_addr.to_string(),
+                ))
             );
             admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
@@ -1295,11 +1317,11 @@ pub async fn serve(
             let h = tokio::spawn(async move {
                 info!(
                     "Starting admin HTTPS listener on {}",
-                    crate::secrets::report_listener_addr(
+                    sanitize_startup_scalar(crate::secrets::report_listener_addr(
                         "FERRUM_ADMIN_BIND_ADDRESS",
                         "FERRUM_ADMIN_HTTPS_PORT",
-                        &admin_https_addr.to_string()
-                    )
+                        &admin_https_addr.to_string(),
+                    ))
                 );
                 let result = if let Some(slot) = admin_tls_slot {
                     admin::start_admin_listener_with_dynamic_tls_and_signal(
@@ -1362,11 +1384,11 @@ pub async fn serve(
         let h = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
-                crate::secrets::report_listener_addr(
+                sanitize_startup_scalar(crate::secrets::report_listener_addr(
                     "FERRUM_PROXY_BIND_ADDRESS",
                     "FERRUM_PROXY_HTTP_PORT",
-                    &http_addr.to_string()
-                )
+                    &http_addr.to_string(),
+                ))
             );
             proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
@@ -1413,11 +1435,11 @@ pub async fn serve(
             let h = tokio::spawn(async move {
                 info!(
                     "Starting HTTPS proxy listener on {}",
-                    crate::secrets::report_listener_addr(
+                    sanitize_startup_scalar(crate::secrets::report_listener_addr(
                         "FERRUM_PROXY_BIND_ADDRESS",
                         "FERRUM_PROXY_HTTPS_PORT",
-                        &https_addr.to_string()
-                    )
+                        &https_addr.to_string(),
+                    ))
                 );
                 let result = if let Some(slot) = reload_slot {
                     proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -1552,11 +1574,11 @@ pub async fn serve(
                 let h = tokio::spawn(async move {
                     info!(
                         "Starting HTTP/3 (QUIC) proxy listener on {}",
-                        crate::secrets::report_listener_addr(
+                        sanitize_startup_scalar(crate::secrets::report_listener_addr(
                             "FERRUM_PROXY_BIND_ADDRESS",
                             "FERRUM_PROXY_HTTPS_PORT",
-                            &h3_addr.to_string()
-                        )
+                            &h3_addr.to_string(),
+                        ))
                     );
                     crate::http3::server::start_http3_listener_with_signal(
                         h3_addr,
@@ -1638,7 +1660,7 @@ pub async fn serve(
         warn!(
             "Gateway startup failed after spawning listener / background tasks: {}; \
              draining spawned tasks before returning",
-            e
+            listener_failure_for_log(&e)
         );
         if let Err(listener_err) = serve_handles.shutdown_and_join().await {
             return Err(listener_err.context(format!("Gateway startup failed: {e}")));
@@ -1664,6 +1686,41 @@ mod tests {
     use super::*;
     use std::future::pending;
     use std::time::Instant;
+
+    #[test]
+    fn listener_failure_emits_io_kind_and_preserves_the_original_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shutdown_requested = AtomicBool::new(false);
+        let (result, logs) = crate::modes::database::tests::capture_logs(|| {
+            runtime.block_on(async {
+                let listener = tokio::spawn(async {
+                    Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "bare-unregistered-listener-canary",
+                    ))
+                    .context("listener provider context"))
+                });
+                await_fallible_listener_handles(
+                    vec![("HTTP proxy listener".to_string(), listener)],
+                    || shutdown_requested.store(true, Ordering::Relaxed),
+                )
+                .await
+            })
+        });
+
+        assert!(shutdown_requested.load(Ordering::Relaxed));
+        assert!(format!("{:#}", result.unwrap_err()).contains("bare-unregistered-listener-canary"));
+        assert!(logs.contains("HTTP proxy listener"), "{logs}");
+        assert!(logs.contains("AddrInUse"), "{logs}");
+        assert!(logs.contains("address in use"), "{logs}");
+        assert!(
+            !logs.contains("bare-unregistered-listener-canary"),
+            "{logs}"
+        );
+    }
 
     // Regression: a stuck background task must not wedge graceful shutdown.
     // The pre-refactor `run()` capped the background drain at 5 s; the

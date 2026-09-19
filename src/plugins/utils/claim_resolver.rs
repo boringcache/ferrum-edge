@@ -36,13 +36,16 @@ pub fn resolve_claim_path<'a>(claims: &'a Value, path: &str) -> Option<&'a Value
 
 /// Parse and validate a dot-path claim configuration value.
 pub fn parse_claim_path_value(field: &str, value: &Value, plugin: &str) -> Result<String, String> {
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be a string, got: {value}"))?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let path = raw.trim();
     if path.is_empty() || path.split('.').any(str::is_empty) {
         return Err(format!(
-            "{plugin}: '{field}' must be a non-empty dot path without empty segments"
+            "{plugin}: `{field}` must be a non-empty dot path without empty segments"
         ));
     }
     Ok(path.to_string())

@@ -174,13 +174,100 @@ Shared runner/sampler edits are isolated behind `--h1-profile`; root should
 coordinate those two file overlaps with #5602. The frozen benchmark job and its
 policy verifier are untouched.
 
-`h1_internal_profile.py` retains bounded integer-only snapshots with sample IDs,
-timestamps, scrape duration/CPU, process identity and measurement boundary slack.
-It rejects missing/malformed/decreasing counters, reused process identities,
-missing slots, loss and overflow. Idle-thread tails explicitly prevent complete
-allocation coverage. Useful traffic validity is separate from profile
-completeness. Every expected arm/pair/size is retained, including missing samples
-and failed 5 MiB observations. No surviving-worker average, guessed observer
+`h1_internal_profile.py` requires schema-2 traffic samples bound to the expected
+pair, gateway, payload and nonempty campaign host ID. The runner manifest records
+the H1 mode, `http1-tls` selection, 15-second duration and base 200 workers; each
+sample must carry the producer's `HTTP/1.1+TLS` protocol, 15-second measurement
+phase and both worker fields matching the committed 200/200/200/100/50 size table.
+Legacy samples, copied rows, aggregate samples, wrong-host samples and substituted
+workloads remain failed observations. Invalid/missing manifest selections retain
+the full expected matrix; valid budgeted payload subsets retain every selected
+pair/arm/size and do not satisfy the separate all-five-size campaign obligation.
+
+Every gateway arm also requires a versioned runtime record with embedded
+pair/arm/host/mode identity, including calibration's observer-off control. The
+runner records its full checked-out revision in the campaign manifest and
+captures the two fixed revision/observer labels from both `docker inspect` and
+`docker image inspect` of the container's immutable `sha256:` image ID. Image
+inspection has a 10-second bound. Both label sets must identify the manifest's
+full 40-hex revision and the expected `ferrum.h1-profile=off` or `on` build.
+Missing labels, overridden container labels, mutable tags, malformed metadata,
+missing runtimes and stale cross-pair records fail validation. Calibration may
+use distinct off/on images, but each arm's image ID must stay fixed across all
+four pairs. Cutoff 0/1 must use exactly one observer-on image ID across all pairs.
+
+The collector verifies the running container's command (`/app/ferrum-edge run`
+without config overrides), working directory, and the read-only bind from the
+hashed source file to `/etc/ferrum/config.yaml`. The report recomputes SHA-256
+from **each retained config file**, then requires identical config hashes across
+all gateway arms and pairs. The current runner selects cutoff in the environment,
+so **no config-file difference is permitted**, even if its new hash is valid.
+Each launch now supplies the cutoff setting exactly once; ambiguous duplicate
+environment entries fail capture. The exact safe `FERRUM_*` settings from the
+release image and runner must be present with valid values, including fixed
+file/metrics bindings and the arm's declared cutoff. Unknown settings and secret
+provider overrides fail capture without recording their names or values. Every
+other safe setting must agree across arms/pairs; only cutoff 0 versus 1 differs
+in the cutoff campaign. Other environment values and other mounts are retained
+as canonical hashes and must also agree. Only Docker's generated short-ID
+`HOSTNAME`, if present, is normalized; arbitrary hostname overrides fail.
+
+For observer-off controls, the raw process timeline must continuously bracket
+measurement with the runtime's owned host PID/start ticks, and its retained
+`h1_gateway` and embedded measurement PID must agree. Missing observer counters
+in that build are expected; missing runtime/process ownership is not. Runtime
+failures appear in each affected observation's `runtime_issues` and make
+`runtime_complete`, `traffic_complete`, `profiles_complete`, and comparison
+eligibility false. Available profile deltas and the entire declared matrix are
+still retained. These checks validate retained Docker evidence, not signed
+binary provenance, and do not retroactively certify older artifacts.
+
+Profile brackets have a **two-second total boundary-slack limit**, including the
+last scrape's duration, and a **one-second maximum start-to-start sampling gap**
+for the fixed 500 ms sampler / 200 ms HTTP timeout. They require an observation
+inside measurement, nonnegative integer sample IDs increasing consecutively,
+strictly increasing finite wall/monotonic timestamps, nonoverlapping captures,
+and wall/monotonic elapsed agreement within **50 ms of the first bracket sample**.
+Process observations must precede their scrape by at most one second. These are
+fixed acceptance limits, not bounds enlarged to rescue scheduling stalls. Excess
+slack, skipped samples and discontinuities retain available published deltas as
+partial evidence. Each accepted row needs present, finite, nonnegative numeric
+sampler CPU (booleans excluded); invalid overhead remains null with an issue,
+never silently zero. A measured zero CPU value is valid.
+
+The runner retains the owned container's full ID, host init PID/start ticks,
+host-network mode and fixed `http://127.0.0.1:9000/metrics` endpoint. The sampler
+checks that record against the selected container ID. Before **and** after each
+scrape it rereads `/proc` start ticks and `NSpid`, requires exactly one observed
+gateway, and joins the unique IPv4 loopback port-9000 LISTEN inode to that
+process's fd table. The stored namespace PID must equal the exported metrics PID
+at every accepted row; before/after and successive bindings must agree with the
+retained runtime. This distinguishes unrelated containers exporting PID 1.
+Missing permissions/ownership records, reuse, restarts, stale mappings and
+ambiguous listeners produce partial profiles. This is bounded listener ownership
+evidence, not a new syscall/connection tracing facility or a cryptographic artifact
+attestation. Older captures without the binding cannot become complete retroactively.
+
+The fixed export remains **206 counters + eight metadata fields (214 total)**.
+The consumer requires positive metrics PID, capacity 128, and 1–128 registered
+slots that never decrease. Successful traffic requires positive advancement of
+`body_proxy_output_all_data_bytes`, the guaranteed response DATA boundary for
+this H1 workload. It does not require optional coalescing, copy, vectored-write
+or EOF counters to advance, nor equate bracket bytes with measured client bytes.
+Missing/malformed/decreasing counters, missing slots, loss and overflow remain
+failures. Idle-thread tails explicitly prevent complete allocation coverage.
+Useful traffic validity is separate from profile completeness. Every expected
+arm/pair/size is retained, including missing samples and failed 5 MiB observations.
+The hosted H1 Python suite exercises complete producer-shaped campaigns and
+negative campaign, timing, identity, metadata/work and CPU cases, including
+written full-matrix reports and the capture-to-sampler ownership path. Runtime
+fixtures pass Docker-shaped inputs through the actual collector with only Docker
+inspection and `/proc` reads mocked. Hosted regressions cover missing/malformed
+image/container labels, revisions, environment/command/mount evidence, retained
+config tampering, image/config/environment drift in later pairs, and observer-off
+process ownership. The pool collector is a sibling with its own review/fix; this
+change is confined to H1 collection/reporting. No local execution was performed.
+No surviving-worker average, guessed observer
 overhead subtraction, or gain claim is produced. Raw on/off measurements are the
 overhead calibration; shared-host process CPU is not isolated proxy cost, and RSS
 is not allocation traffic. Scrape overhead is included in the gateway process and
