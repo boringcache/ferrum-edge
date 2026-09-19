@@ -74,6 +74,7 @@ use super::log_helpers::redacted_endpoint_url;
 use crate::config::{BackendEgressPolicy, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
+use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar};
 use crate::tls::CrlList;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use std::sync::Arc;
@@ -349,7 +350,13 @@ impl PluginTlsPosture {
         let ca_material = match load_material_blocking(&source, MaterialKind::CaBundle) {
             Ok(ca_material) => ca_material,
             Err(error) => {
-                return Self::fail_closed(source_id, error.to_string());
+                return Self::fail_closed(
+                    source_id,
+                    format!(
+                        "`FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle ({})",
+                        error.failure_class()
+                    ),
+                );
             }
         };
 
@@ -357,16 +364,22 @@ impl PluginTlsPosture {
             Ok(certs) if !certs.is_empty() => Self::CustomCaBundle(certs),
             Ok(_) => Self::fail_closed(
                 ca_material.display_source_id,
-                "CA bundle did not contain any PEM certificates".to_string(),
+                "`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle did not contain any PEM certificates"
+                    .to_string(),
             ),
-            Err(error) => Self::fail_closed(ca_material.display_source_id, error.to_string()),
+            Err(_) => Self::fail_closed(
+                ca_material.display_source_id,
+                "`FERRUM_TLS_CA_BUNDLE_PATH`: malformed PEM CA bundle".to_string(),
+            ),
         }
     }
 
     fn fail_closed(source_id: String, reason: String) -> Self {
+        // Source IDs can contain filesystem paths. Withhold them before either
+        // the initial error or the later debug event, and retain only safe reasons.
         tracing::error!(
-            ca_bundle = %source_id,
-            error = %reason,
+            ca_bundle = %sanitize_startup_scalar(&source_id),
+            error = %sanitize_startup_cause(&reason, &[]),
             "Failed to load configured plugin HTTP CA bundle; failing closed with an empty trust store"
         );
         Self::FailClosedCaBundle { source_id, reason }
@@ -453,8 +466,8 @@ impl PluginTlsPosture {
             Self::CustomCaBundle(certs) => builder.tls_certs_only(certs.clone()),
             Self::FailClosedCaBundle { source_id, reason } => {
                 tracing::debug!(
-                    ca_bundle = %source_id,
-                    error = %reason,
+                    ca_bundle = %sanitize_startup_scalar(source_id),
+                    error = %sanitize_startup_cause(reason, &[]),
                     "Applying empty trust store for invalid plugin HTTP CA bundle"
                 );
                 Self::apply_fail_closed_empty_trust(builder)
@@ -491,15 +504,15 @@ struct PluginHttpClientBuildError {
 }
 
 impl PluginHttpClientBuildError {
-    fn from_reqwest(error: reqwest::Error) -> Self {
+    fn from_reqwest(_error: reqwest::Error) -> Self {
         Self {
-            message: error.to_string(),
+            message: "plugin HTTP client construction failed".to_string(),
         }
     }
 
-    fn from_rustls(error: rustls::Error) -> Self {
+    fn from_rustls(_error: rustls::Error) -> Self {
         Self {
-            message: error.to_string(),
+            message: "plugin HTTP TLS configuration failed".to_string(),
         }
     }
 }
@@ -613,7 +626,7 @@ fn build_fail_closed_plugin_client(
     }) {
         Ok(client) => return Ok(client),
         Err(error) => tracing::error!(
-            error = %error,
+            error = %sanitize_startup_cause(PluginHttpClientBuildError::from_reqwest(error), &[]),
             http2_prior_knowledge,
             has_gateway_dns_resolver = dns_cache.is_some(),
             "Fail-closed empty-trust plugin HTTP client failed; using a preconfigured \
@@ -662,7 +675,7 @@ fn build_dns_cached_fallback_client(
     let provider_mismatch = crypto_provider.is_err();
     if let Err(error) = &crypto_provider {
         tracing::error!(
-            %error,
+            error = %sanitize_startup_cause(error, &[]),
             "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
              is not the FIPS-approved one this enforcing process requires. The client is left \
              unable to establish any connection."
@@ -674,7 +687,7 @@ fn build_dns_cached_fallback_client(
     }) {
         Ok(client) => return Ok(client),
         Err(error) => tracing::error!(
-            error = %error,
+            error = %sanitize_startup_cause(PluginHttpClientBuildError::from_reqwest(error), &[]),
             http2_prior_knowledge,
             "Failed to build minimal DNS-cached fallback plugin client; \
              retrying with fail-closed empty-trust TLS while keeping the DNS cache"
@@ -692,7 +705,7 @@ fn accept_plugin_http_client(
         Ok(client) => Some(Arc::new(client)),
         Err(error) => {
             tracing::error!(
-                error = %error,
+                error = %sanitize_startup_cause(error, &[]),
                 "{context}; outbound plugin HTTP will fail closed without aborting the gateway"
             );
             None
@@ -760,7 +773,7 @@ fn build_configured_plugin_client(
     //     the configured posture outright; see `apply_inert_crypto_posture`)
     if let Err(error) = &crypto_provider {
         tracing::error!(
-            %error,
+            error = %sanitize_startup_cause(error, &[]),
             "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
              is not the FIPS-approved one this enforcing process requires. The client is left \
              unable to establish any connection."
@@ -793,7 +806,10 @@ fn build_configured_plugin_client(
         Err(error) => {
             tracing::error!(
                 http2_prior_knowledge,
-                error = %error,
+                error = %sanitize_startup_cause(
+                    PluginHttpClientBuildError::from_reqwest(error),
+                    &[],
+                ),
                 "Failed to build fully-configured plugin HTTP client. Retrying a \
                  minimal builder that preserves the TLS trust posture (custom CA / \
                  no-verify), DNS cache, connect/request timeouts, and HTTP/2 \
