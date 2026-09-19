@@ -312,7 +312,8 @@ fn sql_tls_source_generations_belong_to_pools_and_failed_builds_leave_no_files()
         let foreign = dir.path().join("ferrum-db-client-key-foreign.pem");
         std::fs::write(&foreign, "foreign owner").unwrap();
         for db_type in ["postgres", "mysql"] {
-            let accepted_pem = "-----BEGIN PRIVATE KEY-----\naccepted-canary\n-----END PRIVATE KEY-----";
+            let accepted_pem =
+                "-----BEGIN PRIVATE KEY-----\naccepted-canary\n-----END PRIVATE KEY-----";
             let backend = source_env(db_type, accepted_pem)
                 .effective_sql_backend()
                 .unwrap();
@@ -377,12 +378,7 @@ fn sql_tls_snapshot_failure_is_fatal_except_for_offline_backup_bootstrap() {
             let backend = source_env(db_type, "-----BEGIN CERTIFICATE-----\nmaterial")
                 .effective_sql_backend()
                 .unwrap();
-            assert!(
-                backend
-                    .connect_lazy(quiet_lazy_options(), 5)
-                    .await
-                    .is_err()
-            );
+            assert!(backend.connect_lazy(quiet_lazy_options(), 5).await.is_err());
             let store = DatabaseStore::connect_offline_with_pool_config(
                 db_type,
                 &backend.effective_url,
@@ -485,9 +481,9 @@ fn sql_tls_offline_timeout_fences_abandoned_reads_without_pinning_runtime_teardo
         let observer = dir.path().join("scrub-observer");
         std::fs::hard_link(&partial[0], &observer).unwrap();
         let original_len = std::fs::metadata(&observer).unwrap().len();
-        finished_rx.recv_timeout(Duration::from_secs(5)).expect(
-            "offline timeout and runtime drop must both finish while TLS read is blocked",
-        );
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("offline timeout and runtime drop must both finish while TLS read is blocked");
         worker.join().unwrap();
         assert_eq!(
             private_paths(dir.path()).len(),

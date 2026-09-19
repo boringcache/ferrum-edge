@@ -480,7 +480,10 @@ async fn vault_database_tls_snapshots_follow_pool_lifetime() {
                 );
             }
             for path in &old_paths {
-                assert_eq!(std::fs::read_to_string(path).unwrap(), "provider generation 0");
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "provider generation 0"
+                );
             }
             if generation == 0 {
                 old = Some(pool.clone());
@@ -508,7 +511,12 @@ async fn vault_database_tls_snapshots_follow_pool_lifetime() {
         for path in old_paths {
             assert!(!path.exists());
         }
-        assert!(std::fs::read(&observer).unwrap().iter().all(|byte| *byte == 0));
+        assert!(
+            std::fs::read(&observer)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         std::fs::remove_file(observer).unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "foreign owner");

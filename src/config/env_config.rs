@@ -6164,16 +6164,10 @@ impl EnvConfig {
                         ));
                     }
                     if let Some(ref cert) = self.db_tls_client_cert_path {
-                        params.push(format!(
-                            "sslcert={}",
-                            Self::db_tls_source_param_value(cert)
-                        ));
+                        params.push(format!("sslcert={}", Self::db_tls_source_param_value(cert)));
                     }
                     if let Some(ref key) = self.db_tls_client_key_path {
-                        params.push(format!(
-                            "sslkey={}",
-                            Self::db_tls_source_param_value(key)
-                        ));
+                        params.push(format!("sslkey={}", Self::db_tls_source_param_value(key)));
                     }
                 }
             }
@@ -6184,10 +6178,7 @@ impl EnvConfig {
                     if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
                         && let Some(ref cert) = self.db_tls_ca_cert_path
                     {
-                        params.push(format!(
-                            "ssl-ca={}",
-                            Self::db_tls_source_param_value(cert)
-                        ));
+                        params.push(format!("ssl-ca={}", Self::db_tls_source_param_value(cert)));
                     }
                     if let Some(ref cert) = self.db_tls_client_cert_path {
                         params.push(format!(
@@ -6196,10 +6187,7 @@ impl EnvConfig {
                         ));
                     }
                     if let Some(ref key) = self.db_tls_client_key_path {
-                        params.push(format!(
-                            "ssl-key={}",
-                            Self::db_tls_source_param_value(key)
-                        ));
+                        params.push(format!("ssl-key={}", Self::db_tls_source_param_value(key)));
                     }
                 }
             }
