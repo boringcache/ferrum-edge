@@ -228,9 +228,9 @@ def profile_bracket(usage, phases, *, owned_gateway=None, successful_responses=0
     captured = [row["h1_profile"] for row in timeline if "h1_profile" in row]
     for field in ("sample_id", "monotonic_secs", "unix_secs"):
         values = [p.get(field) for p in captured]
-        if (any(not finite_number(value) for value in values)
+        if (any(not finite_number(value) or value < 0 for value in values)
                 or any(b <= a for a, b in zip(values, values[1:]))):
-            result["issues"].append("missing or non-increasing capture " + field)
+            result["issues"].append("missing, negative or non-increasing capture " + field)
     if any(type(p.get("sample_id")) is not int or p["sample_id"] < 0 for p in captured):
         result["issues"].append("invalid integer sample ID")
     if any(b["unix_secs"] < a["unix_secs"] for a, b in zip(timeline, timeline[1:])):

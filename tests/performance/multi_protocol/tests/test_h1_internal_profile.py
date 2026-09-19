@@ -483,6 +483,14 @@ class H1InternalProfileTests(unittest.TestCase):
         for index, row in enumerate(drift["timeline"]):
             row["h1_profile"]["monotonic_secs"] += index * 0.01
         cases.append((drift, "clock discontinuity"))
+        negative_clock = capture(duration=15)
+        for row in negative_clock["timeline"]:
+            row["h1_profile"]["monotonic_secs"] -= 1000
+        # Preserve cadence and wall/monotonic deltas: negativity itself must fail.
+        negative_result = bracket(negative_clock, dict(measurement_start_unix_secs=10, measurement_secs=15))
+        self.assertIn("missing, negative or non-increasing capture monotonic_secs", negative_result["issues"])
+        self.assertIn("published_delta", negative_result)
+        cases.append((negative_clock, "negative monotonic clock"))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _, usage_path = campaign(root)
