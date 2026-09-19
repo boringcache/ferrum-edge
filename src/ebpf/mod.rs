@@ -1711,7 +1711,8 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
         if self.fail_attach_sock_ops {
-            return Err("sock_ops attach failed".to_string());
+            // Model a backend that embeds its path without safe escaping.
+            return Err(format!("sock_ops attach failed at '{cgroup_root}'"));
         }
         self.sock_ops_attached_cgroup_root = Some(cgroup_root.to_string());
         Ok(())

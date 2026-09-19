@@ -21,6 +21,7 @@ use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
     validate_update_ferrum_version,
 };
+use crate::grpc::admission::admission_status_diagnostic;
 use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
@@ -403,26 +404,6 @@ pub async fn start_native_mesh_client_with_shutdown(
         }
         backoff_secs = next_secs;
     }
-}
-
-/// Preserve known CP budget guidance, but never trust arbitrary peer status
-/// text merely because the status code is RESOURCE_EXHAUSTED.
-fn admission_status_diagnostic(status: &tonic::Status) -> String {
-    use crate::grpc::admission::CpGrpcAdmissionRejection;
-
-    for rejection in [
-        CpGrpcAdmissionRejection::TotalStreams,
-        CpGrpcAdmissionRejection::NamespaceStreams,
-        CpGrpcAdmissionRejection::PrincipalStreams,
-        CpGrpcAdmissionRejection::NodeStreams,
-        CpGrpcAdmissionRejection::NodeCardinality,
-    ] {
-        let known = rejection.into_native_status();
-        if status.message() == known.message() {
-            return known.message().to_string();
-        }
-    }
-    "CP gRPC stream admission refused (unrecognized details withheld)".to_string()
 }
 
 fn connection_error_diagnostic(error: &anyhow::Error, attempt: MeshStreamAttempt) -> &'static str {
