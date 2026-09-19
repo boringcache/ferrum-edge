@@ -141,12 +141,17 @@ does not dispatch). Once the workflow is available to GitHub Actions:
 
 ```sh
 gh workflow run h1-internal-profile.yml \
-  --ref codex/20260918-5588-h1-profile -f payloads=all
+  --ref codex/20260918-5588-h1-profile -f payloads=all -f diagnostic_only=true
 ```
 
-The sole input is `payloads`: `all` (default), `10240`, `71680`, `512000`,
-`1048576`, or `5242880`. Root can budget separate size dispatches; all five remain
-required. Each comparison's two arms and repeated direct controls share one VM.
+`diagnostic_only=true` is the default: it runs the bounded slice below, then
+stops. Root must pin and verify the dispatched head against the pushed branch
+before interpreting artifacts; the command selects a ref, not an immutable SHA.
+For full profiles after reviewing the slice, root uses the same command with
+`-f diagnostic_only=false`. That dispatch includes its own diagnostic slice;
+there is no automatic rerun. `payloads` is `all` (default), `10240`, `71680`,
+`512000`, `1048576`, or `5242880` and applies only to full profiles. Root can
+budget separate size dispatches; all five remain required. Each comparison's two arms and repeated direct controls share one VM.
 No worker dispatch, PR, review, merge or issue write is part of this task.
 
 The manual job builds observer-off/on binaries at the **same checked-out SHA**,
@@ -181,6 +186,116 @@ overhead calibration; shared-host process CPU is not isolated proxy cost, and RS
 is not allocation traffic. Scrape overhead is included in the gateway process and
 sampler timings, not analytically subtracted.
 
+## Bounded H1 request-drain diagnostic
+
+The retained three 5 MiB drain failures and slow 1 MiB tails still have **no
+proven cause or repair**. Process write accounting near 79 kB/s does not identify
+socket throughput, TCP pacing, a TLS flush, or an HTTP body boundary. This mode
+adds evidence at the client boundary; a clean run alone cannot resolve those
+failures. No production `src/`, allocator, body/counter, H3 observer or global
+clock implementation is changed by this diagnostic addition. Backend upload EOF,
+upstream identity joins, syscall and CPU traces remain later observations; no
+cross-hop request identity is inferred from the client IDs.
+
+`proto_bench http1 --h1-diagnostic` is default off. It wraps the existing
+`ObservedBody` admission and response `collect()` with last-state observations;
+the first transport body poll still admits work, and the existing status/exact
+bytes/content check still determines useful completion. It adds no warmup,
+retry, request deadline, flush or measurement extension. The existing `Phases`
+coordinator (the harness phase coordinator) supplies the narrow phase/snapshot
+hooks; the real connection still owns the existing `ConnectionGuard`.
+
+The parent-owned registry survives cancelled worker futures. Each registered
+worker has a numeric worker ID and one latest request record, with globally
+increasing numeric request and connection IDs within that diagnostic session.
+Connection records retain numeric local/peer socket tuples when available;
+missing tuples are null, never fabricated. Request-body first poll, accepted
+body bytes, last progress and body end; response status/version, parsed
+Content-Length and framing flags; response DATA bytes, last progress, end/error
+class and validation completion are separate observations. No paths, arbitrary
+header values, payloads or credentials enter this registry. Header flags are
+meaningful only when the headers timestamp is present. Null completion/end/error
+means unobserved, not success. Errors use bounded classes, not arbitrary error
+strings. Lifetime offered/admitted/completion/error counters survive cancellation;
+they do not reconstruct the lost worker's measured histogram or silently replace
+useful-work totals. A stale body cannot update a newer request's record: that
+update is counted as capture loss.
+
+Every timestamp carries session microseconds plus phase name and phase-relative
+microseconds in `client_process_diagnostic_session_instant_microseconds`, from
+one client `std::time::Instant` epoch. Snapshots and the final report name that
+clock domain and client PID explicitly. This is **not host CLOCK_MONOTONIC** and
+cannot be directly compared with backend, BPF, perf or another process's times.
+Measurement/drain classification follows the existing fixed deadline. Session
+origin is diagnostic creation, not the generic harness monotonic origin; existing
+wall timestamps remain approximate cross-process context only. Generic clocks
+are left for root and the separate H3 repair.
+
+At warmup +10 seconds, if workers have not reached the barrier, the coordinator
+captures one `delayed_warmup` snapshot without extending its existing preflight
+bound. It snapshots immediately before preflight/drain worker abortion, then
+after request collection and after separate driver retirement. Last await and
+stage-entry time remain intact on worker drop; lifecycle becomes
+`dropped_without_return`, which deliberately does not guess cancellation versus
+panic. Snapshot copying briefly serializes diagnostic updates, so this mode is
+intrusive and is excluded from the full off/on performance comparison.
+
+Bounds per client invocation: 256 worker records, 512 connection records, four
+snapshots, fixed-size fields and no per-packet/request history. Omitted records,
+stale/unrecordable updates, snapshot overflow and poisoned locks are explicit
+loss counters; any loss makes diagnostic completeness fail. Numeric socket
+addresses and static enums bound strings. Compact serialized diagnostic state is bounded below 4 MiB at these capacities;
+the hosted capacity regression checks the compact report. Budget up to 16 MiB
+for the pretty-printed diagnostic report in stdout and 4 MiB for the four compact
+stderr snapshots per invocation; the single slice has three client invocations. Existing process/startup logs and build/debug artifacts retain their
+existing bounds and are not covered by that diagnostic byte budget. Snapshots
+are emitted immediately as `H1_DIAGNOSTIC` JSON lines, then included in
+`phases.h1_diagnostic`, so an outer timeout need not erase pre-abort evidence.
+
+Only when enabled, driver handles are owned in a bounded `JoinSet`, finished
+handles are reaped during connection registration, and remaining handles are
+reaped **after all request workers join**. At most 512 live/unreaped driver
+handles are accepted; capacity rejection is an explicit failed worker and a
+retirement error, never a silent detach or a valid workload sample. Connection
+metadata overflow alone does not stop admission. The declared 50-worker slice
+fits both capacities; the bounds are diagnostic resource guards, not tuning.
+Retirement allows 5 seconds, then requests abort and allows 1 second to reap;
+any remaining handles are counted `unreaped_after_abort` and dropped with abort
+requested. Normal completion, Hyper error, cancellation, panic, pending/aborted
+and unreaped counts are distinct. `completed_ok` means the Hyper driver returned
+`Ok`, not peer FIN, TLS close_notify or successful request completion. The old
+H1 `transport_close_secs=0`/false defaults are still **unobserved** when this mode
+is off. They must never be interpreted as successful transport closure. The
+new retirement report is authoritative only when present; driver retirement
+never increments useful request completions or replaces request-drain timing.
+
+The existing manual workflow builds its same-revision twins and common harness,
+then runs exactly one direct/cutoff-0/cutoff-1 pass using the observer-off gateway
+image and diagnostic-on client. Each arm uses 5 MiB, 50 workers (the unchanged
+200-base scaling), one full-payload warmup, 30-second measurement, 30-second
+request drain, and unchanged timeout/guard/TLS policies. Preflight remains
+70 seconds and the runner's existing outer bound remains 190 seconds per arm;
+the selected campaign budget is 900 seconds. No optional 1 MiB control, automatic
+retry or adaptive extension is added. Failed diagnostics block full profiles on
+that dispatch. The runner retains original/partial client stdout as
+`diagnostics/<arm>_5242880_client.raw.json` and exit status before writing any
+error placeholder or metadata; stderr, each sample, runtime config, process
+usage, image identity, gateway/backend logs, and the diagnostic report are all
+retained in `h1-profile-evidence/diagnostic/`. Upload remains unconditional,
+14 days, in `h1-internal-profile-<sha>-<payloads>`. The three-arm report includes
+missing/failed arms and always sets `comparison_eligible=false`.
+
+Hosted registration: `metrics_tests::h1_diagnostic_tests` exercises actual plain
+and rustls H1 worker paths, opt-in/off useful-work parity, clean responses,
+length/chunk truncation, malformed headers, the unchanged delayed warmup and
+30-second pre-abort hooks, cancellation-preserved counters, capacity/stale-update
+loss and separately timed driver cancellation. It is selected explicitly in the
+existing H1 checks job and included by the existing Benchmark Harness Tests
+`metrics_tests` target. Python selection/report/registration regressions run in
+both existing Python discovery gates. All cadence and supported-trailer gates
+remain registered unchanged. These are registrations only: no repository code,
+formatter, linter, test, build or benchmark was executed locally.
+
 ## Live cadence and safety gate
 
 `tests/functional/h1_cadence_tests.rs` is registered in the functional binary on
@@ -191,8 +306,8 @@ binary, pins `FERRUM_EDGE_TEST_BIN`, and retains the revision, binary SHA-256,
 test output and failures in `h1-cadence-{off,on}-<sha>` artifacts. No implicit
 harness rebuild is allowed. Measurement now depends on both cadence jobs as
 well as the existing checks. PR events run these gates without measurements;
-manual dispatch uses the unchanged `payloads` input and command above, and
-also runs the calibration/measurement job. These are hosted registrations;
+manual dispatch uses the inputs and command above. Full calibration/measurement
+requires `diagnostic_only=false` and a successful diagnostic slice. These are hosted registrations;
 no passing execution is claimed by this implementation.
 
 Each of five tests runs cutoffs **0 and 1**, with cleartext H1 on both hops and

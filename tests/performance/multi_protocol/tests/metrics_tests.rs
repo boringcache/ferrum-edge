@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 #[path = "../proto_bench.rs"]
 mod proto_bench;
 
+#[path = "support/h1_diagnostic_tests.rs"]
+mod h1_diagnostic_tests;
+
 #[path = "support/h1_profile_tests.rs"]
 mod h1_profile_tests;
 

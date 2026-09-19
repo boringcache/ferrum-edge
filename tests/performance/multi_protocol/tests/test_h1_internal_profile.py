@@ -83,6 +83,35 @@ class H1InternalProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 profile.validate_selection(*invalid)
 
+    def test_diagnostic_slice_cannot_change_bounds_or_enter_full_comparisons(self):
+        args = ["diagnostic", "http1-tls", "1", "30", "200", "ferrum", "5242880", "", ""]
+        profile.validate_selection(*args)
+        for index, replacement in [(1, "http3"), (2, "2"), (3, "31"), (4, "100"),
+                                   (5, "ferrum envoy"), (6, "1048576"), (7, "image"),
+                                   (8, "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1")]:
+            invalid = args.copy()
+            invalid[index] = replacement
+            with self.assertRaises(ValueError):
+                profile.validate_selection(*invalid)
+        with tempfile.TemporaryDirectory() as directory:
+            result = profile.report_diagnostic(directory)
+            self.assertEqual(len(result["observations"]), 3)
+            self.assertFalse(result["complete"])
+            self.assertFalse(result["comparison_eligible"])
+            self.assertTrue(all(row["issues"] for row in result["observations"]))
+
+    def test_h1_diagnostic_is_registered_without_changing_cadence_or_retry_policy(self):
+        root = Path(__file__).resolve().parents[4]
+        workflow = (root / ".github/workflows/h1-internal-profile.yml").read_text()
+        self.assertIn("--test metrics_tests h1_diagnostic_tests", workflow)
+        self.assertIn("--duration 30 --concurrency 200 --pairs 1 --payload-sizes 5242880", workflow)
+        self.assertLess(workflow.index("id: diagnostic"), workflow.index("id: calibration"))
+        self.assertIn("--test functional_tests h1_cadence_tests::", workflow)
+        runner = (root / "tests/performance/multi_protocol/run_gateway_protocol_bench.sh").read_text()
+        self.assertIn('extra_args+=(--h1-diagnostic)', runner)
+        self.assertIn('cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"', runner)
+        self.assertIn("One pass only: never pair, extend, rerun", runner)
+
     def test_reports_retain_failed_and_missing_five_mib_observations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

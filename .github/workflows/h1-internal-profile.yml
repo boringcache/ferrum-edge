@@ -25,6 +25,10 @@ on:
         type: choice
         default: all
         options: [all, '10240', '71680', '512000', '1048576', '5242880']
+      diagnostic_only:
+        description: Stop after the single-pass 5 MiB H1 drain diagnostic
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -56,6 +60,11 @@ jobs:
           sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
       - name: Formatting (hosted only)
         run: cargo fmt --all -- --check
+      - name: H1 harness formatting, lint and cancellation/retirement regressions
+        run: |
+          cargo fmt --manifest-path tests/performance/multi_protocol/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --lib --bin proto_bench --test metrics_tests -- -D warnings
+          cargo test --locked --manifest-path tests/performance/multi_protocol/Cargo.toml --test metrics_tests h1_diagnostic_tests
       - name: Feature compile and lint (default builds do not cover observers)
         run: cargo clippy --locked --features bench-h1-profile --lib --bin ferrum-edge --test unit_gateway_core_tests -- -D warnings
       - name: Allocator publication seams
@@ -210,8 +219,19 @@ jobs:
           done
       - name: Build common harness
         run: cargo build --locked --release --manifest-path tests/performance/multi_protocol/Cargo.toml
+      - name: Single-pass H1 drain diagnostic before full profiles
+        id: diagnostic
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          FERRUM_IMAGE=ferrum-h1:off bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
+            http1-tls --h1-profile diagnostic --gateways ferrum --skip-build \
+            --duration 30 --concurrency 200 --pairs 1 --payload-sizes 5242880 \
+            --wallclock-budget-seconds 900 --output-dir h1-profile-evidence/diagnostic \
+            2>&1 | tee h1-profile-evidence/diagnostic-run.log
       - name: Calibrate overhead at identical revision and configuration
         id: calibration
+        if: inputs.diagnostic_only != true && steps.diagnostic.outcome == 'success'
         continue-on-error: true
         env:
           H1_PAYLOAD_SELECTION: ${{ inputs.payloads }}
@@ -226,6 +246,7 @@ jobs:
             --output-dir h1-profile-evidence/calibration
       - name: Four counterbalanced cutoff pairs with repeated direct controls
         id: cutoff
+        if: inputs.diagnostic_only != true && steps.diagnostic.outcome == 'success'
         continue-on-error: true
         env:
           H1_PAYLOAD_SELECTION: ${{ inputs.payloads }}
@@ -239,8 +260,14 @@ jobs:
             --wallclock-budget-seconds 7200 --output-dir h1-profile-evidence/cutoff
       - name: Retain every failed observation and profile completeness
         if: always()
+        env:
+          DIAGNOSTIC_ONLY: ${{ inputs.diagnostic_only }}
+          DIAGNOSTIC_OUTCOME: ${{ steps.diagnostic.outcome }}
         run: |
           status=0
+          python3 tests/performance/multi_protocol/h1_internal_profile.py report-diagnostic \
+            h1-profile-evidence/diagnostic || status=1
+          if [ "$DIAGNOSTIC_ONLY" = true ] || [ "$DIAGNOSTIC_OUTCOME" != success ]; then exit "$status"; fi
           for campaign in calibration cutoff; do
             python3 tests/performance/multi_protocol/h1_internal_profile.py report \
               "h1-profile-evidence/$campaign" "$campaign" || status=1
@@ -256,6 +283,12 @@ jobs:
       - name: Preserve runner failures in job conclusion
         if: always()
         env:
+          DIAGNOSTIC_ONLY: ${{ inputs.diagnostic_only }}
+          DIAGNOSTIC_OUTCOME: ${{ steps.diagnostic.outcome }}
           CALIBRATION_OUTCOME: ${{ steps.calibration.outcome }}
           CUTOFF_OUTCOME: ${{ steps.cutoff.outcome }}
-        run: test "$CALIBRATION_OUTCOME" = success && test "$CUTOFF_OUTCOME" = success
+        run: |
+          test "$DIAGNOSTIC_OUTCOME" = success
+          if [ "$DIAGNOSTIC_ONLY" != true ]; then
+            test "$CALIBRATION_OUTCOME" = success && test "$CUTOFF_OUTCOME" = success
+          fi

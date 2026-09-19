@@ -157,6 +157,11 @@ def profile_bracket(usage, phases):
 
 
 def validate_selection(mode, protocol, pairs, duration, workers, gateways, sizes, baseline, extra):
+    if mode == "diagnostic":
+        if (protocol, pairs, duration, workers, gateways, sizes, baseline, extra) != (
+                "http1-tls", "1", "30", "200", "ferrum", "5242880", "", ""):
+            raise ValueError("H1 diagnostic requires one pass, 5 MiB, 50 scaled workers, 30 seconds")
+        return
     if mode not in ("calibration", "cutoff") or protocol != "http1-tls":
         raise ValueError("H1-only calibration/cutoff selection required")
     if (pairs, duration, workers, gateways) != ("4", "15", "200", "ferrum") or extra:
@@ -261,10 +266,47 @@ def report(directory, mode):
     return report
 
 
+def report_diagnostic(directory):
+    from benchmark_validity import sample_issues
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    result = dict(mode="diagnostic", comparison_eligible=False,
+                  cause="unproven; a clean slice does not resolve retained failures",
+                  observations=[], complete=True)
+    for gateway in ("direct", "ferrum", "ferrum-exp-cutoff-one"):
+        path = directory / "pairs/pair_001" / f"{gateway}_http1-tls_5242880.json"
+        issues = []
+        try:
+            sample = json.loads(path.read_text())
+            issues.extend(sample_issues(sample))
+            diagnostic = sample["phases"]["h1_diagnostic"]
+            if diagnostic["clock_domain"] != "client_process_diagnostic_session_instant_microseconds":
+                issues.append("missing named client clock domain")
+            if any(diagnostic["loss"].values()):
+                issues.append("diagnostic capture loss")
+            if len(diagnostic["snapshots"][-1]["workers"]) != 50:
+                issues.append("missing worker last state")
+            retirement = diagnostic["retirement"]
+            if retirement["timed_out"] or any(retirement[key] for key in (
+                    "completed_error", "cancelled", "panicked", "capacity_rejections",
+                    "unreaped_after_abort")):
+                issues.append("driver retirement incomplete or failed (separate from request work)")
+            if retirement["started"] < 50 or retirement["started"] != retirement["completed_ok"]:
+                issues.append("driver completion accounting incomplete")
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+            issues.append("missing or malformed diagnostic sample")
+        result["observations"].append(dict(gateway=gateway, path=str(path), issues=issues))
+        result["complete"] = result["complete"] and not issues
+    (directory / "h1_diagnostic_report.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
 if __name__ == "__main__":
     command, *arguments = sys.argv[1:]
     if command == "validate-selection":
         validate_selection(*arguments)
+    elif command == "report-diagnostic":
+        sys.exit(0 if report_diagnostic(*arguments)["complete"] else 1)
     elif command == "runtime":
         retain_runtime(arguments[0], json.load(sys.stdin), arguments[1])
     elif command == "report":

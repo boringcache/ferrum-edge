@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::h1_diagnostic::{self, Diagnostic};
 use crate::h1_profile;
 use crate::metrics::{BenchMetrics, collect_results};
 use crate::process_usage::{ClientUsage, Snapshot};
@@ -271,6 +272,8 @@ pub struct PhaseReport {
     pub measurement_start_unix_secs: Option<f64>,
     pub client_usage: Option<ClientUsage>,
     pub h1_profile: Option<h1_profile::Snapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub h1_diagnostic: Option<h1_diagnostic::Report>,
     pub drain_secs: f64,
     pub transport_close_secs: f64,
     pub transport_close_timed_out: bool,
@@ -349,6 +352,7 @@ pub struct Phases {
     slots: Vec<Arc<Slot>>,
     connections: Connections,
     h1_counters: Vec<Arc<h1_profile::Counters>>,
+    h1_diagnostic: Diagnostic,
 }
 
 impl Phases {
@@ -367,11 +371,17 @@ impl Phases {
             slots: Vec::new(),
             connections: Connections(Arc::new(AtomicUsize::new(0))),
             h1_counters: Vec::new(),
+            h1_diagnostic: Diagnostic::default(),
         }
     }
 
     pub fn with_payload(mut self, payload_bytes: usize) -> Self {
         self.preflight_bound = preflight_bound(payload_bytes);
+        self
+    }
+
+    pub fn with_h1_diagnostic(mut self, diagnostic: Diagnostic) -> Self {
+        self.h1_diagnostic = diagnostic;
         self
     }
 
@@ -446,8 +456,19 @@ impl Phases {
             phases.setup_secs = self.created.elapsed().as_secs_f64();
             let warmup = Instant::now();
             phases.warmup_start_monotonic_secs = Some(monotonic_secs());
+            self.h1_diagnostic.phase("warmup", warmup, None);
             self.phase.send_replace(Phase::Warmup);
-            self.wait_for(BARRIER).await;
+            if self.h1_diagnostic.enabled() {
+                tokio::select! {
+                    _ = self.wait_for(BARRIER) => {}
+                    _ = tokio::time::sleep(h1_diagnostic::WARMUP_NOTICE) => {
+                        self.h1_diagnostic.snapshot("delayed_warmup");
+                        self.wait_for(BARRIER).await;
+                    }
+                }
+            } else {
+                self.wait_for(BARRIER).await;
+            }
             phases.warmup_secs = warmup.elapsed().as_secs_f64();
         };
         if tokio::time::timeout(self.preflight_bound, preflight)
@@ -464,6 +485,7 @@ impl Phases {
             }
         } else {
             let barrier = Instant::now();
+            self.h1_diagnostic.phase("barrier", barrier, None);
             // Give the passive sampler a full tick after every transport and
             // warmup is ready, with workers still parked at the common barrier.
             tokio::time::sleep(self.observation_settle).await;
@@ -483,6 +505,7 @@ impl Phases {
                 .map(|elapsed| elapsed.as_secs_f64());
             let client_start = Snapshot::capture();
             let h1_start = h1_profile::Snapshot::capture(&self.h1_counters);
+            self.h1_diagnostic.phase("measurement", start, Some(end));
             self.phase.send_replace(Phase::Measure { start, end });
             // Sample independently of worker joins, including after worker loss.
             while Instant::now() < end {
@@ -530,8 +553,10 @@ impl Phases {
         self.phase.send_replace(Phase::Stop);
         phases.drain_start_monotonic_secs = Some(monotonic_secs());
         let drain = Instant::now();
+        self.h1_diagnostic.phase("drain", drain, None);
         // Abort only after a bounded drain. Join every task; never detach it.
         if phases.timed_out {
+            self.h1_diagnostic.snapshot("preflight_pre_abort");
             for handle in &aborts {
                 handle.abort();
             }
@@ -541,6 +566,7 @@ impl Phases {
                 Ok(metrics) => metrics,
                 Err(_) => {
                     phases.timed_out = true;
+                    self.h1_diagnostic.snapshot("drain_pre_abort");
                     for handle in aborts {
                         handle.abort();
                     }
@@ -548,6 +574,8 @@ impl Phases {
                 }
             };
         phases.drain_secs = drain.elapsed().as_secs_f64();
+        self.h1_diagnostic.snapshot("request_drain_complete");
+        phases.h1_diagnostic = self.h1_diagnostic.report();
         phases.transport_close_timed_out |= combined.transport_close_timed_out;
         for slot in &self.slots {
             observed.queue_time_ns += slot.queue_ns.load(Ordering::Relaxed);

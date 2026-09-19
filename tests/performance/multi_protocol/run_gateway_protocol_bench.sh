@@ -21,7 +21,7 @@
 #   --adaptive                  (opt in to one budget-gated extension)
 #   --wallclock-budget-seconds N (per invocation, default 4200)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
-#   --h1-profile calibration|cutoff (separate manual H1 lane; see docs/h1_internal_profile.md)
+#   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -100,7 +100,7 @@ if [[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]; then
     exit 2
 fi
 
-if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]]; then
+if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]] && ! { [ "$H1_PROFILE" = diagnostic ] && [ "$PAIRS" = 1 ]; }; then
     echo "--pairs must be an EVEN integer from 2 through 12 for exact position balance" >&2
     exit 2
 fi
@@ -830,6 +830,9 @@ run_bench() {
             extra_args+=(--ca-cert "$CERT_DIR/ca.pem")
         fi
     fi
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        extra_args+=(--h1-diagnostic)
+    fi
     local effective_concurrency
     effective_concurrency=$(scale_concurrency_for_payload "$payload" "$CONCURRENCY")
 
@@ -857,7 +860,7 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
-    if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
+    if [ -n "$H1_PROFILE" ] && [ "$H1_PROFILE" != diagnostic ] && [ "$target" = gateway ]; then
         sampler_args+=(--h1-profile)
     fi
     if [ "$H2_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
@@ -950,6 +953,11 @@ run_bench() {
         fi
     fi
 
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        # Preserve even partial stdout before error placeholders or stamping.
+        cp "$out" "$diagnostics/${gateway}_${payload}_client.raw.json"
+        printf '%s\n' "$rc" > "$diagnostics/${gateway}_${payload}_client.exit"
+    fi
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"
@@ -974,7 +982,7 @@ run_bench() {
 
     # Surface proto_bench stderr (error detail lines) if non-empty.
     local err_file="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"
-    if [ -s "$err_file" ]; then
+    if [ -s "$err_file" ] && [ "$H1_PROFILE" != diagnostic ]; then
         local err_lines
         err_lines=$(wc -l < "$err_file")
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
@@ -1002,7 +1010,7 @@ main() {
     if [ "$H3_BUDGET" -ne 0 ] && [[ " $expected_gateways " == *" envoy "* ]]; then
         expected_gateways+=" envoy-limit-4"
     fi
-    if [ "$H1_PROFILE" = cutoff ]; then
+    if [ "$H1_PROFILE" = cutoff ] || [ "$H1_PROFILE" = diagnostic ]; then
         expected_gateways+=" ferrum-exp-cutoff-one"
     fi
     if [ -z "$H1_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
@@ -1038,13 +1046,14 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
                "payload_sizes": [int(size) for size in sys.argv[3].split()],
                "pairs": int(sys.argv[4]), "host_id": sys.argv[5],
                "h2_observation_enabled": sys.argv[6] == "1",
+               **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -1129,6 +1138,10 @@ PYEOF
             done
         done
         OUTPUT_DIR="$root_output"
+        if [ "$H1_PROFILE" = diagnostic ]; then
+            # One pass only: never pair, extend, rerun, or promote a comparison.
+            break
+        fi
         local decision
         decision=$(python3 "$SCRIPT_DIR/benchmark_plan.py" summarize "$OUTPUT_DIR" \
             "$PROTOCOL" "$expected_gateways" "$PAYLOAD_SIZES" "$final_pairs")
@@ -1172,6 +1185,9 @@ plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
 with open(path, "w") as f:
     json.dump(plan, f, indent=2)
 PYEOF
+    if [ "$H1_PROFILE" = diagnostic ]; then
+        python3 "$SCRIPT_DIR/h1_internal_profile.py" report-diagnostic "$OUTPUT_DIR"
+    fi
     echo "[main] done. results in $OUTPUT_DIR"
 }
 

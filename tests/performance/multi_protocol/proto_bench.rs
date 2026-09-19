@@ -15,6 +15,9 @@ use clap::{Parser, Subcommand};
 use multi_protocol_perf::h2_observation::{Observer, error_chain, escaped_snippet};
 
 use bytes::Buf;
+use multi_protocol_perf::h1_diagnostic::{
+    DRIVER_BOUND, Diagnostic, DiagnosticBody, Drivers, Observation, error_class as h1_error_class,
+};
 use multi_protocol_perf::h1_profile::{Counters, ObservedTls};
 use multi_protocol_perf::metrics::BenchMetrics;
 use multi_protocol_perf::phases::{Connections, Phases, TransportEvent};
@@ -99,6 +102,10 @@ struct BenchArgs {
     /// Bounded H2/gRPC transport observations; identical overhead in every arm.
     #[arg(long, default_value = "false")]
     h2_observe: bool,
+
+    /// Bounded H1 last-state snapshots and separate driver retirement (diagnostic only).
+    #[arg(long, default_value = "false")]
+    h1_diagnostic: bool,
 }
 
 #[derive(Parser, Clone)]
@@ -283,6 +290,45 @@ fn make_payload(size: usize) -> Vec<u8> {
 // ── HTTP/1.1 ─────────────────────────────────────────────────────────────────
 
 async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
+    let combined = run_http1_metrics(args).await?;
+    let protocol = if args.target.starts_with("https://") {
+        "HTTP/1.1+TLS"
+    } else {
+        "HTTP/1.1"
+    };
+    print_results(&combined, protocol, args);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn h1_diagnostic_test_run(
+    target: String,
+    enabled: bool,
+    seconds: u64,
+) -> BenchMetrics {
+    let duration = seconds.to_string();
+    let mut arguments = vec![
+        "proto_bench",
+        "http1",
+        "--target",
+        &target,
+        "--duration",
+        &duration,
+        "--concurrency",
+        "1",
+        "--payload-size",
+        "4",
+    ];
+    if enabled {
+        arguments.push("--h1-diagnostic");
+    }
+    let Protocol::Http1(args) = Cli::try_parse_from(arguments).unwrap().command else {
+        panic!("H1 test arguments selected another protocol");
+    };
+    run_http1_metrics(&args).await.unwrap()
+}
+
+async fn run_http1_metrics(args: &BenchArgs) -> anyhow::Result<BenchMetrics> {
     let is_tls = args.target.starts_with("https://");
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
     let host = url.host().context("no host in URL")?;
@@ -306,14 +352,17 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         None
     };
 
-    let mut phases =
-        Phases::new(Duration::from_secs(args.duration)).with_payload(args.payload_size);
+    let diagnostic = Diagnostic::new(args.h1_diagnostic);
+    let drivers = Drivers::default();
+    let mut phases = Phases::new(Duration::from_secs(args.duration))
+        .with_payload(args.payload_size)
+        .with_h1_diagnostic(diagnostic.clone());
     let connections = phases.connections();
     let protocol_label = if is_tls { "HTTP/1.1+TLS" } else { "HTTP/1.1" };
     let payload = Bytes::from(make_payload(args.payload_size));
 
     let mut handles = Vec::new();
-    for _ in 0..args.concurrency {
+    for worker_id in 0..args.concurrency {
         let path = path.clone();
         let authority = authority.clone();
         let tls_connector = tls_connector.clone();
@@ -321,121 +370,196 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
         let h1_counters = phases.h1_counters();
         let mut metrics = phases.worker();
         let connections = connections.clone();
+        let mut trace = diagnostic.worker(worker_id as usize);
+        let observation = trace.observation.clone();
+        let diagnostic = diagnostic.clone();
+        let drivers = drivers.clone();
         handles.push(tokio::spawn(async move {
-            // Helper to create a connection (plain or TLS)
-            async fn connect_h1(
-                addr: SocketAddr,
-                connections: &Connections,
-                counters: &Arc<Counters>,
-                tls: &Option<(
-                    tokio_rustls::TlsConnector,
-                    rustls::pki_types::ServerName<'static>,
-                )>,
-            ) -> anyhow::Result<hyper::client::conn::http1::SendRequest<ObservedBody>> {
-                let tcp = tokio::net::TcpStream::connect(addr).await?;
-                let _ = tcp.set_nodelay(true);
-                if let Some((connector, server_name)) = tls {
-                    let tcp = ObservedTls::new(tcp, counters.clone());
-                    let tls_stream = connector.connect(server_name.clone(), tcp).await?;
-                    let io = hyper_util::rt::TokioIo::new(tls_stream);
-                    let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
-                    let connection = connections.opened();
-                    tokio::spawn(async move {
-                        let _connection = connection;
-                        let _ = conn.await;
-                    });
-                    Ok(sr)
-                } else {
-                    let io = hyper_util::rt::TokioIo::new(tcp);
-                    let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
-                    let connection = connections.opened();
-                    tokio::spawn(async move {
-                        let _connection = connection;
-                        let _ = conn.await;
-                    });
-                    Ok(sr)
+            let result = async {
+                // Helper to create a connection (plain or TLS)
+                async fn connect_h1(
+                    addr: SocketAddr,
+                    connections: &Connections,
+                    counters: &Arc<Counters>,
+                    diagnostic: &Diagnostic,
+                    observation: &Observation,
+                    drivers: &Drivers,
+                    tls: &Option<(
+                        tokio_rustls::TlsConnector,
+                        rustls::pki_types::ServerName<'static>,
+                    )>,
+                ) -> anyhow::Result<
+                    hyper::client::conn::http1::SendRequest<DiagnosticBody<ObservedBody>>,
+                > {
+                    observation.connecting();
+                    let tcp = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .inspect_err(|_| observation.error("tcp_connect"))?;
+                    let id = observation.socket(tcp.local_addr().ok(), tcp.peer_addr().ok());
+                    let _ = tcp.set_nodelay(true);
+                    if let Some((connector, server_name)) = tls {
+                        let tcp = ObservedTls::new(tcp, counters.clone());
+                        observation.stage("tls_handshake");
+                        let tls_stream = connector
+                            .connect(server_name.clone(), tcp)
+                            .await
+                            .inspect_err(|_| observation.error("tls_handshake"))?;
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        observation.stage("http_handshake");
+                        let (sr, conn) = hyper::client::conn::http1::handshake(io)
+                            .await
+                            .inspect_err(|error| observation.error(h1_error_class(error)))?;
+                        let connection = connections.opened();
+                        drivers
+                            .spawn(diagnostic, id, async move {
+                                let _connection = connection;
+                                conn.await
+                            })
+                            .inspect_err(|_| observation.error("driver_registration"))?;
+                        Ok(sr)
+                    } else {
+                        let io = hyper_util::rt::TokioIo::new(tcp);
+                        observation.stage("http_handshake");
+                        let (sr, conn) = hyper::client::conn::http1::handshake(io)
+                            .await
+                            .inspect_err(|error| observation.error(h1_error_class(error)))?;
+                        let connection = connections.opened();
+                        drivers
+                            .spawn(diagnostic, id, async move {
+                                let _connection = connection;
+                                conn.await
+                            })
+                            .inspect_err(|_| observation.error("driver_registration"))?;
+                        Ok(sr)
+                    }
                 }
-            }
 
-            let mut send_req = connect_h1(addr, &connections, &h1_counters, &tls_connector).await?;
-            let mut reconnects: u64 = 0;
+                let mut send_req = connect_h1(
+                    addr,
+                    &connections,
+                    &h1_counters,
+                    &diagnostic,
+                    &observation,
+                    &drivers,
+                    &tls_connector,
+                )
+                .await?;
+                let mut reconnects: u64 = 0;
 
-            while metrics.next_request().await {
-                // Reconnect if the connection was closed
-                if send_req.is_closed() {
-                    reconnects += 1;
-                    send_req = connect_h1(addr, &connections, &h1_counters, &tls_connector).await?;
-                }
+                observation.stage("next_request");
+                while metrics.next_request().await {
+                    let request_observation = observation.request();
+                    // Reconnect if the connection was closed
+                    if send_req.is_closed() {
+                        reconnects += 1;
+                        send_req = connect_h1(
+                            addr,
+                            &connections,
+                            &h1_counters,
+                            &diagnostic,
+                            &observation,
+                            &drivers,
+                            &tls_connector,
+                        )
+                        .await?;
+                    }
 
-                let req = hyper::Request::post(&path)
-                    .header("host", &authority)
-                    .body(request_body(payload.clone(), metrics.admission()))
-                    .unwrap();
-                let start = Instant::now();
-                match send_req.send_request(req).await {
-                    Ok(resp) => {
-                        use http_body_util::BodyExt;
-                        let status = resp.status();
-                        h1_counters.response_headers(resp.headers());
-                        let counters = h1_counters.clone();
-                        let body = resp.into_body().map_frame(move |frame| {
-                            if let Some(data) = frame.data_ref() {
-                                counters.data_frame(data.len());
-                            }
-                            frame
-                        });
-                        match body.collect().await {
-                            Ok(body) => {
-                                let bytes = body.to_bytes();
-                                let latency = start.elapsed().as_micros() as u64;
-                                if !record_http_echo_result(
-                                    &mut metrics,
-                                    protocol_label,
-                                    status,
-                                    bytes.len(),
-                                    payload.len(),
-                                    bytes.as_ref() == payload.as_ref(),
-                                    latency,
-                                    bytes.as_ref(),
-                                ) {
-                                    break;
+                    let req = hyper::Request::post(&path)
+                        .header("host", &authority)
+                        .body(DiagnosticBody::new(
+                            request_body(payload.clone(), metrics.admission()),
+                            request_observation.clone(),
+                            true,
+                        ))
+                        .unwrap();
+                    let start = Instant::now();
+                    observation.stage("send_request");
+                    match send_req.send_request(req).await {
+                        Ok(resp) => {
+                            use http_body_util::BodyExt;
+                            let status = resp.status();
+                            h1_counters.response_headers(resp.headers());
+                            request_observation.headers(status, resp.version(), resp.headers());
+                            let counters = h1_counters.clone();
+                            let body = DiagnosticBody::new(
+                                resp.into_body(),
+                                request_observation.clone(),
+                                false,
+                            )
+                            .map_frame(move |frame| {
+                                if let Some(data) = frame.data_ref() {
+                                    counters.data_frame(data.len());
+                                }
+                                frame
+                            });
+                            match body.collect().await {
+                                Ok(body) => {
+                                    let bytes = body.to_bytes();
+                                    let latency = start.elapsed().as_micros() as u64;
+                                    let valid = record_http_echo_result(
+                                        &mut metrics,
+                                        protocol_label,
+                                        status,
+                                        bytes.len(),
+                                        payload.len(),
+                                        bytes.as_ref() == payload.as_ref(),
+                                        latency,
+                                        if diagnostic.enabled() {
+                                            &[]
+                                        } else {
+                                            bytes.as_ref()
+                                        },
+                                    );
+                                    request_observation.complete(valid);
+                                    if !valid {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    request_observation.error(h1_error_class(&error));
+                                    report_transport_error(protocol_label, "response body", &error);
+                                    metrics.record_error();
                                 }
                             }
-                            Err(error) => {
-                                report_transport_error(protocol_label, "response body", &error);
-                                metrics.record_error();
-                            }
+                        }
+                        Err(error) => {
+                            // Break out of the per-task loop on connection-level
+                            // send errors (matches run_http2 / run_grpc). Without
+                            // the break, a broken connection that reports fast
+                            // errors without flipping is_closed() can spin the
+                            // loop ~millions of times per second, inflating
+                            // total_errors into the tens of millions at large
+                            // payload sizes. Dropping the task is preferable —
+                            // the other N-1 workers continue producing clean
+                            // throughput data.
+                            request_observation.error(h1_error_class(&error));
+                            report_transport_error(protocol_label, "send_request", &error);
+                            metrics.record_error();
+                            break;
                         }
                     }
-                    Err(error) => {
-                        // Break out of the per-task loop on connection-level
-                        // send errors (matches run_http2 / run_grpc). Without
-                        // the break, a broken connection that reports fast
-                        // errors without flipping is_closed() can spin the
-                        // loop ~millions of times per second, inflating
-                        // total_errors into the tens of millions at large
-                        // payload sizes. Dropping the task is preferable —
-                        // the other N-1 workers continue producing clean
-                        // throughput data.
-                        report_transport_error(protocol_label, "send_request", &error);
-                        metrics.record_error();
-                        break;
-                    }
+                    observation.stage("next_request");
                 }
+                if reconnects > 0 {
+                    eprintln!(
+                        "[http1] task reconnected {reconnects} times over {} requests",
+                        metrics.total_requests
+                    );
+                }
+                Ok(metrics.finish_worker())
             }
-            if reconnects > 0 {
-                eprintln!(
-                    "[http1] task reconnected {reconnects} times over {} requests",
-                    metrics.total_requests
-                );
-            }
-            Ok(metrics.finish_worker())
+            .await;
+            trace.returned(result.is_ok());
+            result
         }));
     }
 
-    let combined = phases.finish(handles).await;
-    print_results(&combined, protocol_label, args);
-    Ok(())
+    let mut combined = phases.finish(handles).await;
+    drivers.retire(&diagnostic, DRIVER_BOUND).await;
+    if let Some(phases) = combined.phases.as_mut() {
+        phases.h1_diagnostic = diagnostic.report();
+    }
+    Ok(combined)
 }
 
 // ── HTTP/2 ───────────────────────────────────────────────────────────────────
