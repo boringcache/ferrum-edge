@@ -939,7 +939,8 @@ fn assert_constructor_debug_fields_withheld(config: Value) {
     let plugin = {
         let _guard = tracing::subscriber::set_default(subscriber);
         tracing::callsite::rebuild_interest_cache();
-        AiSemanticCache::new(&config, http_client).expect("valid cache config must still be admitted")
+        AiSemanticCache::new(&config, http_client)
+            .expect("valid cache config must still be admitted")
     };
     assert_eq!(plugin.name(), "ai_semantic_cache");
 
