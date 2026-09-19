@@ -213,9 +213,10 @@ impl CompiledConditions {
                     // still apply to normal paths like `/api/v1` and
                     // `/v1/api-keys`. Global exemptions use separate anchored
                     // semantics because they short-circuit the entire WAF.
-                    Regex::new(regex)
-                        .map(PathMatcher::Regex)
-                        .map_err(|e| format!("waf: invalid conditions.paths regex: {e}"))
+                    Regex::new(regex).map(PathMatcher::Regex).map_err(|_| {
+                        "waf: invalid conditions.paths regex or complexity limit exceeded"
+                            .to_string()
+                    })
                 } else if let Some(prefix) = pattern.strip_suffix('*') {
                     Ok(PathMatcher::Prefix(prefix.to_string()))
                 } else {
@@ -501,7 +502,7 @@ pub(super) fn compile_rules(
     for (mut rule, is_default) in rules.drain(..) {
         validate_rule(&rule)?;
         if !seen.insert(rule.id.clone()) {
-            return Err(format!("waf: duplicate rule id '{}'", rule.id));
+            return Err(format!("waf: duplicate rule id {:?}", rule.id));
         }
         if is_default {
             seen_default.insert(rule.id.clone());
@@ -559,7 +560,7 @@ pub(super) fn compile_rules(
         let cidr = if rule.match_kind == MatchKind::Cidr {
             Some(IpCidr::parse(&rule.pattern).ok_or_else(|| {
                 format!(
-                    "waf: rule '{}' has invalid CIDR '{}'",
+                    "waf: rule {:?} has invalid CIDR {:?}",
                     rule.id, rule.pattern
                 )
             })?)
@@ -572,7 +573,7 @@ pub(super) fn compile_rules(
             .as_ref()
             .map(CompiledConditions::compile)
             .transpose()
-            .map_err(|e| format!("waf: rule '{}': {e}", rule.id))?;
+            .map_err(|e| format!("waf: rule {:?}: {e}", rule.id))?;
 
         let rule_index = compiled_rules.len();
         let compiled = CompiledRule {
@@ -599,7 +600,7 @@ pub(super) fn compile_rules(
     if !unknown_disabled.is_empty() {
         unknown_disabled.sort_unstable();
         return Err(format!(
-            "waf: 'disabled_default_rules' references unknown default rule id(s): {}",
+            "waf: `disabled_default_rules` references unknown default rule id(s): {:?}",
             unknown_disabled.join(", ")
         ));
     }
@@ -615,7 +616,7 @@ pub(super) fn compile_rules(
     if !unknown.is_empty() {
         unknown.sort_unstable();
         return Err(format!(
-            "waf: 'rule_modes' references unknown rule id(s): {}",
+            "waf: `rule_modes` references unknown rule id(s): {:?}",
             unknown.join(", ")
         ));
     }
@@ -630,7 +631,7 @@ pub(super) fn compile_rules(
     if !unknown_overrides.is_empty() {
         unknown_overrides.sort_unstable();
         return Err(format!(
-            "waf: 'rule_overrides' references unknown rule id(s): {}",
+            "waf: `rule_overrides` references unknown rule id(s): {:?}",
             unknown_overrides.join(", ")
         ));
     }
@@ -653,19 +654,19 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
     }
     if rule.category.trim().is_empty() {
         return Err(format!(
-            "waf: rule '{}' category must be non-empty",
+            "waf: rule {:?} category must be non-empty",
             rule.id
         ));
     }
     if !(1..=4).contains(&rule.paranoia_min) {
         return Err(format!(
-            "waf: rule '{}' paranoia_min must be from 1 to 4",
+            "waf: rule {:?} paranoia_min must be from 1 to 4",
             rule.id
         ));
     }
     if !matches!(rule.match_kind, MatchKind::Luhn) && rule.pattern.is_empty() {
         return Err(format!(
-            "waf: rule '{}' pattern must be non-empty unless match_kind is luhn",
+            "waf: rule {:?} pattern must be non-empty unless match_kind is luhn",
             rule.id
         ));
     }
@@ -674,7 +675,7 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
         && !rule.target.is_response_body()
     {
         return Err(format!(
-            "waf: rule '{}' match_kind luhn is only supported for body targets",
+            "waf: rule {:?} match_kind luhn is only supported for body targets",
             rule.id
         ));
     }
@@ -682,7 +683,7 @@ fn validate_rule(rule: &WafRule) -> Result<(), String> {
         && !matches!(rule.target, RuleTarget::FullUrl)
     {
         return Err(format!(
-            "waf: rule '{}' canonical query-value mirror is only valid for full_url targets",
+            "waf: rule {:?} canonical query-value mirror is only valid for full_url targets",
             rule.id
         ));
     }
@@ -693,9 +694,9 @@ fn compile_fp_filters(rule: &WafRule) -> Result<Option<RegexSet>, String> {
     if rule.fp_filters.is_empty() {
         return Ok(None);
     }
-    RegexSet::new(&rule.fp_filters).map(Some).map_err(|e| {
+    RegexSet::new(&rule.fp_filters).map(Some).map_err(|_| {
         format!(
-            "waf: failed to compile fp_filters for rule '{}': {e}",
+            "waf: `fp_filters` for rule {:?} is invalid or too complex",
             rule.id
         )
     })
@@ -851,29 +852,34 @@ impl PatternBuilder {
         if self.patterns.is_empty() {
             return Ok(None);
         }
-        RegexSetBuilder::new(self.patterns)
+        let set = RegexSetBuilder::new(&self.patterns)
             .build()
-            .map(|set| {
-                Some(TextRuleSet {
-                    set,
-                    refs: self.refs,
-                })
-            })
-            .map_err(|e| format!("waf: failed to build {label} RegexSet: {e}"))
+            .map_err(|_| self.rejection(label))?;
+        Ok(Some(TextRuleSet {
+            set,
+            refs: self.refs,
+        }))
     }
 
     fn finish_bytes(self, label: &str) -> Result<Option<BytesRuleSet>, String> {
         if self.patterns.is_empty() {
             return Ok(None);
         }
-        BytesRegexSet::new(self.patterns)
-            .map(|set| {
-                Some(BytesRuleSet {
-                    set,
-                    refs: self.refs,
-                })
-            })
-            .map_err(|e| format!("waf: failed to build {label} bytes RegexSet: {e}"))
+        let set = BytesRegexSet::new(&self.patterns).map_err(|_| self.rejection(label))?;
+        Ok(Some(BytesRuleSet {
+            set,
+            refs: self.refs,
+        }))
+    }
+
+    fn rejection(&self, label: &str) -> String {
+        // Regex errors can echo patterns without quotes. Keep only schema/set
+        // context and source rule indexes, including aggregate size failures.
+        let indexes: Vec<_> = self.refs.iter().map(|rule| rule.rule_index).collect();
+        format!(
+            "waf: `pattern` set for `{label}` at rule indexes {indexes:?} is invalid \
+             or too complex"
+        )
     }
 }
 
@@ -898,9 +904,10 @@ fn compile_json_path_rule(
             let pattern = rule_pattern(rule);
             Regex::new(&pattern)
                 .map(JsonPathMatcher::Regex)
-                .map_err(|e| {
+                .map_err(|_| {
                     format!(
-                        "waf: failed to compile body_json_path pattern for rule '{}': {e}",
+                        "waf: failed to compile body_json_path pattern for rule {:?} \
+                         (invalid regex or complexity limit exceeded)",
                         rule.id
                     )
                 })?
@@ -921,7 +928,7 @@ fn compile_json_path(path: &str, rule_id: &str) -> Result<Vec<JsonPathSegment>, 
     for segment in path.split('.') {
         if segment.is_empty() {
             return Err(format!(
-                "waf: rule '{rule_id}' body_json_path contains an empty segment"
+                "waf: rule {rule_id:?} body_json_path contains an empty segment"
             ));
         }
         if let Ok(index) = segment.parse::<usize>() {
@@ -932,7 +939,7 @@ fn compile_json_path(path: &str, rule_id: &str) -> Result<Vec<JsonPathSegment>, 
     }
     if segments.is_empty() {
         return Err(format!(
-            "waf: rule '{rule_id}' body_json_path must not be empty"
+            "waf: rule {rule_id:?} body_json_path must not be empty"
         ));
     }
     Ok(segments)
@@ -944,7 +951,7 @@ pub(super) fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, St
         "monitor" | "log" | "warn" => Ok(RuleAction::Monitor),
         "disabled" | "disable" | "off" => Ok(RuleAction::Disabled),
         other => Err(format!(
-            "waf: '{field}' must be one of enforce, monitor, disabled; got {other:?}"
+            "waf: `{field}` must be one of enforce, monitor, disabled; got {other:?}"
         )),
     }
 }
@@ -972,8 +979,8 @@ pub(super) fn parse_rule_overrides(
             for (id, raw) in map {
                 let object = raw
                     .as_object()
-                    .ok_or_else(|| format!("waf: rule_overrides['{id}'] must be an object"))?;
-                let path = format!("config.rule_overrides['{id}']");
+                    .ok_or_else(|| format!("waf: rule_overrides[{id:?}] must be an object"))?;
+                let path = format!("config.rule_overrides[{id:?}]");
                 reject_unknown_keys(object, &path, RULE_OVERRIDE_KEYS, "waf: ")?;
                 let action = optional_string(object, "action")?
                     .map(|raw| parse_rule_action(&raw, "rule_overrides.action"))
@@ -983,7 +990,7 @@ pub(super) fn parse_rule_overrides(
                     && !(1..=4).contains(&p)
                 {
                     return Err(format!(
-                        "waf: rule_overrides['{id}'].paranoia_min must be from 1 to 4"
+                        "waf: rule_overrides[{id:?}].paranoia_min must be from 1 to 4"
                     ));
                 }
                 let severity = optional_string(object, "severity")?
@@ -1010,7 +1017,8 @@ pub(super) fn parse_rule_overrides(
             Ok(out)
         }
         Some(other) => Err(format!(
-            "waf: 'rule_overrides' must be an object, got {other}"
+            "waf: `rule_overrides` must be an object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -1035,7 +1043,7 @@ pub(super) fn parse_custom_rule(
     let target = parse_target(
         object
             .get("target")
-            .ok_or_else(|| format!("waf: custom rule '{id}' requires 'target'"))?,
+            .ok_or_else(|| format!("waf: custom rule {id:?} requires `target`"))?,
         &format!("{path}.target"),
     )?;
     let match_kind = parse_match_kind(
@@ -1195,7 +1203,7 @@ fn parse_conditions(value: &Value, path: &str) -> Result<Conditions, String> {
 }
 
 fn required_string(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
-    optional_string(object, key)?.ok_or_else(|| format!("waf: missing required string '{key}'"))
+    optional_string(object, key)?.ok_or_else(|| format!("waf: missing required string `{key}`"))
 }
 
 fn optional_string(
@@ -1205,8 +1213,11 @@ fn optional_string(
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
-        Some(Value::String(_)) => Err(format!("waf: '{key}' must be non-empty")),
-        Some(other) => Err(format!("waf: '{key}' must be a string, got {other}")),
+        Some(Value::String(_)) => Err(format!("waf: `{key}` must be non-empty")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1217,8 +1228,11 @@ fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Opt
             .as_u64()
             .and_then(|v| u8::try_from(v).ok())
             .map(Some)
-            .ok_or_else(|| format!("waf: '{key}' must be an integer from 0 to 255")),
-        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+            .ok_or_else(|| format!("waf: `{key}` must be an integer from 0 to 255")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an integer, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1229,8 +1243,11 @@ fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .map(Some)
-            .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
-        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+            .ok_or_else(|| format!("waf: `{key}` must be a non-negative integer")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an integer, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 
@@ -1244,16 +1261,19 @@ fn optional_string_vec(
             let mut parsed = Vec::with_capacity(values.len());
             for value in values {
                 let Some(raw) = value.as_str() else {
-                    return Err(format!("waf: '{key}' entries must be strings"));
+                    return Err(format!("waf: `{key}` entries must be strings"));
                 };
                 if raw.is_empty() {
-                    return Err(format!("waf: '{key}' entries must be non-empty"));
+                    return Err(format!("waf: `{key}` entries must be non-empty"));
                 }
                 parsed.push(raw.to_string());
             }
             Ok(Some(parsed))
         }
-        Some(other) => Err(format!("waf: '{key}' must be an array, got {other}")),
+        Some(other) => Err(format!(
+            "waf: `{key}` must be an array, got {other:?}",
+            other = other.to_string()
+        )),
     }
 }
 

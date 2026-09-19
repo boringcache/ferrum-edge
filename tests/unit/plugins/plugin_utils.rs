@@ -644,7 +644,7 @@ pub fn ensure_basic_auth_test_secret() {
 /// build opens a bracket on its own thread, so an unbracketed construction on
 /// another thread is a no-op only while no sibling test happens to be
 /// mid-build; otherwise it writes into that sibling's staging map, or fails
-/// with `named schema 'default' registered more than once` when the sibling
+/// with `named schema "default" registered more than once` when the sibling
 /// (or a third bare constructor) staged the same name first. Holding the
 /// serializer guarantees no other thread has a bracket open.
 ///

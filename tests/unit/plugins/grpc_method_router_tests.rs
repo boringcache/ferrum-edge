@@ -606,7 +606,7 @@ fn test_non_array_method_list_rejected() {
         .err()
         .expect("non-array deny_methods must be rejected");
     assert!(
-        err.contains("'deny_methods' must be an array"),
+        err.contains("`deny_methods` must be an array"),
         "got: {err}"
     );
 }
@@ -618,7 +618,7 @@ fn test_non_string_method_list_entry_rejected() {
         .err()
         .expect("non-string allow_methods entry must be rejected");
     assert!(
-        err.contains("'allow_methods[0]' must be a string"),
+        err.contains("`allow_methods[0]` must be a string"),
         "got: {err}"
     );
 }
@@ -769,7 +769,7 @@ fn test_method_rate_limits_must_be_object() {
         .err()
         .expect("non-object method_rate_limits must be rejected");
     assert!(
-        err.contains("'method_rate_limits' must be an object"),
+        err.contains("`method_rate_limits` must be an object"),
         "got: {err}"
     );
 }

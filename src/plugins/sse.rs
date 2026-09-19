@@ -523,7 +523,7 @@ fn optional_positive_u64_config(
             Some(value) if value > 0 => Ok(Some(value)),
             Some(_) => Err(format!("sse: '{key}' must be greater than zero")),
             None => Err(format!(
-                "sse: '{key}' must be an unsigned integer, got: {number}"
+                "sse: `{key}` must be an unsigned integer, got: \"{number}\""
             )),
         },
         Some(other) => Err(format!(

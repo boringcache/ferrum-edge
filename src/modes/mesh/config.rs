@@ -749,14 +749,14 @@ fn mesh_ext_authz_header_is_reserved(lowercase: &str) -> bool {
 pub fn validate_mesh_ext_authz_forwarded_header(name: &str) -> Result<String, String> {
     if !mesh_ext_authz_header_name_is_wellformed(name) {
         return Err(format!(
-            "'{}' is not a valid HTTP header name (RFC 9110 token, at most {MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN} bytes)",
+            "{:?} is not a valid HTTP header name (RFC 9110 token, at most {MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN} bytes)",
             sanitize_mesh_ext_authz_diagnostic(name)
         ));
     }
     let lowercase = name.to_ascii_lowercase();
     if mesh_ext_authz_header_is_reserved(&lowercase) {
         return Err(format!(
-            "'{lowercase}' is a hop-by-hop, framing, routing, or gateway-reserved header and cannot be forwarded to an external authorization provider"
+            "{lowercase:?} is a hop-by-hop, framing, routing, or gateway-reserved header and cannot be forwarded to an external authorization provider"
         ));
     }
     Ok(lowercase)
@@ -768,7 +768,7 @@ pub fn validate_mesh_ext_authz_mutable_header(name: &str) -> Result<String, Stri
     let lowercase = validate_mesh_ext_authz_forwarded_header(name)?;
     if MESH_EXT_AUTHZ_UNMUTABLE_HEADERS.contains(&lowercase.as_str()) {
         return Err(format!(
-            "'{lowercase}' controls request provenance or proxy authentication and cannot be mutated by an external authorization provider"
+            "{lowercase:?} controls request provenance or proxy authentication and cannot be mutated by an external authorization provider"
         ));
     }
     Ok(lowercase)
@@ -965,38 +965,38 @@ impl MeshExtAuthzProvider {
         }
         validate_mesh_ext_authz_service_host(&self.service).map_err(|error| {
             format!(
-                "extensionProviders '{}' {error}",
+                "extensionProviders {:?} {error}",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             )
         })?;
         if self.port == 0 {
             return Err(format!(
-                "extensionProviders '{}' port must be between 1 and 65535",
+                "extensionProviders {:?} port must be between 1 and 65535",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
         if !self.tls && !mesh_ext_authz_host_is_loopback(&self.service) {
             return Err(format!(
-                "extensionProviders '{}' must set an https scheme for a non-loopback external authorization service; plaintext ext-authz would expose the check (and any forwarded credential) to the network",
+                "extensionProviders {:?} must set an https scheme for a non-loopback external authorization service; plaintext ext-authz would expose the check (and any forwarded credential) to the network",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
         if self.timeout_ms == 0 || self.timeout_ms > MESH_EXT_AUTHZ_MAX_TIMEOUT_MS {
             return Err(format!(
-                "extensionProviders '{}' timeout must be between 1ms and {MESH_EXT_AUTHZ_MAX_TIMEOUT_MS}ms",
+                "extensionProviders {:?} timeout must be between 1ms and {MESH_EXT_AUTHZ_MAX_TIMEOUT_MS}ms",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
         if !(400..=599).contains(&self.status_on_error) {
             return Err(format!(
-                "extensionProviders '{}' statusOnError must be a 4xx or 5xx status",
+                "extensionProviders {:?} statusOnError must be a 4xx or 5xx status",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
         if let Some(prefix) = self.path_prefix.as_deref() {
             validate_mesh_ext_authz_path_prefix(prefix).map_err(|error| {
                 format!(
-                    "extensionProviders '{}' {error}",
+                    "extensionProviders {:?} {error}",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
                 )
             })?;
@@ -1019,13 +1019,13 @@ impl MeshExtAuthzProvider {
         // contract is in force when it is not.
         if !self.headers_to_upstream_on_allow.is_empty() {
             return Err(format!(
-                "extensionProviders '{}' headersToUpstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate the backend-visible request",
+                "extensionProviders {:?} headersToUpstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate the backend-visible request",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
         if !self.headers_to_downstream_on_allow.is_empty() {
             return Err(format!(
-                "extensionProviders '{}' headersToDownstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate an allowed response",
+                "extensionProviders {:?} headersToDownstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate an allowed response",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
@@ -1040,7 +1040,7 @@ impl MeshExtAuthzProvider {
         )?;
         if self.include_additional_headers_in_check.len() > MAX_MESH_EXT_AUTHZ_HEADER_RULES {
             return Err(format!(
-                "extensionProviders '{}' includeAdditionalHeadersInCheck supports at most {MAX_MESH_EXT_AUTHZ_HEADER_RULES} entries",
+                "extensionProviders {:?} includeAdditionalHeadersInCheck supports at most {MAX_MESH_EXT_AUTHZ_HEADER_RULES} entries",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
@@ -1054,19 +1054,19 @@ impl MeshExtAuthzProvider {
             let normalized =
                 validate_mesh_ext_authz_forwarded_header(&header.name).map_err(|error| {
                     format!(
-                        "extensionProviders '{}' includeAdditionalHeadersInCheck {error}",
+                        "extensionProviders {:?} includeAdditionalHeadersInCheck {error}",
                         sanitize_mesh_ext_authz_diagnostic(&self.name)
                     )
                 })?;
             if !fixed_names.insert(normalized.clone()) {
                 return Err(format!(
-                    "extensionProviders '{}' includeAdditionalHeadersInCheck declares '{normalized}' more than once (header names are case-insensitive)",
+                    "extensionProviders {:?} includeAdditionalHeadersInCheck declares {normalized:?} more than once (header names are case-insensitive)",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
                 ));
             }
             if header.name != normalized {
                 return Err(format!(
-                    "extensionProviders '{}' includeAdditionalHeadersInCheck names must be normalized to lowercase ('{normalized}')",
+                    "extensionProviders {:?} includeAdditionalHeadersInCheck names must be normalized to lowercase ({normalized:?})",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
                 ));
             }
@@ -1077,7 +1077,7 @@ impl MeshExtAuthzProvider {
                     .any(|byte| byte.is_ascii_control() || !byte.is_ascii())
             {
                 return Err(format!(
-                    "extensionProviders '{}' includeAdditionalHeadersInCheck value for '{}' must be printable ASCII and at most {MAX_MESH_EXT_AUTHZ_HEADER_VALUE_LEN} bytes",
+                    "extensionProviders {:?} includeAdditionalHeadersInCheck value for {:?} must be printable ASCII and at most {MAX_MESH_EXT_AUTHZ_HEADER_VALUE_LEN} bytes",
                     sanitize_mesh_ext_authz_diagnostic(&self.name),
                     sanitize_mesh_ext_authz_diagnostic(&header.name)
                 ));
@@ -1088,7 +1088,7 @@ impl MeshExtAuthzProvider {
                 || body.max_request_bytes > MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES
             {
                 return Err(format!(
-                    "extensionProviders '{}' includeRequestBodyInCheck.maxRequestBytes must be between 1 and {MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES}",
+                    "extensionProviders {:?} includeRequestBodyInCheck.maxRequestBytes must be between 1 and {MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES}",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
                 ));
             }
@@ -1105,7 +1105,7 @@ impl MeshExtAuthzProvider {
             // large bodies are being checked when the request is really 413ed.
             if body.allow_partial_message {
                 return Err(format!(
-                    "extensionProviders '{}' includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the complete buffered body and returns 413 at maxRequestBytes instead of checking a truncated prefix",
+                    "extensionProviders {:?} includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the complete buffered body and returns 413 at maxRequestBytes instead of checking a truncated prefix",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
                 ));
             }
@@ -1121,7 +1121,7 @@ impl MeshExtAuthzProvider {
     ) -> Result<(), String> {
         if names.len() > MAX_MESH_EXT_AUTHZ_HEADER_RULES {
             return Err(format!(
-                "extensionProviders '{}' {field} supports at most {MAX_MESH_EXT_AUTHZ_HEADER_RULES} entries",
+                "extensionProviders {:?} {field} supports at most {MAX_MESH_EXT_AUTHZ_HEADER_RULES} entries",
                 sanitize_mesh_ext_authz_diagnostic(provider)
             ));
         }
@@ -1129,19 +1129,19 @@ impl MeshExtAuthzProvider {
         for name in names {
             let normalized = validator(name).map_err(|error| {
                 format!(
-                    "extensionProviders '{}' {field} {error}",
+                    "extensionProviders {:?} {field} {error}",
                     sanitize_mesh_ext_authz_diagnostic(provider)
                 )
             })?;
             if !seen.insert(normalized.clone()) {
                 return Err(format!(
-                    "extensionProviders '{}' {field} declares '{normalized}' more than once (header names are case-insensitive)",
+                    "extensionProviders {:?} {field} declares {normalized:?} more than once (header names are case-insensitive)",
                     sanitize_mesh_ext_authz_diagnostic(provider)
                 ));
             }
             if *name != normalized {
                 return Err(format!(
-                    "extensionProviders '{}' {field} names must be normalized to lowercase ('{normalized}')",
+                    "extensionProviders {:?} {field} names must be normalized to lowercase ({normalized:?})",
                     sanitize_mesh_ext_authz_diagnostic(provider)
                 ));
             }
@@ -1174,7 +1174,7 @@ pub fn validate_mesh_ext_authz_binding(
             };
             if !providers.iter().any(|candidate| candidate.name == provider) {
                 errors.push(format!(
-                    "AuthorizationPolicy '{}' in namespace '{}' uses action CUSTOM with provider '{}', which is not declared in meshConfig.extensionProviders",
+                    "AuthorizationPolicy {:?} in namespace {:?} uses action CUSTOM with provider {:?}, which is not declared in meshConfig.extensionProviders",
                     sanitize_mesh_ext_authz_diagnostic(&policy.name),
                     sanitize_mesh_ext_authz_diagnostic(&policy.namespace),
                     sanitize_mesh_ext_authz_diagnostic(provider)
@@ -1197,7 +1197,7 @@ pub fn validate_mesh_ext_authz_providers(providers: &[MeshExtAuthzProvider]) -> 
         provider.validate()?;
         if !seen.insert(provider.name.as_str()) {
             return Err(format!(
-                "duplicate mesh ext-authz provider '{}'",
+                "duplicate mesh ext-authz provider {:?}",
                 sanitize_mesh_ext_authz_diagnostic(&provider.name)
             ));
         }
@@ -1262,19 +1262,21 @@ impl ParsedCidr {
             Some((net, plen)) => {
                 let prefix = plen
                     .parse::<u8>()
-                    .map_err(|_| format!("invalid prefix length in CIDR '{s}'"))?;
+                    .map_err(|_| format!("invalid prefix length in CIDR {s:?}"))?;
                 (net, Some(prefix))
             }
             None => (trimmed, None),
         };
         let ip: IpAddr = network_str
             .parse()
-            .map_err(|_| format!("invalid IP in CIDR '{s}'"))?;
+            .map_err(|_| format!("invalid IP in CIDR {s:?}"))?;
         let (network, prefix) =
-            Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR '{s}'"))?;
+            Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR {s:?}"))?;
         let max = if network.is_ipv4() { 32 } else { 128 };
         if prefix > max {
-            return Err(format!("prefix length {prefix} out of range in CIDR '{s}'"));
+            return Err(format!(
+                "prefix length \"{prefix}\" out of range (maximum {max}) in CIDR {s:?}"
+            ));
         }
         Ok(Self { network, prefix })
     }
@@ -1310,7 +1312,7 @@ impl ParsedCidr {
                         Some(p) if p >= 96 => p - 96,
                         Some(p) => {
                             return Err(format!(
-                                "IPv4-mapped IPv6 CIDR prefix {p} must be at least 96"
+                                "IPv4-mapped IPv6 CIDR prefix \"{p}\" must be at least 96"
                             ));
                         }
                         None => 32,
@@ -1749,7 +1751,7 @@ pub fn validate_mesh_condition(
         // `MAX_MESH_CONDITION_KEY_LEN` printable UTF-8 bytes, and operators
         // cannot fix the policy without seeing which key failed.
         return Err(vec![MeshConditionIssue::key(format!(
-            "'{}' is unsupported (expected one of source.principal, source.namespace, \
+            "{:?} is unsupported (expected one of source.principal, source.namespace, \
              source.serviceAccount, source.trustDomain, source.ip, remote.ip, destination.ip, \
              destination.port, connection.sni, \
              request.auth.principal, request.auth.presenter, request.auth.audiences, \
@@ -1937,16 +1939,17 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
         Some((net, prefix_str)) => {
             let ip = net
                 .parse::<IpAddr>()
-                .map_err(|_| format!("invalid IP in CIDR '{cidr}'"))?;
+                .map_err(|_| format!("invalid IP in CIDR {cidr:?}"))?;
             let prefix = prefix_str
                 .parse::<u8>()
-                .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
+                .map_err(|_| format!("invalid prefix length in CIDR {cidr:?}"))?;
             let max = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(v6) => {
                     if v6.to_ipv4_mapped().is_some() && prefix < 96 {
                         return Err(format!(
-                            "IPv4-mapped IPv6 CIDR prefix {prefix} must be at least 96 in CIDR '{cidr}'"
+                            "IPv4-mapped IPv6 CIDR prefix \"{prefix}\" must be at least 96 in \
+                             CIDR {cidr:?}"
                         ));
                     }
                     128
@@ -1954,7 +1957,7 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
             };
             if prefix > max {
                 return Err(format!(
-                    "prefix length {prefix} out of range in CIDR '{cidr}'"
+                    "prefix length \"{prefix}\" out of range (maximum {max}) in CIDR {cidr:?}"
                 ));
             }
             Ok(())
@@ -1962,7 +1965,7 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
         None => trimmed
             .parse::<IpAddr>()
             .map(|_| ())
-            .map_err(|_| format!("invalid IP address '{cidr}'")),
+            .map_err(|_| format!("invalid IP address {cidr:?}")),
     }
 }
 
@@ -2286,30 +2289,30 @@ pub fn validate_mesh_jwt_claim_header(
     let header = header.trim();
     if !mesh_ext_authz_header_name_is_wellformed(header) {
         return Err(format!(
-            "outputClaimToHeaders header '{}' is not a valid HTTP header name (RFC 9110 token, at most {MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN} bytes)",
+            "outputClaimToHeaders header {:?} is not a valid HTTP header name (RFC 9110 token, at most {MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN} bytes)",
             sanitize_mesh_ext_authz_diagnostic(header)
         ));
     }
     let lowercase = header.to_ascii_lowercase();
     if crate::plugins::utils::claim_header_fanout::is_output_claim_reserved_header(&lowercase) {
         return Err(format!(
-            "outputClaimToHeaders header '{lowercase}' is hop-by-hop, framing, routing, credential-bearing, or gateway-reserved and cannot carry a JWT claim"
+            "outputClaimToHeaders header {lowercase:?} is hop-by-hop, framing, routing, credential-bearing, or gateway-reserved and cannot carry a JWT claim"
         ));
     }
     let claim = claim.trim();
     if claim.is_empty() || claim.split('.').any(str::is_empty) {
         return Err(format!(
-            "outputClaimToHeaders claim for header '{lowercase}' must be a non-empty dot path without empty segments"
+            "outputClaimToHeaders claim for header {lowercase:?} must be a non-empty dot path without empty segments"
         ));
     }
     if claim.len() > MAX_MESH_JWT_CLAIM_PATH_LEN {
         return Err(format!(
-            "outputClaimToHeaders claim for header '{lowercase}' must be at most {MAX_MESH_JWT_CLAIM_PATH_LEN} bytes"
+            "outputClaimToHeaders claim for header {lowercase:?} must be at most {MAX_MESH_JWT_CLAIM_PATH_LEN} bytes"
         ));
     }
     if claim.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(format!(
-            "outputClaimToHeaders claim for header '{lowercase}' must not contain whitespace or control characters"
+            "outputClaimToHeaders claim for header {lowercase:?} must not contain whitespace or control characters"
         ));
     }
     Ok((lowercase, claim.to_string()))
@@ -2333,7 +2336,7 @@ pub fn validate_mesh_jwt_output_claim_headers(
         let (header, _claim) = validate_mesh_jwt_claim_header(&entry.header, &entry.claim)?;
         if seen.contains(&header) {
             return Err(format!(
-                "outputClaimToHeaders declares header '{header}' more than once; a destination may be asserted from exactly one claim"
+                "outputClaimToHeaders declares header {header:?} more than once; a destination may be asserted from exactly one claim"
             ));
         }
         seen.push(header);
@@ -2551,9 +2554,9 @@ where
         return Ok(Vec::new());
     }
     if value.is_array() {
-        serde_json::from_value(value).map_err(serde::de::Error::custom)
+        crate::util::deserialization::from_json_value(value).map_err(serde::de::Error::custom)
     } else {
-        serde_json::from_value(value)
+        crate::util::deserialization::from_json_value(value)
             .map(|provider| vec![provider])
             .map_err(serde::de::Error::custom)
     }
@@ -3058,7 +3061,7 @@ impl TrustBundle {
             .map(|(i, s)| {
                 engine
                     .decode(s.as_bytes())
-                    .map_err(|e| format!("x509_authorities[{}]: invalid base64: {}", i, e))
+                    .map_err(|_| format!("x509_authorities[{}]: invalid base64", i))
             })
             .collect()
     }
@@ -4513,7 +4516,7 @@ impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
             "prefix" => Ok(MeshCorsOriginMatch::Prefix(value)),
             "regex" => Ok(MeshCorsOriginMatch::Regex(value)),
             other => Err(D::Error::custom(format!(
-                "unknown CORS origin matcher `{other}` (expected `exact`, `prefix`, or `regex`)"
+                "unknown CORS origin matcher {other:?} (expected `exact`, `prefix`, or `regex`)"
             ))),
         }
     }
@@ -6653,7 +6656,7 @@ fn validate_virtual_service_cors_policies(
 ) {
     for policy in policies {
         let context = format!(
-            "MeshVirtualServiceCorsPolicy '{}/{}'",
+            "MeshVirtualServiceCorsPolicy {:?}/{:?}",
             policy.namespace, policy.name
         );
         validate_non_empty_string(format!("{context}.name"), &policy.name, errors);
@@ -6802,27 +6805,27 @@ fn validate_mesh_config_internal(
     for wl in workloads {
         if wl.spiffe_id.trust_domain() != &wl.trust_domain {
             errors.push(format!(
-                "Workload '{}': spiffe_id trust domain '{}' does not match \
-                 workload's trust_domain '{}'",
+                "Workload {:?}: spiffe_id trust domain {:?} does not match \
+                 workload trust_domain {:?}",
                 wl.spiffe_id,
                 wl.spiffe_id.trust_domain(),
                 wl.trust_domain
             ));
         }
         validate_non_empty_string(
-            format!("Workload '{}'.namespace", wl.spiffe_id),
+            format!("Workload {:?}.namespace", wl.spiffe_id),
             &wl.namespace,
             &mut errors,
         );
         validate_non_empty_string(
-            format!("Workload '{}'.service_name", wl.spiffe_id),
+            format!("Workload {:?}.service_name", wl.spiffe_id),
             &wl.service_name,
             &mut errors,
         );
         if let Some(service_namespace) = wl.service_namespace.as_deref() {
             if service_namespace.trim().is_empty() {
                 errors.push(format!(
-                    "Workload '{}'.service_namespace: must not be empty when set",
+                    "Workload {:?}.service_namespace: must not be empty when set",
                     wl.spiffe_id
                 ));
             } else if service_namespace != wl.namespace {
@@ -6841,8 +6844,8 @@ fn validate_mesh_config_internal(
                 });
                 if !authorized {
                     errors.push(format!(
-                        "Workload '{}'.service_namespace: cross-namespace attachment to \
-                         '{}/{}' requires that MeshService to list this workload's SPIFFE id",
+                        "Workload {:?}.service_namespace: cross-namespace attachment to \
+                         {:?}/{:?} requires that MeshService to list this workload SPIFFE id",
                         wl.spiffe_id, service_namespace, wl.service_name
                     ));
                 }
@@ -6851,14 +6854,14 @@ fn validate_mesh_config_internal(
         for (i, address) in wl.addresses.iter().enumerate() {
             if address.trim().is_empty() {
                 errors.push(format!(
-                    "Workload '{}'.addresses[{}]: address must not be empty",
+                    "Workload {:?}.addresses[{}]: address must not be empty",
                     wl.spiffe_id, i
                 ));
             }
         }
         for (i, port) in wl.ports.iter().enumerate() {
             validate_non_zero_port(
-                format!("Workload '{}'.ports[{}].port", wl.spiffe_id, i),
+                format!("Workload {:?}.ports[{}].port", wl.spiffe_id, i),
                 port.port,
                 &mut errors,
             );
@@ -6869,7 +6872,7 @@ fn validate_mesh_config_internal(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "Workload '{}': network must not be empty when set",
+                "Workload {:?}: network must not be empty when set",
                 wl.spiffe_id
             ));
         }
@@ -6879,18 +6882,18 @@ fn validate_mesh_config_internal(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "Workload '{}': cluster must not be empty when set",
+                "Workload {:?}: cluster must not be empty when set",
                 wl.spiffe_id
             ));
         }
         if let Some(endpoint) = &wl.node_waypoint {
             validate_non_empty_string(
-                format!("Workload '{}'.node_waypoint.address", wl.spiffe_id),
+                format!("Workload {:?}.node_waypoint.address", wl.spiffe_id),
                 &endpoint.address,
                 &mut errors,
             );
             validate_non_zero_port(
-                format!("Workload '{}'.node_waypoint.hbone_port", wl.spiffe_id),
+                format!("Workload {:?}.node_waypoint.hbone_port", wl.spiffe_id),
                 endpoint.hbone_port,
                 &mut errors,
             );
@@ -6900,7 +6903,7 @@ fn validate_mesh_config_internal(
                 .is_some_and(|value| value.trim().is_empty())
             {
                 errors.push(format!(
-                    "Workload '{}'.node_waypoint.node_name: must not be empty when set",
+                    "Workload {:?}.node_waypoint.node_name: must not be empty when set",
                     wl.spiffe_id
                 ));
             }
@@ -6910,7 +6913,7 @@ fn validate_mesh_config_internal(
                 .is_some_and(|value| value.trim().is_empty())
             {
                 errors.push(format!(
-                    "Workload '{}'.node_waypoint.node_uid: must not be empty when set",
+                    "Workload {:?}.node_waypoint.node_uid: must not be empty when set",
                     wl.spiffe_id
                 ));
             }
@@ -6920,7 +6923,7 @@ fn validate_mesh_config_internal(
                 .is_some_and(|value| value.trim().is_empty())
             {
                 errors.push(format!(
-                    "Workload '{}'.node_waypoint.network: must not be empty when set",
+                    "Workload {:?}.node_waypoint.network: must not be empty when set",
                     wl.spiffe_id
                 ));
             }
@@ -6930,7 +6933,7 @@ fn validate_mesh_config_internal(
                 .is_some_and(|value| value.trim().is_empty())
             {
                 errors.push(format!(
-                    "Workload '{}'.node_waypoint.cluster: must not be empty when set",
+                    "Workload {:?}.node_waypoint.cluster: must not be empty when set",
                     wl.spiffe_id
                 ));
             }
@@ -6941,23 +6944,23 @@ fn validate_mesh_config_internal(
     for svc in services {
         validate_non_empty_string("MeshService.name".to_string(), &svc.name, &mut errors);
         validate_non_empty_string(
-            format!("MeshService '{}'.namespace", svc.name),
+            format!("MeshService {:?}.namespace", svc.name),
             &svc.namespace,
             &mut errors,
         );
         for (i, port) in svc.ports.iter().enumerate() {
             validate_non_zero_port(
-                format!("MeshService '{}'.ports[{}].port", svc.name, i),
+                format!("MeshService {:?}.ports[{}].port", svc.name, i),
                 port.port,
                 &mut errors,
             );
             match &port.target_port {
                 Some(ServiceTargetPort::Number(0)) => errors.push(format!(
-                    "MeshService '{}'.ports[{}].target_port: numeric targetPort must be greater than 0",
+                    "MeshService {:?}.ports[{}].target_port: numeric targetPort must be greater than 0",
                     svc.name, i
                 )),
                 Some(ServiceTargetPort::Name(name)) if name.trim().is_empty() => errors.push(format!(
-                    "MeshService '{}'.ports[{}].target_port: named targetPort must not be empty",
+                    "MeshService {:?}.ports[{}].target_port: named targetPort must not be empty",
                     svc.name, i
                 )),
                 _ => {}
@@ -6965,7 +6968,10 @@ fn validate_mesh_config_internal(
         }
         for port in svc.protocol_overrides.keys() {
             validate_non_zero_port(
-                format!("MeshService '{}'.protocol_overrides[{}]", svc.name, port),
+                format!(
+                    "MeshService {:?}.protocol_overrides[\"{}\"]",
+                    svc.name, port
+                ),
                 *port,
                 &mut errors,
             );
@@ -6973,8 +6979,8 @@ fn validate_mesh_config_internal(
         for (i, vip) in svc.cluster_ips.iter().enumerate() {
             if vip.parse::<std::net::IpAddr>().is_err() {
                 errors.push(format!(
-                    "MeshService '{}'.cluster_ips[{}]: '{}' is not a valid IP address \
-                     (headless services should omit cluster_ips, not carry 'None')",
+                    "MeshService {:?}.cluster_ips[{}]: {:?} is not a valid IP address \
+                     (headless services should omit cluster_ips, not carry `None`)",
                     svc.name, i, vip
                 ));
             }
@@ -6985,7 +6991,7 @@ fn validate_mesh_config_internal(
     for policy in policies {
         validate_non_empty_string("MeshPolicy.name".to_string(), &policy.name, &mut errors);
         validate_non_empty_string(
-            format!("MeshPolicy '{}'.namespace", policy.name),
+            format!("MeshPolicy {:?}.namespace", policy.name),
             &policy.namespace,
             &mut errors,
         );
@@ -7009,37 +7015,37 @@ fn validate_mesh_config_internal(
                     && principal.trust_domain_pattern.is_none()
                 {
                     errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].from[{}]: at least one \
+                        "MeshPolicy {:?}.rules[{}].from[{}]: at least one \
                          of spiffe_id_pattern/namespace_pattern/trust_domain/\
                          trust_domain_pattern must be set",
                         policy.name, i, j
                     ));
                 }
                 if let Some(pat) = principal.spiffe_id_pattern.as_ref()
-                    && let Err(e) = glob::Pattern::new(pat)
+                    && glob::Pattern::new(pat).is_err()
                 {
                     errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].from[{}].spiffe_id_pattern \
-                         '{}' is not a valid glob: {}",
-                        policy.name, i, j, pat, e
+                        "MeshPolicy {:?}.rules[{}].from[{}].spiffe_id_pattern \
+                         {:?} is not a valid glob",
+                        policy.name, i, j, pat
                     ));
                 }
                 if let Some(pat) = principal.namespace_pattern.as_ref()
-                    && let Err(e) = glob::Pattern::new(pat)
+                    && glob::Pattern::new(pat).is_err()
                 {
                     errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].from[{}].namespace_pattern \
-                         '{}' is not a valid glob: {}",
-                        policy.name, i, j, pat, e
+                        "MeshPolicy {:?}.rules[{}].from[{}].namespace_pattern \
+                         {:?} is not a valid glob",
+                        policy.name, i, j, pat
                     ));
                 }
                 if let Some(pat) = principal.trust_domain_pattern.as_ref()
-                    && let Err(e) = glob::Pattern::new(pat)
+                    && glob::Pattern::new(pat).is_err()
                 {
                     errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].from[{}].trust_domain_pattern \
-                         '{}' is not a valid glob: {}",
-                        policy.name, i, j, pat, e
+                        "MeshPolicy {:?}.rules[{}].from[{}].trust_domain_pattern \
+                         {:?} is not a valid glob",
+                        policy.name, i, j, pat
                     ));
                 }
             }
@@ -7056,7 +7062,7 @@ fn validate_mesh_config_internal(
                     || !request.not_port_patterns.is_empty();
                 if !(any_method || any_path || any_host || any_header || any_port || any_not) {
                     errors.push(format!(
-                        "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \
+                        "MeshPolicy {:?}.rules[{}].to[{}]: at least one of \
                          methods/paths/hosts/headers/ports or their negated \
                          counterparts must be non-empty",
                         policy.name, i, j
@@ -7065,10 +7071,10 @@ fn validate_mesh_config_internal(
                 for (k, host) in request.hosts.iter().enumerate() {
                     if !is_valid_request_match_host_pattern(host) {
                         errors.push(format!(
-                            "MeshPolicy '{}'.rules[{}].to[{}].hosts[{}] \
-                             '{}' is not a valid host pattern \
+                            "MeshPolicy {:?}.rules[{}].to[{}].hosts[{}] \
+                             {:?} is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or '*' port)",
+                             with u16 numeric or `*` port)",
                             policy.name, i, j, k, host
                         ));
                     }
@@ -7076,10 +7082,10 @@ fn validate_mesh_config_internal(
                 for (k, host) in request.not_hosts.iter().enumerate() {
                     if !is_valid_request_match_host_pattern(host) {
                         errors.push(format!(
-                            "MeshPolicy '{}'.rules[{}].to[{}].not_hosts[{}] \
-                             '{}' is not a valid host pattern \
+                            "MeshPolicy {:?}.rules[{}].to[{}].not_hosts[{}] \
+                             {:?} is not a valid host pattern \
                              (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or '*' port)",
+                             with u16 numeric or `*` port)",
                             policy.name, i, j, k, host
                         ));
                     }
@@ -7087,9 +7093,9 @@ fn validate_mesh_config_internal(
                 for (k, pattern) in request.port_patterns.iter().enumerate() {
                     if !is_valid_request_match_port_pattern(pattern) {
                         errors.push(format!(
-                            "MeshPolicy '{}'.rules[{}].to[{}].port_patterns[{}] \
+                            "MeshPolicy {:?}.rules[{}].to[{}].port_patterns[{}] \
                              is not an admissible port pattern \
-                             (expected '*', '<digits>*', or '*<digits>' that can \
+                             (expected `*`, `<digits>*`, or `*<digits>` that can \
                              match a destination/listener port in 1..=65535)",
                             policy.name, i, j, k
                         ));
@@ -7098,9 +7104,9 @@ fn validate_mesh_config_internal(
                 for (k, pattern) in request.not_port_patterns.iter().enumerate() {
                     if !is_valid_request_match_port_pattern(pattern) {
                         errors.push(format!(
-                            "MeshPolicy '{}'.rules[{}].to[{}].not_port_patterns[{}] \
+                            "MeshPolicy {:?}.rules[{}].to[{}].not_port_patterns[{}] \
                              is not an admissible port pattern \
-                             (expected '*', '<digits>*', or '*<digits>' that can \
+                             (expected `*`, `<digits>*`, or `*<digits>` that can \
                              match a destination/listener port in 1..=65535)",
                             policy.name, i, j, k
                         ));
@@ -7109,7 +7115,7 @@ fn validate_mesh_config_internal(
             }
             if rule.when.len() > MAX_MESH_RULE_CONDITIONS {
                 errors.push(format!(
-                    "MeshPolicy '{}'.rules[{}].when must have at most \
+                    "MeshPolicy {:?}.rules[{}].when must have at most \
                      {MAX_MESH_RULE_CONDITIONS} entries",
                     policy.name, i
                 ));
@@ -7118,7 +7124,7 @@ fn validate_mesh_config_internal(
                 if let Err(issues) = validate_mesh_condition(condition) {
                     for issue in issues {
                         errors.push(format!(
-                            "MeshPolicy '{}'.rules[{}].when[{}].{} {}",
+                            "MeshPolicy {:?}.rules[{}].when[{}].{} {}",
                             policy.name,
                             i,
                             j,
@@ -7135,7 +7141,7 @@ fn validate_mesh_config_internal(
     for pa in peer_auths {
         validate_non_empty_string("PeerAuthentication.name".to_string(), &pa.name, &mut errors);
         validate_non_empty_string(
-            format!("PeerAuthentication '{}'.namespace", pa.name),
+            format!("PeerAuthentication {:?}.namespace", pa.name),
             &pa.namespace,
             &mut errors,
         );
@@ -7149,21 +7155,25 @@ fn validate_mesh_config_internal(
         }
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
-                format!("PeerAuthentication '{}'.port_overrides[{}]", pa.name, port),
+                format!(
+                    "PeerAuthentication {:?}.port_overrides[\"{}\"]",
+                    pa.name, port
+                ),
                 *port,
                 &mut errors,
             );
         }
         if !pa.mtls_mode.is_peer_auth_mode() {
             errors.push(format!(
-                "PeerAuthentication '{}': mtls_mode '{:?}' is invalid for server-side policy",
+                "PeerAuthentication {:?}: mtls_mode \"{:?}\" is invalid for server-side policy",
                 pa.name, pa.mtls_mode
             ));
         }
         for (port, mode) in &pa.port_overrides {
             if !mode.is_peer_auth_mode() {
                 errors.push(format!(
-                    "PeerAuthentication '{}': port_overrides[{port}] mode '{mode:?}' is invalid for server-side policy",
+                    "PeerAuthentication {:?}: port_overrides[\"{port}\"] mode \"{mode:?}\" is \
+                     invalid for server-side policy",
                     pa.name
                 ));
             }
@@ -7178,7 +7188,7 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         validate_non_empty_string(
-            format!("MeshRequestAuthentication '{}'.namespace", ra.name),
+            format!("MeshRequestAuthentication {:?}.namespace", ra.name),
             &ra.namespace,
             &mut errors,
         );
@@ -7191,13 +7201,13 @@ fn validate_mesh_config_internal(
         for (i, rule) in ra.jwt_rules.iter().enumerate() {
             if rule.issuer.trim().is_empty() {
                 errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: issuer must not be empty",
+                    "MeshRequestAuthentication {:?} jwt_rules[{}]: issuer must not be empty",
                     ra.name, i
                 ));
             }
             if rule.jwks_uri.is_none() && rule.jwks.is_none() {
                 errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: one of jwks_uri or jwks is required",
+                    "MeshRequestAuthentication {:?} jwt_rules[{}]: one of jwks_uri or jwks is required",
                     ra.name, i
                 ));
             }
@@ -7209,7 +7219,7 @@ fn validate_mesh_config_internal(
                 validate_mesh_jwt_output_claim_headers(&rule.output_claim_to_headers);
             if let Err(error) = claim_headers {
                 errors.push(format!(
-                    "MeshRequestAuthentication '{}' jwt_rules[{}]: {error}",
+                    "MeshRequestAuthentication {:?} jwt_rules[{}]: {error}",
                     ra.name, i
                 ));
             }
@@ -7221,27 +7231,27 @@ fn validate_mesh_config_internal(
         validate_non_empty_string("ServiceEntry.name".to_string(), &se.name, &mut errors);
         if se.hosts.is_empty() {
             errors.push(format!(
-                "ServiceEntry '{}': hosts must not be empty",
+                "ServiceEntry {:?}: hosts must not be empty",
                 se.name
             ));
         }
         for (i, port) in se.ports.iter().enumerate() {
             validate_non_zero_port(
-                format!("ServiceEntry '{}'.ports[{}].port", se.name, i),
+                format!("ServiceEntry {:?}.ports[{}].port", se.name, i),
                 port.port,
                 &mut errors,
             );
         }
         for (i, endpoint) in se.endpoints.iter().enumerate() {
             validate_non_empty_string(
-                format!("ServiceEntry '{}'.endpoints[{}].address", se.name, i),
+                format!("ServiceEntry {:?}.endpoints[{}].address", se.name, i),
                 &endpoint.address,
                 &mut errors,
             );
             for (name, port) in &endpoint.ports {
                 validate_non_zero_port(
                     format!(
-                        "ServiceEntry '{}'.endpoints[{}].ports['{}']",
+                        "ServiceEntry {:?}.endpoints[{}].ports[{:?}]",
                         se.name, i, name
                     ),
                     *port,
@@ -7251,7 +7261,7 @@ fn validate_mesh_config_internal(
         }
         if se.resolution != Resolution::Static && !se.endpoints.is_empty() {
             errors.push(format!(
-                "ServiceEntry '{}': endpoints are only valid when resolution=static",
+                "ServiceEntry {:?}: endpoints are only valid when resolution=static",
                 se.name
             ));
         }
@@ -7260,7 +7270,7 @@ fn validate_mesh_config_internal(
         // than be interpreted, so a typo can never widen a namespace-local
         // entry into a mesh-wide one.
         validate_mesh_export_to(
-            &format!("ServiceEntry '{}'", se.name),
+            &format!("ServiceEntry {:?}", se.name),
             &se.export_to,
             &mut errors,
         );
@@ -7274,7 +7284,7 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         validate_non_empty_string(
-            format!("MeshTelemetryResource '{}'.namespace", telemetry.name),
+            format!("MeshTelemetryResource {:?}.namespace", telemetry.name),
             &telemetry.namespace,
             &mut errors,
         );
@@ -7287,7 +7297,7 @@ fn validate_mesh_config_internal(
         if let Some(tracing) = telemetry.config.tracing.as_ref() {
             validate_percentage(
                 format!(
-                    "MeshTelemetryResource '{}'.config.tracing.sampling_percentage",
+                    "MeshTelemetryResource {:?}.config.tracing.sampling_percentage",
                     telemetry.name
                 ),
                 tracing.sampling_percentage,
@@ -7304,12 +7314,12 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         validate_non_empty_string(
-            format!("MeshDestinationRule '{}'.namespace", dr.name),
+            format!("MeshDestinationRule {:?}.namespace", dr.name),
             &dr.namespace,
             &mut errors,
         );
         validate_non_empty_string(
-            format!("MeshDestinationRule '{}'.host", dr.name),
+            format!("MeshDestinationRule {:?}.host", dr.name),
             &dr.host,
             &mut errors,
         );
@@ -7318,7 +7328,7 @@ fn validate_mesh_config_internal(
         // than be interpreted, so a typo can never widen a namespace-local
         // rule into a mesh-wide one.
         validate_mesh_export_to(
-            &format!("MeshDestinationRule '{}'", dr.name),
+            &format!("MeshDestinationRule {:?}", dr.name),
             &dr.export_to,
             &mut errors,
         );
@@ -7327,7 +7337,7 @@ fn validate_mesh_config_internal(
         // enforces but the native/file/xDS slice path otherwise skips.
         if let Some(policy) = dr.traffic_policy.as_ref() {
             validate_mesh_traffic_policy(
-                format!("MeshDestinationRule '{}'.traffic_policy", dr.name),
+                format!("MeshDestinationRule {:?}.traffic_policy", dr.name),
                 policy,
                 &mut errors,
             );
@@ -7343,14 +7353,14 @@ fn validate_mesh_config_internal(
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
         // `subsets[].trafficPolicy`.
         validate_dr_connection_pool(
-            &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
+            &format!("MeshDestinationRule {:?}.trafficPolicy", dr.name),
             dr.traffic_policy.as_ref(),
             &mut errors,
         );
         for (port, policy) in &dr.port_level_settings {
             validate_non_zero_port(
                 format!(
-                    "MeshDestinationRule '{}'.port_level_settings[{}]",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"]",
                     dr.name, port
                 ),
                 *port,
@@ -7358,7 +7368,7 @@ fn validate_mesh_config_internal(
             );
             validate_mesh_traffic_policy(
                 format!(
-                    "MeshDestinationRule '{}'.port_level_settings[{}]",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"]",
                     dr.name, port
                 ),
                 policy,
@@ -7366,7 +7376,7 @@ fn validate_mesh_config_internal(
             );
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"].trafficPolicy",
                     dr.name, port
                 ),
                 Some(policy),
@@ -7375,14 +7385,14 @@ fn validate_mesh_config_internal(
         }
         for (i, subset) in dr.subsets.iter().enumerate() {
             validate_non_empty_string(
-                format!("MeshDestinationRule '{}'.subsets[{}].name", dr.name, i),
+                format!("MeshDestinationRule {:?}.subsets[{}].name", dr.name, i),
                 &subset.name,
                 &mut errors,
             );
             if let Some(policy) = subset.traffic_policy.as_ref() {
                 validate_mesh_traffic_policy(
                     format!(
-                        "MeshDestinationRule '{}'.subsets[{}].traffic_policy",
+                        "MeshDestinationRule {:?}.subsets[{}].traffic_policy",
                         dr.name, i
                     ),
                     policy,
@@ -7391,7 +7401,7 @@ fn validate_mesh_config_internal(
             }
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
+                    "MeshDestinationRule {:?}.subsets[{}].trafficPolicy",
                     dr.name, i
                 ),
                 subset.traffic_policy.as_ref(),
@@ -7408,7 +7418,7 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         validate_non_empty_string(
-            format!("MeshProxyConfig '{}'.namespace", proxy_config.name),
+            format!("MeshProxyConfig {:?}.namespace", proxy_config.name),
             &proxy_config.namespace,
             &mut errors,
         );
@@ -7419,7 +7429,7 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         validate_percentage(
-            format!("MeshProxyConfig '{}'.tracing_sampling", proxy_config.name),
+            format!("MeshProxyConfig {:?}.tracing_sampling", proxy_config.name),
             proxy_config.tracing_sampling,
             &mut errors,
         );
@@ -7429,28 +7439,28 @@ fn validate_mesh_config_internal(
     for sidecar in sidecars {
         validate_non_empty_string("MeshSidecar.name".to_string(), &sidecar.name, &mut errors);
         validate_non_empty_string(
-            format!("MeshSidecar '{}'.namespace", sidecar.name),
+            format!("MeshSidecar {:?}.namespace", sidecar.name),
             &sidecar.namespace,
             &mut errors,
         );
         for (i, egress) in sidecar.egress.iter().enumerate() {
             if egress.hosts.is_empty() {
                 errors.push(format!(
-                    "MeshSidecar '{}'.egress[{}].hosts must not be empty",
+                    "MeshSidecar {:?}.egress[{}].hosts must not be empty",
                     sidecar.name, i
                 ));
             }
             for (j, host) in egress.hosts.iter().enumerate() {
                 if !is_valid_sidecar_host_pattern(host) {
                     errors.push(format!(
-                        "MeshSidecar '{}'.egress[{}].hosts[{}] '{}' is not a valid Sidecar host pattern",
+                        "MeshSidecar {:?}.egress[{}].hosts[{}] {:?} is not a valid Sidecar host pattern",
                         sidecar.name, i, j, host
                     ));
                 }
             }
             if let Some(port) = egress.port {
                 validate_non_zero_port(
-                    format!("MeshSidecar '{}'.egress[{}].port", sidecar.name, i),
+                    format!("MeshSidecar {:?}.egress[{}].port", sidecar.name, i),
                     port,
                     &mut errors,
                 );
@@ -7464,7 +7474,7 @@ fn validate_mesh_config_internal(
         // materialization. Recognized HTTP and stream protocols are modeled.
         for (i, ingress) in sidecar.ingress.iter().enumerate() {
             validate_non_zero_port(
-                format!("MeshSidecar '{}'.ingress[{}].port", sidecar.name, i),
+                format!("MeshSidecar {:?}.ingress[{}].port", sidecar.name, i),
                 ingress.port,
                 &mut errors,
             );
@@ -7475,7 +7485,7 @@ fn validate_mesh_config_internal(
     if let Some(tb_set) = trust_bundles {
         if tb_set.local.x509_authorities.is_empty() && tb_set.local.jwt_authorities.is_empty() {
             errors.push(format!(
-                "TrustBundleSet.local for trust domain '{}' has no authorities",
+                "TrustBundleSet.local for trust domain {:?} has no authorities",
                 tb_set.local.trust_domain
             ));
         }
@@ -7486,19 +7496,19 @@ fn validate_mesh_config_internal(
         for fed in &tb_set.federated {
             if !seen_trust_domains.insert(fed.trust_domain.clone()) {
                 errors.push(format!(
-                    "TrustBundleSet.federated[{}]: duplicate trust domain",
+                    "TrustBundleSet.federated[{:?}]: duplicate trust domain",
                     fed.trust_domain
                 ));
             }
             if fed.x509_authorities.is_empty() && fed.jwt_authorities.is_empty() {
                 errors.push(format!(
-                    "TrustBundleSet.federated[{}]: no authorities",
+                    "TrustBundleSet.federated[{:?}]: no authorities",
                     fed.trust_domain
                 ));
             }
             if let Err(e) = fed.decode_x509_authorities() {
                 errors.push(format!(
-                    "TrustBundleSet.federated[{}]: {e}",
+                    "TrustBundleSet.federated[{:?}]: {e}",
                     fed.trust_domain
                 ));
             }
@@ -7524,7 +7534,7 @@ fn reject_unsupported_target_refs_scope(
 ) {
     if matches!(scope, PolicyScope::TargetRefs { .. }) {
         errors.push(format!(
-            "{resource_kind} '{resource_name}': PolicyScope::target_refs is not supported; \
+            "{resource_kind} {resource_name:?}: PolicyScope::target_refs is not supported; \
              only AuthorizationPolicy/MeshPolicy implement targetRefs attachment"
         ));
     }
@@ -7578,7 +7588,7 @@ fn validate_mesh_policy_target_refs_scope(
         return;
     };
     let context = format!(
-        "{} '{}'.scope.target_refs",
+        "{} {:?}.scope.target_refs",
         identity.resource_kind, identity.resource_name
     );
     let policy_namespace = identity.policy_namespace;
@@ -7631,9 +7641,9 @@ fn validate_mesh_policy_target_refs_scope(
                 }
                 if namespace != policy_namespace {
                     errors.push(format!(
-                        "{path}: {kind} '{namespace}/{name}' is in another namespace; \
+                        "{path}: {kind} {namespace:?}/{name:?} is in another namespace; \
                          Istio AuthorizationPolicy targetRefs to {kind} are same-namespace only \
-                         (policy namespace '{policy_namespace}')"
+                         (policy namespace {policy_namespace:?})"
                     ));
                     continue;
                 }
@@ -7646,7 +7656,7 @@ fn validate_mesh_policy_target_refs_scope(
                         valid_attachments += 1;
                     } else {
                         unresolved.push(format!(
-                            "{path}: Service '{namespace}/{name}' was not found in services; \
+                            "{path}: Service {namespace:?}/{name:?} was not found in services; \
                              targeted policies fail closed when the target is missing"
                         ));
                     }
@@ -7663,7 +7673,7 @@ fn validate_mesh_policy_target_refs_scope(
                     valid_attachments += 1;
                 } else {
                     unresolved.push(format!(
-                        "{path}: Gateway '{namespace}/{name}' was not found in \
+                        "{path}: Gateway {namespace:?}/{name:?} was not found in \
                          waypoint_bindings; targeted policies fail closed when the \
                          target is missing"
                     ));
@@ -7699,7 +7709,7 @@ fn validate_mesh_policy_target_refs_scope(
                 if !istio_root_namespace.is_empty() && policy_namespace != istio_root_namespace {
                     errors.push(format!(
                         "{path}: GatewayClass attachments must be owned by a policy in the Istio \
-                         root namespace ('{istio_root_namespace}'), not '{policy_namespace}'"
+                         root namespace ({istio_root_namespace:?}), not {policy_namespace:?}"
                     ));
                     continue;
                 }
@@ -7714,7 +7724,7 @@ fn validate_mesh_policy_target_refs_scope(
                         // Unsupported class name is a structural refusal, not an
                         // inventory miss — always hard-fail.
                         errors.push(format!(
-                            "{path}: GatewayClass '{name}' is unsupported; \
+                            "{path}: GatewayClass {name:?} is unsupported; \
                              Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
                         ));
                         continue;
@@ -8075,7 +8085,7 @@ fn validate_dr_connection_pool(
         && idle > crate::config::types::MAX_TCP_IDLE_TIMEOUT
     {
         errors.push(format!(
-            "{context}.connectionPool.tcp.idleTimeout must be between 0 and {} seconds (got {idle})",
+            "{context}.connectionPool.tcp.idleTimeout must be between 0 and {} seconds (got \"{idle}\")",
             crate::config::types::MAX_TCP_IDLE_TIMEOUT
         ));
     }
@@ -8163,12 +8173,12 @@ fn validate_multi_cluster(
         } else {
             if remote.name.as_str() != canonical_name {
                 errors.push(format!(
-                    "RemoteCluster '{}': name must not have leading/trailing whitespace",
+                    "RemoteCluster {:?}: name must not have leading/trailing whitespace",
                     remote.name
                 ));
             }
             if !seen_cluster_names.insert(canonical_name) {
-                errors.push(format!("RemoteCluster '{}': duplicate name", remote.name));
+                errors.push(format!("RemoteCluster {:?}: duplicate name", remote.name));
             }
         }
         if remote
@@ -8177,7 +8187,7 @@ fn validate_multi_cluster(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "RemoteCluster '{}': network must not be empty when set",
+                "RemoteCluster {:?}: network must not be empty when set",
                 remote.name
             ));
         }
@@ -8187,7 +8197,7 @@ fn validate_multi_cluster(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "RemoteCluster '{}': control_plane_url must not be empty when set",
+                "RemoteCluster {:?}: control_plane_url must not be empty when set",
                 remote.name
             ));
         }
@@ -8197,7 +8207,7 @@ fn validate_multi_cluster(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "RemoteCluster '{}': federation_endpoint must not be empty when set",
+                "RemoteCluster {:?}: federation_endpoint must not be empty when set",
                 remote.name
             ));
         }
@@ -8207,7 +8217,7 @@ fn validate_multi_cluster(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "RemoteCluster '{}': discovery_credential_ref must not be empty when set",
+                "RemoteCluster {:?}: discovery_credential_ref must not be empty when set",
                 remote.name
             ));
         }
@@ -8220,7 +8230,7 @@ fn validate_multi_cluster(
                 .any(|bundle| bundle.trust_domain == remote.trust_domain)
         {
             errors.push(format!(
-                "RemoteCluster '{}': trust domain '{}' has no matching federated trust bundle",
+                "RemoteCluster {:?}: trust domain {:?} has no matching federated trust bundle",
                 remote.name, remote.trust_domain
             ));
         }
@@ -8237,25 +8247,25 @@ fn validate_multi_cluster(
         }
         if gateway.namespace.trim().is_empty() {
             errors.push(format!(
-                "EastWestGateway '{}': namespace must not be empty",
+                "EastWestGateway {:?}: namespace must not be empty",
                 gateway.name
             ));
         }
         if gateway.host.trim().is_empty() {
             errors.push(format!(
-                "EastWestGateway '{}': host must not be empty",
+                "EastWestGateway {:?}: host must not be empty",
                 gateway.name
             ));
         }
         if gateway.port == 0 {
             errors.push(format!(
-                "EastWestGateway '{}': port must be between 1 and 65535",
+                "EastWestGateway {:?}: port must be between 1 and 65535",
                 gateway.name
             ));
         }
         if gateway.sni_hosts.is_empty() {
             errors.push(format!(
-                "EastWestGateway '{}': sni_hosts must not be empty",
+                "EastWestGateway {:?}: sni_hosts must not be empty",
                 gateway.name
             ));
         }
@@ -8265,14 +8275,14 @@ fn validate_multi_cluster(
             .is_some_and(|value| value.trim().is_empty())
         {
             errors.push(format!(
-                "EastWestGateway '{}': network must not be empty when set",
+                "EastWestGateway {:?}: network must not be empty when set",
                 gateway.name
             ));
         }
         for sni in &gateway.sni_hosts {
             if sni.trim().is_empty() {
                 errors.push(format!(
-                    "EastWestGateway '{}': sni_hosts must not contain empty entries",
+                    "EastWestGateway {:?}: sni_hosts must not contain empty entries",
                     gateway.name
                 ));
             }
@@ -8330,7 +8340,7 @@ fn validate_multi_cluster(
                 .collect();
             if east_west_sni_hosts_overlap(&earlier_snis, &later_snis) {
                 errors.push(format!(
-                    "EastWestGateway '{}': sni_hosts overlap EastWestGateway '{}' on the same \
+                    "EastWestGateway {:?}: sni_hosts overlap EastWestGateway {:?} on the same \
                      network for an overlapping trust domain (both can route the same destination \
                      FQDN or per-port SNI alias; selection would silently pick one — disambiguate \
                      by sni_hosts, network, or trust_domain)",

@@ -43,8 +43,11 @@ pub async fn run(
             // `migrate_action` is lowercased at parse time, so both renderings
             // are transformed forms; withhold by key rather than relying on the
             // length-bounded textual pass.
-            let shown = crate::secrets::quoted_env_value("FERRUM_MIGRATE_ACTION", action);
-            error!("Unknown migrate action: {}", shown);
+            let shown = crate::startup::quoted_config_value("FERRUM_MIGRATE_ACTION", action);
+            error!(
+                "Unknown migrate action: {}",
+                crate::startup::sanitize_startup_cause(&shown, &[])
+            );
             anyhow::bail!(
                 "Invalid FERRUM_MIGRATE_ACTION {}. Expected: up, status, config",
                 shown

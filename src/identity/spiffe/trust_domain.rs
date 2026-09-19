@@ -96,13 +96,13 @@ impl AsRef<str> for TrustDomain {
 pub enum TrustDomainError {
     #[error("trust domain must not be empty")]
     Empty,
-    #[error("trust domain '{0}' must be lowercase")]
+    #[error("trust domain {0:?} must be lowercase")]
     NotLowercase(String),
-    #[error("trust domain '{0}' contains '/' — trust domains do not have a path component")]
+    #[error("trust domain {0:?} contains `/` — trust domains do not have a path component")]
     HasPath(String),
     #[error("trust domain is too long (max {0}, got {1})")]
     TooLong(usize, usize),
-    #[error("trust domain '{0}' contains invalid character '{1}'")]
+    #[error("trust domain {0:?} contains invalid character {1:?}")]
     InvalidChar(String, char),
 }
 

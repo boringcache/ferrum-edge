@@ -43,6 +43,7 @@ use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use crate::modes::mesh::revision::MeshRevisionContentIdentity;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, slice_content_identity};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar};
 
 /// On-disk shape of the localized mesh config document.
 ///
@@ -85,7 +86,12 @@ pub async fn load_mesh_slice_from_file_off_thread(
     tokio::task::spawn_blocking(move || load_mesh_slice_from_file(&path, request))
         .await
         .map_err(|error| {
-            anyhow::anyhow!("Mesh configuration file validation worker failed: {error}")
+            let reason = if error.is_cancelled() {
+                "cancelled"
+            } else {
+                "panicked"
+            };
+            anyhow::anyhow!("Mesh configuration file validation worker failed: {reason}")
         })?
 }
 
@@ -109,7 +115,8 @@ pub fn read_mesh_config_document(
     let document: MeshFileDocument = if is_yaml {
         admit_yaml_alias_expansion(&content)
             .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?;
-        serde_yaml::from_str(&content).map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
+        crate::util::deserialization::from_yaml_str(&content)
+            .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
     } else {
         crate::util::json_object::from_json_object_slice::<MeshFileDocument>(content.as_bytes())
             .map_err(|e| anyhow::anyhow!(mesh_doc_parse_error(e)))?
@@ -122,8 +129,8 @@ pub fn read_mesh_config_document(
         && version != CURRENT_CONFIG_VERSION
     {
         anyhow::bail!(
-            "mesh configuration file declares version '{version}' but this gateway expects \
-             '{CURRENT_CONFIG_VERSION}' (the mesh model has no file migrations)"
+            "unsupported mesh document version (<redacted scalar>); supported: \
+             {CURRENT_CONFIG_VERSION} (the mesh model has no file migrations)"
         );
     }
 
@@ -135,7 +142,7 @@ pub fn read_mesh_config_document(
 /// file source would later refuse (size, regularity, UTF-8, settle contract).
 fn read_mesh_file_bytes(path: &Path) -> Result<String, anyhow::Error> {
     if !path.exists() {
-        anyhow::bail!("mesh configuration file not found: {}", path.display());
+        anyhow::bail!("mesh configuration file not found: {:?}", path.display());
     }
 
     // Mirror file mode's credential-hygiene warning: mesh documents can carry
@@ -149,7 +156,7 @@ fn read_mesh_file_bytes(path: &Path) -> Result<String, anyhow::Error> {
                 warn!(
                     "Mesh config file {} is world-readable (mode {:o}). Consider restricting \
                      permissions as it may contain trust material.",
-                    path.display(),
+                    sanitize_startup_cause(format!("{path:?}"), &[]),
                     mode & 0o777
                 );
             }
@@ -249,6 +256,8 @@ pub fn normalized_mesh_gateway_config(
 /// who fed a full gateway config file gets steered instead of puzzled by a
 /// bare "unknown field `proxies`".
 fn mesh_doc_parse_error(err: impl std::fmt::Display) -> String {
+    // Document adapters already sanitize the inner error. Never classify this
+    // composed diagnostic: its leading path may contain document map keys.
     format!(
         "invalid mesh configuration document: {err} (the localized mesh source consumes only an \
          optional `version` plus the `mesh` section; gateway resources such as proxies/upstreams \
@@ -430,7 +439,7 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                         let latest = latest_requested.load(Ordering::Acquire);
                         if !mesh_reload_generation_is_current(generation, latest) {
                             info!(
-                                file_path = %path,
+                                file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                                 generation,
                                 latest,
                                 "{}", messages.stale_generation
@@ -442,8 +451,8 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                                 MeshLocalReloadApply::Applied | MeshLocalReloadApply::Unchanged
                             ) {
                                 info!(
-                                    file_path = %path,
-                                    mesh_slice_version = result.version.as_deref().unwrap_or(""),
+                                    file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
+                                    mesh_slice_version = %sanitize_startup_scalar(result.version.as_deref().unwrap_or("")),
                                     generation,
                                     outcome = ?result.apply,
                                     "{}", messages.reloaded
@@ -454,25 +463,25 @@ pub async fn run_mesh_local_reload_loop<N, T, S, A>(
                     }
                     Ok(Err(e)) => {
                         warn!(
-                            file_path = %path,
+                            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
-                            error = %e,
+                            error = %sanitize_startup_cause(&e, &[]),
                             "{}", messages.load_failed
                         );
                         mark_mesh_local_reload_rejected(recovery);
                     }
                     Err(join_error) if join_error.is_cancelled() => {
                         info!(
-                            file_path = %path,
+                            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
                             "{}", messages.join_cancelled
                         );
                     }
-                    Err(join_error) => {
+                    Err(_) => {
                         warn!(
-                            file_path = %path,
+                            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
                             generation,
-                            error = %join_error,
+                            error = "reload worker panicked (details withheld)",
                             "{}", messages.worker_panicked
                         );
                         mark_mesh_local_reload_rejected(recovery);
@@ -923,7 +932,7 @@ pub fn apply_mesh_file_reload_candidate(
                 }
                 MeshSliceInstall::Quarantined(rejection) => {
                     warn!(
-                        ?rejection,
+                        rejection = %sanitize_startup_cause(&rejection, &[]),
                         "Mesh file reload quarantined by the revision gate; keeping the last \
                          good mesh slice and raising config_rejected"
                     );
@@ -934,7 +943,7 @@ pub fn apply_mesh_file_reload_candidate(
         }
         Err(error) => {
             warn!(
-                error = %error,
+                error = %sanitize_startup_cause(&error, &[]),
                 "Failed to reload mesh config file; keeping the last good mesh slice and \
                  raising config_rejected"
             );
@@ -976,7 +985,7 @@ pub async fn start_mesh_file_source_with_shutdown(
             Ok(stream) => stream,
             Err(e) => {
                 warn!(
-                    error = %e,
+                    error = %sanitize_startup_cause(&e, &[]),
                     "Failed to register SIGHUP handler for mesh file source; the mesh \
                      document will not reload until restart"
                 );
@@ -1003,7 +1012,7 @@ pub async fn start_mesh_file_source_with_shutdown(
     #[cfg(not(unix))]
     {
         info!(
-            file_path = %path,
+            file_path = %sanitize_startup_cause(format!("{path:?}"), &[]),
             "Mesh file source loaded; live reload is Unix-only (SIGHUP), restart to pick up \
              changes"
         );
@@ -1052,5 +1061,79 @@ fn stop_accepting_reload_candidates<T>(
     if let Some((_, handle)) = in_flight.take() {
         handle.abort();
         drop(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::common::diagnostic_test_support::DiagnosticLogs;
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_emissions_withhold_versions_and_panic_payloads() {
+        for panic_worker in [false, true] {
+            let logs = DiagnosticLogs::default();
+            let _guard = tracing::subscriber::set_default(logs.subscriber());
+            let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+            let (notify_tx, notify_rx) = tokio::sync::mpsc::channel(1);
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let applied = std::cell::Cell::new(0);
+            notify_tx.send(()).await.unwrap();
+            let reload = run_mesh_local_reload_loop(
+                notify_rx,
+                &mut shutdown_rx,
+                "'UNREGISTERED_PATH5591\"\\\n",
+                &recovery,
+                &MESH_FILE_RELOAD_MESSAGES,
+                || {
+                    tokio::spawn(async move {
+                        if panic_worker {
+                            panic!("UNREGISTERED_PANIC5591 '\"\\\n");
+                        }
+                        Ok(())
+                    })
+                },
+                |()| {
+                    applied.set(applied.get() + 1);
+                    shutdown_tx.send(true).unwrap();
+                    MeshLocalReloadResult {
+                        apply: MeshLocalReloadApply::Applied,
+                        version: Some("'UNREGISTERED_VERSION5591\"\\\n".to_string()),
+                    }
+                },
+            );
+            let stop_after_rejection = async {
+                if panic_worker {
+                    while !recovery.is_rejected() {
+                        tokio::task::yield_now().await;
+                    }
+                    shutdown_tx.send(true).unwrap();
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(reload, stop_after_rejection);
+            })
+            .await
+            .expect("reload must complete and observe shutdown");
+            assert_eq!(recovery.is_rejected(), panic_worker);
+            assert_eq!(applied.get(), usize::from(!panic_worker));
+            let output = logs.output();
+            assert!(output.contains("file_path="), "{output}");
+            assert!(output.contains("generation=1"), "{output}");
+            if panic_worker {
+                assert!(output.contains("error="), "{output}");
+                assert!(output.contains("panicked"), "{output}");
+            } else {
+                assert!(output.contains("mesh_slice_version="), "{output}");
+                assert!(output.contains("outcome=Applied"), "{output}");
+            }
+            for secret in [
+                "UNREGISTERED_PATH5591",
+                "UNREGISTERED_VERSION5591",
+                "UNREGISTERED_PANIC5591",
+            ] {
+                assert!(!output.contains(secret), "{output}");
+            }
+        }
     }
 }

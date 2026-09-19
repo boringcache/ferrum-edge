@@ -133,7 +133,8 @@ impl IpRestriction {
             Some(Value::String(mode)) if mode == "deny_first" => Mode::DenyFirst,
             Some(other) => {
                 return Err(format!(
-                    "ip_restriction: 'mode' must be 'allow_first' or 'deny_first', got: {other}"
+                    "ip_restriction: `mode` must be `allow_first` or `deny_first`, got: {other:?}",
+                    other = other.to_string()
                 ));
             }
         };

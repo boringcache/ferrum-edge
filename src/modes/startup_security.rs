@@ -647,7 +647,7 @@ pub fn load_mesh_inbound_client_ca_bundle(
     let source = CertSource::parse(path, MaterialKind::CaBundle);
     let material = load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
         format!(
-            "failed to load mesh frontend client CA bundle at {}",
+            "failed to load mesh frontend client CA bundle at {:?}",
             source.redacted_source_id()
         )
     })?;

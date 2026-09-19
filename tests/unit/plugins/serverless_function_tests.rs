@@ -723,7 +723,7 @@ fn test_unknown_on_error_rejects() {
         }),
         default_client(),
     ));
-    assert!(err.contains("unknown on_error"), "got: {}", err);
+    assert!(err.contains("unknown `on_error`"), "got: {}", err);
 }
 
 #[test]

@@ -232,7 +232,10 @@ impl TcpConnectionThrottle {
 
 fn parse_config(config: &Value) -> Result<(u64, u64), String> {
     let object = config.as_object().ok_or_else(|| {
-        format!("tcp_connection_throttle: config must be an object, got: {config}")
+        format!(
+            "tcp_connection_throttle: config must be an object, got: {config:?}",
+            config = config.to_string()
+        )
     })?;
     let max_connections_per_key = parse_required_u64(object, "max_connections_per_key")?;
     if max_connections_per_key == 0 {

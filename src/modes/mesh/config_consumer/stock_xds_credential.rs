@@ -1236,10 +1236,11 @@ pub async fn start_stock_credential_watcher_with_shutdown(
     }
     let interval = source.policy().watch_interval.max(Duration::from_secs(1));
     info!(
-        watch_interval_secs = interval.as_secs(),
-        max_stream_lifetime_secs =
-            clamp_max_stream_lifetime(source.policy().max_stream_lifetime).as_secs(),
-        refresh_skew_secs = source.policy().refresh_skew.as_secs(),
+        watch_interval_secs = %crate::startup::sanitize_startup_scalar(interval.as_secs()),
+        max_stream_lifetime_secs = %crate::startup::sanitize_startup_scalar(
+            clamp_max_stream_lifetime(source.policy().max_stream_lifetime).as_secs()
+        ),
+        refresh_skew_secs = %crate::startup::sanitize_startup_scalar(source.policy().refresh_skew.as_secs()),
         "Stock xDS bearer-credential watcher starting; ADS streams are retired when the source \
          rotates, becomes invalid, or reaches its authorization deadline"
     );

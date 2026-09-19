@@ -1345,9 +1345,12 @@ fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> 
                 .to_string(),
         );
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("ldap_auth: 'ldap_url' must be a string, got: {value}"))?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "ldap_auth: `ldap_url` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     if raw.is_empty() {
         return Err("ldap_auth: 'ldap_url' must not be empty".to_string());
     }
@@ -1410,9 +1413,12 @@ fn parse_optional_string(
     let Some(value) = config.get(field) else {
         return Ok(None);
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("ldap_auth: '{field}' must be a string, got: {value}"))?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "ldap_auth: `{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let value = raw.trim();
     if value.is_empty() {
         return Err(format!("ldap_auth: '{field}' must not be empty"));
@@ -1452,18 +1458,24 @@ fn parse_bool(
     let Some(value) = config.get(field) else {
         return Ok(default_value);
     };
-    value
-        .as_bool()
-        .ok_or_else(|| format!("ldap_auth: '{field}' must be a boolean, got: {value}"))
+    value.as_bool().ok_or_else(|| {
+        format!(
+            "ldap_auth: `{field}` must be a boolean, got: {value:?}",
+            value = value.to_string()
+        )
+    })
 }
 
 fn parse_u64(config: &Map<String, Value>, field: &str, default_value: u64) -> Result<u64, String> {
     let Some(value) = config.get(field) else {
         return Ok(default_value);
     };
-    value
-        .as_u64()
-        .ok_or_else(|| format!("ldap_auth: '{field}' must be an unsigned integer, got: {value}"))
+    value.as_u64().ok_or_else(|| {
+        format!(
+            "ldap_auth: `{field}` must be an unsigned integer, got: {value:?}",
+            value = value.to_string()
+        )
+    })
 }
 
 fn parse_usize(
@@ -1479,13 +1491,19 @@ fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<St
     let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
-    let arr = value
-        .as_array()
-        .ok_or_else(|| format!("ldap_auth: '{field}' must be an array of strings, got: {value}"))?;
+    let arr = value.as_array().ok_or_else(|| {
+        format!(
+            "ldap_auth: `{field}` must be an array of strings, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     arr.iter()
         .map(|item| {
             let raw = item.as_str().ok_or_else(|| {
-                format!("ldap_auth: '{field}' entries must be strings, got: {item}")
+                format!(
+                    "ldap_auth: `{field}` entries must be strings, got: {item:?}",
+                    item = item.to_string()
+                )
             })?;
             let value = raw.trim();
             if value.is_empty() {

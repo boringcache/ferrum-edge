@@ -14,6 +14,7 @@ use crate::config::stable_file::{
 };
 use crate::config::types::CURRENT_CONFIG_VERSION;
 use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
+use crate::util::deserialization as config_decode;
 
 /// Type alias for a config migration step function.
 /// Each function transforms a `serde_json::Value` from version N to version N+1.
@@ -49,7 +50,7 @@ impl ConfigMigrator {
         let current_version = value
             .get("version")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
             .to_string();
 
         if current_version == target_version {
@@ -78,15 +79,13 @@ impl ConfigMigrator {
                     if steps_applied == 0 {
                         // No migration path found from the current version
                         anyhow::bail!(
-                            "No config migration path from version '{}' to '{}'",
-                            current_version,
+                            "No config migration path from version (<redacted scalar>) to {}",
                             target_version
                         );
                     }
                     // We've applied some steps but can't reach the target
                     anyhow::bail!(
-                        "Config migration chain broken at version '{}' (target: '{}')",
-                        version,
+                        "Config migration chain broken at version (<redacted scalar>) (target: {})",
                         target_version
                     );
                 }
@@ -102,7 +101,7 @@ impl ConfigMigrator {
     pub fn migrate_file(path: &str) -> Result<ConfigMigrateResult, anyhow::Error> {
         let file_path = Path::new(path);
         if !file_path.exists() {
-            anyhow::bail!("Configuration file not found: {}", path);
+            anyhow::bail!("Configuration file not found: {:?}", path);
         }
 
         let content = read_config_migration_file(file_path)?;
@@ -114,7 +113,7 @@ impl ConfigMigrator {
 
         // Parse to serde_json::Value (works for both YAML and JSON)
         let mut value: serde_json::Value = match ext.as_str() {
-            "json" => serde_json::from_str(&content)?,
+            "json" => config_decode::from_json_str(&content)?,
             _ => parse_yaml_value(&content)?,
         };
         drop(content);
@@ -122,7 +121,7 @@ impl ConfigMigrator {
         let from_version = value
             .get("version")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
             .to_string();
 
         let target = CURRENT_CONFIG_VERSION;
@@ -154,22 +153,25 @@ impl ConfigMigrator {
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
         let backup_path = format!("{}.backup.{}", path, timestamp);
         std::fs::copy(file_path, &backup_path)?;
-        info!("Created config backup at {}", backup_path);
+        info!(
+            "Created config backup at {}",
+            crate::startup::sanitize_startup_cause(format!("{backup_path:?}"), &[])
+        );
 
         // Write migrated content back in the original format
         let migrated_content = match ext.as_str() {
             "json" => serde_json::to_string_pretty(&value)?,
             _ => {
                 // Convert back to YAML
-                let yaml_val: serde_yaml::Value = serde_json::from_value(value)?;
+                let yaml_val: serde_yaml::Value = config_decode::from_json_value(value)?;
                 serde_yaml::to_string(&yaml_val)?
             }
         };
 
         std::fs::write(file_path, migrated_content)?;
         info!(
-            "Config file migrated from version {} to {} ({} steps)",
-            from_version, target, steps
+            "Config file migrated from version (<redacted scalar>) to {} ({} steps)",
+            target, steps
         );
 
         Ok(ConfigMigrateResult {
@@ -184,7 +186,7 @@ impl ConfigMigrator {
     pub fn detect_version(path: &str) -> Result<String, anyhow::Error> {
         let file_path = Path::new(path);
         if !file_path.exists() {
-            anyhow::bail!("Configuration file not found: {}", path);
+            anyhow::bail!("Configuration file not found: {:?}", path);
         }
 
         let content = read_config_migration_file(file_path)?;
@@ -195,7 +197,7 @@ impl ConfigMigrator {
             .to_lowercase();
 
         let value: serde_json::Value = match ext.as_str() {
-            "json" => serde_json::from_str(&content)?,
+            "json" => config_decode::from_json_str(&content)?,
             _ => parse_yaml_value(&content)?,
         };
         drop(content);
@@ -203,7 +205,7 @@ impl ConfigMigrator {
         let version = value
             .get("version")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
             .to_string();
 
         Ok(version)
@@ -216,7 +218,7 @@ impl ConfigMigrator {
         let current = value
             .get("version")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required 'version' field"))?
+            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
             .to_string();
 
         if current == target {
@@ -226,9 +228,9 @@ impl ConfigMigrator {
         let steps = Self::migrate_value(value, target)?;
         if steps > 0 {
             warn!(
-                "Config was at version {}, migrated to {} in memory ({} steps). \
+                "Config was at version (<redacted scalar>), migrated to {} in memory ({} steps). \
                  Run FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=config to persist.",
-                current, target, steps
+                target, steps
             );
         }
         Ok(steps)
@@ -245,6 +247,6 @@ fn read_config_migration_file(path: &Path) -> Result<String, anyhow::Error> {
 
 fn parse_yaml_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {
     admit_yaml_alias_expansion(content)?;
-    let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
+    let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(content)?;
     Ok(serde_json::to_value(yaml_val)?)
 }

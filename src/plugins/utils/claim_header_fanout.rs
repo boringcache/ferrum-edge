@@ -91,19 +91,23 @@ pub fn parse_claim_headers(
     let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be an object, got: {value}"))?;
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be an object, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     let mut mappings = Vec::with_capacity(object.len());
-    for (claim_path, header_value) in object {
+    for (index, (claim_path, header_value)) in object.iter().enumerate() {
         let parsed_claim_path = parse_claim_path_value(
-            &format!("{field}.{claim_path}"),
+            &format!("{field}[{index}].claim"),
             &Value::String(claim_path.clone()),
             plugin,
         )?;
         let raw_header = header_value.as_str().ok_or_else(|| {
             format!(
-                "{plugin}: '{field}.{claim_path}' must be a header name string, got: {header_value}"
+                "{plugin}: `{field}[{index}].header` must be a header name string, got: {header_value:?}",
+                header_value = header_value.to_string()
             )
         })?;
         let header_name = normalize_allowed_header(raw_header, plugin, field)?;
@@ -139,9 +143,12 @@ pub fn parse_claim_header_list(
     let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
-    let entries = value
-        .as_array()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be an array, got: {value}"))?;
+    let entries = value.as_array().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be an array, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     if entries.len() > MAX_OUTPUT_CLAIM_HEADERS {
         return Err(format!(
             "{plugin}: '{field}' supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
@@ -382,9 +389,12 @@ pub fn parse_separator(
     let Some(value) = config.get(field) else {
         return Ok(default_value.to_string());
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| format!("{plugin}: '{field}' must be a string, got: {value}"))?;
+    let raw = value.as_str().ok_or_else(|| {
+        format!(
+            "{plugin}: `{field}` must be a string, got: {value:?}",
+            value = value.to_string()
+        )
+    })?;
     if raw.is_empty() {
         return Err(format!("{plugin}: '{field}' must not be empty"));
     }

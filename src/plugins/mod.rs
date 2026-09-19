@@ -12268,7 +12268,13 @@ pub fn create_plugin_with_http_client_and_config_id(
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
             if result.is_none() {
-                tracing::warn!("Unknown plugin: {}", name);
+                tracing::warn!(
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!("Unknown plugin: {name:?}"),
+                        &[]
+                    )
+                );
             }
             Ok(result)
         }
@@ -12355,7 +12361,7 @@ pub(crate) fn validate_plugin_config_with_http_client(
     }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
-        None => Err(format!("Unknown plugin name '{}'", name)),
+        None => Err(format!("Unknown plugin name {:?}", name)),
     }
 }
 

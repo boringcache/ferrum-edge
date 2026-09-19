@@ -497,7 +497,7 @@ fn admission_rejects_unresolved_named_probe_port() {
     });
     let message = admission_denied_message(pod);
     assert!(
-        message.contains("names port 'metrics'"),
+        message.contains("names port \"metrics\""),
         "denial must name the unresolved probe port: {message}"
     );
 }

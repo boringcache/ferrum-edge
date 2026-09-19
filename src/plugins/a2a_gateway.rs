@@ -221,7 +221,7 @@ impl PolicyAction {
             "allow" => Ok(Self::Allow),
             "deny" => Ok(Self::Deny),
             other => Err(format!(
-                "a2a_gateway: '{field}' must be allow or deny, got {other:?}"
+                "a2a_gateway: `{field}` must be allow or deny, got {other:?}"
             )),
         }
     }
@@ -2014,8 +2014,9 @@ fn parse_grpc_service_entry(item: &Value) -> Result<(&str, Option<A2aGrpcCardSch
             Ok((service, declared))
         }
         other => Err(format!(
-            "a2a_gateway: 'endpoint.grpc_services' entries must be a service name string or a \
-             {{service, card_schema}} object, got {other}"
+            "a2a_gateway: `endpoint.grpc_services` entries must be a service name string or a \
+             {{service, card_schema}} object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -4238,7 +4239,8 @@ fn optional_object<'a>(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(value)) => Ok(Some(value)),
         Some(other) => Err(format!(
-            "a2a_gateway: '{key}' must be an object, got {other}"
+            "a2a_gateway: `{key}` must be an object, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -4248,7 +4250,8 @@ fn optional_bool(object: &Map<String, Value>, key: &str) -> Result<Option<bool>,
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(other) => Err(format!(
-            "a2a_gateway: '{key}' must be a boolean, got {other}"
+            "a2a_gateway: `{key}` must be a boolean, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -4261,7 +4264,8 @@ fn optional_string<'a>(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(other) => Err(format!(
-            "a2a_gateway: '{key}' must be a string, got {other}"
+            "a2a_gateway: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -4274,7 +4278,8 @@ fn optional_string_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(format!(
-            "a2a_gateway: '{key}' must be a string, got {other}"
+            "a2a_gateway: `{key}` must be a string, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -4287,7 +4292,8 @@ fn optional_bool_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(other) => Err(format!(
-            "a2a_gateway: '{key}' must be a boolean, got {other}"
+            "a2a_gateway: `{key}` must be a boolean, got {other:?}",
+            other = other.to_string()
         )),
     }
 }
@@ -4303,7 +4309,8 @@ fn optional_u64_from_object(
             .ok_or_else(|| format!("a2a_gateway: '{key}' must be a positive integer"))
             .map(Some),
         Some(other) => Err(format!(
-            "a2a_gateway: '{key}' must be a positive integer, got {other}"
+            "a2a_gateway: `{key}` must be a positive integer, got {other:?}",
+            other = other.to_string()
         )),
     }
 }

@@ -1030,8 +1030,8 @@ pub fn merge_remote_endpoints_into_mesh(
                 service_index.insert(key, new_idx);
             } else {
                 tracing::debug!(
-                    namespace = %remote_svc.namespace,
-                    service = %remote_svc.name,
+                    namespace = %crate::startup::sanitize_startup_scalar(&remote_svc.namespace),
+                    service = %crate::startup::sanitize_startup_scalar(&remote_svc.name),
                     "skipping poller-discovered remote service absent from Sidecar-narrowed slice"
                 );
             }
@@ -1216,7 +1216,7 @@ impl RemoteDiscoveryManager {
                 }
                 None => {
                     warn!(
-                        cluster = %target.cluster_name,
+                        cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
                         "RemoteCluster references an unknown discovery credential; \
                          skipping discovery (configure FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)"
                     );
@@ -1229,7 +1229,7 @@ impl RemoteDiscoveryManager {
                 // deprecated — warn loudly but keep working (migration path).
                 if config.production_mode && config.jwt_secret.is_some() {
                     warn!(
-                        cluster = %target.cluster_name,
+                        cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
                         "Remote-cluster discovery is using the shared CP-DP JWT secret in \
                          production mode; configure a per-RemoteCluster discovery_credential_ref \
                          + FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS so a credential for one cluster \
@@ -1268,12 +1268,12 @@ impl RemoteDiscoveryManager {
         let (cluster_shutdown_tx, cluster_shutdown_rx) = watch::channel(false);
         let url_for_logs = sanitize_url_for_logging(&target.control_plane_url);
         info!(
-            cluster = %target.cluster_name,
-            trust_domain = %target.trust_domain,
-            control_plane = %url_for_logs,
-            poll_interval_seconds = ctx.config.poll_interval.as_secs(),
-            max_stale_seconds = ctx.config.max_stale_age.map(|age| age.as_secs()),
-            production_mode = ctx.config.production_mode,
+            cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
+            trust_domain = %crate::startup::sanitize_startup_scalar(&target.trust_domain),
+            control_plane = %crate::startup::sanitize_startup_scalar(&url_for_logs),
+            poll_interval_seconds = %crate::startup::sanitize_startup_scalar(ctx.config.poll_interval.as_secs()),
+            max_stale_seconds = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", ctx.config.max_stale_age.map(|age| age.as_secs()))),
+            production_mode = %crate::startup::sanitize_startup_scalar(ctx.config.production_mode),
             "Spawning remote-cluster endpoint discovery"
         );
         let handle = tokio::spawn(async move {
@@ -1451,10 +1451,11 @@ pub(crate) fn parse_remote_discovery_credentials(
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(std::collections::HashMap::new());
     };
-    let parsed: std::collections::HashMap<String, String> = serde_json::from_str(raw)
-        .map_err(|e| {
+    let parsed: std::collections::HashMap<String, String> =
+        crate::util::deserialization::from_json_str(raw).map_err(|e| {
             format!(
-                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS is not a valid JSON object of ref->secret: {e}"
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS is not a valid JSON object \
+                 of ref->secret: {e}"
             )
         })?;
     let mut out = std::collections::HashMap::with_capacity(parsed.len());
@@ -1476,7 +1477,7 @@ pub(crate) fn parse_remote_discovery_credentials(
             return Err(format!(
                 "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference {} secret must be at \
                  least {} characters (matching FERRUM_CP_DP_GRPC_JWT_SECRET); got {}",
-                crate::secrets::quoted_env_value(
+                crate::startup::quoted_config_value(
                     "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS",
                     reference.trim()
                 ),
@@ -1529,8 +1530,8 @@ fn poll_targets_for_multi_cluster_with_posture(
         }
         if !trust_bundle_domains.contains(&remote.trust_domain) {
             warn!(
-                cluster = %remote.name,
-                trust_domain = %remote.trust_domain,
+                cluster = %crate::startup::sanitize_startup_scalar(&remote.name),
+                trust_domain = %crate::startup::sanitize_startup_scalar(&remote.trust_domain),
                 "Skipping remote-cluster discovery: no federated trust bundle for the remote \
                  trust domain (cross-cluster discovery is fail-closed). Configure trust \
                  federation for this cluster first."
@@ -1539,15 +1540,15 @@ fn poll_targets_for_multi_cluster_with_posture(
         }
         if let Err(err) = validate_control_plane_url_with_posture(url, production_mode) {
             warn!(
-                cluster = %remote.name,
-                error = %err,
+                cluster = %crate::startup::sanitize_startup_scalar(&remote.name),
+                error = %crate::startup::sanitize_startup_cause(&err, &[]),
                 "Dropping remote-cluster control_plane_url that failed validation"
             );
             continue;
         }
         if targets.len() >= MAX_MESH_REMOTE_CLUSTERS {
             warn!(
-                cluster = %remote.name,
+                cluster = %crate::startup::sanitize_startup_scalar(&remote.name),
                 max_remote_clusters = MAX_MESH_REMOTE_CLUSTERS,
                 "Skipping remote-cluster discovery beyond remote-cluster target cap"
             );
@@ -1605,10 +1606,16 @@ pub(crate) fn validate_control_plane_url_with_posture(
     // Normalise before parsing so the scheme check is on the canonical form.
     let normalized = normalize_control_plane_url(url);
     let parsed =
-        reqwest::Url::parse(&normalized).map_err(|e| format!("invalid control_plane_url: {e}"))?;
+        reqwest::Url::parse(&normalized).map_err(|_| "invalid control_plane_url".to_string())?;
     match parsed.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("unsupported control_plane_url scheme '{other}'")),
+        _ => {
+            return Err(
+                "unsupported control_plane_url scheme <redacted scalar>; supported: \
+                 http, https, grpc, grpcs"
+                    .to_string(),
+            );
+        }
     }
     if production_mode && parsed.scheme() != "https" {
         return Err(
@@ -1627,12 +1634,13 @@ pub(crate) fn validate_control_plane_url_with_posture(
             }
             if ip.is_link_local() || ip.octets() == [169, 254, 169, 254] {
                 return Err(format!(
-                    "control_plane_url refuses link-local / cloud-metadata host {ip} (SSRF defense)"
+                    "control_plane_url refuses link-local / cloud-metadata host \"{ip}\" (SSRF \
+                     defense)"
                 ));
             }
             if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
                 return Err(format!(
-                    "control_plane_url refuses non-unicast IPv4 host {ip}"
+                    "control_plane_url refuses non-unicast IPv4 host \"{ip}\""
                 ));
             }
         }
@@ -1642,12 +1650,12 @@ pub(crate) fn validate_control_plane_url_with_posture(
             }
             if ip.is_unspecified() || ip.is_multicast() {
                 return Err(format!(
-                    "control_plane_url refuses non-unicast IPv6 host {ip}"
+                    "control_plane_url refuses non-unicast IPv6 host \"{ip}\""
                 ));
             }
             if ip.segments()[0] & 0xffc0 == 0xfe80 {
                 return Err(format!(
-                    "control_plane_url refuses link-local IPv6 host {ip}"
+                    "control_plane_url refuses link-local IPv6 host \"{ip}\""
                 ));
             }
         }
@@ -1813,11 +1821,11 @@ async fn remote_discovery_loop(
                 }
                 if outcome.installed() {
                     info!(
-                        cluster = %ctx.cluster_name,
-                        trust_domain = %log_trust_domain,
-                        network = log_network.as_deref().unwrap_or(""),
+                        cluster = %crate::startup::sanitize_startup_scalar(&ctx.cluster_name),
+                        trust_domain = %crate::startup::sanitize_startup_scalar(&log_trust_domain),
+                        network = %crate::startup::sanitize_startup_scalar(log_network.as_deref().unwrap_or("")),
                         fetched_at_unix_seconds = log_fetched_at,
-                        control_plane = %url_for_logs,
+                        control_plane = %crate::startup::sanitize_startup_scalar(&url_for_logs),
                         workloads = workload_count,
                         "Installed remote-cluster endpoints"
                     );
@@ -1828,8 +1836,8 @@ async fn remote_discovery_loop(
                     // "installed" event; keep it at debug to avoid steady-state
                     // INFO spam every poll interval.
                     debug!(
-                        cluster = %ctx.cluster_name,
-                        control_plane = %url_for_logs,
+                        cluster = %crate::startup::sanitize_startup_scalar(&ctx.cluster_name),
+                        control_plane = %crate::startup::sanitize_startup_scalar(&url_for_logs),
                         workloads = workload_count,
                         "Remote-cluster poll succeeded with no endpoint change; not re-installing"
                     );
@@ -1858,11 +1866,11 @@ async fn remote_discovery_loop(
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
             }
-            Err(err) => {
+            Err(_) => {
                 warn!(
-                    cluster = %ctx.cluster_name,
-                    control_plane = %url_for_logs,
-                    error = %err,
+                    cluster = %crate::startup::sanitize_startup_scalar(&ctx.cluster_name),
+                    control_plane = %crate::startup::sanitize_startup_scalar(&url_for_logs),
+                    error = "remote endpoint fetch or admission failed",
                     "Remote-cluster endpoint discovery failed; keeping last-good endpoints if any"
                 );
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
@@ -1906,10 +1914,10 @@ fn expire_stale_endpoints_after_failure(
         max_stale_age,
     ) {
         warn!(
-            cluster = %ctx.cluster_name,
-            trust_domain = %ctx.trust_domain,
-            control_plane = %url_for_logs,
-            max_stale_seconds = max_stale_age.as_secs(),
+            cluster = %crate::startup::sanitize_startup_scalar(&ctx.cluster_name),
+            trust_domain = %crate::startup::sanitize_startup_scalar(&ctx.trust_domain),
+            control_plane = %crate::startup::sanitize_startup_scalar(url_for_logs),
+            max_stale_seconds = %crate::startup::sanitize_startup_scalar(max_stale_age.as_secs()),
             "Expired last-good remote-cluster endpoints after bounded staleness window"
         );
     }
@@ -2003,12 +2011,12 @@ fn enforce_remote_trust_domain(
 
     if dropped_workloads > 0 || dropped_service_refs > 0 || dropped_services > 0 {
         warn!(
-            cluster = %cluster_name,
-            declared_trust_domain = %declared,
+            cluster = %crate::startup::sanitize_startup_scalar(cluster_name),
+            declared_trust_domain = %crate::startup::sanitize_startup_scalar(declared),
             dropped_workloads,
             dropped_service_refs,
             dropped_services,
-            example_offending_spiffe_id = example_offender.as_deref().unwrap_or(""),
+            example_offending_spiffe_id = %crate::startup::sanitize_startup_scalar(example_offender.as_deref().unwrap_or("")),
             "Dropped remote-cluster endpoints whose identity is outside the cluster's declared trust domain (cross-trust-domain confusion guard)"
         );
     }
@@ -2020,13 +2028,15 @@ fn validate_remote_endpoints(
 ) -> Result<(), String> {
     if endpoints.workloads.len() > REMOTE_MAX_WORKLOADS_PER_CLUSTER {
         return Err(format!(
-            "remote cluster '{cluster_name}' returned {} workloads (max {REMOTE_MAX_WORKLOADS_PER_CLUSTER})",
+            "remote cluster {cluster_name:?} returned {} workloads (max \
+             {REMOTE_MAX_WORKLOADS_PER_CLUSTER})",
             endpoints.workloads.len()
         ));
     }
     if endpoints.services.len() > REMOTE_MAX_SERVICES_PER_CLUSTER {
         return Err(format!(
-            "remote cluster '{cluster_name}' returned {} services (max {REMOTE_MAX_SERVICES_PER_CLUSTER})",
+            "remote cluster {cluster_name:?} returned {} services (max \
+             {REMOTE_MAX_SERVICES_PER_CLUSTER})",
             endpoints.services.len()
         ));
     }
@@ -2146,7 +2156,7 @@ struct MissingSecretSource {
 impl RemoteServiceSource for MissingSecretSource {
     async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
         Err(format!(
-            "remote cluster '{}' has no CP↔DP gRPC JWT secret configured; cannot authenticate to \
+            "remote cluster {:?} has no CP↔DP gRPC JWT secret configured; cannot authenticate to \
              the remote control plane (set FERRUM_CP_DP_GRPC_JWT_SECRET)",
             self.cluster_name
         ))
@@ -2185,7 +2195,7 @@ async fn fetch_remote_slice(
 
     let attempt = async {
         let mut endpoint = Channel::from_shared(control_plane_url.to_string())
-            .map_err(|e| format!("invalid control_plane_url: {e}"))?
+            .map_err(|_| "invalid control_plane_url".to_string())?
             .connect_timeout(Duration::from_secs(10));
         if let Some(tls) = tls_config {
             let mut client_tls = tonic_tls_config(tls);
@@ -2291,6 +2301,159 @@ mod tests {
 
     fn td(raw: &str) -> TrustDomain {
         TrustDomain::new(raw).expect("trust domain")
+    }
+
+    #[test]
+    fn remote_target_rejections_keep_reasons_and_withhold_each_supplied_field() {
+        let mut config = relative_to("local");
+        config.remote_clusters[0].name = "'UNREGISTERED_cluster\"\\\nname".to_string();
+        config.remote_clusters[0].trust_domain = td("private-remote.invalid");
+        config.remote_clusters[0].control_plane_url = Some("http://169.254.169.254".to_string());
+        let trusted = HashSet::from([config.remote_clusters[0].trust_domain.clone()]);
+        let ((), logs) = crate::modes::tests::capture_logs(|| {
+            assert!(poll_targets_for_multi_cluster(&config, &HashSet::new()).is_empty());
+            assert!(poll_targets_for_multi_cluster(&config, &trusted).is_empty());
+            let mut endpoints = RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://foreign.invalid/ns/default/sa/private-workload",
+                    "private-service",
+                    "192.0.2.211",
+                    None,
+                )],
+                services: vec![],
+            };
+            enforce_remote_trust_domain(
+                &mut endpoints,
+                &config.remote_clusters[0].trust_domain,
+                &config.remote_clusters[0].name,
+            );
+            assert!(endpoints.workloads.is_empty());
+        });
+        assert!(logs.contains("no federated trust bundle"), "{logs}");
+        assert!(
+            logs.contains("control_plane_url refuses link-local"),
+            "{logs}"
+        );
+        assert!(logs.contains("dropped_workloads=1"), "{logs}");
+        for value in [
+            "UNREGISTERED",
+            "private-remote.invalid",
+            "169.254.169.254",
+            "foreign.invalid",
+            "private-workload",
+        ] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+    }
+
+    struct OnePollSource {
+        response: Mutex<Option<Result<RemoteDiscoveryCandidate, String>>>,
+        shutdown: watch::Sender<bool>,
+    }
+
+    #[async_trait]
+    impl RemoteServiceSource for OnePollSource {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+            self.shutdown.send(true).unwrap();
+            self.response.lock().unwrap().take().unwrap()
+        }
+    }
+
+    #[test]
+    fn remote_discovery_logs_withhold_startup_scalars_and_opaque_failures() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut ctx = remote_ctx(
+            "https://user:p'ass@private-cp.invalid:49387/secret-path?token=UNREGISTERED_url",
+            None,
+            Duration::from_secs(1),
+        );
+        ctx.cluster_name = "'UNREGISTERED_cluster\"\\name".to_string();
+        ctx.trust_domain = td("private-remote.invalid");
+        ctx.network = Some("'UNREGISTERED_network\"\\name".to_string());
+        ctx.config.poll_interval = Duration::from_secs(87654);
+        ctx.config.max_stale_age = Some(Duration::from_secs(76543));
+        ctx.config.production_mode = true;
+        let store = RemoteEndpointStore::new();
+        let ((), logs) = crate::modes::tests::capture_logs(|| {
+            runtime.block_on(async {
+                let mut manager = RemoteDiscoveryManager::new(None, store.clone(), |_| {
+                    Arc::new(MockSource {
+                        responses: Mutex::new(Vec::new()),
+                    })
+                });
+                manager.start_cluster(
+                    RemoteClusterPollTarget {
+                        cluster_name: ctx.cluster_name.clone(),
+                        trust_domain: ctx.trust_domain.clone(),
+                        network: ctx.network.clone(),
+                        control_plane_url: ctx.control_plane_url.clone(),
+                        credential_ref: None,
+                    },
+                    ctx.config.clone(),
+                );
+                manager.stop_cluster(&ctx.cluster_name, true);
+
+                for response in [
+                    Ok(RemoteDiscoveryCandidate {
+                        endpoints: RemoteClusterEndpoints {
+                            workloads: vec![workload(
+                                "spiffe://private-remote.invalid/ns/default/sa/private-service",
+                                "private-service",
+                                "192.0.2.211",
+                                None,
+                            )],
+                            services: vec![],
+                        },
+                        revision: None,
+                    }),
+                    Err("bare UNREGISTERED_provider 'unbalanced\" response".to_string()),
+                ] {
+                    let (shutdown, receiver) = watch::channel(false);
+                    let source = Arc::new(OnePollSource {
+                        response: Mutex::new(Some(response)),
+                        shutdown,
+                    });
+                    let generation = store.register_cluster(&ctx.cluster_name);
+                    remote_discovery_loop(ctx.clone(), source, store.clone(), receiver, generation)
+                        .await;
+                }
+            });
+        });
+        for expected in [
+            "Spawning remote-cluster endpoint discovery",
+            "Installed remote-cluster endpoints",
+            "workloads=1",
+            "remote endpoint fetch or admission failed",
+            "control_plane=<redacted scalar>",
+            "poll_interval_seconds=<redacted scalar>",
+            "max_stale_seconds=<redacted scalar>",
+            "production_mode=<redacted scalar>",
+        ] {
+            assert!(logs.contains(expected), "{logs}");
+        }
+        for value in [
+            "UNREGISTERED",
+            "private-cp.invalid",
+            "private-remote.invalid",
+            "private-service",
+            "192.0.2.211",
+            "true",
+        ] {
+            assert!(!logs.contains(value), "{logs}");
+        }
+        // Legitimate timestamps can contain a short numeric canary as a substring.
+        // Complete numeric tokens still detect a supplied port or duration leak.
+        for value in ["49387", "87654", "76543"] {
+            assert!(
+                !logs
+                    .split(|ch: char| !ch.is_ascii_digit())
+                    .any(|token| token == value),
+                "{value}: {logs}"
+            );
+        }
     }
 
     fn spiffe(raw: &str) -> SpiffeId {
