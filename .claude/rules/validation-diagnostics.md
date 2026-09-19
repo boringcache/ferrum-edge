@@ -123,6 +123,11 @@ paths:
   supplied identities, label/header keys, expressions and numeric values are
   withheld. Registered constructor/rendered-output regressions retain the
   existing admission and composed-plan budget checks.
+- The #5594 agent-protocol conversion covers A2A gateway and MCP audit/security
+  configuration. Fixed endpoint, binding, policy and tool-map schema paths remain
+  visible while supplied service/tool names, paths, tokens and parser payloads
+  are withheld. Registered real-constructor rendered regressions preserve the
+  existing admission decisions and protocol behavior assertions.
 - The constructor audit includes root/nested JSON object guards, file-mode
   plaintext Basic-auth consumer IDs, WAF stream/rule IDs and exemption/filter
   regex sets, gRPC-Web header elements, plugin numeric bounds and URL schemes,
