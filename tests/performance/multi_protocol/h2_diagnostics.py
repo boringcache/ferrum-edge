@@ -12,6 +12,18 @@ from pathlib import Path
 def parse_gauges(text):
     values = {}
     for line in text.splitlines():
+        health = re.fullmatch(r'ferrum_log_sink_(healthy|queued_records|queued_bytes|reserved_bytes|'
+                              r'shutdown_timeouts_total|shutdown_incomplete_records_total)'
+                              r'\{sink="(stdout|stderr)"\} ([0-9]+)', line)
+        io = re.fullmatch(r'ferrum_log_sink_io_failures_total\{sink="(stdout|stderr)",'
+                          r'operation="(write|flush)"\} ([0-9]+)', line)
+        if health or io:
+            key = ("log_" + health[2] + "_" + health[1] if health
+                   else "log_" + io[1] + "_io_" + io[2])
+            if key in values:
+                raise ValueError("duplicate log health counter")
+            values[key] = int(health[3] if health else io[3])
+            continue
         loss = re.fullmatch(r'ferrum_log_sink_dropped_records_total\{sink="(stdout|stderr)",'
                             r'reason="(saturation|record_too_large|closed)"\} ([0-9]+)', line)
         if loss:

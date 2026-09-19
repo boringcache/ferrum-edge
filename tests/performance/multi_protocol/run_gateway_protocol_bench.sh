@@ -1092,6 +1092,16 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" \
+            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
+    fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
+    fi
     if [ "$H1_PROFILE" = diagnostic ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
@@ -1121,6 +1131,10 @@ run_bench() {
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
     fi
+    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
+            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
+    fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
@@ -1143,6 +1157,10 @@ run_bench() {
         cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     fi
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
+        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
+            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json" \
+                --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
+        fi
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
             curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
@@ -1385,6 +1403,19 @@ PYEOF
                     if [[ "$gw" == envoy* ]]; then
                         cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
                     fi
+                fi
+                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$gw" != direct ]; then
+                    # Explicit trigger/HTTP ack/log-fence smoke before offered work.
+                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" \
+                        --identity "$gw" "$PROTOCOL" 0 "$PAIR" "$HOST_ID"
+                    docker logs --timestamps "$GATEWAY_CID" \
+                        > "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.log" 2>&1 || true
+                    python3 "$SCRIPT_DIR/h2_guard/verify.py" smoke \
+                        "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" || {
+                        echo "[guard] snapshot smoke incomplete; retained raw evidence" >&2
+                        stop_gateway
+                        continue
+                    }
                 fi
                 for size in $PAYLOAD_SIZES; do
                     if [ "$gw" = direct ]; then
