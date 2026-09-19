@@ -184,6 +184,44 @@ workloads remain failed observations. Invalid/missing manifest selections retain
 the full expected matrix; valid budgeted payload subsets retain every selected
 pair/arm/size and do not satisfy the separate all-five-size campaign obligation.
 
+Every gateway arm also requires a versioned runtime record with embedded
+pair/arm/host/mode identity, including calibration's observer-off control. The
+runner records its full checked-out revision in the campaign manifest and
+captures the two fixed revision/observer labels from both `docker inspect` and
+`docker image inspect` of the container's immutable `sha256:` image ID. Image
+inspection has a 10-second bound. Both label sets must identify the manifest's
+full 40-hex revision and the expected `ferrum.h1-profile=off` or `on` build.
+Missing labels, overridden container labels, mutable tags, malformed metadata,
+missing runtimes and stale cross-pair records fail validation. Calibration may
+use distinct off/on images, but each arm's image ID must stay fixed across all
+four pairs. Cutoff 0/1 must use exactly one observer-on image ID across all pairs.
+
+The collector verifies the running container's command (`/app/ferrum-edge run`
+without config overrides), working directory, and the read-only bind from the
+hashed source file to `/etc/ferrum/config.yaml`. The report recomputes SHA-256
+from **each retained config file**, then requires identical config hashes across
+all gateway arms and pairs. The current runner selects cutoff in the environment,
+so **no config-file difference is permitted**, even if its new hash is valid.
+Each launch now supplies the cutoff setting exactly once; ambiguous duplicate
+environment entries fail capture. The exact safe `FERRUM_*` settings from the
+release image and runner must be present with valid values, including fixed
+file/metrics bindings and the arm's declared cutoff. Unknown settings and secret
+provider overrides fail capture without recording their names or values. Every
+other safe setting must agree across arms/pairs; only cutoff 0 versus 1 differs
+in the cutoff campaign. Other environment values and other mounts are retained
+as canonical hashes and must also agree. Only Docker's generated short-ID
+`HOSTNAME`, if present, is normalized; arbitrary hostname overrides fail.
+
+For observer-off controls, the raw process timeline must continuously bracket
+measurement with the runtime's owned host PID/start ticks, and its retained
+`h1_gateway` and embedded measurement PID must agree. Missing observer counters
+in that build are expected; missing runtime/process ownership is not. Runtime
+failures appear in each affected observation's `runtime_issues` and make
+`runtime_complete`, `traffic_complete`, `profiles_complete`, and comparison
+eligibility false. Available profile deltas and the entire declared matrix are
+still retained. These checks validate retained Docker evidence, not signed
+binary provenance, and do not retroactively certify older artifacts.
+
 Profile brackets have a **two-second total boundary-slack limit**, including the
 last scrape's duration, and a **one-second maximum start-to-start sampling gap**
 for the fixed 500 ms sampler / 200 ms HTTP timeout. They require an observation
@@ -222,7 +260,13 @@ Useful traffic validity is separate from profile completeness. Every expected
 arm/pair/size is retained, including missing samples and failed 5 MiB observations.
 The hosted H1 Python suite exercises complete producer-shaped campaigns and
 negative campaign, timing, identity, metadata/work and CPU cases, including
-written full-matrix reports and the capture-to-sampler ownership path.
+written full-matrix reports and the capture-to-sampler ownership path. Runtime
+fixtures pass Docker-shaped inputs through the actual collector with only Docker
+inspection and `/proc` reads mocked. Hosted regressions cover missing/malformed
+image/container labels, revisions, environment/command/mount evidence, retained
+config tampering, image/config/environment drift in later pairs, and observer-off
+process ownership. The pool collector is a sibling with its own review/fix; this
+change is confined to H1 collection/reporting. No local execution was performed.
 No surviving-worker average, guessed observer
 overhead subtraction, or gain claim is produced. Raw on/off measurements are the
 overhead calibration; shared-host process CPU is not isolated proxy cost, and RSS

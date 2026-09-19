@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import re
 import sys
@@ -22,13 +23,16 @@ def owned_gateway():
                 network_mode="host", metrics_endpoint=profile.METRICS_ENDPOINT)
 
 
-def binding():
-    endpoint = dict(host_pid=31, start_ticks=100, namespace_pids=[31, 1], listener_inode=1234)
-    return dict(container_id="a" * 64, endpoint=profile.METRICS_ENDPOINT,
+def binding(identity=None):
+    identity = owned_gateway() if identity is None else identity
+    endpoint = dict(host_pid=identity["host_pid"], start_ticks=identity["start_ticks"],
+                    namespace_pids=[identity["host_pid"], 1], listener_inode=1234)
+    return dict(container_id=identity["container_id"], endpoint=profile.METRICS_ENDPOINT,
                 before=endpoint, after=copy.deepcopy(endpoint))
 
 
-def capture(duration=1, times=None):
+def capture(duration=1, times=None, identity=None):
+    identity = owned_gateway() if identity is None else identity
     rows = []
     times = times if times is not None else [9.75 + index * 0.5 for index in range(duration * 2 + 2)]
     for index, time in enumerate(times):
@@ -42,11 +46,11 @@ def capture(duration=1, times=None):
             counters[boundary + "_data_bytes"] = (100 + index * 10) * 10240
             counters[boundary + "_size_1025_16384"] = 100 + index * 10
         rows.append(dict(unix_secs=time - 0.001,
-                         processes=[dict(pid=31, start_ticks=100, role="gateway")],
+                         processes=[dict(pid=identity["host_pid"], start_ticks=identity["start_ticks"], role="gateway")],
                          h1_profile=dict(sample_id=index, unix_secs=time, monotonic_secs=time + 100,
                                          capture_secs=0.01, sampler_cpu_secs=0.001,
-                                         counters=counters, gateway_binding=binding())))
-    return dict(capture_complete=True, timeline=rows, h1_gateway=owned_gateway())
+                                         counters=counters, gateway_binding=binding(identity))))
+    return dict(capture_complete=True, timeline=rows, h1_gateway=identity)
 
 
 def bracket(data, phases=None, **kwargs):
@@ -55,10 +59,10 @@ def bracket(data, phases=None, **kwargs):
                                    successful_responses=100, **kwargs)
 
 
-def traffic_sample(gateway, pair, size):
+def traffic_sample(gateway, pair, size, gateway_pid=31):
     workers = profile.MANIFEST["scaled_workers"][profile.MANIFEST["payload_sizes"].index(size)]
     roles = ["client", "backend"] + ([] if gateway == "direct" else ["gateway"])
-    processes = [dict(pid={"client": 32, "backend": 30, "gateway": 31}[role],
+    processes = [dict(pid={"client": 32, "backend": 30, "gateway": gateway_pid}[role],
                       role=role, complete_bracket=True, cpu_seconds=1) for role in roles]
     observed = {name: dict(min=0, max=workers, mean=workers / 2) for name in (
         "active_workers", "active_connections", "active_streams", "queued_requests")}
@@ -72,23 +76,91 @@ def traffic_sample(gateway, pair, size):
                 observed=observed, process_usage=dict(processes=processes, measurement=processes))
 
 
+REVISION = "f73e1d2299ed61612bc5dd95315e3df901b150fa"
+
+
+def docker_inspect(config, gateway="ferrum", pair=1):
+    # Actual Dockerfile.release + start_ferrum shape, independently enumerated
+    # so producer/consumer changes cannot silently update a mirrored fixture.
+    observer = "off" if gateway == "ferrum-baseline" else "on"
+    labels = {"org.opencontainers.image.revision": REVISION, "ferrum.h1-profile": observer,
+              "org.opencontainers.image.title": "Ferrum Edge"}
+    environment = [
+        "PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+        "FERRUM_MODE=file", "FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml",
+        "FERRUM_PROXY_HTTP_PORT=8000", "FERRUM_PROXY_HTTPS_PORT=8443",
+        "FERRUM_ADMIN_HTTP_PORT=9000", "FERRUM_ADMIN_HTTPS_PORT=9443",
+        "FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1", "FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32",
+        "FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/cert.pem",
+        "FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/key.pem",
+        "FERRUM_DTLS_CERT_PATH=/etc/ferrum/tls/cert.pem", "FERRUM_DTLS_KEY_PATH=/etc/ferrum/tls/key.pem",
+        "FERRUM_LOG_LEVEL=error", "FERRUM_ADD_VIA_HEADER=false", "FERRUM_ADD_FORWARDED_HEADER=false",
+        "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0", "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0",
+        "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0", "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0",
+        "FERRUM_MAX_CONNECTIONS=0", "FERRUM_POOL_MAX_IDLE_PER_HOST=200",
+        "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true", "FERRUM_POOL_WARMUP_ENABLED=true",
+        "FERRUM_WEBSOCKET_TUNNEL_MODE=true", "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608",
+        "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432",
+        "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true", "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576",
+        "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000", "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=16",
+        "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000", "FERRUM_UDP_MAX_SESSIONS=10000",
+        "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64", "FERRUM_TCP_IDLE_TIMEOUT_SECONDS=30",
+        "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=30",
+        "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=" + ("1" if gateway == "ferrum-exp-cutoff-one" else "0"),
+    ]
+    image_id = "sha256:" + ("b" if observer == "off" else "c") * 64
+    ordinal = (pair - 1) * 3 + ("ferrum", "ferrum-baseline", "ferrum-exp-cutoff-one").index(gateway)
+    container = dict(Id="a" * 64 if ordinal == 0 else f"{ordinal:064x}", Image=image_id,
+                     # Synthetic wall clock matches the measurement starting at 10.
+                     State=dict(Pid=31 + ordinal * 10, StartedAt="1970-01-01T00:00:01.123456789Z", Running=True),
+                     HostConfig=dict(NetworkMode="host"),
+                     Config=dict(Env=environment, Labels=labels, Entrypoint=["/app/ferrum-edge"],
+                                 Cmd=["run"], WorkingDir="/app"),
+                     Mounts=[dict(Type="bind", Source=str(config.resolve()),
+                                  Destination="/etc/ferrum/config.yaml", RW=False),
+                             dict(Type="bind", Source="/tmp/campaign/tls",
+                                  Destination="/etc/ferrum/tls", RW=False)])
+    return container, dict(Id=image_id, Config=dict(Labels=copy.deepcopy(labels)))
+
+
+def retain_fixture(path, config, gateway="ferrum", pair=1, mode="cutoff"):
+    container, image = docker_inspect(config, gateway, pair)
+    with patch.object(profile, "process_start_ticks", return_value=100), \
+            patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))):
+        profile.retain_runtime(path, container, config, pair, gateway, "campaign-host", mode)
+    return json.loads(path.read_text())
+
+
 def campaign(root, mode="cutoff"):
     gateways = ["direct"] + list(profile.MANIFEST["campaigns"][mode])
     manifest = dict(pairs=4, gateways=gateways, payload_sizes=profile.MANIFEST["payload_sizes"],
                     host_id="campaign-host", sample_schema=2, protocol="http1-tls", duration=15,
-                    offered_workers=200, h1_profile_mode=mode)
+                    offered_workers=200, h1_profile_mode=mode, h1_revision=REVISION)
     (root / "manifest.json").write_text(json.dumps(manifest))
     for pair in range(1, 5):
         folder = root / "pairs" / f"pair_{pair:03d}"
         (folder / "diagnostics").mkdir(parents=True)
         for gateway in gateways:
-            (folder / "diagnostics" / f"{gateway}_runtime.json").write_text(json.dumps(owned_gateway()))
+            identity = None
+            if gateway != "direct":
+                config = folder / "diagnostics" / f"{gateway}_config.yaml"
+                config.write_text((profile.ROOT / "configs/http1_tls_e2e_perf.yaml").read_text().replace(
+                    "CA_PATH", "/etc/ferrum/tls/ca.pem"))
+                runtime = retain_fixture(folder / "diagnostics" / f"{gateway}_runtime.json",
+                                         config, gateway, pair, mode)
+                identity = {key: runtime[key] for key in owned_gateway()}
             for size in profile.MANIFEST["payload_sizes"]:
                 (folder / f"{gateway}_http1-tls_{size}.json").write_text(
-                    json.dumps(traffic_sample(gateway, pair, size)))
-                if gateway not in ("direct", "ferrum-baseline"):
+                    json.dumps(traffic_sample(gateway, pair, size, identity["host_pid"] if identity else 31)))
+                if gateway != "direct":
+                    usage = capture(duration=15, identity=identity)
+                    if gateway == "ferrum-baseline":
+                        for row in usage["timeline"]:
+                            row["h1_profile"].pop("counters")
+                            row["h1_profile"]["error"] = "ValueError"
                     (folder / "diagnostics" / f"{gateway}_{size}_process_usage.json").write_text(
-                        json.dumps(capture(duration=15)))
+                        json.dumps(usage))
     return root / "pairs/pair_001/ferrum_http1-tls_10240.json", \
         root / "pairs/pair_001/diagnostics/ferrum_10240_process_usage.json"
 
@@ -174,8 +246,167 @@ class H1InternalProfileTests(unittest.TestCase):
                 campaign(root, mode)
                 row = self.assert_matrix(root, eligible=True, mode=mode)
                 self.assertFalse(row["traffic_issues"])
+                self.assertFalse(row["runtime_issues"])
                 self.assertTrue(row["profile"]["complete"])
                 self.assertGreater(row["profile"]["published_delta"]["body_proxy_output_all_data_bytes"], 0)
+                written = json.loads((root / "h1_profile_report.json").read_text())
+                self.assertTrue(written["runtime_complete"])
+                ids = {r["runtime"]["image_id"] for r in written["observations"] if "runtime" in r}
+                self.assertEqual(len(ids), 2 if mode == "calibration" else 1)
+
+    def assert_runtime_failure(self, root, mode, gateway, pair=1):
+        self.assert_matrix(root, mode=mode)
+        report = json.loads((root / "h1_profile_report.json").read_text())
+        for key in ("runtime_complete", "traffic_complete", "profiles_complete"):
+            self.assertFalse(report[key], key)
+        rows = [row for row in report["observations"] if row["gateway"] == gateway and row["pair"] == pair]
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(row["runtime_issues"] for row in rows))
+        return rows
+
+    def test_every_arm_requires_typed_runtime_revision_image_observer_and_environment(self):
+        for mode in ("calibration", "cutoff"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                campaign(root, mode)
+                for gateway in profile.MANIFEST["campaigns"][mode]:
+                    path = root / "pairs/pair_001/diagnostics" / f"{gateway}_runtime.json"
+                    original = json.loads(path.read_text())
+                    cases = [None, [], "invalid", {}]
+                    for key, value in (
+                            ("runtime_schema", True), ("pair", 2), ("gateway", "direct"),
+                            ("host_id", "other-host"), ("h1_profile_mode", "diagnostic"),
+                            ("capture_issues", None), ("capture_issues", ["failed"]),
+                            ("running", False), ("running", 1), ("started_at", "time"),
+                            ("started_at", "2026-99-18T10:00:00Z"), ("started_at", []),
+                            ("started_at", "1970-01-01T00:00:11Z"),
+                            ("container_id", "a"), ("host_pid", True), ("start_ticks", 0),
+                            ("network_mode", "bridge"), ("identity_error", "unavailable"),
+                            ("metrics_endpoint", "http://127.0.0.1:9001/metrics"),
+                            ("image_id", "ferrum-h1:on"), ("image_id", []),
+                            ("config_sha256", True), ("other_environment_sha256", None),
+                            ("other_mounts_sha256", "bad"), ("environment", []),
+                            ("environment", {}), ("config_mount", []), ("command", None)):
+                        cases.append(dict(original, **{key: value}))
+                    for key in ("image_id", "image_labels", "container_labels", "environment",
+                                "config_sha256", "config_mount", "other_environment_sha256"):
+                        missing = copy.deepcopy(original)
+                        missing.pop(key)
+                        cases.append(missing)
+                    for key in ("image_labels", "container_labels"):
+                        for value in (None, [], {}, {profile.REVISION_LABEL: REVISION}):
+                            cases.append(dict(original, **{key: value}))
+                        for label, value in (
+                                (profile.REVISION_LABEL, None), (profile.REVISION_LABEL, REVISION[:12]),
+                                (profile.REVISION_LABEL, "d" * 40), (profile.REVISION_LABEL, []),
+                                (profile.OBSERVER_LABEL, None), (profile.OBSERVER_LABEL, True),
+                                (profile.OBSERVER_LABEL, "on" if gateway == "ferrum-baseline" else "off")):
+                            bad = copy.deepcopy(original)
+                            bad[key][label] = value
+                            cases.append(bad)
+                    for key, value in ((profile.CUTOFF_ENV, "0" if gateway == "ferrum-exp-cutoff-one" else "1"),
+                                       ("FERRUM_MODE", "database"), ("FERRUM_FILE_CONFIG_PATH", "/tmp/other"),
+                                       ("FERRUM_METRICS_ALLOWED_CIDRS", "0.0.0.0/0"),
+                                       ("FERRUM_POOL_MAX_IDLE_PER_HOST", "1"),
+                                       ("FERRUM_PROXY_HTTP_PORT", True), ("FERRUM_LOG_LEVEL", {})):
+                        bad = copy.deepcopy(original)
+                        bad["environment"][key] = value
+                        cases.append(bad)
+                    for key, value in (("source", None), ("source", "relative.yaml"),
+                                       ("destination", "/tmp/config.yaml"), ("read_only", 1), ("type", "volume")):
+                        bad = copy.deepcopy(original)
+                        bad["config_mount"][key] = value
+                        cases.append(bad)
+                    path.unlink()
+                    self.assert_runtime_failure(root, mode, gateway)
+                    for serialized in ("{bad", *[json.dumps(case) for case in cases]):
+                        with self.subTest(mode=mode, gateway=gateway, case=serialized[:120]):
+                            path.write_text(serialized)
+                            self.assert_runtime_failure(root, mode, gateway)
+                    path.write_text(json.dumps(original))
+                self.assert_matrix(root, eligible=True, mode=mode)
+
+    def test_pairing_across_all_pairs_and_actual_config_bytes(self):
+        for mode in ("calibration", "cutoff"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                campaign(root, mode)
+                for gateway in profile.MANIFEST["campaigns"][mode]:
+                    folder = root / "pairs/pair_004/diagnostics"
+                    path, config = folder / f"{gateway}_runtime.json", folder / f"{gateway}_config.yaml"
+                    original, content = json.loads(path.read_text()), config.read_bytes()
+                    for key in ("image_id", "other_environment_sha256", "other_mounts_sha256"):
+                        with self.subTest(mode=mode, gateway=gateway, key=key):
+                            value = ("sha256:" if key == "image_id" else "") + "e" * 64
+                            path.write_text(json.dumps(dict(original, **{key: value})))
+                            rows = self.assert_runtime_failure(root, mode, gateway, pair=4)
+                            self.assertTrue(any("pairing mismatch" in issue for issue in rows[0]["runtime_issues"]))
+                            path.write_text(json.dumps(original))
+                    changed = copy.deepcopy(original)
+                    changed["environment"]["FERRUM_LOG_LEVEL"] = "warn"  # valid alone, unequal in campaign
+                    path.write_text(json.dumps(changed))
+                    self.assert_runtime_failure(root, mode, gateway, pair=4)
+                    path.write_text(json.dumps(original))
+                    config.unlink()
+                    self.assert_runtime_failure(root, mode, gateway, pair=4)
+                    changed_content = content.replace(b"backend_read_timeout_ms: 30000", b"backend_read_timeout_ms: 30001")
+                    self.assertNotEqual(content, changed_content)
+                    config.write_bytes(changed_content)
+                    self.assert_runtime_failure(root, mode, gateway, pair=4)  # retained hash was stale
+                    changed = dict(original, config_sha256=hashlib.sha256(changed_content).hexdigest())
+                    path.write_text(json.dumps(changed))
+                    rows = self.assert_runtime_failure(root, mode, gateway, pair=4)  # hash alone is not pairing
+                    self.assertIn("campaign config pairing mismatch", rows[0]["runtime_issues"])
+                    path.write_text(json.dumps(original))
+                    config.write_bytes(content)
+                self.assert_matrix(root, eligible=True, mode=mode)
+                manifest_path = root / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                for revision in (None, True, [], REVISION[:12], "d" * 40):
+                    manifest_path.write_text(json.dumps(dict(manifest, h1_revision=revision)))
+                    self.assert_runtime_failure(root, mode, "ferrum")
+
+    def test_calibration_cannot_relabel_one_image_as_both_observers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            campaign(root, "calibration")
+            for path in root.glob("pairs/*/diagnostics/ferrum-baseline_runtime.json"):
+                runtime = json.loads(path.read_text())
+                runtime["image_id"] = "sha256:" + "c" * 64
+                path.write_text(json.dumps(runtime))
+            self.assert_runtime_failure(root, "calibration", "ferrum-baseline")
+
+    def test_observer_off_control_requires_its_owned_process_through_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            campaign(root, "calibration")
+            path = root / "pairs/pair_001/diagnostics/ferrum-baseline_10240_process_usage.json"
+            original = json.loads(path.read_text())
+            cases = [None, [], {}, dict(original, capture_complete=False), dict(original, timeline=[])]
+            for mutate in (
+                    lambda u: u.pop("h1_gateway"),
+                    lambda u: u["h1_gateway"].update(container_id="d" * 64),
+                    lambda u: u["timeline"][1]["processes"].clear(),
+                    lambda u: u["timeline"][1]["processes"][0].update(start_ticks=101),
+                    lambda u: u["timeline"][1]["processes"].append(dict(pid=32, start_ticks=100, role="gateway"))):
+                invalid = copy.deepcopy(original)
+                mutate(invalid)
+                cases.append(invalid)
+            for usage in cases:
+                path.write_text(json.dumps(usage))
+                self.assert_matrix(root, mode="calibration")
+                result = json.loads((root / "h1_profile_report.json").read_text())
+                row = next(r for r in result["observations"] if (r["pair"], r["gateway"], r["payload"]) ==
+                           (1, "ferrum-baseline", 10240))
+                self.assertIn("missing/mismatched owned runtime process bracket", row["runtime_issues"])
+                self.assertFalse(row["profile"]["expected"])
+                self.assertFalse(result["runtime_complete"])
+            path.write_text(json.dumps(original))
+            sample_path = root / "pairs/pair_001/ferrum-baseline_http1-tls_10240.json"
+            sample = json.loads(sample_path.read_text())
+            sample["process_usage"]["measurement"][-1]["pid"] = 999
+            sample_path.write_text(json.dumps(sample))
+            self.assert_matrix(root, mode="calibration")
 
     def test_campaign_rejects_legacy_and_substituted_samples_without_losing_rows(self):
         from benchmark_validity import sample_issues
@@ -450,18 +681,115 @@ class H1InternalProfileTests(unittest.TestCase):
             self.assertIn("counters", result)  # preserve partial metrics
             self.assertNotIn("after", result["gateway_binding"])
 
+    def test_runtime_captures_actual_image_and_container_labels_by_immutable_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, path = root / "config.yaml", root / "runtime.json"
+            config.write_text("proxies: []\n")
+            for gateway in ("ferrum", "ferrum-baseline", "ferrum-exp-cutoff-one"):
+                mode = "calibration" if gateway == "ferrum-baseline" else "cutoff"
+                container, image = docker_inspect(config, gateway)
+                with patch.object(profile, "process_start_ticks", return_value=100), \
+                        patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))) as inspect:
+                    profile.retain_runtime(path, container, config, 1, gateway, "campaign-host", mode)
+                inspect.assert_called_once_with(
+                    ["docker", "image", "inspect", container["Image"], "--format", "{{json .}}"],
+                    check=True, capture_output=True, text=True, timeout=10)
+                runtime = json.loads(path.read_text())
+                for key in ("image_labels", "container_labels"):
+                    self.assertEqual(runtime[key], {profile.REVISION_LABEL: REVISION,
+                                                   profile.OBSERVER_LABEL: "off" if gateway == "ferrum-baseline" else "on"})
+                self.assertEqual(runtime["config_sha256"], hashlib.sha256(config.read_bytes()).hexdigest())
+                self.assertEqual(profile.runtime_issues(runtime, config, 1, gateway,
+                                                        dict(host_id="campaign-host", h1_revision=REVISION), mode), [])
+
+    def test_runtime_capture_failures_remain_safe_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, path = root / "config.yaml", root / "runtime.json"
+            config.write_text("proxies: []\n")
+            original_container, original_image = docker_inspect(config)
+            failures = [(None, original_image), ([], original_image), ({}, original_image),
+                        (original_container, None), (original_container, []), (original_container, {})]
+            for mutate in (
+                    lambda c: c.update(Image="mutable:tag"),
+                    lambda c: c["Config"].update(Labels=None),
+                    lambda c: c["Config"]["Labels"].update({profile.REVISION_LABEL: "d" * 40}),
+                    lambda c: c["Config"]["Labels"].update({profile.OBSERVER_LABEL: "off"}),
+                    lambda c: c["Config"].update(Env=None),
+                    lambda c: c["Config"]["Env"].append("FERRUM_MODE=file"),
+                    lambda c: c["Config"]["Env"].append("FERRUM_ADMIN_JWT_SECRET=do-not-retain-this"),
+                    lambda c: c["Config"]["Env"].append("FERRUM_FILE_CONFIG_PATH_FILE=do-not-retain-this"),
+                    lambda c: c["Config"]["Env"].append(None),
+                    lambda c: c["Config"]["Env"].append("no-equals"),
+                    lambda c: c["Config"]["Env"].append("HOSTNAME=foreign-override"),
+                    lambda c: c["Config"].update(Cmd=["run", "--settings", "do-not-retain-this"]),
+                    lambda c: c["State"].update(Running=False),
+                    lambda c: c["Mounts"][0].update(RW=True),
+                    lambda c: c["Mounts"][0].update(Source=str(root / "missing.yaml")),
+                    lambda c: c["Mounts"][0].update(Destination="/etc/ferrum/other.yaml"),
+                    lambda c: c["Mounts"].append(copy.deepcopy(c["Mounts"][0])),
+                    lambda c: c.update(Mounts=None)):
+                container = copy.deepcopy(original_container)
+                mutate(container)
+                failures.append((container, original_image))
+            for mutate in (
+                    lambda i: i.update(Id="sha256:" + "e" * 64),
+                    lambda i: i["Config"].update(Labels=[]),
+                    lambda i: i["Config"]["Labels"].pop(profile.REVISION_LABEL),
+                    lambda i: i["Config"]["Labels"].update({profile.REVISION_LABEL: REVISION[:12]}),
+                    lambda i: i["Config"]["Labels"].update({profile.OBSERVER_LABEL: True})):
+                image = copy.deepcopy(original_image)
+                mutate(image)
+                failures.append((original_container, image))
+            for index, (container, image) in enumerate(failures):
+                with self.subTest(index=index), \
+                        patch.object(profile, "process_start_ticks", return_value=100), \
+                        patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))):
+                    profile.retain_runtime(path, container, config, 1, "ferrum", "campaign-host", "cutoff")
+                runtime = json.loads(path.read_text())
+                self.assertTrue(profile.runtime_issues(runtime, config, 1, "ferrum",
+                                                       dict(host_id="campaign-host", h1_revision=REVISION), "cutoff"))
+                self.assertNotIn("do-not-retain-this", path.read_text())
+            for output in ("not-json", ""):
+                with patch.object(profile, "process_start_ticks", return_value=100), \
+                        patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=output)):
+                    profile.retain_runtime(path, original_container, config, 1, "ferrum", "campaign-host", "cutoff")
+                self.assertIn("immutable image/container label capture unavailable",
+                              json.loads(path.read_text())["capture_issues"])
+            for error in (OSError("unavailable"), profile.subprocess.TimeoutExpired("docker", 10)):
+                with patch.object(profile, "process_start_ticks", return_value=100), \
+                        patch.object(profile.subprocess, "run", side_effect=error):
+                    profile.retain_runtime(path, original_container, config, 1, "ferrum", "campaign-host", "cutoff")
+                self.assertTrue(json.loads(path.read_text())["capture_issues"])
+
+    def test_environment_hash_retains_hidden_differences_and_ignores_only_generated_hostname(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, path = root / "config.yaml", root / "runtime.json"
+            config.write_text("proxies: []\n")
+            original = retain_fixture(path, config)
+            container, image = docker_inspect(config)
+            container["Config"]["Env"].reverse()  # map order cannot change pairing
+            container["Config"]["Env"].append("HOSTNAME=" + "a" * 12)
+            for changed in (False, True):
+                if changed:
+                    container["Config"]["Env"].append("LD_PRELOAD=do-not-retain-this")
+                with patch.object(profile, "process_start_ticks", return_value=100), \
+                        patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))):
+                    profile.retain_runtime(path, container, config, 1, "ferrum", "campaign-host", "cutoff")
+                runtime = json.loads(path.read_text())
+                self.assertEqual(runtime["capture_issues"], [])
+                self.assertEqual(runtime["other_environment_sha256"] == original["other_environment_sha256"], not changed)
+                self.assertNotIn("do-not-retain-this", path.read_text())
+
     def test_runtime_and_sampler_bind_the_selected_container_not_a_stable_foreign_pid(self):
         from process_usage import sample_processes
-        container = dict(Id="a" * 64, Image="image-id", State=dict(Pid=31, StartedAt="time", Running=True),
-                         HostConfig=dict(NetworkMode="host"), Config=dict(Env=[
-                             "FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1", "FERRUM_ADMIN_HTTP_PORT=9000",
-                             "FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32"]))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime, config = root / "runtime.json", root / "config.yaml"
             config.write_text("proxies: []\n")
-            with patch.object(profile, "process_start_ticks", return_value=100):
-                profile.retain_runtime(runtime, container, config)
+            retain_fixture(runtime, config)
             self.assertEqual(profile.gateway_identity(json.loads(runtime.read_text())), owned_gateway())
             stop, output = root / "stop", root / "usage.json"
             stop.touch()
@@ -488,8 +816,10 @@ class H1InternalProfileTests(unittest.TestCase):
                 self.assertEqual(result["h1_gateway"], owned_gateway() if selected == "a" * 64 else None)
                 if selected != "a" * 64:
                     self.assertTrue(all(row["h1_profile"]["identity_error"] for row in result["timeline"]))
+            container, image = docker_inspect(config)
             container["HostConfig"]["NetworkMode"] = "bridge"
-            profile.retain_runtime(runtime, container, config)
+            with patch.object(profile.subprocess, "run", return_value=MagicMock(stdout=json.dumps(image))):
+                profile.retain_runtime(runtime, container, config, 1, "ferrum", "campaign-host", "cutoff")
             self.assertIn("identity_error", json.loads(runtime.read_text()))
 
     def test_diagnostic_slice_cannot_change_bounds_or_enter_full_comparisons(self):

@@ -356,6 +356,7 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    local response_cutoff=0
     case "$PROTOCOL" in
         http3)
             extra_env+=(
@@ -376,7 +377,7 @@ start_ferrum() {
                     -e FERRUM_ADMIN_HTTP_PORT=9000
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
         if [ "$gw" = ferrum-exp-cutoff-one ]; then
-            extra_env+=(-e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=1)
+            response_cutoff=1
         fi
     fi
     GATEWAY_CID=$(docker run -d --rm --network host \
@@ -396,7 +397,7 @@ start_ferrum() {
         -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0" \
-        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0" \
+        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=$response_cutoff" \
         -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
@@ -427,7 +428,8 @@ start_ferrum() {
         cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/h1_internal_profile.py" runtime \
-                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
+                "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
+                "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
     fi
     wait_for_gateway
 }
@@ -1047,7 +1049,11 @@ main() {
         HOST_ID="$(hostname)-$$"
     fi
     local root_output="$OUTPUT_DIR"
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" <<'PYEOF'
+    local h1_revision=""
+    if [ -n "$H1_PROFILE" ]; then
+        h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
+    fi
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1056,7 +1062,8 @@ with open(sys.argv[1], "w") as manifest:
                "h2_observation_enabled": sys.argv[6] == "1",
                **({"h1_diagnostic_enabled": True} if sys.argv[7] == "diagnostic" else {}),
                **({"h1_profile_mode": sys.argv[7], "protocol": sys.argv[8],
-                   "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10])}
+                   "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
+                   "h1_revision": sys.argv[11]}
                   if sys.argv[7] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
