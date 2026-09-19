@@ -88,6 +88,26 @@ fn constructor_decode_diagnostics_withhold_values_and_document_paths() {
         (json!(918273641), "`config`", "must be an object"),
         (json!({"mode": hostile}), "`mode`", "unknown variant"),
         (
+            json!({"mode": {"snapshot": 918273641}}),
+            "`mode`",
+            "expected unit",
+        ),
+        (
+            json!({"mode": {"per_event": hostile}}),
+            "`mode`",
+            "expected unit",
+        ),
+        (
+            json!({"spool": {"compression": {"zstd": hostile}}}),
+            "`spool.compression`",
+            "expected unit",
+        ),
+        (
+            json!({"spool": {"compression": {"none": 918273641}}}),
+            "`spool.compression`",
+            "expected unit",
+        ),
+        (
             json!({"batch": {"size": -918273641}}),
             "`batch.size`",
             "invalid value",
@@ -157,6 +177,20 @@ fn constructor_decode_diagnostics_withhold_values_and_document_paths() {
         assert!(rendered.contains(reason), "{rendered}");
         for withheld in ["UNREGISTERED", "map.key", "918273641", "true", "false"] {
             assert!(!rendered.contains(withheld), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn constructor_preserves_known_unit_enum_object_representations() {
+    let temp = tempfile::tempdir().unwrap();
+    for mode in ["per_event", "snapshot"] {
+        for compression in ["none", "zstd"] {
+            let mut config = valid_config(temp.path());
+            config["mode"] = json!({(mode): null});
+            config["spool"]["compression"] = json!({(compression): null});
+            ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+                .expect("known unit enum object forms remain valid");
         }
     }
 }
