@@ -22,6 +22,7 @@ mod pkcs11_key_encoding_tests;
 mod pkcs11_module_policy_tests;
 #[cfg(feature = "pkcs11")]
 mod pkcs11_softhsm_tests;
+mod policy_log_redaction_tests;
 mod renewal_lease_tests;
 mod san_allow_list_verifier_tests;
 mod san_summary_tests;
