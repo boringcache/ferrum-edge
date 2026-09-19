@@ -595,6 +595,8 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     // the shared production maxima. Local sliding-window memory itself is
     // bounded by a fixed aggregate-bucket ring, not by one timestamp per request.
     let label = format!("graphql: `{field}` entry {key:?}");
+    // `field` is one of the two schema-authored caller literals. Preserve it
+    // outside the opaque label, which also contains the supplied operation key.
     let max_requests = validate_max_requests(&label, "max_requests", max_requests)
         .map_err(|error| format!("graphql: `{field}`: {error}"))?;
     let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)

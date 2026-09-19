@@ -1085,8 +1085,10 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
             .ok_or_else(|| format!("{label} must be an object"))?;
         validate_limit_rule_fields(&label, rule)?;
 
-        let specs =
-            parse_window_specs(&label, rule).map_err(|error| format!("{label}: {error}"))?;
+        // The shared bound helpers withhold the whole label. Keep the schema
+        // ordinal separately so a rendered rejection still locates this rule.
+        let specs = parse_window_specs(&label, rule)
+            .map_err(|error| format!("rate_limiting: `limits[{idx}]`: {error}"))?;
         if specs.is_empty() {
             return Err(format!(
                 "{label}: no rate limit windows configured — set `window_seconds`+`max_requests`, or `requests_per_second`/`requests_per_minute`/`requests_per_hour`"
