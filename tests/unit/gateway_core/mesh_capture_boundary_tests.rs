@@ -47,9 +47,11 @@ fn merged_ports_are_sorted_and_deduplicated_before_applying_the_bpf_cap() {
     config.include_outbound_ports = overflow.ports;
     let plan = IptablesPlan::for_config(&config).unwrap();
     for commands in [&plan.v4_commands, &plan.v6_commands] {
-        assert!(commands.iter().any(|command| {
-            command.contains("--dport 17 ") && command.contains("-j REDIRECT")
-        }));
+        assert!(
+            commands.iter().any(|command| {
+                command.contains("--dport 17 ") && command.contains("-j REDIRECT")
+            })
+        );
     }
 }
 
@@ -139,7 +141,11 @@ fn directly_constructed_root_uid_cannot_generate_tcp_udp_or_fallback_rules() {
             if let Some(uid) = uid {
                 assert_eq!(owner_rules.len(), 2, "TCP and UDP owner exemptions");
                 let owner_match = format!("--uid-owner {uid} -j RETURN");
-                assert!(owner_rules.iter().all(|command| command.contains(&owner_match)));
+                assert!(
+                    owner_rules
+                        .iter()
+                        .all(|command| command.contains(&owner_match))
+                );
             } else {
                 assert!(owner_rules.is_empty());
             }

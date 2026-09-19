@@ -5357,7 +5357,9 @@ iptables() {{
         // SAME `udp_tproxy_commands_for_family`, so the producer's OUTBOUND rules
         // stay byte-identical to the injector's — only the inbound chain differs.
         let config = udp_enabled_iptables_config();
-        let producer = IptablesPlan::udp_only_for_config(&config).unwrap().v4_commands;
+        let producer = IptablesPlan::udp_only_for_config(&config)
+            .unwrap()
+            .v4_commands;
         let injector = IptablesPlan::for_config(&config).unwrap().v4_commands;
         assert!(!producer.is_empty());
 

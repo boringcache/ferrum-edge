@@ -85,7 +85,11 @@ fn admission_rejects_direct_root_proxy_uid_in_every_capture_mode() {
             "object": pod_object()
         }
     });
-    for mode in [CaptureMode::Explicit, CaptureMode::Iptables, CaptureMode::Ebpf] {
+    for mode in [
+        CaptureMode::Explicit,
+        CaptureMode::Iptables,
+        CaptureMode::Ebpf,
+    ] {
         let mut config = injector_config(mode);
         config.proxy_uid = Some(0);
         let response = admission_response(review.to_string().as_bytes(), &config).unwrap();
