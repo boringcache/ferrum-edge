@@ -68,7 +68,12 @@ jobs:
   benchmark:
     name: bench / ${{ matrix.protocol }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The full five-payload matrix at three iterations does not fit 90 minutes:
+    # run 35497385452 lost http1-tls, wss and grpcs to the inner step timeout
+    # with iteration 3 partly written, and a truncated protocol still uploads
+    # artifacts that look complete per file. Sized so three iterations finish
+    # with headroom; GitHub's hosted ceiling is 360.
+    timeout-minutes: 170
     strategy:
       fail-fast: false
       matrix:
@@ -255,7 +260,10 @@ jobs:
 
       - name: Run benchmark
         if: steps.skip_check.outputs.skip != 'true'
-        timeout-minutes: 75
+        # Binding constraint, not the job timeout: image builds consume roughly
+        # the first 15 minutes, so 75 here is what cancelled the three heaviest
+        # protocols at ~90 minutes of wall clock.
+        timeout-minutes: 150
         env:
           ITERATIONS: ${{ inputs.iterations }}
           FERRUM_IMAGE: ferrum-edge:bench
