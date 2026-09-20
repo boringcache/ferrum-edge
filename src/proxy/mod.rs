@@ -6674,6 +6674,10 @@ pub struct ProxyState {
     pub max_response_body_size_bytes: usize,
     pub response_buffer_cutoff_bytes: usize,
     pub h2_coalesce_target_bytes: usize,
+    /// Bounded aggregation window for HTTP/1.1 response coalescing, in
+    /// milliseconds. 0 disables it and keeps the flush-on-first-`Pending`
+    /// behaviour (issue #5588).
+    pub response_coalesce_flush_ms: u64,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
     pub max_grpc_recv_size_bytes: usize,
@@ -7902,6 +7906,23 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
+    /// The bounded aggregation window for HTTP/1.1 response coalescing, or
+    /// `None` when the operator has not enabled one (issue #5588).
+    ///
+    /// `None` keeps `Coalescing`'s flush-on-first-`Pending` behaviour, which is
+    /// the shipped default: it never holds a byte the backend has already
+    /// delivered. A configured window trades that for larger writes, so the
+    /// conversion lives here rather than at the call site — the hot path reads
+    /// one field and this stays the single place the `0 == disabled` contract
+    /// is spelled.
+    #[inline]
+    pub(crate) fn response_coalesce_flush(&self) -> Option<std::time::Duration> {
+        match self.response_coalesce_flush_ms {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        }
+    }
+
     /// Apply a full snapshot on Tokio's blocking pool, carrying the CP-delivered
     /// gateway trust decision for this snapshot.
     ///
@@ -9623,6 +9644,7 @@ impl ProxyState {
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
         let response_buffer_cutoff_bytes = env_config.response_buffer_cutoff_bytes;
         let h2_coalesce_target_bytes = env_config.h2_coalesce_target_bytes;
+        let response_coalesce_flush_ms = env_config.response_coalesce_flush_ms;
         let max_url_length_bytes = env_config.max_url_length_bytes;
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
@@ -10231,6 +10253,7 @@ impl ProxyState {
             max_response_body_size_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
+            response_coalesce_flush_ms,
             max_url_length_bytes,
             max_query_params,
             max_grpc_recv_size_bytes,
@@ -40113,6 +40136,7 @@ async fn handle_proxy_request_inner(
                         response,
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
+                        state.response_coalesce_flush(),
                     )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
