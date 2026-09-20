@@ -2735,6 +2735,11 @@ pub struct EnvConfig {
     /// frame before flushing, trading tail latency for larger writes. HTTP/3
     /// already runs this shape with its own flush interval.
     ///
+    /// Clamped at use to half the proxy's `backend_read_timeout_ms`, the same
+    /// bound HTTP/3 applies, because a window makes the coalescer report
+    /// `Pending` while holding a sub-target frame and the idle read deadline
+    /// wrapped around it must not read that as a stalled backend.
+    ///
     /// 0 = disabled (flush on the first `Pending`) and is the default, so this
     /// is inert until an operator or a benchmark arm opts in.
     /// Maximum: 1000 (1 second).

@@ -1405,6 +1405,35 @@ fn target_uses_direct_h2_pool(
 /// `PluginCache::requires_request_body_buffering(&proxy.id)` accessors so
 /// this predicate is a pure function over its inputs and trivially
 /// unit-testable.
+/// Resolve the configured HTTP/1.1 response-coalescing window against the
+/// proxy's per-frame idle read timeout (issue #5588).
+///
+/// `0` disables the window, which is the shipped default and keeps
+/// `Coalescing` flushing on the first `Pending` — it never holds a byte the
+/// backend has already delivered.
+///
+/// A configured window is clamped to half `read_timeout_ms`, the same bound
+/// `h3_effective_flush_interval` applies. With a window the coalescer reports
+/// `Pending` while still holding a sub-target frame, so the
+/// `IdleReadTimeoutBody` wrapped around it can no longer treat every `Pending`
+/// as a genuine backend-read wait. Staying well inside that deadline is what
+/// keeps a held frame from being read as a stalled backend. `0` disables the
+/// timeout entirely, so there is nothing to clamp against.
+#[inline]
+pub(crate) fn coalesce_flush_window(
+    flush_ms: u64,
+    read_timeout_ms: u64,
+) -> Option<std::time::Duration> {
+    let window = match flush_ms {
+        0 => return None,
+        ms => std::time::Duration::from_millis(ms),
+    };
+    if read_timeout_ms == 0 {
+        return Some(window);
+    }
+    Some(window.min(std::time::Duration::from_millis(read_timeout_ms) / 2))
+}
+
 fn proxy_config_forces_reqwest_dispatch(
     proxy: &Proxy,
     enable_http2: bool,
@@ -7915,12 +7944,20 @@ impl ProxyState {
     /// conversion lives here rather than at the call site — the hot path reads
     /// one field and this stays the single place the `0 == disabled` contract
     /// is spelled.
+    ///
+    /// Clamped to half the per-frame idle read timeout, exactly as
+    /// `h3_effective_flush_interval` does for HTTP/3. With a window the
+    /// coalescer reports `Pending` while still holding a sub-target frame, so
+    /// the `IdleReadTimeoutBody` wrapped around it can no longer assume every
+    /// `Pending` means a genuine backend-read wait. Keeping the window well
+    /// inside that deadline is what stops a held frame from being mistaken for
+    /// a stalled backend.
     #[inline]
-    pub(crate) fn response_coalesce_flush(&self) -> Option<std::time::Duration> {
-        match self.response_coalesce_flush_ms {
-            0 => None,
-            ms => Some(std::time::Duration::from_millis(ms)),
-        }
+    pub(crate) fn response_coalesce_flush(
+        &self,
+        read_timeout_ms: u64,
+    ) -> Option<std::time::Duration> {
+        coalesce_flush_window(self.response_coalesce_flush_ms, read_timeout_ms)
     }
 
     /// Apply a full snapshot on Tokio's blocking pool, carrying the CP-delivered
@@ -40136,7 +40173,7 @@ async fn handle_proxy_request_inner(
                         response,
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
-                        state.response_coalesce_flush(),
+                        state.response_coalesce_flush(proxy.backend_read_timeout_ms),
                     )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
@@ -56223,6 +56260,42 @@ async fn proxy_to_backend_http3_retry(
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #5588. The window must stay well inside the idle read deadline:
+    /// with one configured the coalescer parks holding a sub-target frame, and
+    /// `IdleReadTimeoutBody` would otherwise read that as a stalled backend.
+    #[test]
+    fn coalesce_flush_window_is_clamped_to_half_the_idle_read_timeout() {
+        use super::coalesce_flush_window;
+        use std::time::Duration;
+
+        // Disabled is the shipped default and survives any timeout.
+        assert_eq!(coalesce_flush_window(0, 5_000), None);
+        assert_eq!(coalesce_flush_window(0, 0), None);
+
+        // Comfortably inside the deadline: taken as configured.
+        assert_eq!(
+            coalesce_flush_window(2, 5_000),
+            Some(Duration::from_millis(2))
+        );
+
+        // At or past half the deadline: clamped, never adopted whole.
+        assert_eq!(
+            coalesce_flush_window(1_000, 100),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            coalesce_flush_window(60, 100),
+            Some(Duration::from_millis(50))
+        );
+
+        // No timeout configured means no deadline to protect.
+        assert_eq!(
+            coalesce_flush_window(1_000, 0),
+            Some(Duration::from_millis(1_000))
+        );
+    }
+
     #[test]
     fn route_rebase_preserves_rewrite_for_finalized_egress() {
         let mut ctx = crate::plugins::RequestContext::new(
