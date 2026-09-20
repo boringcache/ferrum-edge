@@ -34,6 +34,14 @@ on:
         description: Stop after the single-pass 5 MiB H1 drain diagnostic
         type: boolean
         default: true
+      coalesce_flush_ms:
+        description: >-
+          Issue #5588 bounded aggregation window (ms) for the cutoff lane's
+          ferrum-exp-cutoff-one arm. 0 keeps the shipped flush-on-first-Pending
+          behaviour, so the lane is unchanged unless a window is selected.
+        type: choice
+        default: '0'
+        options: ['0', '1', '2', '5']
 
 permissions:
   contents: read
@@ -319,12 +327,14 @@ jobs:
         continue-on-error: true
         env:
           H1_PAYLOAD_SELECTION: ${{ inputs.payloads }}
+          H1_COALESCE_FLUSH_MS: ${{ inputs.coalesce_flush_ms || '0' }}
         run: |
           set -euo pipefail
           sizes="$H1_PAYLOAD_SELECTION"
           if [ "$sizes" = all ]; then sizes='10240 71680 512000 1048576 5242880'; fi
           FERRUM_IMAGE=ferrum-h1:on bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
             http1-tls --h1-profile cutoff --gateways ferrum --skip-build \
+            --h1-coalesce-flush-ms "$H1_COALESCE_FLUSH_MS" \
             --duration 15 --concurrency 200 --pairs 4 --payload-sizes "$sizes" \
             --wallclock-budget-seconds 7200 --output-dir h1-profile-evidence/cutoff
       - name: Compile and stage the same shared observer for the selected trace lane

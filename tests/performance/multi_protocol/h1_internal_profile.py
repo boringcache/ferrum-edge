@@ -32,6 +32,10 @@ REVISION_LABEL = "org.opencontainers.image.revision"
 OBSERVER_LABEL = "ferrum.h1-profile"
 CONFIG_DESTINATION = "/etc/ferrum/config.yaml"
 CUTOFF_ENV = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES"
+# Issue #5588. Always present in the runtime environment so this allowlist
+# stays an exact key set; "0" is the shipped behaviour and the only value the
+# control arms may carry.
+COALESCE_FLUSH_ENV = "FERRUM_RESPONSE_COALESCE_FLUSH_MS"
 # Dockerfile.release defaults plus start_ferrum's explicit settings. Unknown
 # FERRUM_* settings (including secret-provider suffixes) fail closed without
 # retaining their names/values. Non-Ferrum environment values are hash-only.
@@ -48,6 +52,7 @@ RUNTIME_ENV = {
     "FERRUM_ADD_VIA_HEADER": "false", "FERRUM_ADD_FORWARDED_HEADER": "false",
     "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES": "0", "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES": "0",
     "FERRUM_MAX_GRPC_RECV_SIZE_BYTES": "0", CUTOFF_ENV: None,
+    COALESCE_FLUSH_ENV: None,
     "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS": "0", "FERRUM_MAX_CONNECTIONS": "0",
     "FERRUM_POOL_MAX_IDLE_PER_HOST": "200", "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE": "true",
     "FERRUM_POOL_WARMUP_ENABLED": "true", "FERRUM_WEBSOCKET_TUNNEL_MODE": "true",
@@ -449,6 +454,9 @@ def safe_environment(environment):
     if any(expected is not None and environment[key] != expected
            for key, expected in RUNTIME_ENV.items()):
         return False
+    if not (matches(r"[0-9]{1,4}", environment[COALESCE_FLUSH_ENV])
+            and int(environment[COALESCE_FLUSH_ENV]) <= 1000):
+        return False
     return (environment[CUTOFF_ENV] in ("0", "1")
             and environment["FERRUM_LOG_LEVEL"] in ("error", "warn", "info", "debug", "trace", "off")
             and all(matches(r"[1-9][0-9]{0,4}", environment[key])
@@ -586,6 +594,10 @@ def runtime_issues(runtime, config_path, pair, gateway, manifest, mode):
         issues.append("invalid safe runtime environment")
     elif environment[CUTOFF_ENV] != ("1" if gateway == "ferrum-exp-cutoff-one" else "0"):
         issues.append("runtime cutoff does not match arm")
+    elif gateway != "ferrum-exp-cutoff-one" and environment[COALESCE_FLUSH_ENV] != "0":
+        # A window on a control arm would silently make the comparison
+        # two-variable; only the experiment arm may carry one.
+        issues.append("runtime coalesce window set on a control arm")
     if runtime.get("command") != dict(entrypoint=["/app/ferrum-edge"], cmd=["run"], working_dir="/app"):
         issues.append("invalid runtime command/config binding")
     mount = runtime.get("config_mount")
