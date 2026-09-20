@@ -45753,10 +45753,17 @@ async fn proxy_to_backend(
         } else {
             ("backend_read_timeout_ms", proxy.backend_read_timeout_ms)
         };
+        // Issue #5575. When this fires, the open question is always which part
+        // of the dispatch never resolved. `upload_pump` says whether the pumped
+        // arm — and therefore the #4411 backend-socket scope wrapping the send —
+        // was in play at all, which splits the search in half before anyone
+        // reaches for a repro. It is a cold read of an Option on a request that
+        // is already failing.
         warn!(
             proxy_id = %proxy.id,
             watermark,
             watermark_ms,
+            upload_pump = upload_pump.is_some(),
             "reqwest dispatch: per-direction watermark expired before response headers"
         );
         return backend_dispatch_response(
