@@ -2112,6 +2112,24 @@ pub(crate) fn streaming_response_requires_size_limit(
     max_response_body_size_bytes > 0 && trusted_backend_content_length.is_none()
 }
 
+/// Decide whether a streaming reqwest response body may skip the coalescing
+/// adapter entirely and stream frame-for-frame through [`direct_streaming_body`].
+///
+/// The fast path exists to avoid per-frame `BytesMut` buffering when nothing
+/// needs it. An operator-configured aggregation window IS something that needs
+/// it: without this term the window would be silently inert in the default
+/// configuration (cutoff disabled, no size limit), because that configuration
+/// never constructs a `Coalescing` adapter for the window to apply to.
+pub(crate) fn streaming_response_takes_direct_fast_path(
+    response_buffer_cutoff_bytes: usize,
+    max_response_body_size_bytes: usize,
+    coalesce_flush: Option<std::time::Duration>,
+) -> bool {
+    response_buffer_cutoff_bytes == 0
+        && max_response_body_size_bytes == 0
+        && coalesce_flush.is_none()
+}
+
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
 /// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
 /// directly.
@@ -40143,12 +40161,19 @@ async fn handle_proxy_request_inner(
                 // default streaming path — we have one source of truth for body
                 // construction across the H1/H2-via-reqwest hot paths.
                 //
+                // Resolve the aggregation window first: an operator-configured
+                // window is itself a reason to take the coalescing path, so the
+                // gate below and the value handed to the adapter cannot drift.
+                let coalesce_flush = state.response_coalesce_flush(proxy.backend_read_timeout_ms);
                 // Fast path: skip coalescing when no plugins need body buffering,
-                // no size limits apply, and response buffer cutoff is disabled.
+                // no size limits apply, the response buffer cutoff is disabled,
+                // and no aggregation window was configured.
                 // This eliminates per-frame BytesMut buffering and branch overhead.
-                let base = if state.response_buffer_cutoff_bytes == 0
-                    && effective_max_response_body_size_bytes == 0
-                {
+                let base = if streaming_response_takes_direct_fast_path(
+                    state.response_buffer_cutoff_bytes,
+                    effective_max_response_body_size_bytes,
+                    coalesce_flush,
+                ) {
                     crate::proxy::body::direct_streaming_body(
                         response,
                         advertised_cl,
@@ -40173,7 +40198,7 @@ async fn handle_proxy_request_inner(
                         response,
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
-                        state.response_coalesce_flush(proxy.backend_read_timeout_ms),
+                        coalesce_flush,
                     )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
@@ -56294,6 +56319,30 @@ mod tests {
             coalesce_flush_window(1_000, 0),
             Some(Duration::from_millis(1_000))
         );
+    }
+
+    #[test]
+    fn a_configured_flush_window_keeps_the_body_off_the_direct_fast_path() {
+        use super::streaming_response_takes_direct_fast_path as takes_fast_path;
+        use std::time::Duration;
+
+        let window = Some(Duration::from_millis(2));
+
+        // Shipped default: cutoff disabled, no size limit, no window. The fast
+        // path is the whole point here — nothing needs per-frame buffering.
+        assert!(takes_fast_path(0, 0, None));
+
+        // Regression guard: in exactly that default configuration, a window is
+        // the ONLY thing asking for aggregation. If the fast path swallowed it,
+        // FERRUM_RESPONSE_COALESCE_FLUSH_MS would be silently inert unless the
+        // operator also set an unrelated knob, which is how this was missed.
+        assert!(!takes_fast_path(0, 0, window));
+
+        // The pre-existing reasons to coalesce still hold on their own, with or
+        // without a window.
+        assert!(!takes_fast_path(1, 0, None));
+        assert!(!takes_fast_path(0, 1, None));
+        assert!(!takes_fast_path(1, 1, window));
     }
 
     #[test]
