@@ -166,16 +166,24 @@ async fn one_request(args: &Args, tls: Arc<rustls::ClientConfig>) -> Result<Samp
     // HTTP/2 derives `:authority` from the URI, so it needs absolute form;
     // HTTP/1.1 wants origin form against an origin server and carries the
     // authority in `host`.
-    let uri = if args.alpn == "h2" {
-        format!("https://{}{}", args.target, path)
+    //
+    // Do NOT also send `host` on h2: RFC 9113 8.3.1 requires it to agree with
+    // `:authority`, and a gateway is right to reject the pair when they differ.
+    // The authority is built from the TLS server name rather than the dial
+    // address so it matches SNI and the certificate.
+    let port = args.target.rsplit(':').next().unwrap_or("443");
+    let request = if args.alpn == "h2" {
+        Request::builder()
+            .uri(format!("https://localhost:{port}{path}"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .context("request")?
     } else {
-        path
+        Request::builder()
+            .uri(&path)
+            .header("host", "localhost")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .context("request")?
     };
-    let request = Request::builder()
-        .uri(&uri)
-        .header("host", "localhost")
-        .body(http_body_util::Empty::<bytes::Bytes>::new())
-        .context("request")?;
 
     // Send, then time every frame off the same origin.
     let start = Instant::now();
