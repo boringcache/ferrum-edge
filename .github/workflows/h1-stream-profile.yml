@@ -79,7 +79,10 @@ jobs:
       - name: Hosted prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev clang lsof
+          # Matches the package set the sibling benchmark lanes use to build
+          # this same image: rdkafka-sys compiles librdkafka from source and
+          # needs curl/curl.h, which is not on the hosted image by default.
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev libssl-dev clang lsof sysstat
       - name: Retain source and runner identity
         run: |
           mkdir -p stream-profile-results
