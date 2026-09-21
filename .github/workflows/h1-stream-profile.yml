@@ -12,6 +12,13 @@
 name: H1 Stream Profile
 
 on:
+  # A workflow_dispatch entry is only offered once the file is on the default
+  # branch, so this lane also triggers on its own investigation branches. Push
+  # events run the workflow from the pushed commit, which is what lets the lane
+  # be exercised before it merges.
+  push:
+    branches:
+      - 'bench/5588-stream-**'
   workflow_dispatch:
     inputs:
       window_ms:
@@ -29,11 +36,6 @@ on:
         type: choice
         default: '20'
         options: ['10', '20', '50']
-      alpn:
-        description: Frontend protocol. h2 covers the axis the throughput run left unmeasured.
-        type: choice
-        default: h1
-        options: [h1, h2]
       repeats:
         description: Counterbalanced repeats per arm
         type: choice
@@ -45,9 +47,17 @@ permissions:
 
 jobs:
   stream-profile:
-    name: stream profile / ${{ inputs.alpn }}
+    name: stream profile / ${{ matrix.alpn }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both frontend protocols every run. H1 frames a streaming response with
+        # chunked transfer-coding and is where the window's benefit was measured;
+        # H2 frames with END_STREAM and was left unmeasured by the throughput
+        # run, so it is exactly the axis this lane exists to close.
+        alpn: [h1, h2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -82,7 +92,7 @@ jobs:
           WINDOW_MS: ${{ inputs.window_ms || '2' }}
           GAP_MS: ${{ inputs.gap_ms || '10' }}
           FRAMES: ${{ inputs.frames || '20' }}
-          ALPN: ${{ inputs.alpn || 'h1' }}
+          ALPN: ${{ matrix.alpn }}
           REPEATS: ${{ inputs.repeats || '5' }}
           OUTPUT_DIR: ${{ github.workspace }}/stream-profile-results
           FERRUM_IMAGE: ferrum-edge:bench
@@ -98,6 +108,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: h1-stream-profile-${{ github.sha }}-${{ inputs.alpn || 'h1' }}
+          name: h1-stream-profile-${{ github.sha }}-${{ matrix.alpn }}
           path: stream-profile-results
           retention-days: 14
