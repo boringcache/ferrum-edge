@@ -159,10 +159,18 @@ async fn one_request(args: &Args, tls: Arc<rustls::ClientConfig>) -> Result<Samp
         .context("tls")?;
     let io = TokioIo::new(tls_stream);
 
-    let uri = format!(
+    let path = format!(
         "/trickle?frames={}&size={}&gap_ms={}",
         args.frames, args.size, args.gap_ms
     );
+    // HTTP/2 derives `:authority` from the URI, so it needs absolute form;
+    // HTTP/1.1 wants origin form against an origin server and carries the
+    // authority in `host`.
+    let uri = if args.alpn == "h2" {
+        format!("https://{}{}", args.target, path)
+    } else {
+        path
+    };
     let request = Request::builder()
         .uri(&uri)
         .header("host", "localhost")

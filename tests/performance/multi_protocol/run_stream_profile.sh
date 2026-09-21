@@ -21,7 +21,12 @@ OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/stream-profile-results}"
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
 GATEWAY_HTTPS_PORT="${GATEWAY_HTTPS_PORT:-8443}"
 GATEWAY_HTTP_PORT="${GATEWAY_HTTP_PORT:-8000}"
-BACKEND_TLS_PORT=3447
+# The TLS backends are protocol-exclusive by design so a mismatch cannot slip
+# through silently: 3447 advertises only http/1.1 and 3443 only h2. A direct
+# control that offers the wrong ALPN gets `NoApplicationProtocol` rather than a
+# quiet fallback, so pick the port that matches the axis under test.
+BACKEND_TLS_PORT_H1=3447
+BACKEND_TLS_PORT_H2=3443
 
 FRAMES="${FRAMES:-20}"
 FRAME_SIZE="${FRAME_SIZE:-1024}"
@@ -113,6 +118,12 @@ profile() {
         --out "$OUTPUT_DIR/${arm}_repeat${repeat}.json" > /dev/null
 }
 
+case "$ALPN" in
+    h2) DIRECT_PORT="$BACKEND_TLS_PORT_H2" ;;
+    h1) DIRECT_PORT="$BACKEND_TLS_PORT_H1" ;;
+    *) echo "unsupported ALPN: $ALPN" >&2; exit 2 ;;
+esac
+
 mkdir -p "$OUTPUT_DIR"
 echo "[build] proto_backend + stream_profile"
 ( cd "$SCRIPT_DIR" && cargo build --release --bin proto_backend --bin stream_profile )
@@ -130,7 +141,7 @@ for repeat in $(seq 1 "$REPEATS"); do
     for arm in $order; do
         case "$arm" in
             direct)
-                profile direct "127.0.0.1:$BACKEND_TLS_PORT" "$repeat"
+                profile direct "127.0.0.1:$DIRECT_PORT" "$repeat"
                 ;;
             plain)
                 start_gateway 0
