@@ -1,0 +1,103 @@
+# Low-rate streaming latency profile for the response-aggregation window
+# (issue #5588).
+#
+# The throughput benchmark measures the window where it helps and cannot
+# measure where it hurts: at saturation a millisecond hold is invisible against
+# a p50 of hundreds of milliseconds. This lane runs the opposite workload — an
+# idle proxy carrying small frames spaced far apart, the SSE / long-poll shape —
+# and is the evidence any change to the shipped default depends on.
+#
+# Arms differ in one variable. Both run the coalescing adapter; only the window
+# changes, so a difference cannot be attributed to enabling coalescing.
+name: H1 Stream Profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      window_ms:
+        description: Aggregation window under test (ms)
+        type: choice
+        default: '2'
+        options: ['1', '2', '5', '10']
+      gap_ms:
+        description: Backend inter-frame gap (ms). Must exceed the window for the hold to be the dominant term.
+        type: choice
+        default: '10'
+        options: ['5', '10', '25', '100']
+      frames:
+        description: Frames per response
+        type: choice
+        default: '20'
+        options: ['10', '20', '50']
+      alpn:
+        description: Frontend protocol. h2 covers the axis the throughput run left unmeasured.
+        type: choice
+        default: h1
+        options: [h1, h2]
+      repeats:
+        description: Counterbalanced repeats per arm
+        type: choice
+        default: '5'
+        options: ['3', '5', '8']
+
+permissions:
+  contents: read
+
+jobs:
+  stream-profile:
+    name: stream profile / ${{ inputs.alpn }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Hosted prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev clang lsof
+      - name: Retain source and runner identity
+        run: |
+          mkdir -p stream-profile-results
+          git rev-parse HEAD > stream-profile-results/revision.txt
+          git status --porcelain > stream-profile-results/source-status.txt
+          uname -a > stream-profile-results/kernel.txt
+          lscpu > stream-profile-results/cpu.txt
+      - name: Build gateway image
+        run: |
+          set -euo pipefail
+          mkdir -p bin/amd64
+          cargo build --locked --release --bin ferrum-edge --bin ferrum-cni
+          cp target/release/ferrum-edge target/release/ferrum-cni bin/amd64/
+          sha256sum bin/amd64/* > stream-profile-results/binaries.sha256
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t ferrum-edge:bench .
+          docker image inspect ferrum-edge:bench > stream-profile-results/image.json
+      - name: Run the stream profile
+        env:
+          WINDOW_MS: ${{ inputs.window_ms || '2' }}
+          GAP_MS: ${{ inputs.gap_ms || '10' }}
+          FRAMES: ${{ inputs.frames || '20' }}
+          ALPN: ${{ inputs.alpn || 'h1' }}
+          REPEATS: ${{ inputs.repeats || '5' }}
+          OUTPUT_DIR: ${{ github.workspace }}/stream-profile-results
+          FERRUM_IMAGE: ferrum-edge:bench
+        run: |
+          set -euo pipefail
+          # The window only binds when it is shorter than the backend's gap;
+          # otherwise the next frame arrives first and the aggregator flushes on
+          # size or stream end, measuring nothing.
+          test "$WINDOW_MS" -lt "$GAP_MS"
+          ./tests/performance/multi_protocol/run_stream_profile.sh \
+            2>&1 | tee stream-profile-results/run.log
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: h1-stream-profile-${{ github.sha }}-${{ inputs.alpn || 'h1' }}
+          path: stream-profile-results
+          retention-days: 14
