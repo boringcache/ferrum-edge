@@ -75,7 +75,13 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "stream-profile"
+          # Same guards as the sibling benchmark lanes. The Actions cache is a
+          # shared 10 GB quota, and saving a fat-LTO release target/ from every
+          # investigation branch evicts the caches the required lanes depend
+          # on. Only a push to main may save; everything else restores.
+          cache-targets: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Hosted prerequisites
         run: |
           sudo apt-get update
