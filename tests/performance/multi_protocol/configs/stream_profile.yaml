@@ -1,14 +1,15 @@
 ---
 version: "1"
-# Low-rate streaming profile: HTTP/1.1+TLS frontend, plain HTTP/1.1 upstream.
+# Low-rate streaming profile: TLS frontend on the HTTPS port, which negotiates
+# HTTP/1.1 or HTTP/2 by ALPN (the lane runs both), plain HTTP/1.1 upstream.
 #
 # `/trickle` is the workload a response-aggregation window can penalise: small
 # frames spaced far apart, where holding one to wait for a sibling that is not
 # coming adds latency no throughput gain offsets. Routed on its own so the
 # throughput configs keep their exact shape.
 proxies:
-  - id: "h1-tls-trickle"
-    name: "HTTP/1.1+TLS Trickle"
+  - id: "tls-trickle"
+    name: "TLS Trickle"
     listen_path: "/trickle"
     backend_scheme: http
     backend_host: "127.0.0.1"

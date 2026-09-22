@@ -9,7 +9,7 @@
 #
 # Arms differ in one variable. Both run the coalescing adapter; only the window
 # changes, so a difference cannot be attributed to enabling coalescing.
-name: H1 Stream Profile
+name: Stream Profile
 
 on:
   # A workflow_dispatch entry is only offered once the file is on the default
@@ -74,7 +74,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: "h1-stream-profile"
+          shared-key: "stream-profile"
           cache-directories: ${{ github.workspace }}/.cache/sccache
       - name: Hosted prerequisites
         run: |
@@ -122,6 +122,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: h1-stream-profile-${{ github.sha }}-${{ matrix.alpn }}
+          name: stream-profile-${{ github.sha }}-${{ matrix.alpn }}
           path: stream-profile-results
           retention-days: 14

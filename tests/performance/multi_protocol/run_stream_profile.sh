@@ -69,7 +69,7 @@ start_backend() {
 start_gateway() {
     local flush_ms="$1"
     GATEWAY_CID=$(docker run -d --rm --network host \
-        -v "$SCRIPT_DIR/configs/h1_stream_profile.yaml:/etc/ferrum/config.yaml:ro" \
+        -v "$SCRIPT_DIR/configs/stream_profile.yaml:/etc/ferrum/config.yaml:ro" \
         -v "$CERT_DIR:/etc/ferrum/tls:ro" \
         -e "FERRUM_MODE=file" \
         -e "FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml" \
