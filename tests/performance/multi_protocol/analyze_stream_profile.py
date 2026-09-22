@@ -73,20 +73,26 @@ def main(root):
         print(f"{group}.{stat:<4} {r['ma']:>9.0f}us -> {r['mb']:>9.0f}us  "
               f"{r['diff']:>+8.0f}us  [{r['lo']:+.0f}, {r['hi']:+.0f}]  {verdict}")
 
-    window_ms = None
-    for doc in arms.get("window", []):
-        window_ms = doc.get("gap_ms")
     r = welch(series("plain", "frame_delay_us", "p50"),
               series("window", "frame_delay_us", "p50"))
     if r:
         print("\nA window that holds every frame for its full length would move "
               "frame_delay p50 by about the window itself.")
         print(f"Observed shift: {r['diff']:+.0f}us")
-    if arms.get("window") and arms.get("plain"):
-        wr = statistics.mean(d["reads_mean"] for d in arms["window"])
-        pr = statistics.mean(d["reads_mean"] for d in arms["plain"])
-        print(f"Reads per response: plain {pr:.1f} -> window {wr:.1f} "
-              f"({'merging' if wr < pr - 0.5 else 'no merging'})")
+
+    # Aggregation means one read carried more than one backend frame, so the
+    # test is reads < frames WITHIN an arm. Comparing reads BETWEEN arms is
+    # wrong: a gateway can deliver one frame split across two reads, and a
+    # window that rejoins the halves drops the read count with nothing merged.
+    print("\nBackend frames merged into one read (reads < frames within the arm):")
+    for arm in ("plain", "window"):
+        docs = arms.get(arm)
+        if not docs:
+            continue
+        reads = statistics.mean(d["reads_mean"] for d in docs)
+        frames = statistics.mean(d["frames_received_mean"] for d in docs)
+        verdict = "merging" if reads < frames - 0.5 else "no merging"
+        print(f"  {arm:7} reads {reads:.1f} / frames {frames:.1f}  ({verdict})")
 
 
 main(sys.argv[1] if len(sys.argv) > 1 else ".")
