@@ -110,9 +110,6 @@ def docker_inspect(config, gateway="ferrum", pair=1, mode="cutoff"):
         "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64", "FERRUM_TCP_IDLE_TIMEOUT_SECONDS=30",
         "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=30",
         "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=" + ("1" if gateway == "ferrum-exp-cutoff-one" else "0"),
-        # Issue #5588: always emitted so the runtime allowlist stays an exact
-        # key set. Only the experiment arm may carry a non-zero window.
-        "FERRUM_RESPONSE_COALESCE_FLUSH_MS=0",
     ]
     image_id = "sha256:" + ("b" if observer == "off" else "c") * 64
     ordinal = (pair - 1) * 3 + ("ferrum", "ferrum-baseline", "ferrum-exp-cutoff-one").index(gateway)
@@ -652,20 +649,9 @@ class H1InternalProfileTests(unittest.TestCase):
                                        ("FERRUM_MODE", "database"), ("FERRUM_FILE_CONFIG_PATH", "/tmp/other"),
                                        ("FERRUM_METRICS_ALLOWED_CIDRS", "0.0.0.0/0"),
                                        ("FERRUM_POOL_MAX_IDLE_PER_HOST", "1"),
-                                       # Issue #5588: past the 0..1000 clamp, so
-                                       # illegal on every arm.
-                                       (profile.COALESCE_FLUSH_ENV, "1001"),
-                                       (profile.COALESCE_FLUSH_ENV, "two"),
                                        ("FERRUM_PROXY_HTTP_PORT", True), ("FERRUM_LOG_LEVEL", {})):
                         bad = copy.deepcopy(original)
                         bad["environment"][key] = value
-                        cases.append(bad)
-                    if gateway != "ferrum-exp-cutoff-one":
-                        # Issue #5588: a window on a control arm would make the
-                        # comparison two-variable, so it must be rejected even
-                        # though the value itself is well formed.
-                        bad = copy.deepcopy(original)
-                        bad["environment"][profile.COALESCE_FLUSH_ENV] = "2"
                         cases.append(bad)
                     for key, value in (("source", None), ("source", "relative.yaml"),
                                        ("destination", "/tmp/config.yaml"), ("read_only", 1), ("type", "volume")):

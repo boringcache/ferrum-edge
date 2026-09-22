@@ -79,10 +79,6 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
-# Issue #5588: bounded aggregation window handed to the cutoff lane's
-# `ferrum-exp-cutoff-one` arm. 0 keeps today's flush-on-first-Pending shape, so
-# every existing lane is byte-identical unless a dispatch asks for a window.
-H1_COALESCE_FLUSH_MS=0
 H1_TRACE=none
 H1_TRACE_BUILDS=""
 h1_trace_pid=""
@@ -107,7 +103,6 @@ while [[ $# -gt 0 ]]; do
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
-        --h1-coalesce-flush-ms) H1_COALESCE_FLUSH_MS="$2"; shift 2 ;;
         --h1-trace) H1_TRACE="$2"; shift 2 ;;
         --h1-trace-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         --pool-profile) POOL_PROFILE="$2"; shift 2 ;;
@@ -436,7 +431,6 @@ start_ferrum() {
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
     local response_cutoff=0
-    local response_coalesce_flush_ms=0
     case "$PROTOCOL" in
         http3)
             extra_env+=(
@@ -458,9 +452,6 @@ start_ferrum() {
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
         if [ "$gw" = ferrum-exp-cutoff-one ]; then
             response_cutoff=1
-            # Only this arm selects `coalescing_body`, so it is the only one a
-            # window can affect. The `ferrum` control stays at 0/0.
-            response_coalesce_flush_ms="$H1_COALESCE_FLUSH_MS"
         fi
     fi
     if [ -n "$POOL_PROFILE" ]; then
@@ -496,7 +487,6 @@ start_ferrum() {
         -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
         -e "FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0" \
         -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=$response_cutoff" \
-        -e "FERRUM_RESPONSE_COALESCE_FLUSH_MS=$response_coalesce_flush_ms" \
         -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
         -e "FERRUM_MAX_CONNECTIONS=0" \
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
