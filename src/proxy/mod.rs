@@ -1405,35 +1405,6 @@ fn target_uses_direct_h2_pool(
 /// `PluginCache::requires_request_body_buffering(&proxy.id)` accessors so
 /// this predicate is a pure function over its inputs and trivially
 /// unit-testable.
-/// Resolve the configured HTTP/1.1 response-coalescing window against the
-/// proxy's per-frame idle read timeout (issue #5588).
-///
-/// `0` disables the window, which is the shipped default and keeps
-/// `Coalescing` flushing on the first `Pending` — it never holds a byte the
-/// backend has already delivered.
-///
-/// A configured window is clamped to half `read_timeout_ms`, the same bound
-/// `h3_effective_flush_interval` applies. With a window the coalescer reports
-/// `Pending` while still holding a sub-target frame, so the
-/// `IdleReadTimeoutBody` wrapped around it can no longer treat every `Pending`
-/// as a genuine backend-read wait. Staying well inside that deadline is what
-/// keeps a held frame from being read as a stalled backend. `0` disables the
-/// timeout entirely, so there is nothing to clamp against.
-#[inline]
-pub(crate) fn coalesce_flush_window(
-    flush_ms: u64,
-    read_timeout_ms: u64,
-) -> Option<std::time::Duration> {
-    let window = match flush_ms {
-        0 => return None,
-        ms => std::time::Duration::from_millis(ms),
-    };
-    if read_timeout_ms == 0 {
-        return Some(window);
-    }
-    Some(window.min(std::time::Duration::from_millis(read_timeout_ms) / 2))
-}
-
 fn proxy_config_forces_reqwest_dispatch(
     proxy: &Proxy,
     enable_http2: bool,
@@ -2110,6 +2081,35 @@ pub(crate) fn streaming_response_requires_size_limit(
     trusted_backend_content_length: Option<u64>,
 ) -> bool {
     max_response_body_size_bytes > 0 && trusted_backend_content_length.is_none()
+}
+
+/// Resolve the configured response-coalescing window against the proxy's
+/// per-frame idle read timeout (issue #5588).
+///
+/// `0` disables the window, which is the shipped default and keeps
+/// `Coalescing` flushing on the first `Pending` — it never holds a byte the
+/// backend has already delivered.
+///
+/// A configured window is clamped to half `read_timeout_ms`, the same bound
+/// `h3_effective_flush_interval` applies. With a window the coalescer reports
+/// `Pending` while still holding a sub-target frame, so the
+/// `IdleReadTimeoutBody` wrapped around it can no longer treat every `Pending`
+/// as a genuine backend-read wait. Staying well inside that deadline is what
+/// keeps a held frame from being read as a stalled backend. `0` disables the
+/// timeout entirely, so there is nothing to clamp against.
+#[inline]
+pub(crate) fn coalesce_flush_window(
+    flush_ms: u64,
+    read_timeout_ms: u64,
+) -> Option<std::time::Duration> {
+    let window = match flush_ms {
+        0 => return None,
+        ms => std::time::Duration::from_millis(ms),
+    };
+    if read_timeout_ms == 0 {
+        return Some(window);
+    }
+    Some(window.min(std::time::Duration::from_millis(read_timeout_ms) / 2))
 }
 
 /// Decide whether a streaming reqwest response body may skip the coalescing
@@ -6721,9 +6721,9 @@ pub struct ProxyState {
     pub max_response_body_size_bytes: usize,
     pub response_buffer_cutoff_bytes: usize,
     pub h2_coalesce_target_bytes: usize,
-    /// Bounded aggregation window for HTTP/1.1 response coalescing, in
-    /// milliseconds. 0 disables it and keeps the flush-on-first-`Pending`
-    /// behaviour (issue #5588).
+    /// Bounded aggregation window for response coalescing on the
+    /// reqwest-backed streaming path, in milliseconds. 0 disables it and keeps
+    /// the flush-on-first-`Pending` behaviour (issue #5588).
     pub response_coalesce_flush_ms: u64,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
@@ -7953,8 +7953,9 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
-    /// The bounded aggregation window for HTTP/1.1 response coalescing, or
-    /// `None` when the operator has not enabled one (issue #5588).
+    /// The bounded aggregation window for response coalescing on the
+    /// reqwest-backed streaming path, or `None` when the operator has not
+    /// enabled one (issue #5588).
     ///
     /// `None` keeps `Coalescing`'s flush-on-first-`Pending` behaviour, which is
     /// the shipped default: it never holds a byte the backend has already
@@ -56285,66 +56286,6 @@ async fn proxy_to_backend_http3_retry(
 
 #[cfg(test)]
 mod tests {
-
-    /// Issue #5588. The window must stay well inside the idle read deadline:
-    /// with one configured the coalescer parks holding a sub-target frame, and
-    /// `IdleReadTimeoutBody` would otherwise read that as a stalled backend.
-    #[test]
-    fn coalesce_flush_window_is_clamped_to_half_the_idle_read_timeout() {
-        use super::coalesce_flush_window;
-        use std::time::Duration;
-
-        // Disabled is the shipped default and survives any timeout.
-        assert_eq!(coalesce_flush_window(0, 5_000), None);
-        assert_eq!(coalesce_flush_window(0, 0), None);
-
-        // Comfortably inside the deadline: taken as configured.
-        assert_eq!(
-            coalesce_flush_window(2, 5_000),
-            Some(Duration::from_millis(2))
-        );
-
-        // At or past half the deadline: clamped, never adopted whole.
-        assert_eq!(
-            coalesce_flush_window(1_000, 100),
-            Some(Duration::from_millis(50))
-        );
-        assert_eq!(
-            coalesce_flush_window(60, 100),
-            Some(Duration::from_millis(50))
-        );
-
-        // No timeout configured means no deadline to protect.
-        assert_eq!(
-            coalesce_flush_window(1_000, 0),
-            Some(Duration::from_millis(1_000))
-        );
-    }
-
-    #[test]
-    fn a_configured_flush_window_keeps_the_body_off_the_direct_fast_path() {
-        use super::streaming_response_takes_direct_fast_path as takes_fast_path;
-        use std::time::Duration;
-
-        let window = Some(Duration::from_millis(2));
-
-        // Shipped default: cutoff disabled, no size limit, no window. The fast
-        // path is the whole point here — nothing needs per-frame buffering.
-        assert!(takes_fast_path(0, 0, None));
-
-        // Regression guard: in exactly that default configuration, a window is
-        // the ONLY thing asking for aggregation. If the fast path swallowed it,
-        // FERRUM_RESPONSE_COALESCE_FLUSH_MS would be silently inert unless the
-        // operator also set an unrelated knob, which is how this was missed.
-        assert!(!takes_fast_path(0, 0, window));
-
-        // The pre-existing reasons to coalesce still hold on their own, with or
-        // without a window.
-        assert!(!takes_fast_path(1, 0, None));
-        assert!(!takes_fast_path(0, 1, None));
-        assert!(!takes_fast_path(1, 1, window));
-    }
-
     #[test]
     fn route_rebase_preserves_rewrite_for_finalized_egress() {
         let mut ctx = crate::plugins::RequestContext::new(

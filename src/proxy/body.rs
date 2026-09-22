@@ -4852,8 +4852,9 @@ pub(crate) fn coalescing_body(
     let stream = crate::h1_profile::ObservedStream::new(stream, 1);
     // `flush_after: None` makes the adapter flush on the first `Pending`, so on
     // a backend leg that yields one frame per read it never reaches
-    // `COALESCE_TARGET` and every chunk is charged its own chunked-framing TLS
-    // record (issue #5588). A window lets it aggregate, as HTTP/3 already does.
+    // `COALESCE_TARGET`. On an HTTP/1.1 frontend every such chunk is charged its
+    // own chunked-framing TLS record (issue #5588). A window lets it aggregate,
+    // at a per-frame latency cost on low-rate streams — hence off by default.
     let body = Coalescing::with_flush_after(
         ReqwestFrameSource { inner: stream },
         COALESCE_TARGET,

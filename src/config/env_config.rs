@@ -2721,15 +2721,18 @@ pub struct EnvConfig {
     /// per-frame overhead on gRPC and HTTP/2 direct pool paths.
     /// Default: 131072 (128 KiB). Minimum: 16384 (16 KiB). Maximum: 1048576 (1 MiB).
     pub h2_coalesce_target_bytes: usize,
-    /// Bounded aggregation window (milliseconds) for HTTP/1.1 response body
-    /// coalescing on the reqwest streaming path.
+    /// Bounded aggregation window (milliseconds) for response body coalescing
+    /// on the reqwest-backed streaming path. That path serves H1, H2 and H3
+    /// frontends alike; only the direct HTTP/2 pool and the H3 client, which
+    /// carry their own flush handling, are outside it.
     ///
     /// The `Coalescing` adapter aggregates backend body frames toward
     /// `COALESCE_TARGET`, but with no window configured it flushes whatever it
     /// holds the moment the backend stream returns `Pending`. On a TLS backend
     /// leg the source goes `Pending` after every record, so the target is
-    /// unreachable and every emitted chunk is charged its own chunked-framing
-    /// TLS record (issue #5588).
+    /// unreachable. On an HTTP/1.1 frontend, where a streaming response is
+    /// chunked, every emitted chunk is then charged its own chunked-framing TLS
+    /// record (issue #5588).
     ///
     /// A non-zero value lets the adapter wait up to this long for the next
     /// frame before flushing, trading tail latency for larger writes. HTTP/3
