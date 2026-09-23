@@ -456,12 +456,10 @@ fn validate_and_normalize_rewrite(
             ));
         }
     }
-    if let Some(prefix) = rewrite.match_prefix.as_deref()
-        && prefix.is_empty()
-    {
-        // An empty match_prefix would be a degenerate "strip nothing" prefix
-        // rewrite — treat as "no prefix" by clearing it so the hot path takes
-        // the whole-path replacement branch.
+    if rewrite.match_prefix.is_some() && rewrite.uri.is_none() {
+        // `match_prefix` only describes how `uri` rebases the path. Without a
+        // `uri` it is inert, and keeping it would imply a path rewrite that
+        // never happens.
         rewrite.match_prefix = None;
     }
     Ok(())
@@ -485,9 +483,10 @@ fn validate_and_normalize_redirect(
         }
         reject_crlf(rule_idx, "redirect.uri", uri)?;
     }
-    if let Some(prefix) = redirect.match_prefix.as_deref()
-        && prefix.is_empty()
-    {
+    // An explicitly empty `match_prefix` strips nothing and prepends `uri` —
+    // the root `PathPrefix: /` case of the Gateway API rewrite table. It is
+    // only inert (and therefore cleared) when there is no `uri` to rebase.
+    if redirect.match_prefix.is_some() && redirect.uri.is_none() {
         redirect.match_prefix = None;
     }
     if let Some(authority) = redirect.authority.as_mut() {
@@ -1499,6 +1498,14 @@ pub struct RouteRewriteConfig {
     /// path and prepends `uri`, mirroring Istio's prefix-rewrite semantics.
     /// `None` (exact / regex match, or no `match.uri`) means `uri` replaces
     /// the whole path.
+    ///
+    /// An explicitly EMPTY prefix is the degenerate but meaningful "strip
+    /// nothing, prepend `uri`" rewrite. The Gateway API translator emits it for
+    /// a `URLRewrite` `ReplacePrefixMatch` whose rule matches the root
+    /// `PathPrefix: /`, where upstream's rewrite table requires
+    /// `/bar` -> `/xyz/bar` rather than a whole-path replacement. It is
+    /// normalized away only when no `uri` is present, because `match_prefix`
+    /// alone rewrites nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_prefix: Option<String>,
 }
@@ -2119,6 +2126,8 @@ impl Plugin for MeshRouteDispatch {
                     rule.request_transform_compiled.as_ref().map(Arc::clone);
                 ctx.route_override_response_transform =
                     rule.response_transform_compiled.as_ref().map(Arc::clone);
+                ctx.route_override_response_transform_published =
+                    ctx.route_override_response_transform.is_some();
                 // Per-rule rewrite (Istio `http[].rewrite`): rebase the path /
                 // authority forwarded to the backend. A non-matching later
                 // instance must not stomp this, so — like the destination
@@ -3364,6 +3373,10 @@ mod tests {
             .expect("request_transform must be published on match");
         assert_eq!(arc.len(), 3);
         assert!(ctx.route_override_response_transform.is_none());
+        assert!(
+            !ctx.route_override_response_transform_published,
+            "a request-only rule must not arm response-trailer governance"
+        );
     }
 
     #[tokio::test]
@@ -3382,6 +3395,7 @@ mod tests {
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(ctx.route_override_request_transform.is_none());
+        assert!(ctx.route_override_response_transform_published);
         let arc = ctx
             .route_override_response_transform
             .expect("response_transform must be published on match");
@@ -5802,6 +5816,66 @@ mod tests {
             rewrite_request_path("/other/users", "/v2", Some("/Api")),
             "/v2"
         );
+    }
+
+    #[test]
+    fn rewrite_request_path_empty_prefix_prepends_without_stripping() {
+        // The Gateway API translator canonicalizes a root `PathPrefix: /`
+        // rewrite to the EMPTY prefix: nothing is stripped and the replacement
+        // is prepended. A literal `/` prefix would consume the leading
+        // separator and fuse the replacement onto the first segment.
+        assert_eq!(rewrite_request_path("/bar", "/xyz", Some("")), "/xyz/bar");
+        assert_eq!(rewrite_request_path("/bar", "/", Some("")), "/bar");
+        assert_eq!(rewrite_request_path("/", "/xyz", Some("")), "/xyz/");
+    }
+
+    #[test]
+    fn rewrite_request_path_reproduces_gateway_api_replace_prefix_table() {
+        // github.com/kubernetes-sigs/gateway-api v1.5.1 `HTTPPathModifier`
+        // `ReplacePrefixMatch` documentation table, in upstream's own prefix
+        // spelling. The Gateway API translator trims a trailing separator from
+        // the matched prefix before it becomes `match_prefix`
+        // (`gateway_prefix_rewrite_match_prefix`) and maps an empty
+        // replacement to `/`; `canonical` below mirrors that trim so the
+        // `/foo/` rows exercise the same composed behavior.
+        for (path, prefix, replacement, expected) in [
+            ("/foo/bar", "/foo", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo", "/xyz/", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz", "/xyz/bar"),
+            ("/foo/bar", "/foo/", "/xyz/", "/xyz/bar"),
+            ("/foo", "/foo", "/xyz", "/xyz"),
+            ("/foo/", "/foo", "/xyz", "/xyz/"),
+            ("/foo/bar", "/foo", "/", "/bar"),
+            ("/foo/", "/foo", "/", "/"),
+            ("/foo", "/foo", "/", "/"),
+        ] {
+            let canonical = prefix.strip_suffix('/').unwrap_or(prefix);
+            assert_eq!(
+                rewrite_request_path(path, replacement, Some(canonical)),
+                expected,
+                "{path} + prefix {prefix} + replacement {replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_match_prefix_survives_normalization_when_a_uri_is_present() {
+        let mut rewrite = RouteRewriteConfig {
+            uri: Some("/xyz".to_string()),
+            authority: None,
+            match_prefix: Some(String::new()),
+        };
+        validate_and_normalize_rewrite(0, &mut rewrite).expect("empty prefix is a valid rewrite");
+        assert_eq!(rewrite.match_prefix.as_deref(), Some(""));
+
+        // Without a `uri` the prefix rebases nothing and is cleared.
+        let mut inert = RouteRewriteConfig {
+            uri: None,
+            authority: Some("internal.example.com".to_string()),
+            match_prefix: Some("/api".to_string()),
+        };
+        validate_and_normalize_rewrite(0, &mut inert).expect("authority-only rewrite is valid");
+        assert!(inert.match_prefix.is_none());
     }
 
     #[tokio::test]

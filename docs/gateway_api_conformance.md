@@ -40,7 +40,7 @@ authoritative Gateway API conformance check, and it **gates** merges:
 |---|---|
 | Gateway API version | `v1.5.1` |
 | Conformance profile | `GATEWAY-HTTP,GATEWAY-GRPC` |
-| Supported features | `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` |
+| Supported features | `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite` |
 | GatewayClass | `ferrum` |
 | Controller name | `ferrum.io/gateway-controller` |
 
@@ -50,7 +50,7 @@ Kick a manual run with:
 gh workflow run "Gateway API Conformance" \
   --field gateway_api_version=v1.5.1 \
   --field conformance_profile=GATEWAY-HTTP,GATEWAY-GRPC \
-  --field supported_features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute
+  --field supported_features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite
 ```
 
 ## Independent Validation
@@ -78,6 +78,8 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` hostname, path, method, header, and query matching | Yes | Translated into proxies plus ordered `mesh_route_dispatch` rules where predicate matching is needed |
 | `HTTPRoute` `RequestHeaderModifier` | Yes | Route-level set/add/remove header filters are projected into request-transform rules and verified by black-box backend echo |
 | `HTTPRoute` `RequestRedirect` | Yes | Redirect filters materialize action-only dispatch rules with status, hostname, scheme, port, and path replacement support |
+| `HTTPRoute` / `GRPCRoute` `ResponseHeaderModifier` | Yes | Rule-level set/add/remove response-header filters are projected into route-local response-transform rules applied by a generated `response_transformer` consumer, and verified through the data plane on both kinds. Upstream `set` overwrites and `add` appends to an existing value. The generated consumer is additive to a same-name **global** `response_transformer`: global static rules run first, the matched route's rules run last and win on a shared name. A filter naming a protocol-managed (hop-by-hop or framing) response field, or setting, adding or removing a gRPC terminal status field (`grpc-status` / `grpc-message` / `grpc-status-details-bin`), is refused at admission. **Trailer cost:** a route override can name any field at request time, so the requests a filtered rule matches drop their non-reserved backend trailers. The generated consumer's trailer policy is request-conditional: sibling rules, and other routes merged onto the same proxy, that declare no response-header filter keep their trailers. For a native gRPC call the initial metadata is modified while `grpc-status` / `grpc-message` / `grpc-status-details-bin`, the message and streaming are preserved; application trailers on that rule are not. `ResponseHeaderModifier` never modifies trailers on any kind. See [ResponseHeaderModifier and response trailers](#responseheadermodifier-and-response-trailers) |
+| `HTTPRoute` `URLRewrite` | Yes | `hostname` rebases the backend-facing `Host` / `:authority` (backend selection, SNI, and `BackendTLSPolicy` are unaffected — the rewrite changes the forwarded authority only). `path.type: ReplaceFullPath` replaces the whole path; `path.type: ReplacePrefixMatch` replaces the matched `PathPrefix` and preserves the untouched suffix and the query string, reproducing the upstream rewrite table (`/foo/` and `/foo` rewrite identically, an empty replacement normalizes to `/`, and the root `PathPrefix: /` prepends rather than replacing). `ReplacePrefixMatch` requires every match in the rule to be a `PathPrefix` match. Gateway API proxies never strip their `listen_path` and carry no backend path prefix, so the rewrite is the only path mutation. `URLRewrite` is HTTPRoute-only upstream and stays refused on `GRPCRoute`, and combining it with `RequestRedirect` in one rule is refused rather than silently dropping one action. An HTTPRoute rule with no `backendRefs` whose only filters are `URLRewrite` and/or header modifiers answers HTTP 500, as upstream requires for a rule that forwards nowhere |
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
 | Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace (`HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `TLSRoute`). `allowedRoutes.namespaces.selector` is parsed atomically with Kubernetes label-key/value and operator-cardinality validation; a malformed component invalidates the listener and attaches no routes. ReferenceGrant is not used for parentRefs. |
@@ -574,6 +576,117 @@ since both are unbounded, attacker-influenceable input.
 A rule whose every match is dropped materializes no route, so its parent status
 is not reported as programmed.
 
+## Rule-filter admission
+
+Every rule in an `HTTPRoute` / `GRPCRoute` is validated before any route
+configuration is emitted, so a supported rule never makes an unsupported
+sibling look programmed. Beyond the per-filter field inventory, the shapes
+below are refused rather than partially honored.
+
+The status reason follows **what** is wrong, never which CRD mechanism
+(`Pattern`, a required field, or an `XValidation` CEL rule) forbids it. A file-
+or CP-delivered object never passed through the API server, so Ferrum re-checks
+every one of these itself.
+
+- **`IncompatibleFilters`** — the rule's filter *set* cannot be honored as
+  declared: filters that conflict with each other, a filter type the route kind
+  does not carry, or a filter type or field Ferrum does not implement. This is
+  upstream's own definition of the reason, whose documented example is
+  `URLRewrite` + `RequestRedirect` — a combination the CRD also forbids with CEL.
+- **`Invalid`** — a bad *value* inside one filter: malformed, missing where
+  required, or inconsistent with the rest of that filter or its rule.
+- **`UnsupportedValue`** — a CRD-valid value Ferrum declines to implement or
+  refuses by policy.
+
+| Shape | Status | Why |
+|---|---|---|
+| `URLRewrite` + `RequestRedirect` in one rule | `Accepted=False` / `IncompatibleFilters` | A redirect answers the request itself, so the rewrite could never be applied. Honoring one would silently drop the other. |
+| A repeated `RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestRedirect` or `URLRewrite` in one rule | `Accepted=False` / `IncompatibleFilters` | Upstream declares these at most once per rule; a repeat is a conflicting declaration, and taking the first would discard the second. |
+| `URLRewrite` on a `GRPCRoute` | `Accepted=False` / `IncompatibleFilters` | Upstream's GRPCRoute filter enum carries no `URLRewrite`. |
+| An unknown field inside `URLRewrite.path` (for example `replaceQuery`) | `Accepted=False` / `IncompatibleFilters` | A filter field Ferrum does not implement, exactly like an unhandled field elsewhere in a filter. |
+| `URLRewrite` `path.type: ReplacePrefixMatch` with a non-`PathPrefix` match in the rule | `Accepted=False` / `Invalid` | There is no matched prefix to rebase. Upstream is stricter (exactly one `PathPrefix` match); Ferrum also accepts several `PathPrefix` matches and a match-less rule, each rebased against its own prefix. |
+| `URLRewrite.path` carrying the modifier field of the other `type` (`type: ReplaceFullPath` with `replacePrefixMatch`, or the reverse) | `Accepted=False` / `Invalid` | Only the selected type's field is honored, so the other replacement would be silently dropped. |
+| An unknown `URLRewrite` `path.type` | `Accepted=False` / `UnsupportedValue` | A newer channel may add an enum member Ferrum has not implemented yet. |
+| `ResponseHeaderModifier` naming a hop-by-hop or framing response field | `Accepted=False` / `UnsupportedValue` | Ferrum strips those from backend responses by design; reintroducing one from a route filter would punch a hole in the proxy boundary. |
+| `ResponseHeaderModifier` `set` / `add` / `remove` of `grpc-status`, `grpc-message` or `grpc-status-details-bin` (any case, either route kind) | `Accepted=False` / `UnsupportedValue` | A Trailers-Only gRPC response — how servers report most errors — carries its terminal status in the one HEADERS frame the filter edits, so the filter could turn a failed RPC into `grpc-status: 0` or strip its outcome. HTTPRoute is covered too because it can carry gRPC traffic. |
+| A malformed header name/value, rewrite hostname, or replacement path | `Accepted=False` / `Invalid` | The generated dispatch plugin applies the same gates, so admitting it would leave an "Accepted" route carrying configuration no data plane can load. |
+
+### `URLRewrite` prefix rewriting
+
+`ReplacePrefixMatch` reproduces the upstream `HTTPPathModifier` table. Upstream
+prefix matching is path-element aware, so `/foo/` and `/foo` select the same
+requests and must rewrite identically; Ferrum's dispatch plugin strips a literal
+byte prefix, so the translator canonicalizes the matched prefix by dropping a
+trailing separator and reducing the root `PathPrefix: /` to the empty prefix
+(strip nothing, prepend). An empty `replacePrefixMatch` normalizes to `/`.
+A `PathPrefix` match with no `value`, and a match with no (or a null) `path`,
+rebase against `/` — upstream's default, and where routing already places such
+an entry. The same prefix resolution applies to `RequestRedirect`
+`ReplacePrefixMatch`.
+
+| Request path | Prefix match | Replacement | Forwarded path |
+|---|---|---|---|
+| `/foo/bar` | `/foo` | `/xyz` | `/xyz/bar` |
+| `/foo/bar` | `/foo/` | `/xyz` | `/xyz/bar` |
+| `/foo/bar` | `/foo` | `/xyz/` | `/xyz/bar` |
+| `/foo` | `/foo` | `/xyz` | `/xyz` |
+| `/foo/` | `/foo` | `/xyz` | `/xyz/` |
+| `/foo/bar` | `/foo` | *(empty)* or `/` | `/bar` |
+| `/foo` | `/foo` | *(empty)* or `/` | `/` |
+| `/bar` | `/` | `/xyz` | `/xyz/bar` |
+
+The query string is carried separately and is never rewritten. Gateway API
+proxies are generated with `strip_listen_path: false` and no backend path
+prefix, so the rewrite is the only path mutation on the request — a path is
+never stripped and replaced twice. `hostname` rebases the forwarded
+`Host` / `:authority` only: it does not change backend selection, upstream SNI,
+or `BackendTLSPolicy` verification.
+
+### `ResponseHeaderModifier` and response trailers
+
+The translator projects the filter onto route-local response-transform rules
+carried by the rule's dispatch entry, and auto-emits a rules-free
+`response_transformer` on that proxy to consume them. That consumer is additive
+to a same-name **global** `response_transformer` (issue #4304): global static
+rules run first and the matched route's rules run last, so a route `set` wins a
+name the global also writes, while unrelated global rules keep applying.
+
+A response-header policy governs the response **trailers** of the requests it
+applies to, because a route override can name any field at request time and a
+field the backend sent only as a trailer would otherwise slip past it. The
+gateway's response-trailer governance therefore drops the non-reserved backend
+trailers of every request a filtered rule matches — this is a suppression, not a
+modification: `ResponseHeaderModifier` never rewrites a trailer.
+
+That cost is **per request, not per proxy**. The generated consumer carries no
+rules of its own, so it declares a request-conditional trailer policy
+(`RequestConditionalUnbounded`): the fail-closed drop applies only when the
+matched dispatch rule published a response transform for that request. This
+matters because same-kind routes that share a hostname, listener and path merge
+onto one proxy with one consumer — two GRPCRoutes whose method-only,
+header-only or match-less rules all land on `/`, or two HTTPRoutes on one
+`PathPrefix` where one rule is header-gated. A sibling there, possibly another
+team's route, keeps its application trailers.
+
+For a native gRPC call the practical contract is:
+
+- **Preserved**: the response message and streaming, and the terminal
+  `grpc-status` / `grpc-message` / `grpc-status-details-bin` fields.
+- **Modified**: the response's initial metadata (the HEADERS frame), which is
+  what upstream defines the filter to act on.
+- **Dropped**: other application trailers of the requests that rule matches.
+
+A sibling rule — on the same route, or on another route merged onto the same
+proxy — that declares no response-header filter keeps its application trailers,
+so the cost is scoped to the rules that opt in. Operators who need application
+trailers on a gRPC route should not attach a `ResponseHeaderModifier` to that
+rule. An operator-authored `response_transformer` with its own static rules is
+different: it governs every response on its proxy, as it always has.
+
+The filter may not name the terminal fields themselves: a response-side `set`,
+`add` or `remove` of `grpc-status`, `grpc-message` or `grpc-status-details-bin`
+is refused with `UnsupportedValue` (see the table above).
+
 ## backendRef port and zero-weight semantics
 
 These behaviors are exercised by the black-box lab (invalid and weighted refs)
@@ -601,6 +714,16 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
   (`http_route_keeps_all_zero_weight_rule_as_500_fault`) pins the route and
   fault shape; the black-box lab asserts `/zero-weight` returns `500` even with
   a later `/zero` backend route.
+- **Filter-only rule with no backendRefs.** An HTTPRoute rule with no
+  `backendRefs` and no `RequestRedirect`, whose only filters are header
+  modifiers and/or `URLRewrite`, forwards nowhere, so upstream requires a 500.
+  Ferrum attaches the same 100% fault-abort (`NoServiceableBackend`) rather than
+  forwarding to an unresolvable backend. A GRPCRoute rule in that shape keeps
+  the blackhole backend, exactly as its all-zero-weight rule does. The
+  translator test `http_route_filter_only_rule_without_backend_refs_answers_500`
+  pins the fault, and
+  `gateway_response_header_modifier_reaches_the_client_through_the_data_plane`
+  asserts the `500` through the gateway.
 - **backendRef port is numeric-only in the upstream CRD.** Gateway API v1.5
   defines `HTTPBackendRef.port` as `PortNumber`: for a Kubernetes Service it is
   the numeric Service port, not the target port. There is therefore no named
@@ -620,7 +743,7 @@ The standalone `gateway-api-conformance.yml` workflow is the single owner that d
 - HTTP echo backend namespaces, the upstream suite's gRPC echo-basic fixtures,
   plus tagged TCP and TLS echo fixtures for live `TCPRoute` / `TLSRoute` checks.
 - `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, and `ReferenceGrant` resources for direct black-box checks.
-- The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` and `GATEWAY-GRPC` profiles with explicit supported features `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`. TCPRoute/TLSRoute remain gated by Ferrum black-box evidence, not by advertising upstream `GATEWAY-TCP` / `GATEWAY-TLS` profiles on this pin.
+- The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` and `GATEWAY-GRPC` profiles with explicit supported features `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` plus the three Extended filter features Ferrum implements end to end — `HTTPRouteResponseHeaderModification`, `HTTPRoutePathRewrite` and `HTTPRouteHostRewrite` (issue #5646), which makes the suite RUN their tests rather than skip them. TCPRoute/TLSRoute remain gated by Ferrum black-box evidence, not by advertising upstream `GATEWAY-TCP` / `GATEWAY-TLS` profiles on this pin.
 
 Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP, plus TCPRoute parent/listener attachment, AllowedRoutes cross-namespace parentRefs (attach + tighten withdrawal), ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion, plus TLSRoute AllowedRoutes cross-namespace parentRefs, Passthrough SNI selection, ReferenceGrant backend resolution, tagged TLS echo traffic, unmatched-SNI and empty/missing/unpermitted backend fail-closed behavior, status, update, and deletion, plus ListenerSet allowedListeners attachment, HTTPRoute parentRef traffic, NotAllowed default, Gateway `attachedListenerSets`, and delete withdrawal, plus GatewayClass observed-authority create/delete: a dedicated listener appears when the owned `GatewayClass` is created and withdraws without restarting Ferrum when that class is deleted. The pinned upstream suite owns live GRPCRoute conformance evidence. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 

@@ -37,7 +37,9 @@ citations):
   / CI surface changed.
 - **Profile & features.** Gateway API `v1.5.1`, profiles
   `GATEWAY-HTTP,GATEWAY-GRPC`, supported features
-  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute`, GatewayClass `ferrum`,
+  `Gateway,ReferenceGrant,HTTPRoute,GRPCRoute` plus the Extended filter features
+  `HTTPRouteResponseHeaderModification`, `HTTPRoutePathRewrite` and
+  `HTTPRouteHostRewrite`, GatewayClass `ferrum`,
   controller `ferrum.io/gateway-controller`. Live `TCPRoute` and `TLSRoute`
   data-plane behavior is release-gated by Ferrum black-box checks in the same
   workflow. `UDPRoute` is release-gated by the required `Tests` aggregate
@@ -145,14 +147,59 @@ reviewers can compare the generated matrix to the declared product promise.
 
 ## Gateway API rule feature admission
 
-HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier`; HTTPRoute
-also supports `RequestRedirect`. ResponseHeaderModifier, URLRewrite,
-RequestMirror, ExtensionRef, CORS, ExternalAuth and backend-reference filters
-remain deferred. Translation rejects a route containing these unimplemented
-filter actions with `Accepted=False` / `IncompatibleFilters`; it does not emit
-partially interpreted rules. Unknown filter types and unimplemented rule fields,
-including timeouts and retry, report `UnsupportedValue`. Both cases report
-`Programmed=False`, while independently valid routes remain available.
+HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier` and
+`ResponseHeaderModifier`; HTTPRoute also supports `RequestRedirect` and
+`URLRewrite` (both HTTPRoute-only upstream — a GRPCRoute asking for either is
+still refused). RequestMirror, ExtensionRef, CORS, ExternalAuth and
+backend-reference filters remain deferred. Translation rejects a route
+containing these unimplemented filter actions with `Accepted=False` /
+`IncompatibleFilters`; it does not emit partially interpreted rules. Unknown
+filter types and unimplemented rule fields, including timeouts and retry, report
+`UnsupportedValue`. Both cases report `Programmed=False`, while independently
+valid routes remain available.
+
+Filter shapes are refused rather than partially honored, and the status reason
+follows what is wrong rather than which CRD mechanism forbids it:
+`IncompatibleFilters` when the rule's filter set cannot be honored as declared
+(conflicting filters, a filter type the kind does not carry, an unimplemented
+filter type or field), `Invalid` for a bad value inside one filter, and
+`UnsupportedValue` for a CRD-valid value Ferrum declines. So `URLRewrite` and
+`RequestRedirect` in one rule are `IncompatibleFilters` (a redirect answers the
+request itself, so the rewrite could never fire — upstream's own example of the
+reason), and the four upstream at-most-once filter types —
+`RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestRedirect`,
+`URLRewrite` — are refused when repeated in one rule. `URLRewrite`
+`path.type: ReplacePrefixMatch` requires every match in the rule to use a
+`PathPrefix` path match; anything else is `Invalid`, as is a `URLRewrite.path`
+carrying the modifier field of the type it did not select. Upstream's CEL rule
+is stricter (exactly one `PathPrefix` match); Ferrum also accepts several
+`PathPrefix` matches and a match-less rule (the implicit `PathPrefix: /`), each
+rebased against its own prefix. A `PathPrefix` match with no `value`, or a match
+with no or a null `path`, rebases against `/`, matching upstream's default and
+Ferrum's routing. A `ResponseHeaderModifier` naming a protocol-managed response
+field (hop-by-hop or framing) is `UnsupportedValue`: Ferrum strips those from
+backend responses by design and a route filter may not put one back. So is a
+response-side `set` / `add` / `remove` of `grpc-status`, `grpc-message` or
+`grpc-status-details-bin` on either kind, because a Trailers-Only gRPC error
+carries its status in the headers the filter edits. Malformed header
+names/values and malformed rewrite hostnames or replacement paths are `Invalid`.
+An HTTPRoute rule with no `backendRefs` and no `RequestRedirect` whose only
+filters are header modifiers and/or `URLRewrite` answers HTTP 500, as upstream
+requires for a rule that forwards nowhere.
+
+**Response-trailer cost of `ResponseHeaderModifier`.** A route override can name
+any field at request time, so the requests a filtered rule matches have their
+non-reserved backend trailers dropped by the gateway's response-trailer
+governance boundary. The generated `response_transformer` consumer carries no
+rules of its own and declares a request-conditional policy, so the drop applies
+only when the matched dispatch rule published a response transform. Same-kind
+routes that share a hostname, listener and path merge onto one proxy and one
+consumer; a merged sibling rule or route that declares no response-header filter
+keeps its trailers. The gRPC terminal fields (`grpc-status`, `grpc-message`,
+`grpc-status-details-bin`), the response message and streaming are preserved;
+application trailers on the filtered rule are not. The filter does not modify
+trailers in either case — `ResponseHeaderModifier` governs response headers
+only, which for a native gRPC call is the initial metadata.
 
 The field inventory admits rule name, matches, backendRefs, filters and
 sessionPersistence, each subject to its existing validation. Empty backend
@@ -163,14 +210,38 @@ checks translator/status agreement for both route kinds, all six reported gaps,
 future fields, and a supported RequestHeaderModifier control (issue #4816).
 `supported_gateway_request_headers_reach_backend_beside_rejected_route` also
 drives the translated HTTPRoute through the gateway to a real backend and
-checks header set/add/remove plus no traffic for the refused sibling. Default
+checks header set/add/remove plus no traffic for the refused sibling. Five more
+data-plane regressions in the same file cover the newly supported filters:
+`gateway_response_header_modifier_reaches_the_client_through_the_data_plane`
+(client-observed set/add/remove, sibling-rule isolation, and composition with an
+operator's global `response_transformer`),
+`gateway_url_rewrite_reaches_the_backend_through_the_data_plane`
+(backend-observed `ReplacePrefixMatch` path plus preserved query,
+`ReplaceFullPath`, hostname rewrite, and sibling-rule isolation),
+`grpc_route_response_header_modifier_reaches_the_client_and_preserves_status`
+(gRPC response metadata, message, terminal status, and the trailer cost above).
+`merged_grpc_route_sibling_without_response_header_modifier_keeps_trailers` and
+`merged_http_route_sibling_without_response_header_modifier_keeps_trailers`
+first prove two routes merged onto one proxy and one consumer, then show the
+filtered rule pays the trailer cost while the merged sibling keeps its
+application trailers. The response-header test also asserts that `add` appends
+to a header the backend already sent and that a filter-only rule with no
+`backendRefs` answers `500`.
+The translator-level `removing_a_rule_filter_withdraws_its_generated_resources`
+checks that dropping a filter emits no rewrite, response transform, or consumer
+plugin; the live reconciler replaces those generated ids on every compose
+because `istio-vs-resp-xform-` is a managed plugin-id prefix. The upstream
+`HTTPRouteResponseHeaderModifier`, `HTTPRouteRewritePath` and
+`HTTPRouteRewriteHost` conformance tests run and pass in the hosted lab. Default
 HTTPRoute matches use the same internal predicate conversion as explicit
 matches, so supported actions do not emit an invalid raw Gateway API path field.
 The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)
-marks response-header modification as Extended. The
+marks response-header modification and `URLRewrite` as Extended. The
 [GRPCRoute filter-type contract](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/grpcroute_types.go)
-lists it as Core. Ferrum records the missing implementation as a conformance
-gap for both kinds; refusing it visibly does not establish full conformance.
+lists response-header modification as Core and carries no `URLRewrite` variant.
+Both are now implemented for the kinds upstream defines them on; the remaining
+refusals above are still recorded as conformance gaps, and refusing them visibly
+does not establish full conformance.
 
 ## Status values
 
