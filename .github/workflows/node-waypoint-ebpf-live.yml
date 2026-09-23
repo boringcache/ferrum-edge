@@ -217,7 +217,7 @@ jobs:
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -337,7 +337,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -447,7 +447,7 @@ jobs:
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       # Ambient's trusted main writer exports this identical Dockerfile target.
       # Every NodeWaypoint event is an anonymous reader; there is no cache export.
