@@ -13,6 +13,7 @@ from pathlib import Path
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
 from test_unit_ci import (
+    COMMANDS as UNIT_CI_COMMANDS,
     check_repository as unit_ci_contract_errors,
     self_test as unit_ci_self_test,
 )
@@ -71,6 +72,7 @@ from verify_release_image_attestations import (
     validate_release_workflow,
 )
 from verify_ci_runtime_cache import (
+    BORINGCACHE_CARGO_PREFIX,
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
@@ -771,7 +773,7 @@ def native_binary_compile_gate_self_test() -> list[str]:
     macos_check_gate = (
         "- name: Check merge-group macOS target\n"
         "        if: github.event_name == 'merge_group' && runner.os == 'macOS'\n"
-        "        run: cargo check --features cloud-secrets --profile pr-build "
+        f"        run: {BORINGCACHE_CARGO_PREFIX}binaries check --features cloud-secrets --profile pr-build "
         "--target ${{ matrix.target }}"
     )
     if macos_check_gate not in build_body:
@@ -781,15 +783,15 @@ def native_binary_compile_gate_self_test() -> list[str]:
     native_build_gate = (
         "- name: Build fast verification binary\n"
         "        if: github.event_name != 'merge_group' || runner.os != 'macOS'\n"
-        "        run: cargo build --features cloud-secrets --profile pr-build "
+        f"        run: {BORINGCACHE_CARGO_PREFIX}binaries build --features cloud-secrets --profile pr-build "
         "--target ${{ matrix.target }}"
     )
     if native_build_gate not in build_body:
         failures.append("CI must use linked pr-build binaries on Linux/Windows")
     if "--release" in build_body or "LINUX_GNU_PROFILE: release" in build_body:
         failures.append("CI must not compile production release binaries")
-    if 'shared-key: "build-${{ matrix.target }}-prbuild"' not in build_body:
-        failures.append("CI verification must use the prbuild cache namespace")
+    if build_body.count(BORINGCACHE_CARGO_PREFIX + "binaries ") != 2:
+        failures.append("CI verification must use the binaries Cargo cache profile")
     if "./.github/actions/setup-sccache" not in build_body:
         failures.append(
             "jobs.build-binaries must install sccache via the pinned repository action"
@@ -1588,7 +1590,7 @@ def main() -> int:
     unit_inline = "Run inline lib tests"
     unit_hardening = "Run cache accounting and reload safety regressions"
     if not (
-        unit_body.count("cargo test $UNIT_PRECOMPILE_TARGETS --no-run") == 1
+        unit_body.count(UNIT_CI_COMMANDS["default-build"]) == 1
         and unit_body.count('precompile: "--lib"') == 1
         and unit_body.count('precompile: "--test unit_tests"') == 1
         and 0 <= unit_body.find(unit_precompile)
@@ -1613,7 +1615,7 @@ def main() -> int:
     pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
     if not (
         pkcs11_body.count(
-            "cargo test --features pkcs11 --lib --test unit_tests --no-run"
+            BORINGCACHE_CARGO_PREFIX + "pkcs11 test --features pkcs11 --lib --test unit_tests --no-run"
         )
         == 1
         and 0 <= pkcs11_body.find(pkcs11_precompile)
