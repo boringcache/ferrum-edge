@@ -57,6 +57,12 @@ jobs:
           cache: "false"
           boringcache: "false"
           shared-key: archive-selective
+      - name: Expose the verified compiler cache
+        run: |
+          test -x "$FERRUM_SCCACHE_BIN"
+          dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"
+          echo 'CC=sccache cc' >> "$GITHUB_ENV"
+          echo 'CXX=sccache c++' >> "$GITHUB_ENV"
       - name: Build gateway and CNI binaries
         id: cache
         uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
@@ -110,6 +116,12 @@ jobs:
           cache: "false"
           boringcache: "false"
           shared-key: archive-selective
+      - name: Expose the verified compiler cache
+        run: |
+          test -x "$FERRUM_SCCACHE_BIN"
+          dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"
+          echo 'CC=sccache cc' >> "$GITHUB_ENV"
+          echo 'CXX=sccache c++' >> "$GITHUB_ENV"
       - name: Build gateway and CNI binaries
         id: cache
         uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
