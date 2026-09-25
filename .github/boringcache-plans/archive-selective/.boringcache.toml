@@ -1,0 +1,28 @@
+workspace = "boringcache/ferrum-edge"
+
+[entries.cargo-registry-cache]
+tag = "ferrum-selective-registry-cache"
+
+[entries.cargo-registry-index]
+tag = "ferrum-selective-registry-index"
+
+[entries.cargo-git-db]
+tag = "ferrum-selective-git-db"
+
+[entries.target]
+kind = "cargo-target"
+tag = "ferrum-selective-target"
+path = "target"
+
+[profiles.cargo]
+entries = ["cargo-registry-cache", "cargo-registry-index", "cargo-git-db", "target"]
+
+[adapters.cargo]
+profiles = ["cargo"]
+compiler-cache = "sccache"
+no-git = true
+command = ["cargo", "build", "--locked", "--bin", "ferrum-edge", "--bin", "ferrum-cni"]
+
+[adapters.sccache]
+tag = "ferrum-selective-sccache"
+no-git = true

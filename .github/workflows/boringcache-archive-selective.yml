@@ -1,0 +1,130 @@
+name: BoringCache archive selective saves — Ferrum Edge
+on:
+  push:
+    branches: [boringcache-validation]
+    paths:
+      - .github/workflows/boringcache-archive-selective.yml
+      - .github/boringcache-plans/archive-selective/.boringcache.toml
+  workflow_dispatch:
+    inputs:
+      seed_ref:
+        description: Exact source commit to seed.
+        type: string
+        default: e8848386b9f4d49247e2ab0f6cce19c291d19d1f
+      head_ref:
+        description: Adjacent source commit to build and publish.
+        type: string
+        default: 9bd6cd8bff3adcbedb561715464801b63292797f
+permissions:
+  contents: read
+concurrency:
+  group: ferrum-archive-selective
+  cancel-in-progress: false
+env:
+  BORINGCACHE_ARCHIVE_GRAPH_WRITES: "1"
+  BORINGCACHE_ARCHIVE_SELECTIVE_READS: "1"
+  BORINGCACHE_ARCHIVE_SELECTIVE_VERIFY: "0"
+  CARGO_BUILD_JOBS: "3"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+jobs:
+  seed:
+    name: BoringCache Ferrum selective seed
+    if: github.repository == 'boringcache/ferrum-edge' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.seed_ref || 'e8848386b9f4d49247e2ab0f6cce19c291d19d1f' }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Checkout the selected workflow plan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .boringcache-lane
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Select the archive plan
+        run: |
+          cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
+      - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
+        with:
+          cache: "false"
+          boringcache: "false"
+          shared-key: archive-selective
+      - name: Build gateway and CNI binaries
+        id: cache
+        uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+        with:
+          mode: cargo
+          trust-policy: publish
+          fail-on-cache-error: true
+          diagnostics: summary
+      - name: Verify build outputs
+        run: |
+          test -x target/debug/ferrum-edge
+          test -x target/debug/ferrum-cni
+      - name: Retain product evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ferrum-archive-selective-seed
+          path: ${{ steps.cache.outputs.evidence-path }}
+          if-no-files-found: error
+
+  commit:
+    name: BoringCache Ferrum selective commit
+    needs: seed
+    if: github.repository == 'boringcache/ferrum-edge' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_ref || '9bd6cd8bff3adcbedb561715464801b63292797f' }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Require an adjacent source commit
+        env:
+          SEED_REF: ${{ inputs.seed_ref || 'e8848386b9f4d49247e2ab0f6cce19c291d19d1f' }}
+        run: test "$(git rev-parse HEAD^)" = "$SEED_REF"
+      - name: Checkout the selected workflow plan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .boringcache-lane
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Select the archive plan
+        run: |
+          cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
+      - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
+        with:
+          cache: "false"
+          boringcache: "false"
+          shared-key: archive-selective
+      - name: Build gateway and CNI binaries
+        id: cache
+        uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+        with:
+          mode: cargo
+          trust-policy: publish
+          fail-on-cache-error: true
+          diagnostics: summary
+      - name: Verify build outputs
+        run: |
+          test -x target/debug/ferrum-edge
+          test -x target/debug/ferrum-cni
+      - name: Retain product evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ferrum-archive-selective-commit
+          path: ${{ steps.cache.outputs.evidence-path }}
+          if-no-files-found: error

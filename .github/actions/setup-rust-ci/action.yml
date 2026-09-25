@@ -25,6 +25,10 @@ description: >-
   any extra rustup components, and an optional rust-cache `workspaces` list.
 
 inputs:
+  boringcache:
+    description: Configure the shared BoringCache dependency plan when the GitHub Rust cache is disabled
+    required: false
+    default: "true"
   cache:
     description: Restore and save the GitHub Rust cache
     required: false
@@ -253,7 +257,7 @@ runs:
         save-if: ${{ inputs.save == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
 
     - name: BoringCache Cargo
-      if: inputs.cache == 'false'
+      if: inputs.cache == 'false' && inputs.boringcache == 'true'
       uses: ./.github/actions/setup-boringcache
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
