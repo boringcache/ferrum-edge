@@ -1,47 +1,112 @@
-name: BoringCache archive selective saves — Ferrum Edge
+name: "Ferrum archive rolling saves"
+run-name: ${{ format('Ferrum archive {0} | three commits | CLI {1}', inputs.archive_format, inputs.cli_version || 'Action default') }}
+
 on:
-  push:
-    branches: [boringcache-validation]
-    paths:
-      - .github/workflows/boringcache-archive-selective.yml
-      - .github/boringcache-plans/archive-selective/.boringcache.toml
   workflow_dispatch:
     inputs:
-      seed_ref:
-        description: Exact source commit to seed.
+      cli_version:
+        description: Optional exact immutable BoringCache CLI release tag.
         type: string
-        default: e8848386b9f4d49247e2ab0f6cce19c291d19d1f
-      head_ref:
-        description: Adjacent source commit to build and publish.
+        default: ""
+      archive_format:
+        description: Archive format for every seed and commit save.
+        type: choice
+        options: [v3, v2]
+        default: v3
+      head_sha:
+        description: Exact final source commit; its three first-parent predecessors form the chain.
         type: string
-        default: 9bd6cd8bff3adcbedb561715464801b63292797f
+        default: "9bd6cd8bff3adcbedb561715464801b63292797f"
+
 permissions:
+  actions: read
   contents: read
+
 concurrency:
-  group: ferrum-archive-selective
+  group: archive-rolling-${{ github.workflow }}-${{ inputs.archive_format }}
   cancel-in-progress: false
+
 env:
   BORINGCACHE_ARCHIVE_GRAPH_WRITES: "1"
-  BORINGCACHE_ARCHIVE_SELECTIVE_READS: "1"
+  BORINGCACHE_ARCHIVE_SELECTIVE_READS: ${{ inputs.archive_format == 'v3' && '1' || '0' }}
   BORINGCACHE_ARCHIVE_SELECTIVE_VERIFY: "0"
+  CACHE_SCOPE: rolling-${{ inputs.archive_format }}-r${{ github.run_id }}-a${{ github.run_attempt }}
   CARGO_BUILD_JOBS: "3"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
-  seed:
-    name: BoringCache Ferrum selective seed
+  source:
+    name: Resolve Ferrum source chain
     if: github.repository == 'boringcache/ferrum-edge' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    outputs:
+      repository: ${{ steps.pin.outputs.repository }}
+      seed_parent: ${{ steps.chain.outputs.seed_parent }}
+      seed: ${{ steps.chain.outputs.seed }}
+      commit1: ${{ steps.chain.outputs.commit1 }}
+      commit2: ${{ steps.chain.outputs.commit2 }}
+      commit3: ${{ steps.chain.outputs.commit3 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the source pin
+        id: pin
+        env:
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          source_sha="$INPUT_HEAD_SHA"
+          echo "repository=$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "head_sha=$source_sha" >> "$GITHUB_OUTPUT"
+      - name: Checkout the source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.pin.outputs.repository }}
+          ref: ${{ steps.pin.outputs.head_sha }}
+          path: source-chain
+          fetch-depth: 5
+          persist-credentials: false
+      - name: Resolve three first-parent commits
+        id: chain
+        working-directory: source-chain
+        run: |
+          set -euo pipefail
+          for item in seed_parent:4 seed:3 commit1:2 commit2:1 commit3:0; do
+            key="${item%:*}"
+            depth="${item#*:}"
+            sha="$(git rev-parse "HEAD~$depth")"
+            echo "$key=$sha" >> "$GITHUB_OUTPUT"
+            echo "$key: $sha" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  seed:
+    name: BoringCache Ferrum seed
+    needs: source
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
       contents: read
       id-token: write
-    steps:
+    env:
+      PHASE: seed
+      SOURCE_SHA: ${{ needs.source.outputs.seed }}
+      PARENT_SHA: ${{ needs.source.outputs.seed_parent }}
+    steps: &build_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.seed_ref || 'e8848386b9f4d49247e2ab0f6cce19c291d19d1f' }}
+          ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 2
           persist-credentials: false
+      - name: Verify the adjacent source and empty target
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^)" = "$PARENT_SHA"
+          test ! -e target
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
       - name: Checkout the selected workflow plan
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,6 +118,21 @@ jobs:
         run: |
           cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
           printf '%s\n' '/.boringcache.toml' '/.boringcache-lane/' >> .git/info/exclude
+      - name: Scope this archive comparison
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          from pathlib import Path
+          scope = os.environ["CACHE_SCOPE"]
+          assert re.fullmatch(r"[a-z0-9-]+", scope)
+          for filename in ['.boringcache.toml']:
+              path = Path(filename)
+              text, count = re.subn(r'(?m)^(tag = ")([^"]+)(")$', lambda m: m[1] + m[2] + "-" + scope + m[3], path.read_text())
+              assert count > 0, filename
+              path.write_text(text)
+          PYTHON
+
       - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
         with:
           cache: "false"
@@ -64,10 +144,27 @@ jobs:
           dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"
           echo 'CC=sccache cc' >> "$GITHUB_ENV"
           echo 'CXX=sccache c++' >> "$GITHUB_ENV"
+      - name: Require clean source before caching
+        run: test -z "$(git -C . status --porcelain=v1 --untracked-files=all)"
+
+      - name: Require a published target before the commit build
+        if: env.PHASE != 'seed'
+        uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+        with:
+          cli-version: ${{ inputs.cli_version }}
+          setup: none
+          mode: cargo
+          lookup-only: true
+          fail-on-cache-miss: true
+          trust-policy: restore
+          fail-on-cache-error: true
+          diagnostics: summary
       - name: Build gateway and CNI binaries
         id: cache
         uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
         with:
+          cli-version: ${{ inputs.cli_version }}
+          setup: none
           mode: cargo
           trust-policy: publish
           fail-on-cache-error: true
@@ -76,69 +173,55 @@ jobs:
         run: |
           test -x target/debug/ferrum-edge
           test -x target/debug/ferrum-cni
+      - name: Verify source remained clean
+        run: test -z "$(git -C . status --porcelain=v1 --untracked-files=all)"
+
       - name: Retain product evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ferrum-archive-selective-seed
+          name: ferrum-archive-${{ inputs.archive_format }}-${{ env.PHASE }}
           path: ${{ steps.cache.outputs.evidence-path }}
           if-no-files-found: error
 
-  commit:
-    name: BoringCache Ferrum selective commit
-    needs: seed
-    if: github.repository == 'boringcache/ferrum-edge' && github.ref == 'refs/heads/boringcache-validation'
+  commit1:
+    name: BoringCache Ferrum commit 1
+    needs: [source, seed]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
       contents: read
       id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.head_ref || '9bd6cd8bff3adcbedb561715464801b63292797f' }}
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Require an adjacent source commit
-        env:
-          SEED_REF: ${{ inputs.seed_ref || 'e8848386b9f4d49247e2ab0f6cce19c291d19d1f' }}
-        run: test "$(git rev-parse HEAD^)" = "$SEED_REF"
-      - name: Checkout the selected workflow plan
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          path: .boringcache-lane
-          sparse-checkout: .github
-          persist-credentials: false
-      - name: Select the archive plan
-        run: |
-          cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
-          printf '%s\n' '/.boringcache.toml' '/.boringcache-lane/' >> .git/info/exclude
-      - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
-        with:
-          cache: "false"
-          boringcache: "false"
-          shared-key: archive-selective
-      - name: Expose the verified compiler cache
-        run: |
-          test -x "$FERRUM_SCCACHE_BIN"
-          dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"
-          echo 'CC=sccache cc' >> "$GITHUB_ENV"
-          echo 'CXX=sccache c++' >> "$GITHUB_ENV"
-      - name: Build gateway and CNI binaries
-        id: cache
-        uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
-        with:
-          mode: cargo
-          trust-policy: publish
-          fail-on-cache-error: true
-          diagnostics: summary
-      - name: Verify build outputs
-        run: |
-          test -x target/debug/ferrum-edge
-          test -x target/debug/ferrum-cni
-      - name: Retain product evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ferrum-archive-selective-commit
-          path: ${{ steps.cache.outputs.evidence-path }}
-          if-no-files-found: error
+    env:
+      PHASE: commit1
+      SOURCE_SHA: ${{ needs.source.outputs.commit1 }}
+      PARENT_SHA: ${{ needs.source.outputs.seed }}
+    steps: *build_steps
+
+  commit2:
+    name: BoringCache Ferrum commit 2
+    needs: [source, commit1]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PHASE: commit2
+      SOURCE_SHA: ${{ needs.source.outputs.commit2 }}
+      PARENT_SHA: ${{ needs.source.outputs.commit1 }}
+    steps: *build_steps
+
+  commit3:
+    name: BoringCache Ferrum commit 3
+    needs: [source, commit2]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PHASE: commit3
+      SOURCE_SHA: ${{ needs.source.outputs.commit3 }}
+      PARENT_SHA: ${{ needs.source.outputs.commit2 }}
+    steps: *build_steps
