@@ -52,6 +52,7 @@ jobs:
       - name: Select the archive plan
         run: |
           cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
+          printf '%s\n' '/.boringcache.toml' '/.boringcache-lane/' >> .git/info/exclude
       - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
         with:
           cache: "false"
@@ -111,6 +112,7 @@ jobs:
       - name: Select the archive plan
         run: |
           cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
+          printf '%s\n' '/.boringcache.toml' '/.boringcache-lane/' >> .git/info/exclude
       - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
         with:
           cache: "false"
