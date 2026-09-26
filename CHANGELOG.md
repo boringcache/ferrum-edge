@@ -89,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.23.1 to the lockfiles next to 0.22.1. hyper-util's `TokioExecutor` no
   longer carries the current `tracing` span into spawned tasks; Ferrum opens
   no spans, so its logs are unchanged.
+- With backend TLS live reload disabled, a new reqwest pool entry now reuses
+  the cached config of its TLS identity, as the HTTP/2, gRPC and HTTP/3 pools
+  already did, so an in-place CA or certificate rotation needs a restart or a
+  TLS identity change (#5776).
 
 ### Fixed
 
