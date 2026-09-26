@@ -26,7 +26,14 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Upgrading to the next release
+## Upgrading to 0.9.8
+
+v0.9.8 makes native HTTP/3 enforce HTTPRoute rule `timeouts`, changes the
+`ValidateJWTSVID` claims wire type, and adds the `request_timeout`
+`X-Gateway-Error` token. Most other changes are fixes that bring HTTP/3,
+gRPC-Web pass-through, and the AI SSE stream inspectors in line with HTTP/1.1
+and HTTP/2 or with WHATWG event-stream framing. The full list is in the
+CHANGELOG `[0.9.8]` section.
 
 **Native HTTP/3 enforces HTTPRoute rule `timeouts` (#5646).** HTTP/3 no longer
 refuses a plain request routed under a rule carrying `timeouts.request` or
@@ -55,6 +62,176 @@ the upstream (or current vendored) proto and read `claims` as a `Struct`.
 Numbers arrive as doubles, and a token whose claims nest deeper than 32 levels
 is refused with `INVALID_ARGUMENT`. See
 [mesh.md → Workload API JWT-SVID](mesh.md#workload-api-jwt-svid).
+
+**Gateway error attribution (`X-Gateway-Error`)**
+
+- **New `request_timeout` token:** a route-deadline `504` that no backend
+  received (expiry during the client upload, a gateway-local phase, admission,
+  or retry backoff) now carries `X-Gateway-Error: request_timeout` instead of
+  `backend_timeout`, logged as `before_dispatch` or `retry_backoff` (#5762).
+  `backend_timeout` now always means a backend held the request. The token
+  vocabulary grows from seven to eight; the metrics `error_class` label is
+  unchanged. Update alerts and client tooling that match on `backend_timeout`.
+- **Backend copies are stripped:** a backend can no longer supply
+  `X-Gateway-Error` or `X-Gateway-Upstream-Status` (#5759). Every backend
+  response boundary strips them, in headers or trailers, buffered or streamed.
+  The headers are still unauthenticated, so trust them only on a response from
+  a gateway the client authenticated.
+- **HTTP/3 terminals:** a backend 5xx on every HTTP/3 path now reads
+  `backend_error`, and a copy a plugin or hook wrote is replaced (#5783). An
+  HTTP/3 `502` for a declared `Content-Length` over the response size limit now
+  carries `backend_error`, as do the HTTP/3 bridge's other buffered-collection
+  refusals (#5804). The HTTP/3 bridge's gateway error terminals write the token
+  after the `after_proxy` hooks, so hooks can no longer see, replace, duplicate,
+  or erase it, and a hook-set non-5xx status without a connection error carries
+  no token (#5807). An HTTP/3 bridge attempt whose connection-pool client could
+  not be built answers `502` with `connection_failure`, and a gRPC-Web client's
+  copy is decorated by the `after_proxy` hooks (#5783 / #5819 / #5824).
+- **HTTP/1.1 and HTTP/2 native gRPC:** the buffered and streamed builders write
+  the token after the last response hook (#5798). A gRPC backend's HTTP 5xx now
+  carries `backend_error`, and a plugin- or hook-written copy is replaced.
+- **Fixed retry body:** a reqwest retry attempt whose backend client cannot be
+  built answers the same fixed `502` `{"error":"Bad Gateway"}` body as the
+  first attempt; the construction error goes only to the operator log.
+
+**Behavior changes to plan for**
+
+- **HBONE relay refusals:** an inbound HBONE CONNECT refused at relay synthesis
+  returns the documented `403` instead of a route-miss `404`, and writes a
+  transaction line with `rejection_phase: hbone_relay_destination_denied` (or
+  `hbone_udp_relay_destination_denied`) (#5763). A terminator that has not
+  applied its first mesh slice answers `503` `hbone_relay_not_ready`, and a
+  CONNECT without a verified SPIFFE identity gets `hbone_unauthenticated_peer`.
+  Neither is counted as a `relay_destination_denied` rejection. A
+  datagram-over-HBONE relay that ends on a socket error is recorded as an error
+  with `hbone.udp.termination_reason` (#5765). Update dashboards keyed on the
+  old `404`.
+- **Ambient node-agent registry:** when
+  `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default
+  `/run/ferrum/node-waypoint-pods`) is missing or incomplete, a warning naming
+  the directory repeats every 60 seconds (#5766). The default is authoritative
+  even when no node agent runs, so every declared destination is refused; run
+  the node agent or clear the variable.
+- **Gateway API redirects and response headers:** an HTTPRoute
+  `RequestRedirect` `path` is validated like a `URLRewrite` path, so a violating
+  route is now `Accepted=False` with a field-specific reason instead of
+  producing a corrupted `Location` (#5752). An empty `replacePrefixMatch` or
+  `replaceFullPath` now redirects to `/`. A matched rule's
+  `ResponseHeaderModifier` (or Istio `headers.response`) now also applies to
+  the rule's `RequestRedirect`, fail-closed `500`, and aborted `fault`
+  responses (#5753).
+- **HTTP/3 early data:** with `FERRUM_TLS_EARLY_DATA_METHODS` set, a request
+  sent after the TLS handshake no longer gets `425 Too Early` or
+  `Early-Data: 1` (#5761). Requests opened by 0-RTT data are still
+  method-gated.
+- **gRPC-Web pass-through:** a backend's gRPC-Web body reaches the client byte
+  for byte on HTTP/1.1 and HTTP/2, without a synthesized second trailer frame
+  (#5758). The transaction log's `grpc_status` is read from the backend's final
+  trailer frame instead of defaulting to `UNKNOWN`; an unreadable final frame
+  leaves it unset and names the reason in `metadata.grpc_status_unreadable`
+  (#5758 / #5784). The request and response message counters count pass-through
+  gRPC-Web on its decoded message frames, streamed or buffered, including the
+  HTTP/3 bridge's uploads, and no longer count the trailer frame or scan
+  `grpc-web-text` base64 as frames (#5784 / #5798 / #5807 / #5819). On the
+  HTTP/3 bridge to HTTP/1.1 and HTTP/2 backends, each attempt sends the backend
+  its remaining RPC budget in `grpc-timeout`, and a `backendRequest` expiry
+  after send answers `Backend deadline exceeded` (#5734).
+- **gRPC-Web errors carry CORS headers:** gateway-generated gRPC-Web errors
+  (backend unavailable, the gateway's own deadline, an oversized response, a
+  charged `backendRequest` expiry) now run the bounded reject-path
+  `after_proxy` decorators, so browsers can read the gRPC status (#5744 /
+  #5747). `ai_rate_limiter` releases its token reservation on a gRPC-Web call
+  that ends in one of these terminals. An expired credential still gets the
+  fixed authorization terminal and no hook is polled over it.
+- **AI SSE inspection framing:** the shared SSE parser follows WHATWG
+  event-stream framing, consuming leading BOMs and splitting on CRLF, LF, or a
+  lone CR (#5795). `ai_semantic_firewall` windowed inspection,
+  `ai_transcript_audit` capture, `ai_response_guard` rewriters,
+  `ai_rate_limiter` usage parsing, `ai_stream_router`, and `ai_tool_governor`
+  share that splitting (#5803 / #5808 / #5809 / #5814), so CR-only and mixed
+  CR/LF/CRLF streams are handled like LF ones; `ai_response_guard` redact mode
+  rewrites such streams instead of rejecting them. A fail-open hold timeout that
+  forwards only framing, metadata lines, or the data-less start of an event no
+  longer starts pass-through, so the next event (or that event's data) is still
+  inspected.
+- **SSE firewall cut framing:** a windowed `ai_semantic_firewall` cut after
+  forwarded bytes that end mid-line now ends that line with one LF before the
+  terminal error event, so clients read `event: error` and its JSON data
+  intact (#5820). Bytes the same chunk already cleared leave ahead of the error
+  event instead of being dropped, and a `cut_silent` cut sends them too.
+- **Stream inspector chains:** when an `ai_semantic_firewall` or
+  `ai_tool_governor` inspector that is not last in the chain cuts, the bytes it
+  cleared in that call now run through every later stream inspector before the
+  terminal error event, and the later inspectors are told the stream ended with
+  a cut, so a later `ai_transcript_audit` records a truncated transcript
+  (#5826). If a later inspector cuts on those bytes, its cut wins. At that
+  flush a later `ai_tool_governor` drops a still-pending tool-call batch
+  without governing it: no approval webhook fires, even in `dry_run`, and no
+  decision metadata is recorded.
+- **Cached rate-limit headers:** `response_caching`, `request_deduplication`,
+  and `ai_semantic_cache` strip the IETF `RateLimit` field and the
+  `RateLimit-*`, `X-RateLimit-*` (and, for `response_caching`,
+  `X-AI-RateLimit-*` and `Anthropic-RateLimit-*`) fields from stored entries,
+  so a hit no longer reports another client's stale quota (#5788 / #5790).
+  `ai_federation` relays a provider's combined `RateLimit` field.
+- **`adaptive_concurrency` baseline:** the minimum-latency baseline is now the
+  minimum of the current and previous window of `baseline_window_samples`
+  healthy samples (new option, default `1000`), so one unusually fast response
+  no longer tightens the target forever (#5737).
+- **HTTP/2 trailers:** backend HTTP/2 response trailers now reach HTTP/2
+  clients on the reqwest relay and every buffered collection path (#5760).
+  Clients that previously saw no trailer section on those paths now receive
+  it; HTTP/1.1 clients still receive none.
+- **Streaming error ordering:** a streaming response that fails soon after its
+  first bytes (a backend error or reset, or an over-limit body without
+  `Content-Length`) now shows the client the committed status and the bytes
+  received before it is cut, instead of closing before the status line
+  (#5801 / #5802 / #5811). The ordering is deterministic on HTTP/1.1 and best
+  effort on HTTP/2 and HTTP/3.
+- **Graceful shutdown log line:** database, file, dp, and mesh modes log
+  `Shutdown drain begun: Connection: close hint and new-request rejection are
+  active` at `info` once the drain flags are set (#5821). A closed proxy port
+  does not by itself mean drain has begun: the flags are set only after every
+  listener task returns, including the HTTP/3 listener's own drain. The
+  graceful-shutdown functional test now waits for this line. `cp` mode has no
+  proxy drain and does not log it.
+- **Health probes and logs:** HTTP active health probes decide the verdict from
+  the response headers and drain small bodies (up to 64 KiB, within at most 1
+  second and the remaining probe timeout) in the background, so HTTP/1.1 probe
+  connections stay pooled (#5791). The circuit-breaker cache at-capacity warning
+  is rate-limited to one line per second with a suppressed count;
+  `ferrum_circuit_breaker_cache_admission_refused_total` still counts every
+  refusal (#5787).
+
+**Backend TLS**
+
+- **Cold builds leave the request worker:** the first request to a new backend
+  TLS identity (and the first after a cache clear or SVID rotation) builds its
+  TLS configuration on the bounded TLS source executor instead of inline
+  (#5754). Each waiting request has a total budget of
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS` (at most 5s) and fails closed when
+  it runs out; a late success is cached for the next request. Concurrent
+  misses for one identity share a single build.
+- **Follow-ups (#5782):** `wss://` backends reuse one cached config per TLS
+  identity and follow CRL reloads. A build that fails only after holding its
+  slot for the full budget backs that identity off for one more budget. A
+  quarter of the executor's slots (at least one when it has two or more) is
+  reserved for request-path builds. Every config load prebuilds, in idle
+  capacity, the reqwest backend TLS config of each HTTPS proxy whose identity
+  is not cached; with a small `FERRUM_TLS_SOURCE_MAX_BLOCKING_CONCURRENCY`, two
+  running prebuilds reduce refresh capacity for up to 3×
+  `FERRUM_TLS_SOURCE_LOAD_TIMEOUT_SECONDS`.
+
+**Dependencies**
+
+- **Vendored hyper-util:** the pooled HTTP/1.1 close patch (#5714) is rebased
+  onto hyper-util 0.1.21 (`vendor/hyper-util-0.1.21-ferrum-patched/`), bringing
+  0.1.21's upstream fixes and adding `base64` 0.23.1 to the lockfiles. The
+  patch's behavior is unchanged.
+- **Vendored `h3`:** the frame-drain patch defers only QUIC connection errors
+  behind buffered bytes, matching upstream (hyperium/h3#339). A peer that resets an
+  HTTP/3 stream mid-DATA no longer tears down the whole QUIC connection
+  (PR #5741), and a close that truncates a DATA frame surfaces as the close.
 
 ## Upgrading to 0.9.7
 
@@ -489,8 +666,8 @@ size `backendRequest` for the longest complete response the rule must serve,
 or omit it. The current admission contract, including the remaining refusals
 and the HTTP/3 `request`- and `backendRequest`-timeout limitations, is
 [`docs/gateway_api_conformance.md`](gateway_api_conformance.md).
-Native HTTP/3 enforcement of these timeouts lands after 0.9.7; see
-[Upgrading to the next release](#upgrading-to-the-next-release).
+Native HTTP/3 enforces these timeouts from 0.9.8; see
+[Upgrading to 0.9.8](#upgrading-to-098).
 
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
@@ -1458,7 +1635,7 @@ FERRUM_MODE=file \
 
 ### Pre-Upgrade Checklist
 
-- [ ] Read the section for your target release above (for example [Upgrading to 0.9.7](#upgrading-to-097)), [Breaking changes in 0.9.0](#breaking-changes-in-090), and the release notes for breaking changes, deprecated fields, and new required fields
+- [ ] Read the section for your target release above (for example [Upgrading to 0.9.8](#upgrading-to-098)), [Breaking changes in 0.9.0](#breaking-changes-in-090), and the release notes for breaking changes, deprecated fields, and new required fields
 - [ ] For database/CP modes during build-out: plan a
       [fresh-database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
       (`GET /backup` → fresh `V001` baseline → `POST /restore`); keep the old
