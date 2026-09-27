@@ -120,6 +120,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`vendor/hyper-1.9.0-ferrum-patched/`) that adds
   `Upgraded::reset_with_connect_error()`; see
   `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
+- With `FERRUM_DIAGNOSTIC_REFS=errors`, a response a plugin replayed or
+  relayed as origin content no longer gets an `X-Ferrum-Diagnostic-Ref`, even
+  when it carries an `X-Gateway-Error` token (#5860). For example, a
+  `response_caching` hit of a backend `502` stored because
+  `cacheable_status_codes` lists `502` is left unmarked, in `all` mode too.
+  The gateway's own error responses are referenced as before, on HTTP/1.1,
+  HTTP/2, gRPC, and HTTP/3.
 - A Gateway API listener port whose HTTP/3 (QUIC) task died now gets HTTP/3
   back in the same reconcile pass (#5840). Before, the rebind could run before
   the dead endpoint released its UDP socket. It then failed with
