@@ -116,6 +116,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `waf.block_reason=content_type`; recorded bodies set
   `waf.body_uninspected=content_type`.
 
+### Changed
+
+- WAF scanning is faster on the request path with identical results. Rule
+  sets run an `is_match` prefilter before collecting matches, so a clean
+  header, query, cookie, or path value (the common case) skips the overlapping
+  search and its allocation: 1.9–3.4x on request metadata. The escape and
+  entity decoders copy literal runs in bulk and return the input untouched when
+  nothing decodes, decode rounds chain without re-allocating, and the
+  decodable-marker gate uses SIMD `memchr`: building decoded body variants is
+  3–8x faster on bodies with JSON escapes, entities, or percent-encoding, and
+  ~10x faster on plain bodies. Global exemption checks no longer allocate or
+  parse the client IP when their lists are empty.
+
 ### Fixed
 
 - An HBONE relay that ends on a socket error now resets its HTTP/2 CONNECT
