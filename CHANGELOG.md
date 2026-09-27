@@ -113,13 +113,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tunnel_read_error`, `tunnel_write_error`, `app_send_error`, or
   `app_recv_error` ending). Before, the client could not tell a failed tunnel
   from a normal close, and a truncated byte stream looked complete. A peer
-  close, idle expiry, write stall, relay timeout, or admission revocation still
-  ends the stream with `END_STREAM`. A byte-stream failure after the backend's
-  FIN was already relayed stays `END_STREAM`, because the stream's send side
-  has finished. Resetting an upgraded stream needs a vendored hyper 1.9.0
-  (`vendor/hyper-1.9.0-ferrum-patched/`) that adds
+  close or idle expiry still ends the stream with `END_STREAM`. A byte-stream
+  failure after the backend's FIN was already relayed stays `END_STREAM`,
+  because the stream's send side has finished. Resetting an upgraded stream
+  needs a vendored hyper 1.9.0 (`vendor/hyper-1.9.0-ferrum-patched/`) that adds
   `Upgraded::reset_with_connect_error()`; see
   `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
+- An HBONE relay cut short by a backend read or write deadline
+  (`backend_read_timeout_ms`, `backend_write_timeout_ms`) or by an
+  admission-fence revocation now also resets its CONNECT stream with
+  `RST_STREAM(CONNECT_ERROR)` instead of closing it with a clean `END_STREAM`
+  (#5858). Before, a backend that stalled mid-response, or a tunnel revoked
+  mid-stream, looked to the client like a complete byte stream. The datagram
+  relay also resets on a tunnel write stall and a revocation. The byte-stream
+  relay also resets when the TCP half-close cap
+  (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expires: the cap runs from the
+  half-close regardless of activity, so it can cut a backend that is still
+  streaming its response. Only a peer close or an idle expiry still ends the
+  stream with `END_STREAM`.
 - With `FERRUM_DIAGNOSTIC_REFS=errors`, a response a plugin replayed or
   relayed as origin content no longer gets an `X-Ferrum-Diagnostic-Ref`, even
   when it carries an `X-Gateway-Error` token (#5860). For example, a
