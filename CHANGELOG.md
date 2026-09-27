@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-09-27
+
 ### Changed
 
 - A route-deadline `504` that no backend received now carries the new
@@ -87,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.23.1 to the lockfiles next to 0.22.1. hyper-util's `TokioExecutor` no
   longer carries the current `tracing` span into spawned tasks; Ferrum opens
   no spans, so its logs are unchanged.
+- With backend TLS live reload disabled, a new reqwest pool entry now reuses
+  the cached config of its TLS identity, as the HTTP/2, gRPC and HTTP/3 pools
+  already did, so an in-place CA or certificate rotation needs a restart or a
+  TLS identity change (#5776).
 
 ### Fixed
 
@@ -468,7 +474,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it no longer fires `always_capture_on_error` for it. The HTTP/3
   mesh-egress buffered bridge already reads the pass-through status through
   the bridge's shared buffered path; the docs no longer say it is not covered.
-
 - The circuit-breaker cache's at-capacity warning is now rate-limited to at
   most one line per second (with a suppressed count) instead of one line per
   request to an uncached overflow target, and it is emitted after the cache
@@ -674,7 +679,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `security_headers` removes matching response headers in place without allocating or cloning keys
   (#5755).
-
 - Backend TLS follow-ups to the off-worker cold builds (#5782). `wss://` WebSocket
   backends reuse one cached rustls config per TLS identity, built on the bounded TLS
   source executor, instead of building a connector on the Tokio worker for every
@@ -4870,7 +4874,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.7
 [0.9.6]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.4...v0.9.5
