@@ -1,4 +1,4 @@
-workspace = "boringcache/ferrum-edge"
+workspace = "jeremy-j/ferrum-edge"
 
 [entries.unit-target]
 kind = "cargo-target"
