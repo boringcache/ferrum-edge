@@ -24,6 +24,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -266,13 +268,10 @@ async fn start_h2_tls_header_echo_backend(
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
 
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|cert| cert.ok())
         .collect();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key =
-        rustls_pemfile::private_key(&mut key_reader)?.ok_or("missing private key in test cert")?;
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
     let provider = rustls::crypto::ring::default_provider();
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
@@ -2378,6 +2377,162 @@ mod waf_wide_charset {
     #[tokio::test]
     #[ignore]
     async fn waf_wide_charset_http2_buffered_and_streaming() {
+        exercise(true).await;
+    }
+}
+
+/// `on_unlisted_content_type: block` end to end: a non-empty request body whose
+/// `Content-Type` is outside the WAF scan scope is refused before it reaches
+/// the origin — declared-length and unknown-length (chunked / HTTP/2 without
+/// `Content-Length`) alike — while empty uploads, bodyless methods, and listed
+/// types still pass. This is the proxy-level check that the WAF's buffering
+/// request actually reaches the final-body decision on both frontends.
+mod waf_unlisted_content_type {
+    use super::*;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn exercise(http2: bool) {
+        let reservation = crate::scaffolding::ports::reserve_port().await.unwrap();
+        let port = reservation.port;
+        let listener = reservation.into_listener();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let backend_hits = Arc::clone(&hits);
+        let backend = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let hits = Arc::clone(&backend_hits);
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let hits = Arc::clone(&hits);
+                        async move {
+                            let _ = request.into_body().collect().await;
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let config = json!({
+            "version": "1",
+            "proxies": [{
+                "id": "unlisted", "listen_path": "/", "backend_scheme": "http",
+                "backend_host": "127.0.0.1", "backend_port": port,
+                "strip_listen_path": false, "pool_enable_http2": false,
+                "plugins": [{"plugin_config_id": "unlisted-waf"}]
+            }],
+            "consumers": [], "upstreams": [],
+            "plugin_configs": [{
+                "id": "unlisted-waf", "plugin_name": "waf", "scope": "proxy",
+                "proxy_id": "unlisted", "enabled": true,
+                "config": {
+                    "mode": "enforce",
+                    "default_rule_action": "enforce",
+                    "on_unlisted_content_type": "block"
+                }
+            }]
+        });
+        let mut gateway = TestGateway::builder()
+            .mode_file(serde_yaml::to_string(&config).unwrap())
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+            .log_level("warn")
+            .spawn()
+            .await
+            .unwrap();
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        let client = if http2 {
+            builder.http2_prior_knowledge()
+        } else {
+            builder.http1_only()
+        }
+        .build()
+        .unwrap();
+        let payload = br#"{"id":"1 UNION SELECT password FROM users"}"#;
+
+        // Declared-length unlisted bodies, including a missing Content-Type.
+        for content_type in [Some("application/octet-stream"), Some("text/csv"), None] {
+            let before = hits.load(Ordering::SeqCst);
+            let mut request = client
+                .post(gateway.proxy_url("/items"))
+                .body(payload.to_vec());
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 403, "{content_type:?} http2={http2}");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                before,
+                "refused body reached origin"
+            );
+        }
+
+        // Unknown-length upload: chunked on HTTP/1.1, no Content-Length on
+        // HTTP/2. The decision must still see the body.
+        let before = hits.load(Ordering::SeqCst);
+        let chunks: Vec<_> = payload
+            .chunks(5)
+            .map(|chunk| Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let response = client
+            .post(gateway.proxy_url("/items"))
+            .header("content-type", "application/octet-stream")
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "unknown-length http2={http2}");
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+
+        // Empty unlisted upload, a bodyless method, and a listed type pass.
+        for (method, content_type, body) in [
+            (
+                reqwest::Method::POST,
+                "application/octet-stream",
+                Vec::new(),
+            ),
+            (reqwest::Method::GET, "application/octet-stream", Vec::new()),
+            (
+                reqwest::Method::POST,
+                "application/json",
+                br#"{"name":"widget"}"#.to_vec(),
+            ),
+        ] {
+            let before = hits.load(Ordering::SeqCst);
+            let response = client
+                .request(method.clone(), gateway.proxy_url("/items"))
+                .header("content-type", content_type)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                200,
+                "{method} {content_type} http2={http2}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+        }
+
+        gateway.shutdown();
+        backend.abort();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn waf_unlisted_content_type_http1() {
+        exercise(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn waf_unlisted_content_type_http2() {
         exercise(true).await;
     }
 }

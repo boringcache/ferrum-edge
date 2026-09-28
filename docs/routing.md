@@ -9,7 +9,7 @@ Routing is the first half of the request path; protocol dispatch is the second. 
 - **`proxy.backend_scheme`** (`http`, `https`, `tcp`, `tcps`, `udp`, `dtls`) — the wire transport. HTTP family proxies (`http`, `https`) default to `https` when omitted. Stream family proxies must set a scheme explicitly.
 - **Runtime `HttpFlavor`** — `Plain`, `Grpc`, or `WebSocket`, classified per-request by `detect_http_flavor()` from the request's content-type and upgrade headers.
 
-The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. This is the decoupling introduced alongside the `BackendScheme` refactor; older `BackendProtocol::{Grpcs, Wss, H3}` config values no longer exist.
+The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. There are no gRPC-, WebSocket-, or HTTP/3-specific scheme values.
 
 HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.md) for the dispatch model, the cross-protocol bridge, and why WebSocket upgrades on the H3 listener return 501.
 
@@ -23,7 +23,7 @@ The request path used for routing is the **canonical policy path**, derived once
 
 ### Step 1: Cache Lookup (O(1))
 
-Before any route table scanning, the router checks two bounded caches keyed by `(host, path)`:
+Before any route table scanning, the router checks two bounded caches keyed by `(host, path)` plus the frontend port and TLS flag:
 
 1. **Prefix cache** — stores prefix route matches and negative (no-match) entries
 2. **Regex/exact cache** — stores regex, exact-path, and path-param route matches (separate partition)
@@ -59,8 +59,8 @@ Within **each** host tier, four path matching strategies are tried in order:
 
 After scanning, the result is cached for future O(1) lookups:
 
-- **Prefix match** is stored in the prefix cache
-- **Regex match** is stored in the regex cache (separate partition)
+- **Prefix or host-only match** is stored in the prefix cache
+- **Regex or exact-path match** is stored in the regex/exact cache (separate partition)
 - **No match** is stored as a negative entry in the prefix cache (prevents repeated O(n) scans from scanner/bot traffic)
 
 ## Priority Rules (Most to Least Specific)
@@ -70,7 +70,7 @@ After scanning, the result is cached for future O(1) lookups:
    exact host  >  wildcard host (*.domain)  >  catch-all (no hosts)
 
 2. Path match type (within the same host tier)
-   exact path  >  prefix route  >  regex route
+   exact path  >  prefix route  >  regex route  >  host-only fallback
 
 3. Prefix tiebreaker
    longest prefix wins (pre-sorted at config load time)
@@ -109,11 +109,11 @@ and `deep.other.example.com`, but not `example.com` itself.
 | `api.example.com` | `/api/health` | `wildcard-api` | No exact-host prefix match for `/api/health`, wildcard `*.example.com` + prefix `/api` |
 | `other.example.com` | `/api/data` | `wildcard-api` | Wildcard host match + prefix `/api` |
 | `other.org` | `/anything` | `catchall` | No exact/wildcard match, catch-all `/` |
-| `other.org` | `/users/42/orders` | `user-orders-regex` | No prefix match, catch-all regex matches exact path |
-| `other.org` | `/users/42/orders/pending` | `catchall` | Regex pattern has auto-appended `$`, so `/orders/pending` doesn't match — falls through to catch-all `/` |
-| `api.example.com` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders/pending` | `catchall` | Catch-all prefix `/` (the regex would not match anyway: it is anchored with `$`) |
+| `api.example.com` | `/users/42/orders` | `catchall` | No exact-host or wildcard match; catch-all prefix `/` beats catch-all regex |
 
-Note the last row: the catch-all prefix route `/` matches `/users/42/orders` before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route for this path, either remove the catch-all or assign the regex route to a more specific host tier.
+In this example `user-orders-regex` never wins: the catch-all prefix route `/` matches every path before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route, either remove the catch-all `/` or give the regex route a more specific host tier.
 
 ## Host-only Routing
 
@@ -386,4 +386,130 @@ plugin_configs:
       allow_credentials: true
     scope: global
     enabled: true
+```
+
+## WebSocket compression (`permessage-deflate`)
+
+By default the gateway strips the client's `Sec-WebSocket-Extensions` offer before
+the backend handshake, so RFC 7692 `permessage-deflate` is never negotiated end to
+end and every message stays inspectable by WebSocket frame plugins
+(`websocket_permessage_deflate: strip`). Two opt-in modes enable compression:
+`passthrough` (below) and gateway-terminated `terminate`
+([below](#gateway-terminated-compression-terminate)).
+
+A proxy can opt into `websocket_permessage_deflate: passthrough`. The client's
+`permessage-deflate` offer elements then reach the backend unchanged, and the
+backend's `permessage-deflate` answer reaches the client unchanged, on HTTP/1.1,
+HTTP/2 Extended CONNECT, and HTTP/3 Extended CONNECT. Any other extension token in
+the offer or answer is still stripped. A session that actually negotiates the
+extension is relayed as raw bytes (the gateway frame parser cannot decode
+compressed frames), so `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` and the
+incomplete-message bounds do not apply to it — idle, lifetime, drain, and
+connection limits still do. A session whose backend declines the offer keeps the
+normal relay.
+
+Passthrough is refused by config validation (Admin API 400, file-mode startup,
+database / CP load) on any proxy that has a plugin requiring the parsed WebSocket
+relay — `waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`,
+or a custom plugin whose `requires_websocket_framing()` returns `true` — whether it
+is attached directly, through a proxy group, or inherited from a global plugin
+config. As a second guard, the runtime keeps stripping the offer whenever the
+proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/
+`dtls`) must keep `strip`.
+
+In CP/DP deployments, upgrade every DP before enabling passthrough on the CP. A
+proxy rejects unknown fields, so a DP that predates `websocket_permessage_deflate`
+rejects the whole namespace snapshot from a CP that sends it.
+
+### Gateway-terminated compression (`terminate`)
+
+`websocket_permessage_deflate: terminate` keeps compression and inspection on the
+same route. The gateway is an RFC 7692 endpoint on each leg, and the two legs
+negotiate independently, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+Extended CONNECT alike:
+
+- **Client leg.** The gateway answers the first valid `permessage-deflate`
+  element of the client's offer itself. It honors `server_no_context_takeover`
+  and `server_max_window_bits` (echoing them in its answer) and never asks the
+  client to limit its own window. Elements with unknown or duplicate parameters,
+  or window bits outside 8–15, are declined; other extension tokens are dropped.
+  A client that does not offer the extension gets an uncompressed leg.
+- **Backend leg.** The backend receives the gateway's own offer,
+  `Sec-WebSocket-Extensions: permessage-deflate`, whatever the client offered.
+  The whole `Sec-WebSocket-Extensions` answer (every field line) must be one
+  valid `permessage-deflate` element without `client_max_window_bits` (which the
+  gateway did not offer); anything else — a foreign extension, a second element,
+  a malformed list, or a non-ASCII value — fails the upgrade with 502
+  (`rejection_phase: websocket_permessage_deflate`). A backend that sends no
+  extension answer gets an uncompressed leg.
+
+Every message is inflated before the shared frame relay parses it, so every frame
+and body-inspecting plugin — the WAF WebSocket scanner, `ws_message_size_limiting`,
+`ws_rate_limiting`, `ws_frame_logging`, custom `on_ws_frame` hooks — sees
+plaintext, and none is refused on a `terminate` proxy. After the plugins run, the
+gateway re-deflates each Text or Binary message toward a leg that negotiated
+compression, with that leg's context-takeover choice. Control frames are never
+compressed, and a compressed message may arrive fragmented (RSV1 on its first
+frame only). RSV1 on a control or continuation frame, or on a leg that did not
+negotiate the extension, fails the connection exactly as without it.
+
+Decompression is bounded per leg:
+
+- a compressed wire frame may not exceed the frame ceiling
+  (`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, or a lower `ws_message_size_limiting`
+  `max_frame_bytes`), and one frame may not inflate past it;
+- a message may not inflate past
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default 1 MiB, never
+  above the reassembled-message ceiling of 4x the frame ceiling or a lower
+  `max_message_bytes`; `0` explicitly opts into that ceiling);
+- inflation stops one byte past a limit and the session closes with 1009 in both
+  directions; corrupt compressed data closes with 1007;
+- buffers grow only with bytes that arrived: a compressed frame's declared length
+  reserves nothing, and an inflated frame never holds more than its limit plus
+  one byte;
+- the LZ77 window is the RFC 7692 maximum of 32 KiB. Each negotiated leg holds a
+  DEFLATE decompressor (about 50 KiB) and a 16 KiB read buffer from the start,
+  and a compressor (about 240 KiB) from the first message the gateway compresses
+  toward it, for the life of the session. A session with both legs negotiated
+  therefore holds about 0.6 MB, plus buffers bounded by the frame and message
+  ceilings. Size connection limits with that in mind.
+
+The message bound is also the amplification bound. DEFLATE expands up to about
+1032:1, so a peer can make the gateway inflate, inspect (every frame and body
+plugin, the WAF included), and re-compress a whole message for about 1/1000 of
+its size on the wire, and repeat that for every message. With the 1 MiB default
+that is about 1 KiB of wire data per 1 MiB of work. Setting the bound to `0`
+raises it to the reassembled-message ceiling — 64 MiB with the default 16 MiB
+frame size — where about 64 KiB of compressed data forces 64 MiB of memory and
+on the order of a second of CPU per message. Keep the bound as low as the
+application's largest legitimate message allows.
+
+Frame and message ceilings, fragment metering, and the incomplete-message bounds
+all apply to the decompressed messages the plugins see, and the wire
+fragmentation is preserved. Terminate costs CPU on both legs; a session whose
+peers both decline compression uses the ordinary relay (including
+`FERRUM_WEBSOCKET_TUNNEL_MODE`), while a negotiated session always uses the parsed
+relay. Byte counters and `ws_frame_logging` sizes are decompressed sizes. As with
+`passthrough`, upgrade every DP, and every database-mode node sharing the DB,
+before enabling `terminate`: a DP that predates the value rejects the namespace
+snapshot, and a database-mode node that predates it rejects the proxy row.
+
+```yaml
+proxies:
+  - id: chat
+    listen_path: /chat
+    backend_scheme: http
+    backend_host: chat.internal
+    backend_port: 8080
+    websocket_permessage_deflate: terminate
+```
+
+```yaml
+proxies:
+  - id: chat
+    listen_path: /chat
+    backend_scheme: http
+    backend_host: chat.internal
+    backend_port: 8080
+    websocket_permessage_deflate: passthrough
 ```

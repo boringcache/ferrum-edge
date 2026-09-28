@@ -92,6 +92,9 @@ use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
 use super::utils::sink_loss::{SinkLossReason, record_dropped as record_sink_loss};
+use super::utils::sse::{
+    split_sse_line_terminator, sse_lines, sse_lines_inclusive, strip_sse_boms,
+};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,
@@ -6200,7 +6203,9 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     // distinct choices by construction while separate frames are not.
     let mut choice_deltas: usize = 0;
     let mut malformed_fields: BTreeSet<&'static str> = BTreeSet::new();
-    for line in text.lines() {
+    // Same BOM policy and CR/LF/CRLF line splitting as the shared SSE parser, so
+    // a frame the client decodes is never hidden inside one unsplit line.
+    for line in sse_lines(strip_sse_boms(text)) {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
         };
@@ -6711,16 +6716,18 @@ fn sensitive_json_field(key: &str) -> bool {
 
 fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(raw).ok()?;
-    if !text.lines().any(|line| line.starts_with("data:")) {
+    // Same BOM policy and CR/LF/CRLF line splitting as the shared SSE parser.
+    let body = strip_sse_boms(text);
+    if !sse_lines(body).any(|line| line.starts_with("data:")) {
         return None;
     }
     let mut changed = false;
     let mut out = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let (line_no_newline, newline) = match line.strip_suffix('\n') {
-            Some(stripped) => (stripped.strip_suffix('\r').unwrap_or(stripped), "\n"),
-            None => (line, ""),
-        };
+    // Leading BOMs are copied through unchanged; only the lines after them are
+    // rewritten, each keeping its original terminator.
+    out.push_str(&text[..text.len() - body.len()]);
+    for line in sse_lines_inclusive(body) {
+        let (line_no_newline, newline) = split_sse_line_terminator(line);
         if let Some(rest) = line_no_newline
             .strip_prefix("data: ")
             .or_else(|| line_no_newline.strip_prefix("data:"))
@@ -6810,13 +6817,24 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
 /// `response_headers` is the Trailers-Only fallback for a hook that holds the
 /// initial header block and whose status never reached metadata. A gRPC
 /// transaction that ends with no terminal status at all is `UNKNOWN` for the
-/// client, matching [`TransactionSummary::grpc_status`].
+/// client, and one whose status is present but unreadable
+/// (`metadata.grpc_status_unreadable`) is `None`, both matching
+/// [`TransactionSummary::grpc_status`], so an unreadable status never triggers
+/// `always_capture_on_error`.
 fn final_grpc_status(
     metadata: &HashMap<String, String>,
     response_headers: Option<&HashMap<String, String>>,
 ) -> Option<u32> {
     if let Some(status) = metadata.get("grpc_status") {
         return Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status));
+    }
+    // A terminal status the client received but the gateway could not read (a
+    // pass-through gRPC-Web compressed trailer frame or content-coded body) is
+    // neither a failure nor missing; like `TransactionSummary::grpc_status`, it
+    // stays unset rather than `UNKNOWN`.
+    let unreadable = crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY;
+    if metadata.contains_key(unreadable) {
+        return None;
     }
     if let Some(status) =
         response_headers.and_then(crate::proxy::grpc_proxy::grpc_status_from_headers)

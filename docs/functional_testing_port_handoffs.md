@@ -4,7 +4,8 @@ Static audit against `5ce0a7594`, covering every `drop_and_take_port` call under
 `tests/` and the `unbound_port`, `unbound_tcp_port`, and `unbound_udp_port`
 entry points. Counts below refer to call sites, not runtime allocations.
 
-The shared reservation constructors now exclude the host source-port range.
+The shared reservation constructors now exclude the host's ephemeral
+source-port range (see [Functional Testing Guide](functional_testing.md#subprocess-harness-process-identity)).
 This deliberately makes **every** TCP, UDP, pair, and colocated reservation safe
 to release without requiring each caller to select a special allocator.
 Native fixtures should still keep their sockets; `TestSocket::bind_test(:0)`
@@ -43,6 +44,7 @@ range policy; the future refused stream reservation uses `reserve_future_tcp_por
 | `functional_stream_listener_failure_test.rs` | 1 future stream listener, initially bound without listening |
 | `functional_tcp_idle_timeout_env_test.rs` | 1 TCP stream frontend |
 | `functional_tls_lifecycle_test.rs` | 3 HTTPS, TCP and UDP frontends |
+| `functional_waf_unlisted_content_type_h3_test.rs` | 1 H3 frontend |
 | `scripted_backend_h3_tests.rs` | 1 H3 frontend |
 | `scripted_backend_streaming_latency_tests.rs` | 1 HTTPS frontend |
 

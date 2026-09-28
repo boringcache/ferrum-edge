@@ -1,6 +1,6 @@
 [package]
 name = "ferrum-edge"
-version = "0.9.5"
+version = "0.9.8"
 edition = "2024"
 description = "A high-performance edge proxy built in Rust"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -14,12 +14,22 @@ publish = false
 # patched in via `[patch.crates-io]` below. Cargo treats vendored deps under
 # `[patch.crates-io]` as fully built, but `cargo test -p h3 --lib frame` does
 # not run their tests because they aren't workspace members. The patch's
-# regression coverage is the two new unit tests in
-# `vendor/h3-0.0.8-ferrum-patched/src/frame.rs::tests`
-# (`poll_next_drains_buffered_headers_before_quic_close` and
-# `poll_data_drains_buffered_body_before_quic_close`); to run them locally,
-# invoke `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
-# The same tests are part of hyperium/h3#339 and run on the upstream PR's CI.
+# regression coverage is the unit tests in
+# `vendor/h3-0.0.8-ferrum-patched/src/frame.rs::tests`. Only a QUIC connection
+# error is deferred behind buffered bytes, stored until they drain, and
+# surfaced once: `poll_next_drains_buffered_headers_before_quic_close`,
+# `poll_next_drains_a_buffered_frame_when_it_reads_the_quic_close`,
+# `poll_data_drains_buffered_body_before_quic_close`, and
+# `poll_data_surfaces_quic_close_over_a_truncated_buffered_body`. Every
+# stream-level error surfaces immediately:
+# `poll_data_surfaces_stream_reset_over_a_truncated_buffered_body`,
+# `poll_data_surfaces_stream_reset_over_a_buffered_frame`,
+# `poll_next_surfaces_stream_reset_over_a_buffered_frame`,
+# `poll_data_surfaces_unknown_stream_error_over_a_buffered_body`, and
+# `poll_next_surfaces_unknown_stream_error_over_a_buffered_frame`. To run them
+# locally, invoke
+# `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
+# hyperium/h3#339 carries the same fix and its tests against upstream master.
 #
 # The vendored tungstenite/tokio-tungstenite crates live at
 # `vendor/tungstenite-0.29.0-ferrum-patched/` and
@@ -124,7 +134,6 @@ ring = { version = "0.17", optional = true }
 aws-lc-rs = { version = "1.16", default-features = false, features = ["alloc", "ring-io", "ring-sig-verify"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
-rustls-pemfile = "2"
 webpki-roots = "1.0"
 zeroize = "1"
 
@@ -159,6 +168,9 @@ tracing-appender = "0.2"
 tonic = { version = "0.14.6", features = ["tls-webpki-roots"] }
 tonic-prost = "0.14.6"
 prost = "0.14.3"
+# Well-known types (`google.protobuf.Struct`) for the SPIFFE Workload API
+# `ValidateJWTSVIDResponse.claims` field.
+prost-types = "0.14.3"
 tower = { version = "0.5", features = ["util"] }
 
 # JWT and auth
@@ -299,7 +311,11 @@ instant-acme = { version = "0.8.5", default-features = false, features = ["hyper
 cryptoki = { version = "0.12", optional = true }
 vaultrs = { version = "0.8", optional = true }
 aws-config = { version = "1.8", features = ["behavior-version-latest"], optional = true }
-aws-sdk-secretsmanager = { version = "1", optional = true }
+# `default-features = false` drops the SDK's legacy `rustls` feature, which pulls
+# the hyper 0.14 / rustls 0.21 / h2 0.3 connector stack (RUSTSEC-2026-0098,
+# -0099, -0104, -0258). The client is built from `aws_config::load_defaults`,
+# whose `default-https-client` (hyper 1.x + rustls 0.23) is what it uses.
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 google-cloud-secretmanager-v1 = { version = "1.9", optional = true }
 # Provides anonymous credentials so the GCP Secret Manager client can target a
 # local fake/emulator endpoint (`FERRUM_GCP_SECRET_MANAGER_ENDPOINT`) without
@@ -325,7 +341,11 @@ rdkafka = { version = "0.39", features = ["cmake-build", "zstd", "ssl-vendored"]
 # MongoDB (NoSQL database backend). Its default `rustls-tls` feature selects
 # ring, so retain the non-crypto defaults explicitly and select the TLS provider
 # through `crypto-ring` / `fips` below.
-mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "dns-resolver"] }
+# 3.7 is the first release on hickory 0.26; older 3.x pin hickory-proto 0.25
+# (RUSTSEC-2026-0118 / RUSTSEC-2026-0119). Capped below 3.9, which raised the
+# driver's minimum wire version to 9 (MongoDB 4.4) and would drop MongoDB 4.2 /
+# Cosmos DB server-version-4.2 support; 3.7 and 3.8 still accept wire version 8.
+mongodb = { version = ">=3.7, <3.9", default-features = false, features = ["compat-3-0-0", "dns-resolver"] }
 
 # DTLS 1.2/1.3 (secure UDP) — Sans-IO state machine
 # SYNC: version must match tests/performance/multi_protocol/Cargo.toml (cross-version DTLS handshakes hang)
@@ -569,7 +589,9 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # into one recv (common for fast backends doing graceful shutdown), the
 # buffered HEADERS frame is silently discarded and `recv_response` returns
 # `StreamError::ConnectionError` — the gateway surfaces a 502 to the client
-# even though the response was on the wire.
+# even though the response was on the wire. The patch defers only connection
+# errors; a stream reset or any other stream-level error (including a rejected
+# 0-RTT read) surfaces ahead of buffered bytes, as in stock h3.
 #
 # Retirement plan: when h3 ships a release with the fix, remove the
 # corresponding `[patch.crates-io]` line, drop `vendor/h3-0.0.8-ferrum-patched/`,
@@ -638,6 +660,38 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # line, drop `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both
 # lockfiles and the drift manifest. See
 # `docs/upstream-sqlx-patches/001-verify-ca-name-context/README.md`.
+#
+# We also carry a vendored copy of hyper-util 0.1.21 whose legacy client stops
+# holding an HTTP/1 connection's only request sender once that connection's
+# dispatcher has stopped reading requests (issue #5714). hyper queues a request
+# on a tokio unbounded channel, and tokio checks for closure and publishes the
+# message as two steps. A backend reset or FIN that closes an idle connection
+# between them strands the request in a channel nobody reads. Its callback
+# fires only when the channel drops, and hyper-util held the last sender, so
+# reqwest's `send()` hung until `backend_read_timeout_ms` (a 504) instead of
+# failing as an unsent request. Ferrum cannot reach the pooled sender through
+# reqwest, so the fix has to live in hyper-util.
+#
+# Retirement plan: when a hyper-util release no longer holds the only HTTP/1
+# sender while waiting (or hyper's dispatcher no longer strands a racing send),
+# remove the `[patch.crates-io]` line, drop
+# `vendor/hyper-util-0.1.21-ferrum-patched/`, and update both lockfiles and the
+# drift manifest. See
+# `docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md`.
+#
+# We also carry a vendored copy of hyper 1.9.0 that adds
+# `Upgraded::reset_with_connect_error()`, which resets an upgraded HTTP/2
+# CONNECT stream with `RST_STREAM(CONNECT_ERROR)` (issue #5781). Stock hyper's
+# upgraded HTTP/2 stream is private, and dropping or shutting it down always
+# sends a clean `END_STREAM`, so an HBONE relay that ended on a socket error
+# looked exactly like a normal close to the peer. RFC 9113 section 8.5 names
+# `CONNECT_ERROR` as the signal for a tunnel whose connection failed.
+#
+# Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
+# with a chosen error code, remove the `hyper` line below, drop
+# `vendor/hyper-1.9.0-ferrum-patched/`, move the HBONE relays to the upstream
+# API, and update the three lockfiles and the drift manifest. See
+# `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
@@ -646,3 +700,5 @@ h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }
 tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
+hyper-util = { path = "vendor/hyper-util-0.1.21-ferrum-patched" }
+hyper = { path = "vendor/hyper-1.9.0-ferrum-patched" }

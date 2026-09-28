@@ -5183,6 +5183,7 @@ fn is_safe_provider_response_header(name: &str) -> bool {
             | "x-goog-request-id"
             | "anthropic-request-id"
             | "openai-request-id"
+            | "ratelimit"
     ) || name.starts_with("x-ratelimit-")
         || name.starts_with("ratelimit-")
         || name.starts_with("anthropic-ratelimit-")
@@ -6748,6 +6749,13 @@ fn stamp_stream_response_representation(headers: &mut HashMap<String, String>) {
 impl Plugin for AiFederation {
     fn name(&self) -> &str {
         "ai_federation"
+    }
+
+    // The short-circuit is the federated provider's response (or a
+    // provider-failure envelope standing in for it), not a gateway policy
+    // rejection.
+    fn rejects_with_origin_response(&self) -> bool {
+        true
     }
 
     fn priority(&self) -> u16 {

@@ -136,6 +136,7 @@ fn test_proxy() -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -959,6 +960,15 @@ struct ExternalIdentityAuth;
 
 const BASIC_AUTH_TEST_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
 
+/// `basic_auth` built with an explicit HMAC secret. Publishing the secret into
+/// the process environment raced env-isolated tests in this binary, which
+/// clear every `FERRUM_*` variable while they hold `ENV_LOCK` (issue #5705).
+fn basic_auth_plugin() -> BasicAuth {
+    let config = json!({});
+    ferrum_edge::_test_support::basic_auth_with_secret_for_test(&config, BASIC_AUTH_TEST_SECRET)
+        .expect("basic_auth builds with the explicit test secret")
+}
+
 fn basic_auth_dispatch_consumer() -> Consumer {
     use hmac::{KeyInit, Mac};
 
@@ -1645,10 +1655,7 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
 
 #[tokio::test]
 async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
-    }
-    let basic_auth: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let basic_auth: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -1673,11 +1680,8 @@ async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
 
 #[tokio::test]
 async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
-    }
     let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
-    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -1704,11 +1708,8 @@ async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
 async fn test_single_auth_valid_basic_skips_earlier_jwt_scheme() {
     use base64::Engine;
 
-    unsafe {
-        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
-    }
     let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
-    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let auth_plugins = vec![jwt, basic];
     let consumer_index = ConsumerIndex::new(&[basic_auth_dispatch_consumer()]);
     let encoded = base64::engine::general_purpose::STANDARD.encode("alice:password");
@@ -2293,8 +2294,10 @@ fn unix_h1_keep_alive_buffers_only_within_the_eager_buffer_contract() {
         .split("async fn proxy_to_backend_unix(")
         .nth(1)
         .expect("unix dispatch");
+    // The response wait hands the lease back as an `Option` (issue #5720): a
+    // released lease has nothing to check in, so it must never buffer.
     assert!(
-        dispatch.contains("checkout.keep_alive()"),
+        dispatch.contains("checkout.as_ref().is_some_and(|lease| lease.keep_alive())"),
         "unix dispatch must gate in-dispatch buffering on the lease's keep-alive decision"
     );
     assert!(
@@ -2315,7 +2318,7 @@ fn direct_h2_body_size_hint_does_not_leak_incoming_exact_length() {
     // hyper reconstruct Content-Length and finish without Ready(None).
     let source = include_str!("../../../src/proxy/body.rs");
     let arm = source
-        .split("struct DirectH2Body {")
+        .split("struct DirectH2Body<B = Incoming> {")
         .nth(1)
         .expect("DirectH2Body")
         .split("/// Wraps a streaming HTTP/2 response body with a per-frame idle read deadline.")
@@ -3934,7 +3937,7 @@ fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
         "the completion-gate arm must remain the first dispatch choice"
     );
     assert!(
-        dispatch.contains("else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc)"),
+        dispatch.contains("else if let (true, Some(tap)) = (use_limit_adapter, observe_grpc)"),
         "gRPC observation without a gate must still take SizeLimitedIncoming"
     );
     let limited_ctors: Vec<&str> = dispatch.split("SizeLimitedIncoming::").skip(1).collect();

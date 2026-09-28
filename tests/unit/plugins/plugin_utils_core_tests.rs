@@ -1,5 +1,6 @@
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::plugins::utils::auth_flow::ExtractedCredential;
+use ferrum_edge::plugins::utils::cache_headers::{is_sensitive_header, sanitize_cached_headers};
 use ferrum_edge::plugins::utils::cert_hash::{sha256_base64url_no_pad, sha256_hex_lower};
 use ferrum_edge::plugins::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, extract_claim_values, parse_claim_path_value,
@@ -15,8 +16,11 @@ use ferrum_edge::plugins::utils::query::{
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
-    MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseReassembler, SseText, SseTextKind,
-    parse_sse_data_frames_checked,
+    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
+    SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
+    classify_forwarded_sse_prefix, parse_sse_data_frames_checked, split_sse_line_terminator,
+    sse_event_end, sse_event_end_after, sse_line_end, sse_lines, sse_lines_inclusive,
+    strip_sse_boms,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
@@ -26,6 +30,7 @@ use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use std::collections::HashMap;
 
 #[test]
 fn unknown_key_diagnostics_keep_sorted_suggestions_when_rendered() {
@@ -1010,6 +1015,483 @@ fn canonical_policy_view_ignores_a_duplicate_only_the_strip_removes() {
 }
 
 // ---------------------------------------------------------------------------
+// utils::sse — WHATWG event-stream framing (BOM, CR / LF / CRLF line endings)
+// ---------------------------------------------------------------------------
+
+/// One OpenAI chat-completion delta event carrying `text`, terminated by `eol`
+/// twice so the blank line that dispatches it uses the same delimiter.
+fn chat_delta_event(text: &str, eol: &str) -> String {
+    let frame = json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    format!("data: {frame}{eol}{eol}")
+}
+
+/// Parse a buffered SSE body and reassemble it the way the AI inspectors do,
+/// returning `(frame count, fully_parsed, reassembled assistant content)`.
+fn parse_and_reassemble(body: &str) -> (usize, bool, String) {
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    let mut reassembler = SseReassembler::new();
+    for (event, frame) in parsed.reassembly_frames() {
+        reassembler.push_event_frame(event, frame);
+    }
+    (
+        parsed.frames.len(),
+        parsed.fully_parsed,
+        reassembler.assistant_content(),
+    )
+}
+
+#[test]
+fn sse_parser_keeps_every_event_under_every_legal_line_ending_and_bom() {
+    // Each body decodes, per the WHATWG event-stream algorithm, to the same two
+    // events. A parser that lost the first one would still report the second as
+    // complete, nonempty content — so every encoding must match the LF control.
+    let blocked = "AUDIT-BLOCKED";
+    let clean = chat_delta_event("clean", "\n");
+    let blocked_lf = chat_delta_event(blocked, "\n");
+    let blocked_crlf = chat_delta_event(blocked, "\r\n");
+    let blocked_cr = chat_delta_event(blocked, "\r");
+    // CRLF ends the data line, then a lone CR ends the dispatching blank line.
+    let blocked_mixed = format!("{}\r\n\r", blocked_cr.trim_end_matches('\r'));
+    let bodies = [
+        ("lf", format!("{blocked_lf}{clean}")),
+        ("crlf", format!("{blocked_crlf}{clean}")),
+        ("bom", format!("\u{feff}{blocked_lf}{clean}")),
+        ("bom_crlf", format!("\u{feff}{blocked_crlf}{clean}")),
+        ("cr", format!(": keepalive\r{blocked_cr}{clean}")),
+        ("bom_cr", format!("\u{feff}{blocked_cr}{clean}")),
+        ("mixed", format!(": keepalive\r\n{blocked_mixed}{clean}")),
+    ];
+
+    for (encoding, body) in bodies {
+        assert_eq!(
+            parse_and_reassemble(&body),
+            (2, true, "AUDIT-BLOCKEDclean".to_string()),
+            "{encoding}: every event must be parsed and reassembled"
+        );
+    }
+}
+
+#[test]
+fn sse_parser_strips_leading_bom_from_single_event_stream() {
+    let body = format!("\u{feff}{}", chat_delta_event("AUDIT-BLOCKED", "\n"));
+    assert_eq!(
+        parse_and_reassemble(&body),
+        (1, true, "AUDIT-BLOCKED".to_string())
+    );
+}
+
+#[test]
+fn sse_parser_splits_cr_only_stream_after_comment() {
+    let body = format!(": keepalive\r{}", chat_delta_event("AUDIT-BLOCKED", "\r"));
+    assert_eq!(
+        parse_and_reassemble(&body),
+        (1, true, "AUDIT-BLOCKED".to_string())
+    );
+}
+
+#[test]
+fn sse_parser_consumes_multiple_leading_boms() {
+    let body = format!("\u{feff}\u{feff}{}", chat_delta_event("x", "\n"));
+    assert_eq!(parse_and_reassemble(&body), (1, true, "x".to_string()));
+}
+
+#[test]
+fn sse_parser_dispatches_lf_then_cr_blank_line() {
+    let body = "data: {\"n\":1}\n\rdata: {\"n\":2}\n\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 1}), json!({"n": 2})]);
+}
+
+#[test]
+fn sse_parser_dispatches_cr_then_crlf_blank_line() {
+    let body = "data: {\"n\":1}\r\r\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 1})]);
+}
+
+#[test]
+fn sse_parser_strips_only_one_space_after_data_colon() {
+    let body = "data:  \" x\"\n\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!(" x")]);
+}
+
+#[test]
+fn sse_parser_ignores_capitalized_and_unknown_fields() {
+    let body = concat!(
+        "Data: {\"n\":0}\n",
+        "unknown: {\"n\":1}\n",
+        "data: {\"n\":2}\n\n",
+    );
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 2})]);
+}
+
+#[test]
+fn sse_parser_ignores_id_and_retry_fields() {
+    let body = "id: cursor\nretry: 1000\ndata: {\"n\":1}\n\n";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(parsed.frames, vec![json!({"n": 1})]);
+}
+
+#[test]
+fn sse_parser_joins_multiline_data_across_cr_line_endings() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\r",
+        "data: \"delta\":{\"content\":\"hi\"}}]}\r\r",
+    );
+    assert_eq!(parse_and_reassemble(body), (1, true, "hi".to_string()));
+}
+
+#[test]
+fn sse_parser_reads_event_name_under_cr_framing() {
+    let body = "event: message_start\rdata: {\"type\":\"message_start\",\"message\":{}}\r\r";
+    let parsed = parse_sse_data_frames_checked(body.as_bytes());
+    assert!(parsed.fully_parsed);
+    assert_eq!(
+        parsed.events,
+        vec![Some(SseEventName::Anthropic(AnthropicEvent::MessageStart))]
+    );
+}
+
+#[test]
+fn sse_parser_treats_colonless_data_line_as_empty_data_field() {
+    // `data` with no colon is a `data` field with an empty value, contributing
+    // an empty line to the event's data buffer — whitespace inside JSON.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\n",
+        "data\n",
+        "data: \"delta\":{\"content\":\"hi\"}}]}\n\n",
+    );
+    assert_eq!(parse_and_reassemble(body), (1, true, "hi".to_string()));
+}
+
+#[test]
+fn sse_parser_still_fails_closed_on_malformed_json_under_cr_and_bom() {
+    for body in [
+        "\u{feff}data: {not json\n\n",
+        "data: {not json\r\r",
+        "data: {not json\r\n\r\n",
+    ] {
+        let parsed = parse_sse_data_frames_checked(body.as_bytes());
+        assert!(parsed.frames.is_empty(), "{body:?}");
+        assert!(
+            !parsed.fully_parsed,
+            "{body:?} must not report fully parsed"
+        );
+    }
+}
+
+#[test]
+fn sse_line_splitter_keeps_each_terminator_and_round_trips() {
+    let body = ": c\rdata: a\r\ndata: b\n\r\r\nz";
+    let inclusive: Vec<&str> = sse_lines_inclusive(body).collect();
+    assert_eq!(
+        inclusive,
+        [": c\r", "data: a\r\n", "data: b\n", "\r", "\r\n", "z"]
+    );
+    assert_eq!(inclusive.concat(), body);
+    let split: Vec<(&str, &str)> = inclusive
+        .iter()
+        .copied()
+        .map(split_sse_line_terminator)
+        .collect();
+    assert_eq!(
+        split,
+        [
+            (": c", "\r"),
+            ("data: a", "\r\n"),
+            ("data: b", "\n"),
+            ("", "\r"),
+            ("", "\r\n"),
+            ("z", ""),
+        ]
+    );
+    assert_eq!(
+        sse_lines(body).collect::<Vec<_>>(),
+        [": c", "data: a", "data: b", "", "", "z"]
+    );
+    assert_eq!(sse_lines("").count(), 0);
+}
+
+#[test]
+fn sse_bom_policy_strips_every_leading_bom_and_nothing_else() {
+    assert_eq!(strip_sse_boms("\u{feff}\u{feff}data: x\r"), "data: x\r");
+    assert_eq!(strip_sse_boms("data: \u{feff}x\n"), "data: \u{feff}x\n");
+    assert_eq!(strip_sse_boms(""), "");
+}
+
+#[test]
+fn sse_event_end_finds_blank_lines_under_every_terminator_mix() {
+    let cases: [(&[u8], Option<usize>); 17] = [
+        (b"data: x\n\nrest", Some(9)),
+        (b"data: x\r\n\r\nrest", Some(11)),
+        (b"data: x\r\rrest", Some(9)),
+        (b"data: x\n\r\nrest", Some(10)),
+        (b"data: x\r\n\nrest", Some(10)),
+        (b"data: x\n\rrest", Some(9)),
+        (b"data: x\r\n\rrest", Some(10)),
+        (b"data: x\r\r\nrest", Some(10)),
+        // One line end is not an event end, whatever its form.
+        (b"data: x\n", None),
+        (b"data: x\r\n", None),
+        (b"data: x\ny\n", None),
+        (b"data: x\ry\r", None),
+        // A final CR may still be half of a CRLF, so it cannot end a line
+        // that the next byte might continue...
+        (b"data: x\r", None),
+        // ...but as the second line end it already dispatches the event.
+        (b"data: x\r\n\r", Some(10)),
+        (b"data: x\r\r", Some(9)),
+        // The buffer starts inside a line, so a leading terminator ends it.
+        (b"\ndata: x\r\r", Some(10)),
+        (b"", None),
+    ];
+    for (buf, expected) in cases {
+        assert_eq!(
+            sse_event_end(buf),
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(buf)
+        );
+    }
+}
+
+#[test]
+fn sse_event_end_after_joins_a_cr_and_lf_split_across_chunks() {
+    // The CR ending `carry` and the LF starting `chunk` are one CRLF.
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\n\r\nnext"), Some(3));
+    assert_eq!(
+        sse_event_end_after(b"data: x\r", b"\ndata: y\r\r"),
+        Some(10)
+    );
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\n"), None);
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\n\r"), Some(2));
+    // A CR followed by a CR is two line ends: the event is complete.
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\rnext"), Some(1));
+    assert_eq!(sse_event_end_after(b"data: x\r", b"\r\nnext"), Some(2));
+    assert_eq!(sse_event_end_after(b"data: x\n", b"\rnext"), Some(1));
+    assert_eq!(sse_event_end_after(b"data: x\r\n", b"\r"), Some(1));
+    assert_eq!(sse_event_end_after(b"data: x\r", b""), None);
+    assert_eq!(sse_event_end_after(b"", b"data: x\r\r"), Some(9));
+}
+
+#[test]
+fn sse_event_end_after_matches_a_contiguous_scan_at_every_split() {
+    let bodies: [&[u8]; 6] = [
+        b": c\rdata: {\"a\":1}\r\rdata: {\"b\":2}\r\r",
+        b"data: x\r\ndata: y\r\n\r\n",
+        b"data: x\r\n\rnext\r\r",
+        b"data: x\r\r\nnext\n\n",
+        b"data: x\n\r\nnext\r\n\n",
+        b"data: x\ry\r\nz\n\r",
+    ];
+    for body in bodies {
+        for split in 0..=body.len() {
+            let (carry, chunk) = body.split_at(split);
+            // The streaming caller only asks once `carry` holds no event.
+            if sse_event_end(carry).is_some() {
+                continue;
+            }
+            assert_eq!(
+                sse_event_end_after(carry, chunk),
+                sse_event_end(body).map(|end| end - split),
+                "{:?} split at {split}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+}
+
+#[test]
+fn sse_line_end_reports_content_end_and_next_line_start() {
+    assert_eq!(sse_line_end(b"data: x\nrest"), Some((7, 8)));
+    assert_eq!(sse_line_end(b"data: x\r\nrest"), Some((7, 9)));
+    assert_eq!(sse_line_end(b"data: x\rrest"), Some((7, 8)));
+    // A final CR is reported alone; the caller joins an LF that follows it.
+    assert_eq!(sse_line_end(b"data: x\r"), Some((7, 8)));
+    assert_eq!(sse_line_end(b"\n"), Some((0, 1)));
+    assert_eq!(sse_line_end(b"data: x"), None);
+    assert_eq!(sse_line_end(b""), None);
+}
+
+#[test]
+fn forwarded_sse_prefix_without_data_is_inert_under_every_line_ending() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            String::new(),
+            eol.to_string(),
+            "\u{feff}".to_string(),
+            "\u{feff}\u{feff}".to_string(),
+            format!("\u{feff}{eol}"),
+            format!(": keepalive{eol}"),
+            format!("\u{feff}: keepalive{eol}id: 7{eol}retry: 1000{eol}"),
+            format!("id{eol}retry{eol}:{eol}"),
+            // A blank line ends a data event, so nothing after it is open.
+            format!("data: x{eol}{eol}"),
+            format!("data: x{eol}{eol}: keepalive{eol}"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::Inert,
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\n: keepalive\r"),
+        SseForwardedPrefix::Inert
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_ending_inside_a_data_less_line_is_an_inert_line() {
+    // Unterminated lines already past their `:` carry no data, but the bytes
+    // up to their next terminator still belong to them, so the caller must not
+    // read those bytes as a fresh line.
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            ":".to_string(),
+            ": keep".to_string(),
+            "id:".to_string(),
+            "id: 7".to_string(),
+            "retry: 10".to_string(),
+            "\u{feff}: keep".to_string(),
+            format!("id: 7{eol}retry: 10"),
+            format!(": keepalive{eol}:"),
+            format!("data: x{eol}{eol}id: 7"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::InertLine,
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\n: keep"),
+        SseForwardedPrefix::InertLine
+    );
+    // A data line earlier in the same event keeps the whole event open.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"data: x\n: keep"),
+        SseForwardedPrefix::OpenEvent
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_ending_inside_a_bom_reports_the_missing_bytes() {
+    assert_eq!(
+        classify_forwarded_sse_prefix(&UTF8_BOM[..1]),
+        SseForwardedPrefix::PartialBom(2)
+    );
+    assert_eq!(
+        classify_forwarded_sse_prefix(&UTF8_BOM[..2]),
+        SseForwardedPrefix::PartialBom(1)
+    );
+    let mut stacked = UTF8_BOM.to_vec();
+    stacked.push(UTF8_BOM[0]);
+    assert_eq!(
+        classify_forwarded_sse_prefix(&stacked),
+        SseForwardedPrefix::PartialBom(2)
+    );
+}
+
+#[test]
+fn forwarded_sse_prefix_that_carries_data_is_open() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let prefixes = [
+            format!("data: x{eol}"),
+            format!("\u{feff}data: x{eol}"),
+            format!(": keepalive{eol}data: x{eol}"),
+            format!("data: x{eol}id: 7{eol}"),
+            format!("event: message{eol}data: x{eol}"),
+            // An empty `data` line ahead of one with a value.
+            format!("data:{eol}data: x{eol}"),
+            // Unterminated `data` lines whose value has begun.
+            "data: {\"partial\"".to_string(),
+            "data:x".to_string(),
+            "data:  ".to_string(),
+            format!("event: message{eol}data: {{"),
+        ];
+        for prefix in prefixes {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::OpenEvent,
+                "{prefix:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn forwarded_sse_prefix_whose_open_event_holds_no_data_is_context() {
+    // The open event has no data yet, but its lines change how the client reads
+    // the rest of it, so the caller keeps it, from the offset where it starts,
+    // as parse context for the rest of that event.
+    for eol in ["\n", "\r\n", "\r"] {
+        let cases = [
+            (format!("event: message{eol}"), 0),
+            (format!("custom: value{eol}"), 0),
+            (format!(": keepalive{eol}event: message{eol}id: 7{eol}"), 0),
+            (format!("event: message{eol}: keep"), 0),
+            ("event: mess".to_string(), 0),
+            // Unterminated lines whose field name is not complete yet, or
+            // `data` lines whose value has not begun.
+            ("d".to_string(), 0),
+            ("dat".to_string(), 0),
+            ("data".to_string(), 0),
+            ("data:".to_string(), 0),
+            ("data: ".to_string(), 0),
+            (format!(": keepalive{eol}da"), 0),
+            (format!("id: 7{eol}i"), 0),
+            // Complete `data` lines whose value is empty add no text of their
+            // own, so the event's data is still ahead.
+            (format!("data{eol}"), 0),
+            (format!("data:{eol}"), 0),
+            (format!("data: {eol}"), 0),
+            (format!("event: message{eol}data:{eol}"), 0),
+            (format!("data:{eol}data: "), 0),
+            // A BOM that is not leading is part of a field name.
+            (format!("id: 7{eol}\u{feff}"), 0),
+            // Leading BOMs are not part of the event.
+            (format!("\u{feff}event: message{eol}"), 3),
+            // A blank line ends an event, so the open one starts after it.
+            (
+                format!("data: x{eol}{eol}event: message{eol}"),
+                7 + 2 * eol.len(),
+            ),
+        ];
+        for (prefix, event_start) in cases {
+            assert_eq!(
+                classify_forwarded_sse_prefix(prefix.as_bytes()),
+                SseForwardedPrefix::EventContext(event_start),
+                "{prefix:?}"
+            );
+        }
+    }
+    // The LF of a CRLF whose CR ended the previous bytes.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\nevent: message\n"),
+        SseForwardedPrefix::EventContext(1)
+    );
+    // A partial BOM followed by other bytes is not a BOM, but a field name.
+    assert_eq!(
+        classify_forwarded_sse_prefix(b"\xEFdata: x\n"),
+        SseForwardedPrefix::EventContext(0)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // utils::sse — Anthropic Messages event-stream reassembly
 // ---------------------------------------------------------------------------
 
@@ -1802,4 +2284,79 @@ fn openai_sse_reassembly_is_unaffected_by_anthropic_support() {
     let responses = fragment(&texts, "$.output[0].content[0].text");
     assert_eq!(responses.kind, SseTextKind::ResponsesText);
     assert_eq!(responses.text, "lo");
+}
+
+#[test]
+fn cached_header_sanitizer_strips_non_x_ratelimit_families_case_insensitively() {
+    // The IETF-draft `RateLimit` combined field and the split `RateLimit-*`
+    // fields carry the original response's remaining quota and relative reset.
+    // Storing or replaying them would make every later cache hit report a
+    // stale budget (e.g. back off on `remaining=0` long after the upstream
+    // quota recovered).
+    let mut headers = HashMap::new();
+    headers.insert("RateLimit-Remaining".to_string(), "0".to_string());
+    headers.insert("RateLimit-Reset".to_string(), "60".to_string());
+    headers.insert("ratelimit-limit".to_string(), "100".to_string());
+    headers.insert("rAtElImIt".to_string(), "\"api\";r=0;t=60".to_string());
+    headers.insert(
+        "RateLimit-Policy".to_string(),
+        "\"api\";q=100;w=60;pk=:dXNlci1h:".to_string(),
+    );
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let sanitized = sanitize_cached_headers(&headers);
+    for name in [
+        "RateLimit-Remaining",
+        "RateLimit-Reset",
+        "ratelimit-limit",
+        "rAtElImIt",
+        "RateLimit-Policy",
+    ] {
+        assert!(
+            !sanitized.contains_key(name),
+            "{name} must not be stored or replayed from a cache entry"
+        );
+    }
+    assert_eq!(
+        sanitized.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(sanitized.len(), 1);
+}
+
+#[test]
+fn cached_header_sanitizer_ratelimit_match_is_bounded_and_keeps_existing_families() {
+    // Both rate-limit families (legacy `X-RateLimit-*` and IETF `RateLimit*`)
+    // plus the pre-existing sensitive headers stay stripped.
+    for name in [
+        "RATELIMIT",
+        "RateLimit-Policy",
+        "X-RateLimit-Remaining",
+        "x-ratelimit-reset",
+        "X-RateLimit-Policy",
+        "anthropic-ratelimit-tokens-remaining",
+        "x-ai-ratelimit-usage",
+        "Set-Cookie",
+        "Authorization",
+        "Retry-After",
+        "traceparent",
+    ] {
+        assert!(is_sensitive_header(name), "{name} should be stripped");
+    }
+
+    // Ordinary application/representation headers and near-miss names that
+    // merely contain the token are retained.
+    for name in [
+        "content-type",
+        "cache-control",
+        "etag",
+        "x-app-version",
+        "ratelimited-by",
+        "ratelimits",
+        "x-ratelimited-by",
+        "x-ai-cache-status",
+        "my-ratelimit-remaining",
+    ] {
+        assert!(!is_sensitive_header(name), "{name} should be kept");
+    }
 }

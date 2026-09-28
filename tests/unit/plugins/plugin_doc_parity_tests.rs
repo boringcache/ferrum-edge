@@ -217,8 +217,10 @@ fn builtin_parity_meta_matches_registry_set() {
 
 #[tokio::test]
 async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
+    // ENV_LOCK first: `PluginCache` builds take the registry serializer while
+    // env-guarded tests hold ENV_LOCK, so ENV_LOCK is always the outer lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
-    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
     assert_unique_names("complete-order table", rows.iter().map(|r| r.name.clone()));
 
@@ -307,8 +309,10 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
 
 #[tokio::test]
 async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
+    // ENV_LOCK first: `PluginCache` builds take the registry serializer while
+    // env-guarded tests hold ENV_LOCK, so ENV_LOCK is always the outer lock.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     let _registry = super::plugin_utils::log_schema_registry_guard();
-    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_protocol_matrix(EXECUTION_ORDER_DOC);
     assert_unique_names("protocol matrix", rows.iter().map(|r| r.name.clone()));
 
@@ -563,6 +567,58 @@ async fn response_body_production_declarations_match_the_built_in_producers() {
                 .is_none(),
             "{} declares it never replaces a response body, so nothing reserves \
              a window for it; returning bytes here would be refused at runtime",
+            entry.name
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `websocket_permessage_deflate: passthrough` admission refuses every built-in
+// in `BUILTIN_WEBSOCKET_FRAMING_PLUGINS` without constructing it, and trusts
+// every other built-in to never need the parsed relay. Both halves of that
+// declaration have to stay true (issue #5769).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn websocket_framing_declarations_match_the_built_in_frame_plugins() {
+    // Same guards (and lock order) as the protocol-matrix test, which proves
+    // every built-in constructs from `minimal_plugin_config` under them.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
+    let _registry = super::plugin_utils::log_schema_registry_guard();
+    use ferrum_edge::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS;
+
+    let inventory: BTreeSet<_> = BUILTIN_PLUGIN_PARITY_META.iter().map(|m| m.name).collect();
+    for member in BUILTIN_WEBSOCKET_FRAMING_PLUGINS {
+        assert!(
+            inventory.contains(member),
+            "{member} is declared a WebSocket framing plugin but is not a built-in plugin"
+        );
+    }
+
+    for entry in BUILTIN_PLUGIN_PARITY_META {
+        let declared = BUILTIN_WEBSOCKET_FRAMING_PLUGINS.contains(&entry.name);
+        let documents_frame_policy = entry.active_phases.contains("on_ws_frame")
+            || entry.active_phases.contains("parser-level");
+        assert!(
+            declared || !documents_frame_policy,
+            "{} documents WebSocket frame/parser policy but is missing from \
+             BUILTIN_WEBSOCKET_FRAMING_PLUGINS",
+            entry.name
+        );
+        if declared {
+            continue;
+        }
+
+        // Every non-framing built-in must construct, so this drift check can
+        // never pass while silently checking nothing.
+        let config = minimal_plugin_config(entry.name);
+        let plugin = create_plugin(entry.name, &config)
+            .unwrap_or_else(|e| panic!("create_plugin({}) failed: {e}", entry.name))
+            .unwrap_or_else(|| panic!("create_plugin({}) returned None", entry.name));
+        assert!(
+            !plugin.requires_websocket_framing(),
+            "{} requires the parsed WebSocket relay but is missing from \
+             BUILTIN_WEBSOCKET_FRAMING_PLUGINS, so passthrough admission would accept it",
             entry.name
         );
     }

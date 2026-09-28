@@ -2585,6 +2585,69 @@ pub enum ResponseBodyMode {
     Buffer,
 }
 
+/// Per-proxy handling of the RFC 7692 `permessage-deflate` WebSocket extension.
+///
+/// - **Strip** (default): the client's `Sec-WebSocket-Extensions` offer never
+///   reaches the backend and no extension is negotiated end to end, so every
+///   message stays inspectable by plugins that parse WebSocket frames.
+/// - **Passthrough**: `permessage-deflate` offer elements reach the backend
+///   unchanged and the backend's `permessage-deflate` answer reaches the
+///   client unchanged, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+///   Extended CONNECT. Every other extension token is still stripped. A
+///   session that actually negotiates the extension is relayed as raw bytes,
+///   so config validation refuses this mode on any proxy that has a plugin
+///   requiring the parsed WebSocket relay
+///   ([`crate::plugins::Plugin::requires_websocket_framing`]), attached
+///   directly, through a proxy group, or inherited from a global plugin.
+/// - **Terminate**: the gateway negotiates `permessage-deflate` with the
+///   client and with the backend independently, inflates every message before
+///   the frame relay and its plugins see it, and re-deflates toward each leg
+///   that negotiated compression. Decompression is bounded by the frame and
+///   message ceilings (see [`crate::proxy::ws_permessage_deflate`]). Every
+///   plugin stays allowed, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+///   Extended CONNECT.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSocketPermessageDeflate {
+    #[default]
+    Strip,
+    Passthrough,
+    Terminate,
+}
+
+impl WebSocketPermessageDeflate {
+    /// Wire / SQL form (`"strip"` / `"passthrough"` / `"terminate"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strip => "strip",
+            Self::Passthrough => "passthrough",
+            Self::Terminate => "terminate",
+        }
+    }
+
+    /// Parse the wire / SQL form. Unknown values are rejected, never defaulted.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strip" => Some(Self::Strip),
+            "passthrough" => Some(Self::Passthrough),
+            "terminate" => Some(Self::Terminate),
+            _ => None,
+        }
+    }
+
+    pub fn is_strip(&self) -> bool {
+        matches!(self, Self::Strip)
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self, Self::Passthrough)
+    }
+
+    pub fn is_terminate(&self) -> bool {
+        matches!(self, Self::Terminate)
+    }
+}
+
 /// Outbound PROXY protocol version written on backend TCP connects.
 ///
 /// When set on a `tcp` / `tcps` stream proxy, Ferrum prepends a PROXY
@@ -3041,6 +3104,11 @@ pub struct Proxy {
     /// idle window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<u64>,
+    /// RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
+    /// proxy: `strip` (default), `passthrough`, or `terminate`. See
+    /// [`WebSocketPermessageDeflate`]. Only valid on HTTP-family proxies.
+    #[serde(default, skip_serializing_if = "WebSocketPermessageDeflate::is_strip")]
+    pub websocket_permessage_deflate: WebSocketPermessageDeflate,
     /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
     /// When `None` (default), all methods are allowed. When `Some`, requests
     /// with methods not in the list receive 405 Method Not Allowed.
@@ -5402,13 +5470,17 @@ impl GatewayConfig {
             // `stream_proxy_protocol` is valid on every stream family, with two
             // different framings: the connection-borne PROXY header on
             // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
-            // udp/dtls (issue #3289). HTTP proxies use XFF instead and are
-            // still rejected.
+            // udp/dtls (issue #3289). HTTP-family proxies share the global
+            // HTTP/HTTPS listeners, so one proxy cannot decide how a listener
+            // reads its first bytes: inbound PROXY protocol for those is the
+            // listener-level `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS`
+            // setting (issue #5768), and the per-proxy flag stays rejected.
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
-                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
-                     valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
-                     the client IP from X-Forwarded-For",
+                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but that field is only \
+                     valid for tcp/tcp_tls/udp/dtls stream proxies — for HTTP-family proxies \
+                     enable inbound PROXY protocol on the listener with \
+                     FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS",
                     proxy.id,
                     proxy.scheme_display()
                 ));
@@ -7929,16 +8001,18 @@ impl Proxy {
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
 
-        // Inbound PROXY protocol is a stream-family control: the connection
-        // header on tcp/tcps, the per-datagram DGRAM envelope on udp/dtls
-        // (issue #3289). Enforced here (single-proxy admin writes: POST/PUT
-        // /proxies and the API-spec proxy path) in addition to
-        // `GatewayConfig::validate_stream_proxies`, so a bad row can never
-        // persist and then wedge the next full-config load/reconcile.
+        // Per-proxy inbound PROXY protocol is a stream-family control: the
+        // connection header on tcp/tcps, the per-datagram DGRAM envelope on
+        // udp/dtls (issue #3289). HTTP-family proxies get it from the global
+        // listener setting instead (issue #5768). Enforced here (single-proxy
+        // admin writes: POST/PUT /proxies and the API-spec proxy path) in
+        // addition to `GatewayConfig::validate_stream_proxies`, so a bad row
+        // can never persist and then wedge the next full-config load/reconcile.
         if self.stream_proxy_protocol == Some(true) && !is_stream_proxy {
             errors.push(
                 "stream_proxy_protocol is only valid for tcp/tcps/udp/dtls stream proxies \
-                 (HTTP-family proxies resolve the client IP from X-Forwarded-For)"
+                 (for HTTP-family proxies enable inbound PROXY protocol on the listener with \
+                 FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS)"
                     .to_string(),
             );
         }
@@ -8559,6 +8633,14 @@ impl Proxy {
 
         if is_stream_proxy && self.response_body_mode != ResponseBodyMode::Stream {
             errors.push("Stream proxies (TCP/UDP) must use response_body_mode 'stream'".into());
+        }
+
+        if is_stream_proxy && !self.websocket_permessage_deflate.is_strip() {
+            errors.push(
+                "Stream proxies (TCP/UDP) carry no WebSocket upgrade; \
+                 `websocket_permessage_deflate` must be 'strip'"
+                    .into(),
+            );
         }
 
         if errors.is_empty() {

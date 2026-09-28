@@ -21,7 +21,7 @@ const GLOBAL_EXEMPTION_KEYS: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct CompiledExemptions {
     path_set: Option<RegexSet>,
-    methods: HashSet<String>,
+    methods: Vec<String>,
     consumers: HashSet<String>,
     ips: Vec<IpCidr>,
     header_present: HashMap<String, Option<String>>,
@@ -63,7 +63,7 @@ impl CompiledExemptions {
             .unwrap_or_default()
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
-            .collect();
+            .collect::<Vec<_>>();
         let consumers = optional_string_vec(object, "consumers")?
             .unwrap_or_default()
             .into_iter()
@@ -106,15 +106,27 @@ impl CompiledExemptions {
         {
             return true;
         }
-        if self.methods.contains(&ctx.method.to_ascii_uppercase()) {
+        // This predicate runs several times per request (authorize, both body
+        // buffering decisions, response phases), so each check is skipped
+        // outright when its list is empty and none allocates: methods compare
+        // case-insensitively in place instead of uppercasing the request
+        // method, and the client IP is parsed only when an IP exemption exists.
+        if !self.methods.is_empty()
+            && self
+                .methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+        {
             return true;
         }
-        if let Ok(client_ip) = ctx.client_ip.parse()
+        if !self.ips.is_empty()
+            && let Ok(client_ip) = ctx.client_ip.parse()
             && self.ips.iter().any(|cidr| cidr.matches(client_ip))
         {
             return true;
         }
-        if let Some(identity) = ctx.effective_identity()
+        if !self.consumers.is_empty()
+            && let Some(identity) = ctx.effective_identity()
             && self.consumers.contains(identity)
         {
             return true;

@@ -52,6 +52,8 @@ Two helpers live with the enum:
 
 `TlsError` requires an independently known setup context; a typed rustls variant or peer-provided alert description alone is not proof that application bytes were never processed. `io::Error::get_ref()` is still inspected so setup callers do not lose typed rustls payloads. Display text is not used when a typed source is reachable. Do **not** classify by matching `"connection was not ready"`: that label also covers every other reason a pooled connection was not ready; the typed `is_canceled` flag is the evidence. An origin error after reqwest's connect phase without `is_canceled` is indistinguishable from case (4) and stays `ConnectionReset`.
 
+Case (3) also covers a request queued at the moment its pooled HTTP/1 connection is reset or closed (issue #5714). tokio's channel send checks for closure and publishes the request in two separate steps. If the connection closes between them, the request misses hyper's drain and is never dequeued. The vendored hyper-util ([patch 001](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)) then releases the connection's only sender, so the request fails with hyper `is_canceled()`: hyper-util retries it on a new connection when the old one was reused, and otherwise it reaches the gateway as `ConnectionPoolError` rather than waiting out `backend_read_timeout_ms` as a spurious `ReadWriteTimeout` (504).
+
 Every pre-wire io verdict in `classify_typed_chain` is gated the same way (issue #4536): `ConnectionRefused`, `ConnectionReset` → `ConnectionRefused`, `TimedOut` → `ConnectionTimeout`, and `EADDRNOTAVAIL` → `PortExhaustion` are issued only when `phase_is_connect` is true; after the connect phase the same signals classify post-wire. `classify_reqwest_error` runs its `is_port_exhaustion` walk **inside** the `is_connect()` branch for the same reason — only a dial can exhaust ephemeral ports.
 
 **Partial reversal of #4406 / #4476.** Those issues made handshake-named rustls variants `TlsError` regardless of phase, because reqwest reports a missing-client-certificate rejection with `is_connect() = false`. That inference is withdrawn: the alert kind never proves the phase. Setup-phase mTLS rejections keep `TlsError` by *context* on every path that dials for itself — the direct H2 pool (`BackendUnavailableSource::Tls`), the gRPC pool (`GrpcBackendUnavailableKind::TlsHandshake`), the native H3 pool, the HBONE / mesh-mTLS pools (`HbonePoolError::TlsHandshake`), the WebSocket backend dial and `GenericPool` (`classify_boxed_setup_error`), and reqwest's own `is_connect()` branch. The one path that loses it is a rustls alert surfaced through reqwest's shared HTTP/1 pool after connect: it is now `ConnectionReset` (post-wire, `X-Gateway-Error: backend_error`) instead of `TlsError`. Restoring a pre-wire verdict there would require a handshake-completion signal threaded out of reqwest's connector (a new vendored-reqwest hook), not another error-shape heuristic.
@@ -60,7 +62,7 @@ Omitted TLS `close_notify` is teardown (#4051): `UnexpectedEof` whose Display co
 
 When hyper reports the live backend-mTLS failure as a typed pool cancellation, `ConnectionPoolError` remains pre-wire and replayable under `retry_on_connect_failure`, and the public token stays `connection_failure`. A rustls error exposed only after reqwest's connect phase is conservatively post-wire (`X-Gateway-Error: backend_error`, circuit-breaker and passive health charged on the post-wire path), so non-idempotent retries remain subject to `retryable_methods`.
 
-`PluginHttpClient` (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) has a separate safe-method transport-retry list. It is not `!request_reached_wire()`: GET/HEAD/OPTIONS also replay some post-wire classes (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `RequestError`, `ReadWriteTimeout`). After issue #4406 that list includes `ConnectionPoolError` so a hyper `is_canceled` drop still retries. It still omits `TlsError` (handshake misconfig rarely recovers on replay) and the health-neutral policy classes. Gateway backend dispatch continues to use `request_reached_wire` / `retry_on_connect_failure`.
+`PluginHttpClient` (`FERRUM_PLUGIN_HTTP_MAX_RETRIES`) has a separate safe-method transport-retry list. It is not `!request_reached_wire()`: GET/HEAD/OPTIONS also replay some post-wire classes (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `RequestError`, `ReadWriteTimeout`). The list includes `ConnectionPoolError` so a hyper `is_canceled` drop still retries (issue #4406). It still omits `TlsError` (handshake misconfig rarely recovers on replay) and the health-neutral policy classes. Gateway backend dispatch continues to use `request_reached_wire` / `retry_on_connect_failure`.
 
 ## Per-protocol classifiers
 
@@ -81,11 +83,11 @@ The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `reque
 
 Direct-H2 pool acquisition and pooled request dispatch have different phase boundaries. Acquisition errors are pre-wire. Once a pooled sender is acquired, `hyper::Error::is_canceled()` is the only typed proof that dispatch never occurred; every other known or unknown send failure is post-wire. In particular, a connect-only class inferred from an inner I/O source is normalized to `ProtocolError`, because an inner `ConnectionRefused` or port-exhaustion errno cannot prove that an already-pooled request was never sent.
 
+The HTTP/1.1 dispatches Ferrum drives on hyper directly — the HBONE inner HTTP/1.1 pool and the Unix-socket backend pool (`proxy_to_backend_hbone_after_ready` / `proxy_to_backend_unix` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) — send with `try_send_request`, so their pre-wire evidence is stronger than `is_canceled()` alone: a `TrySendError` that hands the request back (`take_message()` is `Some`) proves hyper never dequeued it, and hyper polls a request body only after dequeuing, so no byte of the head or the body reached the backend. A reused lease replays that request once on a fresh connection; a fresh lease reports `ConnectionPoolError` (`502`, pre-wire) whether the body was buffered or streaming. A canceled error *without* the request keeps the older rule: `ConnectionPoolError` only for a replayable body, `ProtocolError` otherwise. That includes a request queued at the moment its pooled connection was reset or closed (issue #5720): tokio's channel send checks for closure and publishes the request in two separate steps, so the request can land after the connection task drained its queue and exited. Both dispatches watch the sender's readiness while they wait ([`h1_send_release`](../src/proxy/h1_send_release.rs)) and drop the connection's only sender once it stops accepting requests, which fails the stranded request with the request handed back instead of leaving it to wait out `backend_read_timeout_ms` (a spurious `ReadWriteTimeout` / `504`, or no resolution at all when that timeout is `0`).
+
 ## Stream-family typed errors (`StreamSetupError`)
 
-TCP and UDP relays previously classified their setup-phase failures by `.contains()`-matching shared error-message prefixes (`STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED`, etc.) to disambiguate frontend vs backend TLS, plugin rejects, and load-balancer failures. That mechanism was fragile: a typo at a construction site or a reworded `format!()` silently broke cause attribution.
-
-[`StreamSetupError`](../src/proxy/stream_error.rs) replaces the substring approach with a typed kind:
+TCP and UDP relays attribute setup-phase failures (frontend vs backend TLS, plugin rejects, load-balancer failures, …) through a typed kind carried by [`StreamSetupError`](../src/proxy/stream_error.rs), not by matching error-message prefixes such as `STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED`:
 
 ```rust
 pub enum StreamSetupKind {
@@ -93,10 +95,14 @@ pub enum StreamSetupKind {
     BackendTlsHandshake,    // gateway → backend TCP-TLS failed (backend-side)
     BackendDtlsHandshake,   // gateway → backend DTLS failed (backend-side)
     RejectedByPlugin,       // umbrella for ACL/policy/throttle rejections (client-side)
+    ClientDisconnectedDuringAdmission, // client reset while fault injection delayed admission (client-side)
     DnsLookup,              // backend hostname did not resolve (backend-side, pre-wire)
     NoHealthyTargets,       // LB pool empty, empty subset, or no family-matching backends (backend-side)
     CircuitBreakerOpen,     // per-proxy passive-health circuit breaker is open (backend-side)
     BackendMaxConnectionsExceeded, // DestinationRule connectionPool.tcp.maxConnections cap hit at backend dial (backend-side)
+    UnsupportedStreamPolicy, // configured stream policy this path cannot apply yet (backend-side)
+    AuthorizationExpired,   // admitting credential expired during post-admission setup (client-side, health-neutral)
+    ClientTrustWithdrawn,   // frontend client-cert trust withdrawn during setup (client-side, health-neutral)
     SniAdmissionRefused,    // opaque-TLS SNI listener refused before any backend dial (gateway-local)
 }
 ```
@@ -191,9 +197,11 @@ The cause/direction mappers walk the chain via `find_stream_setup_error()` — `
 | `H2Handshake` | `TlsError` | HTTP/2 handshake over TLS (pre-wire) |
 | `H2cHandshake` | `ConnectionRefused` | HTTP/2 cleartext handshake — fails before any stream is opened, so request bytes never reach the application layer (pre-wire) |
 | `InvalidServerName` | `DnsLookupError` | rustls rejected the SNI name (pre-wire) |
-| `BackendRequest` | `ConnectionReset` | hyper `send_request` failed post-handshake — request bytes may already be on the wire, so this is **post-wire** by definition. Excluded from `is_connect_class()` so `retry_on_connect_failure` cannot bypass `retry_on_methods` and replay non-idempotent POSTs |
+| `BackendRequest` | `ConnectionReset` | hyper `send_request` failed post-handshake — request bytes may already be on the wire, so this is **post-wire** by definition. Excluded from `is_connect_class()` so `retry_on_connect_failure` cannot bypass `retryable_methods` and replay non-idempotent POSTs |
 | `TrustWithdrawn` | `TrustWithdrawn` | An accepted gateway trust publication withdrew an authority while a mesh transport was being established, or after a pooled transport was checked out but before it opened a stream (issue #3859). Pre-wire and backend-health-neutral — see the taxonomy table above |
 | `DispatchCanceled` | `ConnectionPoolError` | Pooled H2 `send_request` returned hyper `is_canceled` for a **fully collected, caller-retained** outbound body — hyper's contract that the request was **never dispatched**. Pre-wire / connect-class so `retry_on_connect_failure` can redial after invalidating the stale sender. The criterion is REPLAYABILITY, not the carrier shape: a buffered body written through the `backend_write_timeout_ms` upload pump (issue #4055) is still the same caller-owned `Bytes`, so it keeps this kind. Only genuinely unreplayable streaming / channel bodies keep `BackendRequest` on `is_canceled` |
+| `ProtocolNack` | `ConnectionPoolError` | Typed RFC 9113 NACK on a buffered request: remote `GOAWAY(NO_ERROR)` excluding the stream, or `RST_STREAM(REFUSED_STREAM)`. Pre-wire — see [Native gRPC Protocol NACKs](retry.md#native-grpc-protocol-nacks) |
+| `MaxConnections` | `BackendConnectionLimit` | DestinationRule `connectionPool.tcp.maxConnections` ceiling reached; no new socket was opened. Pre-wire and backend-health-neutral |
 
 `GrpcBackendUnavailableKind::is_connect_class()` enumerates the pre-wire kinds; the gRPC and H3→gRPC retry loops use it to decide whether `retry_on_connect_failure` is eligible for a given failure. A regression test (`test_every_connect_class_kind_classifies_as_pre_wire`) enforces the invariant that every connect-class kind classifies to `!request_reached_wire(class)` so the retry-loop predicate and the canonical wire boundary cannot drift.
 
@@ -209,7 +217,7 @@ The eager-buffer path (`buffered_backend_response_from_eager_collect` in [`src/p
 
 A pre-wire class is impossible on the eager-buffer path (response headers have already arrived, so a handshake failure cannot appear here), but one is coerced to `ConnectionReset` anyway so the documented `connection_error == !request_reached_wire(error_class)` boundary holds even if the classifier changes. Dispatch-level failures keep their classified pre-wire label so `retry_on_connect_failure` can still rotate to another target.
 
-A backend FIN (or `UnexpectedEof`) before a complete HTTP body is `ConnectionClosed`. That class is post-wire, the same as the previous `RequestError` catch-all: `request_reached_wire` is `true` for both, so `BackendResponse::connection_error` stays `false` and `retry_on_connect_failure` does not replay the request. Non-idempotent methods are therefore not retried via the connect-failure path. Circuit-breaker accounting *does* change: `error_class_is_post_wire_backend_failure` includes `ConnectionClosed` and not `RequestError`, so a truncated body that had been a phantom success (HTTP 200 + catch-all class) now trips the breaker as a backend failure. When the public status is already 502 and 502 is in `failure_status_codes`, the breaker already trips via status.
+A backend FIN (or `UnexpectedEof`) before a complete HTTP body is `ConnectionClosed`. That class is post-wire, so `BackendResponse::connection_error` stays `false` and `retry_on_connect_failure` does not replay the request; non-idempotent methods are not retried via the connect-failure path. `error_class_is_post_wire_backend_failure` includes `ConnectionClosed` (but not the `RequestError` catch-all), so a truncated body trips the circuit breaker as a backend failure even when the relayed status was 200. When the public status is already 502 and 502 is in `failure_status_codes`, the breaker already trips via status.
 
 ## WebSocket graceful close
 
@@ -234,7 +242,7 @@ its empty-bodied automatic `400`. The response uses the same JSON envelope
 handler-layer protocol rejects use: `Content-Type: application/json`, a fixed
 `{"error":"..."}` body matching `check_protocol_headers()`, and
 `Connection: close`. Like the handler-layer protocol `400`s, it carries **no**
-`X-Gateway-Error`: that header is the closed seven-token client-facing
+`X-Gateway-Error`: that header is the closed eight-token client-facing
 vocabulary below, which names why a *backend* attempt failed, and none of its
 tokens describes a client-caused `400` (issue #4543). The parse reject names
 itself only in its `warn`-level log line (`parse_reject_class`,
@@ -249,9 +257,9 @@ produce a `ferrum_requests_total{proxy_id,method,...}` series or a transaction
 log row: a pre-parse reject has no `RequestContext`, no matched proxy, no method
 and no `proxy_id`, and never reaches a plugin cache.
 
-Admitted (well-formed) HTTP/1 requests keep the existing in-place observe path
-and the same vectored writes as on `main`; the connection I/O type Hyper is
-handed does not change.
+Admitted (well-formed) HTTP/1 requests are unaffected: they keep the in-place
+observe path and vectored writes, and the connection I/O type Hyper is handed
+does not change.
 
 Other Hyper parse failures the scanner cannot identify (for example a
 non-numeric `Content-Length` that Hyper rejects at parse time, a truncated
@@ -300,7 +308,7 @@ HTTP-family 5xx use **two** closed vocabularies across three surfaces:
 
 | Surface | Closed set | Cardinality |
 |---|---|---|
-| `X-Gateway-Error` (client header) | seven coarse tokens below | **7** |
+| `X-Gateway-Error` (client header) | eight coarse tokens below | **8** |
 | Access-log `error_class` | [`ErrorClass::as_str`](../src/retry.rs) | **19** (omitted when unset) |
 | `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus five non-class tokens | **24** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
 
@@ -310,19 +318,80 @@ Metrics and logs keep the granular class so PromQL and log alerts can split
 `port_exhaustion`. Values on every surface are compiled-in `&'static str` —
 never an error message, never a client- or backend-influenced string.
 
+`X-Gateway-Error`, `X-Gateway-Upstream-Status`, and `X-Ferrum-Diagnostic-Ref`
+are gateway-owned. All three names live in one shared list
+([`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`](../src/proxy/headers.rs)).
+Every dispatch path strips a backend-supplied copy, in the response headers or
+the trailers, before any gateway value is written. That covers HTTP/1.1,
+HTTP/2, HTTP/3 (native and bridged), reqwest and direct hyper, native gRPC,
+gRPC-Web, and serverless functions, buffered or streamed. A backend therefore
+cannot make a response look gateway-attributed.
+
+The gateway then writes its own `X-Gateway-Error` only where that path
+classifies the response:
+
+- Gateway-synthesized failures (pre-wire connect/DNS/TLS `502`, backend
+  timeout and route-deadline `504`, reject-path `503`s, response-transformer
+  output-ceiling refusals) carry their token on every protocol.
+- A backend-returned 5xx carries `backend_error` on every path that relays
+  it: the HTTP/1.1 and HTTP/2 response builder, the HTTP/1.1 and HTTP/2
+  native gRPC response (buffered and streamed), and every HTTP/3 response,
+  native or bridged, buffered or streamed, plain or gRPC
+  ([`finalize_h3_response_gateway_headers`](../src/http3/server.rs)). The
+  plain HTTP/1.1 / HTTP/2 builder derives the token with
+  [`x_gateway_error_for_response`](../src/proxy/mod.rs) and removes every
+  hook- or backend-written copy with
+  [`strip_gateway_owned_diagnostic_response_headers`](../src/proxy/headers.rs)
+  before writing it. The native gRPC builders and every HTTP/3 response apply
+  [`apply_authoritative_gateway_error_header_for_response`](../src/proxy/mod.rs)
+  after the last response hook. Either way a copy a plugin or hook wrote is
+  replaced by the gateway's own value, never forwarded or duplicated. A gRPC
+  response still reports the RPC outcome in `grpc-status`; the token describes
+  only the HTTP status the gateway relayed.
+- An HTTP/3 bridge attempt whose reqwest connection-pool client could not be
+  built answers its `502` with `connection_failure`, exactly as the HTTP/1.1
+  and HTTP/2 builder does for the same shared pool-failure response.
+- A backend response whose declared `Content-Length` exceeds the effective
+  response ceiling is refused with a `502` carrying `backend_error` (the
+  refusal is not a connection error) on every protocol: the HTTP/1.1 and
+  HTTP/2 builder, the native HTTP/3 buffered path, the three native HTTP/3
+  streaming relays, and the HTTP/3 bridge. A body found too large while it is
+  collected carries the same token. On the HTTP/3 bridge's buffered path so do
+  the other collection refusals, as on HTTP/1.1 and HTTP/2: a body read error
+  `502` and an exhausted retained-response budget `503` read `backend_error`,
+  and a read timeout `504` reads `backend_timeout`.
+
+The contract covers the HTTP response headers and HTTP trailers. It does not
+cover a pass-through gRPC-Web backend's in-body trailer frame. On a route
+without the `grpc_web` translator, the backend answers in gRPC-Web itself, and
+its trailer frame is backend body content that the gateway relays unchanged.
+Metadata in that frame, `x-gateway-error` included, reaches the client byte
+for byte. The gateway does not write it and does not derive or write
+`X-Gateway-Error` from it, and the gateway does not rewrite pass-through
+bodies. Only the HTTP header section carries the gateway's own token (see the
+[`grpc_web` plugin](plugins.md#grpc_web) for the pass-through relay).
+
+The headers are not authenticated, though: a client should trust them only on
+a response it received from a gateway it authenticated. When a client needs to
+confirm what the gateway saw, use a diagnostic reference (below).
+
 ### Header tokens (`X-Gateway-Error`)
 
 | Token | When |
 |---|---|
 | `connection_failure` | Pre-wire connect/DNS/TLS failure (502) |
-| `backend_timeout` | Backend accepted the connection but timed out (504) |
+| `backend_timeout` | A backend held the request (it accepted the connection and was sent the request) but did not answer in time (504) |
 | `backend_error` | Backend returned 5xx, or a post-wire 5xx without a more specific token |
 | `circuit_breaker_open` | Open-breaker 503; never reached a backend |
 | `overload` | Gateway resource refusal: overload/drain `reject_new_requests` 503, or response-transformer output above the configured response ceiling (502) |
 | `config_stale` | DP stale-config fence 503 |
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
+| `request_timeout` | A matched route rule's total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API `timeouts.request`) expired before any backend held the request: during the client upload, a gateway-local phase, admission, or retry backoff (504). The transaction log records `route_request_timeout` as `before_dispatch` or `retry_backoff` |
 
-Do not reuse `backend_error` for a response that never reached a backend.
+Do not reuse `backend_error` for a response that never reached a backend, and
+do not reuse `backend_timeout` for a timeout no backend held. A route-deadline
+`504` whose recorded phase is `dispatch` (the backend held the cancelled
+attempt) stays `backend_timeout`.
 
 ### Granular class → header token
 
@@ -345,7 +414,7 @@ Do not reuse `backend_error` for a response that never reached a backend.
 | `gateway_buffer_capacity` | `backend_error` |
 | `request_body_too_large` | `backend_error` |
 | `graceful_remote_close` | `backend_error` |
-| `dispatch_policy_rejected` | `overload` for a response-transformer output-ceiling refusal; existing dispatch paths retain their header mapping |
+| `dispatch_policy_rejected` | `overload` for a response-transformer output-ceiling refusal; `request_timeout` for a route-deadline `504` no backend held; existing dispatch paths retain their header mapping |
 | `request_error` | `backend_error` |
 | *(no `ErrorClass`; `rejection_phase=circuit_breaker_open`)* | `circuit_breaker_open` |
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
@@ -362,6 +431,224 @@ empty label. They are omitted from the access log in that case;
 the granular `ErrorClass::as_str` values (19 compiled-in variants) and add
 that optional label on `ferrum_stream_disconnects_total`.
 
+## Gateway diagnostic references
+
+`X-Gateway-Error` stays coarse on purpose: one `connection_failure` covers DNS,
+TCP, TLS, pool, and egress-policy failures, and the precise class reaches only
+the access log. Diagnostic references (issue #5767) let an authorized operator
+tool resolve one specific response to the gateway's own detail without
+widening the public header surface. The feature is additive and off by
+default.
+
+**Enable.** Set `FERRUM_DIAGNOSTIC_REFS=errors` (see
+[configuration.md](configuration.md#observability)). Every HTTP/1.1, HTTP/2,
+and HTTP/3 response that carries the gateway's own `X-Gateway-Error` token then
+also carries:
+
+```
+X-Ferrum-Diagnostic-Ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+The value is `fd1_` plus 128 bits from the process CSPRNG in lowercase hex. It
+embeds nothing: no cause, route, backend, tenant, time, or counter. (With the
+opt-in `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` it also names the minting
+process's random replica id; see
+[Lookup across replicas](#lookup-across-replicas).) With
+`errors`, a response without an `X-Gateway-Error` token never carries a
+reference, and a request never carries two. Neither does an origin-authored
+representation a plugin replayed or relayed, even when it carries an
+`X-Gateway-Error` token (issue #5860): a `response_caching` hit of a backend
+`502` stored because `cacheable_status_codes` lists `502` carries no reference,
+in either mode, while the gateway's own `502` still does.
+
+**`all` mode.** `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846) references every
+gateway-authored error response, not only those with an `X-Gateway-Error`
+token:
+
+- plugin rejections (for example a `key_auth` `401`, an `access_control`
+  `403`, a `rate_limiting` `429`, a request-validation `400`), in every plugin
+  phase;
+- gateway policy fences (allowed methods, WebSocket connection limits,
+  backend connection limits, and the HTTP/1.1 and HTTP/2 frontend admission
+  fences: unverifiable HTTP/1 framing, withdrawn client-certificate trust,
+  overload, stale configuration);
+- routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
+
+gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
+as error responses. A gRPC-Web rejection whose `grpc-status` is carried only in
+the body's trailer frame (an HTTP `200` head without `grpc-status`) is not
+recognized as an error when the head is stamped, so it carries no reference:
+such a rejection can be under-marked, but it never gets a false reference. A
+response is gateway-authored only when its rejection site recorded it in the
+request's diagnostic slot before the head was written, and
+only on a head whose status is the one that rejection recorded (a rejection a
+later phase replaced marks nothing). A backend's own `4xx`/`5xx` never carries a
+reference: not when it is relayed to the client, and not when a plugin replays
+or relays it as its short-circuit (a `response_caching` or `ai_semantic_cache`
+hit, a `request_deduplication` idempotent replay, a `serverless_function`
+terminate reply, an `ai_federation` provider response or provider-failure
+envelope). Neither does a plugin short-circuit that answers `2xx`/`3xx`. The
+lookup of such a reference has a `null` `gateway_error`.
+
+**Ownership.** The header is gateway-owned whatever the setting. A backend or
+serverless-function copy, in the headers or the trailers, is stripped at every
+backend response boundary. The reference is stamped as the last step before the
+response head reaches the client — after every builder, plugin hook, and policy
+phase — and that final client boundary first removes any copy a plugin or hook
+wrote, even while the feature is off. A client therefore never sees a reference
+the gateway did not mint, and cannot pre-seed one.
+
+**Resolve.** `GET /diagnostics/v1/refs/{ref}` on the admin listener of the
+same gateway process (see [admin_api.md](admin_api.md#diagnostic-references);
+[Lookup across replicas](#lookup-across-replicas) covers finding that process).
+It requires an admin JWT with the `diagnostics:read` scope and an `ns` claim
+that names the gateway's namespace. An unknown, expired, evicted, or
+out-of-namespace reference answers `404` indistinguishably. The versioned body
+(`schema_version: ferrum.diagnostic_ref.v1`) names the public token and status,
+the protocol, and — once the request's terminal transaction record exists —
+the granular `error_class`, the body-streaming class, the gateway rejection
+phase, the route-deadline phase, how far the request reached a backend
+(`not_dispatched`, `pre_wire_failure`, `ambiguous_failure`,
+`backend_response`), the matched `proxy_id`, the backend origin
+(`scheme://host:port`), and a coarse duration bucket. It never carries bodies,
+headers, paths, query strings, credentials, client addresses, or raw error
+text.
+
+The detail also carries, when present (issue #5846):
+
+- `rejection`: the gateway policy or plugin that rejected the request —
+  `source` (`plugin`, `gateway`, or `routing`), the rejection `phase`
+  (`authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+  `backend_admission`, `route_not_found`, ...), and the rejecting `plugin` name
+  when the phase knows it. The phase is always one of the gateway's compiled-in labels (any other is
+  reported as `other`); the plugin is a built-in plugin name or a custom plugin
+  type name of at most 64 label characters (anything else is dropped). Never
+  plugin configuration, credentials, or the rejection body. In `errors` mode a
+  rejection is recorded only for a `5xx`, so a `4xx` rejection costs no
+  diagnostic bookkeeping there.
+- `attempts`: every backend attempt, in dispatch order — one per attempt a
+  retry replaced plus the attempt the client saw. A retry loop that ends
+  without sending another attempt (its backoff reached the route or gRPC
+  deadline, the next target's circuit breaker was open, or the rotated target
+  was refused) adds no entry for it. Each names its `attempt`
+  number, `backend_dispatch`, the backend `status` when it got a response, the
+  granular `error_class` when it failed, and, for a `tls_error` whose typed
+  TLS error was available (HTTP/1.1 and HTTP/2 reqwest dispatch, direct HTTP/2
+  pool, gRPC, and native HTTP/3 streaming dispatch), a closed `tls` object: the
+  `failure` kind (`certificate_verification`, `alert_received`,
+  `no_certificates_presented`, ...) and its `reason` (`expired`,
+  `unknown_issuer`, `not_valid_for_name`, the received alert such as
+  `unknown_ca`, ...). Certificate contents, names, and times are never
+  recorded. At most 8 attempts are listed; `attempts_omitted` counts the rest.
+
+**Bounds.** References live only in process memory, in 16 independently locked
+shards, for `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900). At most
+`FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000) are retained; a full shard
+evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB
+(up to about 1.5 KB with a full attempt list and a rejection record), so the
+default holds about 5–10 MB and the 1000000 maximum up to about 0.5–1.5 GB. A restart forgets every reference. Lookup attempts are admitted at
+`FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second, with
+one JWT `sub` limited to half of that (at least 1). Every attempt counts
+against its `sub`'s share, including one refused with `403`; only an attempt
+whose credential passes the scope and `ns` checks also spends the global
+budget, so refused credentials cannot exhaust it. `429` answers above either
+budget. Each
+`200`/`404` emits one WARN-level `audit.event = "diagnostic_ref_lookup"` event;
+`403` and `429` events are throttled to one per second each. `/metrics` exports
+`ferrum_diagnostic_refs_minted_total`, `ferrum_diagnostic_refs_entries`,
+`ferrum_diagnostic_refs_evicted_total{reason}`, and
+`ferrum_diagnostic_ref_lookups_total{result}` while the feature is on.
+
+**Cost.** Off: one `OnceLock` load per HTTP-family request and one header
+removal per response head. On: one small
+shared slot per request; on a response that gets a reference, one CSPRNG read
+and one short shard-lock critical section; one uncontended per-request mutex
+per backend attempt. Detail is copied from the terminal transaction summary
+only for a 5xx, a classified dispatch error, or, in `all` mode, a recorded
+gateway rejection. Every recording site is a single `Option` check when
+references are off.
+
+**Not covered yet.** A reference resolves only on the gateway process that
+minted it; another replica can name that process (below) but never fetches the
+detail for you, and the control plane does not proxy lookups. Attempts carry no
+per-attempt timing. A rejection that a plugin hook answers outside the shared
+rejection path (for example an `after_proxy` hook replacing a backend
+response) is not recorded as gateway-authored, so `all` mode does not
+reference it.
+
+### Lookup across replicas
+
+The detail lives only in the memory of the process that minted the reference,
+so behind a load balancer an operator must query that process's admin
+listener. `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` (issue #5846, default
+`false`) makes the reference say which process that is:
+
+```
+X-Ferrum-Diagnostic-Ref: fd2_1a2b3c4d_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+`fd2_` is followed by the process's replica id (8 lowercase hex digits), `_`,
+and the same 128 CSPRNG bits. The replica id is 32 bits drawn from the process
+CSPRNG when the store is installed. It is derived from nothing: no host name,
+pod name, node, address, or namespace, and a restart draws a new one, just as
+a restart forgets every reference. It is logged once at startup
+(`replica_id` on the INFO line "Diagnostic references carry this process's
+replica id", visible only with `FERRUM_LOG_LEVEL=info` or finer; the default
+`warn` hides it) and exported as
+`ferrum_diagnostic_ref_replica_info{replica_id="1a2b3c4d"} 1` on `/metrics`,
+so a Prometheus query joins it to the scrape target's pod and instance labels.
+The metric needs no log level, so it is the discovery path to rely on.
+The owning replica's lookup body carries it as `replica_id`.
+
+A lookup that reaches another replica:
+
+- answers the same `404` status and body as an unknown reference, is counted
+  as `not_found`, and is audited like any miss;
+- adds `X-Ferrum-Diagnostic-Owner-Replica: 1a2b3c4d` only when the caller
+  passed every check a `200` on that replica would need: the
+  `diagnostics:read` scope, an `ns` claim, and an `ns` claim that names the
+  answering replica's own namespace. A `403`, a `429`, a caller bound to other
+  namespaces, and a replica with references off never carry it. The owner is
+  read from the reference the caller supplied; the answering replica never
+  learns whether the owner exists, still holds the reference, or serves the
+  caller's namespace, so the hint cannot be used to probe another replica or
+  another namespace. The owner enforces its own namespace check when asked.
+
+An `fd1_` reference keeps resolving on the untagged replica that minted it, so
+a fleet can switch the flag replica by replica: an untagged replica still
+points at the owner of an `fd2_` reference, and a tagged replica answers an
+`fd1_` reference it did not mint with the plain `404`. A reference resolves
+only in the format its store mints, so re-spelling one format as the other
+never resolves.
+
+**What the tag reveals.** Untagged references are unlinkable. A tagged
+reference lets anyone who collects references (a client included) tell which
+responses one process served and roughly how many processes answered them,
+until the next restart. Watching the ids change over time also shows when
+processes restart, how a rollout proceeds, and whether a load balancer keeps a
+client on one process. It names no host, pod, node, or address. That exposure
+is why the tag is opt-in.
+
+**Rejected alternatives** (see
+[the ADR](plans/diagnostic_ref_cross_replica_adr.md)):
+
+- *Control-plane fan-out.* The CP↔DP ConfigSync channel is a stream the data
+  plane opens and the control plane only writes configuration to; the control
+  plane cannot call a data plane. Fan-out would need a new DP-side RPC that
+  carries diagnostic detail across the network, per-namespace authorization on
+  it, and time and concurrency bounds, and would still not cover `file` or
+  `database` fleets, which have no control plane.
+- *A shared store* (control plane, database, or Redis). Every referenced error
+  would cost a network write on the proxy path, the detail would leave the
+  process that owns it, and each store would need its own bounds and
+  retention.
+- *A hash of a host, pod, or node name.* A short unkeyed hash of a guessable
+  name can be reversed by a client. The DP `node_id` is itself a random
+  per-process id, but it exists only in `dp` mode, so reusing it would leave
+  `file` and `database` fleets without one.
+- *An operator-assigned id.* It needs per-replica configuration and silently
+  collides when two replicas share one.
+
 ## Adding a new error path
 
 ### Response-transformer output ceiling
@@ -371,8 +658,8 @@ the gateway applies configured JSON body rules. That is a deterministic policy
 refusal: HTTP **502** with the existing `Response body too large` JSON error
 and numeric `limit`, plus the existing
 gateway-owned `overload` header token. It uses `DispatchPolicyRejected`, not
-`GatewayBufferCapacity` or `ResponseBodyTooLarge`. The closed sets remain seven
-header tokens and nineteen error classes. Private request provenance restores
+`GatewayBufferCapacity` or `ResponseBodyTooLarge`, so the closed sets stay at
+eight header tokens and nineteen error classes. Private request provenance restores
 the header after mutable hooks and stamps the class in the shared transaction-log
 funnel, including native H3 and cross-protocol paths.
 

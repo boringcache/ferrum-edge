@@ -29,12 +29,13 @@ Mesh mode (`FERRUM_MODE=mesh`) requires a live native `MeshSubscribe` gRPC consu
 ## Quickstart
 
 ```bash
-# From the repo root:
-cargo build --release --example hbone_perf_fixture
-
 # From this directory:
 ./run.sh --duration 30 --concurrency 50 --payload-size 1024
 ```
+
+Without `--skip-build`, `run.sh` builds the `hbone_perf_fixture` example in the
+repo root and the harness binaries here (`cargo build --release`). With
+`--skip-build` it requires those binaries to exist already.
 
 ## Flags
 
@@ -43,7 +44,7 @@ cargo build --release --example hbone_perf_fixture
 | `--duration N` | 30 | Seconds to run each phase |
 | `--concurrency N` | 50 | Concurrent in-flight requests |
 | `--payload-size N` | 1024 | Request body bytes |
-| `--skip-build` | off | Reuse existing binaries (use after first run) |
+| `--skip-build` | off | Reuse existing release binaries (fails if any is missing) |
 | `--json` | off | Machine-readable per-phase reports |
 | `--sidecar-port N` | 15008 | HBONE listener port on the stub sidecar |
 
@@ -61,6 +62,11 @@ cargo build --release --example hbone_perf_fixture
 
 ## Caveats
 
+- **Port conflicts fail closed.** `run.sh` refuses to start if 18000, 19999, or
+  15008 is already bound, and cleanup stops only the gateway/sidecar/backend
+  PIDs this run started (graceful `SIGTERM`, bounded wait, then `SIGKILL`) and
+  removes `$RUNTIME_DIR` only after it was created by this run. It never kills
+  an unrelated listener on those ports.
 - **Steady-state only.** The mTLS handshake and HBONE CONNECT setup are amortised across many requests; the per-request cost dominates after the first.
 - **Operator-specific numbers.** Baseline RPS depends entirely on hardware. The shipped `baseline.md` records provenance-tagged GitHub-hosted reference numbers; operators should run `./run.sh` on production-equivalent hardware before setting local expectations.
 - **Cross-platform.** macOS works end-to-end via the userspace HBONE relay. Linux uses the same userspace relay (the gateway's `splice(2)` fast path is bypassed for HBONE because the tunnel terminates in userspace TLS state).

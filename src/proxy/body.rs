@@ -28,6 +28,7 @@ use crate::retry::ErrorClass;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
+use crate::plugins::grpc_web::{PassthroughFraming, PassthroughGrpcStatus};
 use crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER;
 use crate::proxy::response_watchdog::AuthorizationTerminalOwner;
 
@@ -99,6 +100,11 @@ pub struct ProxyBody {
     /// status even though the downstream frame is DATA rather than native HTTP
     /// trailers.
     grpc_web_terminal_status: Option<Arc<AtomicU64>>,
+    /// Set by the pass-through gRPC-Web relay to the `grpc-status` of the
+    /// backend's own final body trailer frame. Read only when the body ends, so
+    /// the deferred logger and backend outcome classification report the status
+    /// the client actually received without a synthesized trailer.
+    grpc_web_passthrough_status: Option<Arc<AtomicU64>>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -419,7 +425,9 @@ impl http_body::Body for TrackedBody {
 /// `response_body_mode = Buffer`, but a non-empty gRPC response must still end
 /// with an HTTP/2 trailers frame carrying `grpc-status`. `Full<Bytes>` cannot
 /// emit that terminal frame, so this tiny body yields the buffered DATA once,
-/// then the sanitized trailers collected from the backend.
+/// then the sanitized trailers collected from the backend. Buffered plain-HTTP
+/// responses that carried trailers use the same shape
+/// ([`ProxyBody::buffered_with_trailers`]).
 struct BufferedGrpcBody {
     data: Option<Bytes>,
     trailers: Option<HeaderMap>,
@@ -467,6 +475,40 @@ impl http_body::Body for BufferedGrpcBody {
 }
 
 const GRPC_WEB_TERMINAL_STATUS_UNSET: u64 = u64::MAX;
+/// Pass-through outcomes that name no readable status. They share the atomic
+/// that carries a readable `u32` status, so both lie above `u32::MAX`.
+const GRPC_WEB_PASSTHROUGH_COMPRESSED_TRAILER: u64 = u64::MAX - 1;
+const GRPC_WEB_PASSTHROUGH_CONTENT_ENCODED: u64 = u64::MAX - 2;
+
+fn encode_passthrough_grpc_status(outcome: Option<PassthroughGrpcStatus>) -> u64 {
+    use crate::plugins::grpc_web::GrpcWebTrailerUnreadable::{
+        CompressedTrailerFrame, ContentEncodedBody,
+    };
+    match outcome {
+        None => GRPC_WEB_TERMINAL_STATUS_UNSET,
+        Some(PassthroughGrpcStatus::Status(code)) => u64::from(code),
+        Some(PassthroughGrpcStatus::Unreadable(CompressedTrailerFrame)) => {
+            GRPC_WEB_PASSTHROUGH_COMPRESSED_TRAILER
+        }
+        Some(PassthroughGrpcStatus::Unreadable(ContentEncodedBody)) => {
+            GRPC_WEB_PASSTHROUGH_CONTENT_ENCODED
+        }
+    }
+}
+
+fn decode_passthrough_grpc_status(value: u64) -> Option<PassthroughGrpcStatus> {
+    use crate::plugins::grpc_web::GrpcWebTrailerUnreadable::{
+        CompressedTrailerFrame, ContentEncodedBody,
+    };
+    let reason = match value {
+        GRPC_WEB_TERMINAL_STATUS_UNSET => return None,
+        GRPC_WEB_PASSTHROUGH_COMPRESSED_TRAILER => CompressedTrailerFrame,
+        GRPC_WEB_PASSTHROUGH_CONTENT_ENCODED => ContentEncodedBody,
+        // Every other stored value came from a `u32` status.
+        code => return Some(PassthroughGrpcStatus::Status(code as u32)),
+    };
+    Some(PassthroughGrpcStatus::Unreadable(reason))
+}
 
 /// Incremental native-gRPC to gRPC-Web response adapter.
 ///
@@ -620,6 +662,138 @@ impl http_body::Body for GrpcWebStreamingBody {
     }
 }
 
+/// Pass-through gRPC-Web response relay.
+///
+/// The route has no `grpc_web` translator and the backend already answers in
+/// gRPC-Web, so every backend DATA byte, including the backend's own trailer
+/// frame, is forwarded unchanged and a clean EOF adds nothing. Synthesizing a
+/// terminal here would append a second trailer frame after the backend's and
+/// misreport the RPC status.
+///
+/// The backend's trailer frame is read, never rewritten, so the outer body can
+/// log and classify the status the client actually received. The only frame
+/// this relay authors is a gateway terminal: when a client-deadline or
+/// authorization-lifetime wrapper below it ends the stream with native
+/// trailers, those become one gRPC-Web trailer frame, because a gRPC-Web client
+/// cannot read HTTP trailers.
+///
+/// The authoritative gRPC message counter, when one is attached, is fed from
+/// the same observer: it counts decoded message frames, never the backend's
+/// trailer frame or the base64 text of `grpc-web-text`.
+struct GrpcWebPassthroughBody {
+    inner: ProxyBody,
+    text_mode: bool,
+    http_status: u16,
+    observer: crate::plugins::grpc_web::GrpcWebTrailerStatusObserver,
+    observed_status: Arc<AtomicU64>,
+    grpc_messages: Option<Arc<AtomicU64>>,
+    messages_published: u64,
+    terminal_status: Arc<AtomicU64>,
+    terminal_emitted: bool,
+    failed: bool,
+}
+
+impl GrpcWebPassthroughBody {
+    /// Status of a gateway terminal that a deadline wrapper below this relay
+    /// has selected, or `None` while the backend still owns the stream. The
+    /// authorization deadline wins over a client-chosen deadline.
+    fn gateway_terminal_status(&self) -> Option<u32> {
+        if self
+            .inner
+            .stream_auth_deadline
+            .as_ref()
+            .is_some_and(|state| state.fired.load(Ordering::Acquire))
+        {
+            return Some(crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED);
+        }
+        self.inner
+            .client_grpc_deadline_fired
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
+    }
+}
+
+impl http_body::Body for GrpcWebPassthroughBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.terminal_emitted || this.failed {
+            return Poll::Ready(None);
+        }
+        let frame = match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                this.failed = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            Poll::Ready(Some(Ok(frame))) => frame,
+        };
+        let gateway_terminal = this.gateway_terminal_status();
+        if let Some(data) = frame.data_ref() {
+            if let Some(status) = gateway_terminal {
+                // The wrapper below already framed its terminal as gRPC-Web
+                // DATA; forward it verbatim and expose its status.
+                this.terminal_status
+                    .store(u64::from(status), Ordering::Release);
+                this.terminal_emitted = true;
+            } else {
+                this.observer.push(data);
+                let observed = encode_passthrough_grpc_status(this.observer.outcome());
+                this.observed_status.store(observed, Ordering::Release);
+                if let Some(messages) = this.grpc_messages.as_ref() {
+                    let counted = this.observer.messages();
+                    if counted > this.messages_published {
+                        messages.fetch_add(counted - this.messages_published, Ordering::Release);
+                        this.messages_published = counted;
+                    }
+                }
+            }
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if gateway_terminal.is_some() && frame.is_trailers() {
+            let trailers = match frame.into_trailers() {
+                Ok(trailers) => trailers,
+                Err(_) => {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                        "gRPC-Web pass-through relay received an invalid trailer frame",
+                    )))));
+                }
+            };
+            let mut collected = std::collections::HashMap::new();
+            super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
+            let (data, grpc_status) = crate::plugins::grpc_web::build_streaming_trailer_data(
+                &collected,
+                this.http_status,
+                this.text_mode,
+            );
+            this.terminal_status
+                .store(u64::from(grpc_status), Ordering::Release);
+            this.terminal_emitted = true;
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        // Backend-authored HTTP trailers are part of the pass-through response.
+        Poll::Ready(Some(Ok(frame)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminal_emitted || self.failed || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        // The relay forwards the backend's bytes unchanged. The deadline
+        // wrappers below it own their hints for the terminals they can emit.
+        self.inner.size_hint()
+    }
+}
+
 /// Immediately-EOF body that never advertises an exact length.
 ///
 /// Used for HTTP 205 responses so Hyper does not synthesize
@@ -665,6 +839,7 @@ impl ProxyBody {
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
+            grpc_web_passthrough_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             grpc_messages: None,
@@ -696,6 +871,7 @@ impl ProxyBody {
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
+            grpc_web_passthrough_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             grpc_messages: None,
@@ -729,6 +905,14 @@ impl ProxyBody {
     /// is empty.
     pub(crate) fn buffered_grpc_with_trailers(data: impl Into<Bytes>, trailers: HeaderMap) -> Self {
         Self::streaming(Box::pin(BufferedGrpcBody::new(data.into(), trailers)))
+    }
+
+    /// Create a buffered plain-HTTP response body that emits DATA followed by
+    /// the backend's already-sanitized trailer section (issue #5760). Same
+    /// frame shape as [`Self::buffered_grpc_with_trailers`]; the separate name
+    /// keeps plain-response callers from reading as gRPC.
+    pub(crate) fn buffered_with_trailers(data: Bytes, trailers: HeaderMap) -> Self {
+        Self::streaming(Box::pin(BufferedGrpcBody::new(data, trailers)))
     }
 
     /// Translate a live native-gRPC body into an incremental gRPC-Web body.
@@ -774,6 +958,101 @@ impl ProxyBody {
         body.grpc_web_terminal_status = Some(terminal_status);
         body.logger = logger;
         body
+    }
+
+    /// Wrap a PASS-THROUGH gRPC-Web response: the backend already answers in
+    /// gRPC-Web, so its bytes and its own trailer frame reach the client
+    /// unchanged and nothing is appended at EOF (see
+    /// [`GrpcWebPassthroughBody`]). `framing` names the response framing the
+    /// backend's trailer frame is read in, and whether a content-coding hides
+    /// it.
+    ///
+    /// Ownership moves exactly as in [`Self::into_grpc_web_streaming`]: guards
+    /// stay on the inner body, while outcome classifiers and the deferred
+    /// logger move to the returned outer body so the backend's terminal status
+    /// is logged and classified once, at the end of the client-visible body.
+    ///
+    /// A gRPC message counter attached below moves into the relay: the inner
+    /// body's native length-prefix scanner would count the backend's `0x80`
+    /// trailer frame as a message and would scan `grpc-web-text` base64 as if
+    /// it were frames, so the relay counts decoded message frames instead.
+    pub(crate) fn into_grpc_web_passthrough_streaming(
+        self,
+        framing: PassthroughFraming,
+        http_status: u16,
+    ) -> Self {
+        let mut inner = self;
+        let grpc_messages = inner.grpc_messages.take();
+        inner.grpc_scanner = None;
+        let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
+        let stream_auth_deadline = inner.stream_auth_deadline.clone();
+        let logger = inner.logger.take();
+        let backend_admission_permits = inner._backend_admission_permits.take();
+        let backend_admission_outcome = inner.backend_admission_outcome.take();
+        let backend_dispatch_outcome = inner.backend_dispatch_outcome.take();
+        let terminal_status = Arc::new(AtomicU64::new(GRPC_WEB_TERMINAL_STATUS_UNSET));
+        let observer = framing.observer();
+        let initial_status = encode_passthrough_grpc_status(observer.outcome());
+        let observed_status = Arc::new(AtomicU64::new(initial_status));
+        let relay = GrpcWebPassthroughBody {
+            inner,
+            text_mode: framing.text_mode,
+            http_status,
+            observer,
+            observed_status: Arc::clone(&observed_status),
+            grpc_messages,
+            messages_published: 0,
+            terminal_status: Arc::clone(&terminal_status),
+            terminal_emitted: false,
+            failed: false,
+        };
+        let mut body = Self::streaming(Box::pin(relay));
+        body._backend_admission_permits = backend_admission_permits;
+        body.backend_admission_outcome = backend_admission_outcome;
+        body.backend_dispatch_outcome = backend_dispatch_outcome;
+        body.client_grpc_deadline_fired = client_grpc_deadline_fired;
+        body.stream_auth_deadline = stream_auth_deadline;
+        body.grpc_web_terminal_status = Some(terminal_status);
+        body.grpc_web_passthrough_status = Some(observed_status);
+        body.logger = logger;
+        body
+    }
+
+    /// Terminal status of the backend's final body frame on a pass-through
+    /// gRPC-Web response, when one has been observed.
+    fn grpc_web_passthrough_outcome(&self) -> Option<PassthroughGrpcStatus> {
+        self.grpc_web_passthrough_status
+            .as_ref()
+            .and_then(|status| decode_passthrough_grpc_status(status.load(Ordering::Acquire)))
+    }
+
+    /// Whether a body dropped without its terminal poll is nevertheless proven
+    /// to have ended: a protocol adapter's declared byte count was reached, or
+    /// an inner wrapper already reports end-of-stream.
+    fn proved_complete_on_drop(&self, client_deadline_fired: bool) -> bool {
+        self.success_on_drop_after_bytes
+            .is_some_and(|expected| self.bytes_streamed.load(Ordering::Relaxed) == expected)
+            || (!client_deadline_fired && self.proved_end_of_stream_on_drop())
+    }
+
+    /// Feed a terminal gRPC status into deferred admission and dispatch
+    /// accounting. gRPC failures complete under HTTP 200, so a non-OK status is
+    /// mapped once and recorded for both classifiers.
+    fn classify_grpc_terminal_status(&mut self, code: u32) {
+        if code == 0 {
+            return;
+        }
+        let status = crate::proxy::grpc_proxy::grpc_status_to_http_status(code);
+        if let Some(outcome) = self.backend_admission_outcome.as_mut()
+            && outcome.classify_grpc_trailer
+        {
+            outcome.grpc_trailer_http_status = Some(status);
+        }
+        if let Some(outcome) = self.backend_dispatch_outcome.as_mut()
+            && outcome.classify_grpc_trailer
+        {
+            outcome.grpc_trailer_http_status = Some(status);
+        }
     }
 
     /// Attach a [`RequestGuard`] to this body so the `active_requests`
@@ -1345,6 +1624,7 @@ impl ProxyBody {
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
+            grpc_web_passthrough_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             grpc_messages: None,
@@ -1677,24 +1957,21 @@ impl http_body::Body for ProxyBody {
                         })
                     })
                     .or(grpc_web_terminal_status);
+                // Pass-through gRPC-Web carries its status in the backend's body
+                // trailer frame; HTTP trailers without one fall back to it.
+                let passthrough = if is_trailers && grpc_status.is_none() {
+                    this.grpc_web_passthrough_outcome()
+                } else {
+                    None
+                };
+                let grpc_status =
+                    grpc_status.or_else(|| passthrough.and_then(PassthroughGrpcStatus::status));
                 // gRPC streaming: the response can finish HTTP 200 while the real
                 // outcome rides in the grpc-status trailer. Capture a non-OK status
                 // once and feed both deferred admission and backend dispatch
                 // accounting from the same mapped value.
-                if let Some(code) = grpc_status
-                    && code != 0
-                {
-                    let status = crate::proxy::grpc_proxy::grpc_status_to_http_status(code);
-                    if let Some(outcome) = this.backend_admission_outcome.as_mut()
-                        && outcome.classify_grpc_trailer
-                    {
-                        outcome.grpc_trailer_http_status = Some(status);
-                    }
-                    if let Some(outcome) = this.backend_dispatch_outcome.as_mut()
-                        && outcome.classify_grpc_trailer
-                    {
-                        outcome.grpc_trailer_http_status = Some(status);
-                    }
+                if let Some(code) = grpc_status {
+                    this.classify_grpc_terminal_status(code);
                 }
                 if is_trailers || is_grpc_web_deadline_terminal || is_grpc_web_streaming_terminal {
                     if let Some(logger) = this.logger.take() {
@@ -1706,9 +1983,15 @@ impl http_body::Body for ProxyBody {
                         } else {
                             grpc_status
                         };
+                        // A gateway terminal names its own status; otherwise an
+                        // unreadable pass-through status stays unset.
+                        let grpc_status_unreadable = passthrough
+                            .and_then(PassthroughGrpcStatus::unreadable)
+                            .filter(|_| terminal_grpc_status.is_none());
                         logger.fire(
                             crate::proxy::deferred_log::BodyOutcome::success(bytes)
                                 .with_grpc_status(terminal_grpc_status)
+                                .with_grpc_status_unreadable(grpc_status_unreadable)
                                 .with_authorization_termination(auth_deadline_termination),
                         );
                     }
@@ -1756,10 +2039,21 @@ impl http_body::Body for ProxyBody {
                 this.pooled_backend_lease = None;
             }
             Poll::Ready(None) => {
+                // A pass-through gRPC-Web body ends on the backend's own trailer
+                // frame, so its status is known only once the body has ended.
+                let passthrough = this.grpc_web_passthrough_outcome();
+                let passthrough_grpc_status = passthrough.and_then(PassthroughGrpcStatus::status);
+                if let Some(code) = passthrough_grpc_status {
+                    this.classify_grpc_terminal_status(code);
+                }
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                    let passthrough_unreadable =
+                        passthrough.and_then(PassthroughGrpcStatus::unreadable);
                     logger.fire(
                         crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                            .with_grpc_status(passthrough_grpc_status)
+                            .with_grpc_status_unreadable(passthrough_unreadable)
                             .with_authorization_termination(auth_deadline_termination),
                     );
                 }
@@ -1863,10 +2157,7 @@ impl Drop for ProxyBody {
             //    `is_end_stream()` is still unreliable before terminal poll,
             //    so we trust `polled` exclusively and treat never-polled as
             //    success.
-            let proved_complete = self
-                .success_on_drop_after_bytes
-                .is_some_and(|expected| bytes == expected)
-                || (!client_deadline_fired && self.proved_end_of_stream_on_drop());
+            let proved_complete = self.proved_complete_on_drop(client_deadline_fired);
             let outcome = if self.polled.load(Ordering::Relaxed) {
                 // Polled at least once but never reached Ready(None) or an
                 // error terminal. That's normally a client disconnect
@@ -1906,6 +2197,23 @@ impl Drop for ProxyBody {
                 deferred_admission_error_class = outcome.body_error_class;
                 deferred_admission_client_disconnected = outcome.client_disconnected;
             }
+            // A proven-complete pass-through gRPC-Web body that hyper dropped
+            // before the EOF poll still ended on the backend's trailer frame.
+            let passthrough = if outcome.body_completed {
+                self.grpc_web_passthrough_outcome()
+            } else {
+                None
+            };
+            if let Some(code) = passthrough.and_then(PassthroughGrpcStatus::status) {
+                self.classify_grpc_terminal_status(code);
+            }
+            let outcome = if let Some(passthrough) = passthrough {
+                outcome
+                    .with_grpc_status(passthrough.status())
+                    .with_grpc_status_unreadable(passthrough.unreadable())
+            } else {
+                outcome
+            };
             // `fire` is single-fire, so a body whose terminal poll already
             // recorded the class cannot record it twice. This branch only
             // covers the Drop safety net.
@@ -1914,16 +2222,22 @@ impl Drop for ProxyBody {
             && self.backend_admission_outcome.is_some()
             || self.backend_dispatch_outcome.is_some())
             && self.polled.load(Ordering::Relaxed)
-            && self
-                .success_on_drop_after_bytes
-                .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
-            // Same proof as the logger branch above: a body whose wrapper
-            // already reported end-of-stream completed, so backend admission
-            // and dispatch accounting must not record a client disconnect.
-            && (client_deadline_fired || !self.proved_end_of_stream_on_drop())
+            // Same proof as the logger branch above: a body that reached its
+            // declared byte count, or whose wrapper already reported
+            // end-of-stream, completed, so backend admission and dispatch
+            // accounting must not record a client disconnect.
+            && !self.proved_complete_on_drop(client_deadline_fired)
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;
+        } else if let Some(passthrough) = self.grpc_web_passthrough_outcome()
+            && let Some(code) = passthrough.status()
+            && self.proved_complete_on_drop(client_deadline_fired)
+        {
+            // No logger: a proven-complete pass-through gRPC-Web body still
+            // feeds the backend's terminal status into admission and dispatch
+            // accounting, exactly as its EOF poll would have.
+            self.classify_grpc_terminal_status(code);
         }
         if client_deadline_fired {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
@@ -2650,6 +2964,19 @@ impl SizeLimitedIncoming {
         self
     }
 
+    /// [`Self::with_grpc_message_counter`] reading the tap's own framing, so a
+    /// pass-through gRPC-Web upload counts its decoded message frames only.
+    #[must_use]
+    pub fn with_grpc_message_tap(
+        mut self,
+        tap: crate::plugins::mesh::prometheus_helpers::GrpcMessageTap,
+    ) -> Self {
+        let (messages, scanner) = tap.into_parts();
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner = Some(scanner);
+        self
+    }
+
     /// Clone the internal byte counter so the caller can observe `bytes_seen`
     /// after `into_reqwest_body()` has moved ownership into reqwest.
     /// Prefer [`new_with_counter`](Self::new_with_counter) when the counter
@@ -3152,6 +3479,19 @@ impl CountingIncoming {
         self
     }
 
+    /// [`Self::with_grpc_message_counter`] reading the tap's own framing, so a
+    /// pass-through gRPC-Web upload counts its decoded message frames only.
+    #[must_use]
+    pub fn with_grpc_message_tap(
+        mut self,
+        tap: crate::plugins::mesh::prometheus_helpers::GrpcMessageTap,
+    ) -> Self {
+        let (messages, scanner) = tap.into_parts();
+        self.grpc_messages = Some(messages);
+        self.grpc_scanner = Some(scanner);
+        self
+    }
+
     /// Clone the internal byte counter so the caller can observe `bytes_seen`
     /// after the body has been moved into a downstream consumer. Must be
     /// captured before the move.
@@ -3230,10 +3570,10 @@ impl http_body::Body for CountingIncoming {
 
 // -- SizeLimitedStreamingResponse ---------------------------------------------
 
-/// A size-limited streaming adapter over a reqwest response byte stream.
+/// A size-limited streaming adapter over a reqwest response frame stream.
 ///
-/// Wraps a reqwest response's `bytes_stream()` and counts bytes as they flow
-/// through. If the accumulated size exceeds `max_bytes`, yields an error frame.
+/// Counts DATA bytes as they flow through; trailer frames pass untouched. If
+/// the accumulated size exceeds `max_bytes`, yields an error frame.
 /// This allows streaming response bodies to the client while still enforcing
 /// `max_response_body_size_bytes` without buffering the entire body into memory.
 ///
@@ -3256,13 +3596,24 @@ pub(crate) fn size_limited_streaming_body(
     max_bytes: usize,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    trailers: ReqwestResponseTrailers,
 ) -> ProxyBody {
-    use futures_util::StreamExt;
+    let stream = reqwest_response_frames(response, trailers);
+    size_limited_frame_stream_body(stream, max_bytes, content_length, read_timeout_ms)
+}
 
-    let stream = response.bytes_stream().map(|r| {
-        r.map(Frame::data)
-            .map_err(|e| Box::new(e) as ProxyBodyError)
-    });
+/// The adapter chain behind [`size_limited_streaming_body`], over any backend
+/// frame stream: size limit, coalescing, the idle read timeout, then a flush
+/// of the committed head before the terminal error.
+pub(crate) fn size_limited_frame_stream_body<S>(
+    stream: S,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    read_timeout_ms: u64,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
     let limited = SizeLimitedStreamingResponse {
         inner: stream,
         max_bytes,
@@ -3273,7 +3624,90 @@ pub(crate) fn size_limited_streaming_body(
         COALESCE_TARGET,
         content_length,
     );
-    wrap_idle_read_timeout(coalescing, read_timeout_ms)
+    wrap_idle_read_timeout_and_error_hold(coalescing, read_timeout_ms)
+}
+
+/// Yields once before handing a committed streaming response's terminal error
+/// to the frontend.
+///
+/// A streaming response is committed before its first body poll: the status
+/// and headers are already with the frontend. Hyper's HTTP/1.1 server queues
+/// that head together with every body frame it takes in the same write pass.
+/// It flushes the queue when the body returns `Pending` or when its write
+/// buffer fills; a body error in that pass aborts the connection with the
+/// queue unflushed. When the backend delivers its whole over-limit body at
+/// once (one read, one segment), the limit trips inside that first pass, so
+/// the client saw the connection close before any status line instead of the
+/// committed status followed by a truncated body. A backend error or reset
+/// that arrives with the first bytes ends the response the same way. HTTP/2
+/// likewise resets the stream before its HEADERS frame can leave.
+///
+/// Returning `Pending` once, with an immediate self-wake, hands the frontend a
+/// write pass that ends without the error. On HTTP/1.1 the same connection
+/// task flushes the head and every accepted byte at the end of that pass, so
+/// once the socket accepts the write, a reading client deterministically sees
+/// them first. On HTTP/2 and HTTP/3 the flush runs on another task (h2's
+/// connection task, quinn's driver), so the turn is best effort: under tokio
+/// it almost always lets the head and the data leave first, but it does not
+/// prove they did. Data frames pass straight through; only the terminal error
+/// path pays the extra scheduler turn.
+///
+/// Wraps every committed streaming response body: the reqwest bodies
+/// (size-limited, coalescing, direct), the plugin-inspected body, and the
+/// direct-H2/gRPC and native-H3 bodies (size-limited, coalescing, direct).
+///
+/// The hold sits OUTSIDE the builder-level idle read timeout and gRPC deadline.
+/// Those wrappers read an inner `Pending` as a backend wait and check their
+/// deadline on it, so a hold inside them could lose its error to a deadline
+/// that expired on the held turn. Outer client, route, and stream-auth deadlines
+/// wrap the finished `ProxyBody` on generic H2 and H3 paths, so they can still
+/// win on the held turn.
+struct FlushBeforeTerminalError<B> {
+    inner: B,
+    stashed_error: Option<BoxError>,
+}
+
+impl<B> FlushBeforeTerminalError<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            stashed_error: None,
+        }
+    }
+}
+
+impl<B> http_body::Body for FlushBeforeTerminalError<B>
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Unpin,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(error) = this.stashed_error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Err(error))) => {
+                this.stashed_error = Some(error);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.stashed_error.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl<S> futures_util::Stream for SizeLimitedStreamingResponse<S>
@@ -3395,7 +3829,9 @@ enum H3FrameSourceState {
     Done,
 }
 
-trait H3RecvStream {
+/// The backend half of a native-H3 request stream an [`H3FrameSource`] reads:
+/// h3's request stream in production, a scripted stream in tests.
+pub(crate) trait H3RecvStream {
     fn poll_recv_data_bytes(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -4260,14 +4696,17 @@ where
     }
 }
 
-struct DirectH2Body {
-    inner: Incoming,
+struct DirectH2Body<B = Incoming> {
+    inner: B,
     content_length: Option<u64>,
 }
 
-impl http_body::Body for DirectH2Body {
+impl<B> http_body::Body for DirectH2Body<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = B::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -4307,7 +4746,8 @@ impl http_body::Body for DirectH2Body {
 /// so deferred backend/admission accounting records a read timeout (and, being
 /// post-wire, NOT a connection error) rather than an indefinite in-flight
 /// stream — matching the buffered H2 body collection
-/// (`collect_hyper_body_with_limit`) and the native-H3 streaming read timeout.
+/// (`collect_hyper_body_and_trailers_with_limit`) and the native-H3 streaming
+/// read timeout.
 ///
 /// The deadline is (re)armed only on the transition from "have a frame" to
 /// "waiting on the backend" — NOT on every received frame. A slow downstream
@@ -4403,11 +4843,13 @@ where
     type Data = Bytes;
     // `BoxError` (not a concrete enum) because this wrapper is placed OUTERMOST
     // — directly around the `Coalescing` adapter (whose `Error` is already
-    // `BoxError`) — rather than inside it. The outermost placement keeps the
-    // deadline from elapsing while a buffered sub-target frame waits on a SLOW
-    // DOWNSTREAM CLIENT: under client backpressure hyper stops polling this
-    // wrapper entirely, and when polling resumes the coalescer delivers the
-    // buffered frame as `Ready` (resetting `waiting`) before any deadline check.
+    // `BoxError`) — rather than inside it; only the terminal-error flush hold
+    // (`FlushBeforeTerminalError`) sits outside it. The outermost placement
+    // keeps the deadline from elapsing while a buffered sub-target frame waits
+    // on a SLOW DOWNSTREAM CLIENT: under client backpressure hyper stops
+    // polling this wrapper entirely, and when polling resumes the coalescer
+    // delivers the buffered frame as `Ready` (resetting `waiting`) before any
+    // deadline check.
     // Placing the timer INSIDE the coalescer would instead let a client-drain
     // stall elapse a deadline armed during an earlier backend-pending — a false
     // positive the outermost placement avoids.
@@ -4934,16 +5376,129 @@ impl<S: H3RecvStream + Unpin> http_body::Body for DirectH3Body<S> {
     }
 }
 
-/// Outermost idle `backend_read_timeout_ms` wrapper for reqwest streaming
-/// bodies. `0` skips the wrapper so long-lived streams stay unbounded.
-fn wrap_idle_read_timeout<B>(body: B, read_timeout_ms: u64) -> ProxyBody
+/// What a reqwest-dispatched streaming response does with the backend's trailer
+/// section.
+///
+/// `Response::bytes_stream()` yields DATA only, so the reqwest relay used to
+/// drop every trailer while the direct HTTP/2 relay forwarded them — whether a
+/// client saw its trailers depended on which dispatch path the backend's
+/// capability record selected (issue #5760). The relay now reads real frames,
+/// and this decides what happens to the trailer frame.
+pub(crate) struct ReqwestResponseTrailers {
+    relay: bool,
+    /// Keep a trailer frame that stripping and governance emptied. Only a
+    /// gRPC terminal section needs it: a translated gRPC-Web adapter reads an
+    /// empty trailer frame differently from a clean EOF.
+    keep_empty_section: bool,
+    /// Response-header policy boundary, applied after hop-by-hop stripping.
+    /// `None` when the chain has nothing that could govern a trailer.
+    governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+}
+
+impl ReqwestResponseTrailers {
+    /// The client cannot receive a trailer section on this response, or the
+    /// backend response cannot carry one, so no response-policy evidence was
+    /// captured for it. Drop it at the source rather than forward an
+    /// ungoverned section.
+    pub(crate) fn drop_all() -> Self {
+        Self {
+            relay: false,
+            keep_empty_section: false,
+            governor: None,
+        }
+    }
+
+    /// Forward a plain-HTTP trailer section after hop-by-hop stripping and,
+    /// when present, the response-header policy boundary. A section left
+    /// empty by those ends the body on its last DATA frame instead.
+    pub(crate) fn relay(
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        Self {
+            relay: true,
+            keep_empty_section: false,
+            governor,
+        }
+    }
+
+    /// Forward a gRPC terminal section like [`Self::relay`], keeping the
+    /// trailer frame even when nothing in it survives.
+    pub(crate) fn relay_grpc_terminal(
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        Self {
+            relay: true,
+            keep_empty_section: true,
+            governor,
+        }
+    }
+}
+
+/// Frame-level view of a reqwest response body: DATA frames pass through and
+/// the trailer frame is sanitized or dropped per [`ReqwestResponseTrailers`].
+struct ReqwestResponseFrames {
+    body: StripHopByHopTrailers<reqwest::Body>,
+    relay_trailers: bool,
+    keep_empty_section: bool,
+}
+
+impl ReqwestResponseFrames {
+    /// Whether a frame read from the backend is withheld from the client: a
+    /// trailer section the client cannot receive, or one left empty.
+    fn withholds(&self, frame: &Frame<Bytes>) -> bool {
+        match frame.trailers_ref() {
+            Some(section) => {
+                !self.relay_trailers || (section.is_empty() && !self.keep_empty_section)
+            }
+            None => false,
+        }
+    }
+}
+
+impl futures_util::Stream for ReqwestResponseFrames {
+    type Item = Result<Frame<Bytes>, BoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match http_body::Body::poll_frame(Pin::new(&mut this.body), cx) {
+                Poll::Ready(Some(Ok(frame))) if this.withholds(&frame) => {}
+                Poll::Ready(Some(Ok(frame))) => return Poll::Ready(Some(Ok(frame))),
+                Poll::Ready(Some(Err(err))) => {
+                    return Poll::Ready(Some(Err(Box::new(err) as BoxError)));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Read a reqwest response as HTTP frames, trailers included.
+fn reqwest_response_frames(
+    response: reqwest::Response,
+    trailers: ReqwestResponseTrailers,
+) -> ReqwestResponseFrames {
+    let body = http::Response::<reqwest::Body>::from(response).into_body();
+    ReqwestResponseFrames {
+        body: StripHopByHopTrailers::with_trailer_governor(body, trailers.governor),
+        relay_trailers: trailers.relay,
+        keep_empty_section: trailers.keep_empty_section,
+    }
+}
+
+/// Outer wrappers for a committed streaming body: the idle
+/// `backend_read_timeout_ms` deadline (`0` skips it so long-lived streams stay
+/// unbounded), then [`FlushBeforeTerminalError`] around it.
+fn wrap_idle_read_timeout_and_error_hold<B>(body: B, read_timeout_ms: u64) -> ProxyBody
 where
     B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
 {
     if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
+        let timed = IdleReadTimeoutBody::new(body, read_timeout_ms);
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(timed)))
     } else {
-        ProxyBody::streaming(Box::pin(body))
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body)))
     }
 }
 
@@ -4952,14 +5507,26 @@ pub(crate) fn coalescing_body(
     content_length: Option<u64>,
     read_timeout_ms: u64,
     flush_after: Option<Duration>,
+    trailers: ReqwestResponseTrailers,
 ) -> ProxyBody {
-    use futures_util::StreamExt;
-
-    let stream = response
-        .bytes_stream()
-        .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    let stream = reqwest_response_frames(response, trailers);
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 1);
+    coalescing_frame_stream_body(stream, content_length, read_timeout_ms, flush_after)
+}
+
+/// The adapter chain behind [`coalescing_body`], over any backend frame
+/// stream: coalescing, the idle read timeout, then a flush of the committed
+/// head before a terminal error.
+pub(crate) fn coalescing_frame_stream_body<S>(
+    stream: S,
+    content_length: Option<u64>,
+    read_timeout_ms: u64,
+    flush_after: Option<Duration>,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
     // `flush_after: None` makes the adapter flush on the first `Pending`, so on
     // a backend leg that yields one frame per read it never reaches
     // `COALESCE_TARGET`. On an HTTP/1.1 frontend every such chunk is charged its
@@ -4971,26 +5538,37 @@ pub(crate) fn coalescing_body(
         content_length,
         flush_after,
     );
-    wrap_idle_read_timeout(body, read_timeout_ms)
+    wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
 }
 
 pub(crate) fn direct_streaming_body(
     response: reqwest::Response,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    trailers: ReqwestResponseTrailers,
 ) -> ProxyBody {
-    use futures_util::StreamExt;
-
-    let stream = response
-        .bytes_stream()
-        .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+    let stream = reqwest_response_frames(response, trailers);
     #[cfg(feature = "bench-h1-profile")]
     let stream = crate::h1_profile::ObservedStream::new(stream, 0);
+    direct_frame_stream_body(stream, content_length, read_timeout_ms)
+}
+
+/// The adapter chain behind [`direct_streaming_body`], over any backend frame
+/// stream: pass-through frames, the idle read timeout, then a flush of the
+/// committed head before a terminal error.
+pub(crate) fn direct_frame_stream_body<S>(
+    stream: S,
+    content_length: Option<u64>,
+    read_timeout_ms: u64,
+) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
+{
     let body = DirectStreamBody {
         inner: stream,
         content_length,
     };
-    wrap_idle_read_timeout(body, read_timeout_ms)
+    wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
 }
 
 /// Build a streaming response body fed by [`run_response_inspection`] over an
@@ -5003,6 +5581,11 @@ pub(crate) fn direct_streaming_body(
 /// (re-coalescing would batch windows and defeat that). It is the poll/async
 /// bridge for H1/H2: the async inspection runs in a detached task while this
 /// poll-based body just drains the channel.
+///
+/// The inspection task can queue released bytes and its terminal error (size
+/// limit, backend error, idle read timeout) before the frontend's first poll,
+/// so the error is held for one scheduler turn like every other committed
+/// streaming body.
 pub(crate) fn inspected_streaming_body(
     rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
 ) -> ProxyBody {
@@ -5011,7 +5594,7 @@ pub(crate) fn inspected_streaming_body(
         inner: stream,
         content_length: None,
     };
-    ProxyBody::streaming(Box::pin(body))
+    ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body)))
 }
 
 /// Build a streaming response body from a gateway-owned frame source.
@@ -5050,6 +5633,9 @@ where
 /// than forwarded unbounded just because each window was clean. A live
 /// `backend_read_timeout_ms` is an idle-between-chunks bound on `stream.next()`
 /// only — inspector time is not charged, and `0` leaves the wait unbounded.
+///
+/// A relayed backend trailer section is sent after the inspector's final
+/// `on_end()` release, never ahead of bytes it still holds.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_response_inspection(
     response: reqwest::Response,
@@ -5059,12 +5645,14 @@ pub(crate) async fn run_response_inspection(
     read_timeout_ms: u64,
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
     _lb_connection_guard: super::LoadBalancerConnectionGuard,
+    trailers: ReqwestResponseTrailers,
 ) {
     use crate::plugins::ResponseStreamAction;
     use futures_util::StreamExt;
 
-    let mut stream = response.bytes_stream();
+    let mut stream = reqwest_response_frames(response, trailers);
     let mut total_received: usize = 0;
+    let mut trailing_frame: Option<Frame<Bytes>> = None;
     // Built ONLY when the bound is live (issue #4074): `0` is the documented
     // opt-out that long-lived SSE routes rely on, and an unconditional `Sleep`
     // made every such relay construct timer state and read the clock for a
@@ -5090,7 +5678,7 @@ pub(crate) async fn run_response_inspection(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
         }
-        let chunk = tokio::select! {
+        let frame = tokio::select! {
             biased;
             _ = tx.closed() => return,
             _ = super::optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active => {
@@ -5106,47 +5694,53 @@ pub(crate) async fn run_response_inspection(
             }
             next = stream.next() => next,
         };
-        let Some(chunk) = chunk else { break };
-        match chunk {
-            Ok(bytes) => {
-                total_received = total_received.saturating_add(bytes.len());
-                if max_response_body_size_bytes > 0 && total_received > max_response_body_size_bytes
-                {
-                    // Operator response-size cap exceeded: stop and surface a body
-                    // error, instead of forwarding an unbounded stream. Use the
-                    // SAME message as the non-inspected size-limited path so
-                    // `classify_body_error` tags it `ResponseBodyTooLarge`.
-                    let _ = tx
-                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                            "response body exceeds maximum size",
-                        ) as BoxError))
-                        .await;
-                    return;
+        let Some(frame) = frame else { break };
+        let bytes = match frame {
+            Ok(frame) => match frame.into_data() {
+                Ok(bytes) => bytes,
+                Err(frame) => {
+                    // The backend's trailer frame must stay behind any bytes the
+                    // inspector still holds for `on_end()`.
+                    trailing_frame = Some(frame);
+                    continue;
                 }
-                let action = tokio::select! {
-                    biased;
-                    _ = tx.closed() => return,
-                    action = inspector.on_chunk(&bytes) => action,
-                };
-                match action {
-                    ResponseStreamAction::Forward(out) => {
-                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                            return; // client dropped the receiver
-                        }
-                    }
-                    ResponseStreamAction::Terminate(final_bytes) => {
-                        if let Some(fb) = final_bytes
-                            && !fb.is_empty()
-                        {
-                            let _ = tx.send(Ok(Frame::data(fb))).await;
-                        }
-                        return; // drop tx → downstream EOF; drop stream → cancel backend
-                    }
+            },
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+        total_received = total_received.saturating_add(bytes.len());
+        if max_response_body_size_bytes > 0 && total_received > max_response_body_size_bytes {
+            // Operator response-size cap exceeded: stop and surface a body
+            // error, instead of forwarding an unbounded stream. Use the
+            // SAME message as the non-inspected size-limited path so
+            // `classify_body_error` tags it `ResponseBodyTooLarge`.
+            let _ = tx
+                .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "response body exceeds maximum size",
+                ) as BoxError))
+                .await;
+            return;
+        }
+        let action = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            action = inspector.on_chunk(&bytes) => action,
+        };
+        match action {
+            ResponseStreamAction::Forward(out) => {
+                if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                    return; // client dropped the receiver
                 }
             }
-            Err(e) => {
-                let _ = tx.send(Err(Box::new(e) as BoxError)).await;
-                return;
+            ResponseStreamAction::Terminate(final_bytes) => {
+                if let Some(fb) = final_bytes
+                    && !fb.is_empty()
+                {
+                    let _ = tx.send(Ok(Frame::data(fb))).await;
+                }
+                return; // drop tx → downstream EOF; drop stream → cancel backend
             }
         }
     }
@@ -5158,10 +5752,14 @@ pub(crate) async fn run_response_inspection(
     };
     match action {
         ResponseStreamAction::Forward(out) => {
-            if !out.is_empty() {
-                let _ = tx.send(Ok(Frame::data(out))).await;
+            if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                return;
+            }
+            if let Some(frame) = trailing_frame {
+                let _ = tx.send(Ok(frame)).await;
             }
         }
+        // A policy cut ends the body without the backend's trailer section.
         ResponseStreamAction::Terminate(final_bytes) => {
             if let Some(fb) = final_bytes
                 && !fb.is_empty()
@@ -5322,37 +5920,55 @@ pub(crate) async fn run_proxy_body_response_inspection(
 /// The wrapper is interposed BEFORE the `Coalescing` adapter so the stash-
 /// then-flush trailer logic in `Coalescing<Incoming>` still works on the
 /// already-filtered map.
-pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
-    body: Incoming,
+///
+/// `body` is hyper's `Incoming` in production; tests drive the same chain
+/// with a scripted body.
+pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers<B>(
+    body: B,
     content_length: Option<u64>,
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     // Bound the backend read so a backend that sends headers then stalls cannot
     // pin the streaming relay indefinitely. Two mutually-exclusive regimes
     // (issue #1649): `total_deadline` (a client `grpc-timeout`) is an ABSOLUTE
     // end-to-end deadline via `TotalDeadlineBody`; otherwise `read_timeout_ms`
     // (`backend_read_timeout_ms`) is a PER-FRAME idle timeout via
-    // `IdleReadTimeoutBody`. Either deadline wraps the coalescer OUTERMOST (not
-    // the raw body inside it): the coalescer only reports `Pending` once it has
-    // no buffered frame left to flush AND the backend is pending, so a per-frame
+    // `IdleReadTimeoutBody`. Either deadline wraps the coalescer (not the raw
+    // body inside it): the coalescer only reports `Pending` once it has no
+    // buffered frame left to flush AND the backend is pending, so a per-frame
     // idle deadline measures genuine backend-read waits and never fires while a
-    // sub-target frame is buffered waiting on a slow downstream client.
+    // sub-target frame is buffered waiting on a slow downstream client. Only
+    // the terminal-error flush hold sits outside the deadline.
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+    wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
+}
+
+/// Outer wrappers for a committed coalescing direct-H2/gRPC streaming body:
+/// one of the two mutually-exclusive backend deadlines (issue #1649), then
+/// [`FlushBeforeTerminalError`] around it.
+fn wrap_h2_deadline_and_error_hold<B>(
+    body: B,
+    read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
+{
     if let Some(deadline) = total_deadline {
-        let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
+        let timed = TotalDeadlineBody::new(body, Some(deadline));
         let fired = timed.deadline_fired_handle();
-        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_fired_flag(fired)
-    } else if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
-            coalescing,
-            read_timeout_ms,
-        )))
+        let held = FlushBeforeTerminalError::new(timed);
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_fired_flag(fired)
     } else {
-        ProxyBody::streaming(Box::pin(coalescing))
+        wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
     }
 }
 
@@ -5371,23 +5987,12 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
 ) -> ProxyBody {
     // See `coalescing_h2_body_strip_hop_by_hop_trailers` for the two
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
-    // coalescer OUTERMOST so a per-frame idle deadline never fires while a
-    // buffered sub-target frame is waiting on a slow downstream client.
+    // coalescer so a per-frame idle deadline never fires while a buffered
+    // sub-target frame is waiting on a slow downstream client.
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
     let coalescing = Coalescing::new(limited, coalesce_target, content_length);
-    if let Some(deadline) = total_deadline {
-        let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
-        let fired = timed.deadline_fired_handle();
-        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_fired_flag(fired)
-    } else if read_timeout_ms > 0 {
-        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
-            coalescing,
-            read_timeout_ms,
-        )))
-    } else {
-        ProxyBody::streaming(Box::pin(coalescing))
-    }
+    wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in
@@ -5395,13 +6000,20 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
 /// [`coalescing_h2_body_strip_hop_by_hop_trailers`] for the gRPC streaming
 /// path's `response_buffer_cutoff_bytes == 0 && max_response_body_size_bytes
 /// == 0` zero-buffering branch.
-pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
-    body: Incoming,
+///
+/// `body` is hyper's `Incoming` in production; tests drive the same chain
+/// with a scripted body.
+pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers<B>(
+    body: B,
     content_length: Option<u64>,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     use http_body_util::BodyExt;
 
     let direct = DirectH2Body {
@@ -5412,19 +6024,23 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     // direct body directly — `Strip` forwards frames without buffering. Both
     // `TotalDeadlineBody` (absolute client `grpc-timeout`, issue #1649) and
     // `IdleReadTimeoutBody` (per-frame `backend_read_timeout_ms`) already yield
-    // `BoxError`, so no `map_err` is needed in those branches.
+    // `BoxError`, so no `map_err` is needed in those branches. The
+    // terminal-error flush hold wraps each branch outermost, outside the
+    // deadline.
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(direct, Some(deadline));
         let fired = timed.deadline_fired_handle();
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
-        ProxyBody::streaming(Box::pin(stripped)).with_client_grpc_deadline_fired_flag(fired)
+        let held = FlushBeforeTerminalError::new(stripped);
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
-        ProxyBody::streaming(Box::pin(stripped))
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(stripped)))
     } else {
         let stripped = StripHopByHopTrailers::with_trailer_governor(direct, trailer_governor);
-        ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+        let stripped = stripped.map_err(|e| Box::new(e) as BoxError);
+        ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(stripped)))
     }
 }
 
@@ -5598,8 +6214,8 @@ fn h3_read_progress(read_timeout_ms: u64) -> Option<Arc<H3ReadProgress>> {
 /// `Content-Length` when the header is absent — so an ordinary streamed response
 /// passes `None` there even though the completeness gate still gets the value.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn coalescing_h3_body(
-    recv_stream: crate::http3::client::H3RequestStream,
+pub(crate) fn coalescing_h3_body<S>(
+    recv_stream: S,
     method: Arc<str>,
     status: u16,
     completeness_content_length: Option<u64>,
@@ -5609,7 +6225,10 @@ pub(crate) fn coalescing_h3_body(
     flush_interval: Duration,
     read_timeout_ms: u64,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    S: H3RecvStream + Send + Unpin + 'static,
+{
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
         recv_stream,
@@ -5632,13 +6251,26 @@ pub(crate) fn coalescing_h3_body(
         advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
+    wrap_h3_idle_read_timeout_and_error_hold(body, read_timeout_ms, progress)
+}
+
+/// Outer wrappers for a committed native-H3 streaming body: the idle read
+/// deadline that shares `progress` with the [`H3FrameSource`] (absent when no
+/// read timeout is configured), then [`FlushBeforeTerminalError`] around it.
+fn wrap_h3_idle_read_timeout_and_error_hold<B>(
+    body: B,
+    read_timeout_ms: u64,
+    progress: Option<Arc<H3ReadProgress>>,
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
+{
     match progress {
-        Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
-            body,
-            read_timeout_ms,
-            Some(p),
-        ))),
-        None => ProxyBody::streaming(Box::pin(body)),
+        Some(p) => {
+            let timed = IdleReadTimeoutBody::with_progress(body, read_timeout_ms, Some(p));
+            ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(timed)))
+        }
+        None => ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body))),
     }
 }
 
@@ -5685,14 +6317,7 @@ pub(crate) fn size_limited_streaming_h3_body(
         advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
-    match progress {
-        Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
-            body,
-            read_timeout_ms,
-            Some(p),
-        ))),
-        None => ProxyBody::streaming(Box::pin(body)),
-    }
+    wrap_h3_idle_read_timeout_and_error_hold(body, read_timeout_ms, progress)
 }
 
 /// `completeness_content_length` is the backend's declared length, used ONLY by
@@ -5702,15 +6327,18 @@ pub(crate) fn size_limited_streaming_h3_body(
 /// `Content-Length` when the header is absent — so an ordinary streamed response
 /// passes `None` there even though the completeness gate still gets the value.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn direct_streaming_h3_body(
-    recv_stream: crate::http3::client::H3RequestStream,
+pub(crate) fn direct_streaming_h3_body<S>(
+    recv_stream: S,
     method: Arc<str>,
     status: u16,
     completeness_content_length: Option<u64>,
     advertised_content_length: Option<u64>,
     read_timeout_ms: u64,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
-) -> ProxyBody {
+) -> ProxyBody
+where
+    S: H3RecvStream + Send + Unpin + 'static,
+{
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
         recv_stream,
@@ -5724,14 +6352,7 @@ pub(crate) fn direct_streaming_h3_body(
         source,
         content_length: advertised_content_length,
     };
-    match progress {
-        Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(
-            body,
-            read_timeout_ms,
-            Some(p),
-        ))),
-        None => ProxyBody::streaming(Box::pin(body)),
-    }
+    wrap_h3_idle_read_timeout_and_error_hold(body, read_timeout_ms, progress)
 }
 
 #[cfg(test)]
