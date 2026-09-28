@@ -44,6 +44,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolving on the untagged process that minted them, and the control plane
   does not proxy lookups. See `docs/plans/diagnostic_ref_cross_replica_adr.md`
   for the design and rejected alternatives.
+- **Gateway-terminated WebSocket `permessage-deflate`** (#5769). A new
+  `terminate` value for the per-proxy `websocket_permessage_deflate` field makes
+  the gateway an RFC 7692 endpoint on each leg: it answers the client's offer
+  itself (honoring `server_no_context_takeover` / `server_max_window_bits`),
+  sends the backend its own `permessage-deflate` offer, and the two legs
+  negotiate independently on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+  Extended CONNECT. Every message is inflated beneath the frame relay, so every
+  frame and body-inspecting plugin — the WAF WebSocket scanner included — sees
+  plaintext and none is refused, and it is re-deflated toward each leg that
+  negotiated compression after the plugins run. Control frames are never
+  compressed, fragmentation and context takeover are handled, and RSV1 misuse
+  fails the connection as before. Decompression is bounded: a compressed frame
+  may not exceed the frame ceiling, a frame may not inflate past it, and a
+  message may not inflate past the new
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default 1 MiB; `0`
+  opts into the reassembled-message ceiling). DEFLATE expands up to about
+  1032:1, so this bound also caps how much inflate, inspection, and
+  re-compression work a small compressed message can force. Inflation stops one
+  byte past a limit and the session closes with 1009 (1007 for corrupt data),
+  and buffers grow only with bytes that arrived. A session with both legs
+  negotiated holds about 0.6 MB of DEFLATE state. An invalid backend answer —
+  including a foreign extension, a malformed list, or a non-ASCII value —
+  refuses the upgrade with 502. `strip` (default) and `passthrough` are
+  unchanged and pay nothing. Stream proxies must keep `strip`. No schema change:
+  the existing `proxies.websocket_permessage_deflate` column stores the new
+  value. **Upgrade note:** a DP that predates `terminate` rejects a namespace
+  snapshot that uses it, and a database-mode node that predates it rejects the
+  proxy row; upgrade every DP, and every database-mode node sharing the DB,
+  before enabling `terminate`.
+
 - **Diagnostic references for every gateway-authored error, with rejection and
   per-attempt detail** (#5846). `FERRUM_DIAGNOSTIC_REFS` takes a new `all`
   value: besides the responses `errors` already references (those carrying the
