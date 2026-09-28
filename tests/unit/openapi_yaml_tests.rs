@@ -2370,6 +2370,12 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
         "rule_modes must remain an open rule-id map"
     );
     assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["category_modes"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "category_modes must remain an open category-name map"
+    );
+    assert!(
         spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]
             .get("additionalProperties")
             .is_some_and(|v| v.is_object()),
@@ -2413,6 +2419,57 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
             }))
             .is_ok()
     );
+    assert!(
+        validator
+            .validate(&json!({
+                "paranoia_level": 1,
+                "detection_paranoia_level": 2,
+                "category_modes": { "xss": "enforce", "ldap_injection": "off" }
+            }))
+            .is_ok(),
+        "tuning controls must be admitted by the schema"
+    );
+    assert!(
+        validator
+            .validate(&json!({ "category_modes": { "xss": "loud" } }))
+            .is_err(),
+        "category_modes values are rule actions"
+    );
+    assert!(
+        validator
+            .validate(&json!({ "detection_paranoia_level": 5 }))
+            .is_err(),
+        "detection_paranoia_level is 1-4"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "rule_overrides": {
+                    "FE-XSS-001": { "exclude": { "query_params": ["html"], "headers": ["referer"] } }
+                }
+            }))
+            .is_ok(),
+        "field exclusions must be admitted by the schema"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "rule_overrides": { "FE-XSS-001": { "exclude": { "query_param": ["html"] } } }
+            }))
+            .is_err(),
+        "exclude is a closed object"
+    );
+    for empty in [
+        json!(null),
+        json!({}),
+        json!({ "query_params": [], "headers": null }),
+    ] {
+        let config = json!({ "rule_overrides": { "FE-XSS-001": { "exclude": empty } } });
+        assert!(
+            validator.validate(&config).is_err(),
+            "exclude must name at least one field: {empty}"
+        );
+    }
     assert!(
         validator
             .validate(&json!({ "default_rule_actoin": "enforce" }))

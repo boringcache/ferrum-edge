@@ -607,6 +607,23 @@ pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<
     CanonicalQueryViews { primary, variants }
 }
 
+/// A query parameter's name as the application reads it: one percent-decode
+/// plus `+`→space, the primary view of [`canonical_query_component_views`].
+/// Field exclusions compare configured names against this. A name holding a
+/// `%u` escape is left as written: only IIS-style parsers decode `%u`, so for
+/// most backends `%u0068tml` is not `html`, and decoding it would let a
+/// payload hide under an excluded name while landing in another parameter.
+pub(super) fn query_component_name(raw: &str) -> Cow<'_, str> {
+    if raw
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'%' && (pair[1] | 0x20) == b'u')
+    {
+        return Cow::Borrowed(raw);
+    }
+    percent_decode_plus(raw)
+}
+
 /// Inspection views of one `name=value` cookie crumb:
 ///
 /// * the percent decode with `+` → space (PHP `urldecode`, Rails);

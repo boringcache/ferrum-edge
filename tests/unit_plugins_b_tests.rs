@@ -110,6 +110,7 @@ mod unit {
         mod waf_normalization_evasion_tests;
         mod waf_rule_pack_coverage_tests;
         mod waf_tests;
+        mod waf_tuning_controls_tests;
         mod waf_unlisted_content_type_tests;
         mod workload_metrics_custom_env_tags_tests;
         mod workload_metrics_tests;

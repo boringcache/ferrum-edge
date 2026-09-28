@@ -68,10 +68,21 @@ rules into enforcement. There are three ways:
    **monitor** under that bulk switch; only an explicit per-rule `rule_modes`
    or `rule_overrides.action` entry promotes them. Other `rule_modes` overrides
    still win per rule.
-2. **`rule_modes`** — set the action of individual rules by id:
+2. **`category_modes`** — set the action of every built-in rule in a
+   category: `{"xss": "enforce", "ldap_injection": "disabled"}`. Categories
+   are the backticked keys in the `Category` column of the
+   [rule pack](#built-in-rule-pack) table (for example `sqli`,
+   `path_traversal`, `http_response_splitting`, `stack_trace`); an unknown
+   category is rejected. Naming an opt-in category (for example
+   `encoding_evasion`) promotes its rules, unlike the bulk switch. Custom
+   rules keep their own `action`.
+3. **`rule_modes`** — set the action of individual rules by id:
    `{"FE-SQLI-001": "enforce"}`.
-3. **anomaly scoring** — keep rules in `monitor` and block on the aggregate
+4. **anomaly scoring** — keep rules in `monitor` and block on the aggregate
    score (see [Anomaly scoring](#anomaly-scoring)).
+
+Action precedence for a built-in rule, lowest first: `default_rule_action`,
+`category_modes`, `rule_overrides.<id>.action`, `rule_modes`.
 
 Because the loud/broad rules are gated behind `paranoia_level >= 2` (see
 below), the recommended starting posture for active blocking is:
@@ -100,6 +111,7 @@ by a blanket `additionalProperties: false` on the map itself:
 | Map | Why it stays open |
 | --- | --- |
 | `rule_modes` | keys are rule ids |
+| `category_modes` | keys are built-in rule categories (validated against the pack at construction) |
 | `rule_overrides` | keys are rule ids; **values** are fixed-shape and closed |
 | `conditions.headers` | keys are header names |
 | `global_exemptions.header_present` | keys are header names |
@@ -134,6 +146,52 @@ its `fail_closed` does not.
 Higher levels add broader, noisier signatures that catch more attacks at the
 cost of more false positives. Loud rules retuned to `paranoia_min: 2` or `3`
 (see below) are inactive at the default level 1.
+
+### Detection paranoia level
+
+Raising `paranoia_level` blind is risky: the new rules block before you know
+what they flag. `detection_paranoia_level` (1–4, default = `paranoia_level`)
+runs the higher level in **detection-only** mode first, like CRS's
+`detection_paranoia_level`:
+
+```json
+{ "mode": "enforce", "default_rule_action": "enforce",
+  "paranoia_level": 1, "detection_paranoia_level": 2 }
+```
+
+Rules with `paranoia_level < paranoia_min <= detection_paranoia_level` are
+compiled and scanned but:
+
+- are always `monitor`, whatever `default_rule_action`, `category_modes`, or
+  `rule_overrides.action` say — only an explicit `rule_modes: {"<id>":
+  "enforce"}` promotes one, exactly as it force-compiles a rule above
+  `paranoia_level` today;
+- contribute **zero** to anomaly scoring;
+- never make a body policy "enforcing", so they cannot trigger
+  `on_body_too_large: fail_closed`, `on_scan_timeout: fail_closed`, a
+  WebSocket close, or a fail-closed representation claim, and they do not
+  satisfy `mode: enforce` admission (the configuration-level `block`
+  dispositions are the exception; see below);
+- report through their own metadata: `waf.detection_rule_hits` (comma-joined
+  ids) and `waf.detection_paranoia`. They are **not** added to
+  `waf.rule_hits`, `waf.target`, or `waf.severity`, and a request whose only
+  hits are detection-only keeps `waf.action=clean`, so dashboards built on
+  the blocking posture are undisturbed. `log_to_stdout` events carry
+  `action=detection_only`.
+
+Detection-band body rules still cause request/response bodies (and WebSocket
+messages) to be buffered and scanned, so budget for that scan cost while the
+band is active. Because the band turns on inspection of that body direction,
+the dispositions that refuse **every** inspected body by configuration rather
+than by a rule verdict apply to it too: in `mode: enforce`,
+`on_body_too_large: block` rejects an oversize body or WebSocket message, and
+`on_unlisted_content_type: block` rejects a non-empty unlisted request body,
+exactly as they would with a monitor-only body rule. This only changes
+behavior when the band supplies the first body rule in a direction (for
+example a custom-only pack whose one body rule sits in the band); the
+`fail_closed` variants of both settings are unaffected, since band rules never
+make a body policy enforcing. `detection_paranoia_level` below
+`paranoia_level` is rejected.
 
 ## Decode / normalization
 
@@ -372,7 +430,7 @@ and `rule_overrides`. Categories:
 | `http_response_splitting` | FE-CRLF-001 | a decoded CR/LF in a query value followed by a response header name (`Set-Cookie:`, `Location:`, …) or a status line — the shape that splits a response when an application reflects the value into a header (redirect targets, download names). Level 1. |
 | `restricted_file` | FE-RESTRICTED-001, FE-RESTRICTED-002 (L2) | matched on the **canonical** path, so `/%2egit/config` is `/.git/config`. 001 (level 1) covers version-control metadata (`.git/`, `.svn/`, `.hg/`), dotenv files, `.htaccess`/`.htpasswd`, credential stores (`.aws/`, `.ssh/`, `.docker/`, `.kube/`, `.npmrc`, `.netrc`, `.pgpass`, `id_rsa`), shell histories, `.DS_Store`, `web.config`, and `wp-config.php` together with its backup and editor-swap copies (`wp-config.php.bak`, `wp-config.php~`, `.wp-config.php.swp`). `.well-known`, `.github`, and `.gitignore` are not matched. 002 (level 2) covers backup, swap, and dump artifacts (`.bak`, `.old`, `.swp`, `.sql`, `.sqlite`, trailing `~`), which some sites publish legitimately. |
 | `file_upload` | FE-UPLOAD-001 | a `filename` / `filename*` parameter on a multipart `Content-Disposition` line naming a server-executable script (`.php`, `.phtml`, `.phar`, `.jsp`, `.aspx`, `.ashx`, `.cgi`, `.shtml`, `.htaccess`, …), including double extensions such as `shell.php.jpg` and the spellings Windows/IIS and C-backed handlers reduce to `shell.php`: a trailing dot or space, the `::$DATA` stream suffix, and a raw or `%00` NUL. A form or JSON field that merely names a file (`filename=index.php`) is not matched. Level 1, but multipart bodies are only scanned when `inspect_multipart` is enabled. |
-| stack trace / db error / source / fingerprint disclosure | FE-RESP-* | response-side; requires `response_inspection` |
+| `stack_trace` / `database_error` / `source_disclosure` / `fingerprinting` | FE-RESP-STACK-001..003, FE-RESP-DB-001, FE-RESP-SOURCE-001, FE-RESP-FP-001 | response-side; requires `response_inspection` |
 | `data_leak` | FE-DATA-LEAK-001..006 | credit card (Luhn), AWS/Stripe/GitHub keys, JWT (L2), private key |
 
 Disable the whole pack with `include_default_rules: false`, or selected rules
@@ -457,7 +515,8 @@ mode.
 
 `rule_overrides` tunes individual rules — **including built-ins** — without
 forking the rule pack. Attach false-positive filters, scope to paths, raise
-paranoia, change severity/score, or set a per-rule `action`. Per-rule
+paranoia, change severity/score, set a per-rule `action`, or exclude named
+fields (see [Field exclusions](#field-exclusions)). Per-rule
 `fp_filters` are unanchored regular expressions evaluated against the **complete
 inspected target value** after the rule matcher finds a hit — for example the
 full query value, header value, or `body_json_path` scalar string — not merely
@@ -480,6 +539,59 @@ same terms as text:
 Per-rule `action: "enforce"` only blocks when global `mode` is also
 `enforce`; with `mode: "monitor"` the match is logged but allowed.
 
+### Field exclusions
+
+The most common false positive is one rule firing on one field that
+legitimately carries its pattern — a CMS `html` parameter full of markup, a
+`redirect` parameter holding a URL, a repeated `ids` parameter. Disabling the
+rule or scoping it away with `conditions` also drops its coverage of every
+other field. `exclude` removes only the named fields from one rule (CRS-style
+target exclusions):
+
+```json
+{
+  "rule_overrides": {
+    "FE-XSS-001":      { "exclude": { "query_params": ["html"] } },
+    "FE-PATHTRAV-001": { "exclude": { "query_params": ["relpath"] } },
+    "FE-HPP-001":      { "exclude": { "query_params": ["ids"] } },
+    "FE-JNDI-001-H":   { "exclude": { "headers": ["x-template-preview"] } },
+    "ACME-COOKIE-1":   { "exclude": { "cookies": ["prefs"] } }
+  }
+}
+```
+
+- `query_params` — names compared after one percent-decode (`%68tml` is
+  `html`), exactly as a query parser delivers them; case-sensitive. Applies to
+  `query_keys` / `query_values` rules and to `full_url` rules. A whole-URL
+  match cannot be attributed to one pair, so a `full_url` rule with
+  exclusions re-runs its own matcher over the URL rebuilt without the excluded
+  pairs, and the hit counts only if it still matches. `FE-HPP-001` drops the
+  excluded pairs before comparing duplicates, and the URL-side encoding
+  heuristics judge the rebuilt URL.
+- `headers` — header names, case-insensitive. Applies to `header_names`,
+  `header_values`, and `response_headers` rules.
+- `cookies` — cookie names (the text before `=` in the raw crumb),
+  case-sensitive. Applies to `cookies` rules, including their scans of the
+  crumb's percent-decoded views: the name always comes from the raw crumb, so
+  an encoded `prefs%3D=…` is not the `prefs` cookie.
+
+The exclusion boundary is the WAF's own split: query pairs on `&` only (as
+CRS and current query parsers split them) and cookie crumbs on `;` only.
+With `html` excluded, `html=x;evil=…` is one `html` pair to the WAF, so the
+excluding rule skips all of it, while a backend that also splits a query on
+`;` (Go before 1.17, older Python `parse_qs`) reads a second parameter,
+`evil`. The same applies to a legacy cookie parser that also splits on `,`.
+Every other rule still inspects that value; if such a backend sits behind the
+WAF, keep exclusions narrow or rely on `fp_filters` instead.
+
+Every other rule still inspects an excluded field, and the excluding rule
+still inspects every other field. Exclusions must fit the rule: naming
+`cookies` on a query rule, or any field on a path, method, or body rule, is
+rejected at construction (bodies are scanned as whole documents; narrow body
+rules with `fp_filters`, `conditions`, or a `body_json_path` custom rule
+instead). An `exclude` object must name at least one field and rejects
+unknown keys.
+
 For per-rule `conditions.paths`, plain strings are exact matches, trailing `*`
 means prefix match, and leading `~` means the remaining text is compiled as the
 operator-authored regex. Regex conditions are evaluated with Rust regex
@@ -498,7 +610,14 @@ unintended routes:
   containing it. Use `~^/a|^/b` for alternation, or `~.*pattern` if you really
   need a floating substring match.
 - `methods`, `consumers`, `ips` (CIDR)
-- `header_present` — suppress rules when a header is present/equal
+- `header_present` — suppress rules when a header is present/equal. **Clients
+  choose their own headers**: an entry keyed on a header the client can send
+  (for example `x-internal-scan`) lets any caller switch the WAF off for their
+  request. Key it only on a header that a trusted component in front of the
+  gateway always strips or overwrites — Ferrum's own `request_transformer`
+  runs in `before_proxy`, after the WAF has decided, so it cannot protect
+  this — or exempt authenticated callers via `consumers` instead. The same
+  caution applies to per-rule `conditions.headers`.
 - `fp_capture_filters` — suppress any matched value matching these patterns
   (these match anywhere in the value by design and are **not** anchored)
 
@@ -1002,7 +1121,8 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.instances.<id>.score` / `waf.instance_scores`, `waf.action`
 (`blocked` / `monitored` / `clean`), `waf.first_blocking_rule`,
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
-`waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out` /
+`waf.paranoia`, `waf.detection_rule_hits` / `waf.detection_paranoia` (see
+[Detection paranoia level](#detection-paranoia-level)), plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
 `response_body`) / `waf.body_uninspected` (`content_type`). All of these are
 fixed-cardinality; body bytes are never logged. Blocked requests reject before
@@ -1040,7 +1160,9 @@ fire, then switch to `enforce`.
 | --- | --- | --- | --- |
 | `mode` | enum | `enforce` | `enforce` / `monitor` / `disabled` |
 | `default_rule_action` | enum | _(unset)_ | bulk action for built-ins that inherit it; encoding heuristics stay monitor until `rule_modes`; `rule_modes` overrides win |
+| `category_modes` | map | `{}` | per-category action for built-in rules; above `default_rule_action`, below `rule_overrides.action` / `rule_modes`; unknown categories rejected |
 | `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
+| `detection_paranoia_level` | int 1–4 | `paranoia_level` | also compile rules up to this level as detection-only (never block or score; reported in `waf.detection_rule_hits`) |
 | `request_inspection` | bool | `true` | scan request metadata |
 | `request_body_inspection` | bool | `true` | scan request bodies |
 | `response_inspection` | bool | `false` | scan response headers |
@@ -1048,7 +1170,7 @@ fire, then switch to `enforce`.
 | `include_default_rules` | bool | `true` | load the built-in pack |
 | `disabled_default_rules` | string[] | `[]` | built-in ids to drop |
 | `rule_modes` | map | `{}` | per-rule action by id |
-| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action |
+| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action/exclude (see [Field exclusions](#field-exclusions)) |
 | `custom_rules` | object[] | `[]` | additional rules |
 | `scoring` | object | _(off)_ | anomaly scoring (see above) |
 | `global_exemptions` | object | _(none)_ | request short-circuits |
