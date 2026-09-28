@@ -3082,6 +3082,618 @@ impl GrpcWebFrameScanner {
     }
 }
 
+/// Longest trailer line [`GrpcWebTrailerStatusObserver`] buffers while looking
+/// for `grpc-status`. A well-formed `grpc-status: <code>` line is far shorter;
+/// a longer line is skipped without being retained.
+const TRAILER_STATUS_LINE_CAP: usize = 64;
+
+/// Why a pass-through gRPC-Web response's terminal status could not be read
+/// although its body carries one.
+///
+/// The transaction log then leaves `grpc_status` unset and names the reason
+/// under [`crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY`]
+/// instead of reporting an `UNKNOWN` (2) the client never received. `UNKNOWN`
+/// stays reserved for a body that has no final trailer frame at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrpcWebTrailerUnreadable {
+    /// The body ends on a compressed trailer frame (flag `0x81`, exactly).
+    CompressedTrailerFrame,
+    /// The response carries an HTTP content-coding, so the relayed bytes are
+    /// not gRPC-Web frames the gateway can parse. Reported only once at least
+    /// one body byte was relayed: an empty body carries no status at all.
+    ContentEncodedBody,
+}
+
+impl GrpcWebTrailerUnreadable {
+    /// Bounded, fixed-cardinality log value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CompressedTrailerFrame => "compressed_trailer_frame",
+            Self::ContentEncodedBody => "content_encoded_body",
+        }
+    }
+}
+
+/// What a complete PASS-THROUGH gRPC-Web body's final frame says about the
+/// RPC's terminal status. Callers hold it as an `Option`: `None` means the
+/// body has no final trailer frame naming a status, which stays `UNKNOWN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassthroughGrpcStatus {
+    /// The final trailer frame names this `grpc-status`.
+    Status(u32),
+    /// The body carries a terminal status the gateway cannot read.
+    Unreadable(GrpcWebTrailerUnreadable),
+}
+
+impl PassthroughGrpcStatus {
+    /// The readable status, if any.
+    pub(crate) fn status(self) -> Option<u32> {
+        match self {
+            Self::Status(code) => Some(code),
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    /// The reason the status cannot be read, if any.
+    pub(crate) fn unreadable(self) -> Option<GrpcWebTrailerUnreadable> {
+        match self {
+            Self::Status(_) => None,
+            Self::Unreadable(reason) => Some(reason),
+        }
+    }
+
+    /// Record this outcome in transaction metadata, unless a status is already
+    /// recorded there: a gateway-authored terminal owns its own status.
+    pub(crate) fn record(self, metadata: &mut HashMap<String, String>) {
+        if metadata.contains_key("grpc_status") {
+            return;
+        }
+        match self {
+            Self::Status(code) => {
+                metadata.insert("grpc_status".to_string(), code.to_string());
+            }
+            Self::Unreadable(reason) => {
+                metadata.insert(
+                    crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY.to_string(),
+                    reason.as_str().to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// Framing of a PASS-THROUGH gRPC-Web response body, fixed when its headers
+/// are known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PassthroughFraming {
+    /// Base64 (`application/grpc-web-text`) framing.
+    pub(crate) text_mode: bool,
+    /// The body carries an HTTP content-coding that hides its frames.
+    pub(crate) content_encoded: bool,
+}
+
+impl PassthroughFraming {
+    /// Framing of a response body in `text_mode`, read from its headers.
+    pub(crate) fn from_response(
+        text_mode: bool,
+        response_headers: &HashMap<String, String>,
+    ) -> Self {
+        Self {
+            text_mode,
+            content_encoded: response_body_is_content_encoded(response_headers),
+        }
+    }
+
+    /// A trailer status observer for a body in this framing.
+    pub(crate) fn observer(self) -> GrpcWebTrailerStatusObserver {
+        let mut observer = GrpcWebTrailerStatusObserver::new(self.text_mode);
+        observer.content_encoded = self.content_encoded;
+        observer
+    }
+}
+
+/// Whether a response body carries an HTTP content-coding other than
+/// `identity`, which hides its gRPC-Web frames from the observer.
+fn response_body_is_content_encoded(response_headers: &HashMap<String, String>) -> bool {
+    let Some(coding) = response_headers.get("content-encoding") else {
+        return false;
+    };
+    let coding = coding.trim();
+    !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")
+}
+
+/// Which part of a gRPC-Web frame the observer is reading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObservedGrpcWebFrame {
+    /// Assembling the 5-byte frame header.
+    Header,
+    /// Skipping a message payload.
+    Message,
+    /// Reading an uncompressed trailer payload line by line.
+    Trailer,
+    /// Skipping a compressed trailer payload (flag `0x81`) the observer cannot
+    /// read.
+    OpaqueTrailer,
+    /// Skipping a trailer-flagged frame whose reserved flag bits are set (e.g.
+    /// `0x82`, `0xC0`). It is not a status frame the gateway can name, so a
+    /// body ending on one has no terminal status.
+    ReservedTrailer,
+}
+
+/// Incremental reader of the terminal `grpc-status` in a PASS-THROUGH gRPC-Web
+/// response body.
+///
+/// A route without the `grpc_web` translator relays a gRPC-Web backend's body
+/// unchanged, so the backend's own trailer frame (flag `0x80`) is the only
+/// terminal status the client receives. Transaction logging and backend
+/// outcome classification read that frame through this observer instead of
+/// synthesizing a status. The observer never alters or retains the body: a
+/// message payload is skipped by length, text mode decodes one 4-character
+/// base64 group at a time, and at most one bounded trailer line is buffered.
+///
+/// A trailer frame counts only while it is the final frame: any later frame, a
+/// truncated frame, malformed base64, or a final trailer-flagged frame with
+/// reserved flag bits leaves no observed status. A final compressed (`0x81`)
+/// trailer frame, or a non-empty content-encoded body, is reported as present
+/// but unreadable (see [`PassthroughGrpcStatus`]). A declared frame length is
+/// only ever counted down, never allocated.
+///
+/// The observer also counts the complete MESSAGE frames it walked (every frame
+/// without the trailer flag), on the decoded frame stream: a pass-through body's
+/// trailer frame is metadata, and text framing is base64, so neither may be
+/// counted by a native length-prefix scanner over the relayed bytes.
+pub(crate) struct GrpcWebTrailerStatusObserver {
+    text_mode: bool,
+    content_encoded: bool,
+    observed_bytes: bool,
+    messages: u64,
+    text_group: [u8; 4],
+    text_group_len: u8,
+    header: [u8; GRPC_FRAME_HEADER_BYTES],
+    header_len: u8,
+    frame: ObservedGrpcWebFrame,
+    payload_remaining: u32,
+    line: [u8; TRAILER_STATUS_LINE_CAP],
+    line_len: u8,
+    line_overflowed: bool,
+    frame_status: Option<u32>,
+    terminal_status: Option<u32>,
+    terminal_unreadable: bool,
+    malformed: bool,
+}
+
+impl GrpcWebTrailerStatusObserver {
+    pub(crate) fn new(text_mode: bool) -> Self {
+        Self {
+            text_mode,
+            content_encoded: false,
+            observed_bytes: false,
+            messages: 0,
+            text_group: [0u8; 4],
+            text_group_len: 0,
+            header: [0u8; GRPC_FRAME_HEADER_BYTES],
+            header_len: 0,
+            frame: ObservedGrpcWebFrame::Header,
+            payload_remaining: 0,
+            line: [0u8; TRAILER_STATUS_LINE_CAP],
+            line_len: 0,
+            line_overflowed: false,
+            frame_status: None,
+            terminal_status: None,
+            terminal_unreadable: false,
+            malformed: false,
+        }
+    }
+
+    /// Observe the next client-visible body bytes, in wire order. This decoder
+    /// and `GrpcLengthPrefixedScanner` must agree: decode base64 per 4-character
+    /// group, and a frame is a message iff `flag & 0x80 == 0`, so a change to one
+    /// decoder must be mirrored in the other.
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.observed_bytes = true;
+        if self.malformed || self.content_encoded {
+            return;
+        }
+        if !self.text_mode {
+            self.push_binary(data);
+            return;
+        }
+        for &byte in data {
+            self.text_group[usize::from(self.text_group_len)] = byte;
+            self.text_group_len += 1;
+            if self.text_group_len < 4 {
+                continue;
+            }
+            self.text_group_len = 0;
+            let mut decoded = [0u8; 3];
+            // gRPC-Web text may pad at every flush boundary, so each 4-character
+            // group decodes independently.
+            match BASE64.decode_slice(self.text_group, &mut decoded) {
+                Ok(len) => self.push_binary(&decoded[..len]),
+                Err(_) => self.malformed = true,
+            }
+            if self.malformed {
+                return;
+            }
+        }
+    }
+
+    /// Terminal status carried by the bytes observed so far, when they end
+    /// exactly on a final trailer frame that names one or that the gateway
+    /// cannot read. `None` for no body bytes at all, no trailer frame, a later
+    /// frame, truncation, malformed base64, a final trailer frame with reserved
+    /// flag bits, or a readable trailer frame without `grpc-status`.
+    pub(crate) fn outcome(&self) -> Option<PassthroughGrpcStatus> {
+        if self.content_encoded {
+            // An empty or never-polled content-coded body carries no status;
+            // it is missing (`UNKNOWN`), not present but unreadable.
+            if !self.observed_bytes {
+                return None;
+            }
+            let reason = GrpcWebTrailerUnreadable::ContentEncodedBody;
+            return Some(PassthroughGrpcStatus::Unreadable(reason));
+        }
+        if self.malformed
+            || self.text_group_len != 0
+            || self.header_len != 0
+            || self.frame != ObservedGrpcWebFrame::Header
+        {
+            return None;
+        }
+        if self.terminal_unreadable {
+            let reason = GrpcWebTrailerUnreadable::CompressedTrailerFrame;
+            return Some(PassthroughGrpcStatus::Unreadable(reason));
+        }
+        self.terminal_status.map(PassthroughGrpcStatus::Status)
+    }
+
+    /// `grpc-status` of the body's final trailer frame, when the bytes observed
+    /// so far end exactly on that frame and it names a readable status.
+    pub(crate) fn status(&self) -> Option<u32> {
+        self.outcome().and_then(PassthroughGrpcStatus::status)
+    }
+
+    /// Complete gRPC-Web message frames (no trailer flag) observed so far,
+    /// counted on the decoded frame stream. Trailer frames, a truncated final
+    /// frame, and bytes the observer cannot parse (malformed base64, a
+    /// content-coded body) are not counted.
+    pub(crate) fn messages(&self) -> u64 {
+        self.messages
+    }
+
+    /// Walk decoded frames using the same rules as `GrpcLengthPrefixedScanner`:
+    /// base64 is decoded per 4-character group, and a frame is a message iff
+    /// `flag & 0x80 == 0`. A change to one decoder must be mirrored in the other.
+    fn push_binary(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.frame == ObservedGrpcWebFrame::Header {
+                let filled = usize::from(self.header_len);
+                let take = (GRPC_FRAME_HEADER_BYTES - filled).min(data.len());
+                self.header[filled..filled + take].copy_from_slice(&data[..take]);
+                self.header_len += take as u8;
+                data = &data[take..];
+                if usize::from(self.header_len) == GRPC_FRAME_HEADER_BYTES {
+                    self.header_len = 0;
+                    self.begin_frame();
+                }
+                continue;
+            }
+            let take = (self.payload_remaining as usize).min(data.len());
+            if self.frame == ObservedGrpcWebFrame::Trailer {
+                self.read_trailer_bytes(&data[..take]);
+            }
+            data = &data[take..];
+            self.payload_remaining -= take as u32;
+            if self.payload_remaining == 0 {
+                self.end_frame();
+            }
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        let flag = self.header[0];
+        self.payload_remaining = u32::from_be_bytes([
+            self.header[1],
+            self.header[2],
+            self.header[3],
+            self.header[4],
+        ]);
+        // The trailer frame ends a gRPC-Web response; a status followed by any
+        // further frame was not terminal.
+        self.terminal_status = None;
+        self.terminal_unreadable = false;
+        self.frame_status = None;
+        self.line_len = 0;
+        self.line_overflowed = false;
+        self.frame = if flag & GRPC_FRAME_TRAILER == 0 {
+            ObservedGrpcWebFrame::Message
+        } else if flag == GRPC_FRAME_TRAILER {
+            ObservedGrpcWebFrame::Trailer
+        } else if flag == GRPC_FRAME_TRAILER_COMPRESSED {
+            ObservedGrpcWebFrame::OpaqueTrailer
+        } else {
+            ObservedGrpcWebFrame::ReservedTrailer
+        };
+        if self.payload_remaining == 0 {
+            self.end_frame();
+        }
+    }
+
+    fn end_frame(&mut self) {
+        match self.frame {
+            ObservedGrpcWebFrame::Trailer => {
+                // The final trailer line may omit its CRLF.
+                self.finish_trailer_line();
+                self.terminal_status = self.frame_status;
+            }
+            ObservedGrpcWebFrame::OpaqueTrailer => self.terminal_unreadable = true,
+            ObservedGrpcWebFrame::Message => self.messages = self.messages.saturating_add(1),
+            ObservedGrpcWebFrame::Header | ObservedGrpcWebFrame::ReservedTrailer => {}
+        }
+        self.frame = ObservedGrpcWebFrame::Header;
+    }
+
+    fn read_trailer_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.finish_trailer_line();
+            } else if usize::from(self.line_len) == TRAILER_STATUS_LINE_CAP {
+                self.line_overflowed = true;
+            } else if !self.line_overflowed {
+                self.line[usize::from(self.line_len)] = byte;
+                self.line_len += 1;
+            }
+        }
+    }
+
+    fn finish_trailer_line(&mut self) {
+        let len = usize::from(self.line_len);
+        let overflowed = self.line_overflowed;
+        self.line_len = 0;
+        self.line_overflowed = false;
+        // The first `grpc-status` line wins, matching the translated path.
+        if overflowed || self.frame_status.is_some() {
+            return;
+        }
+        let line = &self.line[..len];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+            return;
+        };
+        if !line[..colon]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"grpc-status")
+        {
+            return;
+        }
+        self.frame_status = Some(match std::str::from_utf8(&line[colon + 1..]) {
+            Ok(value) => crate::proxy::grpc_proxy::parse_grpc_status_value(value),
+            Err(_) => u32::MAX,
+        });
+    }
+}
+
+/// Whether this exchange's response is PASS-THROUGH gRPC-Web in text (base64)
+/// framing, or `None` when it is not pass-through gRPC-Web at all.
+///
+/// Pass-through means the client spoke gRPC-Web and no `grpc_web` translator
+/// rewrote the request, so the backend answers in gRPC-Web itself. The
+/// response's own gRPC-Web media type decides the framing; the client's
+/// negotiated type is the fallback when the response names none.
+pub(crate) fn passthrough_response_text_mode(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+) -> Option<bool> {
+    let client_content_type = retained_response_content_type(ctx)?;
+    if request_is_grpc_web_translated(ctx) {
+        return None;
+    }
+    Some(
+        match response_content_type.filter(|ct| is_grpc_web_content_type(ct)) {
+            Some(content_type) => is_grpc_web_text(content_type),
+            None => is_grpc_web_text(client_content_type),
+        },
+    )
+}
+
+/// [`PassthroughFraming`] of this exchange's response when it is PASS-THROUGH
+/// gRPC-Web (see [`passthrough_response_text_mode`]), else `None`.
+pub(crate) fn passthrough_response_framing(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> Option<PassthroughFraming> {
+    let content_type = response_headers.get("content-type").map(String::as_str);
+    let text_mode = passthrough_response_text_mode(ctx, content_type)?;
+    Some(PassthroughFraming::from_response(
+        text_mode,
+        response_headers,
+    ))
+}
+
+/// [`passthrough_response_framing`] for a caller that already knows the
+/// exchange is pass-through gRPC-Web: `client_content_type` names the framing
+/// when the context retained no client representation.
+pub(crate) fn passthrough_response_framing_or(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+    client_content_type: &str,
+) -> PassthroughFraming {
+    if let Some(framing) = passthrough_response_framing(ctx, response_headers) {
+        return framing;
+    }
+    let text_mode = is_grpc_web_text(client_content_type);
+    PassthroughFraming::from_response(text_mode, response_headers)
+}
+
+/// Start a [`GrpcWebTrailerStatusObserver`] for this exchange's response when
+/// it is PASS-THROUGH gRPC-Web (see [`passthrough_response_text_mode`]).
+///
+/// Boxed so the streaming relays that hold it across awaits pay one pointer in
+/// their future state, and only pass-through gRPC-Web pays the allocation.
+pub(crate) fn passthrough_trailer_status_observer(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> Option<Box<GrpcWebTrailerStatusObserver>> {
+    passthrough_response_framing(ctx, response_headers).map(|framing| Box::new(framing.observer()))
+}
+
+/// The terminal status a complete PASS-THROUGH gRPC-Web response body carries
+/// in its final frame. `None` when the exchange is not pass-through gRPC-Web
+/// or the body has no final trailer frame naming a status.
+pub(crate) fn passthrough_body_trailer_status(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) -> Option<PassthroughGrpcStatus> {
+    let framing = passthrough_response_framing(ctx, response_headers)?;
+    let mut observer = framing.observer();
+    observer.push(body);
+    observer.outcome()
+}
+
+/// Record the authoritative response message count for a complete, buffered
+/// backend body, when the transaction observes gRPC messages.
+///
+/// A PASS-THROUGH gRPC-Web body is counted on its decoded frame stream (see
+/// [`GrpcWebTrailerStatusObserver::messages`]): its own trailer frame is
+/// metadata and `grpc-web-text` is base64, so neither is a native message.
+/// Every other body is already the backend's native length-prefixed framing.
+/// `fetch_max` keeps a retried or replayed buffer from inflating the count.
+pub(crate) fn record_backend_response_grpc_message_count(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) {
+    use crate::plugins::mesh::prometheus_helpers as helpers;
+    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        return;
+    }
+    let Some(framing) = passthrough_response_framing(ctx, response_headers) else {
+        helpers::record_complete_grpc_message_count(&ctx.grpc_response_messages_observed, body);
+        return;
+    };
+    let mut observer = framing.observer();
+    observer.push(body);
+    ctx.grpc_response_messages_observed
+        .fetch_max(observer.messages(), Ordering::Release);
+}
+
+/// Whether this request uploads PASS-THROUGH gRPC-Web in text (base64)
+/// framing, or `None` when its upload is not pass-through gRPC-Web at all.
+///
+/// Pass-through means the client spoke gRPC-Web and no `grpc_web` translator
+/// rewrote the request, so the backend receives the client's own framing. The
+/// request's own `Content-Type`, classified at frontend intake, decides the
+/// mode: the negotiated response type can name the other one.
+fn passthrough_request_text_mode(ctx: &RequestContext) -> Option<bool> {
+    if !ctx.request_is_grpc_web() || request_is_grpc_web_translated(ctx) {
+        return None;
+    }
+    Some(ctx.request_is_grpc_web_text())
+}
+
+/// Count the gRPC messages in a complete request body into `counter`.
+///
+/// A PASS-THROUGH gRPC-Web upload (`passthrough_text_mode` is `Some`) is
+/// counted on its decoded frame stream: `grpc-web-text` is base64 and a
+/// trailer frame is metadata, so neither is a native message. Every other body
+/// is already native length-prefixed framing (a translated upload was decoded
+/// by this plugin's request transform). `fetch_max` keeps a retried or
+/// replayed buffer from inflating the count.
+fn record_request_messages(counter: &AtomicU64, passthrough_text_mode: Option<bool>, body: &[u8]) {
+    use crate::plugins::mesh::prometheus_helpers as helpers;
+    let Some(text_mode) = passthrough_text_mode else {
+        helpers::record_complete_grpc_message_count(counter, body);
+        return;
+    };
+    let mut observer = GrpcWebTrailerStatusObserver::new(text_mode);
+    observer.push(body);
+    counter.fetch_max(observer.messages(), Ordering::Release);
+}
+
+/// Record the authoritative request message count for a complete, buffered
+/// backend-visible body, when the transaction observes gRPC messages. See
+/// [`record_request_messages`] for how a pass-through gRPC-Web upload counts.
+pub(crate) fn record_request_grpc_message_count(ctx: &RequestContext, body: &[u8]) {
+    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        record_request_messages(
+            &ctx.grpc_request_messages_observed,
+            passthrough_request_text_mode(ctx),
+            body,
+        );
+    }
+}
+
+/// A request's gRPC message counter, captured with its upload framing so a
+/// dispatch whose context a later phase consumes can still count the
+/// backend-visible body.
+pub(crate) struct RequestGrpcMessageCounter {
+    messages: std::sync::Arc<AtomicU64>,
+    passthrough_text_mode: Option<bool>,
+}
+
+impl RequestGrpcMessageCounter {
+    /// `None` when the transaction does not observe gRPC messages.
+    pub(crate) fn for_request(ctx: &RequestContext) -> Option<Self> {
+        use crate::plugins::mesh::prometheus_helpers as helpers;
+        if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+            return None;
+        }
+        Some(Self {
+            messages: std::sync::Arc::clone(&ctx.grpc_request_messages_observed),
+            passthrough_text_mode: passthrough_request_text_mode(ctx),
+        })
+    }
+
+    /// Count a complete backend-visible request body.
+    pub(crate) fn record(&self, body: &[u8]) {
+        record_request_messages(&self.messages, self.passthrough_text_mode, body);
+    }
+}
+
+/// Framing of this request's backend-visible upload, as a gRPC message scanner
+/// reads it while the upload streams.
+///
+/// A PASS-THROUGH gRPC-Web upload keeps the client's framing: its trailer
+/// frame is metadata and `grpc-web-text` is base64, so neither is read as
+/// native length prefixes. Every other upload is native framing (a translated
+/// upload was decoded by this plugin's request transform).
+pub(crate) fn request_upload_grpc_message_framing(
+    ctx: &RequestContext,
+) -> crate::plugins::mesh::prometheus_helpers::GrpcMessageFraming {
+    use crate::plugins::mesh::prometheus_helpers::GrpcMessageFraming;
+    match passthrough_request_text_mode(ctx) {
+        Some(text_mode) => GrpcMessageFraming::grpc_web(text_mode),
+        None => GrpcMessageFraming::Native,
+    }
+}
+
+/// The message tap a STREAMED upload's body adapter feeds for gRPC message
+/// accounting, reading the upload's own framing (see
+/// [`request_upload_grpc_message_framing`]). `None` when the transaction does
+/// not observe gRPC messages.
+pub(crate) fn request_stream_grpc_message_tap(
+    ctx: &RequestContext,
+) -> Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap> {
+    use crate::plugins::mesh::prometheus_helpers as helpers;
+    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        return None;
+    }
+    Some(helpers::GrpcMessageTap::new(
+        std::sync::Arc::clone(&ctx.grpc_request_messages_observed),
+        request_upload_grpc_message_framing(ctx),
+    ))
+}
+
+/// Whether this request uploads PASS-THROUGH `grpc-web-text` (base64), which
+/// only a text-mode message scanner can read.
+pub(crate) fn request_uploads_passthrough_grpc_web_text(ctx: &RequestContext) -> bool {
+    passthrough_request_text_mode(ctx) == Some(true)
+}
+
 /// Compare an existing trailer-frame suffix against the reconciled trailers
 /// without retaining a rebuilt frame or a decoded body copy.
 fn trailer_suffix_matches_reconciled(

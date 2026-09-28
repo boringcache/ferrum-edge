@@ -344,6 +344,7 @@ mod tests {
             udp_idle_timeout_seconds: 60,
             tcp_idle_timeout_seconds: Some(300),
             websocket_idle_timeout_seconds: None,
+            websocket_permessage_deflate: Default::default(),
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
@@ -1847,14 +1848,6 @@ impl RequestEpochStore {
     #[inline]
     pub fn load(&self) -> Arc<RequestEpoch> {
         self.current.load_full()
-    }
-
-    /// Configuration generation of the published epoch, read through the
-    /// `ArcSwap` guard without cloning the epoch. Per-response callers compare
-    /// it against a memoized derivation before paying for [`Self::load`].
-    #[inline]
-    pub(crate) fn config_generation(&self) -> u64 {
-        self.current.load().config_generation
     }
 
     /// Allocation-free gateway-to-mesh admission read.

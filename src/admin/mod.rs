@@ -62,6 +62,7 @@ use crate::config::types::{
     max_credentials_per_type,
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::diagnostic_ref::DIAGNOSTICS_READ_SCOPE;
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
@@ -1867,6 +1868,40 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
     Ok(PaginationParams { offset, limit })
 }
 
+/// Parse the optional `proxy_id` query filter for `GET /plugins/config`.
+///
+/// The value is validated with the same resource-id rules as every other id in
+/// the admin API (invalid → 400 with the shared `{"error": ...}` shape);
+/// duplicate `proxy_id` parameters are rejected rather than silently
+/// last-wins, matching other strict query-parameter parsers.
+fn parse_plugin_config_proxy_id(
+    uri: &hyper::Uri,
+) -> Result<Option<String>, Box<Response<Full<Bytes>>>> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let mut proxy_id: Option<String> = None;
+    for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "proxy_id" {
+            continue;
+        }
+        if proxy_id.is_some() {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "proxy_id must not be supplied more than once"}),
+            )));
+        }
+        if let Err(error) = crate::config::types::validate_resource_id(&val) {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": error}),
+            )));
+        }
+        proxy_id = Some(val.into_owned());
+    }
+    Ok(proxy_id)
+}
+
 /// Narrow a shared `i64` pagination offset to the `u32` the audit store
 /// indexes by, producing the documented audit 400 when it does not fit.
 ///
@@ -2634,6 +2669,115 @@ fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bo
         .ok()
         .and_then(|token_data| AuditActor::from_claims(&token_data.claims).ok())
         .is_some()
+}
+
+/// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
+/// rate-limited (`429`) attempts; the metric still counts every attempt.
+static DIAGNOSTIC_REF_LOOKUP_AUDIT: crate::diagnostic_ref::DiagnosticRefLookupAudit =
+    crate::diagnostic_ref::DiagnosticRefLookupAudit::new();
+
+/// `GET /diagnostics/v1/refs/{ref}`: resolve a gateway diagnostic reference
+/// (issue #5767).
+///
+/// Every attempt is charged against its JWT `sub`'s share of the lookup rate
+/// limit first (`429` + `Retry-After`), including one then refused for its
+/// credential; only an attempt whose credential passes the scope and `ns`
+/// checks is also charged against the global budget. Requires the
+/// `diagnostics:read` JWT scope and an `ns` claim (`403` otherwise; both
+/// depend only on the credential, never on the reference). A malformed,
+/// unknown, expired, or evicted reference, one minted for a namespace the
+/// token does not name, and every reference while the feature is off all
+/// answer the same `404`, so references cannot be probed.
+/// Every `200`/`404` emits one `audit.event = "diagnostic_ref_lookup"` event at
+/// WARN, visible at the default log level; `403` and `429` events are
+/// throttled to one per second each, carrying how many were suppressed.
+///
+/// A replica-tagged (`fd2_`) reference minted by another gateway process
+/// (issue #5846) answers the same `404` status and body as a miss. When the
+/// caller passed every check a `200` here would need (scope, `ns` binding, and
+/// this process's namespace), the `404` also carries
+/// `X-Ferrum-Diagnostic-Owner-Replica` naming the replica id the reference
+/// embeds, so operator tooling can route the lookup to that process.
+///
+/// `diagnostics_read_granted` comes from the claims the main admin gate
+/// already verified for this request; the token is not verified twice.
+fn diagnostic_ref_lookup_response(
+    auth: &AuditActor,
+    diagnostics_read_granted: bool,
+    reference: &str,
+) -> Response<Full<Bytes>> {
+    use crate::diagnostic_ref::DiagnosticRefLookup;
+
+    let outcome = crate::diagnostic_ref::authorize_lookup(
+        crate::diagnostic_ref::active_store(),
+        &auth.sub,
+        diagnostics_read_granted,
+        &auth.allowed_namespaces,
+        reference,
+        Instant::now(),
+    );
+    // The path segment is caller-controlled: only the fixed reference shape
+    // (prefix plus lowercase hex) is ever echoed into the audit event.
+    let logged_reference = if crate::diagnostic_ref::is_well_formed_ref(reference) {
+        reference
+    } else {
+        "malformed"
+    };
+    let result = outcome.result();
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    if let Some(suppressed) = DIAGNOSTIC_REF_LOOKUP_AUDIT.admit(result, now_ms) {
+        warn!(
+            audit.event = "diagnostic_ref_lookup",
+            actor = %auth.sub,
+            reference = %logged_reference,
+            result = result.as_str(),
+            suppressed_since_last = suppressed,
+            "Diagnostic reference lookup"
+        );
+    }
+    match outcome {
+        DiagnosticRefLookup::Found(view) => match serde_json::to_value(&*view) {
+            Ok(body) => json_response(StatusCode::OK, &body),
+            Err(_) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Diagnostic reference could not be rendered"}),
+            ),
+        },
+        DiagnosticRefLookup::NotFound => diagnostic_ref_not_found_response(),
+        DiagnosticRefLookup::NotOwned(owner) => {
+            let mut response = diagnostic_ref_not_found_response();
+            crate::diagnostic_ref::insert_owner_hint(response.headers_mut(), owner);
+            response
+        }
+        DiagnosticRefLookup::MissingScope => json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Diagnostic reference lookups require the `diagnostics:read` \
+                     JWT scope"}),
+        ),
+        DiagnosticRefLookup::MissingNamespaceBinding => json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Diagnostic reference lookups require a namespace-bound admin \
+                     JWT (`ns` claim)"}),
+        ),
+        DiagnosticRefLookup::RateLimited => {
+            let mut response = json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &json!({"error": "Diagnostic reference lookup rate limit exceeded"}),
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+    }
+}
+
+/// The one `404` every unresolved diagnostic reference lookup answers.
+fn diagnostic_ref_not_found_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &json!({"error": "Diagnostic reference not found"}),
+    )
 }
 
 /// `401` response for `/metrics` when the caller is not authorized to scrape.
@@ -3435,6 +3579,8 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
+        // Diagnostic reference store (issue #5767); empty while it is off.
+        metrics_output.push_str(&crate::diagnostic_ref::render_prometheus());
         // Data-path families (issue #4156): load shedding, upstream health,
         // circuit-breaker state, backend retries, pool saturation, and frontend
         // TLS admission. Sampled here on the cold scrape path from state the
@@ -3467,10 +3613,14 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
 
-    // Authenticate
-    let auth = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+    // Authenticate. The `diagnostics:read` scope is read from the same verified
+    // claims, so the diagnostic reference lookup never re-verifies the token.
+    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
-            Ok(actor) => actor,
+            Ok(actor) => {
+                let diagnostics_read = token_data.claims.grants_scope(DIAGNOSTICS_READ_SCOPE);
+                (actor, diagnostics_read)
+            }
             Err(message) => {
                 return Ok(json_response(
                     StatusCode::UNAUTHORIZED,
@@ -3590,6 +3740,23 @@ async fn handle_admin_request_inner(
             .body(Full::new(Bytes::from(status_output)))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
         return Ok(resp);
+    }
+
+    // Gateway diagnostic reference lookup (issue #5767). Dispatched before the
+    // `X-Ferrum-Namespace` gate on purpose: the header selects nothing here.
+    // The reference's own namespace is checked against the JWT `ns` claim, and
+    // the answer never depends on which namespace the caller asked for.
+    if path.starts_with("/diagnostics/") {
+        let diagnostic_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if let (Method::GET, ["diagnostics", "v1", "refs", reference]) =
+            (method.clone(), diagnostic_segments.as_slice())
+        {
+            return Ok(diagnostic_ref_lookup_response(
+                &auth,
+                diagnostics_read,
+                reference,
+            ));
+        }
     }
 
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")
@@ -4140,7 +4307,18 @@ async fn handle_admin_request_inner(
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
+            let proxy_id = match parse_plugin_config_proxy_id(&uri) {
+                Ok(proxy_id) => proxy_id,
+                Err(response) => return Ok(*response),
+            };
+            crud::handle_list_filtered::<PluginConfig>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &proxy_id,
+            )
+            .await
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

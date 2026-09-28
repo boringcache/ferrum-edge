@@ -133,8 +133,8 @@ pub mod ws_message_size_limiting;
 pub mod ws_rate_limiting;
 
 pub use builtin_parity::{
-    BUILTIN_PLUGIN_PARITY_META, BuiltinPluginClassification, BuiltinPluginParityMeta,
-    builtin_plugin_parity_meta,
+    BUILTIN_PLUGIN_PARITY_META, BUILTIN_WEBSOCKET_FRAMING_PLUGINS, BuiltinPluginClassification,
+    BuiltinPluginParityMeta, builtin_plugin_parity_meta,
 };
 pub use utils::PluginHttpClient;
 
@@ -2522,6 +2522,28 @@ pub struct RequestContext {
     /// this: their route deadline is folded into `grpc_deadline_at` instead, so
     /// the existing absolute-deadline machinery owns their terminals.
     pub(crate) route_request_deadline_at: Option<tokio::time::Instant>,
+    /// Route-scoped per-attempt TOTAL budget for a NON-gRPC request, armed by
+    /// [`Self::arm_route_request_deadline`] from the matched rule's
+    /// [`Self::route_override_attempt_timeout_ms`]. Proxy core starts a fresh
+    /// budget for every backend attempt once that attempt is handed to the
+    /// backend. gRPC-flavored requests never set this: they fold the budget
+    /// into `grpc_deadline_at` instead (see
+    /// [`Self::grpc_route_attempt_timeout`]).
+    pub(crate) route_attempt_timeout: Option<Duration>,
+    /// The same per-attempt budget for a gRPC-flavored request. While it is
+    /// set, `grpc_deadline_at` is the earlier of the receipt-anchored total
+    /// budget and the current attempt's budget, so the existing RPC deadline
+    /// machinery owns its terminals and the backend is told the attempt's
+    /// remaining budget in `grpc-timeout`.
+    pub(crate) grpc_route_attempt_timeout: Option<Duration>,
+    /// The current gRPC attempt's budget instant while it is the BINDING RPC
+    /// deadline (strictly earlier than the receipt-anchored total), set by
+    /// [`Self::begin_grpc_route_attempt`] and cleared by
+    /// [`Self::end_grpc_route_attempt`]. An RPC-deadline expiry after the
+    /// request was sent is then the rule's per-attempt backend bound, charged
+    /// to the backend, not the client's deadline
+    /// ([`Self::grpc_deadline_is_route_attempt_budget`]).
+    pub(crate) grpc_route_attempt_deadline_at: Option<tokio::time::Instant>,
     /// Once any `grpc_deadline` instance requests gateway-time subtraction,
     /// every later instance forwards the same remaining budget instead of
     /// subtracting receipt-to-hook elapsed time again.
@@ -2531,9 +2553,35 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Whether the response in hand is proxy core's charged backend deadline
+    /// terminal (`Backend deadline exceeded`, #5744): a gRPC attempt budget
+    /// expiry charged to the backend after the request was sent. It is written
+    /// after that deadline passed, so the post-dispatch response phases bound
+    /// every hook as over the gateway's own deadline terminal while keeping the
+    /// charged wording. Set only by trusted proxy code; cleared when the attempt
+    /// ends for retry backoff or a new attempt starts.
+    charged_backend_deadline_terminal: bool,
+    /// Phase of the matched route rule's total request deadline that produced
+    /// this request's gateway-authored `504`, or `None` when none did. Any
+    /// phase other than `dispatch` means no backend held the request, which
+    /// selects the `request_timeout` `X-Gateway-Error` token instead of
+    /// `backend_timeout`. Set only by
+    /// [`Self::mark_route_request_timeout_exceeded`]; typed so a plugin-written
+    /// `route_request_timeout` metadata value can neither select the token nor
+    /// make the gateway believe a phase is already recorded.
+    route_request_timeout_phase: Option<&'static str>,
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
+    /// Diagnostic-reference slot of this request (issue #5767). `None` unless
+    /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. Set only by the HTTP
+    /// frontends; the terminal transaction log records the request's detail
+    /// into it. Not visible to plugins and not serialized.
+    diagnostic_slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
+    /// `otel_tracing` per-attempt CLIENT span recorder (issue #5864). `None`
+    /// unless an exporting `otel_tracing` instance sampled this request. Not
+    /// visible to plugins and not serialized.
+    backend_attempt_trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
     /// JSON output-policy counterpart (`502`) for this request.
@@ -2603,6 +2651,11 @@ pub struct RequestContext {
     /// Stamped beside `request_wire_transport` from the same pre-routing
     /// classification the dispatchers already computed.
     request_is_grpc_web: bool,
+    /// Whether that recognized gRPC-Web request declared text (base64)
+    /// framing in its own `Content-Type`. Decided from the immutable inbound
+    /// field at frontend intake, because the negotiated response type can name
+    /// the other mode and a request hook can rewrite the header.
+    request_is_grpc_web_text: bool,
     /// Memoized per-instance execution-trigger decisions, keyed by the opaque
     /// process-local token the plugin cache assigned to each triggered
     /// instance.
@@ -3220,6 +3273,17 @@ pub struct RequestContext {
     /// matching `mesh_route_dispatch` rule replaces it like every other
     /// override field.
     pub route_override_request_timeout_ms: Option<u64>,
+    /// Plugin-set TOTAL bound on each backend attempt for the matched rule, in
+    /// milliseconds (Gateway API `HTTPRoute.rules[].timeouts.backendRequest`).
+    ///
+    /// Where [`Self::route_override_backend_read_timeout_ms`] bounds an
+    /// attempt's header wait and the idle gap between frames, this bounds the
+    /// attempt's whole duration, response body included. Every retry attempt
+    /// gets a fresh budget, and [`Self::route_override_request_timeout_ms`]
+    /// still bounds the whole transaction. Request-scoped policy only, like
+    /// the total deadline: it never changes the effective `Proxy` and is not
+    /// part of [`Self::has_route_overrides`].
+    pub route_override_attempt_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's backend connect timeout.
     ///
     /// Counterpart to [`Self::route_override_backend_read_timeout_ms`] for
@@ -3672,6 +3736,105 @@ impl RequestContext {
         self.backend_dispatch_state
     }
 
+    /// Record one completed backend attempt in the request's diagnostic
+    /// reference detail (issue #5846): once for each attempt the retry loop
+    /// replaces with another, and once for the attempt whose outcome the
+    /// client sees. A no-op when `FERRUM_DIAGNOSTIC_REFS` is off.
+    pub(crate) fn record_backend_attempt(
+        &self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        if let Some(slot) = self.diagnostic_slot.as_ref() {
+            slot.record_attempt(error_class, request_on_wire, response_status);
+        }
+        // The same hook ends the attempt's `otel_tracing` CLIENT span (issue
+        // #5864); a no-op unless a sampled trace is installed.
+        if let Some(trace) = self.backend_attempt_trace.as_ref() {
+            trace.finish(error_class, response_status);
+        }
+    }
+
+    /// Whether [`Self::record_backend_attempt`] records anything for this
+    /// request: a diagnostic-reference slot or an `otel_tracing` attempt
+    /// recorder is installed. A dispatch whose attempt record takes work to
+    /// derive checks this first, so a request that records nothing does none
+    /// of it (issue #5875).
+    pub(crate) fn records_backend_attempts(&self) -> bool {
+        self.diagnostic_slot.is_some() || self.backend_attempt_trace.is_some()
+    }
+
+    /// Install (or clear) the `otel_tracing` per-attempt span recorder.
+    pub(crate) fn set_backend_attempt_trace(
+        &mut self,
+        trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
+    ) {
+        self.backend_attempt_trace = trace;
+    }
+
+    /// Begin the next backend attempt's `otel_tracing` CLIENT span (issue
+    /// #5864) at its dispatch site. The attempt must dispatch
+    /// `span.headers(headers)` and be polled in the span's scope.
+    /// [`Self::record_backend_attempt`] ends it. Inactive, with no allocation,
+    /// unless a sampled trace is installed.
+    pub(crate) fn begin_backend_attempt_span(
+        &self,
+        backend_url: &str,
+        headers: &HashMap<String, String>,
+    ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
+        match self.backend_attempt_trace.as_ref() {
+            Some(trace) => trace.begin(backend_url, headers),
+            None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
+        }
+    }
+
+    /// [`Self::begin_backend_attempt_span`] for a dispatch whose backend
+    /// headers are an ordered header list (the WebSocket upgrades, issue
+    /// #5867). The attempt must dispatch `span.header_list(headers)`.
+    pub(crate) fn begin_backend_attempt_span_for_header_list(
+        &self,
+        backend_url: &str,
+        headers: &[(String, String)],
+    ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
+        match self.backend_attempt_trace.as_ref() {
+            Some(trace) => trace.begin_with_header_list(backend_url, headers),
+            None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
+        }
+    }
+
+    /// Whether this request's short-circuit response is an origin-authored
+    /// representation a plugin replayed or relayed rather than a rejection
+    /// the gateway authored: a `response_caching` HIT/REVALIDATED, a
+    /// `request_deduplication` idempotent replay, an `ai_semantic_cache` hit,
+    /// or a `serverless_function` terminate reply. Such a response never
+    /// carries a diagnostic reference (issue #5846), whatever its status.
+    pub(crate) fn serves_origin_representation(&self) -> bool {
+        self.finalized_response_replay
+            || self.semantic_cache_response_replay
+            || self.serverless_terminate_response
+            || self.serverless_grpc_terminate_frame.is_some()
+    }
+
+    /// Phase of the matched route rule's total request deadline that produced
+    /// this request's gateway-authored `504`, when one did.
+    pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
+        self.route_request_timeout_phase
+    }
+
+    /// This request's diagnostic-reference slot (issue #5767).
+    pub(crate) fn diagnostic_slot(&self) -> Option<&Arc<crate::diagnostic_ref::DiagnosticSlot>> {
+        self.diagnostic_slot.as_ref()
+    }
+
+    /// Attach the frontend's diagnostic-reference slot (issue #5767).
+    pub(crate) fn set_diagnostic_slot(
+        &mut self,
+        slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
+    ) {
+        self.diagnostic_slot = slot;
+    }
+
     /// Carry a final-request-body hook context's plugin state back onto the
     /// live request context.
     ///
@@ -3816,9 +3979,16 @@ impl RequestContext {
             grpc_deadline_budget_ms: None,
             grpc_deadline_at: None,
             route_request_deadline_at: None,
+            route_attempt_timeout: None,
+            grpc_route_attempt_timeout: None,
+            grpc_route_attempt_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            charged_backend_deadline_terminal: false,
+            route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
+            diagnostic_slot: None,
+            backend_attempt_trace: None,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -3829,6 +3999,7 @@ impl RequestContext {
             origin_http_response_status: None,
             request_wire_transport: None,
             request_is_grpc_web: false,
+            request_is_grpc_web_text: false,
             plugin_trigger_decisions: Vec::new(),
             metadata: HashMap::new(),
             ai_usage_export: None,
@@ -3910,6 +4081,7 @@ impl RequestContext {
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
             route_override_request_timeout_ms: None,
+            route_override_attempt_timeout_ms: None,
             route_override_backend_connect_timeout_ms: None,
             route_override_retry: None,
             route_override_request_transform: None,
@@ -4186,6 +4358,12 @@ impl RequestContext {
         self.gateway_deadline_response_selected
     }
 
+    /// Whether the response in hand is the charged backend deadline terminal
+    /// (#5744); see [`Self::end_charged_grpc_route_attempt`].
+    pub(crate) fn charged_backend_deadline_terminal(&self) -> bool {
+        self.charged_backend_deadline_terminal
+    }
+
     pub(crate) fn mark_gateway_capacity_response_selected(&mut self) {
         self.gateway_capacity_response_selected = true;
     }
@@ -4320,40 +4498,174 @@ impl RequestContext {
     /// the route budget wins), so the existing gRPC deadline machinery owns its
     /// dispatch, backoff, response-body, and `DEADLINE_EXCEEDED` terminals and
     /// the remaining budget is what is forwarded upstream as `grpc-timeout`.
-    /// Folding only ever shortens the budget, so re-arming is idempotent. Every
-    /// other request carries the instant in [`Self::route_request_deadline_at`].
+    /// Folding the total only ever shortens that budget. Every other request
+    /// carries the instant in [`Self::route_request_deadline_at`].
+    ///
+    /// The rule's per-attempt budget ([`Self::route_override_attempt_timeout_ms`])
+    /// is armed here too. A non-gRPC request carries it in
+    /// [`Self::route_attempt_timeout`], and proxy core starts it for each
+    /// attempt at the handoff to the backend. A gRPC-flavored request folds it
+    /// into its RPC deadline, anchored now (once the rule is selected); proxy
+    /// core re-arms a fresh budget for each retry attempt
+    /// ([`Self::begin_grpc_route_attempt`]).
+    ///
+    /// Re-arming is therefore NOT idempotent for a gRPC-flavored rule that
+    /// carries an attempt budget: every arm restarts that budget from now (it
+    /// can move later, never past the total), which is still before the
+    /// attempt is handed to the backend.
     ///
     /// Public only for external contract tests; proxy core is the only
     /// production caller.
     #[doc(hidden)]
     pub fn arm_route_request_deadline(&mut self, grpc_flavored: bool) {
-        let Some(timeout_ms) = self
+        let request_timeout_ms = self
             .route_override_request_timeout_ms
+            .filter(|timeout_ms| *timeout_ms > 0);
+        let attempt_timeout = self
+            .route_override_attempt_timeout_ms
             .filter(|timeout_ms| *timeout_ms > 0)
-        else {
-            self.route_request_deadline_at = None;
-            return;
-        };
+            .map(Duration::from_millis);
         if grpc_flavored {
             self.route_request_deadline_at = None;
-            let budget_ms = self
-                .grpc_deadline_budget_ms
-                .map_or(timeout_ms, |current| current.min(timeout_ms));
-            self.set_grpc_deadline_budget(Some(budget_ms));
+            self.route_attempt_timeout = None;
+            // Drop the fold of an earlier arm first, so a re-arm whose rule no
+            // longer carries an attempt budget restores the total deadline.
+            self.end_grpc_route_attempt();
+            if let Some(timeout_ms) = request_timeout_ms {
+                let budget_ms = self
+                    .grpc_deadline_budget_ms
+                    .map_or(timeout_ms, |current| current.min(timeout_ms));
+                self.set_grpc_deadline_budget(Some(budget_ms));
+            }
+            self.grpc_route_attempt_timeout = attempt_timeout;
+            self.begin_grpc_route_attempt();
             return;
         }
-        self.route_request_deadline_at = self
-            .grpc_deadline_received_at
-            .checked_add(Duration::from_millis(timeout_ms));
+        self.end_grpc_route_attempt();
+        self.grpc_route_attempt_timeout = None;
+        self.route_attempt_timeout = attempt_timeout;
+        self.route_request_deadline_at = request_timeout_ms.and_then(|timeout_ms| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(timeout_ms))
+        });
+    }
+
+    /// The matched route rule's per-attempt total budget for this NON-gRPC
+    /// request, armed by [`Self::arm_route_request_deadline`]. Always `None`
+    /// for a gRPC-flavored request, whose attempt budget is folded into
+    /// [`Self::grpc_deadline_at`] instead.
+    pub fn route_attempt_timeout(&self) -> Option<Duration> {
+        self.route_attempt_timeout
+    }
+
+    /// Start a fresh per-attempt budget on a gRPC-flavored request: the RPC
+    /// deadline becomes the earlier of the receipt-anchored total budget and
+    /// `now + attempt budget`. On a tie the total binds, exactly as a
+    /// non-gRPC request reports a total-deadline expiry when both elapse
+    /// together. A no-op unless the matched rule carries an attempt budget.
+    ///
+    /// Public only for external contract tests; proxy core is the only
+    /// production caller.
+    #[doc(hidden)]
+    pub fn begin_grpc_route_attempt(&mut self) {
+        // A new attempt's response is not the previous attempt's charged
+        // terminal.
+        self.charged_backend_deadline_terminal = false;
+        let Some(attempt_timeout) = self.grpc_route_attempt_timeout else {
+            return;
+        };
+        let total = self.grpc_total_deadline_at();
+        let attempt = tokio::time::Instant::now().checked_add(attempt_timeout);
+        self.grpc_route_attempt_deadline_at =
+            attempt.filter(|attempt| total.is_none_or(|total| *attempt < total));
+        self.grpc_deadline_at = match (total, attempt) {
+            (Some(total), Some(attempt)) => Some(total.min(attempt)),
+            (total, attempt) => total.or(attempt),
+        };
+    }
+
+    /// Whether the RPC deadline in force is the current attempt's route budget
+    /// (`attempt_timeout_ms`, Gateway API `timeouts.backendRequest`) rather
+    /// than the receipt-anchored total (the client `grpc-timeout`, a
+    /// `grpc_deadline` policy, or the route's `timeouts.request`). Proxy core
+    /// charges an expiry raised after the request was sent to the backend
+    /// while this holds, exactly as it charges a stalled backend under
+    /// `timeout_ms` alone.
+    pub fn grpc_deadline_is_route_attempt_budget(&self) -> bool {
+        self.grpc_route_attempt_deadline_at
+            .is_some_and(|attempt| self.grpc_deadline_at == Some(attempt))
+    }
+
+    /// End the current gRPC attempt's budget: the RPC deadline reverts to the
+    /// receipt-anchored total, so retry backoff is bounded by the total budget
+    /// alone and never by the attempt that just failed. A no-op unless the
+    /// matched rule carries an attempt budget.
+    ///
+    /// It also clears the charged backend deadline marker (#5744): an attempt
+    /// ended for retry backoff leaves no charged terminal in hand, and whatever
+    /// response replaces it is not that terminal.
+    ///
+    /// Public only for external contract tests; proxy core is the only
+    /// production caller.
+    #[doc(hidden)]
+    pub fn end_grpc_route_attempt(&mut self) {
+        if self.grpc_route_attempt_timeout.is_some() {
+            self.grpc_deadline_at = self.grpc_total_deadline_at();
+        }
+        self.grpc_route_attempt_deadline_at = None;
+        self.charged_backend_deadline_terminal = false;
+    }
+
+    /// End an attempt whose budget expiry proxy core charged to the backend
+    /// (#5744) and mark the charged `Backend deadline exceeded` terminal it
+    /// produced. The spent budget no longer bounds the response pipeline, so
+    /// the marker takes over: `after_proxy` skips response replacers and gives
+    /// every other hook one poll, detaching pending work; the final-body
+    /// validators are skipped; and committed observers get one poll each. The
+    /// terminal keeps its charged wording throughout. Ending the attempt for
+    /// retry backoff, or starting a new one, clears the marker.
+    pub(crate) fn end_charged_grpc_route_attempt(&mut self) {
+        self.end_grpc_route_attempt();
+        self.charged_backend_deadline_terminal = true;
+    }
+
+    /// The receipt-anchored total RPC deadline — the client / `grpc_deadline`
+    /// policy budget with any route total folded in — without the current
+    /// attempt's budget.
+    fn grpc_total_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.grpc_deadline_budget_ms.and_then(|budget| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(budget))
+        })
     }
 
     /// Attribute a gateway-authored route-deadline terminal in the transaction
     /// log. The value is a compiled-in literal naming the phase that expired.
+    /// Any phase other than `dispatch` means no backend held the request, so
+    /// the `504` carries the `request_timeout` `X-Gateway-Error` token.
     pub(crate) fn mark_route_request_timeout_exceeded(&mut self, phase: &'static str) {
+        self.route_request_timeout_phase = Some(phase);
         self.metadata.insert(
             ROUTE_REQUEST_TIMEOUT_METADATA_KEY.to_string(),
             phase.to_string(),
         );
+    }
+
+    /// Whether trusted proxy code has recorded a route-deadline phase for this
+    /// request; see [`Self::mark_route_request_timeout_exceeded`]. Never read
+    /// from the plugin-writable transaction metadata.
+    #[inline]
+    pub(crate) fn route_request_timeout_recorded(&self) -> bool {
+        self.route_request_timeout_phase.is_some()
+    }
+
+    /// Whether a route-deadline `504` was recorded for this request before any
+    /// backend held it; see [`Self::mark_route_request_timeout_exceeded`].
+    #[inline]
+    pub(crate) fn route_request_timeout_before_backend(&self) -> bool {
+        let dispatch = crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH;
+        self.route_request_timeout_phase
+            .is_some_and(|phase| phase != dispatch)
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
@@ -5158,9 +5470,16 @@ impl RequestContext {
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
             grpc_deadline_at: self.grpc_deadline_at,
             route_request_deadline_at: self.route_request_deadline_at,
+            route_attempt_timeout: self.route_attempt_timeout,
+            grpc_route_attempt_timeout: self.grpc_route_attempt_timeout,
+            grpc_route_attempt_deadline_at: self.grpc_route_attempt_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
+            route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
+            diagnostic_slot: self.diagnostic_slot.clone(),
+            backend_attempt_trace: self.backend_attempt_trace.clone(),
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
@@ -5175,6 +5494,7 @@ impl RequestContext {
             origin_http_response_status: self.origin_http_response_status,
             request_wire_transport: self.request_wire_transport,
             request_is_grpc_web: self.request_is_grpc_web,
+            request_is_grpc_web_text: self.request_is_grpc_web_text,
             // Carried, not dropped: the memoized trigger decisions ARE the
             // authority for whether an instance runs. Re-deriving them on this
             // clone would let a `before_proxy` header/path/query rewrite flip a
@@ -5354,6 +5674,7 @@ impl RequestContext {
             route_override_resolved_tls: self.route_override_resolved_tls.clone(),
             route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
             route_override_request_timeout_ms: self.route_override_request_timeout_ms,
+            route_override_attempt_timeout_ms: self.route_override_attempt_timeout_ms,
             route_override_backend_connect_timeout_ms: self
                 .route_override_backend_connect_timeout_ms,
             route_override_retry: self.route_override_retry.clone(),
@@ -5525,6 +5846,18 @@ impl RequestContext {
     /// Whether the frontend classified this request as recognized gRPC-Web.
     pub fn request_is_grpc_web(&self) -> bool {
         self.request_is_grpc_web
+    }
+
+    /// Stamp whether the request's own `Content-Type` named gRPC-Web text
+    /// framing. Called once per request by the H1/H2 and H3 frontends from the
+    /// inbound field, before any hook runs.
+    pub(crate) fn set_request_grpc_web_text(&mut self, text: bool) {
+        self.request_is_grpc_web_text = text;
+    }
+
+    /// Whether the client uploaded gRPC-Web in text (base64) framing.
+    pub fn request_is_grpc_web_text(&self) -> bool {
+        self.request_is_grpc_web_text
     }
 
     /// Previously memoized execution-trigger decision for `token`, if any.
@@ -6735,6 +7068,16 @@ impl PrecommitResponsePhaseBound {
     ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
         self.bound.expired_authorization()
     }
+
+    /// The credential's termination class once its authorization deadline
+    /// has elapsed, whether or not it is the winning bound. Gates work that
+    /// has not been polled yet; attribution of an ended phase stays with
+    /// [`Self::expired_authorization`].
+    pub(crate) fn elapsed_authorization(
+        self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.bound.elapsed_authorization()
+    }
 }
 
 /// Outcome of one awaited PRE-COMMITMENT response phase.
@@ -6944,6 +7287,23 @@ pub enum ResponseStreamInspectorStage {
 /// streaming loop and inside the detached task that drives the poll-based H1/H2
 /// channel body (which cannot borrow the request `ctx`). The proxy drives it
 /// chunk-by-chunk and relays the returned [`ResponseStreamAction`] bytes.
+///
+/// # Terminal payloads
+///
+/// A `Terminate` payload never carries backend bytes that a later chained
+/// inspector has not inspected. The only or last inspector may put bytes it
+/// cleared ahead of its terminal event in the payload, since every inspector
+/// already passed them. An inspector that a later one follows (see
+/// [`Self::set_chained_client_line_open`]) must not: its payload reaches the
+/// client around the later inspectors. To cut after bytes it cleared in the
+/// same call, it returns them in `Forward` and defers the cut instead (see
+/// [`Self::has_deferred_cut`]). The chain passes those bytes through every
+/// later inspector, each flushed with [`Self::flush_before_cut`], before it
+/// emits the terminal payload, so the client receives each cleared byte once,
+/// inspected by every later inspector, followed by the terminal event. One
+/// exception: a later inspector that another follows and that releases some
+/// of those bytes, then cuts in its flush, has them dropped, since the
+/// inspectors after it have not passed them.
 #[async_trait]
 pub trait ResponseStreamInspector: Send {
     /// Stage used when composing multiple inspectors. Policy inspectors should
@@ -6962,10 +7322,52 @@ pub trait ResponseStreamInspector: Send {
         ResponseStreamAction::Forward(bytes::Bytes::new())
     }
 
+    /// Flush at a cut that an earlier chained inspector deferred, once this
+    /// inspector has received the bytes that inspector cleared: the stream
+    /// ends with that cut, not with the backend's end. The chain calls this
+    /// instead of [`Self::on_end`] and sends what it releases ahead of the
+    /// terminal payload. An inspector that governs whole units at their end
+    /// (such as a tool-call batch) should drop an unfinished one here rather
+    /// than govern or release it, since the cut truncated it. The default is
+    /// [`Self::on_end`].
+    async fn flush_before_cut(&mut self) -> ResponseStreamAction {
+        self.on_end().await
+    }
+
     /// Called on inspectors that already saw bytes when a later inspector cuts
-    /// the chain. Earlier inspectors can use this to discard pre-cut state that
-    /// no longer represents the client-visible stream.
+    /// the chain, and, once flushed, on the inspectors after one whose cut
+    /// the chain deferred (see [`Self::has_deferred_cut`]). Inspectors can use
+    /// this to discard pre-cut state that no longer represents the
+    /// client-visible stream, or to record that the stream ended with a cut
+    /// rather than complete.
     fn on_downstream_terminated(&mut self) {}
+
+    /// Called by a chain before each hook on an inspector that a later
+    /// inspector follows, with whether the bytes the chain already sent to the
+    /// client end mid-line (the last is neither CR nor LF). That inspector's
+    /// output is not what the client receives, and its `Terminate` payload
+    /// reaches the client without passing the later inspectors, so the payload
+    /// must not carry backend bytes. The default ignores it.
+    fn set_chained_client_line_open(&mut self, _open: bool) {}
+
+    /// Whether the last hook call cut the stream after clearing the bytes it
+    /// returned in `Forward`. Only an inspector that a later one follows
+    /// defers a cut. The chain then runs those bytes through every later
+    /// inspector, each flushed with [`Self::flush_before_cut`] and then told
+    /// [`Self::on_downstream_terminated`], and ends the stream with what they
+    /// released followed by [`Self::take_deferred_cut`]'s payload. A later
+    /// inspector that cuts on those bytes wins. The default never defers.
+    fn has_deferred_cut(&self) -> bool {
+        false
+    }
+
+    /// Take the deferred cut's terminal payload (`None` for a cut without
+    /// one), framed for a client whose received bytes end mid-line when
+    /// `client_line_open`. Like any chained `Terminate` payload, it must not
+    /// carry backend bytes.
+    fn take_deferred_cut(&mut self, _client_line_open: bool) -> Option<bytes::Bytes> {
+        None
+    }
 
     /// Called immediately before the owning stream task publishes inspector
     /// completion to terminal hooks.
@@ -6994,7 +7396,10 @@ pub fn chain_response_stream_inspectors(
         1 => inspectors.pop(),
         _ => {
             inspectors.sort_by_key(|inspector| inspector.stage());
-            Some(Box::new(ChainedResponseStreamInspector { inspectors }))
+            Some(Box::new(ChainedResponseStreamInspector {
+                inspectors,
+                client_line_open: false,
+            }))
         }
     }
 }
@@ -7119,8 +7524,24 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
         self.inner.on_end().await
     }
 
+    async fn flush_before_cut(&mut self) -> ResponseStreamAction {
+        self.inner.flush_before_cut().await
+    }
+
     fn on_downstream_terminated(&mut self) {
         self.inner.on_downstream_terminated();
+    }
+
+    fn set_chained_client_line_open(&mut self, open: bool) {
+        self.inner.set_chained_client_line_open(open);
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.inner.has_deferred_cut()
+    }
+
+    fn take_deferred_cut(&mut self, client_line_open: bool) -> Option<bytes::Bytes> {
+        self.inner.take_deferred_cut(client_line_open)
     }
 }
 
@@ -7506,88 +7927,60 @@ pub async fn normalize_response_body_for_inspection(
 /// `Terminate` actions short-circuit and cut the stream. A normalizer's terminal
 /// payload is different: it is the final client-visible window, so it is passed
 /// through every downstream inspector and their end-of-stream flushes before
-/// the chain returns `Terminate`. Same-call clean releases from a downstream
-/// policy cut are dropped, preserving the single-action contract.
+/// the chain returns `Terminate`. A policy cut drops what earlier inspectors
+/// released in the same call, since the cutting and later inspectors have not
+/// passed it; bytes the last inspector released earlier in the same call leave
+/// ahead of its terminal payload. An inspector that cuts after clearing bytes
+/// defers its cut instead: those bytes pass every later inspector and their
+/// flushes before the cut, then its terminal payload follows what they
+/// released, unless a later inspector cuts first. The chain tracks whether the
+/// bytes it sent end mid-line and tells each inspector that a later one
+/// follows, so a cut there frames its terminal payload after what the client
+/// actually received.
 struct ChainedResponseStreamInspector {
     inspectors: Vec<Box<dyn ResponseStreamInspector>>,
+    /// Whether the bytes this chain returned so far end mid-line.
+    client_line_open: bool,
+}
+
+/// How the stream ended ahead of a chain flush.
+#[derive(Clone, Copy)]
+enum ChainFlushEnd {
+    /// The backend stream ended; the flush forwards what it released.
+    Eof,
+    /// A normalizer ended the stream with its final window.
+    Normalized,
+    /// The inspector at this index cut after clearing the flushed bytes and
+    /// deferred its terminal payload.
+    Cut(usize),
+}
+
+impl ChainFlushEnd {
+    /// The end after a normalizer terminates; a deferred cut still stands.
+    fn normalized(self) -> Self {
+        match self {
+            Self::Eof => Self::Normalized,
+            end => end,
+        }
+    }
 }
 
 #[async_trait]
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        let mut buf = bytes::Bytes::copy_from_slice(chunk);
-        for index in 0..self.inspectors.len() {
-            if buf.is_empty() {
-                // An upstream inspector is holding this window; nothing yet for
-                // the rest of the chain to see.
-                return ResponseStreamAction::Forward(bytes::Bytes::new());
-            }
-            match self.inspectors[index].on_chunk(&buf).await {
-                ResponseStreamAction::Forward(out) => buf = out,
-                ResponseStreamAction::Terminate(final_bytes)
-                    if self.inspectors[index].stage()
-                        == ResponseStreamInspectorStage::Normalize =>
-                {
-                    return self
-                        .finish_after_normalizer_termination(index, final_bytes)
-                        .await;
-                }
-                terminate @ ResponseStreamAction::Terminate(_) => {
-                    self.notify_prior_downstream_terminated(index);
-                    return terminate;
-                }
-            }
-        }
-        ResponseStreamAction::Forward(buf)
+        let action = self.chunk_through(chunk).await;
+        self.note_sent(&action);
+        action
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         // Flush each inspector in order; bytes flushed by inspector *i* are fed to
         // inspector *i+1* as a final chunk before *i+1* is itself flushed.
-        let mut carry = bytes::Bytes::new();
-        for index in 0..self.inspectors.len() {
-            let mut released = bytes::BytesMut::new();
-            if !carry.is_empty() {
-                match self.inspectors[index].on_chunk(&carry).await {
-                    ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                    ResponseStreamAction::Terminate(final_bytes)
-                        if self.inspectors[index].stage()
-                            == ResponseStreamInspectorStage::Normalize =>
-                    {
-                        return self
-                            .finish_after_normalizer_termination(index, final_bytes)
-                            .await;
-                    }
-                    terminate @ ResponseStreamAction::Terminate(_) => {
-                        self.notify_prior_downstream_terminated(index);
-                        return terminate;
-                    }
-                }
-            }
-            match self.inspectors[index].on_end().await {
-                ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                ResponseStreamAction::Terminate(final_bytes)
-                    if self.inspectors[index].stage()
-                        == ResponseStreamInspectorStage::Normalize =>
-                {
-                    if let Some(final_bytes) = final_bytes {
-                        released.extend_from_slice(&final_bytes);
-                    }
-                    return self
-                        .finish_after_normalizer_termination(
-                            index,
-                            (!released.is_empty()).then(|| released.freeze()),
-                        )
-                        .await;
-                }
-                terminate @ ResponseStreamAction::Terminate(_) => {
-                    self.notify_prior_downstream_terminated(index);
-                    return terminate;
-                }
-            }
-            carry = released.freeze();
-        }
-        ResponseStreamAction::Forward(carry)
+        let action = self
+            .flush_from(0, bytes::Bytes::new(), ChainFlushEnd::Eof)
+            .await;
+        self.note_sent(&action);
+        action
     }
 
     fn on_before_drop(&mut self) {
@@ -7598,23 +7991,65 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
 }
 
 impl ChainedResponseStreamInspector {
-    async fn finish_after_normalizer_termination(
+    async fn chunk_through(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let mut buf = bytes::Bytes::copy_from_slice(chunk);
+        for index in 0..self.inspectors.len() {
+            if buf.is_empty() {
+                // An upstream inspector is holding this window; nothing yet for
+                // the rest of the chain to see.
+                return ResponseStreamAction::Forward(bytes::Bytes::new());
+            }
+            self.prime(index);
+            match self.inspectors[index].on_chunk(&buf).await {
+                ResponseStreamAction::Forward(out) => buf = out,
+                ResponseStreamAction::Terminate(final_bytes)
+                    if self.inspectors[index].stage()
+                        == ResponseStreamInspectorStage::Normalize =>
+                {
+                    self.notify_prior_downstream_terminated(index);
+                    let carry = final_bytes.unwrap_or_default();
+                    return self
+                        .flush_from(index + 1, carry, ChainFlushEnd::Normalized)
+                        .await;
+                }
+                terminate @ ResponseStreamAction::Terminate(_) => {
+                    self.notify_prior_downstream_terminated(index);
+                    return terminate;
+                }
+            }
+            if self.inspectors[index].has_deferred_cut() {
+                self.notify_prior_downstream_terminated(index);
+                return self
+                    .flush_from(index + 1, buf, ChainFlushEnd::Cut(index))
+                    .await;
+            }
+        }
+        ResponseStreamAction::Forward(buf)
+    }
+
+    /// Flush inspectors `from..` as the end of the stream: each receives
+    /// `carry`, what the inspectors before it released, as a final chunk, and
+    /// is then flushed, with [`ResponseStreamInspector::flush_before_cut`]
+    /// once an earlier inspector deferred a cut. `end` says how the stream
+    /// ended ahead of `from`.
+    async fn flush_from(
         &mut self,
-        normalizer_index: usize,
-        final_bytes: Option<bytes::Bytes>,
+        from: usize,
+        mut carry: bytes::Bytes,
+        mut end: ChainFlushEnd,
     ) -> ResponseStreamAction {
-        self.notify_prior_downstream_terminated(normalizer_index);
-        let mut carry = final_bytes.unwrap_or_default();
-        for index in normalizer_index + 1..self.inspectors.len() {
+        for index in from..self.inspectors.len() {
             let stage = self.inspectors[index].stage();
             let mut released = bytes::BytesMut::new();
             if !carry.is_empty() {
+                self.prime(index);
                 match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                     ResponseStreamAction::Terminate(final_bytes)
                         if stage == ResponseStreamInspectorStage::Normalize =>
                     {
                         self.notify_prior_downstream_terminated(index);
+                        end = end.normalized();
                         carry = final_bytes.unwrap_or_default();
                         continue;
                     }
@@ -7623,13 +8058,27 @@ impl ChainedResponseStreamInspector {
                         return terminate;
                     }
                 }
+                if self.inspectors[index].has_deferred_cut() {
+                    // Its cut follows what it just released; it has nothing
+                    // left to flush.
+                    self.notify_prior_downstream_terminated(index);
+                    end = ChainFlushEnd::Cut(index);
+                    carry = released.freeze();
+                    continue;
+                }
             }
-            match self.inspectors[index].on_end().await {
+            self.prime(index);
+            let flushed = match end {
+                ChainFlushEnd::Cut(_) => self.inspectors[index].flush_before_cut().await,
+                _ => self.inspectors[index].on_end().await,
+            };
+            match flushed {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
                 ResponseStreamAction::Terminate(final_bytes)
                     if stage == ResponseStreamInspectorStage::Normalize =>
                 {
                     self.notify_prior_downstream_terminated(index);
+                    end = end.normalized();
                     if let Some(final_bytes) = final_bytes {
                         released.extend_from_slice(&final_bytes);
                     }
@@ -7638,15 +8087,88 @@ impl ChainedResponseStreamInspector {
                 }
                 terminate @ ResponseStreamAction::Terminate(_) => {
                     self.notify_prior_downstream_terminated(index);
-                    return terminate;
+                    return self.cut_after_last_released(index, released, terminate);
                 }
+            }
+            if self.inspectors[index].has_deferred_cut() {
+                self.notify_prior_downstream_terminated(index);
+                end = ChainFlushEnd::Cut(index);
             }
             carry = released.freeze();
         }
-        if carry.is_empty() {
-            ResponseStreamAction::Terminate(None)
-        } else {
-            ResponseStreamAction::Terminate(Some(carry))
+        match end {
+            ChainFlushEnd::Eof => ResponseStreamAction::Forward(carry),
+            ChainFlushEnd::Normalized if carry.is_empty() => ResponseStreamAction::Terminate(None),
+            ChainFlushEnd::Normalized => ResponseStreamAction::Terminate(Some(carry)),
+            ChainFlushEnd::Cut(owner) => self.emit_deferred_cut(owner, carry),
+        }
+    }
+
+    /// Tell inspector `index` whether the client's line is open when a later
+    /// inspector still sees its output.
+    fn prime(&mut self, index: usize) {
+        if index + 1 < self.inspectors.len() {
+            self.inspectors[index].set_chained_client_line_open(self.client_line_open);
+        }
+    }
+
+    /// Record whether `action` leaves the client mid-line.
+    fn note_sent(&mut self, action: &ResponseStreamAction) {
+        if let ResponseStreamAction::Forward(bytes) = action
+            && let Some(&last) = bytes.last()
+        {
+            self.client_line_open = !matches!(last, b'\n' | b'\r');
+        }
+    }
+
+    /// A policy cut from the last inspector's `on_end` follows `released`, the
+    /// bytes its `on_chunk` released in the same call. Every inspector cleared
+    /// them and the cutting one framed its payload after them, so they leave
+    /// first, even when the cut has no payload of its own; an earlier
+    /// inspector's release has not passed the later ones and stays dropped.
+    fn cut_after_last_released(
+        &self,
+        index: usize,
+        mut released: bytes::BytesMut,
+        action: ResponseStreamAction,
+    ) -> ResponseStreamAction {
+        match action {
+            ResponseStreamAction::Terminate(final_bytes)
+                if index + 1 == self.inspectors.len() && !released.is_empty() =>
+            {
+                if let Some(final_bytes) = final_bytes {
+                    released.extend_from_slice(&final_bytes);
+                }
+                ResponseStreamAction::Terminate(Some(released.freeze()))
+            }
+            action => action,
+        }
+    }
+
+    /// End the stream with `carry`, what every inspector after `owner`
+    /// released of the bytes it cleared before its deferred cut, followed by
+    /// that cut's terminal payload framed after what the client then holds.
+    /// The inspectors after `owner`, now flushed, learn that the stream ended
+    /// with a cut rather than complete. Allocates only here, on a cut.
+    fn emit_deferred_cut(&mut self, owner: usize, carry: bytes::Bytes) -> ResponseStreamAction {
+        for inspector in &mut self.inspectors[owner + 1..] {
+            inspector.on_downstream_terminated();
+        }
+        let client_line_open = match carry.last() {
+            Some(&last) => !matches!(last, b'\n' | b'\r'),
+            None => self.client_line_open,
+        };
+        let payload = self.inspectors[owner].take_deferred_cut(client_line_open);
+        match payload {
+            None if carry.is_empty() => ResponseStreamAction::Terminate(None),
+            None => ResponseStreamAction::Terminate(Some(carry)),
+            Some(payload) if carry.is_empty() => ResponseStreamAction::Terminate(Some(payload)),
+            Some(payload) => {
+                let mut out = bytes::BytesMut::with_capacity(carry.len() + payload.len());
+                out.extend_from_slice(&carry);
+                out.extend_from_slice(&payload);
+                ResponseStreamAction::Terminate(Some(out.freeze()))
+            }
         }
     }
 
@@ -7698,6 +8220,20 @@ mod chained_inspector_tests {
 
         async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"FINAL")))
+        }
+    }
+
+    /// Passes chunks through unchanged; cuts at end-of-stream with `payload`.
+    struct CutAtEnd {
+        payload: Option<&'static [u8]>,
+    }
+    #[async_trait]
+    impl ResponseStreamInspector for CutAtEnd {
+        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        }
+        async fn on_end(&mut self) -> ResponseStreamAction {
+            ResponseStreamAction::Terminate(self.payload.map(bytes::Bytes::from_static))
         }
     }
 
@@ -7764,6 +8300,47 @@ mod chained_inspector_tests {
                 assert_eq!(bytes.as_ref(), b"FINALB");
             }
             other => panic!("expected terminal downstream output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_last_end_cut_drops_what_its_carry_chunk_released() {
+        // "A" flushed by the first inspector passes the cutting one's
+        // `on_chunk`, but the last inspector never saw it, so the cut must not
+        // carry it around that inspector.
+        for payload in [Some(&b"CUT"[..]), None] {
+            let mut chain = chain_response_stream_inspectors(vec![
+                Box::new(TagAtEnd { tag: "A" }),
+                Box::new(CutAtEnd { payload }),
+                Box::new(TagAtEnd { tag: "B" }),
+            ])
+            .expect("chain");
+            match chain.on_end().await {
+                ResponseStreamAction::Terminate(final_bytes) => {
+                    assert_eq!(final_bytes.as_deref(), payload, "no backend bytes");
+                }
+                other => panic!("expected Terminate, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn last_end_cut_emits_what_its_carry_chunk_released_first() {
+        // As the last inspector, what the cutting one released every inspector
+        // passed, so it leaves ahead of the payload, or alone on a silent cut.
+        let cases: [(Option<&'static [u8]>, &[u8]); 2] = [(Some(b"CUT"), b"ACUT"), (None, b"A")];
+        for (payload, expected) in cases {
+            let mut chain = chain_response_stream_inspectors(vec![
+                Box::new(TagAtEnd { tag: "A" }),
+                Box::new(CutAtEnd { payload }),
+            ])
+            .expect("chain");
+            match chain.on_end().await {
+                ResponseStreamAction::Terminate(Some(bytes)) => {
+                    assert_eq!(bytes.as_ref(), expected);
+                }
+                other => panic!("expected terminal output, got {other:?}"),
+            }
         }
     }
 
@@ -8162,21 +8739,32 @@ impl TransactionSummary {
     /// HTTP transport status. Missing or malformed terminal status on a known
     /// gRPC transaction remains a failure: missing is UNKNOWN (2), while
     /// malformed input uses the existing `u32::MAX` invalid-status sentinel.
+    /// A status that is present on the wire but unreadable by the gateway
+    /// ([`crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY`]) is
+    /// not missing, so it stays `None` rather than UNKNOWN.
     /// Translated gRPC-Web requests are stamped as `request_protocol="grpc"`
     /// by the H1/H2 and H3 dispatchers; no runtime path currently produces
     /// `request_protocol="grpc-web"` (mesh uses `mesh.request_protocol`).
     pub fn grpc_status(&self) -> Option<u32> {
         match self.metadata.get("grpc_status") {
             Some(status) => Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status)),
-            None if self
-                .metadata
-                .get("request_protocol")
-                .is_some_and(|protocol| protocol == "grpc") =>
-            {
+            None if self.grpc_status_missing() => {
                 Some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
             }
             None => None,
         }
+    }
+
+    /// Whether this is a gRPC transaction whose terminal status never reached
+    /// the log. A status present on the wire but unreadable by the gateway is
+    /// not missing.
+    fn grpc_status_missing(&self) -> bool {
+        let is_grpc = self
+            .metadata
+            .get("request_protocol")
+            .is_some_and(|protocol| protocol == "grpc");
+        let unreadable = crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY;
+        is_grpc && !self.metadata.contains_key(unreadable)
     }
 
     /// Gateway-authored rejection phase (`circuit_breaker_open`,
@@ -8296,6 +8884,7 @@ impl TransactionSummary {
         for key in [
             "request_protocol",
             "grpc_status",
+            crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY,
             "grpc_message",
             "rejection_phase",
             "mirror_error",
@@ -8390,6 +8979,15 @@ pub async fn log_with_mirror(
         }
     }
     let summary = stamped.as_deref().unwrap_or(summary);
+    // Gateway diagnostic reference (issue #5767): the terminal summary is the
+    // authoritative description of the client-visible outcome, so it is the
+    // detail a reference minted for this response resolves to. The first record
+    // wins: a detached delivery already recorded it before spawning.
+    if let Some(slot) = ctx.diagnostic_slot()
+        && slot.detail().is_none()
+    {
+        crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
+    }
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
@@ -8499,6 +9097,13 @@ pub fn spawn_bounded_terminal_summary_log(
     summary: TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // Gateway diagnostic reference (issue #5767): record the detail on the
+    // request task, before admission, so a delivery refused by
+    // `FERRUM_LOG_DELIVERY_MAX_TASKS` cannot leave the client's reference
+    // without its detail. The spawned `log_with_mirror` then finds it set.
+    if let Some(slot) = ctx.diagnostic_slot() {
+        crate::diagnostic_ref::record_request_detail(slot, &summary, ctx);
+    }
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
@@ -9834,6 +10439,18 @@ pub trait Plugin: Send + Sync {
     /// Ordinary body transforms that only need to affect the backend-visible
     /// bytes should keep using `transform_request_body` instead.
     fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when every `Reject`/`RejectBinary` this plugin returns
+    /// is an origin-authored representation (a cached backend response, a
+    /// federated provider response) rather than a rejection of its own.
+    ///
+    /// Gateway diagnostic references (issue #5846) never mark such a response
+    /// as a gateway rejection, whatever its status. Plugins whose short-circuit
+    /// is origin content only on some paths mark the request instead
+    /// (`RequestContext::serves_origin_representation`).
+    fn rejects_with_origin_response(&self) -> bool {
         false
     }
 

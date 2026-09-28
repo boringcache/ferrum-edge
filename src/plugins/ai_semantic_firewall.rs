@@ -21,9 +21,11 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
-    SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
-    is_gemini_stream_frame, is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
-    parse_sse_data_frames_checked,
+    SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
+    classify_forwarded_sse_prefix, encode_sse_error_event, is_gemini_stream_frame,
+    is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
+    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after, sse_event_on_fresh_line,
+    sse_line_end,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -3713,6 +3715,25 @@ struct HeldEvent {
     frame_bytes: usize,
 }
 
+/// How [`StreamWindowEngine::absorb_event`] reads the bytes of one event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventParse {
+    /// A complete event, or the unterminated tail at end of stream, read from
+    /// its first byte together with any context carried before it.
+    Whole,
+    /// The start of an event that outgrew the window before it ended. Never
+    /// parsed: read alone, the fragment could split a `data:` field name at
+    /// the cut and look like ignored non-data lines.
+    Forced,
+    /// The rest of an event whose start was [`Forced`](Self::Forced). It is
+    /// part of that same uninspectable event, so `on_error` decides it too:
+    /// it starts inside a line cut at an arbitrary byte, where a `:` inside a
+    /// JSON value reads as a comment, so on its own it can look clean. Its
+    /// frames are still parsed, best effort, so anything they show is
+    /// inspected.
+    ForcedRest,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IngestStep {
     consumed: usize,
@@ -3745,8 +3766,21 @@ struct StreamWindowEngine {
     store_frames: bool,
     reassembler: SseReassembler,
     /// Raw bytes received but not yet split into a complete SSE event. Bounded
-    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded.
+    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded;
+    /// the rest of a force-flushed event may exceed it by the one framing byte
+    /// saved as its context.
     carry: Vec<u8>,
+    /// How many leading bytes of `carry` are context only: they already left
+    /// the gateway, or belong to an event already absorbed into `held`. They
+    /// are read together with the bytes after them — to parse the event, or to
+    /// find its end — but are never held, released or forwarded again, and the
+    /// hold clock does not count them.
+    carry_context: usize,
+    /// `carry` continues an event whose start was force-flushed at the byte
+    /// cap. Its context is the flushed event's final byte, so the event's end is
+    /// still found where the client finds it, and the rest of that event is
+    /// absorbed as uninspectable instead of being read as a fresh event.
+    carry_continues_forced: bool,
     /// Complete, reassembled events not yet released — oldest first.
     held: Vec<HeldEvent>,
     /// Assistant-content length already inspected-clean and released, in the
@@ -3764,6 +3798,15 @@ struct StreamWindowEngine {
     /// [`passthrough_to_event_end`]. Never re-emitted, never held awaiting a
     /// semantic verdict, and never counted by the hold clock.
     passthrough_tail: Vec<u8>,
+    /// After a fail-open hold timeout forwarded a carry that ends inside a
+    /// leading BOM, how many more bytes complete that BOM. Only those bytes are
+    /// forwarded uninspected; normal inspection resumes right after them.
+    passthrough_bom_rest: usize,
+    /// After a fail-open hold timeout forwarded a carry that ends inside a
+    /// comment, `id` or `retry` line, the rest of that line through its next CR
+    /// or LF is forwarded uninspected, exactly as the client reads it; normal
+    /// inspection resumes right after that terminator.
+    passthrough_to_line_end: bool,
 }
 
 impl StreamWindowEngine {
@@ -3776,16 +3819,22 @@ impl StreamWindowEngine {
             config,
             reassembler: SseReassembler::new(),
             carry: Vec::new(),
+            carry_context: 0,
+            carry_continues_forced: false,
             held: Vec::new(),
             cleared_len: 0,
             pending_clears_to: None,
             passthrough_to_event_end: false,
             passthrough_tail: Vec::new(),
+            passthrough_bom_rest: 0,
+            passthrough_to_line_end: false,
         }
     }
 
     fn in_passthrough(&self) -> bool {
         self.passthrough_to_event_end
+            || self.passthrough_bom_rest > 0
+            || self.passthrough_to_line_end
     }
 
     /// Forward bytes of a fail-open mid-event remainder until the next SSE event
@@ -3796,21 +3845,54 @@ impl StreamWindowEngine {
     /// [`passthrough_tail`] is a copy of already-forwarded bytes used only to
     /// detect a blank line that spans chunk edges — it is never re-emitted and
     /// never held awaiting a semantic verdict.
+    ///
+    /// While [`passthrough_bom_rest`] is set, only the bytes that complete the
+    /// forwarded partial BOM pass; any other byte ends pass-through and is
+    /// inspected as the start of a fresh event.
+    ///
+    /// While [`passthrough_to_line_end`] is set, bytes pass through the next CR
+    /// or LF (a CRLF inside `chunk` as one terminator). A CR that ends `chunk`
+    /// ends pass-through; an LF starting the next chunk is then read by normal
+    /// ingest as the rest of that CRLF, as any carry's leading LF is.
     fn ingest_passthrough(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
+        if self.passthrough_to_line_end {
+            let Some((_, next)) = sse_line_end(chunk) else {
+                return (chunk.to_vec(), chunk.len());
+            };
+            self.passthrough_to_line_end = false;
+            return (chunk[..next].to_vec(), next);
+        }
+        if self.passthrough_bom_rest > 0 {
+            let expected = &UTF8_BOM[UTF8_BOM.len() - self.passthrough_bom_rest..];
+            let matched = chunk
+                .iter()
+                .zip(expected)
+                .take_while(|(got, want)| got == want)
+                .count();
+            self.passthrough_bom_rest = if matched == chunk.len() {
+                expected.len() - matched
+            } else {
+                0
+            };
+            return (chunk[..matched].to_vec(), matched);
+        }
         debug_assert!(self.passthrough_to_event_end);
         let mut scan = self.passthrough_tail.clone();
         let prefix_len = scan.len();
         scan.extend_from_slice(chunk);
-        if let Some(end) = next_event_end(&scan) {
+        if let Some(end) = sse_event_end(&scan) {
             self.passthrough_to_event_end = false;
             self.passthrough_tail.clear();
             // Forward only bytes from this chunk; the lookback was already sent.
             let consumed = end.saturating_sub(prefix_len).min(chunk.len());
             (chunk[..consumed].to_vec(), consumed)
         } else {
-            // Keep a 2-byte lookback so `\n` + `\n` / `\n` + `\r\n` spanning a
-            // chunk edge is still recognized. Forward the entire chunk now so
-            // pass-through cannot re-accumulate an unbounded hold.
+            // Keep a 2-byte lookback so a blank line spanning a chunk edge is
+            // still recognized under every legal terminator mix, including a CR
+            // ending this chunk whose LF starts the next (one CRLF). The scanned
+            // bytes hold no boundary, so two bytes always cover the terminator
+            // that may end them. Forward the entire chunk now so pass-through
+            // cannot re-accumulate an unbounded hold.
             let keep = scan.len().min(2);
             self.passthrough_tail = scan[scan.len() - keep..].to_vec();
             (chunk.to_vec(), chunk.len())
@@ -3822,6 +3904,8 @@ impl StreamWindowEngine {
     fn finish_passthrough(&mut self) -> Vec<u8> {
         self.passthrough_to_event_end = false;
         self.passthrough_tail.clear();
+        self.passthrough_bom_rest = 0;
+        self.passthrough_to_line_end = false;
         Vec::new()
     }
 
@@ -3830,31 +3914,47 @@ impl StreamWindowEngine {
     /// be marked uninspectable even if their individual fragment parses cleanly:
     /// parsing them independently could split a `data:` field name across the
     /// force-flush boundary and otherwise release bytes the client reassembles
-    /// into valid, uninspected SSE data.
-    fn absorb_event(&mut self, raw: Vec<u8>, force_uninspectable: bool) {
-        let raw_len = raw.len();
-        // Reassembled strings cannot contain more payload bytes than the raw
-        // event. Reserve that upper bound before parsing; if the aggregate
+    /// into valid, uninspected SSE data. The rest of such an event is
+    /// uninspectable for the same reason (see [`EventParse::ForcedRest`]).
+    ///
+    /// The first `context` bytes of `raw` are carry context: they are parsed
+    /// with the event but never held, because they already left the gateway or
+    /// belong to an event already held.
+    fn absorb_event(&mut self, mut raw: Vec<u8>, context: usize, parse: EventParse) {
+        let context = context.min(raw.len());
+        let raw_len = raw.len() - context;
+        // A forced rest's only context is the byte that frames it, so parse
+        // just its own bytes.
+        let parse_from = match parse {
+            EventParse::ForcedRest => context,
+            EventParse::Whole | EventParse::Forced => 0,
+        };
+        let parsed_len = raw.len() - parse_from;
+        // Reassembled strings cannot contain more payload bytes than the parsed
+        // bytes. Reserve that upper bound before parsing; if the aggregate
         // retained-state budget would be crossed, keep only the raw block-mode
         // bytes and mark the event uninspectable instead of duplicating it.
-        let retained = self.retained_bytes();
-        let projected = retained.saturating_add(self.absorb_cost(raw_len));
-        let within_budget = !force_uninspectable && projected <= self.config.max_window_bytes;
+        // The context is parsed but never held, so raw retention is `raw_len`.
+        let cost = self.absorb_cost(raw_len, parsed_len);
+        let projected = self.retained_bytes().saturating_add(cost);
+        let within_budget =
+            parse != EventParse::Forced && projected <= self.config.max_window_bytes;
 
         let (inspectable, frames, actual_frame_bytes) = if within_budget {
-            let parsed = parse_sse_data_frames_checked(&raw);
+            let parsed = parse_sse_data_frames_checked(&raw[parse_from..]);
             for (event, frame) in parsed.reassembly_frames() {
                 self.reassembler.push_event_frame(event, frame);
             }
             let actual_frame_bytes = if self.store_frames && !parsed.frames.is_empty() {
-                raw_len
+                parsed_len
             } else {
                 0
             };
             // A frame the Anthropic path could not fold into the reassembled
             // document leaves this window uninspectable, so block mode keeps
             // holding rather than releasing bytes no verdict ever covered.
-            let inspectable = parsed.fully_parsed
+            let inspectable = parse == EventParse::Whole
+                && parsed.fully_parsed
                 && !self.reassembler.provider_stream_uninspectable()
                 // Gemini candidates are independent client-visible streams, but
                 // release() retains one aggregate overlap. Until overlap is
@@ -3874,8 +3974,15 @@ impl StreamWindowEngine {
             (false, Vec::new(), 0)
         };
         let content_len_after = self.reassembler.assistant_content_len();
+        let raw = if self.hold_raw {
+            // Shifts in place: the context never leaves the gateway again.
+            raw.drain(..context);
+            raw
+        } else {
+            Vec::new()
+        };
         self.held.push(HeldEvent {
-            raw: if self.hold_raw { raw } else { Vec::new() },
+            raw,
             raw_len,
             content_len_after,
             inspectable,
@@ -3885,14 +3992,88 @@ impl StreamWindowEngine {
     }
 
     fn input_window_bytes(&self) -> usize {
-        self.carry
-            .len()
+        self.carry_window_bytes()
             .saturating_add(self.held.iter().map(|event| event.raw_len).sum::<usize>())
     }
 
+    /// The saved framing byte of a forced event's rest: the final byte of the
+    /// force-flushed start, kept as the only context of `carry`. It decides
+    /// where that event ends for the client, so it is never shed to make room
+    /// and is left out of every window and budget measure (it is one byte).
+    fn forced_seam_len(&self) -> usize {
+        usize::from(self.carry_continues_forced && self.carry_context > 0)
+    }
+
+    /// Bytes of `carry` the window and budget count: all of it except the
+    /// [`forced_seam_len`](Self::forced_seam_len) byte.
+    fn carry_window_bytes(&self) -> usize {
+        self.carry.len().saturating_sub(self.forced_seam_len())
+    }
+
+    /// Wire bytes awaiting a verdict: complete held events and the carry
+    /// without its context, which already left the gateway or is counted by a
+    /// held event.
+    fn held_wire_bytes(&self) -> usize {
+        let carry = self.carry.len().saturating_sub(self.carry_context);
+        let held: usize = self.held.iter().map(|event| event.raw_len).sum();
+        carry.saturating_add(held)
+    }
+
+    /// Take the first `end` bytes of `carry` (one event, or the whole carry)
+    /// with how many of them are context and how that event must be read.
+    fn take_carry(&mut self, end: usize) -> (Vec<u8>, usize, EventParse) {
+        let raw: Vec<u8> = if end >= self.carry.len() {
+            std::mem::take(&mut self.carry)
+        } else {
+            self.carry.drain(..end).collect()
+        };
+        let context = std::mem::take(&mut self.carry_context).min(raw.len());
+        let parse = if std::mem::take(&mut self.carry_continues_forced) {
+            EventParse::ForcedRest
+        } else {
+            EventParse::Whole
+        };
+        (raw, context, parse)
+    }
+
+    /// Absorb the whole un-terminated `carry`, an event that outgrew the window,
+    /// as a partial uninspectable event. Its final byte stays behind as context,
+    /// so the rest of that event is framed exactly as the client frames it and
+    /// is absorbed as [`EventParse::ForcedRest`] rather than as a fresh event.
+    fn flush_forced_carry(&mut self) {
+        let seam = self.carry.last().copied();
+        let (raw, context, _) = self.take_carry(self.carry.len());
+        self.absorb_event(raw, context, EventParse::Forced);
+        if let Some(seam) = seam {
+            self.carry.push(seam);
+            self.carry_context = 1;
+            self.carry_continues_forced = true;
+        }
+    }
+
+    /// Free window capacity held only by carry context: the open event is too
+    /// large to read together with it. The rest of the event is then read as
+    /// the uninspectable remainder of a forced one, framed against the final
+    /// context byte, which is kept as the
+    /// [`forced_seam_len`](Self::forced_seam_len) byte and no longer counts
+    /// toward the window. Never called on the rest of a forced event, whose
+    /// only context is already that byte.
+    fn shed_carry_context(&mut self) {
+        let keep = self.carry.len().min(1);
+        let shed = self.carry.len() - keep;
+        self.carry.drain(..shed);
+        self.carry_context = keep;
+        self.carry_continues_forced = true;
+    }
+
+    fn clear_carry(&mut self) {
+        self.carry.clear();
+        self.carry_context = 0;
+        self.carry_continues_forced = false;
+    }
+
     fn retained_bytes(&self) -> usize {
-        self.carry
-            .len()
+        self.carry_window_bytes()
             .saturating_add(
                 self.held
                     .iter()
@@ -3909,25 +4090,34 @@ impl StreamWindowEngine {
     }
 
     /// Aggregate retained-state cost [`absorb_event`](Self::absorb_event) charges
-    /// for one complete event of `raw_len` bytes: the block-mode raw retention,
-    /// the retained parsed-frame budget, and the reassembled-text upper bound.
-    fn absorb_cost(&self, raw_len: usize) -> usize {
+    /// for one complete event that holds `raw_len` wire bytes (its carry
+    /// context is never held) and parses `parsed_len` bytes: the block-mode raw
+    /// retention, the retained parsed-frame budget, and the reassembled-text
+    /// upper bound.
+    fn absorb_cost(&self, raw_len: usize, parsed_len: usize) -> usize {
         let raw_retained = if self.hold_raw { raw_len } else { 0 };
-        let frame_budget = if self.store_frames { raw_len } else { 0 };
+        let frame_budget = if self.store_frames { parsed_len } else { 0 };
         raw_retained
             .saturating_add(frame_budget)
-            .saturating_add(raw_len)
+            .saturating_add(parsed_len)
     }
 
     /// Whether the aggregate budget still covers absorbing the complete event of
-    /// `raw_len` bytes currently at the head of `carry` — the same projection
+    /// `end` bytes currently at the head of `carry` — the same projection
     /// [`absorb_event`](Self::absorb_event) applies, evaluated BEFORE the event
     /// is drained (so its own carry bytes are discounted).
-    fn event_fits_budget(&self, raw_len: usize) -> bool {
+    fn event_fits_budget(&self, end: usize) -> bool {
+        let raw_len = end - self.carry_context.min(end);
+        let parsed_len = if self.carry_continues_forced {
+            raw_len
+        } else {
+            end
+        };
+        let counted = end.saturating_sub(self.forced_seam_len());
         let projected = self
             .retained_bytes()
-            .saturating_sub(raw_len)
-            .saturating_add(self.absorb_cost(raw_len));
+            .saturating_sub(counted)
+            .saturating_add(self.absorb_cost(raw_len, parsed_len));
         projected <= self.config.max_window_bytes
     }
 
@@ -3944,7 +4134,7 @@ impl StreamWindowEngine {
             };
         }
 
-        if let Some(end) = next_event_end(&self.carry) {
+        if let Some(end) = sse_event_end(&self.carry) {
             // Budget pressure from ALREADY-HELD events must never make this
             // complete, valid event uninspectable: inspect and drain the pending
             // window first (the caller releases it, freeing the budget) and
@@ -3957,8 +4147,8 @@ impl StreamWindowEngine {
                     window_ready: self.window_ready(false, true),
                 };
             }
-            let raw: Vec<u8> = self.carry.drain(..end).collect();
-            self.absorb_event(raw, false);
+            let (raw, context, parse) = self.take_carry(end);
+            self.absorb_event(raw, context, parse);
             let force = self.input_window_bytes() >= self.config.max_window_bytes
                 || self.retained_bytes() >= self.config.max_window_bytes;
             return IngestStep {
@@ -3987,9 +4177,16 @@ impl StreamWindowEngine {
                     window_ready: self.window_ready(false, true),
                 };
             }
-            if !self.carry.is_empty() {
-                let raw = std::mem::take(&mut self.carry);
-                self.absorb_event(raw, true);
+            if self.carry.len() > self.carry_context {
+                self.flush_forced_carry();
+            } else if !self.carry.is_empty() && !self.carry_continues_forced {
+                // Context alone leaves no room for the rest of its event.
+                self.shed_carry_context();
+                return IngestStep {
+                    consumed: 0,
+                    progressed: true,
+                    window_ready: false,
+                };
             }
             return IngestStep {
                 consumed: 0,
@@ -4014,7 +4211,7 @@ impl StreamWindowEngine {
         // single event still forces the uninspectable overflow below. The
         // complete event is absorbed by the `carry` branch on the next step, so
         // its budget projection sees only what is actually retained.
-        let boundary = next_event_boundary_in_chunk(&self.carry, chunk);
+        let boundary = sse_event_end_after(&self.carry, chunk);
         let wanted = boundary.unwrap_or(chunk.len());
         if wanted > capacity && !self.held.is_empty() {
             // The bytes this step wants do not fit what the held backlog left
@@ -4029,12 +4226,11 @@ impl StreamWindowEngine {
         }
         let consumed = wanted.min(capacity);
         self.carry.extend_from_slice(&chunk[..consumed]);
-        if next_event_end(&self.carry).is_none()
+        if sse_event_end(&self.carry).is_none()
             && (self.input_window_bytes() >= self.config.max_window_bytes
                 || self.retained_bytes() >= self.config.max_window_bytes)
         {
-            let raw = std::mem::take(&mut self.carry);
-            self.absorb_event(raw, true);
+            self.flush_forced_carry();
         }
 
         let force = self.input_window_bytes() >= self.config.max_window_bytes
@@ -4061,7 +4257,7 @@ impl StreamWindowEngine {
         // already-held backlog can make a valid trailing event look
         // uninspectable. At end of stream an un-terminated tail is absorbed as
         // its own event, so it is charged the same way.
-        let pending_len = next_event_end(&self.carry).unwrap_or(self.carry.len());
+        let pending_len = sse_event_end(&self.carry).unwrap_or(self.carry.len());
         if pending_len > 0 && !self.event_fits_budget(pending_len) && !self.held.is_empty() {
             return IngestStep {
                 consumed: 0,
@@ -4070,15 +4266,19 @@ impl StreamWindowEngine {
             };
         }
 
-        let progressed = if let Some(end) = next_event_end(&self.carry) {
-            let raw: Vec<u8> = self.carry.drain(..end).collect();
-            self.absorb_event(raw, false);
+        let progressed = if let Some(end) = sse_event_end(&self.carry) {
+            let (raw, context, parse) = self.take_carry(end);
+            self.absorb_event(raw, context, parse);
             true
-        } else if !self.carry.is_empty() {
-            let raw = std::mem::take(&mut self.carry);
-            self.absorb_event(raw, false);
+        } else if self.carry.len() > self.carry_context {
+            let (raw, context, parse) = self.take_carry(self.carry.len());
+            self.absorb_event(raw, context, parse);
             true
         } else {
+            // Only context is left: its bytes already left the gateway or
+            // belong to a held event, and a client discards an event the
+            // stream ends inside.
+            self.clear_carry();
             false
         };
         let at_end = self.carry.is_empty();
@@ -4303,11 +4503,22 @@ impl StreamWindowEngine {
     }
 
     /// Release every byte that caused the current hold without inspecting it:
-    /// complete held events and any un-terminated `carry`. When `carry` was
-    /// non-empty, enter [`passthrough_to_event_end`] so the remainder of that
-    /// same SSE event is never absorbed as a fresh inspectable event (its
-    /// prefix already left the gateway uninspected). Used only by the fail-open
-    /// hold-timeout path; returns the raw bytes to forward immediately.
+    /// complete held events and any un-terminated `carry` (except its context,
+    /// which already left). When `carry` has started an event that already
+    /// carries data (a `data` line, or one whose value has begun), or continues
+    /// a force-flushed event, enter [`passthrough_to_event_end`] so the
+    /// remainder of that same SSE event is never absorbed as a fresh
+    /// inspectable event (its prefix already left the gateway uninspected).
+    /// When the open event holds no data yet — only `event` or other field
+    /// lines, or a line whose field or `data` value has not begun — keep it as
+    /// carry context: the rest of the event is read together with it, so its
+    /// data is still inspected exactly as the client reads it. A `carry` of
+    /// only line terminators, leading BOMs, and comment, `id` or `retry` lines
+    /// adds nothing to the next event, so that event is read fresh; a carry
+    /// ending inside a leading BOM passes only the bytes that complete it, and
+    /// one ending inside a comment, `id` or `retry` line passes only the rest of
+    /// that line through its terminator. Used only by the fail-open hold-timeout
+    /// path; returns the raw bytes to forward immediately.
     fn force_release_held(&mut self) -> Vec<u8> {
         let mut out = if let Some(last) = self.held.last() {
             // Reuse `release()` so the cleared-offset rebase and overlap draining
@@ -4319,15 +4530,50 @@ impl StreamWindowEngine {
             Vec::new()
         };
         if !self.carry.is_empty() {
-            out.extend_from_slice(&self.carry);
-            // The first bytes of the next chunk may complete a blank-line
-            // boundary that started in this already-forwarded prefix. Retain
-            // only a detection copy of the final two bytes before clearing the
-            // held carry; they must never be emitted a second time.
-            let keep = self.carry.len().min(2);
-            self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+            let context = self.carry_context.min(self.carry.len());
+            self.carry_context = 0;
+            out.extend_from_slice(&self.carry[context..]);
+            let forwarded = if std::mem::take(&mut self.carry_continues_forced) {
+                // The middle of an event already force-flushed as uninspectable
+                // (and released above): never the start of a line.
+                SseForwardedPrefix::OpenEvent
+            } else {
+                classify_forwarded_sse_prefix(&self.carry)
+            };
+            match forwarded {
+                // Nothing forwarded can add data to the event the client
+                // dispatches next (such as the LF of a CRLF split from the held
+                // event's blank line, a stream-start BOM, or a keep-alive
+                // comment), so pass-through here would only forward that
+                // event's data uninspected.
+                SseForwardedPrefix::Inert => {}
+                // The client reads the next bytes as the rest of the forwarded
+                // comment, `id` or `retry` line, so they must not be parsed as
+                // the start of a fresh line.
+                SseForwardedPrefix::InertLine => self.passthrough_to_line_end = true,
+                SseForwardedPrefix::PartialBom(rest) => self.passthrough_bom_rest = rest,
+                // An `event` line (such as the Anthropic event name sent ahead
+                // of its `data:` line) or a field name still in progress shapes
+                // the rest of the event, yet none of its data has left: keep
+                // the open event as context so that data is still inspected
+                // with it, and hold only what follows.
+                SseForwardedPrefix::EventContext(event_start) => {
+                    self.carry.drain(..event_start);
+                    self.carry_context = self.carry.len();
+                    return out;
+                }
+                SseForwardedPrefix::OpenEvent => {
+                    // The first bytes of the next chunk may complete a
+                    // blank-line boundary that started in this already-forwarded
+                    // prefix. Retain only a detection copy of the final two
+                    // bytes before clearing the held carry; they must never be
+                    // emitted a second time.
+                    let keep = self.carry.len().min(2);
+                    self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+                    self.passthrough_to_event_end = true;
+                }
+            }
             self.carry.clear();
-            self.passthrough_to_event_end = true;
         }
         out
     }
@@ -4339,11 +4585,13 @@ impl StreamWindowEngine {
         self.discard_pending();
         self.held.clear();
         self.held.shrink_to_fit();
-        self.carry.clear();
+        self.clear_carry();
         self.carry.shrink_to_fit();
         self.passthrough_to_event_end = false;
         self.passthrough_tail.clear();
         self.passthrough_tail.shrink_to_fit();
+        self.passthrough_bom_rest = 0;
+        self.passthrough_to_line_end = false;
     }
 }
 
@@ -4381,50 +4629,6 @@ fn frame_is_unmapped_governed(frame: &Value) -> bool {
         return false;
     }
     event_type.is_some() || looks_like_governed_response_json(frame)
-}
-
-/// Byte index just past the end of the first complete SSE event in `buf` (the
-/// first blank line), or `None` if no event has fully arrived yet.
-///
-/// SSE line terminators are `\n` or `\r\n` and may be mixed within one stream, so
-/// a blank line is any of `\n\n`, `\r\n\r\n`, `\n\r\n`, or `\r\n\n`. Scans for the
-/// earliest such boundary: a `\n` immediately followed by another line terminator
-/// (`\n` or `\r\n`).
-fn next_event_end(buf: &[u8]) -> Option<usize> {
-    for (i, &b) in buf.iter().enumerate() {
-        if b != b'\n' {
-            continue;
-        }
-        match buf.get(i + 1) {
-            Some(b'\n') => return Some(i + 2),
-            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// How many bytes of `chunk` complete the next SSE event, given the partial
-/// `carry` already accumulated (which by construction holds no complete event).
-///
-/// Allocation-free: an event terminator can only straddle the seam through the
-/// last one or two bytes of `carry`, so those two cases are checked directly and
-/// everything else is found by scanning `chunk` alone. Used to take exactly one
-/// event out of a coalesced transport write instead of the whole budget.
-fn next_event_boundary_in_chunk(carry: &[u8], chunk: &[u8]) -> Option<usize> {
-    let ends_with_lf_cr =
-        carry.len() >= 2 && carry[carry.len() - 2] == b'\n' && carry[carry.len() - 1] == b'\r';
-    if ends_with_lf_cr && chunk.first() == Some(&b'\n') {
-        return Some(1);
-    }
-    if carry.last() == Some(&b'\n') {
-        match chunk.first() {
-            Some(b'\n') => return Some(1),
-            Some(b'\r') if chunk.get(1) == Some(&b'\n') => return Some(2),
-            _ => {}
-        }
-    }
-    next_event_end(chunk)
 }
 
 /// Whether `ch` belongs to a script that is counted one token per character
@@ -4868,6 +5072,21 @@ struct StreamInspector {
     hold: Option<HoldState>,
     /// Whether the one-time hold-timeout warning has fired for this response.
     hold_timeout_logged: Arc<AtomicBool>,
+    /// Whether the bytes the client already received end mid-line (the last
+    /// is neither CR nor LF), such as a fail-open release of an event start.
+    /// A cut then ends that line before its error event, so the client never
+    /// reads the event's first line as the rest of the forwarded one. Tracked
+    /// from this inspector's own output, or set by a chain when a later
+    /// inspector still sees that output.
+    client_line_open: bool,
+    /// Whether a later chained inspector still sees this inspector's output.
+    /// A cut's payload then goes to the client around that inspector, so it
+    /// must not carry the backend bytes this call already cleared.
+    feeds_inspector: bool,
+    /// A cut deferred behind the bytes the same call cleared, for the chain to
+    /// emit once every later inspector has passed them: the error event, or
+    /// `None` for a silent cut. Set only while `feeds_inspector`.
+    deferred_cut: Option<Option<Bytes>>,
 }
 
 impl StreamInspector {
@@ -4936,6 +5155,9 @@ impl StreamInspector {
             detect_provider_error_logged: Arc::new(AtomicBool::new(false)),
             hold,
             hold_timeout_logged: Arc::new(AtomicBool::new(false)),
+            client_line_open: false,
+            feeds_inspector: false,
+            deferred_cut: None,
         }
     }
 
@@ -4960,8 +5182,9 @@ impl StreamInspector {
             return;
         };
         // Un-released wire bytes: complete held events plus the un-terminated
-        // `carry`. Zero exactly when nothing is awaiting a verdict.
-        let held = self.window.input_window_bytes();
+        // `carry` past its context. Zero exactly when nothing is awaiting a
+        // verdict.
+        let held = self.window.held_wire_bytes();
         hold.sync_from(held, first_held_at);
     }
 
@@ -4999,7 +5222,8 @@ impl StreamInspector {
     /// every held/partial byte is discarded and never reaches the client) or
     /// releases every byte that caused the hold uninspected (fail open),
     /// including any un-terminated carry, then pass-through until the next SSE
-    /// event boundary.
+    /// event boundary when that carry started an event that may still carry
+    /// data.
     ///
     /// `dry_run` is observational and never cuts traffic, so a fail-closed
     /// expiry degrades to the fail-open release there — matching the buffered
@@ -5363,11 +5587,61 @@ impl StreamInspector {
         });
         ResponseStreamAction::Terminate(final_bytes)
     }
-}
 
-#[async_trait]
-impl ResponseStreamInspector for StreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    /// Frame a cut's error event after `released`, the bytes this call already
+    /// cleared (clean windows and fail-open releases, including the rest of an
+    /// event whose start the client already holds). They leave first, so that
+    /// event ends on its blank line rather than merging into the error event.
+    /// Then one LF ends a line the client still holds open, so it reads the
+    /// error event from a fresh line. Never a blank line, which would dispatch
+    /// an open event. A silent cut (no error event) still sends `released`
+    /// before the stream ends. When a later chained inspector has not passed
+    /// `released`, this forwards it and defers the cut, so the chain emits the
+    /// error event only after that inspector has inspected `released`.
+    /// Allocates only here, on a cut.
+    fn cut_after(
+        &mut self,
+        released: Vec<u8>,
+        action: ResponseStreamAction,
+    ) -> ResponseStreamAction {
+        let ResponseStreamAction::Terminate(event) = action else {
+            return action;
+        };
+        if self.feeds_inspector && !released.is_empty() {
+            self.deferred_cut = Some(event);
+            return ResponseStreamAction::Forward(Bytes::from(released));
+        }
+        let mut out = released;
+        let Some(event) = event else {
+            // No error event follows, so no line needs ending.
+            if out.is_empty() {
+                return ResponseStreamAction::Terminate(None);
+            }
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out)));
+        };
+        let line_open = match out.last() {
+            Some(&last) => !matches!(last, b'\n' | b'\r'),
+            None => self.client_line_open,
+        };
+        let event = sse_event_on_fresh_line(event, line_open);
+        if out.is_empty() {
+            return ResponseStreamAction::Terminate(Some(event));
+        }
+        out.extend_from_slice(&event);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out)))
+    }
+
+    /// Record whether `action` forwards bytes that leave a line open on the
+    /// client.
+    fn note_forwarded(&mut self, action: &ResponseStreamAction) {
+        if let ResponseStreamAction::Forward(bytes) = action
+            && let Some(&last) = bytes.last()
+        {
+            self.client_line_open = !matches!(last, b'\n' | b'\r');
+        }
+    }
+
+    async fn inspect_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5399,7 +5673,9 @@ impl ResponseStreamInspector for StreamInspector {
                 if self.hold_expired() {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
-                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        terminate @ ResponseStreamAction::Terminate(_) => {
+                            return self.cut_after(released, terminate);
+                        }
                     }
                     // Expiry may have entered pass-through for a partial event;
                     // drain any remainder already present in this same chunk.
@@ -5421,7 +5697,9 @@ impl ResponseStreamInspector for StreamInspector {
                             ResponseStreamAction::Forward(bytes) => {
                                 released.extend_from_slice(&bytes);
                             }
-                            terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                            terminate @ ResponseStreamAction::Terminate(_) => {
+                                return self.cut_after(released, terminate);
+                            }
                         }
                         // `act_on_window` can itself expire the hold while
                         // awaiting a verdict. A fail-open expiry may have
@@ -5450,7 +5728,9 @@ impl ResponseStreamInspector for StreamInspector {
                 if self.hold_expired() {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
-                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        terminate @ ResponseStreamAction::Terminate(_) => {
+                            return self.cut_after(released, terminate);
+                        }
                     }
                 }
                 ResponseStreamAction::Forward(Bytes::from(released))
@@ -5478,7 +5758,7 @@ impl ResponseStreamInspector for StreamInspector {
         }
     }
 
-    async fn on_end(&mut self) -> ResponseStreamAction {
+    async fn inspect_end(&mut self) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5494,7 +5774,9 @@ impl ResponseStreamInspector for StreamInspector {
                 if self.hold_expired() {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
-                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        terminate @ ResponseStreamAction::Terminate(_) => {
+                            return self.cut_after(released, terminate);
+                        }
                     }
                 }
                 if self.window.in_passthrough() {
@@ -5508,7 +5790,9 @@ impl ResponseStreamInspector for StreamInspector {
                             ResponseStreamAction::Forward(bytes) => {
                                 released.extend_from_slice(&bytes);
                             }
-                            terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                            terminate @ ResponseStreamAction::Terminate(_) => {
+                                return self.cut_after(released, terminate);
+                            }
                         }
                         // A verdict timeout can enter fail-open pass-through
                         // after the pre-loop check. End-of-stream has no later
@@ -5537,9 +5821,39 @@ impl ResponseStreamInspector for StreamInspector {
             }
         }
     }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for StreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let action = self.inspect_chunk(chunk).await;
+        self.note_forwarded(&action);
+        action
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        let action = self.inspect_end().await;
+        self.note_forwarded(&action);
+        action
+    }
+
+    fn set_chained_client_line_open(&mut self, open: bool) {
+        self.client_line_open = open;
+        self.feeds_inspector = true;
+    }
+
+    fn has_deferred_cut(&self) -> bool {
+        self.deferred_cut.is_some()
+    }
+
+    fn take_deferred_cut(&mut self, client_line_open: bool) -> Option<Bytes> {
+        let event = self.deferred_cut.take().flatten()?;
+        Some(sse_event_on_fresh_line(event, client_line_open))
+    }
 
     fn on_downstream_terminated(&mut self) {
         self.terminated = true;
+        self.deferred_cut = None;
         self.window.discard_held();
         if let Some(hold) = self.hold.as_mut() {
             hold.restart();
@@ -8453,7 +8767,134 @@ mod stream_window_tests {
             eng.pending_uninspectable(),
             "the oversized un-terminated event is uninspectable"
         );
-        assert!(eng.carry.is_empty(), "carry was drained, not retained");
+        // Only the final byte stays, as context that frames the rest of the
+        // event; it is never held or released again.
+        assert_eq!(eng.carry, b"a", "carry was drained, not retained");
+        assert_eq!(eng.carry_context, 1);
+        assert!(eng.carry_continues_forced);
+    }
+
+    /// Each held event of one window as `(inspectable, raw bytes)`.
+    type HeldWindow = Vec<(bool, Vec<u8>)>;
+
+    /// Drive `chunk` through every step, recording the held events of each
+    /// ready window before releasing it as a clean verdict would.
+    fn feed(eng: &mut StreamWindowEngine, chunk: &[u8]) -> Vec<HeldWindow> {
+        let mut windows = Vec::new();
+        let mut consumed = 0usize;
+        loop {
+            let step = eng.ingest_step(&chunk[consumed..]);
+            consumed += step.consumed;
+            if step.window_ready {
+                let clears_to = eng.pending_clears_to.unwrap_or_default();
+                let window = eng
+                    .held
+                    .iter()
+                    .filter(|event| event.content_len_after <= clears_to)
+                    .map(|event| (event.inspectable, event.raw.clone()))
+                    .collect();
+                windows.push(window);
+                let _ = eng.release();
+            } else if !step.progressed {
+                return windows;
+            }
+        }
+    }
+
+    #[test]
+    fn rest_of_a_forced_event_stays_uninspectable_up_to_the_client_event_end() {
+        // An event that outgrows the window is force-flushed as a partial,
+        // uninspectable event. The rest of it continues a line cut at an
+        // arbitrary byte, so it is not a fresh event: read alone, the `: tail`
+        // inside the cut JSON value looks like a comment and would pass as
+        // clean. It stays uninspectable (so `on_error` decides it) up to the
+        // blank line that ends the event for the client, even one that begins
+        // at the cut or completes a CRLF split by it, and every byte is
+        // released exactly once. The next event is inspected as usual.
+        const CAP: usize = 256;
+        for eol in ["\n", "\r\n", "\r"] {
+            let frame = json!({"choices": [{"index": 0, "delta": {"content": "Done."}}]});
+            let next = format!("data: {frame}{eol}{eol}");
+            let head = "data: {\"k\": \"";
+            let forced = format!("{head}{}", "a".repeat(CAP - head.len()));
+            let long_rest = format!("{}: tail\"}}{eol}{eol}", "b".repeat(CAP + 44));
+            let line = format!("data: {}{eol}", "a".repeat(CAP - 6 - eol.len()));
+            let mut cases = vec![
+                (forced.clone(), format!(": tail\"}}{eol}{eol}")),
+                (forced, long_rest),
+                (line, eol.to_string()),
+            ];
+            if eol == "\r\n" {
+                let split = format!("data: {}\r", "a".repeat(CAP - 7));
+                cases.push((split, "\n\r\n".to_string()));
+            }
+            for (start, rest) in cases {
+                let label = format!("{eol:?} rest {:?}", &rest[..rest.len().min(12)]);
+                let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, CAP, 0));
+                assert_eq!(
+                    feed(&mut eng, start.as_bytes()),
+                    vec![vec![(false, start.as_bytes().to_vec())]],
+                    "{label}: the start is force-flushed as uninspectable"
+                );
+
+                let chunk = format!("{rest}{next}");
+                let events: Vec<(bool, Vec<u8>)> = feed(&mut eng, chunk.as_bytes())
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let released: Vec<u8> = events.iter().flat_map(|(_, raw)| raw.clone()).collect();
+                assert_eq!(
+                    released,
+                    chunk.as_bytes(),
+                    "{label}: every byte is released exactly once"
+                );
+                let (last, rest_of_event) = events
+                    .split_last()
+                    .expect("the next event completes a window");
+                assert_eq!(
+                    last,
+                    &(true, next.as_bytes().to_vec()),
+                    "{label}: the next event is framed and inspected as usual"
+                );
+                assert!(
+                    rest_of_event.iter().all(|(inspectable, _)| !inspectable),
+                    "{label}: the rest of the forced event is uninspectable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forced_event_framing_byte_is_never_shed_for_capacity() {
+        // The final byte of a force-flushed start frames the rest of that
+        // event: after an LF, a leading LF is the blank line that ends it. Even
+        // a window that byte alone would fill keeps it, so the event ends
+        // where the client ends it instead of swallowing the next one.
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 1, 0));
+        let windows = feed(&mut eng, b"data: x\n");
+        assert!(
+            windows
+                .iter()
+                .flatten()
+                .all(|(inspectable, _)| !inspectable),
+            "every forced piece is uninspectable"
+        );
+        assert_eq!(eng.carry, b"\n", "the framing byte is kept");
+        assert_eq!(eng.carry_context, 1);
+        assert!(eng.carry_continues_forced);
+        assert_eq!(eng.input_window_bytes(), 0, "framing byte not counted");
+        assert_eq!(eng.retained_bytes(), 0, "framing byte not counted");
+
+        assert_eq!(
+            feed(&mut eng, b"\n"),
+            vec![vec![(false, b"\n".to_vec())]],
+            "the blank line ends the forced event as the rest of it"
+        );
+        assert!(eng.carry.is_empty());
+        assert!(
+            !eng.carry_continues_forced,
+            "the next bytes start a fresh event"
+        );
     }
 
     #[test]
@@ -8544,18 +8985,6 @@ mod stream_window_tests {
             eng.release().is_empty(),
             "detect mode holds no raw bytes for release"
         );
-    }
-
-    #[test]
-    fn next_event_end_handles_lf_and_crlf() {
-        assert_eq!(next_event_end(b"data: x\n\nrest"), Some(9));
-        assert_eq!(next_event_end(b"data: x\r\n\r\nrest"), Some(11));
-        assert_eq!(next_event_end(b"data: x\n"), None);
-        // Mixed blank-line terminators (Codex round-8): \n\r\n and \r\n\n.
-        assert_eq!(next_event_end(b"data: x\n\r\nrest"), Some(10));
-        assert_eq!(next_event_end(b"data: x\r\n\nrest"), Some(10));
-        // A lone CR is not a blank-line terminator here; no false positive.
-        assert_eq!(next_event_end(b"data: x\ny\n"), None);
     }
 
     fn token_cfg(

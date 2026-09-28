@@ -111,13 +111,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          path: .boringcache-lane
+          path: .github/actions/boringcache-lane
           sparse-checkout: .github
           persist-credentials: false
       - name: Select the archive plan
         run: |
-          cp .boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
-          printf '%s\n' '/.boringcache.toml' '/.boringcache-lane/' >> .git/info/exclude
+          cp .github/actions/boringcache-lane/.github/boringcache-plans/archive-selective/.boringcache.toml .boringcache.toml
+          printf '%s\n' '/.boringcache.toml' '/.github/actions/boringcache-lane/' >> .git/info/exclude
       - name: Scope this archive comparison
         run: |
           python3 - <<'PYTHON'
@@ -133,7 +133,7 @@ jobs:
               path.write_text(text)
           PYTHON
 
-      - uses: ./.boringcache-lane/.github/actions/setup-rust-ci
+      - uses: ./.github/actions/boringcache-lane/.github/actions/setup-rust-ci
         with:
           cache: "false"
           boringcache: "false"

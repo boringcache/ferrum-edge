@@ -694,6 +694,68 @@
       "regression_tests": [
         "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs"
       ]
+    },
+    {
+      "id": "hyper-util-001-release-h1-sender-on-dispatch-close",
+      "label": "hyper-util legacy client releases a closed HTTP/1 sender",
+      "crate": "hyper-util",
+      "vendored_version": "0.1.21",
+      "vendor_path": "vendor/hyper-util-0.1.21-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "An HTTP/1 request enqueued while its pooled connection closes can miss the dispatcher's drain; hyper-util holds the channel's only sender while waiting, so reqwest's send() hangs until backend_read_timeout_ms (504) instead of failing as an unsent request (#5714).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": 4202,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper-util release stops holding the only HTTP/1 sender across the response wait after its dispatcher closes, or a hyper release stops stranding a racing send.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-util-0.1.21-ferrum-patched (client::legacy::client::ferrum_release_on_close_tests)",
+        "vendor/hyper-util-0.1.21-ferrum-patched/tests/legacy_client.rs"
+      ]
+    },
+    {
+      "id": "hyper-001-upgraded-h2-connect-error-reset",
+      "label": "hyper upgraded HTTP/2 stream resets with CONNECT_ERROR",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends a clean END_STREAM, so an HBONE relay that ended on a socket error was indistinguishable on the wire from a normal close; Upgraded::reset_with_connect_error() sends RST_STREAM(CONNECT_ERROR) instead (RFC 9113 section 8.5, #5781).",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/hyper",
+        "pr_number": 4210,
+        "issue_number": 4209,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper release containing hyperium/hyper#4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
+        "tests/integration/mesh_hbone_tests.rs"
+      ]
     }
   ]
 }

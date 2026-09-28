@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -6,8 +7,8 @@ use super::Waf;
 use super::decode;
 use super::normalize;
 use super::rules::{
-    BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
-    TextRuleSet, extract_ip_tokens,
+    BytesRuleSet, CompiledRule, Field, FieldExclusions, JsonPathMatcher, JsonPathRule,
+    JsonPathSegment, RuleHit, RuleRef, RuleTarget, TextRuleSet, UrlQuery, extract_ip_tokens,
 };
 use super::websocket::WsSessionPolicy;
 use crate::plugins::RequestContext;
@@ -71,13 +72,14 @@ impl Waf {
             self.compiled.url_path.as_ref(),
             &ctx.path,
             subject,
-            None,
+            Field::Whole,
         );
         self.scan_cidr_rules_matching(
             &mut outcome,
             &ctx.path,
             &self.compiled.text_cidr_rules,
             subject,
+            Field::Whole,
             |target| matches!(target, RuleTarget::UrlPath),
         );
 
@@ -87,21 +89,26 @@ impl Waf {
                 full_url.push_str(&ctx.path);
                 full_url.push('?');
                 full_url.push_str(raw_query);
+                let url = Field::Url {
+                    path: &ctx.path,
+                    query: UrlQuery::Raw(raw_query),
+                };
                 self.scan_text_set(
                     &mut outcome,
                     self.compiled.full_url.as_ref(),
                     &full_url,
                     subject,
-                    None,
+                    url,
                 );
                 self.scan_cidr_rules_matching(
                     &mut outcome,
                     &full_url,
                     &self.compiled.text_cidr_rules,
                     subject,
+                    url,
                     |target| matches!(target, RuleTarget::FullUrl),
                 );
-                self.scan_encoding_specials(&mut outcome, &full_url, subject);
+                self.scan_encoding_specials(&mut outcome, &full_url, subject, url);
                 self.scan_hpp_special(&mut outcome, raw_query, subject);
             }
         } else if !ctx.query_params.is_empty() {
@@ -116,37 +123,47 @@ impl Waf {
             );
             full_url.push_str(&ctx.path);
             append_materialized_query(&mut full_url, &ctx.query_params);
+            let url = Field::Url {
+                path: &ctx.path,
+                query: UrlQuery::Materialized(&ctx.query_params),
+            };
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.full_url.as_ref(),
                 &full_url,
                 subject,
-                None,
+                url,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 &full_url,
                 &self.compiled.text_cidr_rules,
                 subject,
+                url,
                 |target| matches!(target, RuleTarget::FullUrl),
             );
-            self.scan_encoding_specials(&mut outcome, &full_url, subject);
+            self.scan_encoding_specials(&mut outcome, &full_url, subject, url);
         } else {
+            let url = Field::Url {
+                path: &ctx.path,
+                query: UrlQuery::None,
+            };
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.full_url.as_ref(),
                 &ctx.path,
                 subject,
-                None,
+                url,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 &ctx.path,
                 &self.compiled.text_cidr_rules,
                 subject,
+                url,
                 |target| matches!(target, RuleTarget::FullUrl),
             );
-            self.scan_encoding_specials(&mut outcome, &ctx.path, subject);
+            self.scan_encoding_specials(&mut outcome, &ctx.path, subject, url);
         }
 
         // Scan each raw query pair even after query-param materialization so
@@ -163,27 +180,44 @@ impl Waf {
                     continue;
                 }
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-                self.scan_query_pair(&mut outcome, raw_k, raw_v, subject);
+                // Exclusions name the parameter as the application reads it:
+                // the single percent-decode of the key, the same primary view
+                // a backend's query parser produces. Only decoded when some
+                // rule excludes query parameters; otherwise no rule compares
+                // the name.
+                let name = if self.compiled.query_exclusions_active {
+                    normalize::query_component_name(raw_k)
+                } else {
+                    Cow::Borrowed(raw_k)
+                };
+                self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, subject);
             }
         } else {
+            // Materialized keys are already decoded: they are the names as
+            // the application reads them. Decoding one again would let a
+            // stored `%68tml` (sent as `%2568tml`) match an `html` exclusion
+            // that the whole-URL re-check, which compares these keys as they
+            // are, does not honour.
             for (key, value) in &ctx.query_params {
-                self.scan_query_pair(&mut outcome, key, value, subject);
+                self.scan_query_pair(&mut outcome, key, value, key, subject);
             }
         }
 
         for (name, value) in &ctx.headers {
+            let field = Field::Header(name.as_str());
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.header_names.as_ref(),
                 name,
                 subject,
-                Some(name.as_str()),
+                field,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 name,
                 &self.compiled.text_cidr_rules,
                 subject,
+                field,
                 |target| matches!(target, RuleTarget::HeaderNames),
             );
             self.scan_text_set(
@@ -191,13 +225,14 @@ impl Waf {
                 self.compiled.header_values.as_ref(),
                 value,
                 subject,
-                Some(name.as_str()),
+                field,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 value,
                 &self.compiled.text_cidr_rules,
                 subject,
+                field,
                 |target| header_value_target_matches(target, name),
             );
             if name == "cookie" {
@@ -210,13 +245,14 @@ impl Waf {
             self.compiled.method.as_ref(),
             &ctx.method,
             subject,
-            None,
+            Field::Whole,
         );
         self.scan_cidr_rules_matching(
             &mut outcome,
             &ctx.method,
             &self.compiled.text_cidr_rules,
             subject,
+            Field::Whole,
             |target| matches!(target, RuleTarget::Method),
         );
         self.scan_method_special(&mut outcome, &ctx.method, subject);
@@ -335,23 +371,28 @@ impl Waf {
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
         let subject = ScanSubject::Http(ctx);
+        // One `name: value` buffer for the whole map instead of one allocation
+        // per header.
+        let mut line = String::new();
         for (name, value) in headers {
-            let mut line = String::with_capacity(name.len() + value.len() + 2);
+            line.clear();
             line.push_str(name);
             line.push_str(": ");
             line.push_str(value);
+            let field = Field::ResponseHeader(name.as_str());
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.response_headers.as_ref(),
                 &line,
                 subject,
-                Some(name.as_str()),
+                field,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 &line,
                 &self.compiled.text_cidr_rules,
                 subject,
+                field,
                 |target| matches!(target, RuleTarget::ResponseHeaders),
             );
         }
@@ -383,13 +424,21 @@ impl Waf {
         set: Option<&TextRuleSet>,
         value: &str,
         subject: ScanSubject<'_>,
-        header_name: Option<&str>,
+        field: Field<'_>,
     ) {
         let Some(set) = set else {
             return;
         };
+        // Almost every inspected value is clean. `is_match` stops at the first
+        // match and needs no per-call `SetMatches` allocation, while `matches`
+        // must run the overlapping search to the end and allocate its result;
+        // on short metadata values the prefilter is ~2-3x cheaper, and a real
+        // hit pays for both passes only on the rare matching value.
+        if !set.set.is_match(value) {
+            return;
+        }
         for index in set.set.matches(value) {
-            self.push_if_allowed(outcome, &set.refs[index], value, subject, header_name);
+            self.push_if_allowed(outcome, &set.refs[index], value, subject, field);
         }
     }
 
@@ -413,13 +462,20 @@ impl Waf {
         let Some(set) = set else {
             return;
         };
-        let matches = set.set.matches(value);
-        if !matches.matched_any() {
+        // Same clean-case prefilter as `scan_text_set`.
+        if !set.set.is_match(value) {
             return;
         }
+        let matches = set.set.matches(value);
         let text = String::from_utf8_lossy(value);
         for index in matches {
-            self.push_if_allowed(outcome, &set.refs[index], text.as_ref(), subject, None);
+            self.push_if_allowed(
+                outcome,
+                &set.refs[index],
+                text.as_ref(),
+                subject,
+                Field::Whole,
+            );
         }
     }
 
@@ -444,8 +500,9 @@ impl Waf {
                 continue;
             };
             self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-            let (variants, _) = normalize::decoded_variants_with_residual(text);
-            for variant in variants {
+            // `text` is already JSON-unescaped; its single-character escapes
+            // are not resolved a second time.
+            for variant in normalize::decoded_json_value_variants(text) {
                 self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
             }
         }
@@ -488,26 +545,67 @@ impl Waf {
             && !rule.suppresses_text(fp_filter_target)
     }
 
+    /// Scan each `name=value` cookie crumb as sent AND as decoded.
+    ///
+    /// Frameworks disagree about cookie values: the Servlet API and Go's
+    /// `net/http` hand the application the raw octets, while PHP (`urldecode`,
+    /// so `+` is a space), Express `cookie-parser` (`decodeURIComponent`), and
+    /// Rails unescape them first. A WAF that only scans the raw crumb misses
+    /// `pref=%3Cscript%3E`; one that only scans the decoded form misses a raw
+    /// payload a non-decoding backend reads verbatim. So the raw crumb is
+    /// always scanned and every distinct decoded view is scanned beside it.
+    /// Cookie views are percent decodes (`%XX`, `%uXXXX`, `+` as a space and,
+    /// Express-style, as `+`, and the bounded layered percent decode), plus
+    /// the code-point escapes (`\uXXXX`, `\xXX`) and quote/slash/backslash
+    /// escapes (`\"`, `\'`, `\/`, `\\`) of an Express `j:` JSON cookie.
+    /// Control escapes and HTML entities are not cookie encodings, and
+    /// resolving a `j:` cookie's `\n` would introduce a control character.
+    /// Splitting on `;` happens first, so an encoded `%3B` cannot forge an
+    /// extra crumb. A crumb with nothing to decode costs no allocation.
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
+        if !self.compiled.cookie_rules_active {
+            return;
+        }
         for cookie in header.split(';') {
             let cookie = cookie.trim();
-            if !cookie.is_empty() {
-                self.scan_text_set(
-                    outcome,
-                    self.compiled.cookies.as_ref(),
-                    cookie,
-                    subject,
-                    None,
-                );
-                self.scan_cidr_rules_matching(
-                    outcome,
-                    cookie,
-                    &self.compiled.text_cidr_rules,
-                    subject,
-                    |target| matches!(target, RuleTarget::Cookies),
-                );
+            if cookie.is_empty() {
+                continue;
+            }
+            // One field per crumb, named from the RAW crumb, shared by every
+            // decoded view: a view's own decoded name (`prefs%3D=…` reads as
+            // `prefs`) must not pick up an exclusion the raw crumb does not
+            // name.
+            let field = Field::Cookie(cookie_name(cookie));
+            self.scan_cookie_view(outcome, cookie, subject, field);
+            let views = normalize::canonical_cookie_views(cookie);
+            for view in views.iter().filter(|view| *view != cookie) {
+                self.scan_cookie_view(outcome, view, subject, field);
             }
         }
+    }
+
+    fn scan_cookie_view(
+        &self,
+        outcome: &mut ScanOutcome,
+        cookie: &str,
+        subject: ScanSubject<'_>,
+        field: Field<'_>,
+    ) {
+        self.scan_text_set(
+            outcome,
+            self.compiled.cookies.as_ref(),
+            cookie,
+            subject,
+            field,
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            cookie,
+            &self.compiled.text_cidr_rules,
+            subject,
+            field,
+            |target| matches!(target, RuleTarget::Cookies),
+        );
     }
 
     fn scan_query_pair(
@@ -515,6 +613,7 @@ impl Waf {
         outcome: &mut ScanOutcome,
         raw_key: &str,
         raw_value: &str,
+        name: &str,
         subject: ScanSubject<'_>,
     ) {
         // One shared decode: split components are already isolated, then
@@ -524,47 +623,56 @@ impl Waf {
         // second, weaker decode of the already-normalized string.
         let key_views = normalize::canonical_query_component_views(raw_key);
         let value_views = normalize::canonical_query_component_views(raw_value);
+        let field = Field::QueryParam(name);
         for key in key_views.iter() {
             self.scan_text_set(
                 outcome,
                 self.compiled.query_keys.as_ref(),
                 key,
                 subject,
-                None,
+                field,
             );
             self.scan_cidr_rules_matching(
                 outcome,
                 key,
                 &self.compiled.text_cidr_rules,
                 subject,
+                field,
                 |target| matches!(target, RuleTarget::QueryKeys),
             );
         }
         for value in value_views.iter() {
-            self.scan_query_value(outcome, value, subject);
+            self.scan_query_value(outcome, value, subject, field);
             self.scan_text_set(
                 outcome,
                 self.compiled.canonical_query_values.as_ref(),
                 value,
                 subject,
-                None,
+                field,
             );
         }
     }
 
-    fn scan_query_value(&self, outcome: &mut ScanOutcome, value: &str, subject: ScanSubject<'_>) {
+    fn scan_query_value(
+        &self,
+        outcome: &mut ScanOutcome,
+        value: &str,
+        subject: ScanSubject<'_>,
+        field: Field<'_>,
+    ) {
         self.scan_text_set(
             outcome,
             self.compiled.query_values.as_ref(),
             value,
             subject,
-            None,
+            field,
         );
         self.scan_cidr_rules_matching(
             outcome,
             value,
             &self.compiled.text_cidr_rules,
             subject,
+            field,
             |target| matches!(target, RuleTarget::QueryValues),
         );
     }
@@ -600,7 +708,9 @@ impl Waf {
         rule_indices: &[usize],
         subject: ScanSubject<'_>,
     ) {
-        self.scan_cidr_rules_matching(outcome, value, rule_indices, subject, |_| true);
+        self.scan_cidr_rules_matching(outcome, value, rule_indices, subject, Field::Whole, |_| {
+            true
+        });
     }
 
     fn scan_cidr_rules_matching<F>(
@@ -609,6 +719,7 @@ impl Waf {
         value: &str,
         rule_indices: &[usize],
         subject: ScanSubject<'_>,
+        field: Field<'_>,
         target_matches: F,
     ) where
         F: Fn(&RuleTarget) -> bool,
@@ -633,6 +744,7 @@ impl Waf {
                 && self.rule_applies(subject, rule_index)
                 && !self.exemptions.suppresses_value(value)
                 && !rule.suppresses_text(value)
+                && self.field_permits(rule, field)
             {
                 outcome.push(RuleHit {
                     rule_index,
@@ -642,23 +754,82 @@ impl Waf {
         }
     }
 
+    /// URL-side encoding specials. `url` lets a special with query-parameter
+    /// exclusions judge the URL without its excluded pairs.
     fn scan_encoding_specials(
         &self,
         outcome: &mut ScanOutcome,
         value: &str,
         subject: ScanSubject<'_>,
+        url: Field<'_>,
     ) {
-        if let Some(rule_index) = self.specials.encoding
-            && (decode::has_double_encoded_marker(value)
-                || decode::has_percent_null_byte(value)
-                || decode::has_overlong_utf8_marker(value))
-        {
-            self.push_special(outcome, rule_index, value, subject);
+        if let Some(rule_index) = self.specials.encoding {
+            let judged = self.url_for_rule(rule_index, value, url);
+            if decode::has_double_encoded_marker(&judged)
+                || decode::has_percent_null_byte(&judged)
+                || decode::has_overlong_utf8_marker(&judged)
+            {
+                self.push_special(outcome, rule_index, &judged, subject);
+            }
         }
-        if let Some(rule_index) = self.specials.overlong_utf8
-            && decode::has_overlong_utf8_marker(value)
-        {
-            self.push_special(outcome, rule_index, value, subject);
+        if let Some(rule_index) = self.specials.overlong_utf8 {
+            let judged = self.url_for_rule(rule_index, value, url);
+            if decode::has_overlong_utf8_marker(&judged) {
+                self.push_special(outcome, rule_index, &judged, subject);
+            }
+        }
+    }
+
+    /// The URL text a whole-URL rule judges: `full_url` itself, or — for a
+    /// rule with query-parameter exclusions — the URL rebuilt without the
+    /// excluded pairs. Allocates only for such a rule.
+    fn url_for_rule<'u>(
+        &self,
+        rule_index: usize,
+        full_url: &'u str,
+        url: Field<'_>,
+    ) -> Cow<'u, str> {
+        match (&self.compiled.rules[rule_index].exclusions, url) {
+            (Some(exclusions), Field::Url { path, query })
+                if !exclusions.query_params.is_empty() =>
+            {
+                Cow::Owned(url_without_excluded_params(path, query, exclusions))
+            }
+            _ => Cow::Borrowed(full_url),
+        }
+    }
+
+    /// Whether `rule`'s field exclusions let a match on `field` count.
+    ///
+    /// A per-field match (header, cookie, query parameter) is dropped when its
+    /// field is excluded. A whole-URL match cannot be attributed to one
+    /// pair, so a rule with query-parameter exclusions re-runs its own matcher
+    /// over the URL rebuilt without the excluded pairs: the hit counts only if
+    /// the rule still matches the rest of the request.
+    fn field_permits(&self, rule: &CompiledRule, field: Field<'_>) -> bool {
+        let Some(exclusions) = &rule.exclusions else {
+            return true;
+        };
+        match field {
+            Field::Whole => true,
+            Field::Header(name) | Field::ResponseHeader(name) => !exclusions.excludes_header(name),
+            Field::QueryParam(name) => !exclusions.excludes_query_param(name),
+            Field::Cookie(name) => !exclusions.excludes_cookie(name),
+            Field::Url { path, query } => {
+                if exclusions.query_params.is_empty() {
+                    return true;
+                }
+                let url = url_without_excluded_params(path, query, exclusions);
+                if let Some(matcher) = &rule.url_recheck {
+                    matcher.is_match(&url)
+                } else if let Some(cidr) = rule.cidr {
+                    extract_ip_tokens(&url).any(|ip| cidr.matches(ip))
+                } else {
+                    // Encoding specials re-verify through `url_for_rule` before
+                    // they reach here; nothing else lacks a re-check matcher.
+                    true
+                }
+            }
         }
     }
 
@@ -710,10 +881,18 @@ impl Waf {
         raw_query: &str,
         subject: ScanSubject<'_>,
     ) {
-        if let Some(rule_index) = self.specials.hpp
-            && decode::has_conflicting_duplicate_query_key(raw_query)
-        {
-            self.push_special(outcome, rule_index, raw_query, subject);
+        if let Some(rule_index) = self.specials.hpp {
+            // An excluded parameter may legitimately repeat (`ids=1&ids=2`),
+            // so its pairs are dropped before duplicates are compared.
+            let judged = match &self.compiled.rules[rule_index].exclusions {
+                Some(exclusions) if !exclusions.query_params.is_empty() => {
+                    Cow::Owned(query_without_excluded_params(raw_query, exclusions))
+                }
+                _ => Cow::Borrowed(raw_query),
+            };
+            if decode::has_conflicting_duplicate_query_key(&judged) {
+                self.push_special(outcome, rule_index, &judged, subject);
+            }
         }
     }
 
@@ -744,6 +923,10 @@ impl Waf {
         if let Some(rule_index) = self.specials.method_override
             && let Some(override_method) = headers.get("x-http-method-override")
             && !override_method.eq_ignore_ascii_case(method)
+            && self.field_permits(
+                &self.compiled.rules[rule_index],
+                Field::Header("x-http-method-override"),
+            )
         {
             self.push_special(outcome, rule_index, override_method, subject);
         }
@@ -774,13 +957,18 @@ impl Waf {
         rule_ref: &RuleRef,
         value: &str,
         subject: ScanSubject<'_>,
-        header_name: Option<&str>,
+        field: Field<'_>,
     ) {
         let rule = &self.compiled.rules[rule_ref.rule_index];
+        let header_name = match field {
+            Field::Header(name) | Field::ResponseHeader(name) => Some(name),
+            _ => None,
+        };
         if rule_ref.matches_header(header_name)
             && self.rule_applies(subject, rule_ref.rule_index)
             && !self.exemptions.suppresses_value(value)
             && !rule.suppresses_text(value)
+            && self.field_permits(rule, field)
         {
             outcome.push(RuleHit {
                 rule_index: rule_ref.rule_index,
@@ -788,6 +976,59 @@ impl Waf {
             });
         }
     }
+}
+
+/// A cookie crumb's name: the text before its first `=`, trimmed.
+fn cookie_name(crumb: &str) -> &str {
+    crumb.split_once('=').map_or(crumb, |(name, _)| name).trim()
+}
+
+/// `raw_query` without the pairs whose decoded name is excluded.
+fn query_without_excluded_params(raw_query: &str, exclusions: &FieldExclusions) -> String {
+    let mut kept = String::with_capacity(raw_query.len());
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        if exclusions.excludes_query_param(&normalize::query_component_name(raw_key)) {
+            continue;
+        }
+        if !kept.is_empty() {
+            kept.push('&');
+        }
+        kept.push_str(pair);
+    }
+    kept
+}
+
+/// The URL a whole-URL rule sees once its excluded query parameters are
+/// removed, in the same shape `run_cheap_scan` builds the full URL.
+fn url_without_excluded_params(
+    path: &str,
+    query: UrlQuery<'_>,
+    exclusions: &FieldExclusions,
+) -> String {
+    let mut url = String::from(path);
+    match query {
+        UrlQuery::None => {}
+        UrlQuery::Raw(raw_query) => {
+            let kept = query_without_excluded_params(raw_query, exclusions);
+            if !kept.is_empty() {
+                url.push('?');
+                url.push_str(&kept);
+            }
+        }
+        UrlQuery::Materialized(params) => {
+            let kept: std::collections::HashMap<String, String> = params
+                .iter()
+                .filter(|(name, _)| !exclusions.excludes_query_param(name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            append_materialized_query(&mut url, &kept);
+        }
+    }
+    url
 }
 
 fn header_value_target_matches(target: &RuleTarget, header_name: &str) -> bool {

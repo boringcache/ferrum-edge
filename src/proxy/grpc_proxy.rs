@@ -33,7 +33,6 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -57,11 +56,11 @@ use crate::proxy::headers::{
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
-    BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, append_http2_max_concurrent_streams_pool_key,
-    append_optional_pool_key_component, append_pool_key_component,
-    backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
-    pool_key_host_port_prefix, write_backend_host_port_prefix,
+    BackendSvidGeneration, BackendTlsConfigCache, OwnedBackendTlsConfigInputs,
+    SvidGenerationMatcher, TlsError, append_backend_tls_pool_key_fields,
+    append_http2_max_concurrent_streams_pool_key, append_optional_pool_key_component,
+    append_pool_key_component, backend_svid_generation_for_client_cert,
+    backend_tls_config_cache_key, pool_key_host_port_prefix, write_backend_host_port_prefix,
 };
 use crate::util::body_limit::is_length_limit_error;
 
@@ -1137,7 +1136,10 @@ impl GrpcConnectionPool {
         });
 
         let (selected_key, base_len, start) = match phase1 {
-            GrpcPhase1::Hit(sender) => return Ok(sender),
+            GrpcPhase1::Hit(sender) => {
+                crate::plugins::otel_tracing::note_backend_connection_reused();
+                return Ok(sender);
+            }
             GrpcPhase1::Miss {
                 selected_key,
                 base_len,
@@ -1154,9 +1156,19 @@ impl GrpcConnectionPool {
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
                 |key, attempt| async move {
                     let _ = key;
-                    manager
+                    // Only the creator runs this closure, so the connection
+                    // this attempt waits on is one it set up (issue #5864).
+                    let setup_started =
+                        crate::plugins::otel_tracing::backend_connection_setup_clock();
+                    let created = manager
                         .create_connection(proxy, svid_generation, purpose, Some(attempt))
-                        .await
+                        .await;
+                    if created.is_ok() {
+                        crate::plugins::otel_tracing::note_backend_connection_established_since(
+                            setup_started,
+                        );
+                    }
+                    created
                 },
             )
         });
@@ -1209,43 +1221,34 @@ enum GrpcPhase1 {
 }
 
 impl GrpcPoolManager {
-    fn get_tls_config(
+    /// Cached backend rustls config for this proxy's TLS identity. A miss is
+    /// built once on the bounded TLS source executor and shared by every
+    /// concurrent miss for the same identity; this Tokio worker never reads
+    /// material.
+    async fn get_tls_config(
         &self,
         proxy: &Proxy,
         svid_generation: Option<u64>,
     ) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
         let cache_key = self.tls_config_cache_key_owned(proxy, svid_generation);
-        self.tls_configs.get_or_try_build(cache_key, || {
-            let crls = self.crls.load_full();
-            let mut tls_config = BackendTlsConfigBuilder {
-                proxy,
-                policy: self.tls_policy.as_deref(),
-                global_ca: self
-                    .global_env_config
-                    .tls_ca_bundle_path
-                    .as_deref()
-                    .map(Path::new),
-                global_no_verify: self.global_env_config.tls_no_verify,
-                global_client_cert: self
-                    .global_env_config
-                    .backend_tls_client_cert_path
-                    .as_deref()
-                    .map(Path::new),
-                global_client_key: self
-                    .global_env_config
-                    .backend_tls_client_key_path
-                    .as_deref()
-                    .map(Path::new),
-                crls: crls.as_ref().as_slice(),
-            }
-            .build_rustls()
+        self.tls_configs
+            .get_or_build(cache_key, || {
+                let inputs = OwnedBackendTlsConfigInputs::for_pool(
+                    proxy,
+                    self.tls_policy.as_ref(),
+                    &self.global_env_config,
+                    &self.crls,
+                );
+                move || -> Result<rustls::ClientConfig, TlsError> {
+                    let mut tls_config = inputs.builder().build_rustls()?;
+                    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+                    Ok(tls_config)
+                }
+            })
+            .await
             .map_err(|e| {
                 GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
-            })?;
-
-            tls_config.alpn_protocols = vec![b"h2".to_vec()];
-            Ok(tls_config)
-        })
+            })
     }
 
     async fn create_connection(
@@ -1260,6 +1263,7 @@ impl GrpcPoolManager {
 
         // Resolve backend hostname via the shared DNS cache. Errors propagate
         // — no silent fallback to raw hostname that would bypass the cache.
+        let dns_started = crate::plugins::otel_tracing::backend_attempt_clock();
         let candidates = self
             .dns_cache
             .resolve_candidates(
@@ -1274,6 +1278,7 @@ impl GrpcPoolManager {
                     format!("DNS resolution failed for {}: {}", host, e),
                 )
             })?;
+        crate::plugins::otel_tracing::note_backend_dns_resolution_since(dns_started);
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let pool_config = self.global_pool_config.for_proxy(proxy);
@@ -1320,7 +1325,7 @@ impl GrpcPoolManager {
         // ALPN proof. A peer that accepts TCP but cannot establish the
         // requested protocol must not pin this pool to that DNS address.
         let result = if use_tls {
-            let tls_config = self.get_tls_config(proxy, svid_generation)?;
+            let tls_config = self.get_tls_config(proxy, svid_generation).await?;
             let connector = tokio_rustls::TlsConnector::from(tls_config);
             let server_name =
                 crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host)
@@ -1339,6 +1344,7 @@ impl GrpcPoolManager {
                 // its clone, so only an established connection keeps the slot.
                 let conn_slot = conn_slot.clone();
                 async move {
+                    let connect_started = crate::plugins::otel_tracing::backend_attempt_clock();
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
                         .map_err(|e| {
@@ -1348,6 +1354,7 @@ impl GrpcPoolManager {
                                 e,
                             )
                         })?;
+                    crate::plugins::otel_tracing::note_backend_tcp_connect_since(connect_started);
                     let _ = tcp.set_nodelay(true);
                     crate::socket_opts::apply_pooled_tcp_keepalive(
                         "grpc_proxy",
@@ -1366,6 +1373,7 @@ impl GrpcPoolManager {
                 let pool_config = &pool_config;
                 let conn_slot = conn_slot.clone();
                 async move {
+                    let connect_started = crate::plugins::otel_tracing::backend_attempt_clock();
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
                         .map_err(|e| {
@@ -1375,6 +1383,7 @@ impl GrpcPoolManager {
                                 e,
                             )
                         })?;
+                    crate::plugins::otel_tracing::note_backend_tcp_connect_since(connect_started);
                     let _ = tcp.set_nodelay(true);
                     crate::socket_opts::apply_pooled_tcp_keepalive(
                         "grpc_proxy",
@@ -1533,6 +1542,7 @@ impl GrpcPoolManager {
         pool_config: &PoolConfig,
         conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<GrpcPooledSender, GrpcProxyError> {
+        let tls_started = crate::plugins::otel_tracing::backend_attempt_clock();
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::TlsHandshake,
@@ -1540,6 +1550,7 @@ impl GrpcPoolManager {
                 e,
             )
         })?;
+        crate::plugins::otel_tracing::note_backend_tls_handshake_since(tls_started);
         if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
             let message = "TLS peer did not negotiate ALPN h2".to_string();
             return Err(GrpcProxyError::backend_unavailable_with_source(
@@ -2085,7 +2096,35 @@ impl GrpcProxyError {
             source: Some(Box::new(source)),
         }
     }
+
+    /// Whether this is an RPC-deadline expiry raised after the request was
+    /// sent to the backend: while waiting for its response headers, or while
+    /// collecting its buffered response body. The backend held the attempt
+    /// then, so proxy core charges the expiry to it when the deadline in force
+    /// was the matched rule's per-attempt budget rather than the client's.
+    pub(crate) fn is_deadline_after_request_sent(&self) -> bool {
+        matches!(
+            self,
+            Self::ClientDeadlineExceeded(message)
+                if message == GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE
+                    || message == GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE
+                    || message == GRPC_DEADLINE_RESPONSE_BODY_MESSAGE
+        )
+    }
 }
+
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
+/// while a streaming-upload RPC waited for its response headers.
+const GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE: &str =
+    "gRPC deadline exceeded waiting for streaming RPC response headers";
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
+/// while a buffered-upload RPC waited for its response headers.
+const GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE: &str =
+    "gRPC deadline exceeded waiting for backend response headers";
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
+/// while the buffered response body was being collected.
+const GRPC_DEADLINE_RESPONSE_BODY_MESSAGE: &str =
+    "gRPC deadline exceeded while collecting response body";
 
 impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2248,6 +2287,13 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
         }
     }
 }
+
+/// Transaction metadata key naming why a gRPC exchange's terminal status is
+/// present on the wire but unreadable by the gateway (a pass-through gRPC-Web
+/// body ending on a compressed trailer frame, or a content-encoded one). While
+/// it is set and no `grpc_status` is recorded, the status stays unset rather
+/// than defaulting to `UNKNOWN` (2), which the client never received.
+pub const GRPC_STATUS_UNREADABLE_METADATA_KEY: &str = "grpc_status_unreadable";
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
@@ -2424,10 +2470,11 @@ pub(crate) fn refresh_grpc_status_metadata(
 /// actually received.
 ///
 /// So when the terminal metadata is body-framed and neither map names a status,
-/// an already-recorded status stands. A status present in either map is still
-/// authoritative and still refreshes, so a genuine post-hook edit is never
-/// ignored, and a request with no recorded status at all still falls back to
-/// `UNKNOWN`.
+/// an already-recorded status stands, and so does a body-framed status recorded
+/// as present but unreadable ([`GRPC_STATUS_UNREADABLE_METADATA_KEY`]), which
+/// stays unset. A status present in either map is still authoritative and still
+/// refreshes, so a genuine post-hook edit is never ignored, and a request with
+/// no recorded status at all still falls back to `UNKNOWN`.
 pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
     metadata: &mut HashMap<String, String>,
     trailers: &HashMap<String, String>,
@@ -2436,7 +2483,8 @@ pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
 ) {
     if terminal_metadata_is_body_framed
         && grpc_status_from_maps(trailers, headers).is_none()
-        && metadata.contains_key("grpc_status")
+        && (metadata.contains_key("grpc_status")
+            || metadata.contains_key(GRPC_STATUS_UNREADABLE_METADATA_KEY))
     {
         return;
     }
@@ -2509,6 +2557,7 @@ pub fn grpc_request_body_too_large_backend_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+        buffered_trailers: None,
     }
 }
 
@@ -4555,16 +4604,18 @@ pub async fn proxy_grpc_request_streaming(
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
-    grpc_request_messages: Option<Arc<AtomicU64>>,
+    grpc_request_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     request_bytes: Option<GrpcUploadByteAccounting>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
+    // The tap's scanner reads the upload's own framing (a pass-through
+    // gRPC-Web upload counts decoded message frames only).
     let (grpc_messages, grpc_scanner) = match grpc_request_messages {
-        Some(messages) => (
-            Some(messages),
-            Some(crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default()),
-        ),
+        Some(tap) => {
+            let (messages, scanner) = tap.into_parts();
+            (Some(messages), Some(scanner))
+        }
         None => (None, None),
     };
     // Authorization lifetime for the fully-streamed native-gRPC upload (issue
@@ -4838,8 +4889,7 @@ async fn proxy_grpc_streaming_dispatch(
                         "gRPC deadline exceeded waiting for streaming RPC response headers"
                     );
                     GrpcProxyError::ClientDeadlineExceeded(
-                        "gRPC deadline exceeded waiting for streaming RPC response headers"
-                            .to_string(),
+                        GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE.to_string(),
                     )
                 })?
         } else if let Some(timeout_ms) = effective_timeout_ms {
@@ -5329,8 +5379,7 @@ pub(crate) async fn proxy_grpc_request_core(
                             "gRPC client deadline exceeded waiting for backend response headers"
                         );
                         GrpcProxyError::ClientDeadlineExceeded(
-                            "gRPC deadline exceeded waiting for backend response headers"
-                                .to_string(),
+                            GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE.to_string(),
                         )
                     } else {
                         warn_sampled!(
@@ -5532,7 +5581,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 if response_deadline_is_client {
                     warn_sampled!("gRPC client deadline exceeded while collecting response body");
                     GrpcProxyError::ClientDeadlineExceeded(
-                        "gRPC deadline exceeded while collecting response body".to_string(),
+                        GRPC_DEADLINE_RESPONSE_BODY_MESSAGE.to_string(),
                     )
                 } else {
                     warn_sampled!(
@@ -6005,6 +6054,7 @@ mod tests {
             udp_idle_timeout_seconds: 60,
             tcp_idle_timeout_seconds: Some(300),
             websocket_idle_timeout_seconds: None,
+            websocket_permessage_deflate: Default::default(),
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,

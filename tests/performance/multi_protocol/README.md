@@ -28,6 +28,24 @@ cd tests/performance/multi_protocol
 ./run_protocol_test.sh http2 --envoy --duration 30 --concurrency 200
 ```
 
+Protocols: `http1`, `http1-tls`, `http2`, `http3`, `ws`, `grpc`, `tcp`,
+`tcp-tls`, `udp`, `udp-dtls`, `all`. Options: `--duration` (default 30),
+`--concurrency` (default 100), `--payload-size` (default 64 bytes), `--json`,
+`--skip-build` (reuse existing binaries), `--envoy`.
+
+## Port conflicts and cleanup ownership
+
+`run_protocol_test.sh`, `run_gateway_protocol_bench.sh`, and
+`run_connection_saturation_bench.sh` refuse to start if any of their fixed
+ports (8000, 8443, and the backend/gateway/Envoy/Redis ports) is already bound,
+printing the port and an `lsof` command to inspect the listener, instead of
+`SIGKILL`-ing whatever is listening there. During the run, cleanup terminates
+only the PIDs and Docker container IDs that run recorded — sending `SIGTERM`,
+waiting a bounded interval, and then `SIGKILL` only if the process is still
+alive — and removes certificates/results only when that run actually created
+them. An early failure (for example, a port conflict) therefore cannot kill an
+unrelated local service or another test's listeners.
+
 ## Supported Protocols
 
 | Protocol | Client &rarr; Gateway | Gateway &rarr; Backend | Gateway Port | Backend Port |
@@ -70,6 +88,10 @@ Multi-protocol echo backend that starts all servers on fixed ports:
 | UDP echo    | 3005  | Datagram echo                       |
 | HTTP/3      | 3445  | QUIC/HTTP3 server                   |
 | DTLS echo   | 3006  | DTLS-wrapped datagram echo          |
+| HTTP/1.1+TLS| 3447  | HTTP/1.1 over TLS (ALPN http/1.1)    |
+| WSS         | 3446  | WebSocket over TLS                   |
+| gRPC+TLS    | 50053 | gRPC over TLS                        |
+| Health      | 3010  | HTTP/1.1 health endpoint             |
 
 Self-signed TLS certificates are generated at startup into `./certs/` (gitignored).
 
@@ -109,6 +131,7 @@ Key environment variables set by the test runner:
 | `FERRUM_ADD_FORWARDED_HEADER` | `false` | Skip Forwarded header construction |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `0` | Disable request body size checking (no plugins = safe) |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | `0` | Take fastest streaming path (no size limit checks) |
+| `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` | `0` | Disable small-response buffering (always stream) |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `0` | Disable slowloris timer (avoids per-connection timer overhead) |
 | `FERRUM_MAX_CONNECTIONS` | `0` | Disable connection semaphore (unlimited) |
 | `FERRUM_MAX_HEADER_COUNT` | `0` | Disable per-request header count check |
@@ -117,10 +140,13 @@ Key environment variables set by the test runner:
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | `200` | Prevent connection churn |
 | `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup |
 | `FERRUM_TLS_NO_VERIFY` | `true` | Accept self-signed certs |
-| `FERRUM_ENABLE_HTTP3` | `true` | Enable QUIC listener (HTTP/3 test) |
+| `FERRUM_ENABLE_HTTP3` | `true` | Enable QUIC listener (HTTP/3 test only) |
+| `FERRUM_POOL_ENABLE_HTTP2` | `true` | H2 backend pool (HTTP/2 test only) |
+| `FERRUM_WEBSOCKET_TUNNEL_MODE` | `true` | Raw WebSocket tunnel (no frame parsing) |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | `certs/cert.pem` | Gateway TLS cert |
 | `FERRUM_DTLS_CERT_PATH` | `certs/cert.pem` | Gateway DTLS cert |
-| `FERRUM_POOL_HTTP2_*` | (tuned) | H2 flow control: 8 MiB stream, 32 MiB conn windows |
+| `FERRUM_POOL_HTTP2_*` | (tuned) | Backend H2: 8 MiB stream / 32 MiB conn windows, 1 MiB frames, 16 conns per host |
+| `FERRUM_FRONTEND_H2_*` | (tuned) | Client-facing H2: 8 MiB stream / 32 MiB conn windows, 1 MiB frames |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side H2 stream limit |
 | `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 8 MiB send, 1000 max streams |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | default `4` | QUIC connections per backend; override with `FERRUM_EXTRA_ENV` for experiments |
@@ -135,7 +161,7 @@ Key environment variables set by the test runner:
 Text output (wrk-like format):
 
 ```
-Running 30s test @ https://127.0.0.1:8443/api/users
+Running 30s test @ https://127.0.0.1:8443/echo
   Protocol: HTTP/2
   100 concurrent connections
 
@@ -160,7 +186,7 @@ JSON output (`--json`):
 ```json
 {
   "protocol": "HTTP/2",
-  "target": "https://127.0.0.1:8443/api/users",
+  "target": "https://127.0.0.1:8443/echo",
   "duration_secs": 30,
   "concurrency": 100,
   "total_requests": 158340,
@@ -690,8 +716,11 @@ share one definition. This package is not a workspace member, so the workspace
 `Tests` aggregate never builds it; the **Benchmark Harness Tests** workflow
 (`.github/workflows/benchmark-harness-tests.yml`) is the hosted lane that runs
 these tests, on every pull request and `main` push touching
-`tests/performance/multi_protocol/**`. It is not a branch-protection-required
-check. The same two commands run locally:
+`tests/performance/**`. It is not a branch-protection-required
+check. It also runs a static contract
+(`tests/test_benchmark_runner_cleanup.py`) that fails if any benchmark runner
+or its invoking workflow still contains a port-wide `SIGKILL` idiom. The same
+two commands run locally:
 
 ```bash
 python3 -m unittest discover -s tests/performance/multi_protocol/tests -p 'test_*.py'
@@ -919,8 +948,10 @@ This means Ferrum provides more predictable latency under load — critical for 
 - **Rust toolchain** (cargo, rustc)
 - **protoc** (protobuf compiler) for gRPC support
 - **Envoy** (optional, for `--envoy` comparison mode)
-- The following ports must be free: 3001-3006, 3010, 3443-3445, 5001, 5003-5004, 5010, 8000, 8443, 50052
-- Port 15000 must also be free when using `--envoy` (Envoy admin)
+- The following ports must be free: 3001-3006, 3010, 3443-3447, 5000-5001,
+  5003-5004, 5010, 8000, 8443, 15000 (Envoy admin), 50052-50053.
+  `run_protocol_test.sh` checks all of them except 3446, 3447 and 50053 before
+  starting (including 15000 even without `--envoy`).
 
 Install dependencies:
 ```bash

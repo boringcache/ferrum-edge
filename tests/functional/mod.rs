@@ -1,5 +1,6 @@
 mod destination_active_requests_helpers;
 mod functional_a2a_gateway_grpc_card_test;
+mod functional_adaptive_concurrency_baseline_test;
 mod functional_admin_connection_limit_test;
 mod functional_admin_crud_resources_test;
 mod functional_admin_observability_test;
@@ -54,10 +55,13 @@ mod functional_grpc_message_metrics_test;
 mod functional_grpc_method_pre_hook_test;
 mod functional_grpc_plugins_test;
 mod functional_grpc_test;
+mod functional_grpc_web_passthrough_test;
 mod functional_grpcroute_pathless_dispatch_test;
 mod functional_h1_h2_auth_lifetime_test;
+mod functional_h2_response_trailers_test;
 mod functional_h3_auth_lifetime_test;
 mod functional_h3_authority_validation_test;
+mod functional_h3_early_data_classification_test;
 mod functional_h3_grpc_streaming_test;
 mod functional_h3_grpc_web_test;
 mod functional_h3_local_policy_test;
@@ -91,6 +95,8 @@ mod functional_node_agent_test;
 mod functional_opa_key_auth_redaction_test;
 mod functional_opa_protocol_coverage_test;
 mod functional_openapi_client_contract_test;
+mod functional_otel_attempt_spans_protocols_test;
+mod functional_otel_attempt_spans_test;
 mod functional_otel_ldap_test;
 mod functional_overload_test;
 mod functional_passthrough_test;
@@ -148,11 +154,14 @@ mod functional_udp_proxy_test;
 #[cfg(unix)]
 mod functional_unix_backend_test;
 mod functional_url_query_limits_test;
+mod functional_waf_unlisted_content_type_grpc_test;
+mod functional_waf_unlisted_content_type_h3_test;
 mod functional_websocket_connection_limit_test;
 mod functional_websocket_frame_limit_test;
 mod functional_websocket_limits_test;
 mod functional_websocket_test;
 mod functional_ws_origin_test;
+mod functional_ws_permessage_deflate_test;
 mod functional_ws_plugins_test;
 // Dedicated observer-off/on Linux lane in h1-internal-profile.yml.
 #[cfg(target_os = "linux")]

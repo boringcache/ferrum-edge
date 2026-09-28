@@ -602,18 +602,6 @@ impl PassiveEjection {
     }
 }
 
-/// Process-wide publication counter for the active-unhealthy target set.
-///
-/// Every mutation of any [`ActiveUnhealthyTargets`] bumps this counter AFTER
-/// the map change lands (`Release`). Load balancers tag their cached
-/// active-eligibility snapshot with the value they observed (`Acquire`)
-/// BEFORE scanning the map, so a mutation that races a scan is guaranteed to
-/// leave the counter ahead of the tag and force a recompute on the next
-/// selection. Being process-wide (rather than per map instance) means a
-/// balancer can never mistake one checker's generation `N` for another
-/// checker's generation `N` after a `HealthChecker` swap.
-static ACTIVE_HEALTH_GENERATION: AtomicU64 = AtomicU64::new(0);
-
 /// Result of [`ActiveUnhealthyTargets::insert_if_vacant`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VacantInsert {
@@ -632,14 +620,25 @@ static ACTIVE_UNHEALTHY_TARGETS_IDS: AtomicU64 = AtomicU64::new(1);
 /// Active-probe unhealthy set: `"namespace|upstream_id::host:port"` → epoch ms
 /// of the ejection, shared by every proxy that routes through the upstream.
 ///
-/// Wraps the `DashMap` so every mutation publishes a generation bump (see
-/// [`ACTIVE_HEALTH_GENERATION`]). The selection hot path never scans this map
-/// while the generation it cached is still current, and never calls
-/// `DashMap::is_empty()` / `len()`, which lock every shard.
+/// Wraps the `DashMap` so every mutation publishes a generation bump. The
+/// selection hot path never scans this map while the generation it cached is
+/// still current, and never calls `DashMap::is_empty()` / `len()`, which lock
+/// every shard.
+///
+/// The generation is per instance: every mutation bumps it AFTER the map
+/// change lands (`Release`). Load balancers tag their cached
+/// active-eligibility snapshot with the value they observed (`Acquire`)
+/// BEFORE scanning the map, so a mutation that races a scan is guaranteed to
+/// leave the counter ahead of the tag and force a recompute on the next
+/// selection. Snapshots are keyed on `(id, generation)`, so two maps that
+/// happen to sit at the same generation (e.g. after a `HealthChecker` swap)
+/// are never confused, and a mutation of one checker's map never invalidates
+/// projections of another's.
 #[derive(Debug)]
 pub struct ActiveUnhealthyTargets {
     map: DashMap<String, u64>,
     id: u64,
+    generation: AtomicU64,
 }
 
 impl Default for ActiveUnhealthyTargets {
@@ -653,6 +652,7 @@ impl ActiveUnhealthyTargets {
         Self {
             map: DashMap::new(),
             id: ACTIVE_UNHEALTHY_TARGETS_IDS.fetch_add(1, Ordering::Relaxed),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -665,16 +665,17 @@ impl ActiveUnhealthyTargets {
         self.id
     }
 
-    /// Current publication generation. Cheap (one relaxed-cost `Acquire`
-    /// load of a read-mostly cache line); safe to call per selection.
+    /// Current publication generation of this map instance. Cheap (one
+    /// relaxed-cost `Acquire` load of a read-mostly cache line); safe to call
+    /// per selection. Only meaningful together with [`Self::id`].
     #[inline]
     pub fn generation(&self) -> u64 {
-        ACTIVE_HEALTH_GENERATION.load(Ordering::Acquire)
+        self.generation.load(Ordering::Acquire)
     }
 
     #[inline]
     fn publish(&self) {
-        ACTIVE_HEALTH_GENERATION.fetch_add(1, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     #[inline]
@@ -3246,10 +3247,24 @@ async fn http_probe(
     timeout: Duration,
     healthy_status_codes: &[u16],
 ) -> ProbeOutcome {
+    let (outcome, drain_task) =
+        http_probe_inner(client, url, host_header, timeout, healthy_status_codes).await;
+    drop(drain_task);
+    outcome
+}
+
+async fn http_probe_inner(
+    client: &reqwest::Client,
+    url: &str,
+    host_header: Option<&str>,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> (ProbeOutcome, Option<tokio::task::JoinHandle<()>>) {
     let mut request = client.get(url).timeout(timeout);
     if let Some(host_header) = host_header {
         request = request.header(reqwest::header::HOST, host_header);
     }
+    let started = tokio::time::Instant::now();
     match request.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -3258,11 +3273,27 @@ async fn http_probe(
             } else {
                 healthy_status_codes.contains(&status)
             };
-            if healthy {
+            // The verdict is decided by the response headers. Drain a small body
+            // in the background so the HTTP/1.1 connection can return to the idle
+            // pool; a body that is oversized, stalled, or fails mid-read is
+            // abandoned without changing the verdict or delaying the probe loop.
+            let drain_budget = timeout
+                .saturating_sub(started.elapsed())
+                .min(HTTP_PROBE_BODY_DRAIN_TIMEOUT);
+            let drain_task = tokio::spawn(async move {
+                let mut resp = resp;
+                match tokio::time::timeout(drain_budget, drain_probe_body(&mut resp)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => debug!(reason, "HTTP health probe body not drained"),
+                    Err(_) => debug!("HTTP health probe body drain timed out"),
+                }
+            });
+            let outcome = if healthy {
                 ProbeOutcome::success()
             } else {
                 ProbeOutcome::failure(format!("http status {status}"))
-            }
+            };
+            (outcome, Some(drain_task))
         }
         Err(e) => {
             let failure = sanitized_http_probe_failure(&e);
@@ -3271,9 +3302,38 @@ async fn http_probe(
             } else {
                 debug!(failure = failure, "HTTP health probe failed");
             }
-            ProbeOutcome::failure(failure)
+            (ProbeOutcome::failure(failure), None)
         }
     }
+}
+
+/// Largest HTTP health probe response body drained for connection reuse.
+/// Larger bodies are abandoned and their connection closed.
+const HTTP_PROBE_BODY_DRAIN_MAX_BYTES: u64 = 64 * 1024;
+
+/// Longest time spent draining an HTTP health probe response body, further
+/// capped by whatever remains of the probe timeout.
+const HTTP_PROBE_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Reads and discards a health probe response body so hyper can return the
+/// connection to the pool. Stops as soon as the body exceeds
+/// [`HTTP_PROBE_BODY_DRAIN_MAX_BYTES`]; each chunk is dropped immediately, so
+/// memory stays bounded by the transport's read buffer.
+async fn drain_probe_body(resp: &mut reqwest::Response) -> Result<(), &'static str> {
+    if resp
+        .content_length()
+        .is_some_and(|len| len > HTTP_PROBE_BODY_DRAIN_MAX_BYTES)
+    {
+        return Err("body exceeds drain limit");
+    }
+    let mut drained: u64 = 0;
+    while let Some(chunk) = resp.chunk().await.map_err(|_| "body read failed")? {
+        drained = drained.saturating_add(chunk.len() as u64);
+        if drained > HTTP_PROBE_BODY_DRAIN_MAX_BYTES {
+            return Err("body exceeds drain limit");
+        }
+    }
+    Ok(())
 }
 
 /// TCP health probe — attempts a TCP connection within the timeout.
@@ -4762,6 +4822,39 @@ pub mod probe_timer_for_test {
     pub fn timer(target_key: &str, interval: Duration) -> tokio::time::Interval {
         super::active_probe_timer(target_key, interval)
     }
+}
+
+/// Public wrapper around [`http_probe`] for use in unit/integration tests.
+/// Returns the probe verdict and its failure reason, if any.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn http_probe_for_test(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> (bool, Option<String>) {
+    let (outcome, drain_task) =
+        http_probe_inner(client, url, None, timeout, healthy_status_codes).await;
+    if let Some(drain_task) = drain_task {
+        drop(drain_task.await);
+    }
+    (outcome.success, outcome.failure)
+}
+
+/// Test wrapper that returns at the header-time verdict without waiting for the body drain.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn http_probe_verdict_for_test(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> (bool, Option<String>) {
+    let (outcome, drain_task) =
+        http_probe_inner(client, url, None, timeout, healthy_status_codes).await;
+    drop(drain_task);
+    (outcome.success, outcome.failure)
 }
 
 /// Public wrapper around [`grpc_probe`] for use in unit/integration tests.

@@ -18,6 +18,8 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::CertificateRevocationListDer;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tempfile::TempDir;
 
 static INIT_CRYPTO: Once = Once::new();
@@ -134,6 +136,7 @@ fn create_test_proxy(port: u16, ca_path: &str, san_allow_list: Vec<String>) -> P
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -152,9 +155,8 @@ async fn start_h2_tls_backend(
     key_pem: &str,
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let certs: Vec<_> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
-    let private_key =
-        rustls_pemfile::private_key(&mut key_pem.as_bytes())?.ok_or("missing private key")?;
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
     let provider = rustls::crypto::ring::default_provider();
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))

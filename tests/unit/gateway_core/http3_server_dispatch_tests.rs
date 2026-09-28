@@ -155,8 +155,21 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         mesh_collection.contains("collect_h3_request_body_under_authorization("),
         "mesh uploads must force-collect via collect_h3_request_body_under_authorization"
     );
+    // Buffering a mesh upload is a gateway-local phase: it drains under
+    // `plain_local_bound`, the authorization plan composed with the earliest of
+    // the client RPC deadline and the route rule's total deadline (#5646).
+    let mesh_collection_compact: String = mesh_collection
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mesh_drain_args = mesh_collection_compact
+        .split_once("collect_h3_request_body_under_authorization(")
+        .expect("mesh uploads must force-collect under the authorization bound")
+        .1;
     assert!(
-        mesh_collection.contains("plain_write_bound"),
+        mesh_drain_args.starts_with(
+            "drain_h3_body(stream,effective_max_request_body_size_bytes),plain_local_bound,"
+        ),
         "mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(
@@ -1242,7 +1255,7 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
         "the H3 SSE writer must compose the listener lifetime with that captured plan"
     );
     assert!(
-        sse_writer.contains("await_authorized_headers_write("),
+        sse_writer.contains("await_offered_authorized_headers_write("),
         "the H3 SSE HEADERS write must race the composed bound"
     );
     assert!(
@@ -1352,6 +1365,50 @@ fn h3_aggregate_sse_writer_streams_under_a_hard_listener_bound() {
             "the H3 SSE pump must never buffer the stream (`{buffering}`)"
         );
     }
+}
+
+/// An authorization expiry that cancels the aggregate SSE HEADERS write after
+/// h3 took the frame resets the stream instead of writing the `401` HEADERS
+/// (#5745): h3-quinn would fail that second write with a connection-level
+/// error and h3 would close the whole QUIC connection. A bound that elapsed
+/// before the write began still gets the `401`.
+#[test]
+fn h3_aggregate_sse_resets_after_an_offered_protected_head() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let start = server
+        .find("async fn send_h3_aggregate_sse_response(")
+        .expect("native H3 aggregate SSE writer");
+    let end = server[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .expect("bounded aggregate SSE writer");
+    let sse_writer = &server[start..end];
+
+    assert!(
+        sse_writer.contains("let (headers_write, head_offered) ="),
+        "the HEADERS write must report whether it was offered"
+    );
+    let expired = sse_writer
+        .find("H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {")
+        .expect("the authorization-expired arm");
+    let arm = &sse_writer[expired..];
+    let reset = arm
+        .find("if head_offered {")
+        .expect("an offered head must be reset");
+    let terminal = arm
+        .find("authorization_expired_pre_commitment_response(")
+        .expect("the pre-commitment 401 terminal");
+    assert!(
+        reset < terminal,
+        "the offered-head reset must come before the 401"
+    );
+    let reset_arm = &arm[reset..terminal];
+    assert!(reset_arm.contains("abort_response_stream(stream);"));
+    assert!(reset_arm.contains("return Ok(());"));
+    assert!(
+        !reset_arm.contains("send_h3_finalized_reject_response_with_recv_halt("),
+        "an offered head must never be followed by a second HEADERS"
+    );
 }
 
 #[test]
@@ -1948,23 +2005,50 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
     // with the admitted credential's authorization lifetime (issue #3815) — so
     // a plain HTTP client with no RPC deadline is bounded too.
     let bridge = dispatch
-        .split("let send_result = if plain_write_bound")
+        .split("let send_result = if upload_bound_elapsed {")
         .nth(1)
         .expect("streaming upload/backend response race");
     // An ALREADY-elapsed composed bound must not poll the race at all: the
     // backend send and the frontend reader are both dropped, and the owner is
     // read from the captured composition rather than from a second clock read.
+    // The elapsed check sits with the refusal it decides, with no await in
+    // between (issue #5875).
+    let elapsed_check = dispatch
+        .split("let upload_bound_elapsed = plain_write_bound")
+        .nth(1)
+        .expect("the already-elapsed check of the composed bound")
+        .split("let send_result = if upload_bound_elapsed {")
+        .next()
+        .expect("bounded already-elapsed check");
+    assert!(
+        elapsed_check.contains("tokio::time::Instant::now() >= at"),
+        "an already-elapsed composed bound must refuse before polling the race"
+    );
+    assert!(
+        !elapsed_check.contains(".await"),
+        "no await may separate the already-elapsed check from its refusal"
+    );
     let refusal = bridge
         .split("} else {")
         .next()
         .expect("bounded already-elapsed refusal arm");
     assert!(
-        refusal.contains("tokio::time::Instant::now() >= at"),
-        "an already-elapsed composed bound must refuse before polling the race"
-    );
-    assert!(
         refusal.contains("plain_write_bound.expired_authorization()"),
         "the refusal must attribute from the captured composition"
+    );
+    // A refused upload was never handed to the backend, so the attempt record
+    // is gated on the refusal's own check, not on the earlier sample that
+    // decided whether to begin the attempt's span.
+    let record_gate = bridge
+        .split("if !upload_bound_elapsed {")
+        .nth(1)
+        .expect("the attempt record must be gated on the refusal")
+        .split('}')
+        .next()
+        .expect("bounded attempt record gate");
+    assert!(
+        record_gate.contains("attempt_end.record(ctx);"),
+        "a refused upload must record no attempt"
     );
     let deadline = bridge
         .find("_ = &mut upload_deadline, if upload_deadline_active =>")
@@ -2035,8 +2119,15 @@ fn h3_plain_grpc_web_client_acquisition_is_deadline_bounded() {
         2,
         "both client acquisitions must use the composed expiry-first bound"
     );
-    assert!(
-        dispatch.contains("plain_write_bound.deadline()"),
+    // Client acquisition is a gateway-local phase, so it waits under
+    // `plain_local_bound`: the authorization plan composed with the earliest of
+    // the client RPC deadline and the route rule's total deadline (#5646).
+    let dispatch_compact: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
+    let acquisition_wait =
+        "letclient_result=matchcrate::plugins::await_deadline_first(plain_local_bound.deadline(),";
+    assert_eq!(
+        dispatch_compact.matches(acquisition_wait).count(),
+        2,
         "client acquisition must wait under the captured composed bound, not the client deadline alone"
     );
     assert!(dispatch.contains("drop(pending_slot);"));
@@ -2348,9 +2439,24 @@ fn h3_buffered_retry_recomputes_native_h3_on_target_rotation() {
             && retry.contains("current_dispatch_h3 = crate::proxy::supports_native_http3_backend("),
         "H3 buffered retry must recompute native-H3 eligibility when the concrete target changes"
     );
+    // The rotated attempt dispatches natively only while `current_dispatch_h3`
+    // holds; its `else` arm is the Unknown/Unsupported bridge, which must use
+    // the buffered reqwest path and convert its response for the H3 frontend.
+    let native_arm = retry
+        .find("} else if current_dispatch_h3 {")
+        .expect("rotated attempts must branch on native-H3 eligibility");
+    let bridge_arm = retry[native_arm..]
+        .split_once("} else {")
+        .expect("Unknown/Unsupported rotated targets must have a bridge arm")
+        .1;
+    let bridge_arm = bridge_arm
+        .split("result = match attempt_result {")
+        .next()
+        .expect("bounded Unknown/Unsupported bridge arm");
     assert!(
-        retry.contains("h3_buffered_result_from_backend_response(")
-            && retry.contains("proxy_to_backend_retry("),
+        bridge_arm.contains("crate::proxy::proxy_to_backend_retry(")
+            && bridge_arm.contains(".map(h3_buffered_result_from_backend_response)")
+            && !bridge_arm.contains("proxy_to_backend_h3("),
         "Unknown/Unsupported rotated targets must bridge via the buffered cross-protocol path"
     );
     assert!(
@@ -4056,7 +4162,7 @@ fn h3_native_grpc_bidi_open_is_pre_wire_and_splits() {
         "the request head must receive the receipt-anchored deadline after connection acquisition"
     );
     let pooled_openers = client
-        .split("pub async fn open_bidi_backend_stream(")
+        .split("pub async fn open_bidi_backend_stream<")
         .nth(1)
         .unwrap()
         .split("/// Execute an HTTP/3 request, streaming the request body from a hyper")
@@ -4707,15 +4813,36 @@ fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
     // client deadline, a peer-gone, and a completed exchange all still win over
     // the write watermark. The watermark terminal is the LAST arm added, and it
     // is the typed 504 backend-timeout terminal, never a generic 502.
-    // Slice the whole `Err(())` arm, not just the tail after the watermark
-    // field: the arm halts the request half BEFORE it emits the attributing
-    // `warn!`, so a window opened at the watermark marker would exclude the
-    // very call this asserts.
-    let arm = dispatch
-        .split("let send_result = match header_bound {")
+    // The raced wait's `Err(())` is the write watermark. The prebuffered arm
+    // classifies it before acting on it, so the attempt is recorded at one
+    // point (issue #5875), then answers it with the arm that follows. The raw
+    // wait result is scoped to the classification block.
+    let classification = dispatch
+        .split("let attempt_end: PlainAttemptEnd<_> = {")
         .nth(1)
-        .expect("the prebuffered arm must bound its response headers")
-        .split("Ok(Err(())) => {")
+        .expect("the prebuffered arm must classify each attempt end")
+        .split("let header_bound = loop {")
+        .nth(1)
+        .expect("the raced wait must be scoped to the classification")
+        .split("match header_bound {")
+        .nth(1)
+        .expect("the prebuffered arm must bound its response headers");
+    assert!(
+        classification.contains("Err(()) => PlainAttemptEnd::WriteWatermark,"),
+        "the write-watermark expiry must stay classified as its own attempt end"
+    );
+    // Slice the whole write-watermark arm, not just the tail after the
+    // watermark field: the arm halts the request half BEFORE it emits the
+    // attributing `warn!`, so a window opened at the watermark marker would
+    // exclude the very call this asserts.
+    let arm = dispatch
+        .split("let send_result = match attempt_end {")
+        .nth(1)
+        .expect("the prebuffered arm must answer each attempt end")
+        .split("PlainAttemptEnd::WriteWatermark => {")
+        .nth(1)
+        .expect("the prebuffered write-watermark terminal")
+        .split("PlainAttemptEnd::HeaderTimeout => {")
         .next()
         .expect("bounded prebuffered write-watermark terminal");
     assert!(
@@ -5592,5 +5719,89 @@ fn h3_request_handler_boxes_its_largest_dispatch_relays() {
     assert!(
         streaming_factory.contains("Box::pin(async move {"),
         "boxed_dispatch_grpc_streaming must box an async trampoline"
+    );
+}
+
+/// Issue #5819: the HTTP/3 cross-protocol plain bridge counts gRPC request
+/// messages on every request-body arm, in the upload's own framing, so a
+/// pass-through gRPC-Web upload counts its decoded message frames and never its
+/// trailer frame or its `grpc-web-text` base64. The native gRPC dispatch keeps
+/// its native-framing counters.
+#[test]
+fn h3_plain_bridge_counts_request_messages_in_the_upload_framing() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let run_inner = source
+        .split("async fn run_inner<S>(")
+        .nth(1)
+        .expect("cross-protocol entry")
+        .split("\n}\n")
+        .next()
+        .expect("bounded cross-protocol entry");
+    let plain_arm = run_inner
+        .split("HttpFlavor::Plain => {")
+        .nth(1)
+        .expect("plain arm")
+        .split("boxed_dispatch_plain(")
+        .next()
+        .expect("plain arm before dispatch");
+    let unprepared = "if !request_body_prepared && let Some(body) = prebuffered_body.as_deref() {";
+    assert!(
+        plain_arm.contains(unprepared)
+            && plain_arm.contains("record_request_grpc_message_count(ctx, body);"),
+        "an unprepared prebuffered plain body is counted once, in its own framing"
+    );
+
+    let dispatch = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    let mesh_drain = dispatch
+        .split("drain_h3_body(stream, effective_max_request_body_size_bytes),")
+        .nth(1)
+        .expect("mesh-egress upload drain")
+        .split("(Some(body), len)")
+        .next()
+        .expect("drained mesh-egress body");
+    assert!(
+        mesh_drain.contains("record_request_grpc_message_count(ctx, &body);"),
+        "the drained mesh-egress body is counted in its own framing"
+    );
+
+    let compact: String = dispatch.chars().filter(|c| !c.is_whitespace()).collect();
+    let tap =
+        "letmutreader_grpc_tap=crate::plugins::grpc_web::request_stream_grpc_message_tap(ctx);";
+    assert!(
+        compact.contains(tap),
+        "the streamed upload carries the framing-aware message tap"
+    );
+    let position = |needle: &str| {
+        dispatch
+            .find(needle)
+            .unwrap_or_else(|| panic!("streamed upload reader: missing `{needle}`"))
+    };
+    let chunk = position("let body_bytes = chunk.copy_to_bytes(len);");
+    let copy = position("reader_grpc_tap.as_ref().map(|_| body_bytes.clone())");
+    let send = position("res = tx.send(Ok(body_bytes)) => res,");
+    let count = position("tap.push(metric_data);");
+    assert!(
+        chunk < copy && copy < send && send < count,
+        "a streamed chunk is counted only after it is handed to the backend body"
+    );
+    assert!(
+        !dispatch.contains("GrpcLengthPrefixedScanner::default()")
+            && !dispatch.contains("record_native_grpc_message_count("),
+        "the plain bridge never reads a pass-through upload as native framing"
+    );
+
+    let grpc = source
+        .split("async fn dispatch_grpc<S>(")
+        .nth(1)
+        .expect("cross-protocol gRPC dispatcher");
+    assert!(
+        grpc.contains("record_native_grpc_message_count("),
+        "the native gRPC dispatch keeps its native-framing counter"
     );
 }

@@ -83,12 +83,17 @@
 //!
 //! `FERRUM_WEBSOCKET_TUNNEL_MODE` does not apply to H3 — there is no raw
 //! TCP underneath QUIC, and the H3-side bytes already pass through the
-//! pump tasks regardless. This module always passes
-//! `websocket_tunnel_mode = false` to `run_websocket_proxy`. Operators
-//! who enabled tunnel mode for H1/H2 throughput get H3 frame-parsing
-//! semantics automatically — frame-level plugins (`on_ws_frame`,
-//! `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`) work
-//! on H3 sessions whether or not tunnel mode is set globally.
+//! pump tasks regardless. Operators who enabled tunnel mode for H1/H2
+//! throughput get H3 frame-parsing semantics automatically — frame-level
+//! plugins (`on_ws_frame`, `ws_rate_limit`, `ws_message_size_limiting`,
+//! `ws_frame_logging`) work on H3 sessions whether or not tunnel mode is set
+//! globally. The one exception is a `websocket_permessage_deflate:
+//! passthrough` session that actually negotiated the extension (issue #5769):
+//! its RSV1-compressed frames cannot pass the frame parser, so it is relayed
+//! as raw bytes between the duplex half and the backend. The offer is only
+//! forwarded when no plugin on the chain requires the parsed relay. A
+//! `terminate` session is the opposite: it always frame-parses, over
+//! transports that inflate each leg's compressed frames beneath the framer.
 //!
 //! ## Circuit breaker + load balancer accounting
 //!
@@ -262,7 +267,8 @@ fn collect_forwardable_h3_headers(
         // The WebSocket bridge cannot encode/decode permessage-deflate, so the
         // client's extension offer must not reach the backend (it would set
         // rsv1 and the session would be torn down). Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header.
+        // proxy::is_websocket_backend_strip_header. A passthrough proxy re-adds
+        // only the permessage-deflate elements (issue #5769).
         "sec-websocket-extensions",
         "host",
         "transfer-encoding",
@@ -409,6 +415,7 @@ async fn write_h3_finalized_reject_body<S>(
             return;
         }
     };
+    let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     if let Err(e) = stream.send_response(resp).await {
         debug!("H3 WS: failed to send reject response: {}", e);
         return;
@@ -729,6 +736,19 @@ pub(crate) async fn handle_h3_websocket(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // RFC 7692 passthrough (issue #5769), the same shared gate as H1/H2.
+    let ws_deflate_offered = crate::proxy::forward_permessage_deflate_offer(
+        proxy.websocket_permessage_deflate,
+        requires_websocket_framing,
+        &mut client_headers,
+        &proxy_headers,
+    );
+    // RFC 7692 terminate (issue #5769), the same shared negotiation as H1/H2.
+    let ws_deflate_termination = crate::proxy::begin_permessage_deflate_termination(
+        proxy.websocket_permessage_deflate,
+        &mut client_headers,
+        &proxy_headers,
+    );
 
     // ── Backend WebSocket handshake (reuses H1.1 Upgrade path) ──────
     //
@@ -984,53 +1004,98 @@ pub(crate) async fn handle_h3_websocket(
                     .map(|pq| std::borrow::Cow::Owned(pq.as_str().to_string()))
                     .unwrap_or(std::borrow::Cow::Borrowed("/"))
             });
-        let ws_dial_result: Result<
-            crate::proxy::WsBackendHandshake,
-            Box<dyn std::error::Error + Send + Sync>,
-        > = match (
+        // Gateway-local dial refusals are decided BEFORE the attempt's
+        // `otel_tracing` CLIENT span begins (issue #5875), as on the H1/H2
+        // bridge: a mesh target whose target-effective URL does not parse, and
+        // the direct dial's literal-IP egress denial and unsupported TLS SNI
+        // override. A refusal reaches no backend, so it exports no span and
+        // records no attempt. It still fails through the handshake-failure
+        // handling below exactly as before.
+        let ws_dial_refusal: Option<Box<dyn std::error::Error + Send + Sync>> = match (
             &ws_mesh_egress,
             current_target.as_deref(),
             ws_path_and_query.as_deref(),
         ) {
-            (Some(egress), Some(target), Some(path_and_query)) => {
-                crate::proxy::connect_mesh_websocket_backend(
-                    &state,
+            (Some(_), Some(_), Some(_)) => None,
+            (Some(_), Some(_), None) => {
+                Some(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
+            }
+            _ => crate::proxy::websocket_backend_dial_refusal(
+                &current_backend_url,
+                ws_dial_proxy,
+                &state.env_config,
+            ),
+        };
+        let ws_attempt_dispatched = ws_dial_refusal.is_none();
+        // The attempt's `otel_tracing` CLIENT span (issue #5867): the upgrade
+        // request carries the attempt's own `traceparent`, and the handshake is
+        // polled in the attempt's scope. It ends with the handshake below. A
+        // refused dial begins none.
+        let ws_attempt_span = if ws_attempt_dispatched {
+            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers)
+        } else {
+            crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE
+        };
+        let ws_attempt_headers = ws_attempt_span.header_list(&client_headers);
+        let ws_dial = async {
+            if let Some(refusal) = ws_dial_refusal {
+                return Err(refusal);
+            }
+            match (
+                &ws_mesh_egress,
+                current_target.as_deref(),
+                ws_path_and_query.as_deref(),
+            ) {
+                (Some(egress), Some(target), Some(path_and_query)) => {
+                    crate::proxy::connect_mesh_websocket_backend(
+                        &state,
+                        ws_dial_proxy,
+                        target,
+                        egress,
+                        ws_client_host.as_deref(),
+                        path_and_query,
+                        ws_attempt_headers,
+                        ws_size_limits.max_frame_bytes,
+                        ws_size_limits.max_message_bytes,
+                        state.websocket_write_buffer_size,
+                        ws_idle_tracker.clone(),
+                        ctx.peer_spiffe_id.as_ref(),
+                    )
+                    .await
+                    .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake)))
+                }
+                // Refused above, before the attempt began.
+                (Some(_), Some(_), None) => {
+                    Err(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
+                }
+                _ => crate::proxy::connect_websocket_backend(
+                    &current_backend_url,
                     ws_dial_proxy,
-                    target,
-                    egress,
-                    ws_client_host.as_deref(),
-                    path_and_query,
-                    &client_headers,
+                    &state.env_config,
+                    ws_attempt_headers,
+                    &state.connection_pool,
                     ws_size_limits.max_frame_bytes,
                     ws_size_limits.max_message_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
-                    ctx.peer_spiffe_id.as_ref(),
+                    Some(&state.dns_cache),
                 )
                 .await
-                .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake)))
+                .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
             }
-            (Some(_), Some(_), None) => {
-                Err(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
-            }
-            _ => crate::proxy::connect_websocket_backend(
-                &current_backend_url,
-                ws_dial_proxy,
-                &state.env_config,
-                &client_headers,
-                state.tls_policy.as_deref(),
-                &state.crls,
-                ws_size_limits.max_frame_bytes,
-                ws_size_limits.max_message_bytes,
-                state.websocket_write_buffer_size,
-                ws_idle_tracker.clone(),
-                Some(&state.dns_cache),
-            )
-            .await
-            .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
+        };
+        // Pinned in this block, so the dial future and its borrow of `ctx` end
+        // with the dial.
+        let ws_dial_result: Result<
+            crate::proxy::WsBackendHandshake,
+            Box<dyn std::error::Error + Send + Sync>,
+        > = {
+            tokio::pin!(ws_dial);
+            ws_attempt_span.scope(ws_dial).await
         };
         match ws_dial_result {
             Ok(handshake) => {
+                ctx.record_backend_attempt(None, true, handshake.backend_upgrade_status());
                 backend_conn_guard = conn_slot;
                 break handshake;
             }
@@ -1054,6 +1119,11 @@ pub(crate) async fn handle_h3_websocket(
                 // failure), matching the H1/H2 path.
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
+                // Every failed handshake ends its attempt, retried or not. A
+                // dial refused before its attempt began has none (issue #5875).
+                if ws_attempt_dispatched {
+                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                }
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     let route_retry_ceiling =
                         crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
@@ -1344,12 +1414,56 @@ pub(crate) async fn handle_h3_websocket(
         return Ok(());
     }
 
+    let ws_deflate_negotiation = match ws_deflate_termination {
+        None => crate::proxy::ws_permessage_deflate::NegotiatedTermination::default(),
+        Some(handshake) => match crate::proxy::complete_permessage_deflate_termination(
+            handshake,
+            &backend_handshake,
+            state
+                .env_config
+                .websocket_permessage_deflate_max_message_bytes,
+        ) {
+            Ok(negotiated) => negotiated,
+            Err(reason) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    reason,
+                    "H3 WS: rejecting upgrade: invalid backend permessage-deflate answer"
+                );
+                // Boxed: this future is polled inside `handle_h3_request`'s
+                // stack budget, so the reject ladder must not add inline slots.
+                Box::pin(async {
+                    crate::proxy::log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        502,
+                        start_time,
+                        "websocket_permessage_deflate",
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                    )
+                    .await;
+                    send_h3_error_body(
+                        &mut stream,
+                        StatusCode::BAD_GATEWAY,
+                        r#"{"error":"Backend WebSocket extension negotiation failed"}"#,
+                        &initial_response_header_policy_plugins,
+                    )
+                    .await;
+                })
+                .await;
+                crate::proxy::record_request(&state, 502);
+                return Ok(());
+            }
+        },
+    };
+
     // Capture the LB connection guard NOW — before the 200 is sent — so
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
     let ws_lb_guard = crate::proxy::LoadBalancerConnectionGuard::new(
-        current_target.clone(),
-        upstream_balancer.clone(),
+        current_target.as_deref(),
+        upstream_balancer.as_deref(),
     );
     if let Some(permits) = backend_admission_permits.as_ref() {
         // The permit is held for the full session (moved into the task below),
@@ -1413,6 +1527,22 @@ pub(crate) async fn handle_h3_websocket(
     if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         response_builder = response_builder.header("sec-websocket-protocol", proto);
     }
+    // Forward the backend's permessage-deflate answer only when this upgrade
+    // offered it; a negotiated session is relayed as raw bytes below.
+    let ws_negotiated_deflate = if ws_deflate_offered {
+        backend_handshake.negotiated_permessage_deflate()
+    } else {
+        None
+    };
+    let ws_tunnel = ws_negotiated_deflate.is_some();
+    if let Some(extensions) = ws_negotiated_deflate {
+        response_builder = response_builder.header("sec-websocket-extensions", extensions);
+    }
+    // A `terminate` proxy answers the client with the gateway's own agreement.
+    if let Some(extensions) = ws_deflate_negotiation.client_response {
+        response_builder = response_builder.header("sec-websocket-extensions", extensions);
+    }
+    let ws_deflate_session = ws_deflate_negotiation.session;
     let response = match response_builder.body(()) {
         Ok(r) => r,
         Err(e) => {
@@ -1422,6 +1552,7 @@ pub(crate) async fn handle_h3_websocket(
     };
     crate::proxy::record_request(&state, 200);
 
+    let response = crate::diagnostic_ref::stamp_h3_response(response);
     if let Err(e) = stream.send_response(response).await {
         error!(proxy_id = %proxy.id, "H3 WS: failed to send 200 response: {}", e);
         return Err(anyhow::anyhow!("H3 WebSocket send_response: {}", e));
@@ -1587,11 +1718,16 @@ pub(crate) async fn handle_h3_websocket(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let adaptive_buf = state.adaptive_buffer.clone();
+    let tunnel_safety_cap = crate::proxy::websocket_tunnel_idle_disabled_safety_cap(
+        state.env_config.tcp_half_close_max_wait_seconds,
+    );
 
     // ── Run the shared frame-relay code (same as H1/H2) ─────────────
     //
-    // tunnel mode is forced off — QUIC ≠ TCP, there is no raw socket to
-    // splice. The same shared `run_websocket_proxy` handles per-frame
+    // tunnel mode is off unless a passthrough session negotiated
+    // permessage-deflate — QUIC ≠ TCP, there is no raw socket to splice,
+    // but the duplex half carries the same frame bytes. The same shared
+    // `run_websocket_proxy` handles per-frame
     // plugins, cancellation, and on_ws_disconnect bookkeeping. Dispatch
     // on Direct vs Mesh so both backend transports share one relay
     // (issue #3620). The client-trust session is the same transport-owned
@@ -1600,7 +1736,7 @@ pub(crate) async fn handle_h3_websocket(
     let relay_result = match backend_handshake {
         crate::proxy::WsBackendHandshake::Direct(handshake) => {
             let handshake = *handshake;
-            crate::proxy::run_websocket_proxy(
+            crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
                 &proxy_id_for_relay,
@@ -1612,8 +1748,8 @@ pub(crate) async fn handle_h3_websocket(
                 ws_connection_permit,
                 max_ws_frame,
                 ws_write_buf,
-                false, // H3 always frame-parses; tunnel mode is H1-only
-                crate::proxy::WS_DRAIN_GRACE,
+                ws_tunnel,
+                tunnel_safety_cap,
                 ws_idle_tracker,
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),
@@ -1621,12 +1757,13 @@ pub(crate) async fn handle_h3_websocket(
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
                 ws_client_trust_session,
+                ws_deflate_session,
             )
             .await
         }
         crate::proxy::WsBackendHandshake::Mesh(handshake) => {
             let handshake = *handshake;
-            crate::proxy::run_websocket_proxy(
+            crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
                 &proxy_id_for_relay,
@@ -1638,8 +1775,8 @@ pub(crate) async fn handle_h3_websocket(
                 ws_connection_permit,
                 max_ws_frame,
                 ws_write_buf,
-                false,
-                crate::proxy::WS_DRAIN_GRACE,
+                ws_tunnel,
+                tunnel_safety_cap,
                 ws_idle_tracker,
                 ws_session_deadline,
                 ws_shutdown_rx.clone(),
@@ -1647,6 +1784,7 @@ pub(crate) async fn handle_h3_websocket(
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
                 ws_client_trust_session,
+                ws_deflate_session,
             )
             .await
         }
