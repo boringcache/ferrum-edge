@@ -286,6 +286,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build with `FAILED_PRECONDITION`, the DP refuses any CP frame from another
   build, and a refused DP backs off on the normal failure schedule while it
   keeps serving last-known-good config. Upgrade CP and DP together.
+- **The whole `x-consumer-*` request-header namespace is gateway-owned**
+  (breaking). Every client-supplied request header whose name starts with
+  `x-consumer-` (case-insensitive), not only `X-Consumer-Username` and
+  `X-Consumer-Custom-Id`, is now removed before plugins run and before
+  dispatch on HTTP/1.1, HTTP/2, HTTP/3, native and bridged gRPC, the
+  cross-protocol bridges, mesh/HBONE-forwarded HTTP, and third-party AI
+  provider calls; WebSocket handshakes and request trailers already did this.
+  A client `X-Consumer-Role` or `X-Consumer-Groups` no longer reaches a
+  backend. After the plugin phases the namespace is scrubbed again, so a
+  plugin cannot author a name beneath it, and only the gateway's authenticated
+  `X-Consumer-Username` / `X-Consumer-Custom-Id` are written back. Plugin
+  configuration that targets the namespace is rejected at config load, with an
+  error naming the rule: `request_transformer` header destinations,
+  `claim_headers` / `output_claim_headers` destinations,
+  `correlation_id.header_name`, and `mesh_route_dispatch` `request_transform`
+  destinations. `proxy::headers::is_consumer_assertion_header` is the single
+  predicate every boundary uses. There is no opt-out.
+  - `_` and `-` are equivalent in the namespace prefix, so `X_Consumer_Role`
+    and `x_consumer-groups` are stripped and refused too. CGI-style backends
+    (Rack, WSGI, PHP-FPM) fold both spellings onto the same
+    `HTTP_X_CONSUMER_*` variable.
+  - `request_deduplication.header_name` and `mcp_gateway`
+    `sessions.downstream_session_header` / `sessions.upstream_session_header`
+    naming an `x-consumer-*` header are rejected at config load, since the
+    header could never reach the plugin (`enforce_required` deduplication
+    would otherwise reject every request).
+  - A Gateway API HTTPRoute or GRPCRoute `RequestHeaderModifier` `set`/`add`
+    of an `x-consumer-*` name is refused per route (`Accepted=False`,
+    `UnsupportedValue`); the rest of the cluster's config still loads. An
+    Istio VirtualService `headers.request` `set`/`add` of such a name is
+    rejected when its `mesh_route_dispatch` instance is built.
+  - A load-balancer `hash_on: header:x-consumer-*` key no longer sees a
+    client-supplied value.
+  - A mesh AuthorizationPolicy `when` condition on
+    `request.headers[x-consumer-*]` sees the header as absent rather than the
+    client's value.
+  - Mesh sidecars strip `x-consumer-*` headers an application propagates on
+    outbound hops (previously only `X-Consumer-Username` /
+    `X-Consumer-Custom-Id`).
 - The vendored hyper patch that resets an upgraded HTTP/2 `CONNECT` stream
   with `CONNECT_ERROR` (#5781) is filed upstream as hyperium/hyper#4209 and
   hyperium/hyper#4210; the fork is dropped once a hyper release containing
