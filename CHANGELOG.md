@@ -375,6 +375,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3–8x faster on bodies with JSON escapes, entities, or percent-encoding, and
   ~10x faster on plain bodies. Global exemption checks no longer allocate or
   parse the client IP when their lists are empty.
+- Mesh remote discovery warns once per `RemoteCluster` whose
+  `discovery_credential_ref` is missing or unresolved, instead of on every
+  reconcile.
+
+### Removed
+
+Ferrum Edge is pre-launch, so these mesh compatibility paths are removed
+outright with no deprecation period:
+
+- **Mesh tracing `provider` alias.** `MeshTracingConfig` reads only
+  `providers`, as an array. It now rejects unknown keys, so a config that
+  still sets the singular `provider` fails to load instead of silently
+  disabling tracing. The single-object form and `"providers": null` are also
+  errors.
+- **Istio Telemetry snake_case tracing keys.** The Kubernetes translator reads
+  only the camelCase `agentUrl`, `collectorUrl`, `accessTokenEnv`, and
+  `serviceName` provider fields; `agent_url`, `collector_url`,
+  `access_token_env`, and `service_name` are no longer aliases.
+- **Unsuffixed `.ready` readiness markers.** The NodeWaypoint in-netns capture
+  manager publishes only `<registry>/.ready4/<pod_uid>` and
+  `<registry>/.ready6/<pod_uid>`; nothing is written to `<registry>/.ready`.
+- **`ferrum_mesh_udp_placement_migration_established_adoptions_total`.** Use
+  `ferrum_mesh_udp_placement_migration_adoptions_total{proof}`; the
+  `established_adoption` flag on authenticated `/health` is unchanged.
+- **The `control_plane="redacted"` label** on
+  `ferrum_mesh_remote_discovery_poll_failures_total`. The series is keyed by
+  `cluster` and `trust_domain` only.
+- **The `endpoint="redacted"` label** on
+  `ferrum_mesh_federation_poll_failures_total`. The series is keyed by
+  `trust_domain` only; the bundled federation alert and dashboard now group by
+  `trust_domain`.
+- **The pre-lock CNI socket owner probe.** The node-agent CNI listener relies
+  on its lifetime `<socket>.lock` lock alone and removes any socket it finds at
+  the path once it holds that lock.
+- **Bare-FQDN east-west SNI for single-port services.** Every cross-cluster
+  service port, including a single-port service's only port, routes on its
+  `p<port>.<service>.<namespace>.svc.<cluster-domain>` alias. The alias depends
+  only on the port's number and transport: HTTP-family and raw-TCP ports use
+  `p<port>`, and UDP ports (by declared protocol, never `protocol_overrides`)
+  always use `p<port>-udp`. When more than one declared port maps to one alias
+  (for example HTTP plus raw TCP, or Kubernetes `3868/TCP` plus `3868/SCTP`),
+  every source still translates the service, and both ends skip only that
+  alias for cross-cluster routing with a rate-limited warning. This changes
+  the cross-cluster wire format.
+  - A destination `EastWestGateway` `sni_hosts` entry takes over a port only
+    when it names that port's alias (or a covering wildcard). An entry that
+    names only a local service's base FQDN now logs a one-time warning.
+  - Destination authorization sees the alias as `connection.sni` for
+    cross-cluster traffic. A `connection.sni` rule written against the bare
+    service FQDN no longer matches it, so a DENY rule written that way stops
+    applying.
+- **Non-reserved xDS DestinationRule ECDS carriers.** A resource carrying the
+  DestinationRule carrier type under any name other than
+  `ferrum-destination-rule-carrier/<namespace>/<name>` now NACKs. Mesh config
+  validation rejects an operator `mesh.extension_configs` entry that declares
+  that type, naming the entry.
+- **Non-reserved xDS mesh-slice carriers.** A resource carrying a mesh-slice
+  carrier type under any name other than that carrier's reserved
+  `ferrum-mesh-carrier/…` name now NACKs instead of being skipped with a
+  warning.
+- **Mismatched explicit ports on single-port inbound routes.** A Sidecar
+  inbound route for a single-port service still serves a request with no port
+  signal, and a `Host`/`:authority` port naming its service port or its
+  container port. Any other explicit port, or a captured original destination
+  other than the container port, now fails closed with 502, as it already did
+  for multi-port services. These rejections log a rate-limited warning.
+- **Shared-secret remote discovery.** Cross-cluster endpoint discovery polls a
+  `RemoteCluster` only with its own `discovery_credential_ref` credential from
+  `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS`; a cluster without one is no
+  longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 
 ### Fixed
 
