@@ -17,11 +17,10 @@ permissions:
 
 concurrency:
   group: ci-publish-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  # Superseded pull-request and merge-group runs are cancelled. Pushes to
-  # main are never cancelled: a run in flight finishes and at most one newer
-  # push waits behind it, so main always converges on a complete, exact-SHA
-  # validation set instead of cancelling every run before it can finish.
-  cancel-in-progress: ${{ github.event_name != 'push' && github.repository != 'boringcache/ferrum-edge' }}
+  # Retain validation runs and execute one at a time so saved caches are ready
+  # before the next run starts.
+  queue: max
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
