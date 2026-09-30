@@ -100,9 +100,18 @@ fails with 16,384 bytes without the patch);
 during read-ahead is delivered once, after every buffered byte has drained
 through small reads; `ferrum_greedy_read_error_fails_a_close_delimited_body`
 proves a close-delimited body cut by that error fails instead of ending cleanly;
-and `ferrum_greedy_read_error_reaches_the_upgraded_tunnel` upgrades a client
+`ferrum_greedy_read_error_reaches_the_upgraded_tunnel` upgrades a client
 connection with a 101 whose read-ahead ends in a one-time `ConnectionReset`,
-and proves the tunnel reads every buffered byte, then the reset, then EOF.
+and proves the tunnel reads every buffered byte, then the reset, then EOF; and
+`ferrum_greedy_read_error_reaches_a_server_upgraded_tunnel` proves the same on
+the server, for a client that sends 16 KiB of tunnel bytes right behind its
+upgrade request and then resets
+([#5920](https://github.com/ferrum-edge/ferrum-edge/issues/5920)). Both
+upgrade tests also assert that the scripted reset was read by the connection
+before the upgrade, so neither can pass without exercising the read-ahead. The
+client test builds with hyper's `http1,http2,client` features and the server
+test with `http1,http2,server`; `http2` is needed because the upstream test
+module imports `Compat`, which hyper builds only with `http2`.
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
