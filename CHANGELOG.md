@@ -500,6 +500,10 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **Gateway listeners wait for matching route admission** (#5913). Newly bound
+  listener sockets do not accept connections until their matching config
+  generation publishes admission, preventing brief 404 responses during reload.
+
 - **`main-latest-image.yml` now moves `latest` after a successful publisher
   run** (#5893). GitHub withholds a job output that may contain a secret, and
   the verified Docker Hub `repo@sha256:` reference matched the Docker Hub
