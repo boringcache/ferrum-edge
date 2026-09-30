@@ -2701,7 +2701,7 @@ async fn handle_h3_request(
     // Track this request for overload monitoring and graceful drain.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
-    let method = req.method().to_string();
+    let mut method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
@@ -5434,6 +5434,15 @@ async fn handle_h3_request(
         }
     }
 
+    // Backend method, final once every `before_proxy` pass is complete (only
+    // `mcp_gateway`'s OpenAPI bridge selects one, from a fixed set of static
+    // tokens that excludes HEAD/OPTIONS/TRACE/CONNECT, so client response
+    // framing is unchanged). The common path pays one `Option` test and no
+    // allocation. Keep in sync with `handle_proxy_request_inner`.
+    if let Some(backend_method) = ctx.backend_method_override {
+        method = backend_method.to_owned();
+    }
+
     // Capture the backend-visible query only after every deferred before_proxy
     // pass and the gated destination rebinding above. A remaining deferred hook
     // (for example `ai_federation` streaming) can commit an empty provider-owned
@@ -7029,7 +7038,7 @@ async fn handle_h3_request(
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
-            http_method: method.to_string(),
+            http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
             request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
@@ -7380,7 +7389,7 @@ async fn handle_h3_request(
                     client_ip: ctx.client_ip.clone(),
                     consumer_username: ctx.effective_identity().map(str::to_owned),
                     auth_method: ctx.auth_method,
-                    http_method: method.to_string(),
+                    http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
                     request_path: original_request_path.clone(),
                     proxy_id: Some(proxy.id.clone()),
                     proxy_name: proxy.name.clone(),
@@ -7599,7 +7608,7 @@ async fn handle_h3_request(
                 client_ip: ctx.client_ip.clone(),
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
-                http_method: method.to_string(),
+                http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
                 request_path: path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
@@ -8435,7 +8444,7 @@ async fn handle_h3_request(
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
-            http_method: method.to_string(),
+            http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
             request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
@@ -9044,7 +9053,7 @@ async fn handle_h3_request(
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
-            http_method: method,
+            http_method: crate::proxy::logged_http_method(&ctx, method),
             request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
@@ -10367,7 +10376,7 @@ async fn handle_h3_request(
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
-            http_method: method,
+            http_method: crate::proxy::logged_http_method(&ctx, method),
             request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),

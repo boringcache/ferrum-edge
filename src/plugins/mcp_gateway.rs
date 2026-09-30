@@ -18,8 +18,8 @@ use regex::Regex;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -31,6 +31,11 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
     AggregateSseBounds, AggregateSseBroker, AggregateSseError, StreamIdentity,
+};
+use super::mcp_openapi_bridge::{
+    BridgeObservedResponse, BridgeRebuildContext, BridgeTransformOutcome, McpBridgeClaim,
+    McpBridgeState, McpOpenApiBridge, body_result, bridge_header_names_match,
+    bridge_response_provenance, head_only_result, json_rpc_result_bytes, unconverted_result,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -173,6 +178,7 @@ const MCP_SERVER_KEYS: &[&str] = &[
     "expose_tools",
     "initialize_strategy",
     "namespace",
+    "openapi",
     "upstream_url",
 ];
 const MCP_STDIO_TRANSPORT_KEYS: &[&str] = &["args", "command", "stdio"];
@@ -219,6 +225,14 @@ const MCP_REWRITTEN_RESPONSE_VALIDATORS: &[&str] = &[
     "content-digest",
     "digest",
     "content-md5",
+];
+/// Backend representation metadata that cannot describe the JSON-RPC tool
+/// result an OpenAPI bridge call is answered with.
+const BRIDGE_DISCARDED_RESPONSE_HEADERS: &[&str] = &[
+    "content-disposition",
+    "content-language",
+    "content-location",
+    "content-range",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,13 +578,47 @@ struct McpUpstreamTarget {
 struct McpServerConfig {
     server_id: String,
     namespace: String,
-    upstream_url: String,
-    target: McpUpstreamTarget,
+    transport: McpServerTransport,
     enabled: bool,
     expose_tools: bool,
     expose_resources: bool,
     expose_prompts: bool,
     initialize_strategy: InitializeStrategy,
+}
+
+/// Where a configured server's catalog comes from and where its calls go.
+#[derive(Debug, Clone)]
+enum McpServerTransport {
+    /// An HTTP MCP server: its catalog is its own `tools/list` (and prompts /
+    /// resources), and routed calls are forwarded to `upstream_url`.
+    Upstream {
+        upstream_url: String,
+        target: McpUpstreamTarget,
+    },
+    /// Tools generated from OpenAPI operations. Each `tools/call` becomes an
+    /// HTTP request to the proxy's own configured backend; there is no MCP
+    /// upstream, no upstream session, and no network discovery.
+    OpenApi(Arc<McpOpenApiBridge>),
+}
+
+impl McpServerConfig {
+    /// The MCP upstream URL and target, `None` for an OpenAPI bridge server.
+    fn upstream(&self) -> Option<(&str, &McpUpstreamTarget)> {
+        match &self.transport {
+            McpServerTransport::Upstream {
+                upstream_url,
+                target,
+            } => Some((upstream_url.as_str(), target)),
+            McpServerTransport::OpenApi(_) => None,
+        }
+    }
+
+    fn bridge(&self) -> Option<&Arc<McpOpenApiBridge>> {
+        match &self.transport {
+            McpServerTransport::OpenApi(bridge) => Some(bridge),
+            McpServerTransport::Upstream { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -792,8 +840,8 @@ struct ToolCatalogEntry {
     upstream_name: String,
     server_id: String,
     namespace: String,
-    input_schema: Value,
-    output_schema: Option<Value>,
+    input_schema: Arc<Value>,
+    output_schema: Option<Arc<Value>>,
     title: Option<String>,
     description: Option<String>,
     annotations: Option<Value>,
@@ -1054,6 +1102,10 @@ pub(crate) struct McpAdmissionRecord {
     upstream_session_drift: AtomicBool,
     /// Admitted item identity, absent for passthrough methods and responses.
     target: Option<McpAdmittedTarget>,
+    /// The backend request an OpenAPI bridge tool call was committed to. When
+    /// present the final request is a REST call, not a JSON-RPC envelope, and
+    /// it is re-checked against this claim instead.
+    bridge: Option<Arc<McpBridgeClaim>>,
 }
 
 impl std::fmt::Debug for McpAdmissionRecord {
@@ -1065,6 +1117,7 @@ impl std::fmt::Debug for McpAdmissionRecord {
             .field("method", &self.method)
             .field("server_id", &self.server_id)
             .field("target", &self.target.as_ref().map(|target| target.param))
+            .field("bridge", &self.bridge.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1309,6 +1362,12 @@ pub struct McpGateway {
     validation: McpValidationConfig,
     observability: McpObservabilityConfig,
     http_client: PluginHttpClient,
+    /// Catalog parts of each OpenAPI bridge server's tools, by server id,
+    /// built once at load and shared by every session's catalog.
+    bridge_tools: HashMap<String, Arc<[ToolDefinitionParts]>>,
+    /// The configured `FERRUM_REAL_IP_HEADER`, lower-cased, reserved for
+    /// bridged calls.
+    real_ip_header: Option<String>,
 }
 
 impl McpGateway {
@@ -1413,7 +1472,9 @@ impl McpGateway {
         // skips the DnsCacheResolver for IP literals, so an operator/file/CP
         // write naming e.g. `http://169.254.169.254/...` must be rejected here.
         for server in servers.values() {
-            if let Ok(parsed) = url::Url::parse(&server.upstream_url) {
+            if let Some((upstream_url, _)) = server.upstream()
+                && let Ok(parsed) = url::Url::parse(upstream_url)
+            {
                 crate::plugins::utils::log_helpers::screen_url_host_egress(
                     "mcp_gateway",
                     "servers.*.upstream_url",
@@ -1422,6 +1483,22 @@ impl McpGateway {
                 )?;
             }
         }
+        // The configured client-attribution header is reserved for bridged
+        // calls like the static reserved set: a tool argument may never set
+        // it, and a bridged call never forwards the client's copy.
+        let real_ip_header = http_client.real_ip_header().map(str::to_ascii_lowercase);
+        validate_bridge_servers(
+            mode,
+            &servers,
+            &sessions,
+            &validation,
+            real_ip_header.as_deref(),
+        )?;
+        let bridge_tools = build_bridge_tool_parts(
+            &servers,
+            &discovery.namespace_separator,
+            validation.validate_tool_results,
+        );
         if sessions.initialize_upstreams == InitializeStrategy::Startup
             || servers
                 .values()
@@ -1479,10 +1556,24 @@ impl McpGateway {
             }
         }
 
+        // The primary server receives passthrough methods and transparent
+        // traffic, both of which are MCP JSON-RPC that only an upstream MCP
+        // server can answer; an OpenAPI bridge server is never primary.
         let primary_server_id = enabled_server_ids
-            .first()
-            .ok_or_else(|| "mcp_gateway: at least one server must be enabled".to_string())?
-            .clone();
+            .iter()
+            .find(|server_id| {
+                servers
+                    .get(server_id.as_str())
+                    .is_some_and(|server| server.upstream().is_some())
+            })
+            .cloned()
+            .unwrap_or_default();
+        if capabilities.passthrough_unknown_methods && primary_server_id.is_empty() {
+            return Err(
+                "mcp_gateway: `capabilities.passthrough_unknown_methods` requires an enabled `servers.*.upstream_url` MCP server; OpenAPI bridge servers cannot answer passthrough MCP methods"
+                    .to_string(),
+            );
+        }
 
         // session_store is read/touched on every aggregate request and written on
         // initialize/eviction, so size its shards per the hot-path DashMap invariant
@@ -1521,6 +1612,8 @@ impl McpGateway {
             validation,
             observability,
             http_client,
+            bridge_tools,
+            real_ip_header,
         })
     }
 
@@ -1728,14 +1821,21 @@ impl McpGateway {
         server: &McpServerConfig,
         downstream_session_id: Option<&str>,
     ) {
-        ctx.route_override_backend_scheme = Some(server.target.scheme);
-        ctx.route_override_backend_host = Some(server.target.host.clone());
-        ctx.route_override_backend_port = Some(server.target.port);
+        // Only an MCP upstream is ever routed to directly. Config admission
+        // keeps OpenAPI bridge servers out of every caller (they expose tools
+        // only, are never the primary server, and are refused in transparent
+        // mode); a bridge `tools/call` takes `route_bridge_tool_call` instead.
+        let Some((_, target)) = server.upstream() else {
+            return;
+        };
+        ctx.route_override_backend_scheme = Some(target.scheme);
+        ctx.route_override_backend_host = Some(target.host.clone());
+        ctx.route_override_backend_port = Some(target.port);
         ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
-        ctx.route_override_path = Some(server.target.path.clone());
+        ctx.route_override_path = Some(target.path.clone());
         ctx.route_override_path_is_absolute = true;
-        ctx.route_override_authority = Some(server.target.authority.clone());
-        headers.insert("host".to_string(), server.target.authority.clone());
+        ctx.route_override_authority = Some(target.authority.clone());
+        headers.insert("host".to_string(), target.authority.clone());
         if self.mode == McpGatewayMode::AggregateRouter {
             // Session headers and the protocol version are gateway-owned in aggregate
             // mode. Strip any client-supplied session value — the synthetic downstream
@@ -1803,7 +1903,427 @@ impl McpGateway {
             upstream_session: upstream_session.map(ToOwned::to_owned),
             upstream_session_drift: AtomicBool::new(false),
             target,
+            bridge: None,
         }));
+    }
+
+    /// Route an admitted OpenAPI bridge `tools/call` to this proxy's own
+    /// backend.
+    ///
+    /// Runs after the shared catalog lookup, policy, per-consumer grant, and
+    /// `inputSchema` validation in [`Self::route_tool_call`], so a generated
+    /// tool is admitted by exactly the decisions an upstream MCP tool is. The
+    /// call then becomes the operation's HTTP request through ordinary backend
+    /// dispatch: only the backend method, path, query, headers, and body are
+    /// replaced. The destination host, scheme, port, TLS, and upstream stay
+    /// the proxy's own, so retries, the circuit breaker, and observability
+    /// apply unchanged, and no tool argument can select where the call goes.
+    fn route_bridge_tool_call(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+        entry: &ToolCatalogEntry,
+        bridge: &Arc<McpOpenApiBridge>,
+        grant: Option<McpToolGrant>,
+    ) -> PluginResult {
+        let Some(operation) = bridge.operation(&entry.upstream_name) else {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32002,
+                "Unknown OpenAPI bridge operation",
+                None,
+            );
+        };
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.bridge.operation".to_string(),
+                operation.label().to_string(),
+            );
+        }
+        // The proxy's `allowed_methods` filter ran over the client's MCP
+        // `POST`, never over the method the bridge dispatches, so it is
+        // applied to the bridged method here: an operation the route would
+        // refuse to a direct client is refused to a tool call too.
+        if !bridge_method_allowed_on_route(ctx, operation.method().as_str()) {
+            if self.observability.emit_metadata {
+                ctx.metadata.insert(
+                    "mcp.policy_decision".to_string(),
+                    "method_not_allowed".to_string(),
+                );
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32001,
+                "OpenAPI bridge operation method is not allowed on this proxy",
+                None,
+            );
+        }
+        let arguments = envelope
+            .params
+            .as_ref()
+            .and_then(|params| params.get("arguments"));
+        let request =
+            match operation.build_request(arguments, bridge.max_request_body_bytes(), |name| {
+                self.bridge_header_reserved_for_deployment(ctx, name)
+            }) {
+                Ok(request) => request,
+                Err(error) => {
+                    if self.observability.emit_metadata {
+                        ctx.metadata
+                            .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    }
+                    return json_rpc_error(envelope.id.clone(), -32602, error.message(), None);
+                }
+            };
+        let Some(backend_path) = bridge_backend_path(ctx, &request.public_path) else {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32603,
+                "OpenAPI bridge operation path is outside this proxy's route",
+                None,
+            );
+        };
+        let envelope_digest = self.request_body(ctx).map_or([0u8; 32], Sha256::digest);
+
+        // Destination: the proxy's own backend. Only the request path is
+        // replaced, relative to the backend base path exactly as a direct
+        // request to the operation's public path would be dispatched.
+        ctx.route_override_path = Some(backend_path.clone());
+        ctx.route_override_path_is_absolute = false;
+        ctx.backend_method_override = Some(request.method.as_str());
+        ctx.publish_transformed_query(request.query.clone(), request.query_params);
+
+        // Client headers: an allowlist. The MCP request is a JSON-RPC
+        // exchange with the gateway, so its credentials, cookies, MCP
+        // transport fields, conditional and range fields, method and URL
+        // override families, and application headers describe nothing about
+        // the REST call and never reach the backend. `host` stays for the
+        // proxy's own host handling; the gateway re-adds its forwarding,
+        // identity, and correlation headers at dispatch, and a later
+        // `request_transformer` can still add backend headers.
+        headers.retain(|name, _| {
+            name.eq_ignore_ascii_case("host")
+                || (bridge.forwards_client_header(name)
+                    && !self.bridge_header_reserved_for_deployment(ctx, name))
+                || ctx.is_correlation_header(name)
+        });
+        for (name, value) in &request.headers {
+            remove_header(headers, name);
+            headers.insert(name.clone(), value.clone());
+        }
+        // JSON preferred, anything accepted, identity-encoded so the response
+        // can be converted into a tool result without decoding.
+        headers.insert(
+            "accept".to_string(),
+            "application/json, */*;q=0.8".to_string(),
+        );
+        headers.insert("accept-encoding".to_string(), "identity".to_string());
+        if request.body.is_some() {
+            headers.insert("content-type".to_string(), "application/json".to_string());
+        }
+        // Declare the bridged body's exact length (zero for a bodyless call),
+        // so every dispatch ladder carries the request through the final
+        // request-body phase, where the bridged call is re-checked. The wire
+        // framing is still recomputed from the final body at dispatch.
+        let body_len = request.body.as_ref().map_or(0, Vec::len);
+        headers.insert("content-length".to_string(), body_len.to_string());
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.server_id".to_string(), entry.server_id.clone());
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "forward".to_string());
+        }
+        let input_validator = self
+            .validation
+            .validate_tool_arguments
+            .then(|| Arc::clone(&entry.input_validator));
+        let claim = Arc::new(McpBridgeClaim {
+            owner: self.instance_id,
+            method: request.method,
+            public_path: request.public_path,
+            backend_path,
+            query: request.query,
+            headers: request.headers,
+            body: request.body.unwrap_or_default(),
+            limits: bridge.limits(),
+            envelope_digest,
+            transformed: OnceLock::new(),
+            rebuild: BridgeRebuildContext {
+                bridge: Arc::clone(bridge),
+                operation: entry.upstream_name.clone(),
+                public_tool_name: entry.public_name.clone(),
+                request_id: envelope.id.clone(),
+                input_validator,
+            },
+        });
+        ctx.mcp_bridge = Some(McpBridgeState::new(Arc::clone(&claim)));
+        self.record_bridge_admission(
+            ctx,
+            envelope,
+            &entry.server_id,
+            &entry.upstream_name,
+            grant,
+            claim,
+        );
+        PluginResult::Continue
+    }
+
+    /// Whether this deployment reserves request header `name` for bridged
+    /// calls on top of the static reserved set: the MCP session headers, the
+    /// configured `FERRUM_REAL_IP_HEADER`, and the request's
+    /// `correlation_id` headers. A tool argument may never set one, and a
+    /// client's copy is never forwarded under an operator opt-in.
+    fn bridge_header_reserved_for_deployment(&self, ctx: &RequestContext, name: &str) -> bool {
+        bridge_header_names_match(name, &self.sessions.downstream_session_header)
+            || bridge_header_names_match(name, &self.sessions.upstream_session_header)
+            || self
+                .real_ip_header
+                .as_deref()
+                .is_some_and(|header| bridge_header_names_match(name, header))
+            || ctx.is_correlation_header(name)
+    }
+
+    /// Pin what this instance admitted for a bridged `tools/call`, for the
+    /// final request-body re-check. Must run after the bridge set its
+    /// backend path, method, and query.
+    fn record_bridge_admission(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        server_id: &str,
+        upstream_name: &str,
+        grant: Option<McpToolGrant>,
+        claim: Arc<McpBridgeClaim>,
+    ) {
+        let destination = McpAdmittedDestination::capture(ctx);
+        ctx.mcp_admission = Some(Arc::new(McpAdmissionRecord {
+            owner: self.instance_id,
+            message_kind: envelope.message_kind,
+            method: envelope.method.clone(),
+            response_id: None,
+            server_id: server_id.to_string(),
+            destination,
+            upstream_session: None,
+            upstream_session_drift: AtomicBool::new(false),
+            target: Some(
+                McpAdmittedTarget::without_arguments("name", upstream_name).with_grant(grant),
+            ),
+            bridge: Some(claim),
+        }));
+    }
+
+    /// Why the final backend-visible REST request of a bridged call no longer
+    /// matches what the bridge built, or `None` when it still does. The body
+    /// is compared byte for byte against the body built from the validated
+    /// arguments (or rebuilt from a transformed envelope and validated again),
+    /// so any later change is a change to the admitted operation.
+    fn final_bridge_violation(
+        ctx: &RequestContext,
+        claim: &McpBridgeClaim,
+        body: &[u8],
+    ) -> Option<&'static str> {
+        if ctx.backend_method_override != Some(claim.method.as_str()) {
+            return Some("method_changed");
+        }
+        if ctx.route_override_path.as_deref() != Some(claim.backend_path.as_str()) {
+            return Some("destination_changed");
+        }
+        if ctx.outbound_query_string() != Some(claim.query.as_str()) {
+            return Some("query_changed");
+        }
+        match claim.expected_body() {
+            Ok(expected) if body == expected => None,
+            Ok(_) => Some("body_changed"),
+            Err(reason) => Some(reason),
+        }
+    }
+
+    /// The REST body of a bridged call once earlier request-body transforms
+    /// ran over its JSON-RPC envelope.
+    ///
+    /// An unchanged envelope keeps the admitted body. A changed one (a
+    /// prompt-guard redaction, say) is parsed again, must still be the
+    /// admitted `tools/call` of the admitted tool and id, has its arguments
+    /// validated again against the pinned `inputSchema`, and is rebuilt into
+    /// a REST call that may differ from the admitted one only in its JSON
+    /// body. Anything else latches a refusal the final request-body hook
+    /// answers with `-32014`, so a redaction is never silently discarded and
+    /// never changes the request line or headers after routing.
+    fn bridge_transformed_body(
+        &self,
+        ctx: &RequestContext,
+        claim: &McpBridgeClaim,
+        envelope: &[u8],
+    ) -> Vec<u8> {
+        if claim.transformed.get().is_none() && Sha256::digest(envelope) != claim.envelope_digest {
+            let outcome = match self.rebuild_bridge_body(ctx, claim, envelope) {
+                Ok(body) => BridgeTransformOutcome::Rebuilt(body),
+                Err(reason) => BridgeTransformOutcome::Refused(reason),
+            };
+            let _ = claim.transformed.set(outcome);
+        }
+        match claim.expected_body() {
+            Ok(body) => body.to_vec(),
+            // The request is refused in the final request-body hook; until
+            // then the backend-bound body stays the admitted one.
+            Err(_) => claim.body.clone(),
+        }
+    }
+
+    /// Rebuild a bridged call's REST body from a transformed envelope, or the
+    /// fixed reason the envelope no longer describes the admitted call.
+    fn rebuild_bridge_body(
+        &self,
+        ctx: &RequestContext,
+        claim: &McpBridgeClaim,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        if crate::util::json_dup_keys::slice_ambiguity(envelope).is_some() {
+            return Err("ambiguous_body");
+        }
+        let value: Value = serde_json::from_slice(envelope).map_err(|_| "invalid_body")?;
+        let parsed = parse_mcp_envelope_value(&value, None).map_err(|_| "invalid_body")?;
+        let rebuild = &claim.rebuild;
+        if parsed.message_kind != McpMessageKind::Request
+            || parsed.method.as_deref() != Some("tools/call")
+        {
+            return Err("method_changed");
+        }
+        if parsed.id != rebuild.request_id {
+            return Err("request_id_changed");
+        }
+        let params = parsed.params.as_ref();
+        let name = params.and_then(|params| params.get("name"));
+        if name.and_then(Value::as_str) != Some(rebuild.public_tool_name.as_str()) {
+            return Err("target_changed");
+        }
+        let arguments = params.and_then(|params| params.get("arguments"));
+        if let Some(validator) = rebuild.input_validator.as_deref() {
+            let empty = json!({});
+            if validate_json_schema(validator, arguments.unwrap_or(&empty)).is_err() {
+                return Err("arguments_invalid");
+            }
+        }
+        let operation = rebuild
+            .bridge
+            .operation(&rebuild.operation)
+            .ok_or("target_changed")?;
+        let request = operation
+            .build_request(arguments, rebuild.bridge.max_request_body_bytes(), |name| {
+                self.bridge_header_reserved_for_deployment(ctx, name)
+            })
+            .map_err(|_| "arguments_invalid")?;
+        let same_request_line = request.method == claim.method
+            && request.public_path == claim.public_path
+            && request.query == claim.query;
+        if !same_request_line || request.headers != claim.headers {
+            return Err("request_changed");
+        }
+        // A body appearing or disappearing changes the admitted framing.
+        match request.body {
+            Some(body) if !claim.body.is_empty() => Ok(body),
+            None if claim.body.is_empty() => Ok(Vec::new()),
+            _ => Err("request_changed"),
+        }
+    }
+
+    /// Record the backend response of a bridged call and relabel the
+    /// client-visible representation as the JSON-RPC result the normalize
+    /// phase will build. A response decidable from its head alone (no body
+    /// allowed, partial, coded, streamed, or declared past the response
+    /// bound) is answered here as a gateway-authored tool result.
+    fn bridge_after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        let Some(limits) = ctx.mcp_bridge.as_ref().map(|state| state.claim.limits) else {
+            return PluginResult::Continue;
+        };
+        let (gateway_error, origin) =
+            bridge_response_provenance(ctx, response_status, response_headers);
+        // Recorded whatever `observability.emit_metadata` says: the client
+        // sees HTTP 200 for every bridged call, so this is the only place the
+        // backend status and failure class survive for logs and sinks.
+        ctx.metadata.insert(
+            "mcp.bridge.upstream_status".to_string(),
+            response_status.to_string(),
+        );
+        if let Some(class) = gateway_error {
+            ctx.metadata
+                .insert("mcp.bridge.gateway_error".to_string(), class.to_string());
+        }
+        let head_only = head_only_result(
+            response_status,
+            response_headers,
+            limits,
+            gateway_error,
+            origin,
+        );
+        if let Some(result) = head_only {
+            return self.bridge_terminal(ctx, &result);
+        }
+        let content_type = header_value(response_headers, "content-type").map(ToOwned::to_owned);
+        if let Some(state) = ctx.mcp_bridge.as_mut() {
+            state.response = Some(BridgeObservedResponse {
+                status: response_status,
+                content_type,
+                gateway_error,
+            });
+        }
+        // Every later header-time decision (buffering, response policy scope)
+        // must see the representation the client will receive, not the
+        // backend's.
+        remove_header(response_headers, "content-type");
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        for header in MCP_REWRITTEN_RESPONSE_VALIDATORS
+            .iter()
+            .chain(BRIDGE_DISCARDED_RESPONSE_HEADERS.iter())
+        {
+            remove_header(response_headers, header);
+        }
+        PluginResult::Continue
+    }
+
+    /// A gateway-authored tool result for a bridged call, correlated to the
+    /// admitted JSON-RPC id and answered with HTTP 200.
+    fn bridge_terminal(&self, ctx: &mut RequestContext, result: &Value) -> PluginResult {
+        if let Some(state) = ctx.mcp_bridge.as_mut() {
+            state.converted = true;
+        }
+        let reply = json_response(
+            200,
+            json!({"jsonrpc": "2.0", "id": Value::Null, "result": result}),
+            None,
+        );
+        Self::correlate_gateway_terminal(ctx, reply, &[])
+    }
+
+    /// Whether this instance committed the request to an OpenAPI bridge call.
+    fn owns_bridge_call(&self, ctx: &RequestContext) -> bool {
+        self.owns_request(ctx)
+            && ctx
+                .mcp_bridge
+                .as_ref()
+                .is_some_and(|state| state.claim.owner == self.instance_id)
+    }
+
+    /// Whether this instance's bridged call received a backend response that
+    /// was never converted into a tool result.
+    fn bridge_response_unconverted(&self, ctx: &RequestContext) -> bool {
+        self.owns_bridge_call(ctx)
+            && ctx
+                .mcp_bridge
+                .as_ref()
+                .is_some_and(|state| state.response.is_some() && !state.converted)
     }
 
     /// Whether the final backend-visible headers still carry exactly the
@@ -2144,6 +2664,9 @@ impl McpGateway {
             .servers
             .get(server_id)
             .ok_or_else(|| format!("unknown MCP upstream server {server_id:?}"))?;
+        let Some((upstream_url, _)) = server.upstream() else {
+            return Err("an OpenAPI bridge server has no MCP upstream session".to_string());
+        };
         if server.initialize_strategy == InitializeStrategy::Passthrough {
             return Ok(None);
         }
@@ -2193,7 +2716,7 @@ impl McpGateway {
             .http_client
             .get()
             .map_err(|error| format!("failed to initialize upstream MCP server: {error}"))?
-            .post(&server.upstream_url)
+            .post(upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header(
@@ -2309,6 +2832,9 @@ impl McpGateway {
         protocol_version: &str,
         upstream_session_id: Option<&str>,
     ) -> Result<(), String> {
+        let Some((upstream_url, _)) = server.upstream() else {
+            return Err("an OpenAPI bridge server has no MCP upstream session".to_string());
+        };
         let body = json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -2320,7 +2846,7 @@ impl McpGateway {
             .map_err(|error| {
                 format!("failed to send upstream MCP initialized notification: {error}")
             })?
-            .post(&server.upstream_url)
+            .post(upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header("mcp-protocol-version", protocol_version);
@@ -2426,8 +2952,11 @@ impl McpGateway {
             let Some(server) = self.servers.get(&server_id) else {
                 continue;
             };
+            let Some((upstream_url, _)) = server.upstream() else {
+                continue;
+            };
             let request = client
-                .delete(&server.upstream_url)
+                .delete(upstream_url)
                 .header(&self.sessions.upstream_session_header, upstream_session_id)
                 .header(
                     "mcp-protocol-version",
@@ -2967,6 +3496,9 @@ impl McpGateway {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        let Some((upstream_url, _)) = server.upstream() else {
+            return Err("an OpenAPI bridge server has no MCP upstream".to_string());
+        };
         let upstream_session_id = self
             .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
             .await?;
@@ -2980,7 +3512,7 @@ impl McpGateway {
             .http_client
             .get()
             .map_err(|error| format!("upstream MCP request failed: {error}"))?
-            .post(&server.upstream_url)
+            .post(upstream_url)
             .header("content-type", "application/json")
             .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
             .header(
@@ -3239,6 +3771,40 @@ impl McpGateway {
         }
     }
 
+    /// One server's tool entries for a catalog refresh.
+    ///
+    /// An OpenAPI bridge server's tool list is its operation set, whose
+    /// session-independent parts were built once at plugin load; an upstream
+    /// server's is its `tools/list` pages. Both enter the catalog through the
+    /// same entry construction, collision handling, discovery gates, and
+    /// policy.
+    async fn listed_tool_entries(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server: &McpServerConfig,
+        discovered_at: DateTime<Utc>,
+        old_catalog: &McpCatalog,
+    ) -> Result<Vec<ToolCatalogEntry>, String> {
+        if let Some(parts) = self.bridge_tools.get(&server.server_id) {
+            let mut entries = Vec::with_capacity(parts.len());
+            for part in parts.iter() {
+                let part = part.clone();
+                entries.push(self.tool_entry_from_parts(server, part, discovered_at, old_catalog));
+            }
+            return Ok(entries);
+        }
+        let items = self
+            .request_upstream_list_pages(ctx, downstream_session_id, server, "tools/list", "tools")
+            .await?;
+        let mut entries = Vec::with_capacity(items.len());
+        for item in items {
+            let entry = self.tool_entry_from_value(server, item, discovered_at, old_catalog);
+            entries.extend(entry);
+        }
+        Ok(entries)
+    }
+
     async fn refresh_catalog(
         &self,
         ctx: &RequestContext,
@@ -3264,36 +3830,29 @@ impl McpGateway {
 
         for server in self.servers.values().filter(|server| server.enabled) {
             if self.discovery.aggregate_tools && server.expose_tools {
-                match self
-                    .request_upstream_list_pages(
+                let listed = self
+                    .listed_tool_entries(
                         ctx,
                         downstream_session_id,
                         server,
-                        "tools/list",
-                        "tools",
+                        discovered_at,
+                        &old_catalog,
                     )
-                    .await
-                {
-                    Ok(items) => {
+                    .await;
+                match listed {
+                    Ok(entries) => {
                         families.entry("tools").or_default().record_success();
                         last_good.insert((server.server_id.clone(), "tools"));
-                        for item in items {
-                            if let Some(entry) = self.tool_entry_from_value(
-                                server,
-                                item,
-                                discovered_at,
-                                &old_catalog,
-                            ) {
-                                let public_name = entry.public_name.clone();
-                                insert_catalog_entry(
-                                    &mut tools,
-                                    &mut collision_tombstones.tools,
-                                    public_name,
-                                    entry,
-                                    &server.server_id,
-                                    "tool",
-                                );
-                            }
+                        for entry in entries {
+                            let public_name = entry.public_name.clone();
+                            insert_catalog_entry(
+                                &mut tools,
+                                &mut collision_tombstones.tools,
+                                public_name,
+                                entry,
+                                &server.server_id,
+                                "tool",
+                            );
                         }
                     }
                     Err(_) => {
@@ -3738,64 +4297,38 @@ impl McpGateway {
         discovered_at: DateTime<Utc>,
         old_catalog: &McpCatalog,
     ) -> Option<ToolCatalogEntry> {
-        let name = item.get("name")?.as_str()?.to_string();
-        let public_name = namespaced(
-            &server.namespace,
+        let parts = tool_definition_parts(
+            server,
             &self.discovery.namespace_separator,
-            &name,
-        );
-        let input_schema = item
-            .get("inputSchema")
-            .cloned()
-            .unwrap_or_else(|| json!({"type": "object"}));
-        let output_schema = item.get("outputSchema").cloned();
-        let schema_hash = if self.validation.validate_tool_results {
-            hash_value(&json!({
-                "inputSchema": input_schema,
-                "outputSchema": output_schema,
-            }))
-        } else {
-            // Preserve the pre-enforcement catalog contract when result
-            // validation is disabled: an upstream outputSchema is descriptive
-            // only, so it cannot hide or remove an otherwise valid tool.
-            hash_value(&input_schema)
-        };
-        let input_validator = match jsonschema::validator_for(&input_schema) {
-            Ok(validator) => Arc::new(validator),
-            Err(error) => {
-                warn!(
-                    server_id = %server.server_id,
-                    tool = %name,
-                    error = %error,
-                    "Skipping MCP tool with invalid inputSchema"
-                );
-                return None;
-            }
-        };
-        let output_validator = if self.validation.validate_tool_results {
-            match output_schema.as_ref() {
-                Some(schema) => match compile_tool_output_schema(schema) {
-                    Ok(validator) => Some(validator),
-                    Err(error) => {
-                        warn!(
-                            server_id = %server.server_id,
-                            tool = %name,
-                            error = %error,
-                            "Skipping MCP tool with invalid outputSchema"
-                        );
-                        return None;
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-        let description = item
-            .get("description")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let description_hash = hash_value(&Value::String(description.clone().unwrap_or_default()));
+            self.validation.validate_tool_results,
+            item,
+        )?;
+        Some(self.tool_entry_from_parts(server, parts, discovered_at, old_catalog))
+    }
+
+    /// A per-session catalog entry from session-independent tool parts: the
+    /// discovery, schema-drift, and policy state is decided against this
+    /// session's previous catalog.
+    fn tool_entry_from_parts(
+        &self,
+        server: &McpServerConfig,
+        parts: ToolDefinitionParts,
+        discovered_at: DateTime<Utc>,
+        old_catalog: &McpCatalog,
+    ) -> ToolCatalogEntry {
+        let ToolDefinitionParts {
+            public_name,
+            upstream_name,
+            input_schema,
+            output_schema,
+            title,
+            description,
+            annotations,
+            input_validator,
+            output_validator,
+            schema_hash,
+            description_hash,
+        } = parts;
         let policy_action = self.policy.action_for_tool(&public_name);
         let explicitly_configured = self.policy.tools.contains_key(&public_name);
         let schema_changed = old_catalog
@@ -3829,19 +4362,16 @@ impl McpGateway {
         let hidden_from_discovery =
             hidden_by_discovery || policy_action == PolicyAction::HideFromDiscovery;
         let enabled = policy_action == PolicyAction::Allow && !hidden_by_discovery;
-        Some(ToolCatalogEntry {
+        ToolCatalogEntry {
             public_name,
-            upstream_name: name,
+            upstream_name,
             server_id: server.server_id.clone(),
             namespace: server.namespace.clone(),
             input_schema,
             output_schema,
-            title: item
-                .get("title")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+            title,
             description,
-            annotations: item.get("annotations").cloned(),
+            annotations,
             enabled,
             hidden_by_discovery,
             hidden_from_discovery,
@@ -3851,7 +4381,7 @@ impl McpGateway {
             discovered_at,
             schema_hash,
             description_hash,
-        })
+        }
     }
 
     fn prompt_entry_from_value(
@@ -4429,6 +4959,9 @@ impl McpGateway {
         // enforcement must not re-resolve identity through public
         // `mcp.response_rewrite.*` metadata or a later catalog refresh.
         ctx.mcp_validate_tool_result = pinned_output_validator;
+        if let Some(bridge) = server.bridge() {
+            return self.route_bridge_tool_call(ctx, headers, envelope, &entry, bridge, grant);
+        }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -5913,6 +6446,9 @@ impl McpGateway {
         {
             return Some("upstream_session_changed");
         }
+        if let Some(claim) = record.bridge.as_deref() {
+            return Self::final_bridge_violation(ctx, claim, body);
+        }
         // A duplicate member makes the upstream-visible operation
         // parser-dependent, so an equality check against either copy proves
         // nothing.
@@ -6171,6 +6707,9 @@ impl Plugin for McpGateway {
         self.requires_response_body_buffering()
             && self.owns_request(ctx)
             && (ctx.mcp_validate_tool_result.is_some()
+                // An OpenAPI bridge call is answered with a JSON-RPC tool
+                // result built from the complete backend response.
+                || ctx.mcp_bridge.is_some()
                 // A routed request that opened a stream identity needs its
                 // complete client-visible representation to frame the one SSE
                 // event its POST answers with. If the refinement below declines
@@ -6193,7 +6732,10 @@ impl Plugin for McpGateway {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        // A bridged response must be converted, never released as the raw
+        // backend representation.
         self.should_buffer_response_body(ctx)
+            && ctx.mcp_bridge.is_none()
             && !(header_value(response_headers, "content-type")
                 .is_none_or(mcp_content_type_is_json)
                 && Self::response_encoding_allows_rewrite(response_headers)
@@ -6208,9 +6750,10 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && content_type.is_none_or(mcp_content_type_is_json)
-            && Self::response_encoding_allows_rewrite(response_headers)
-            && self.response_length_allows_rewrite(response_headers)
+            && (ctx.mcp_bridge.is_some()
+                || (content_type.is_none_or(mcp_content_type_is_json)
+                    && Self::response_encoding_allows_rewrite(response_headers)
+                    && self.response_length_allows_rewrite(response_headers)))
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -6475,6 +7018,16 @@ impl Plugin for McpGateway {
         if !self.enabled || self.mode != McpGatewayMode::AggregateRouter {
             return None;
         }
+        // A bridged call's backend body is the REST body built from the
+        // admitted arguments: the JSON-RPC envelope never reaches the REST
+        // backend. An earlier transform's change to the envelope is carried
+        // into that body or refused, never discarded.
+        if let Some(state) = ctx.mcp_bridge.as_ref()
+            && state.claim.owner == self.instance_id
+        {
+            let claim = Arc::clone(&state.claim);
+            return Some(self.bridge_transformed_body(ctx, &claim, body));
+        }
         if ctx.metadata.remove(METADATA_REWRITE_KEY).as_deref() != Some("true") {
             // Routing stages rewrite metadata and the private tool-name mapping
             // together. If a later before_proxy hook stripped the marker before
@@ -6591,6 +7144,10 @@ impl Plugin for McpGateway {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // A bridged call was already converted by the normalize phase.
+        if ctx.mcp_bridge.is_some() {
+            return None;
+        }
         let retained_ceiling = ctx.retained_response_body_ceiling();
         let original_metadata_stamped = ctx
             .metadata
@@ -6753,9 +7310,12 @@ impl Plugin for McpGateway {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if self.owns_bridge_call(ctx) {
+            return self.bridge_after_proxy(ctx, response_status, response_headers);
+        }
         // Response-phase policy is instance-scoped: a sibling instance on a
         // disjoint endpoint (or one configured off) must not consume this
         // request's validator claim or apply its own response bounds to it.
@@ -6827,6 +7387,18 @@ impl Plugin for McpGateway {
         if !self.owns_request(ctx) {
             return PluginResult::Continue;
         }
+        // A bridged backend response that reached this phase without being
+        // converted (normalization skipped, or its replacement refused by the
+        // retained-response budget) is never released as the raw REST body.
+        if self.bridge_response_unconverted(ctx) {
+            Self::settle_sse_stream_inline(ctx);
+            let observed = ctx
+                .mcp_bridge
+                .as_ref()
+                .and_then(|state| state.response.as_ref());
+            let result = unconverted_result(observed);
+            return self.bridge_terminal(ctx, &result);
+        }
         let enforced =
             self.enforce_final_response_body(ctx, response_status, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
@@ -6841,11 +7413,50 @@ impl Plugin for McpGateway {
         }
     }
 
+    /// Convert an OpenAPI bridge call's buffered backend response into the
+    /// JSON-RPC `tools/call` result the MCP client receives.
+    ///
+    /// This is the protocol-adapter phase: it runs before response-body
+    /// inspection, transforms, and the authoritative final client-visible
+    /// policies, so every one of them decides over the representation the
+    /// client actually receives. The HTTP status becomes `200` — a JSON-RPC
+    /// response always rides HTTP 200 — and the backend status survives in
+    /// the result (`isError`, the status line) and in
+    /// `mcp.bridge.upstream_status`.
+    async fn normalize_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if !self.owns_bridge_call(ctx) {
+            return None;
+        }
+        let state = ctx.mcp_bridge.as_ref()?;
+        if state.converted {
+            return None;
+        }
+        let observed = state.response.as_ref()?;
+        let result = body_result(observed, body, state.claim.limits);
+        let converted = json_rpc_result_bytes(
+            ctx.mcp_request_json_rpc_id.as_deref(),
+            &result,
+            ctx.retained_response_body_ceiling(),
+        )?;
+        if let Some(state) = ctx.mcp_bridge.as_mut() {
+            state.converted = true;
+        }
+        ctx.normalized_response_status = Some(200);
+        Some(converted)
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         self.servers
             .values()
             .filter(|server| server.enabled)
-            .map(|server| server.target.host.clone())
+            .filter_map(|server| server.upstream().map(|(_, target)| target.host.clone()))
             .collect()
     }
 }
@@ -7559,7 +8170,9 @@ fn validate_json_schema(validator: &jsonschema::Validator, instance: &Value) -> 
 /// External `$ref` / `$dynamicRef` targets are refused (the `jsonschema` crate
 /// is built without retrievers). Document depth, document node count, and local
 /// reference-resolution depth budgets bound both the audit and compile work.
-fn compile_tool_output_schema(schema: &Value) -> Result<Arc<jsonschema::Validator>, String> {
+pub(crate) fn compile_tool_output_schema(
+    schema: &Value,
+) -> Result<Arc<jsonschema::Validator>, String> {
     if !schema.is_object() && !schema.is_boolean() {
         return Err("outputSchema must be a JSON Schema object or boolean".to_string());
     }
@@ -7569,6 +8182,12 @@ fn compile_tool_output_schema(schema: &Value) -> Result<Arc<jsonschema::Validato
         .build(schema)
         .map(Arc::new)
         .map_err(|error| format!("outputSchema is not a valid JSON Schema: {error}"))
+}
+
+/// Audit a generated OpenAPI bridge tool schema under the same depth, node,
+/// and local-reference budgets as a discovered `outputSchema`.
+pub(crate) fn audit_bridge_tool_schema(schema: &Value) -> Result<(), String> {
+    audit_output_schema(schema)
 }
 
 fn audit_output_schema(schema: &Value) -> Result<(), String> {
@@ -8204,6 +8823,133 @@ fn missing_session_response(id: Option<Value>) -> PluginResult {
     )
 }
 
+/// The session-independent part of a catalog tool entry: its public name,
+/// schemas, compiled validators, and hashes. Schemas and validators are
+/// `Arc`-shared, so cloning parts into another session's catalog copies no
+/// schema and compiles nothing.
+#[derive(Clone)]
+struct ToolDefinitionParts {
+    public_name: String,
+    upstream_name: String,
+    input_schema: Arc<Value>,
+    output_schema: Option<Arc<Value>>,
+    title: Option<String>,
+    description: Option<String>,
+    annotations: Option<Value>,
+    input_validator: Arc<jsonschema::Validator>,
+    output_validator: Option<Arc<jsonschema::Validator>>,
+    schema_hash: String,
+    description_hash: String,
+}
+
+/// Session-independent catalog parts of one listed tool definition, or `None`
+/// (with a warning) when its schemas cannot be compiled.
+fn tool_definition_parts(
+    server: &McpServerConfig,
+    namespace_separator: &str,
+    validate_tool_results: bool,
+    item: Value,
+) -> Option<ToolDefinitionParts> {
+    let name = item.get("name")?.as_str()?.to_string();
+    let public_name = namespaced(&server.namespace, namespace_separator, &name);
+    let input_schema = item
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "object"}));
+    let output_schema = item.get("outputSchema").cloned();
+    let schema_hash = if validate_tool_results {
+        hash_value(&json!({
+            "inputSchema": input_schema,
+            "outputSchema": output_schema,
+        }))
+    } else {
+        // Preserve the pre-enforcement catalog contract when result
+        // validation is disabled: an upstream outputSchema is descriptive
+        // only, so it cannot hide or remove an otherwise valid tool.
+        hash_value(&input_schema)
+    };
+    let input_validator = match jsonschema::validator_for(&input_schema) {
+        Ok(validator) => Arc::new(validator),
+        Err(error) => {
+            warn!(
+                server_id = %server.server_id,
+                tool = %name,
+                error = %error,
+                "Skipping MCP tool with invalid inputSchema"
+            );
+            return None;
+        }
+    };
+    let output_validator = if validate_tool_results {
+        match output_schema.as_ref() {
+            Some(schema) => match compile_tool_output_schema(schema) {
+                Ok(validator) => Some(validator),
+                Err(error) => {
+                    warn!(
+                        server_id = %server.server_id,
+                        tool = %name,
+                        error = %error,
+                        "Skipping MCP tool with invalid outputSchema"
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let description = item
+        .get("description")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let description_hash = hash_value(&Value::String(description.clone().unwrap_or_default()));
+    Some(ToolDefinitionParts {
+        public_name,
+        upstream_name: name,
+        input_schema: Arc::new(input_schema),
+        output_schema: output_schema.map(Arc::new),
+        title: item
+            .get("title")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        description,
+        annotations: item.get("annotations").cloned(),
+        input_validator,
+        output_validator,
+        schema_hash,
+        description_hash,
+    })
+}
+
+/// Catalog parts of every OpenAPI bridge tool, built once per plugin
+/// instance. A bridge's tool list is static, so each session's catalog
+/// refresh clones these `Arc`-shared parts instead of copying the
+/// definitions and recompiling their validators on every refresh.
+fn build_bridge_tool_parts(
+    servers: &HashMap<String, McpServerConfig>,
+    namespace_separator: &str,
+    validate_tool_results: bool,
+) -> HashMap<String, Arc<[ToolDefinitionParts]>> {
+    let mut built = HashMap::new();
+    for server in servers.values() {
+        let Some(bridge) = server.bridge() else {
+            continue;
+        };
+        let mut parts = Vec::with_capacity(bridge.tool_count());
+        for (_, tool) in bridge.tools() {
+            let item = tool.clone();
+            if let Some(part) =
+                tool_definition_parts(server, namespace_separator, validate_tool_results, item)
+            {
+                parts.push(part);
+            }
+        }
+        built.insert(server.server_id.clone(), Arc::from(parts));
+    }
+    built
+}
+
 fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
     let mut object = Map::new();
     object.insert("name".to_string(), Value::String(entry.public_name.clone()));
@@ -8216,9 +8962,9 @@ fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
             Value::String(format!("[{}] {}", entry.namespace, description)),
         );
     }
-    object.insert("inputSchema".to_string(), entry.input_schema.clone());
+    object.insert("inputSchema".to_string(), Value::clone(&entry.input_schema));
     if let Some(output_schema) = &entry.output_schema {
-        object.insert("outputSchema".to_string(), output_schema.clone());
+        object.insert("outputSchema".to_string(), Value::clone(output_schema));
     }
     if let Some(annotations) = &entry.annotations {
         object.insert("annotations".to_string(), annotations.clone());
@@ -9076,9 +9822,28 @@ fn parse_servers(
             .as_object()
             .ok_or_else(|| format!("mcp_gateway: server {server_id:?} must be an object"))?;
         reject_unknown_mcp_keys(object, "config.servers.*", MCP_SERVER_KEYS)?;
-        let upstream_url = optional_string(object, "upstream_url")?
-            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires `upstream_url`"))?
-            .to_string();
+        let upstream_url = optional_string(object, "upstream_url")?;
+        let openapi = object.get("openapi").filter(|value| !value.is_null());
+        let transport = match (upstream_url, openapi) {
+            (Some(upstream_url), None) => McpServerTransport::Upstream {
+                target: parse_upstream_target(upstream_url, server_id)?,
+                upstream_url: upstream_url.to_string(),
+            },
+            (None, Some(openapi)) => {
+                reject_bridge_server_fields(object, server_id)?;
+                McpServerTransport::OpenApi(Arc::new(McpOpenApiBridge::parse(openapi, server_id)?))
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "mcp_gateway: server {server_id:?} must set exactly one of `upstream_url` (an MCP server) or `openapi` (tools generated from OpenAPI operations), not both"
+                ));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "mcp_gateway: server {server_id:?} requires `upstream_url` or `openapi`"
+                ));
+            }
+        };
         let namespace = optional_string(object, "namespace")?
             .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires `namespace`"))?
             .to_string();
@@ -9101,8 +9866,7 @@ fn parse_servers(
             McpServerConfig {
                 server_id: server_id.clone(),
                 namespace,
-                target: parse_upstream_target(&upstream_url, server_id)?,
-                upstream_url,
+                transport,
                 enabled: optional_bool(object, "enabled")?.unwrap_or(true),
                 expose_tools: optional_bool(object, "expose_tools")?.unwrap_or(true),
                 expose_resources: optional_bool(object, "expose_resources")?.unwrap_or(false),
@@ -9112,6 +9876,117 @@ fn parse_servers(
         );
     }
     Ok(servers)
+}
+
+/// Whether the matched route's `allowed_methods` (when set) admits the method
+/// an OpenAPI bridge call dispatches.
+fn bridge_method_allowed_on_route(ctx: &RequestContext, method: &str) -> bool {
+    ctx.matched_proxy
+        .as_deref()
+        .and_then(|proxy| proxy.allowed_methods.as_deref())
+        .is_none_or(|allowed| crate::proxy::request_method_is_allowed(allowed, method))
+}
+
+/// Map an OpenAPI bridge operation's public request path onto the backend path
+/// the proxy dispatches for a direct request to that same public path.
+///
+/// The router matched this MCP request's own path, so its strip offset names
+/// the proxy's literal listen prefix. With `strip_listen_path` an operation
+/// path under that prefix loses it exactly as a direct request would, and the
+/// proxy then joins the remainder onto its `backend_path` as usual (a
+/// non-absolute route override). `None` when the operation path is not under
+/// the prefix: a direct request to it could never reach this proxy, so the
+/// bridge refuses rather than inventing a route.
+fn bridge_backend_path(ctx: &RequestContext, public_path: &str) -> Option<String> {
+    let strip_len = ctx.matched_path_strip_len();
+    let strips = strip_len > 0
+        && ctx
+            .matched_proxy
+            .as_deref()
+            .is_some_and(|proxy| proxy.strip_listen_path);
+    if !strips {
+        return Some(public_path.to_string());
+    }
+    let prefix = ctx.path.get(..strip_len)?;
+    let rest = public_path.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        Some("/".to_string())
+    } else if rest.starts_with('/') {
+        Some(rest.to_string())
+    } else if prefix.ends_with('/') {
+        Some(format!("/{rest}"))
+    } else {
+        None
+    }
+}
+
+/// An OpenAPI bridge server publishes tools only and has no MCP upstream to
+/// initialize, so the upstream-only fields are refused rather than ignored.
+fn reject_bridge_server_fields(object: &Map<String, Value>, server_id: &str) -> Result<(), String> {
+    for field in ["expose_resources", "expose_prompts"] {
+        if object.get(field).and_then(Value::as_bool) == Some(true) {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `{field}` requires `upstream_url`: an `openapi` server publishes tools only"
+            ));
+        }
+    }
+    if object
+        .get("initialize_strategy")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(format!(
+            "mcp_gateway: server {server_id:?} `initialize_strategy` requires `upstream_url`: an `openapi` server has no MCP upstream session"
+        ));
+    }
+    Ok(())
+}
+
+/// Cross-field rules for OpenAPI bridge servers that a single server entry
+/// cannot decide on its own.
+fn validate_bridge_servers(
+    mode: McpGatewayMode,
+    servers: &HashMap<String, McpServerConfig>,
+    sessions: &McpSessionConfig,
+    validation: &McpValidationConfig,
+    real_ip_header: Option<&str>,
+) -> Result<(), String> {
+    for server in servers.values() {
+        let Some(bridge) = server.bridge() else {
+            continue;
+        };
+        let server_id = server.server_id.as_str();
+        if mode != McpGatewayMode::AggregateRouter {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi` requires mode `aggregate_router` because `transparent_proxy` forwards MCP JSON-RPC to one MCP upstream"
+            ));
+        }
+        if bridge.tool_count() > validation.max_catalog_items_per_list {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi.operations` exceeds `validation.max_catalog_items_per_list`"
+            ));
+        }
+        if bridge.tool_definition_bytes() > validation.max_catalog_bytes_per_list {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi.operations` tool definitions exceed `validation.max_catalog_bytes_per_list`"
+            ));
+        }
+        let deployment_reserved = |name: &str| {
+            bridge_header_names_match(name, &sessions.downstream_session_header)
+                || bridge_header_names_match(name, &sessions.upstream_session_header)
+                || real_ip_header.is_some_and(|header| bridge_header_names_match(name, header))
+        };
+        if bridge.header_parameter_names().any(deployment_reserved) {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi` declares a header parameter named after an MCP session header or the configured `FERRUM_REAL_IP_HEADER`, which a tool argument may never set"
+            ));
+        }
+        if bridge.forwarded_header_names().any(deployment_reserved) {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi.forward_request_headers` names an MCP session header or the configured `FERRUM_REAL_IP_HEADER`, which a bridged call never forwards"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_upstream_target(url: &str, server_id: &str) -> Result<McpUpstreamTarget, String> {
