@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Mesh authorization matches both the raw and the parameter-stripped path on
+  services that allow path parameters** (#5948). On a route with
+  `allow_path_parameters` (a mesh service opted in with
+  `MeshService.allow_path_parameters` or `ferrum.io/allow-path-parameters`),
+  `mesh_authz` judged `AuthorizationPolicy` `paths:` / `notPaths:` and
+  `when: request.headers[:path]` only on the parameterised path, while a
+  parameter-stripping backend (Tomcat, Spring) executes the stripped one. A
+  DENY on `/admin/*` missed `/admin;x/users`, a nested DENY on `/api/admin/*`
+  missed `/api;x/admin/users`, an ALLOW on `*.png` admitted
+  `/admin/users;x.png`, and an ALLOW excluding `/api/admin/*` admitted
+  `/api/admin;x/users`. Each rule is now evaluated once per spelling, with its
+  `to:` paths and any `:path` condition reading the same spelling: a DENY,
+  CUSTOM, or AUDIT rule matches when it matches on either spelling, and an
+  ALLOW rule only when it matches on both, so a `notPaths:` / `notValues:`
+  exclusion lifts a DENY only when it holds for both spellings and removes an
+  ALLOW grant when it holds for either. The combination is per rule: two ALLOW
+  rules that each match one spelling leave the request implicitly denied. The
+  second spelling is built whenever the path carries a `;`, and the
+  body-buffering decision for body-inspecting CUSTOM providers considers it
+  too. Routes without the opt-in are unchanged (they refuse `;` before
+  authorization). CUSTOM providers still receive the raw path only.
+  VirtualService routes never inherit the service's opt-in: a route whose own
+  `uri` literal contains `;` opts in by itself and is judged on both
+  spellings, any other refuses `;`, and the re-route check refuses a `;` whose
+  stripped path belongs to one.
 - **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
   GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
 - **The canonical request path refuses dot segments that carry a `;` path
@@ -120,11 +145,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rides the native slice and the xDS `ServicesCarrier`; stock xDS control
   planes cannot carry it. The re-route check of GHSA-fcqw-793q-wg5x applies
   unchanged, so a `;` still cannot reach a path that another route on the
-  service's hosts owns. `mesh_authz` evaluates `paths:` on the parameterised
-  path: on an opted-in service only exact and prefix ALLOW `paths:` fail
-  closed, while suffix patterns, `notPaths:` and DENY `paths:` rules can be
-  bypassed with a `;` segment. Default-off services still refuse `;`
-  with `400 path_parameter`. See `docs/mesh.md` and
+  service's hosts owns, and `mesh_authz` judges `paths:` / `notPaths:` on both
+  the raw and the parameter-stripped spelling (see Security). Default-off
+  services still refuse `;` with `400 path_parameter`. See `docs/mesh.md` and
   `docs/request_path_canonicalization.md`.
 - **AI governance for MCP tool calls** (#5908). The AI governance plugins now
   treat MCP JSON-RPC `tools/call` traffic as AI traffic, through one shared

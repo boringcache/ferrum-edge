@@ -2040,7 +2040,9 @@ frontend boundary — before routing, before any plugin phase, and before backen
 dispatch — so the string the policy matcher reads is the string the backend
 resolves. This is what stops a path-scoped DENY from being evaded, or a
 path-scoped ALLOW from being widened, by an alternative spelling of the same
-resource.
+resource. A path that carries a `;` parameter (only possible on a service that
+opts in) is matched on both its raw and its parameter-stripped spelling; see
+[Authorization on an opted-in service](#path-parameters-and-the-per-service-opt-in).
 
 A target that has more than one reading is **refused with `400`** rather than
 rewritten into one of them:
@@ -2113,20 +2115,61 @@ the same host either: `/admin;x/users` is refused when an `/admin` route
 exists there. Full rule:
 [request_path_canonicalization.md](request_path_canonicalization.md#mesh-materialised-routes).
 
-**Risk to account for.** On an opted-in service, `mesh_authz` evaluates
-`paths:` / `notPaths:` on the parameterised path, while a parameter-stripping
-backend executes the stripped path. A DENY rule for `/admin/*` does not match
-`/admin;x/users`, which Tomcat runs as `/admin/users`. Only exact and prefix
-`paths:` entries in ALLOW rules fail closed for a parameterised spelling. On an
-opted-in service, suffix patterns (`*.png` admits `/admin/users;x.png`),
-`notPaths:` inside an ALLOW rule (`/api/*` minus `/api/admin/*` admits
-`/api/admin;x/users`) and DENY `paths:` rules (`/api/admin/*` misses
-`/api;x/admin/users`) are not reliable, and a DENY pattern cannot cover a `;`
-in an earlier segment without blocking too much. Opt in only services whose
-backends need `;`, and review every AuthorizationPolicy that covers them,
-including mesh-wide DENY rules owned by the platform team. VirtualService
-`http[].match[].uri` matches on the service's routes read the same
-parameterised path.
+**Authorization on an opted-in service.** A `;` request to an opted-in
+service has two spellings: the raw path (`/admin;x/users`) and the path with
+its parameters stripped (`/admin/users`), which Tomcat and Spring execute.
+`mesh_authz` evaluates each `AuthorizationPolicy` rule once per spelling, with
+`to:` `paths:` / `notPaths:` and any `when: request.headers[:path]` condition
+reading the same spelling, and combines the two results by action
+(issue #5948):
+
+| Action | The rule matches when |
+|--------|-----------------------|
+| `DENY`, `CUSTOM`, `AUDIT` | it matches on either spelling |
+| `ALLOW` | it matches on both spellings |
+
+So a `notPaths:` or `notValues:` exclusion lifts a DENY only when both
+spellings are excluded, and removes an ALLOW grant when either one is. As a
+result:
+
+- a DENY on `/admin/*` refuses `/admin;x/users`, including a mesh-wide DENY
+  owned by the platform team on a service whose owner opted in, and including
+  a DENY written as `when: request.headers[:path]`;
+- a DENY on `/api/admin/*` refuses `/api;x/admin/users`;
+- an ALLOW on `*.png` does not admit `/admin/users;x.png`;
+- an ALLOW on `/api/*` with `notPaths: ["/api/admin/*"]`, or with a `:path`
+  condition `notValues: ["/api/admin/*"]`, does not admit
+  `/api/admin;x/users`;
+- a prefix ALLOW (`/app/*`) still admits `/app/page;jsessionid=abc`, and an
+  exact ALLOW (`/app/page`) still does not match `/app/page;jsessionid=abc`.
+  Write a prefix rule, such as `/app/page*`, for an exact path that must
+  accept a `;jsessionid=` suffix.
+
+The combination is per rule: the ALLOW implicit-deny floor is met only by one
+ALLOW rule that matches on both spellings, so two ALLOW rules that each match
+one spelling leave the request implicitly denied.
+
+Residual behaviour to account for:
+
+- The second spelling is built whenever the canonical path carries a `;`, and
+  only routes with `allow_path_parameters` let such a request reach
+  `mesh_authz`, so services that have not opted in are unchanged: they refuse
+  `;` with `400 path_parameter` first.
+- Other plugins that match on the request path still see the parameterised
+  path, so review path-based plugin configuration on the routes of an
+  opted-in service.
+- A CUSTOM (ext_authz) provider receives the raw path only. A provider that
+  makes its own path decisions must apply the stripped rule itself.
+- VirtualService routes never inherit the service's opt-in. A route whose own
+  `uri` literal contains `;` opts in by itself, and `mesh_authz` judges both
+  spellings on it. Any other VirtualService route refuses `;`, and a `;`
+  request whose stripped path belongs to one is refused by the re-route
+  check. A VirtualService `/` route on the service's host makes the mesh route
+  yield to it, so the service opt-in does not apply there and `;` stays
+  refused (fail closed).
+
+Full rule:
+[request_path_canonicalization.md](request_path_canonicalization.md#mesh-authorization-judges-both-spellings).
 
 #### Condition keys
 
