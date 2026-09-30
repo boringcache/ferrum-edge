@@ -448,6 +448,22 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **gRPC and HTTP/2 backend connections no longer die after 100 requests
+  against h2 >= 0.4.16 peers** (#5588). A client that ends a request with a
+  separate empty END_STREAM frame (tonic does, on every unary call) had that
+  frame relayed upstream as an empty DATA frame without END_STREAM. Current
+  `h2` servers (tonic, hyper, axum) answer the 101st such frame on a
+  connection with `GOAWAY(ENHANCE_YOUR_CALM)`, failing every in-flight stream
+  on it: Ferrum returned `UNAVAILABLE` for gRPC and `502` bursts for HTTP/2.
+  Zero-length DATA frames are no longer relayed in either direction, and a
+  streamed upload now sets END_STREAM on its last DATA frame instead of
+  sending a separate empty one. The same peers also GOAWAY a connection that
+  sends too many DATA frames under 256 bytes, which hyper's HTTP/2 body pipe
+  produced whenever a stream held only its 1-byte capacity claim on a nearly
+  spent window; vendored hyper patch 002 hands a chunk to h2 only once
+  `min(len, 1 KiB)` capacity is assigned (filed upstream as
+  hyperium/hyper#4211 / #4212).
+
 - **WAF rule shapes: missed injection forms and prose false positives**
   (#5865). `FE-SQLI-008` now matches `load_file` on a MySQL `X'2f65…'` hex
   literal, behind a charset introducer (`_latin1'/etc/passwd'`), on a
