@@ -4,6 +4,7 @@ pub mod api_specs;
 pub mod audit;
 pub mod audit_spool;
 mod backup;
+pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
 pub mod jwt_auth;
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
-use crate::admin::audit::AuditActor;
+use crate::admin::audit::{AuditActor, NamespaceCeilingDecision};
 use crate::admin::backup::{
     ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
     BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, BatchCreateRequest,
@@ -62,6 +63,7 @@ use crate::config::types::{
     max_credentials_per_type,
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::diagnostic_ref::DIAGNOSTICS_READ_SCOPE;
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
@@ -1867,6 +1869,40 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
     Ok(PaginationParams { offset, limit })
 }
 
+/// Parse the optional `proxy_id` query filter for `GET /plugins/config`.
+///
+/// The value is validated with the same resource-id rules as every other id in
+/// the admin API (invalid → 400 with the shared `{"error": ...}` shape);
+/// duplicate `proxy_id` parameters are rejected rather than silently
+/// last-wins, matching other strict query-parameter parsers.
+fn parse_plugin_config_proxy_id(
+    uri: &hyper::Uri,
+) -> Result<Option<String>, Box<Response<Full<Bytes>>>> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let mut proxy_id: Option<String> = None;
+    for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "proxy_id" {
+            continue;
+        }
+        if proxy_id.is_some() {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "proxy_id must not be supplied more than once"}),
+            )));
+        }
+        if let Err(error) = crate::config::types::validate_resource_id(&val) {
+            return Err(Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": error}),
+            )));
+        }
+        proxy_id = Some(val.into_owned());
+    }
+    Ok(proxy_id)
+}
+
 /// Narrow a shared `i64` pagination offset to the `u32` the audit store
 /// indexes by, producing the documented audit 400 when it does not fit.
 ///
@@ -2278,6 +2314,9 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "api-specs" => "api-specs",
         "batch" => "batch",
         "backup" => "backup",
+        // Only the export: `/config/apply-status` is a process-topology
+        // surface, not a tenant-addressed resource.
+        "config" if segments.get(1) == Some(&"export") => "config-export",
         "restore" => "restore",
         "audit" => "audit",
         "gateway-trust-bundles" => "gateway-trust-bundles",
@@ -2579,8 +2618,10 @@ fn enforce_namespace_claim(
         warn!(
             audit.event = "admin_namespace_authz",
             actor = %auth.sub,
+            key_tier = auth.key_tier.as_str(),
             namespace = %namespace,
             path = %path,
+            namespace_ceiling = auth.namespace_ceiling_decision(namespace).as_str(),
             result = "denied",
             "Admin request rejected: JWT `ns` claim does not authorize the requested namespace"
         );
@@ -2596,8 +2637,10 @@ fn enforce_namespace_claim(
     warn!(
         audit.event = "admin_namespace_authz",
         actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
         namespace = %namespace,
         path = %path,
+        namespace_ceiling = auth.namespace_ceiling_decision(namespace).as_str(),
         result = "denied",
         "Admin request rejected: FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true but the JWT has no `ns` claim"
     );
@@ -2605,6 +2648,110 @@ fn enforce_namespace_claim(
         StatusCode::FORBIDDEN,
         &json!({"error": "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true on this instance: the admin \
              JWT must include an `ns` claim (string or array) listing the namespaces it may manage"}),
+    ))
+}
+
+/// Enforce the viewer-key namespace ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`,
+/// issue #5929) against the requested namespace. Returns `Some(403)` when
+/// `namespace` is outside it; `None` when it is inside or no ceiling applies
+/// (every primary-key token, and every token while the setting is unset).
+///
+/// Unlike [`enforce_namespace_claim`] this does not depend on
+/// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` or on the token's `ns` claim: the
+/// viewer secret's holder chooses its own claims, so only the operator-set
+/// ceiling bounds which tenants it reads. The refusal depends on the
+/// credential and the requested name only, never on whether any resource
+/// exists there.
+fn enforce_viewer_namespace_ceiling(
+    auth: &AuditActor,
+    namespace: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    let decision = auth.namespace_ceiling_decision(namespace);
+    if decision != NamespaceCeilingDecision::Outside {
+        return None;
+    }
+    warn!(
+        audit.event = "admin_namespace_authz",
+        actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
+        namespace = %namespace,
+        path = %path,
+        namespace_ceiling = decision.as_str(),
+        result = "denied",
+        "Admin request rejected: the namespace is outside FERRUM_ADMIN_JWT_VIEWER_NAMESPACES \
+         for viewer-key tokens"
+    );
+    Some(json_response(
+        StatusCode::FORBIDDEN,
+        &json!({"error": format!(
+            "namespace '{namespace}' is outside the namespace ceiling for viewer-key tokens \
+             (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES)"
+        )}),
+    ))
+}
+
+/// Namespace authorization for a request that addresses `namespace`: the
+/// viewer-key namespace ceiling first, always, then the `ns` claim when
+/// `require_claim` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`, or its automatic
+/// engagement on a multi-namespace CP). Every namespace-scoped route and the
+/// namespace registry authorize through here, so the ceiling is enforced in
+/// one place, exactly as the role ceiling is.
+fn authorize_request_namespace(
+    require_claim: bool,
+    auth: &AuditActor,
+    namespace: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    if let Some(resp) = enforce_viewer_namespace_ceiling(auth, namespace, path) {
+        return Some(resp);
+    }
+    if require_claim {
+        return enforce_namespace_claim(auth, namespace, path);
+    }
+    None
+}
+
+/// Global routes that remain available to viewer-key tokens with a namespace
+/// ceiling. Keep this list explicit: a new global route is denied by default.
+fn ceiling_global_route_is_allowed(method: &Method, segments: &[&str]) -> bool {
+    (*method == Method::GET && matches!(segments, ["plugins"]))
+        || (*method == Method::GET
+            && matches!(segments, ["health"] | ["live"] | ["status"] | ["overload"]))
+        || (*method == Method::GET && matches!(segments, ["namespaces"] | ["namespaces", _]))
+}
+
+/// Refuse a ceiling-bound viewer key on every global route except the small
+/// allowlist. Namespace-scoped routes have their own name-based authorization
+/// through [`authorize_request_namespace`].
+fn authorize_ceiling_global_route(
+    method: &Method,
+    segments: &[&str],
+    path: &str,
+    auth: &AuditActor,
+) -> Option<Response<Full<Bytes>>> {
+    if auth.namespace_ceiling.is_none()
+        || is_namespace_scoped_route(segments)
+        || ceiling_global_route_is_allowed(method, segments)
+    {
+        return None;
+    }
+
+    warn!(
+        audit.event = "admin_namespace_authz",
+        actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
+        path = %path,
+        namespace_ceiling = "global_route_denied",
+        result = "denied",
+        "Admin request rejected: viewer-key tokens with a namespace ceiling cannot access this global route"
+    );
+    Some(json_response(
+        StatusCode::FORBIDDEN,
+        &json!({"error": format!(
+            "global route '{path}' is unavailable to viewer-key tokens with a namespace ceiling \
+             (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES)"
+        )}),
     ))
 }
 
@@ -2619,6 +2766,16 @@ fn observability_detail_allowed(
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
+    if state
+        .jwt_manager
+        .verify_request(auth_header)
+        .ok()
+        .and_then(|token| AuditActor::from_verified(&token).ok())
+        .is_some_and(|actor| actor.namespace_ceiling.is_some())
+    {
+        return false;
+    }
+
     admin_jwt_detail_allowed(state, auth_header)
         || state.metrics_auth.token_matches(auth_header)
         || state.metrics_auth.ip_allowed(client_ip)
@@ -2632,8 +2789,121 @@ fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bo
         .jwt_manager
         .verify_request(auth_header)
         .ok()
-        .and_then(|token_data| AuditActor::from_claims(&token_data.claims).ok())
-        .is_some()
+        .and_then(|token| AuditActor::from_verified(&token).ok())
+        .is_some_and(|actor| actor.namespace_ceiling.is_none())
+}
+
+/// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
+/// rate-limited (`429`) attempts; the metric still counts every attempt.
+static DIAGNOSTIC_REF_LOOKUP_AUDIT: crate::diagnostic_ref::DiagnosticRefLookupAudit =
+    crate::diagnostic_ref::DiagnosticRefLookupAudit::new();
+
+/// `GET /diagnostics/v1/refs/{ref}`: resolve a gateway diagnostic reference
+/// (issue #5767).
+///
+/// Every attempt is charged against its JWT `sub`'s share of the lookup rate
+/// limit first (`429` + `Retry-After`), including one then refused for its
+/// credential; only an attempt whose credential passes the scope and `ns`
+/// checks is also charged against the global budget. Requires the
+/// `diagnostics:read` JWT scope and an `ns` claim (`403` otherwise; both
+/// depend only on the credential, never on the reference). A malformed,
+/// unknown, expired, or evicted reference, one minted for a namespace the
+/// token does not name, and every reference while the feature is off all
+/// answer the same `404`, so references cannot be probed.
+/// Every `200`/`404` emits one `audit.event = "diagnostic_ref_lookup"` event at
+/// WARN, visible at the default log level; `403` and `429` events are
+/// throttled to one per second each, carrying how many were suppressed.
+///
+/// A replica-tagged (`fd2_`) reference minted by another gateway process
+/// (issue #5846) answers the same `404` status and body as a miss. When the
+/// caller passed every check a `200` here would need (scope, `ns` binding, and
+/// this process's namespace), the `404` also carries
+/// `X-Ferrum-Diagnostic-Owner-Replica` naming the replica id the reference
+/// embeds, so operator tooling can route the lookup to that process.
+///
+/// `diagnostics_read_granted` comes from the claims the main admin gate
+/// already verified for this request; the token is not verified twice.
+fn diagnostic_ref_lookup_response(
+    auth: &AuditActor,
+    diagnostics_read_granted: bool,
+    reference: &str,
+) -> Response<Full<Bytes>> {
+    use crate::diagnostic_ref::DiagnosticRefLookup;
+
+    // Defense in depth: the caller already derived the grant through
+    // `VerifiedAdminToken::grants_scope`, which refuses viewer-key scopes.
+    let diagnostics_read_granted = diagnostics_read_granted && auth.key_tier.honours_scopes();
+    let outcome = crate::diagnostic_ref::authorize_lookup(
+        crate::diagnostic_ref::active_store(),
+        &auth.sub,
+        diagnostics_read_granted,
+        &auth.allowed_namespaces,
+        reference,
+        Instant::now(),
+    );
+    // The path segment is caller-controlled: only the fixed reference shape
+    // (prefix plus lowercase hex) is ever echoed into the audit event.
+    let logged_reference = if crate::diagnostic_ref::is_well_formed_ref(reference) {
+        reference
+    } else {
+        "malformed"
+    };
+    let result = outcome.result();
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    if let Some(suppressed) = DIAGNOSTIC_REF_LOOKUP_AUDIT.admit(result, now_ms) {
+        warn!(
+            audit.event = "diagnostic_ref_lookup",
+            actor = %auth.sub,
+            key_tier = auth.key_tier.as_str(),
+            reference = %logged_reference,
+            result = result.as_str(),
+            suppressed_since_last = suppressed,
+            "Diagnostic reference lookup"
+        );
+    }
+    match outcome {
+        DiagnosticRefLookup::Found(view) => match serde_json::to_value(&*view) {
+            Ok(body) => json_response(StatusCode::OK, &body),
+            Err(_) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Diagnostic reference could not be rendered"}),
+            ),
+        },
+        DiagnosticRefLookup::NotFound => diagnostic_ref_not_found_response(),
+        DiagnosticRefLookup::NotOwned(owner) => {
+            let mut response = diagnostic_ref_not_found_response();
+            crate::diagnostic_ref::insert_owner_hint(response.headers_mut(), owner);
+            response
+        }
+        DiagnosticRefLookup::MissingScope => json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Diagnostic reference lookups require the `diagnostics:read` \
+                     JWT scope"}),
+        ),
+        DiagnosticRefLookup::MissingNamespaceBinding => json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Diagnostic reference lookups require a namespace-bound admin \
+                     JWT (`ns` claim)"}),
+        ),
+        DiagnosticRefLookup::RateLimited => {
+            let mut response = json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &json!({"error": "Diagnostic reference lookup rate limit exceeded"}),
+            );
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+    }
+}
+
+/// The one `404` every unresolved diagnostic reference lookup answers.
+fn diagnostic_ref_not_found_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &json!({"error": "Diagnostic reference not found"}),
+    )
 }
 
 /// `401` response for `/metrics` when the caller is not authorized to scrape.
@@ -3388,6 +3658,13 @@ async fn handle_admin_request_inner(
     // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
     // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
+        if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
+            && let Ok(actor) = AuditActor::from_verified(&token_data)
+            && let Some(response) =
+                authorize_ceiling_global_route(&method, &["metrics"], &path, &actor)
+        {
+            return Ok(response);
+        }
         if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
             return Ok(metrics_unauthorized_response());
         }
@@ -3435,6 +3712,8 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
+        // Diagnostic reference store (issue #5767); empty while it is off.
+        metrics_output.push_str(&crate::diagnostic_ref::render_prometheus());
         // Data-path families (issue #4156): load shedding, upstream health,
         // circuit-breaker state, backend retries, pool saturation, and frontend
         // TLS admission. Sampled here on the cold scrape path from state the
@@ -3467,10 +3746,15 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
 
-    // Authenticate
-    let auth = match state.jwt_manager.verify_request(auth_header.as_deref()) {
-        Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
-            Ok(actor) => actor,
+    // Authenticate. The `diagnostics:read` scope is read from the same verified
+    // claims, so the diagnostic reference lookup never re-verifies the token.
+    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+        Ok(token_data) => match AuditActor::from_verified(&token_data) {
+            Ok(actor) => {
+                // Tier-aware: a viewer-key token's `scope` claims grant nothing.
+                let diagnostics_read = token_data.grants_scope(DIAGNOSTICS_READ_SCOPE);
+                (actor, diagnostics_read)
+            }
             Err(message) => {
                 return Ok(json_response(
                     StatusCode::UNAUTHORIZED,
@@ -3514,6 +3798,12 @@ async fn handle_admin_request_inner(
     // #2421). Nothing is written to the spool here: an authenticated read never
     // reaches the write gate.
     audit::note_request_actor(&auth, &audit_request_ctx);
+
+    let route_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if let Some(response) = authorize_ceiling_global_route(&method, &route_segments, &path, &auth) {
+        drop(req.into_body());
+        return Ok(response);
+    }
 
     // API chargeback endpoint. Chargeback output contains customer/business data,
     // so it stays behind the standard admin JWT gate even though it is scrapeable.
@@ -3592,6 +3882,23 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
 
+    // Gateway diagnostic reference lookup (issue #5767). Dispatched before the
+    // `X-Ferrum-Namespace` gate on purpose: the header selects nothing here.
+    // The reference's own namespace is checked against the JWT `ns` claim, and
+    // the answer never depends on which namespace the caller asked for.
+    if path.starts_with("/diagnostics/") {
+        let diagnostic_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if let (Method::GET, ["diagnostics", "v1", "refs", reference]) =
+            (method.clone(), diagnostic_segments.as_slice())
+        {
+            return Ok(diagnostic_ref_lookup_response(
+                &auth,
+                diagnostics_read,
+                reference,
+            ));
+        }
+    }
+
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")
     let namespace = match extract_namespace(req.headers()) {
         Ok(ns) => ns,
@@ -3638,10 +3945,18 @@ async fn handle_admin_request_inner(
     // /namespaces registry, metrics, mesh introspection) are not selected
     // by X-Ferrum-Namespace. Registry handlers apply the claim to the
     // path/body name themselves.
-    if state.admin_require_namespace_claim
-        && is_namespace_scoped_route(segments_peek.as_slice())
-        && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
-    {
+    //
+    // The viewer-key namespace ceiling (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES,
+    // issue #5929) is enforced here too, and unconditionally: a token verified
+    // by FERRUM_ADMIN_JWT_VIEWER_SECRET may address only the namespaces it
+    // lists, whatever its `ns` claim or the header says.
+    let require_claim = state.admin_require_namespace_claim;
+    let namespace_denial = if is_namespace_scoped_route(segments_peek.as_slice()) {
+        authorize_request_namespace(require_claim, &auth, &namespace, &path)
+    } else {
+        None
+    };
+    if let Some(resp) = namespace_denial {
         // `GET` only: `/backup` has no other method, so auditing a denied
         // `POST`/`PUT`/`DELETE` here would fabricate a `backup` security record
         // for an export that was never a reachable route.
@@ -3649,13 +3964,18 @@ async fn handle_admin_request_inner(
             let resources = backup_resources_query_audit_value(query.as_deref());
             // The header was just denied: do not file the security record under
             // the unvalidated tenant the caller asked for.
+            let diff = audit::with_namespace_ceiling_decision(
+                audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
+                &auth,
+                &namespace,
+            );
             let event = audit::AuditEvent::new(
                 &auth,
                 "backup",
                 "gateway_config",
                 canonical_global_audit_namespace(),
                 canonical_global_audit_namespace(),
-                audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
+                diff,
             )
             .with_request_context(&audit_request_ctx)
             .with_outcome(audit::outcome::DENIED);
@@ -4140,7 +4460,18 @@ async fn handle_admin_request_inner(
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
+            let proxy_id = match parse_plugin_config_proxy_id(&uri) {
+                Ok(proxy_id) => proxy_id,
+                Err(response) => return Ok(*response),
+            };
+            crud::handle_list_filtered::<PluginConfig>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &proxy_id,
+            )
+            .await
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -4351,18 +4682,44 @@ async fn handle_admin_request_inner(
             .await
         }
 
+        // Read-only configuration export (issue #5904). Any authenticated role,
+        // including a token verified by FERRUM_ADMIN_JWT_VIEWER_SECRET. It is
+        // built from the same projections ordinary viewer reads use, with each
+        // withheld value rendered as a keyed fingerprint, plus one per-consumer
+        // fingerprint of the credential types viewer reads omit (which does
+        // not reveal whether any exist). Namespace-scoped, and a present `ns`
+        // claim is always honoured here — even with
+        // FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM off — so a namespace-scoped
+        // read-only token cannot export another tenant.
+        (Method::GET, ["config", "export"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Viewer) {
+                return Ok(resp);
+            }
+            if auth.allowed_namespaces.is_present()
+                && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(resp);
+            }
+            Ok(config_export::handle_config_export(&state, &auth, &namespace).await)
+        }
+
         // Backup & Restore
         (Method::GET, ["backup"]) => {
             // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 let resources = backup_resources_query_audit_value(query.as_deref());
+                let diff = audit::with_namespace_ceiling_decision(
+                    audit::backup_failure_diff(audit::failure_category::FORBIDDEN, resources),
+                    &auth,
+                    &namespace,
+                );
                 let event = audit::AuditEvent::new(
                     &auth,
                     "backup",
                     "gateway_config",
                     namespace.as_str(),
                     namespace.as_str(),
-                    audit::backup_failure_diff(audit::failure_category::FORBIDDEN, resources),
+                    diff,
                 )
                 .with_request_context(&audit_request_ctx)
                 .with_outcome(audit::outcome::DENIED);
@@ -5115,6 +5472,7 @@ async fn handle_mesh_config_revision_reset(
     let cleared = mesh_runtime.reset_accepted_revision();
     warn!(
         actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
         cleared_authority = cleared
             .as_ref()
             .map(|revision| revision.authority.as_str())
@@ -10882,31 +11240,40 @@ async fn handle_audit_list(
 
 /// When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on, `GET /namespaces` is
 /// filtered to the token's claimed names (missing/empty claim → empty list)
-/// rather than 403, because the list route is a global surface.
+/// rather than 403, because the list route is a global surface. A viewer-key
+/// token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is always filtered to that
+/// ceiling as well, whatever the claim setting.
 fn filter_listed_namespaces(
     require_claim: bool,
     auth: &AuditActor,
     names: Vec<String>,
 ) -> Vec<String> {
-    if !require_claim {
+    if !listed_namespaces_filtered(require_claim, auth) {
         return names;
     }
     names
         .into_iter()
-        .filter(|name| auth.allowed_namespaces.allows(name))
+        .filter(|name| {
+            auth.namespace_ceiling_decision(name) != NamespaceCeilingDecision::Outside
+                && (!require_claim || auth.allowed_namespaces.allows(name))
+        })
         .collect()
 }
 
+/// Whether [`filter_listed_namespaces`] would drop anything for this caller.
+fn listed_namespaces_filtered(require_claim: bool, auth: &AuditActor) -> bool {
+    require_claim || auth.namespace_ceiling.is_some()
+}
+
+/// Namespace-registry authorization for `name`: the viewer-key namespace
+/// ceiling always, and the `ns` claim when claim enforcement is on.
 fn maybe_enforce_namespace_claim(
     state: &AdminState,
     auth: &AuditActor,
     name: &str,
     path: &str,
 ) -> Option<Response<Full<Bytes>>> {
-    if !state.admin_require_namespace_claim {
-        return None;
-    }
-    enforce_namespace_claim(auth, name, path)
+    authorize_request_namespace(state.admin_require_namespace_claim, auth, name, path)
 }
 
 /// Detail record for a name that exists only as a derived resource namespace
@@ -11164,10 +11531,11 @@ async fn handle_list_namespaces(
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        if state.admin_require_namespace_claim {
+        let require_claim = state.admin_require_namespace_claim;
+        if listed_namespaces_filtered(require_claim, auth) {
             match db.list_namespaces().await {
                 Ok(names) => {
-                    let filtered = filter_listed_namespaces(true, auth, names);
+                    let filtered = filter_listed_namespaces(require_claim, auth, names);
                     return Ok(json_response(
                         StatusCode::OK,
                         &paginate_response(&filtered, pagination),
@@ -12270,8 +12638,11 @@ mod tests {
             vec!["plugins", "config", "pc1"],
             vec!["api-specs"],
             vec!["api-specs", "s1"],
+            vec!["gateway-trust-bundles"],
+            vec!["gateway-trust", "status"],
             vec!["batch"],
             vec!["backup"],
+            vec!["config", "export"],
             vec!["restore"],
             vec!["audit"],
         ] {
@@ -12282,12 +12653,51 @@ mod tests {
             );
         }
 
+        // Ceiling-bound viewer keys are fail-closed on global routes, except
+        // this intentionally small set of filtered or probe-safe endpoints.
+        for (method, segs) in [
+            (Method::GET, vec!["plugins"]),
+            (Method::GET, vec!["namespaces"]),
+            (Method::GET, vec!["namespaces", "tenant-a"]),
+            (Method::GET, vec!["health"]),
+            (Method::GET, vec!["live"]),
+            (Method::GET, vec!["status"]),
+            (Method::GET, vec!["overload"]),
+        ] {
+            assert!(
+                ceiling_global_route_is_allowed(&method, &segs),
+                "{} /{} should be allowlisted",
+                method,
+                segs.join("/")
+            );
+        }
+        for (method, segs) in [
+            (Method::GET, vec!["charges"]),
+            (Method::GET, vec!["metrics"]),
+            (Method::GET, vec!["admin", "metrics"]),
+            (Method::GET, vec!["metrics", "runtime"]),
+            (Method::GET, vec!["cluster"]),
+            (Method::GET, vec!["backend-capabilities"]),
+            (Method::POST, vec!["namespaces"]),
+            (Method::PUT, vec!["namespaces", "tenant-a"]),
+            (Method::DELETE, vec!["namespaces", "tenant-a"]),
+            (Method::POST, vec!["plugins"]),
+        ] {
+            assert!(
+                !ceiling_global_route_is_allowed(&method, &segs),
+                "{} /{} should be denied by default",
+                method,
+                segs.join("/")
+            );
+        }
+
         // Global admin surfaces: never gated on the ns claim.
         for segs in [
             vec!["plugins"], // plugin *type* listing — global metadata
             vec!["namespaces"],
             vec!["namespaces", "tenant-a"],
             vec!["cluster"],
+            vec!["config", "apply-status"],
             vec!["backend-capabilities"],
             vec!["metrics", "runtime"],
             vec!["admin", "tls", "inventory"],
@@ -12333,6 +12743,8 @@ mod tests {
             sub: "tester".to_string(),
             role: AdminRole::Admin,
             allowed_namespaces: allowed,
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
 
         // No claim → denied when enforcement is on.
@@ -12376,6 +12788,8 @@ mod tests {
             sub: "tester".to_string(),
             role: AdminRole::Viewer,
             allowed_namespaces: allowed,
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
         let names = vec![
             "alpha".to_string(),
@@ -12610,11 +13024,15 @@ mod tests {
             sub: "operator".to_string(),
             role: AdminRole::Operator,
             allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
         let admin = AuditActor {
             sub: "admin".to_string(),
             role: AdminRole::Admin,
             allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
         for (method, route) in admin_only {
             let required = tls_route_required_role(&method, &route);

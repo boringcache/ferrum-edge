@@ -203,28 +203,62 @@ fn h3_cross_protocol_classified_failures_keep_typed_gateway_error() {
         .find(helper_definition)
         .expect("cross-protocol reqwest classifier definition")
         + helper_definition.len();
+
+    // The prebuffered (buffered-exhausted) bridge wraps its attempt failure in
+    // `PlainAttemptFailure` so a route attempt budget (#5646) can share the
+    // retry/terminal path. Its `attempt_result` must still classify transport
+    // failures through the reqwest classifier, and an attempt-budget expiry
+    // must use proxy core's classified backend-timeout response.
+    let failure_impl_start = cross
+        .find("impl PlainAttemptFailure {")
+        .expect("prebuffered attempt failure classifier must remain present");
+    let failure_impl = &cross[failure_impl_start..];
+    let failure_impl_end = failure_impl
+        .find("\n}\n")
+        .expect("PlainAttemptFailure impl must close");
+    let failure_impl = &failure_impl[..failure_impl_end];
+    let transport_arm =
+        "Self::Transport(error) => reqwest_error_response_for_cross_protocol(state, error, None)";
+    assert!(
+        failure_impl.contains(transport_arm),
+        "prebuffered transport failures must classify through the reqwest classifier"
+    );
+    assert!(
+        failure_impl.contains("crate::proxy::http_backend_dispatch_error_response(class, None)"),
+        "prebuffered attempt-budget expiry must use the classified backend-timeout response"
+    );
+
     let mut classified_writes = 0usize;
     // Search only after the helper definition. Slicing at the function-name
     // match itself loses the preceding `fn `, so trying to reject the
-    // definition from the suffix misclassifies it as a call site.
-    let mut search = &cross[helper_end..];
-    while let Some(idx) = search.find("reqwest_error_response_for_cross_protocol(") {
-        let suffix = &search[idx..];
-        let end = suffix
-            .find("return Ok(outcome);")
-            .expect("classified dispatch branch must return its written outcome")
-            + "return Ok(outcome);".len();
-        let window = &suffix[..end];
-        assert!(
-            window.contains("write_classified_backend_dispatch_error("),
-            "classified H3→HTTP dispatch failure must write via write_classified_backend_dispatch_error"
-        );
-        assert!(
-            !window.contains(r#"{"error":"Bad Gateway"}"#),
-            "classified H3→HTTP dispatch failure must not collapse to generic Bad Gateway"
-        );
-        classified_writes += 1;
-        search = &search[idx + 1..];
+    // definition from the suffix misclassifies it as a call site. The
+    // prebuffered bridge classifies via `e.attempt_result(state)` (which
+    // delegates to the helper, asserted above); the streaming bridge calls
+    // the helper directly.
+    let classifier_call_sites = [
+        "reqwest_error_response_for_cross_protocol(",
+        "let attempt_result = e.attempt_result(state);",
+    ];
+    for needle in classifier_call_sites {
+        let mut search = &cross[helper_end..];
+        while let Some(idx) = search.find(needle) {
+            let suffix = &search[idx..];
+            let end = suffix
+                .find("return Ok(outcome);")
+                .expect("classified dispatch branch must return its written outcome")
+                + "return Ok(outcome);".len();
+            let window = &suffix[..end];
+            assert!(
+                window.contains("write_classified_backend_dispatch_error("),
+                "classified H3→HTTP dispatch failure must use the classified error writer"
+            );
+            assert!(
+                !window.contains(r#"{"error":"Bad Gateway"}"#),
+                "classified H3→HTTP dispatch failure must not collapse to generic Bad Gateway"
+            );
+            classified_writes += 1;
+            search = &search[idx + 1..];
+        }
     }
     assert_eq!(
         classified_writes, 2,
@@ -254,16 +288,104 @@ fn native_h3_dispatch_failures_send_typed_gateway_error() {
         .find("sanitize_client_response_headers_for_wire(")
         .map(|idx| committed + idx)
         .expect("buffered native H3 pre-wire sanitize");
+    // The context-aware writer, so an output-ceiling refusal reads `overload`
+    // and a route-deadline 504 no backend held reads `request_timeout`.
     let restore = buffered[sanitize..]
-        .find("apply_authoritative_backend_gateway_error_header(")
+        .find("apply_authoritative_gateway_error_header_for_response(")
         .map(|idx| sanitize + idx)
         .expect("buffered native H3 must restore X-Gateway-Error after committed hooks");
     assert!(
-        !buffered[..sanitize].contains("apply_authoritative_backend_gateway_error_header("),
+        !buffered[..sanitize].contains("apply_authoritative_gateway_error_header_for_response("),
         "buffered native H3 must not restore X-Gateway-Error before the final pre-wire boundary"
     );
     assert!(
         restore > sanitize,
         "buffered native H3 must restore X-Gateway-Error after sanitizing for the wire"
+    );
+}
+
+/// Issue #5807: the HTTP/3 bridge's gateway error terminal writes
+/// `X-Gateway-Error` after the `after_proxy` hooks, as HTTP/1.1 and HTTP/2 do,
+/// from the typed `connection_error` signal. Its callers hand over that signal,
+/// never a header map that already carries the token.
+#[test]
+fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let token_writer = "apply_authoritative_gateway_error_header_for_response(";
+    let writer = cross
+        .split("async fn write_plain_gateway_error_terminal<S>(")
+        .nth(1)
+        .expect("the HTTP/3 gateway error terminal writer")
+        .split("\n}\n")
+        .next()
+        .expect("the writer body");
+    assert!(
+        writer.contains("connection_error: bool"),
+        "the writer must take the typed connection-error signal"
+    );
+    let hooks = writer
+        .find("apply_after_proxy_hooks_to_gateway_error_terminal(")
+        .expect("the writer runs the after_proxy hooks");
+    let token = writer
+        .find(token_writer)
+        .expect("the writer applies the gateway token itself");
+    let write = writer
+        .find("write_plain_gateway_reject(")
+        .expect("the writer writes through the gateway reject writer");
+    assert!(
+        hooks < token && token < write,
+        "the token must be written after the hooks and before the wire write"
+    );
+    assert_eq!(
+        writer.matches(token_writer).count(),
+        1,
+        "the token is applied exactly once, after the hooks"
+    );
+
+    let classified = cross
+        .split("async fn write_classified_backend_dispatch_error<S>(")
+        .nth(1)
+        .expect("the classified dispatch error writer")
+        .split("\n}\n")
+        .next()
+        .expect("the classified writer body");
+    assert!(
+        !classified.contains(token_writer),
+        "the classified writer must not apply the token before the hooks"
+    );
+    assert!(
+        !classified.contains("restore_authoritative_gateway_error_header"),
+        "the classified writer must not restore the token before the hooks"
+    );
+    assert!(
+        !classified.contains("insert_x_gateway_error_for_backend_failure"),
+        "the classified writer must not insert the token before the hooks"
+    );
+    assert!(
+        classified.contains("attempt_result.connection_error"),
+        "the classified writer must hand the typed signal to the terminal writer"
+    );
+
+    // The declared-oversize 502 hands the writer its non-connection signal.
+    let oversized_body = r##"br#"{"error":"Backend response body exceeds maximum size"}"#"##;
+    let body_start = cross
+        .find(oversized_body)
+        .expect("the declared-oversize response body");
+    let call_start = cross[..body_start]
+        .rfind("let mut outcome = write_plain_gateway_error_terminal(")
+        .expect("the declared-oversize terminal writer call");
+    let oversized = cross[call_start..]
+        .split(".await?;")
+        .next()
+        .expect("the declared-oversize terminal writer call");
+    let oversized_compact: String = oversized.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        oversized_compact.contains(
+            "write_plain_gateway_error_terminal(stream,plugins,ctx,StatusCode::BAD_GATEWAY,"
+        ) && oversized_compact.contains("Bytes::from_static(")
+            && oversized_compact.contains("),false,backend_start,bytes_sent,")
+            && !oversized.contains(token_writer)
+            && !oversized_compact.contains("headers"),
+        "the declared-oversize 502 must hand the typed signal to the terminal writer"
     );
 }

@@ -23,7 +23,10 @@ When `image.tag` is empty the chart defaults to `Chart.appVersion`. That tag
 must exist in the container registry before install. Override with a published
 tag from `docker.io/ferrumedge/ferrum-edge` or `ghcr.io/ferrum-edge/ferrum-edge`
 (for example `--set image.tag=<published-tag>`). The registry's `latest` tag is
-retired; existing images are historical artifacts and do not receive fixes.
+a moving development build of the newest built `main` commit that passed CI
+(intermediate commits may be skipped; only built commits get a `main-<sha>`
+tag), not a release; the mesh injector refuses it for
+`FERRUM_INJECTOR_SIDECAR_IMAGE`.
 
 ## Private registries
 
@@ -120,7 +123,7 @@ Three factors contribute to that outage:
 
 | Factor | Mitigation in this chart |
 | --- | --- |
-| Single injector replica | Addressed separately in PR #4186 (`injector.replicas: 2`, PDB, topology spread) |
+| Single injector replica | `injector.replicas: 2` default plus PDB and topology spread (see [High availability and disruption](#high-availability-and-disruption)) |
 | `failurePolicy: Fail` | Intentional; kept for fail-closed injection |
 | No self-exclusion | **This chart** — release namespace + injector pod label exclusions |
 
@@ -285,11 +288,10 @@ keys the template actually reads — `allowPrivilegeEscalation`,
 anything else at lint time rather than silently ignoring it (`runAsUser` /
 `runAsGroup` are decided by the capture mode; `allowPrivilegeEscalation`
 defaults to `false` so the steady-state proxy satisfies Restricted).
-`capabilities.drop` must stay `["ALL"]`, and `capabilities.add` **merges on top of**
-the datapath minimum: it can add named capabilities but can never remove a required
-one. `ALL` and
-`CAP_ALL` are rejected in `capabilities.add` — they would re-grant the complete
-Linux capability set after `drop: ["ALL"]`. Capability names are validated
+`capabilities.drop` must stay `["ALL"]`, and `capabilities.add` **merges on top
+of** the datapath minimum: it can add named capabilities but can never remove a
+required one. `ALL` and `CAP_ALL` are rejected in `capabilities.add` — they
+would re-grant the complete Linux capability set after `drop: ["ALL"]`. Capability names are validated
 against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered unquoted so NodeWaypoint and
 Ambient UDP live/CI greps keep matching the datapath set. An explicit `drop: []`
 is rejected — it is not silently rewritten to `[ALL]`; omit the key to keep the

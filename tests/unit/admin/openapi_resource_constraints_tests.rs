@@ -330,6 +330,24 @@ fn proxy_routing_and_stream_controls_match_runtime() {
             (json!({"upstream_subset": null}), true),
             (json!({"udp_max_response_amplification_factor": 0}), false),
             (json!({"udp_max_response_amplification_factor": 0.5}), true),
+            (json!({"websocket_permessage_deflate": "strip"}), true),
+            (json!({"websocket_permessage_deflate": "passthrough"}), true),
+            (json!({"websocket_permessage_deflate": "terminate"}), true),
+            (
+                json!({"websocket_permessage_deflate": "Passthrough"}),
+                false,
+            ),
+            (json!({"websocket_permessage_deflate": null}), false),
+            (json!({"allow_path_parameters": true}), true),
+            (json!({"allow_path_parameters": false}), true),
+            (json!({"allow_path_parameters": null}), false),
+            (json!({"listen_path": "/audit;v=1"}), false),
+            (
+                json!({"listen_path": "/audit;v=1", "allow_path_parameters": true}),
+                true,
+            ),
+            (json!({"listen_path": "=/audit;v=1"}), false),
+            (json!({"listen_path": "~^/audit;v=[0-9]+"}), true),
         ] {
             let mut body = proxy();
             body.as_object_mut()
@@ -367,6 +385,12 @@ fn proxy_routing_and_stream_controls_match_runtime() {
                 ),
                 ("stream_match", json!({}), matches!(scheme, "tcp" | "tcps")),
                 ("response_body_mode", json!("buffer"), false),
+                ("websocket_permessage_deflate", json!("passthrough"), false),
+                ("websocket_permessage_deflate", json!("terminate"), false),
+                ("websocket_permessage_deflate", json!("strip"), true),
+                ("websocket_permessage_deflate", json!("bogus"), false),
+                ("allow_path_parameters", json!(true), false),
+                ("allow_path_parameters", json!(false), true),
                 (
                     "udp_max_response_amplification_factor",
                     json!(0),

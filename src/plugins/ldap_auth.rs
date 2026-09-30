@@ -223,6 +223,10 @@ pub struct LdapAuth {
     /// Plaintext loopback endpoints are admitted without the development-only
     /// override, but their actual dial-time answers must remain loopback.
     plaintext_requires_loopback: bool,
+    /// Verifying-authority digest (directory URL, bind/search base, and
+    /// identity attribute) committed with every external principal this
+    /// instance vouches for.
+    identity_realm_authority: [u8; 32],
 }
 
 impl LdapAuth {
@@ -533,6 +537,19 @@ impl LdapAuth {
             None
         };
 
+        let identity_realm_authority = auth_flow::external_identity_realm_authority(
+            "ldap_auth",
+            &[
+                ("ldap_url", Some(ldap_url.as_str())),
+                ("bind_dn_template", bind_dn_template.as_deref()),
+                ("search_base_dn", search_base_dn.as_deref()),
+                (
+                    "canonical_identity_attribute",
+                    canonical_identity_attribute.as_deref(),
+                ),
+            ],
+        );
+
         Ok(Self {
             ldap_url,
             bind_dn_template,
@@ -566,6 +583,7 @@ impl LdapAuth {
             dns_cache,
             backend_egress_policy,
             plaintext_requires_loopback,
+            identity_realm_authority,
         })
     }
 
@@ -1854,6 +1872,10 @@ impl AuthMechanism for LdapAuth {
         "ldap_auth"
     }
 
+    fn identity_realm_authority(&self) -> Option<[u8; 32]> {
+        Some(self.identity_realm_authority)
+    }
+
     /// `ldap_auth` consumes RFC 7617 `Authorization: Basic` credentials, so an
     /// unauthenticated request must be answered with the `Basic` challenge
     /// (RFC 9110 section 11.6.1) — clients that drive Basic authentication off
@@ -2107,6 +2129,7 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use rustls::pki_types::ServerName;
+    use rustls::pki_types::pem::PemObject;
     use std::io::Write;
     use std::sync::Once;
     use tempfile::NamedTempFile;
@@ -2327,12 +2350,12 @@ mod tests {
     /// Build a rustls server `ServerConfig` from leaf PEM cert + PEM key.
     fn build_server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
         let certs: Vec<CertificateDer<'static>> = must(
-            rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
+            CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>(),
             "parse leaf cert",
         );
         let key: rustls::pki_types::PrivateKeyDer<'static> = must_some(
             must(
-                rustls_pemfile::private_key(&mut key_pem.as_bytes()),
+                crate::tls::first_pem_private_key(key_pem.as_bytes()),
                 "parse private key",
             ),
             "private key should be present",

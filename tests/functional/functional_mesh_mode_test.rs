@@ -31,6 +31,8 @@ use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
@@ -73,7 +75,7 @@ use crate::common::{
     run_trusted_projected_gateway_test,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::{Http3Client, Http3GrpcStream, WebSocketOptions};
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3GrpcStream, WebSocketOptions};
 use crate::scaffolding::ports::reserve_port;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
@@ -1151,7 +1153,8 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
 }
 
 /// Issue #4252: these functional cases exercise production synthesis-time
-/// refusal (`build_inbound_hbone_relay_proxy` → 404, zero dials). Mesh-mode
+/// refusal (`build_inbound_hbone_relay_proxy` → the documented 403, zero
+/// dials; issue #5763). Mesh-mode
 /// has no deployed source that puts `mesh_route_dispatch` on a synthesized
 /// inbound relay; do not invent a `MeshSlice` plugin/config bypass. The
 /// post-plugin handler re-check is proved in-process by
@@ -1187,8 +1190,8 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
          the synthesized inbound relay; do not invent a slice/plugin bypass"
     );
     // Without an in-fixture positive control, a terminator that refuses EVERY
-    // destination (slice never applied, SVID mismatch, wrong topology) 404s for
-    // C and passes as a security proof. These pin the control in place.
+    // destination (slice never applied, SVID mismatch, wrong topology) refuses
+    // C too and passes as a security proof. These pin the control in place.
     assert!(
         drive.contains("start_own_dest_echo_for("),
         "the driver must stand up B's OWN declared destination as a live echo \
@@ -1197,7 +1200,7 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
     assert!(
         drive.contains("control_failure"),
         "the driver must require a positive control CONNECT that IS relayed; \
-         otherwise C's 404 is not attributable to C being a third workload"
+         otherwise C's refusal is not attributable to C being a third workload"
     );
     assert!(
         drive.contains("observe_third_workload_backend_hits("),
@@ -1261,13 +1264,14 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
         .expect("no top-level closing brace for assert_third_workload_connect_refused");
     let assertion = &assert_rest[..assert_end];
     assert!(
-        assertion.contains("outcome.status, 404"),
-        "both flavors must require synthesis-time 404; this functional setup \
-         never reaches the post-plugin handler re-check"
+        assertion.contains("outcome.status, 403"),
+        "both flavors must require the documented synthesis-time 403 (issue \
+         #5763); this functional setup never reaches the post-plugin handler \
+         re-check"
     );
     assert!(
         !assertion.contains("403 | 404"),
-        "do not treat a handler-path status as equivalent to synthesis refusal"
+        "a route-miss 404 is not a relay refusal"
     );
 }
 
@@ -2585,16 +2589,15 @@ async fn mesh_inbound_server_leaf(
     client_identity: (&str, &str),
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots.add(cert)?;
     }
     let provider = rustls::crypto::ring::default_provider();
     let (cert_pem, key_pem) = client_identity;
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-        .ok_or("no client private key in PEM")?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
@@ -2672,7 +2675,7 @@ async fn mesh_inbound_mtls_connect(
     use tokio::io::AsyncReadExt;
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots.add(cert)?;
     }
     let provider = rustls::crypto::ring::default_provider();
@@ -2681,11 +2684,10 @@ async fn mesh_inbound_mtls_connect(
         .with_root_certificates(roots);
     let config = match client_identity {
         Some((cert_pem, key_pem)) => {
-            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .filter_map(|c| c.ok())
                 .collect();
-            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-                .ok_or("no client private key in PEM")?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
             builder.with_client_auth_cert(chain, key)?
         }
         None => builder.with_no_client_auth(),
@@ -2918,7 +2920,7 @@ fn mint_spire_server_leaf(
 /// DER of the first certificate in a PEM bundle — the trust anchor the Workload
 /// API ships in `X509SVID.bundle`.
 fn ca_der_from_pem(ca_pem: &str) -> Vec<u8> {
-    rustls_pemfile::certs(&mut ca_pem.as_bytes())
+    CertificateDer::pem_slice_iter(ca_pem.as_bytes())
         .next()
         .expect("at least one CA cert in PEM")
         .expect("valid CA DER")
@@ -3423,7 +3425,7 @@ async fn mesh_inbound_http_get(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots.add(cert)?;
     }
     let provider = rustls::crypto::ring::default_provider();
@@ -3432,11 +3434,10 @@ async fn mesh_inbound_http_get(
         .with_root_certificates(roots);
     let config = match client_identity {
         Some((cert_pem, key_pem)) => {
-            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .filter_map(|c| c.ok())
                 .collect();
-            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-                .ok_or("no client private key in PEM")?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
             builder.with_client_auth_cert(chain, key)?
         }
         None => builder.with_no_client_auth(),
@@ -4605,7 +4606,7 @@ async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
 // The #4150 / #4252 negative of this keystone — an authenticated peer CONNECTs
 // to B naming a third slice-declared workload B does not terminate for — is
 // `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
-// (synthesis-time 404, zero dials). The post-plugin handler re-check is
+// (synthesis-time 403, zero dials). The post-plugin handler re-check is
 // `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
 // `tests/integration/mesh_hbone_tests.rs`.
 
@@ -4694,7 +4695,7 @@ fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::Ser
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca_pem = std::fs::read(&svid.trust_bundle_path).expect("read mesh retry trust bundle");
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
         roots.add(cert).expect("add mesh retry client root");
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -4702,12 +4703,11 @@ fn mesh_retry_mtls_server_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::Ser
         .expect("build mesh retry client verifier");
     let cert_pem = std::fs::read(&svid.cert_path).expect("read mesh retry server SVID");
     let key_pem = std::fs::read(&svid.key_path).expect("read mesh retry server key");
-    let chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain = CertificateDer::pem_slice_iter(cert_pem.as_slice())
         .filter_map(|cert| cert.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .expect("parse mesh retry server key")
-        .expect("mesh retry server key present");
+    let key =
+        PrivateKeyDer::from_pem_slice(key_pem.as_slice()).expect("parse mesh retry server key");
     let mut config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)
@@ -6117,6 +6117,11 @@ fn mint_cross_cluster_svid_under(
     }
 }
 
+/// The east-west SNI alias a client dials for `svc-c`'s `service_port`.
+fn svc_c_east_west_sni(service_port: u16) -> String {
+    format!("p{service_port}.svc-c.ferrum.svc.cluster.local")
+}
+
 /// Poll the complete destination path until the east-west listener accepts an
 /// SNI-routed mTLS connection and the destination presents its expected SVID.
 /// A bare TCP connect only proves that the passthrough listener has bound; this
@@ -6554,25 +6559,33 @@ fn cross_cluster_dest_slice(
 }
 
 /// East-west gateway (B) slice: topology EastWestGateway, trust domain B. SNI
-/// passthrough — its per-service inbound for `svc-c` forwards SNI=`svc-c` FQDN →
-/// C's sidecar inbound listener at `127.0.0.1:c_inbound_port`.
+/// passthrough — its per-service inbound for `svc-c` forwards
+/// SNI=`p<service_port>.<svc-c FQDN>` → C's sidecar inbound listener at
+/// `127.0.0.1:c_inbound_port`.
 ///
 /// TEST-REALISM MODELING (Codex round-1 finding #7 — NOT a client/datapath bug):
 /// the CLIENT (gateway A) datapath is correct — it dials the east-west gateway
-/// with the destination service FQDN as the ClientHello SNI, exactly as a real
-/// cross-cluster sidecar would. In a real injected-sidecar destination, the
+/// with the destination service port's alias as the ClientHello SNI, exactly as
+/// a real cross-cluster sidecar would. In a real injected-sidecar destination, the
 /// gateway forwards the opaque TLS to the destination workload's APP port, and
 /// the destination pod's INBOUND iptables capture REDIRECTS that app-port traffic
 /// to the sidecar's `:15006` mTLS listener (the same model same-cluster east-west
 /// INBOUND uses — `build_east_west_service_targets` forwards to the workload
 /// app/target port, NOT `:15006`). The functional test cannot run iptables, so it
-/// COLLAPSES that destination-side redirect by modeling the service port (and the
-/// east-west "workload" address) as C's sidecar inbound mTLS listener directly
-/// (`c_inbound_port`) — so the passthrough lands straight on the listener that
-/// terminates the client mTLS. This is a test-harness limitation, not a client
-/// bug; the live two-cluster k8s fixture (Stage 2) exercises the realistic
-/// app-port→`:15006` iptables path. See `docs/mesh.md` (cross-cluster east-west).
-fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: u16) -> MeshSlice {
+/// COLLAPSES that destination-side redirect by modeling the service port's
+/// `targetPort` (and the east-west "workload" address) as C's sidecar inbound
+/// mTLS listener directly (`c_inbound_port`) — so the passthrough lands straight
+/// on the listener that terminates the client mTLS. The service port itself
+/// stays the client's `service_port`, because the SNI alias names it. This is a
+/// test-harness limitation, not a client bug; the live two-cluster k8s fixture
+/// (Stage 2) exercises the realistic app-port→`:15006` iptables path. See
+/// `docs/mesh.md` (cross-cluster east-west).
+fn cross_cluster_east_west_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    service_port: u16,
+    c_inbound_port: u16,
+) -> MeshSlice {
     let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
     MeshSlice {
         node_id: node_id.to_string(),
@@ -6608,10 +6621,10 @@ fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: 
             name: "svc-c".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
-                port: c_inbound_port,
+                port: service_port,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Number(c_inbound_port)),
             }],
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
@@ -6792,6 +6805,7 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
         let cp_b = start_static_mesh_cp(cross_cluster_east_west_slice(
             &node_b,
             c_spiffe,
+            backend_port,
             c_inbound_port,
         ))
         .await;
@@ -6893,7 +6907,7 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
         }
         if let Err(error) = wait_for_cross_cluster_destination_ready(
             b_east_west_port,
-            "svc-c.ferrum.svc.cluster.local",
+            &svc_c_east_west_sni(backend_port),
             c_spiffe,
             b_spiffe,
             &b_svid,
@@ -7239,6 +7253,7 @@ async fn try_start_sidecar_cross_cluster_fixture(
     let cp_b = start_static_mesh_cp(cross_cluster_east_west_slice(
         &node_b,
         c_spiffe,
+        backend_port,
         c_inbound_port,
     ))
     .await;
@@ -7332,7 +7347,7 @@ async fn try_start_sidecar_cross_cluster_fixture(
     }
     if wait_for_cross_cluster_destination_ready(
         b_east_west_port,
-        "svc-c.ferrum.svc.cluster.local",
+        &svc_c_east_west_sni(backend_port),
         c_spiffe,
         b_spiffe,
         &b_svid,
@@ -7729,16 +7744,18 @@ fn cross_cluster_ambient_dest_slice(
 ///
 /// TEST-REALISM MODELING (same as the Sidecar east-west slice — NOT a datapath
 /// bug): a real cross-cluster Ambient client dials the east-west gateway with the
-/// destination service FQDN as the outer-TLS SNI; the gateway forwards the opaque
-/// TLS to the destination workload's HBONE listener. The functional test cannot
-/// run a flat dest network / iptables, so it models the east-west "workload" as
-/// C's HBONE listener directly (`127.0.0.1:c_hbone_port`). The inner CONNECT
+/// destination service port's alias as the outer-TLS SNI; the gateway forwards the
+/// opaque TLS to the destination workload's HBONE listener. The functional test
+/// cannot run a flat dest network / iptables, so it models the east-west
+/// "workload" (and the service port's `targetPort`) as C's HBONE listener
+/// directly (`127.0.0.1:c_hbone_port`). The inner CONNECT
 /// authority is C's advertised non-loopback app address, which C can dial
 /// without crossing the loopback-namespace boundary. The live two-cluster
 /// fixture exercises the realistic pod-IP path.
 fn cross_cluster_ambient_east_west_slice(
     node_id: &str,
     c_spiffe: &str,
+    service_port: u16,
     c_hbone_port: u16,
 ) -> MeshSlice {
     let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
@@ -7773,10 +7790,10 @@ fn cross_cluster_ambient_east_west_slice(
             name: "svc-c".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
-                port: c_hbone_port,
+                port: service_port,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Number(c_hbone_port)),
             }],
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
@@ -7960,6 +7977,7 @@ async fn drive_ambient_cross_cluster_egress(
         let cp_b = start_static_mesh_cp(cross_cluster_ambient_east_west_slice(
             &node_b,
             c_spiffe,
+            backend_port,
             c_hbone_port,
         ))
         .await;
@@ -8068,7 +8086,7 @@ async fn drive_ambient_cross_cluster_egress(
         }
         if let Err(error) = wait_for_cross_cluster_destination_ready(
             b_east_west_port,
-            "svc-c.ferrum.svc.cluster.local",
+            &svc_c_east_west_sni(backend_port),
             c_spiffe,
             b_spiffe,
             &b_svid,
@@ -8408,6 +8426,7 @@ async fn try_start_ambient_cross_cluster_fixture(
     let cp_b = start_static_mesh_cp(cross_cluster_ambient_east_west_slice(
         &node_b,
         c_spiffe,
+        backend_port,
         c_hbone_port,
     ))
     .await;
@@ -8508,7 +8527,7 @@ async fn try_start_ambient_cross_cluster_fixture(
     }
     if wait_for_cross_cluster_destination_ready(
         b_east_west_port,
-        "svc-c.ferrum.svc.cluster.local",
+        &svc_c_east_west_sni(backend_port),
         c_spiffe,
         b_spiffe,
         &b_svid,
@@ -9926,12 +9945,10 @@ fn udp_dest_client_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::ClientConf
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cert_pem = std::fs::read(&svid.cert_path).expect("read client svid cert");
     let key_pem = std::fs::read(&svid.key_path).expect("read client svid key");
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_slice())
         .filter_map(|r| r.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .expect("parse client svid key")
-        .expect("client svid key present");
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice()).expect("parse client svid key");
     let mut cfg = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AnyServerCert))
@@ -10263,8 +10280,9 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 // path that places operator `mesh_route_dispatch` on the synthesized inbound
 // HBONE relay. These functional cases therefore prove the production-shaped
 // synthesis refusal: an authenticated peer CONNECTs to terminator B naming
-// slice-declared workload C, `build_inbound_hbone_relay_proxy` returns None,
-// the dispatcher 404s, and C's backend records zero hits.
+// slice-declared workload C, `build_inbound_hbone_relay_proxy` refuses it,
+// the dispatcher answers the documented 403 (issue #5763), and C's backend
+// records zero hits.
 //
 // That is not the post-plugin handler re-check. The independently placed
 // re-checks in `handle_hbone_request` / `handle_hbone_udp_request` are proved
@@ -10281,10 +10299,10 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 // CONNECT, the same peer SVID and the same CONNECT flavor name B's OWN
 // declared non-loopback destination and must be relayed (200 + byte-exact echo).
 // Ambient refuses the loopback namespace (#4315), so the control cannot name
-// `127.0.0.1`. A 404 is only evidence of an ownership refusal once the same
+// `127.0.0.1`. A 403 is only evidence of an ownership refusal once the same
 // terminator has been shown to relay something. Without the control, a
 // fixture whose slice never applied, whose SVID did not chain, or whose
-// topology was wrong would 404 for C and pass as a security proof.
+// topology was wrong would refuse C too and pass as a security proof.
 
 /// After a CONNECT result, wait this long for C's backend task to report a
 /// TCP accept or UDP datagram that was already queued while that task had not
@@ -10780,7 +10798,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         // a byte-exact echo proves the slice loaded, the peer is trusted, and
         // synthesis still builds a relay on this child. Without it, a fixture
         // that refuses EVERY destination (slice never applied, SVID mismatch,
-        // wrong topology) would 404 for C and pass as a security proof.
+        // wrong topology) would refuse C too and pass as a security proof.
         let control_authority = SocketAddr::new(b_ip, b_local_port).to_string();
         let control = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => {
@@ -10821,7 +10839,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             Ok((status, _)) => Some(format!(
                 "own-destination control CONNECT to {control_authority} returned {status}, \
                  expected 200: this terminator refuses even the destination it owns, so a \
-                 404 for C would not be attributable to C being a third workload"
+                 refusal of C would not be attributable to C being a third workload"
             )),
             Err(e) => Some(format!(
                 "own-destination control CONNECT to {control_authority} failed: {e}"
@@ -10836,13 +10854,14 @@ async fn drive_inbound_relay_third_workload_refusal(
             return Err(format!("{failure}\n--- gateway B ---\n{logs}"));
         }
 
-        // CONNECT names C, a dest B does not terminate for. Synthesis 404s
-        // before either HBONE handler runs. When this host has only one
-        // non-loopback IPv4, B and C share that address and the own-address
-        // arm refuses C as PortNotDeclared (C's port lives only on C's
-        // SPIFFE); distinct addresses miss the own-address arm and inventory
-        // refuses as AddressNotTerminated. Both are synthesis 404, and C is
-        // not loopback so the 404 is not the #4315 namespace refusal.
+        // CONNECT names C, a dest B does not terminate for. Synthesis refuses
+        // it with the documented 403 before either HBONE handler runs. When
+        // this host has only one non-loopback IPv4, B and C share that address
+        // and the own-address arm refuses C as PortNotDeclared (C's port lives
+        // only on C's SPIFFE); distinct addresses miss the own-address arm and
+        // inventory refuses as AddressNotTerminated. Both are synthesis
+        // refusals, and C is not loopback so the refusal is not the #4315
+        // namespace refusal.
         let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
@@ -10914,10 +10933,10 @@ async fn drive_inbound_relay_third_workload_refusal(
 
 fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, flavor: &str) {
     assert_eq!(
-        outcome.status, 404,
+        outcome.status, 403,
         "{flavor}: authenticated CONNECT naming C must be refused at \
-         synthesis time; 200/502 means the terminator relayed a dest it \
-         does not own\n{}",
+         synthesis time with the documented 403 (issue #5763); 200/502 means \
+         the terminator relayed a dest it does not own\n{}",
         outcome.logs
     );
     assert_eq!(
@@ -10930,11 +10949,11 @@ fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, f
 }
 
 /// Issue #4252 (byte-stream, synthesis): an authenticated HBONE CONNECT to
-/// terminator B naming slice-declared workload C is refused with 404, and C's
+/// terminator B naming slice-declared workload C is refused with 403, and C's
 /// TCP echo records zero accepts — proving `build_inbound_hbone_relay_proxy`
 /// still withholds the relay before `handle_hbone_request`. The same
 /// terminator relays B's own declared destination in the same attempt, so the
-/// 404 is attributable to C being a third workload.
+/// 403 is attributable to C being a third workload.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
@@ -10946,7 +10965,7 @@ async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
 }
 
 /// Issue #4252 (datagram-over-CONNECT, synthesis): the same C-named CONNECT
-/// over the UDP-marked flavor, asserting synthesis 404 and C's UDP echo
+/// over the UDP-marked flavor, asserting synthesis 403 and C's UDP echo
 /// records zero datagrams — proving the UDP branch of
 /// `build_inbound_hbone_relay_proxy` still withholds the relay before
 /// `handle_hbone_udp_request`. The same terminator round-trips a datagram to
@@ -11031,7 +11050,23 @@ struct IngressConnectOutcome {
     /// The tagged line the relayed loopback backend wrote back, when the tunnel
     /// opened. `None` for every refused CONNECT.
     relayed: Option<String>,
+    /// The response body of a refused CONNECT. `None` when the tunnel opened.
+    ///
+    /// A relay-destination refusal and a `mesh_authz` DENY are both `403`
+    /// (issue #5763) and neither carries a reason header, so the body is the
+    /// only on-the-wire evidence of WHICH layer refused the CONNECT.
+    refusal_body: Option<String>,
 }
+
+/// The body every inbound byte-stream relay-destination refusal answers with
+/// (`hbone_relay_destination_denied`, issue #5763) — including a declared
+/// Sidecar `ingress[]` block that does not map the CONNECT's port.
+const HBONE_RELAY_DESTINATION_DENIED_BODY: &str =
+    r#"{"error":"HBONE relay destination not allowed"}"#;
+
+/// The prefix every `mesh_authz` refusal body carries. A relay-destination
+/// refusal never carries it.
+const MESH_AUTHZ_DENIED_BODY_PREFIX: &str = r#"{"error":"Mesh authorization denied"#;
 
 /// mTLS client config presenting the peer SVID and verifying the sidecar's
 /// server SVID against the shared mesh CA. ALPN `h2` — the mesh-mTLS transport.
@@ -11039,7 +11074,7 @@ fn sidecar_ingress_client_config(
     peers: &MeshPeerSvids,
 ) -> Result<Arc<rustls::ClientConfig>, String> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut peers.ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+    for cert in CertificateDer::pem_slice_iter(peers.ca_pem.as_bytes()).filter_map(|c| c.ok()) {
         roots
             .add(cert)
             .map_err(|e| format!("add mesh CA root: {e}"))?;
@@ -11049,12 +11084,11 @@ fn sidecar_ingress_client_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("client protocol versions: {e}"))?
         .with_root_certificates(roots);
-    let chain: Vec<_> = rustls_pemfile::certs(&mut peers.client_cert_pem.as_bytes())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(peers.client_cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut peers.client_key_pem.as_bytes())
-        .map_err(|e| format!("parse client SVID key: {e}"))?
-        .ok_or_else(|| "no client SVID private key in PEM".to_string())?;
+    let key = PrivateKeyDer::from_pem_slice(peers.client_key_pem.as_bytes())
+        .map_err(|e| format!("parse client SVID key: {e}"))?;
     let mut config = builder
         .with_client_auth_cert(chain, key)
         .map_err(|e| format!("client auth cert: {e}"))?;
@@ -11093,6 +11127,28 @@ async fn read_tagged_relay_reply(
     })
     .await
     .map_err(|_| "timed out reading the relayed reply".to_string())?
+}
+
+/// Drain a refused CONNECT's response body, bounded in size and time.
+///
+/// A stream error ends the read with whatever already arrived: the server may
+/// reset the still-open request half (`RST_STREAM(NO_ERROR)`) right after the
+/// complete refusal. Callers assert on the exact body text, so a truncated,
+/// empty, or wedged body still fails loudly.
+async fn read_connect_refusal_body(body: &mut h2::RecvStream, timeout: Duration) -> String {
+    const MAX_REFUSAL_BODY: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = tokio::time::timeout(timeout, async {
+        while let Some(Ok(chunk)) = body.data().await {
+            let _ = body.flow_control().release_capacity(chunk.len());
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_REFUSAL_BODY {
+                break;
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Open a real mesh-mTLS HTTP/2 tunnel to a Sidecar's inbound listener and
@@ -11167,18 +11223,24 @@ async fn sidecar_ingress_connect(
 
     // Only an accepted CONNECT has a tunnel to write into; a refusal must never
     // be probed for relayed bytes (that would mask a fail-open regression).
-    let relayed = if status == 200 {
+    let mut body = response.into_body();
+    let (relayed, refusal_body) = if status == 200 {
         send_body
             .send_data(Bytes::from(payload.to_string()), false)
             .map_err(|e| format!("write relay payload: {e}"))?;
-        let mut body = response.into_body();
-        Some(read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?)
+        let relayed = read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?;
+        (Some(relayed), None)
     } else {
-        None
+        let refusal = read_connect_refusal_body(&mut body, Duration::from_secs(5)).await;
+        (None, Some(refusal))
     };
 
     conn_task.abort();
-    Ok(IngressConnectOutcome { status, relayed })
+    Ok(IngressConnectOutcome {
+        status,
+        relayed,
+        refusal_body,
+    })
 }
 
 /// The local `echo` workload plus its Service.
@@ -11560,8 +11622,9 @@ async fn functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener
 ///   LISTENER port rejects the CONNECT (403). Authorizing on the
 ///   `defaultEndpoint` backend port instead would let that DENY fail OPEN.
 /// * Phase 3 — a reload that declares a DIFFERENT listener withdraws the first:
-///   the old port fails closed (neither relayed nor still 403 from phase 2) and
-///   the new one relays to the same endpoint.
+///   the old port fails closed as an undeclared destination (the documented
+///   `403` relay-destination refusal, told apart from phase 2's `mesh_authz`
+///   403 by its body; issue #5763) and the new one relays to the same endpoint.
 #[cfg(unix)]
 #[ignore]
 #[tokio::test]
@@ -11784,6 +11847,14 @@ async fn run_sidecar_ingress_reload_phases(
             denied.relayed
         ));
     }
+    // The 403 must be the listener-port DENY itself (`mesh_authz`), not a
+    // relay-destination refusal, which is also a 403 (issue #5763).
+    let denied_body = denied.refusal_body.as_deref().unwrap_or_default();
+    if !denied_body.starts_with(MESH_AUTHZ_DENIED_BODY_PREFIX) {
+        return Err(format!(
+            "the phase-2 403 must be mesh_authz's listener-port DENY, got body {denied_body:?}"
+        ));
+    }
 
     // ── Phase 3: withdraw that listener, declare a different one ──────────
     std::fs::write(
@@ -11797,14 +11868,23 @@ async fn run_sidecar_ingress_reload_phases(
     )
     .map_err(|e| format!("rewrite mesh document withdrawing the first listener: {e}"))?;
     sighup_mesh_gateway(child)?;
-    // Neither 200 (relayed) nor 403 (phase 2's now-withdrawn DENY): under the
-    // NEW document the withdrawn listener port must fail closed.
+    // Under the NEW document the withdrawn listener port must fail closed as
+    // an undeclared destination: the declared `ingress[]` block no longer maps
+    // it, so relay synthesis refuses it (`ingress_endpoint_mapping_mismatch`)
+    // with the documented `403 hbone_relay_destination_denied` (issue #5763)
+    // before `mesh_authz` runs. Phase 2's now-withdrawn DENY is ALSO a 403, so
+    // the status alone cannot tell the reload landed; the refusal body names
+    // the refusing layer: requiring the relay-destination body excludes both a
+    // relayed 200 and phase 2's stale `mesh_authz` DENY.
     let withdrawn = wait_for_ingress_connect(
         inbound_port,
         &first_authority,
         peers,
         reload_deadline,
-        |outcome| outcome.status != 200 && outcome.status != 403,
+        |outcome| {
+            outcome.status == 403
+                && outcome.refusal_body.as_deref() == Some(HBONE_RELAY_DESTINATION_DENIED_BODY)
+        },
     )
     .await
     .map_err(|e| format!("the withdrawn ingress listener never failed closed: {e}"))?;
@@ -11863,8 +11943,8 @@ async fn wait_for_ingress_connect(
         let last = match sidecar_ingress_connect(inbound_port, authority, peers, "ping").await {
             Ok(outcome) if accept(&outcome) => return Ok(outcome),
             Ok(outcome) => format!(
-                "last CONNECT to {authority}: status {} relayed {:?}",
-                outcome.status, outcome.relayed
+                "last CONNECT to {authority}: status {} relayed {:?} refusal body {:?}",
+                outcome.status, outcome.relayed, outcome.refusal_body
             ),
             Err(e) => format!("last CONNECT to {authority} failed: {e}"),
         };
@@ -12096,6 +12176,31 @@ async fn drive_one_waypoint_byte_connect(
     client_svid: &GeneratedGatewaySvid,
     payload: &[u8],
 ) -> Result<(u16, Option<Vec<u8>>), String> {
+    observe_waypoint_byte_connect(hbone_ip, hbone_port, authority, client_svid, payload)
+        .await
+        .map(|outcome| (outcome.status, outcome.echoed))
+}
+
+/// One byte-stream HBONE CONNECT observation.
+struct WaypointByteConnect {
+    status: u16,
+    /// Bytes echoed back through an accepted tunnel. `None` when refused.
+    echoed: Option<Vec<u8>>,
+    /// Response body of a refused CONNECT. `None` when accepted. A
+    /// relay-destination refusal and a `mesh_authz` DENY are both `403`
+    /// (issue #5763), so this is what tells them apart on the wire.
+    refusal_body: Option<String>,
+}
+
+/// [`drive_one_waypoint_byte_connect`], also keeping a refused CONNECT's
+/// response body.
+async fn observe_waypoint_byte_connect(
+    hbone_ip: Ipv4Addr,
+    hbone_port: u16,
+    authority: &str,
+    client_svid: &GeneratedGatewaySvid,
+    payload: &[u8],
+) -> Result<WaypointByteConnect, String> {
     let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect waypoint: {e}"))?;
@@ -12131,19 +12236,23 @@ async fn drive_one_waypoint_byte_connect(
         .map_err(|e| format!("CONNECT response: {e}"))?;
     let status = resp.status().as_u16();
 
-    let echoed = if status == 200 {
-        let mut response_body = resp.into_body();
-        Some(
-            read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
-                .await
-                .map_err(|e| format!("read relayed bytes: {e}"))?,
-        )
+    let mut response_body = resp.into_body();
+    let (echoed, refusal_body) = if status == 200 {
+        let echoed = read_relayed_bytes(&mut response_body, payload.len(), Duration::from_secs(5))
+            .await
+            .map_err(|e| format!("read relayed bytes: {e}"))?;
+        (Some(echoed), None)
     } else {
-        None
+        let refusal = read_connect_refusal_body(&mut response_body, Duration::from_secs(5)).await;
+        (None, Some(refusal))
     };
 
     conn_task.abort();
-    Ok((status, echoed))
+    Ok(WaypointByteConnect {
+        status,
+        echoed,
+        refusal_body,
+    })
 }
 
 /// The outcome of probing BOTH destinations behind one waypoint under one
@@ -12152,6 +12261,7 @@ async fn drive_one_waypoint_byte_connect(
 struct WaypointDestinationOutcome {
     status: u16,
     echoed: Option<Vec<u8>>,
+    refusal_body: Option<String>,
     backend_connections: usize,
 }
 
@@ -12238,7 +12348,7 @@ async fn drive_waypoint_target_refs(
             continue;
         }
 
-        let reviews = drive_one_waypoint_byte_connect(
+        let reviews = observe_waypoint_byte_connect(
             Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{reviews_port}"),
@@ -12246,7 +12356,7 @@ async fn drive_waypoint_target_refs(
             b"reviews-payload",
         )
         .await;
-        let ratings = drive_one_waypoint_byte_connect(
+        let ratings = observe_waypoint_byte_connect(
             Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{ratings_port}"),
@@ -12273,20 +12383,20 @@ async fn drive_waypoint_target_refs(
         }
 
         return match (reviews, ratings) {
-            (Ok((reviews_status, reviews_echoed)), Ok((ratings_status, ratings_echoed))) => {
-                Ok(WaypointTargetRefsOutcome {
-                    reviews: WaypointDestinationOutcome {
-                        status: reviews_status,
-                        echoed: reviews_echoed,
-                        backend_connections: reviews_hits.load(Ordering::SeqCst),
-                    },
-                    ratings: WaypointDestinationOutcome {
-                        status: ratings_status,
-                        echoed: ratings_echoed,
-                        backend_connections: ratings_hits.load(Ordering::SeqCst),
-                    },
-                })
-            }
+            (Ok(reviews), Ok(ratings)) => Ok(WaypointTargetRefsOutcome {
+                reviews: WaypointDestinationOutcome {
+                    status: reviews.status,
+                    echoed: reviews.echoed,
+                    refusal_body: reviews.refusal_body,
+                    backend_connections: reviews_hits.load(Ordering::SeqCst),
+                },
+                ratings: WaypointDestinationOutcome {
+                    status: ratings.status,
+                    echoed: ratings.echoed,
+                    refusal_body: ratings.refusal_body,
+                    backend_connections: ratings_hits.load(Ordering::SeqCst),
+                },
+            }),
             (Err(e), _) | (_, Err(e)) => Err(format!(
                 "waypoint CONNECT failed against a healthy gateway: {e}\n--- waypoint ---\n{logs}"
             )),
@@ -12315,6 +12425,13 @@ fn assert_denied(outcome: &WaypointDestinationOutcome, what: &str) {
     assert_eq!(
         outcome.status, 403,
         "{what} must be denied by mesh_authz (403)"
+    );
+    // A relay-destination refusal is also a 403 (issue #5763); only the body
+    // proves the targetRefs DENY itself refused the CONNECT.
+    let body = outcome.refusal_body.as_deref().unwrap_or_default();
+    assert!(
+        body.starts_with(MESH_AUTHZ_DENIED_BODY_PREFIX),
+        "{what} must be refused by mesh_authz, not another 403 layer; body {body:?}"
     );
     assert_eq!(
         outcome.backend_connections, 0,
@@ -18451,7 +18568,7 @@ fn h3_mesh_server_config(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca_pem = std::fs::read(&svid.trust_bundle_path).expect("read mesh peer trust bundle");
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_slice()).filter_map(|cert| cert.ok()) {
         roots.add(cert).expect("add mesh peer client root");
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -18459,12 +18576,10 @@ fn h3_mesh_server_config(
         .expect("build mesh peer client verifier");
     let cert_pem = std::fs::read(&svid.cert_path).expect("read mesh peer SVID");
     let key_pem = std::fs::read(&svid.key_path).expect("read mesh peer key");
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_slice())
         .filter_map(|cert| cert.ok())
         .collect();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .expect("parse mesh peer key")
-        .expect("mesh peer key present");
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice()).expect("parse mesh peer key");
     let signing_key =
         ferrum_edge::fips::any_supported_signing_key(&key).expect("mesh peer signing key");
     let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, signing_key));
@@ -20060,12 +20175,22 @@ async fn h3_mesh_reload(
 const H3_MESH_PLAIN_UPSTREAM_ID: &str = "h3-mesh-plain-upstream";
 const H3_MESH_PLAIN_PATH: &str = "/mesh/echo";
 const H3_MESH_PLAIN_BACKEND_PATH: &str = "/echo";
+/// Backend path the mesh-mTLS HTTP peer answers with a gRPC-Web response: the
+/// request's message frames echoed, then a `0x80` trailer frame (#5807).
+const H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH: &str = "/grpc-web";
+/// Backend path the mesh-mTLS HTTP peer answers with a `503` that carries a
+/// spoofed `X-Gateway-Error` (#5807).
+const H3_MESH_PLAIN_503_BACKEND_PATH: &str = "/backend-503";
+/// The gRPC-Web trailer frame the mesh-mTLS HTTP peer appends on
+/// [`H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH`].
+const H3_MESH_GRPC_WEB_TRAILER_BLOCK: &[u8] = b"grpc-status:0\r\ngrpc-message:mesh-ok\r\n";
 
 #[derive(Clone, Debug)]
 struct H3MeshObservedHttp {
     authority: String,
     path: String,
     method: String,
+    content_type: Option<String>,
     body: Vec<u8>,
     client_cert_der: Vec<Vec<u8>>,
 }
@@ -20108,6 +20233,65 @@ impl H3MeshHttpPeer {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    async fn wait_for_http_path(&self, path: &str, bound: Duration) -> H3MeshObservedHttp {
+        let deadline = Instant::now() + bound;
+        loop {
+            if let Some(obs) = self
+                .observations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .find(|obs| obs.path == path)
+                .cloned()
+            {
+                return obs;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "H3 mesh HTTP peer never observed a request for {path}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// A gRPC-Web frame: `flag`, a big-endian `u32` length, then `payload`.
+fn h3_mesh_grpc_web_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(flag);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The mesh-mTLS HTTP peer's response for one observed request: a gRPC-Web
+/// pass-through answer, a `503` with a spoofed gateway token, or the echo.
+fn h3_mesh_http_peer_response(path: &str, body: Vec<u8>) -> hyper::Response<Full<Bytes>> {
+    let builder = hyper::Response::builder().header("x-mesh-plain", "ok");
+    let response = if path == H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH {
+        let trailer_frame = h3_mesh_grpc_web_frame(0x80, H3_MESH_GRPC_WEB_TRAILER_BLOCK);
+        let mut wire = body;
+        wire.extend_from_slice(&trailer_frame);
+        builder
+            .status(200)
+            .header("content-type", "application/grpc-web+proto")
+            .body(Full::new(Bytes::from(wire)))
+    } else if path == H3_MESH_PLAIN_503_BACKEND_PATH {
+        builder
+            .status(503)
+            .header("content-type", "application/json")
+            .header("x-gateway-error", "spoofed_by_backend")
+            .body(Full::new(Bytes::from_static(
+                br#"{"error":"mesh peer 503"}"#,
+            )))
+    } else {
+        builder
+            .status(200)
+            .header("content-type", "application/octet-stream")
+            .body(Full::new(Bytes::from(body)))
+    };
+    response.expect("build plain mesh peer response")
 }
 
 async fn serve_h3_mesh_http_echo<T>(
@@ -20124,6 +20308,7 @@ async fn serve_h3_mesh_http_echo<T>(
             let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
+            let content_type = h3_mesh_header(req.headers(), "content-type");
             let body = req.collect().await?.to_bytes().to_vec();
             observations
                 .lock()
@@ -20132,17 +20317,11 @@ async fn serve_h3_mesh_http_echo<T>(
                     authority,
                     path: path.clone(),
                     method,
+                    content_type,
                     body: body.clone(),
                     client_cert_der,
                 });
-            Ok::<_, hyper::Error>(
-                hyper::Response::builder()
-                    .status(200)
-                    .header("content-type", "application/octet-stream")
-                    .header("x-mesh-plain", "ok")
-                    .body(Full::new(Bytes::from(body)))
-                    .expect("build plain mesh echo"),
-            )
+            Ok::<_, hyper::Error>(h3_mesh_http_peer_response(&path, body))
         }
     });
     let _ = Http2ServerBuilder::new(TokioExecutor::new())
@@ -20180,6 +20359,7 @@ where
             let authority = h3_mesh_observed_http_authority(&req);
             let path = req.uri().path().to_string();
             let method = req.method().as_str().to_string();
+            let content_type = h3_mesh_header(req.headers(), "content-type");
             let body = req.collect().await?.to_bytes().to_vec();
             observations
                 .lock()
@@ -20188,6 +20368,7 @@ where
                     authority,
                     path: path.clone(),
                     method,
+                    content_type,
                     body: body.clone(),
                     client_cert_der: Vec::new(),
                 });
@@ -20452,6 +20633,146 @@ async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
     assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
     assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
     assert_eq!(observed.body, payload);
+
+    gateway.shutdown().await;
+}
+
+async fn h3_mesh_plain_request(
+    https_port: u16,
+    backend_path: &str,
+    options: GetOptions,
+) -> crate::scaffolding::clients::Http3Response {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/mesh{backend_path}");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        match client.get_with_options(&url, options.clone()).await {
+            Ok(resp) => return resp,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    panic!("H3 plain mesh request to {backend_path} never completed: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+/// Pass-through gRPC-Web and a relayed backend `5xx` over the H3 plain
+/// bridge's Sidecar mesh-mTLS egress (#5807).
+///
+/// No `grpc_web` plugin is configured, so a gRPC-Web request is passed through:
+/// the peer must see the client's own gRPC-Web content type and frames, and the
+/// client must get the peer's body back byte for byte, trailer frame included.
+/// A `200` carries no `X-Gateway-Error`. A peer `503` reaches the client as a
+/// `503` whose `X-Gateway-Error` is the gateway's own `backend_error`, never the
+/// peer's spoofed value.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
+    let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let peer = start_h3_mesh_mtls_http_peer(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let declared_app_port = h3_mesh_declared_app_port().await;
+    let frontend = h3_mesh_frontend_certs();
+
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        declared_app_port,
+        &h3_mesh_mtls_tags(peer.port, H3_MESH_PEER_SPIFFE),
+    );
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        h3_mesh_plain_config(dead_backend_port, &targets, false),
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, peer.port, declared_app_port],
+    )
+    .await;
+
+    // gRPC-Web pass-through.
+    let request_body = h3_mesh_grpc_web_frame(0x00, b"h3-mesh-grpc-web");
+    let options = GetOptions::default()
+        .method(hyper::Method::POST)
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .body(Bytes::from(request_body.clone()));
+    let result =
+        h3_mesh_plain_request(https_port, H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH, options).await;
+    assert_eq!(
+        result.status.as_u16(),
+        200,
+        "gRPC-Web pass-through over mesh-mTLS must succeed: {:?}",
+        result.headers
+    );
+    assert_eq!(
+        result
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/grpc-web+proto"),
+        "the peer's gRPC-Web content type must pass through"
+    );
+    let trailer_frame = h3_mesh_grpc_web_frame(0x80, H3_MESH_GRPC_WEB_TRAILER_BLOCK);
+    let mut expected_body = request_body.clone();
+    expected_body.extend_from_slice(&trailer_frame);
+    assert_eq!(
+        result.body_bytes.as_ref(),
+        expected_body.as_slice(),
+        "the pass-through body, trailer frame included, must reach the client unchanged"
+    );
+    assert!(
+        result.headers.get("x-gateway-error").is_none(),
+        "a relayed 200 carries no gateway token: {:?}",
+        result.headers
+    );
+    let observed = peer
+        .wait_for_http_path(H3_MESH_PLAIN_GRPC_WEB_BACKEND_PATH, Duration::from_secs(10))
+        .await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "peer must verify this gateway's client SVID"
+    );
+    assert_eq!(observed.method, "POST");
+    assert_eq!(
+        observed.content_type.as_deref(),
+        Some("application/grpc-web+proto"),
+        "pass-through must not translate the request to native gRPC"
+    );
+    assert_eq!(observed.body, request_body);
+
+    // A relayed backend 5xx carries the gateway's own token.
+    let options = GetOptions::default()
+        .method(hyper::Method::POST)
+        .body(Bytes::from_static(b"h3-mesh-503"));
+    let result = h3_mesh_plain_request(https_port, H3_MESH_PLAIN_503_BACKEND_PATH, options).await;
+    assert_eq!(
+        result.status.as_u16(),
+        503,
+        "the peer's 503 must be relayed: {:?}",
+        result.headers
+    );
+    let tokens: Vec<&str> = result
+        .headers
+        .get_all("x-gateway-error")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["backend_error"],
+        "a relayed mesh-egress 5xx must carry exactly the gateway's backend_error token"
+    );
+    let observed = peer
+        .wait_for_http_path(H3_MESH_PLAIN_503_BACKEND_PATH, Duration::from_secs(10))
+        .await;
+    assert!(
+        observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE),
+        "peer must verify this gateway's client SVID"
+    );
 
     gateway.shutdown().await;
 }

@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 
 use multi_protocol_perf::h2_observation::{Observer, error_chain, escaped_snippet};
 
@@ -449,8 +451,14 @@ async fn run_http1_metrics(args: &BenchArgs) -> anyhow::Result<BenchMetrics> {
                 observation.stage("next_request");
                 while metrics.next_request().await {
                     let request_observation = observation.request();
-                    // Reconnect if the connection was closed
-                    if send_req.is_closed() {
+                    // Wait until the connection can take the next request,
+                    // reconnecting if it closed. hyper's HTTP/1 dispatcher
+                    // returns to idle only after it polls the finished
+                    // response, which can trail the collected body, so
+                    // `send_request` without `ready()` intermittently fails
+                    // "connection was not ready" — and that error retires
+                    // the worker below, silently lowering concurrency.
+                    if send_req.is_closed() || send_req.ready().await.is_err() {
                         reconnects += 1;
                         send_req = connect_h1(
                             addr,
@@ -611,7 +619,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         let mut cfg = if let Some(path) = &args.ca_cert {
             let pem = std::fs::read(path).context("reading H2 CA")?;
             let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            for cert in CertificateDer::pem_slice_iter(pem.as_slice()) {
                 roots.add(cert?)?;
             }
             rustls::ClientConfig::builder()
@@ -2033,7 +2041,7 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
                 }
                 next_beat += heartbeat_interval;
 
-                if send_req.is_closed() {
+                if send_req.is_closed() || send_req.ready().await.is_err() {
                     break true;
                 }
 

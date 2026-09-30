@@ -36,7 +36,7 @@ validate_client_request_body_contract() ── can reject (client-facing contrac
 before_proxy()                  ── can reject, can modify headers
   │
   ▼
-on_backend_path_resolved()      ── can reject (backend-effective path pinned; phase 5b)
+on_backend_path_resolved()      ── can reject (backend-effective path pinned; phase 5a)
   │
   ▼
 transform_request_body()        ── can transform request body (buffered only)
@@ -292,7 +292,7 @@ Default source, release, and Docker builds leave `FERRUM_CUSTOM_PLUGINS` unset
 so example plugins (and their migrations) do not alter the production registry
 or schema.
 
-### 4. Configure
+### 3. Configure
 
 Add your plugin to the gateway config (YAML or database):
 
@@ -326,7 +326,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `authorize(&mut ctx)` | Authorization | Yes | Check permissions, enforce rate limits |
 | `validate_client_request_body_contract(&mut ctx, &headers, &body)` | Pre-`before_proxy` client contract (phase 3c) | Yes | Decide a client-facing request-body contract over the **original** client body after gateway-owned normalization and before any `before_proxy` or `transform_request_body` hook. Read-only: admit or reject, never rewrite. Requires `validates_client_request_body_contract()` **and** `requires_request_body_before_before_proxy()`; declaring the first without the second is a **startup-fatal** plugin-cache rejection because the phase would never run. See [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
 | `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs. **Read request headers from `headers`, not `ctx.headers`** (see note below) |
-| `on_backend_path_resolved(&mut ctx, backend_path)` | After path assembly (phase 5b) | Yes | Run once with the backend-effective path pinned and the selected target fixed. Use for route-sensitive policy such as `grpc_method_router`. Deferred external/synthetic `before_proxy` work (phase 5c) runs later — see [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
+| `on_backend_path_resolved(&mut ctx, backend_path)` | After path assembly (phase 5a) | Yes | Run once with the backend-effective path pinned and the selected target fixed. Use for route-sensitive policy such as `grpc_method_router`. Deferred external/synthetic `before_proxy` work (phases 5b–5c) runs later — see [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
 | `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `dispatch_finalized_request_egress(&mut ctx, &headers, &body, &mut backend_header_overlay)` | Finalized request egress (phase 5e) | Yes | Irreversible outbound request egress after request transforms and every final request-body policy hook accept the exact backend-visible bytes. Write backend header overlays into `backend_header_overlay`, not the immutable snapshot. Built-in participants include `serverless_function`, `request_mirror`, and `ai_federation`. |
@@ -452,6 +452,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn correlation_id_header_name(&self) -> Option<&str>` | `None` | Return the non-empty correlation header owned by this instance, or `None` when it owns no correlation header. Empty or whitespace-only claims fail admission with a capability-specific error. Core candidate admission and runtime cache construction defensively trim and compare valid claims ASCII-case-insensitively, rejecting the effective deployment-specific `FERRUM_REAL_IP_HEADER` and duplicate effective headers or priorities on one plugin chain, including custom-only chains. CP/DP deployments require every DP to advertise the same effective real-IP header as the CP before config distribution. Custom plugins must still trim, validate, and normalize the header names used by their own runtime writes. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
 | `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()` or `on_ws_reassembly_frames()`. Pre-computed per proxy for zero overhead when unused. |
+| `fn requires_websocket_framing(&self) -> bool` | `requires_ws_frame_hooks() \|\| websocket_size_limits().is_some()` | Declares that the plugin needs the parsed WebSocket relay (it inspects, counts, or bounds WebSocket messages). This is the capability config admission checks for `websocket_permessage_deflate: passthrough`: a proxy where any effective plugin returns `true` is refused, because a negotiated `permessage-deflate` session is relayed as compressed raw bytes the plugin could never see. Admission constructs custom plugins with their configured `config` and asks this method, so return `true` whenever that config can make the plugin look at message bodies; a constructor error also refuses passthrough. |
 | `fn observes_ws_frame_decisions(&self) -> bool` | `false` | Set to `true` for observe-only frame hooks. After an earlier admission plugin returns a terminal Close, the shared relay still invokes observational hooks with that Close while skipping later mutating plugins. The relay always ignores an observational hook's return value. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |
 | `fn tracked_keys_count(&self) -> Option<usize>` | `None` | Number of tracked rate-limit keys (for admin API diagnostics). |
@@ -478,6 +479,8 @@ Use these constants in `supported_protocols()` to declare which proxy protocols 
 | `GRPC_ONLY_PROTOCOLS` | Grpc | gRPC-specific plugins |
 | `WS_ONLY_PROTOCOLS` | WebSocket | WebSocket frame-level plugins |
 | `TCP_ONLY_PROTOCOLS` | Tcp | TCP stream-only plugins |
+| `UDP_ONLY_PROTOCOLS` | Udp | UDP datagram-only plugins |
+| `HTTP_FAMILY_AND_STREAM_PROTOCOLS` | Http, Grpc, WebSocket, Tcp, Udp | Plugins that authenticate TLS/DTLS client certificates on every transport |
 
 ## Priority Bands
 
@@ -485,16 +488,15 @@ Plugins execute in priority order (lowest number first) within each lifecycle ph
 
 | Band | Range | Purpose | Built-in Examples |
 |------|-------|---------|-------------------|
-| Observability | 0–99 | Tracing, correlation | otel_tracing (25), correlation_id (50) |
-| Preflight | 100–999 | Matched-request CORS, IP filtering, termination, bot detection | cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
-| Authentication | 950–1499 | Identity verification | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
-| Authorization | 2000–2099 | Access control, throttling | access_control (2000), tcp_connection_throttle (2050) |
-| Request Validation | 2800–2999 | Size limits, rate limits, body validation | request_size_limiting (2800), ws_message_size_limiting (2810), graphql (2850), rate_limiting (2900), ws_rate_limiting (2910), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
-| Request Transform | 3000–3099 | Modify request before backend | request_transformer (3000), grpc_deadline (3050) |
-| Response Validation | 3400–3599 | Response size limits, caching | response_size_limiting (3490), response_caching (3500) |
-| Response Transform | 4000–4299 | Modify response, metrics | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
+| Early | 0–949 | Tracing, correlation, CORS preflight, termination, network gates | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
+| Authentication | 950–1999 | Identity verification | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
+| Admission | 2000–2999 | Authorization, throttling, size/rate limits, body and AI validation | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), rate_limiting (2900), waf (2930), body_validator (2950), ai_request_guard (2975) |
+| Transform | 3000–3999 | Request shaping, response size limits, caching | request_transformer (3000), grpc_deadline (3050), response_size_limiting (3490), response_caching (3500) |
+| Response | 4000–4999 | Response transformation, compression, AI accounting | response_transformer (4000), compression (4050), ai_token_metrics (4100), ai_rate_limiter (4200) |
 | **Custom Default** | **5000** | **Default for custom plugins** | — |
-| Logging | 9000–9999 | Observability, metrics | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus (9300) |
+| Logging | 9000–9999 | Logging and metrics | stdout_logging (9000), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
+
+The complete built-in list is in [docs/plugin_execution_order.md](docs/plugin_execution_order.md#priority-bands).
 
 To set a priority, override the `priority()` method:
 
@@ -510,7 +512,7 @@ Authentication plugins participate in the gateway's auth mode logic (Single vs M
 
 1. Override `is_auth_plugin()` to return `true`
 2. Implement the `authenticate()` method
-3. Set priority in the 950–1499 range
+3. Set priority in the 950–1999 range
 
 ```rust
 use crate::consumer_index::ConsumerIndex;
@@ -538,8 +540,9 @@ impl Plugin for MyCustomAuth {
             },
         };
 
-        // Look up the consumer by credential
-        // ConsumerIndex provides O(1) lookups by credential type
+        // Look up the consumer by credential. This linear scan is for
+        // illustration; ConsumerIndex also offers O(1) lookups such as
+        // find_by_api_key() and find_by_username().
         for consumer in consumer_index.consumers().iter() {
             if let Some(cred) = consumer.credentials.get("custom_token") {
                 if cred.as_str() == Some(token.as_str()) {
@@ -829,10 +832,11 @@ The proxy drives inspectors on reqwest, direct HTTP/2, and native HTTP/3 respons
 The `ResponseStreamInspector` action contract is:
 
 - `on_chunk(&mut self, chunk)` receives each decoded body chunk. `Forward(bytes)` releases those bytes now; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
-- `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`.
+- `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`. A later inspector is also flushed at an earlier inspector's deferred cut through `flush_before_cut(&mut self)`, whose default calls `on_end`; override it when a cut must discard an unfinished unit instead of governing or releasing it.
+- `on_downstream_terminated()` is also called on inspectors after the owner of a deferred cut, after they have been flushed, so they can record that the stream ended with a cut or discard state that is no longer client-visible.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
 
-Inspectors must remain portable across the detached H1/H2 driver and the native H3 event loop. They cannot borrow request context, must keep accumulators bounded, and must treat `on_downstream_terminated()` as the signal that a later inspector cut bytes they had already observed.
+Inspectors must remain portable across the detached H1/H2 driver and the native H3 event loop. They cannot borrow request context and must keep accumulators bounded. `on_downstream_terminated()` signals that a later inspector cut bytes they had already observed, and is also called after a deferred cut's owner has flushed them.
 
 ### `Content-Type` relabeling trap
 
@@ -1101,11 +1105,14 @@ plugin_configs:
 ### Scopes
 
 - **Global**: Plugin runs for all proxies
-- **Proxy**: Plugin runs only for the specified proxy. If a proxy-scoped plugin has the same name as a global one, the proxy-scoped version overrides the global one for that proxy.
+- **Proxy**: Plugin runs only for the specified proxy.
+- **Proxy group** (`proxy_group`): Plugin runs for every proxy in the group.
+
+A proxy- or group-scoped plugin with the same name as a global one replaces that global plugin for the affected proxies. See [Plugin Scope](docs/plugins.md#plugin-scope-merging) for the full merge rules.
 
 ## Request Context
 
-The `RequestContext` is a mutable struct passed through all HTTP/gRPC/WebSocket lifecycle phases. Plugins can read and write to it:
+The `RequestContext` is a mutable struct passed through all HTTP/gRPC/WebSocket lifecycle phases. Plugins can read and write to it. Commonly used fields (abbreviated; see `src/plugins/mod.rs` for the full struct):
 
 ```rust
 pub struct RequestContext {
@@ -1115,7 +1122,7 @@ pub struct RequestContext {
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
-    pub identified_consumer: Option<Consumer>,
+    pub identified_consumer: Option<Arc<Consumer>>,
     /// External identity set by JWKS/OIDC auth plugins when no Consumer mapping exists.
     /// Used as rate-limit key, cache key, and in transaction logs.
     pub authenticated_identity: Option<String>,
@@ -1149,6 +1156,8 @@ pub struct RequestContext {
 - `backend_consumer_custom_id()` — returns the Consumer custom ID, if a gateway Consumer was resolved
 - `apply_route_overrides(proxy)` — returns an `Arc<Proxy>` with direct route overrides applied. This helper cannot re-resolve upstream TLS for `route_override_upstream_id`.
 - `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot and rebinds the precomputed H1 `pending_limit_scope` (clearing it on a direct-backend override).
+
+The `x-consumer-*` request-header namespace is gateway-owned. Client-supplied names beneath it never reach `ctx.headers`, and any `x-consumer-*` header a custom plugin writes into the outbound header map is scrubbed before dispatch; the gateway then writes only `X-Consumer-Username` / `X-Consumer-Custom-Id` from the values above. To pass additional consumer attributes to a backend, use a header name outside that namespace.
 
 ### Inter-Plugin Communication
 
@@ -1194,10 +1203,11 @@ over plugin-writable compatibility metadata when the terminal summary is constru
 
 ## Transaction Summary
 
-The `TransactionSummary` struct is passed to the `log()` hook:
+The `TransactionSummary` struct is passed to the `log()` hook (abbreviated; see `src/plugins/mod.rs`):
 
 ```rust
 pub struct TransactionSummary {
+    pub namespace: String,
     pub timestamp_received: String,
     pub client_ip: String,
     pub consumer_username: Option<String>,
@@ -1229,6 +1239,8 @@ pub struct TransactionSummary {
     // HTTP and TCP/UDP transactions. Omitted from output when zero.
     pub bytes_sent: u64,     // client -> backend (request body size)
     pub bytes_received: u64, // backend -> client (response body size)
+    pub grpc_request_messages: u64,
+    pub grpc_response_messages: u64,
     pub mirror: bool,
     pub metadata: HashMap<String, String>,
 }
@@ -1236,10 +1248,11 @@ pub struct TransactionSummary {
 
 ## Stream Transaction Summary
 
-The `StreamTransactionSummary` struct is passed to `on_stream_disconnect`:
+The `StreamTransactionSummary` struct is passed to `on_stream_disconnect` (abbreviated; see `src/plugins/mod.rs`):
 
 ```rust
 pub struct StreamTransactionSummary {
+    pub namespace: String,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub client_ip: String,
@@ -1254,12 +1267,13 @@ pub struct StreamTransactionSummary {
     pub bytes_received: u64,
     pub connection_error: Option<String>,
     pub error_class: Option<ErrorClass>,
-    // Disconnect attribution. `disconnect_cause` disambiguates idle timeouts
-    // from recv errors (before these fields, both presented as `error_class: None`).
+    // Disconnect attribution. `disconnect_cause` distinguishes idle timeouts
+    // from recv errors, which both leave `error_class: None`.
     pub disconnect_direction: Option<Direction>,
     pub disconnect_cause: Option<DisconnectCause>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
+    pub sni_hostname: Option<String>,
     pub metadata: HashMap<String, String>,     // Carried from on_stream_connect
 }
 ```
@@ -1278,6 +1292,7 @@ pub enum DisconnectCause {
     RecvError,         // serialized as "recv_error"     (frontend recv failed)
     BackendError,      // serialized as "backend_error"  (backend recv failed)
     GracefulShutdown,  // serialized as "graceful_shutdown"
+    GatewayPolicy,     // serialized as "gateway_policy" (admission/dispatch refusal before a backend was used)
 }
 ```
 
@@ -1293,6 +1308,12 @@ pub enum PluginResult {
     Reject {
         status_code: u16,
         body: String,
+        headers: HashMap<String, String>,
+    },
+    /// Short-circuit with an arbitrary byte body.
+    RejectBinary {
+        status_code: u16,
+        body: bytes::Bytes,
         headers: HashMap<String, String>,
     },
 }
@@ -1500,10 +1521,10 @@ Pending migrations: (none — schema is up to date)
 === Custom Plugin Migration Status ===
 
 Applied plugin migrations:
-  [example_audit_plugin] V1: create_audit_log (applied: 2026-04-01T..., checksum: v1_create_audit_log_f8a3e1)
+  [example_audit_plugin] V3: create_example_audit_log (applied: 2026-04-01T..., checksum: v3_create_example_audit_log_7c2b31)
 
 Pending plugin migrations:
-  [example_audit_plugin] V2: add_status_timestamp_index
+  [example_audit_plugin] V4: add_status_timestamp_index
 ```
 
 ### Migration Tracking
@@ -1653,6 +1674,7 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`
 - [ ] A plugin that relabels response `Content-Type` declares `may_modify_response_content_type()` with the same conditions as `after_proxy()`
 - [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()` or `on_ws_reassembly_frames()`
+- [ ] Any plugin that inspects, counts, or bounds WebSocket messages reports `requires_websocket_framing() == true` (the default derives it from the two WebSocket capabilities above), so `websocket_permessage_deflate: passthrough` is refused on its proxies
 - [ ] Per-frame budget plugins implement `on_ws_reassembly_frames()` too, or a peer can fragment-flood past them
 - [ ] Mutating `on_ws_frame` hooks treat an inbound `Message::Close` as already-final (no budget charge / no replacement) unless they intentionally observe-only via `observes_ws_frame_decisions()`
 - [ ] `warmup_hostnames()` returns external hosts if applicable

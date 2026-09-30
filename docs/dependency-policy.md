@@ -76,34 +76,33 @@ surface drifts.
 | `tungstenite-004-fragment-accounting` | `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
+| `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.21 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Deliberate fork** — no upstream PR; upstream issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
+| `hyper-001-upgraded-h2-connect-error-reset` | `hyper` | 1.9.0 | `Upgraded::reset_with_connect_error()` resets an upgraded HTTP/2 `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)` in place of the clean `END_STREAM` | issue [hyperium/hyper#4209](https://github.com/hyperium/hyper/issues/4209), PR [hyperium/hyper#4210](https://github.com/hyperium/hyper/pull/4210) (filed 2026-09-28) | Ferrum Edge maintainers | hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends `END_STREAM`, so an HBONE relay that ended on a socket error looked like a normal close to the peer; RFC 9113 §8.5 names `CONNECT_ERROR` for a failed tunnel (#5781). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.9.0 manually | A hyper release containing PR #4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted | [docs/upstream-hyper-patches/001-…](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md) |
+| `hyper-002-min-data-frame-capacity` | `hyper` | 1.9.0 | HTTP/2 body pipe hands a chunk to h2 only once `min(len, 1 KiB)` capacity is assigned, instead of on its 1-byte claim | issue [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211), PR [hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212) (filed 2026-09-30) | Ferrum Edge maintainers | On a nearly spent connection window a request body left as 1-byte DATA frames; h2 >= 0.4.16 peers answer with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")`, failing every stream on the pooled connection (#5588) | A hyper release containing PR #4212 (or an equivalent fix) is adopted | [docs/upstream-hyper-patches/002-…](upstream-hyper-patches/002-min-data-frame-capacity/README.md) |
+| `hyper-003-greedy-h1-read` | `hyper` | 1.9.0 | HTTP/1 `Buffered::poll_read_from_io` keeps reading into its buffer after a full-TLS-record read while the transport has more ready; the HTTP/1 upgrade handoff (`Rewind`/`Upgraded`) also carries a read error met during that read-ahead into the tunnel, after the buffered bytes | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio-rustls returns one decrypted record per read, so bulk HTTP/1 bodies crossed hyper's dispatcher 16 KiB at a time; the per-chunk path cost Ferrum 14–20% CPU per request on large HTTPS/1.1 responses against Envoy (#5588). A reset met during read-ahead is kept for the next read, so an upgrade must hand it to the tunnel, or a WebSocket or TCP relay sees a clean EOF instead (#5911) | hyper or tokio-rustls hands over every readable record per read, or the vendored hyper is retired | [docs/upstream-hyper-patches/003-…](upstream-hyper-patches/003-greedy-h1-read/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
-> work is staged from the `jeremyjpj0916/h3` fork. Patches **h3-002** through
-> **h3-005** are deliberate forks, unfiled upstream, with `fork_ref: null` in
-> `docs/vendored-patch-lifecycle.json` pending maintainer handoff. Patch **h3-001**
-> records a published `fork_ref` for its filed upstream PR. Patches carried
-> without an upstream PR, including the tungstenite frame
-> error-origin and stray-continuation ordering extensions, the tungstenite `auto_pong` opt-out, the tungstenite /
-> tokio-tungstenite fragment-accounting extension, and the dimpl
-> credential-security patch, are governed by the
+> work is staged from the `jeremyjpj0916/h3` fork: **h3-001** records a published
+> `fork_ref` for its filed upstream PR, while **h3-002** through **h3-005** have
+> `fork_ref: null` in `docs/vendored-patch-lifecycle.json` pending maintainer
+> handoff. Every patch without an upstream PR is governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
 ### Deliberate fork policy and SLA
 
-Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
-tungstenite #556 / tokio-tungstenite #380); the weekly
+Five patches ride an **open upstream PR** (reqwest #3017, h3 #339,
+tungstenite #556 / tokio-tungstenite #380, hyper #4210); the weekly
 `scripts/check_vendored_patch_status.sh` (backed by
 `docs/vendored-patch-lifecycle.json`) polls those and goes red when one
-merges. Fork-only patches currently include **h3 002** (Extended CONNECT
-`:protocol=websocket`), **h3 003** (`peek_recv_trailers`), **h3 004**
-(`SendStreamStopped`), and **h3 005** (max buffered frame len) — all four
-unfiled with `fork_ref: null` pending maintainer handoff — plus the tungstenite
-frame-limit origin and stray-continuation ordering extensions, **tungstenite `auto_pong`** (transparent Ping
-relay), **tungstenite / tokio-tungstenite 004** (fragment accounting and
-incomplete-message bounds), and **dimpl 001** (DTLS certificate chains and private-key
-zeroization). They are not untracked TODOs; they are carried as
+merges. Every other row in the inventory table is marked **Deliberate fork**
+(`upstream.filing: deliberate_fork_unfiled` in the lifecycle JSON), including
+sqlx-core, reqwest 002–004, h3 002–005, both h3-quinn patches, the tungstenite /
+tokio-tungstenite extensions other than lossless takeover, dimpl, and
+hyper-util (which has upstream issue
+[hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) but no
+upstream PR). These are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
@@ -162,6 +161,20 @@ members are `publish = false`, so `[licenses] private = { ignore = true }`
 already covers their PolyForm-Noncommercial first-party licenses. Do not add an
 `ebpf/deny.toml`: a second config would let the two policies diverge.
 
+Both lanes also run an **advisories-only** pass over every standalone Cargo
+workspace (`fuzz/`, `tests/performance/**`, and any crate added later), each of
+which resolves its own committed `Cargo.lock` that neither check above can see
+(issues #5704, #5708). The manifest list comes from
+`.github/scripts/standalone_cargo_manifests.py`, the same inventory the ci.yml
+`standalone-cargo` fmt/check gate uses, so a new standalone crate is audited
+without editing either workflow. These harnesses never ship, so the license and
+ban policy is not applied to them; a vulnerable, unsound, or yanked version in
+one of their lockfiles is still blocking. The weekly workflow additionally runs
+the informational `cargo audit --file <lockfile>` over each of them. Refresh a
+standalone lockfile with a targeted
+`cargo update --manifest-path <manifest> -p <crate>@<locked-version>` so the
+benchmark inputs stay otherwise stable.
+
 Run locally:
 
 ```bash
@@ -169,6 +182,10 @@ cargo install --locked cargo-deny
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
 cargo deny --manifest-path ebpf/Cargo.toml \
     check --allow advisory-not-detected --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
+for manifest in $(python3 .github/scripts/standalone_cargo_manifests.py); do
+  cargo deny --manifest-path "$manifest" \
+    check --allow advisory-not-detected --config deny.toml advisories   # standalone workspaces
+done
 ```
 
 ### 2. Advisory exceptions are time-boxed
@@ -181,10 +198,25 @@ comment-only token, both of which would dodge the time-box — so an exception
 cannot silently become permanent. A maintainer must re-fix the advisory or
 consciously extend the window.
 
-Current exceptions are all transitive and either no-fix-available or semver-pinned
-by a transitive parent (e.g. `mongodb` pins `hickory ^0.25`; the old AWS SDK
-chain pins `rustls-webpki ^0.101.7`, only present under the optional `secrets-aws`
-feature). Each entry documents the confinement and the upstream we are waiting on.
+Each entry documents the confinement and the upstream it is waiting on. A
+re-review checks the latest upstream release of the crate and of every parent
+that pulls it in, and either retires the entry (bump, feature change, or
+migration) or re-affirms it with dated evidence and a new time box.
+
+#### Advisory exception register
+
+Last full re-evaluation: 2026-09-24 (issue #5721). Latest upstream versions
+below were checked against crates.io and the RustSec advisory database on that
+date.
+
+| Advisory | Crate | Disposition | Evidence / tracking |
+|---|---|---|---|
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Re-affirmed** until 2026-12-31 | No fixed release: RustSec `patched = []`; 0.9.10 is the latest stable and 0.10.0-rc.18 (required by sqlx 0.9.0) is still affected. Reached via `sqlx-mysql` (public-key OAEP encryption of the MySQL password only, no private-key operation) and via jsonwebtoken's `rust_crypto` backend in the default `crypto-ring` profile, where RSA *signing* of outbound client assertions (`private_key_jwt` in `oidc_relying_party` / `oauth2_introspection`, `ai_federation` service-account JWTs) runs on the non-constant-time code. For `oidc_relying_party` / `oauth2_introspection`, EC/EdDSA assertion keys or the `fips` profile (`aws_lc_rs`) avoid it. `ai_federation` always signs RS256 (GCP service-account keys are RSA), so only the `fips` profile avoids it there. Retire when `rsa` ships a fix. |
+| RUSTSEC-2024-0436 | `paste` 1.0.15 (unmaintained) | **Re-affirmed** until 2026-12-31 | Proc-macro only; no runtime surface. `tikv-jemalloc-ctl` still depends on `paste ^1` in its latest 0.7.0, and the test matrix macro (`tests/scaffolding/matrix.rs`) uses it as a dev-dependency. Retire when `tikv-jemalloc-ctl` drops it. |
+| RUSTSEC-2026-0118, RUSTSEC-2026-0119 | `hickory-proto` 0.25.2 | **Retired** | Only `mongodb` < 3.7 pulled hickory 0.25. `mongodb` 3.7.0 moved to hickory 0.26; `Cargo.toml` now requires `>=3.7, <3.9` and the lockfile resolves 3.8.2. The cap keeps MongoDB 4.2 / Cosmos DB server-version-4.2 support: 3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4). |
+| RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 | `rustls-webpki` 0.101.7 | **Retired** | Came only from rustls 0.21 in the AWS SDK's legacy `rustls` connector (`aws-smithy-runtime/tls-rustls`). `aws-sdk-secretsmanager` is now built with `default-features = false` and `default-https-client` + `rt-tokio`, the hyper 1.x / rustls 0.23 client that `aws_config::load_defaults` already selected. |
+| RUSTSEC-2026-0258 | `h2` 0.3.27 | **Retired** | Same legacy AWS connector (hyper 0.14). The gateway's own h2 0.4.x stays on the patched release. |
+| RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 (unmaintained) | **Retired** | PEM parsing uses the `rustls-pki-types` `PemObject` API (`CertificateDer::pem_slice_iter`, `PrivateKeyDer::from_pem_slice`, `CertificateRevocationListDer::pem_slice_iter`), the code `rustls-pemfile` 2.2 already wrapped. `crate::tls::first_pem_private_key` keeps the old `Result<Option<_>>` contract where callers distinguish "no key" from "malformed". The standalone `tests/performance/**` harnesses were migrated the same way and their lockfiles refreshed. |
 
 ### 3. License allowlist and exceptions
 
@@ -195,12 +227,12 @@ their upstream licenses (MIT, Apache-2.0, and similar permissive terms for the
 current patches) must fall within the allowlist or carry an explicit exception.
 
 Every `[licenses.exceptions]` entry must document an **owner**, a **rationale**,
-and an `[expires:YYYY-MM-DD]` token, and that is now **enforced** — not merely
-documented. `scripts/check_advisory_expiry.sh` walks the `exceptions` array in
+and an `[expires:YYYY-MM-DD]` token, and this is **enforced**:
+`scripts/check_advisory_expiry.sh` walks the `exceptions` array in
 `deny.toml` and fails on a missing token or a passed date, on the per-PR
 `dependency-audit` job in `.github/workflows/ci.yml` **and** on the weekly
-`.github/workflows/dependency-audit.yml`. A first license exception therefore
-cannot become permanent by default, the same guarantee advisories already had.
+`.github/workflows/dependency-audit.yml`, so a license exception cannot become
+permanent by default.
 
 The token lives in a **comment**, not in the entry value, because cargo-deny's
 two schemas differ: an `[advisories.ignore]` table accepts a free-text `reason`
@@ -353,6 +385,39 @@ of the vendor copy and must keep passing after retirement:
   Ferrum integration suite separately verifies a root-only client completes a
   handshake because the configured intermediate is transmitted.
 
+- An HTTP/1 request stranded by a connection close during enqueue fails as
+  unsent instead of hanging until `backend_read_timeout_ms` (issue #5714) — the
+  vendored hyper-util regressions
+  (`client::legacy::client::ferrum_release_on_close_tests`), run with
+  `cargo test --manifest-path vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml --features full --lib ferrum_release_on_close_tests`,
+  plus hyper-util's own `--test legacy_client` suite for ordinary keep-alive,
+  reuse, and close behavior through the patched send path. The race sits
+  between two instructions inside tokio's `send`, so the regressions build the
+  state it leaves behind rather than scheduling it. The `pooled_http1` tests in
+  that module run the step `Client::try_send_request` takes after queuing a
+  request (`await_pooled_response`) against a real pooled HTTP/1 connection.
+- An HTTP/1 read that returned a full TLS record's worth keeps reading while
+  the transport has more ready, a short read never triggers another, and an
+  error from an additional read is delivered after the already-buffered bytes,
+  including to the tunnel of an upgraded client or server connection
+  (issues #5588, #5911) — the vendored hyper regressions
+  `proto::h1::io::tests::ferrum_greedy_read_*`, run with
+  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read`.
+- An HTTP/2 request body is never cut into sliver DATA frames from a 1-byte
+  capacity claim (issue #5588, hyperium/hyper#4211) — the vendored hyper
+  regression `proto::h2::ferrum_min_data_frame_capacity_tests`, run with
+  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_min_data_frame_capacity`.
+- An HBONE relay that ends on a socket error resets its CONNECT stream with
+  `RST_STREAM(CONNECT_ERROR)`, while a normal close still ends it with
+  `END_STREAM` (issue #5781) — the vendored hyper regressions
+  (`proto::h2::upgrade::ferrum_connect_error_reset_tests`), run with
+  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset`,
+  plus the gateway tests in `tests/integration/mesh_hbone_tests.rs`
+  (`hbone_relay_backend_reset_sends_rst_stream_connect_error`,
+  `hbone_relay_backend_close_still_ends_stream_cleanly`,
+  `egress_udp_relay_socket_error_sends_rst_stream_connect_error`,
+  `egress_udp_relay_tunnel_close_still_ends_stream_cleanly`).
+
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
 adding, retiring, or changing a vendored patch.
@@ -388,8 +453,9 @@ adding, retiring, or changing a vendored patch.
 
 ### Retiring a vendored patch
 
-Trigger: the upstream PR merges **and** ships in a release we consume (for `h3`
-and tungstenite, *both* co-vendored patches must be ready — see the table).
+Trigger: the upstream PR merges **and** ships in a release we consume (for
+co-vendored patches such as `h3`, `h3-quinn`, and tungstenite, *every* patch in
+the group must be ready — see the `Removal trigger` column).
 
 1. Bump the registry version in `Cargo.toml` `[dependencies]` to the release
    containing the fix; update `Cargo.lock`.
@@ -659,26 +725,29 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
-#### Retired `fips-build.yml` generation transition (issue #3888 / PR #3889)
+#### Temporary generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
 
-PR #3889 landed on `main`. The temporary whole-file SHA-256 admission that let
-that rewrite pass the Cross surface scan is **retired and non-operational**.
-Ordinary `.github/workflows/fips-build.yml` edits are compared by the normal
-fail-closed Cross surface scan with no special case. The generic SHA-256
-generation digest helper remains because CI-job and local-action finite
-transitions still use it. Full description: `docs/ci_cd.md` → "Retired
-`fips-build.yml` generation transition".
+The verifier can admit an exact whole-file SHA-256 source→destination pair for
+a frozen surface, so one reviewed rewrite can pass the Cross surface scan. Each
+pair is path- or job-bound, one-way, fail-closed, and decided entirely by the
+trusted base; anything else is scanned as an ordinary Cross surface change.
+Current admissions:
 
-The same verifier still carries temporary SHA-256 generation pairs for
-Cross-sensitive `ci.yml` jobs and for `setup-rust-ci/action.yml`
-(`CI_JOB_GENERATION_TRANSITIONS`, `LOCAL_ACTION_GENERATION_TRANSITIONS`). Both
-ends are exact, path- or job-bound, one-way, and decided entirely by the trusted
-base. `setup-rust-ci` now has exactly one pair: current-main
-`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to the
-combined #3911 destination
-`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`. See
-`docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions" and
-"Admitted `setup-rust-ci` generation transition".
+- `fips-build.yml`: one transition for the issue #4018 memory mitigation on the
+  `fips-test-build` job (`FIPS_BUILD_ADMITTED_GENERATION_TRANSITION`). The
+  earlier #3889 admission was retired by #3943.
+- Cross-sensitive `ci.yml` jobs: `CI_JOB_GENERATION_TRANSITIONS`.
+- `setup-rust-ci/action.yml`: a two-step chain in
+  `LOCAL_ACTION_GENERATION_TRANSITIONS`, from
+  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` to the
+  cache-budget generation
+  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`, then to
+  the combined #3911 destination
+  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`.
+
+Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
+transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
+`setup-rust-ci` generation transitions".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
 
@@ -834,7 +903,9 @@ covers, so it must not be replaced with a prebuilt artifact.
   inventory enforced by `scripts/check_vendored_patch_lifecycle.py`.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
-- `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,
-  `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/` —
+- `docs/upstream-sqlx-patches/`, `docs/upstream-reqwest-patches/`,
+  `docs/upstream-h3-patches/`, `docs/upstream-h3-quinn-patches/`,
+  `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/`,
+  `docs/upstream-hyper-util-patches/`, `docs/upstream-hyper-patches/` —
   per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.

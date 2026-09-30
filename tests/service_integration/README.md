@@ -42,6 +42,7 @@ cargo test --test service_integration mysql
 cargo test --test service_integration oidc
 cargo test --test service_integration oauth2_introspection
 cargo test --test service_integration clickhouse
+cargo test --test service_integration db_tls
 ```
 
 The MySQL custom-plugin recovery test requires the pedagogical example at
@@ -51,8 +52,10 @@ test prints `SKIP … example_audit_plugin not compiled in` before starting
 Docker.
 
 **With Docker:** the containers start and the assertions run.
-**Without Docker:** each test prints `SKIP <test>: <service> unavailable …` and
-returns green — the suite stays runnable on a developer machine with no Docker.
+**Without Docker:** most tests print `SKIP <test>: <service> unavailable …` and
+pass, so the suite stays runnable on a developer machine with no Docker. The
+Kafka TLS acceptance tests are the exception: they always require their broker
+(see [Kafka acceptance split](#kafka-acceptance-split)).
 
 The skip/fail decision lives in `common::containers::fail_in_ci_else_skip`: in CI
 (`CI` env var set, which GitHub Actions sets automatically) a container that
@@ -93,8 +96,9 @@ The allocator therefore:
 2. Retries container start **only** when the error is a host-port bind
    collision (`port is already allocated`, `address already in use`,
    `EADDRINUSE`), with a fresh port each time and a bound attempt budget.
-3. Returns every other start failure immediately so an image-pull or wait
-   condition failure still hard-fails in CI.
+3. Returns every other start failure to the caller so a wait-condition or
+   setup failure still hard-fails in CI. Transient image-pull/registry errors
+   are retried one layer down, inside `start_within_deadline()` (see below).
 
 Do not pin a single fixed host port (that trades a race for a hard collision
 under parallel jobs) and do not blanket-retry unrelated container errors.
@@ -116,8 +120,26 @@ The shared bounds live in `common/containers.rs`:
   `FIXTURE_HTTP_CONNECT_TIMEOUT` (5s). Never use `reqwest::Client::new()` in a
   fixture: its default is no request timeout at all.
 - `start_within_deadline()` / `CONTAINER_START_TIMEOUT` — 5 minutes for one
-  `start()` (image pull + create + start). The retry-on-collision behaviour
-  above is unchanged; the deadline only stops an attempt hanging forever.
+  `start()` phase (image pull + create + start), including any retries. It
+  takes a closure that builds and starts a fresh request per attempt, and
+  retries **only** transient image-pull/registry errors
+  (`is_transient_image_pull_error()`: `failed to pull`, `bytes remaining on
+  stream`, connection resets, timeouts, TLS handshake failures,
+  `toomanyrequests`, registry 5xx) up to `CONTAINER_START_ATTEMPTS` (3) times
+  with a short linear backoff, logging each retry to stderr. Wait-condition
+  failures (`container startup timeout`, unhealthy/exited containers),
+  deterministic registry answers (`manifest unknown`, `pull access denied`,
+  `unauthorized`) and host-port collisions are returned after the first
+  attempt; collisions then reach the retry-on-collision loop above, which
+  allocates a fresh port. The helper and its policy live in
+  `common/container_retry.rs` (re-exported from `common/containers.rs`), which
+  the Vault/LocalStack fixtures in `tests/secrets_functional/` include through
+  `#[path]`, so both suites share one classifier, attempt count, backoff and
+  deadline. Every fixture, ClickHouse, MySQL, Vault and LocalStack included,
+  starts through this one helper (asserted structurally by
+  `shared_invariant_parity_tests`); `container_start_retry` is its Docker-free
+  unit coverage (main CI run 36370971003 failed on a `postgres:17` pull that
+  ended with `bytes remaining on stream`).
 - `with_phase_deadline()` — the general form, for any other phase that needs a
   named bound (e.g. `docker exec`, `CONTAINER_EXEC_TIMEOUT`).
 
@@ -139,20 +161,18 @@ blast radius but cannot say what stalled.
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
 `ldapadd` retry; Redpanda metadata fetch; a MySQL connection; Hydra discovery;
-ClickHouse `/ping`),
-not by matching a startup log line —
-so the helpers do not depend on which stream a given image logs to.
+ClickHouse `/ping`), not by matching a startup log line, so the helpers do not
+depend on which stream a given image logs to.
 
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, MySQL, OIDC,
-OAuth2 introspection, and ClickHouse run in one nextest `--no-fail-fast`
-invocation, which
-preserves per-test reporting and continues after one backend fails without
-allocating a second runner. It is wired into the `test` aggregation gate, so it
-blocks merge on failure. Hydra (or any provider) startup failure is a hard
-failure in CI.
+`ubuntu-latest` (Docker available). Every module (`consul`, `ldap`, `kafka`,
+`mysql`, `oidc`, `oauth2_introspection`, `clickhouse`, `host_port_allocation`,
+`container_start_retry`, `db_tls`) runs in one `cargo nextest run --no-fail-fast` invocation, which keeps
+per-test reporting and continues past a failing backend without a second
+runner. The job feeds the `test` aggregation gate, so a failure blocks merge.
+Hydra (or any provider) startup failure is a hard failure in CI.
 
 ## Hydra / OIDC / introspection runbook (#3333)
 
@@ -178,8 +198,8 @@ What it drives against live Hydra:
    fan out; reserved `Authorization` mapping is rejected at config time;
    client-supplied claim destinations are overwritten only with verified values.
 5. Negatives: wrong state, missing correlation cookie, nonce mismatch (Hydra
-   signs a different nonce than Ferrum sealed into the pending-flow cookie), wrong issuer via explicit live
-   endpoints (signed-token `iss` rejection), wrong audience, and live token
+   signs a different nonce than Ferrum sealed into the pending-flow cookie),
+   wrong issuer via explicit live endpoints (signed-token `iss` rejection), wrong audience, and live token
    endpoint + unrelated JWKS (signature failure). Subject is proven positively
    via successful login; multi-audience `azp` enforcement remains unit-covered.
 6. Short idle/absolute TTLs observe re-challenge after margin sleeps that do
@@ -239,8 +259,8 @@ Hosted Redpanda covers the broker-dependent acceptance contract from #2548 /
 - unknown-topic rejection after local admission
 - broker-side oversized-message rejection (`max.message.bytes` on the topic)
 - delivery timeout via `acks=all` against a docker-paused broker (Redpanda
-  v24.2 does not materialize Kafka's topic `min.insync.replicas`; produce the
-  producer while live, then pause so ack cannot complete)
+  v24.2 does not materialize Kafka's topic `min.insync.replicas`; create the
+  producer while the broker is live, then pause so the ack cannot complete)
 - immediate `queue.buffering.max.messages=1` saturation while a prior record is
   stuck on that paused broker
 - successful bounded finalize after delivery
@@ -281,9 +301,8 @@ primary, then accepts a valid reload and reconnects after removing the source CA
 Fixtures prove readiness through their published host ports, and fail in CI when
 unavailable.
 
-Run this module through `cargo test --test service_integration db_tls` on a
-Docker-enabled test host. These tests were added without executing project code
-or tooling locally; validation for this change is the pushed head's hosted CI.
+Run this module with `cargo test --test service_integration db_tls` on a
+Docker-enabled host.
 
 ## Adding another external service
 

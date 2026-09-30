@@ -932,6 +932,42 @@ where
     .await
 }
 
+/// First-failure message the relay watchdogs record when the idle window
+/// expires. The failure is side-less: `(Unknown, ReadWriteTimeout, None)`.
+/// Shared by every emission site and [`relay_failure_is_idle_expiry`], so the
+/// idle window stays distinguishable from the half-close cap, which records
+/// the same side-less tuple.
+#[doc(hidden)]
+pub const STREAM_RELAY_IDLE_TIMEOUT_MESSAGE: &str = "idle timeout";
+
+/// First-failure message the userspace relay records when the half-close cap
+/// (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expires. Side-less like the idle
+/// window, but measured from the half-close regardless of activity, so it can
+/// cut a direction that is still streaming.
+#[doc(hidden)]
+pub const STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE: &str = "tcp half-close max wait exceeded";
+
+/// Whether a relay's first failure is its idle window expiring: nothing moved
+/// in either direction for the whole window, so the relay ended on a quiet
+/// tunnel rather than cutting a byte stream short. The half-close cap, a
+/// backend read/write deadline, a socket error, and a revocation all return
+/// `false`.
+#[doc(hidden)]
+pub fn relay_failure_is_idle_expiry(failure: &StreamFirstFailure) -> bool {
+    let (direction, class, side, message) = failure;
+    if *direction != Direction::Unknown
+        || side.is_some()
+        || !matches!(class, ErrorClass::ReadWriteTimeout)
+    {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if message.starts_with(STREAM_SPLICE_IDLE_TIMEOUT_PREFIX) {
+        return true;
+    }
+    message == STREAM_RELAY_IDLE_TIMEOUT_MESSAGE
+}
+
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
 /// idle timer expired. The splice blocking-thread wrappers
@@ -2667,10 +2703,12 @@ async fn run_tcp_accept_loop(
                             return; // close connection immediately
                         }
                         // Parse the PROXY header from the raw TcpStream. The header precedes
-                        // the TLS ClientHello so we read it before any TLS handshake.
-                        match crate::proxy::proxy_protocol::read_proxy_header(
+                        // the TLS ClientHello so we read it before any TLS handshake. The
+                        // TcpStream reader peeks the v1 line and consumes exactly the header.
+                        match crate::proxy::proxy_protocol::read_proxy_header_accepting_tcp(
                             &mut stream,
                             None, // use default 5s safety timeout
+                            crate::proxy::proxy_protocol::AcceptedProxyVersions::Any,
                         )
                         .await
                         {
@@ -3913,12 +3951,11 @@ async fn handle_tcp_connection_inner(
             !health_checker.has_running_active_probes(&proxy.namespace, upstream_id)
         });
     let arm_lb_guard = |host: &str, port: u16, policy_port: u16| {
-        LoadBalancerConnectionGuard::new(
-            lb_balancer
-                .is_some()
-                .then(|| Arc::new(stream_lb_accounting_target(host, port, policy_port))),
-            lb_balancer.clone(),
-        )
+        let Some(balancer) = lb_balancer.as_deref() else {
+            return LoadBalancerConnectionGuard::new(None, None);
+        };
+        let target = stream_lb_accounting_target(host, port, policy_port);
+        LoadBalancerConnectionGuard::new(Some(&target), Some(balancer))
     };
     // Reassigned on every connect-phase target rotation below: the right-hand
     // side increments the new target before the previous guard's `Drop`
@@ -4788,7 +4825,7 @@ async fn handle_tcp_connection_inner(
             .get_ref()
             .1
             .server_name()
-            .map(str::to_ascii_lowercase);
+            .and_then(crate::proxy::sni::normalize_received_server_name);
 
         // Register immediately after the handshake exposes its verified peer
         // certificate, before decrypted first-byte inspection or stream-connect
@@ -7051,9 +7088,8 @@ mod backend_target_selection_tests {
             .expect("synthetic target must correspond to a configured target");
         let expected_key = crate::load_balancer::target_host_port_key(selected);
         let counted = balancer
-            .active_connections
-            .get(expected_key.as_str())
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            .target_runtime_state(selected)
+            .map(|state| state.active_connections());
         assert_eq!(
             counted,
             Some(1),
@@ -7063,9 +7099,8 @@ mod backend_target_selection_tests {
 
         balancer.record_connection_end(&synthetic);
         let counted = balancer
-            .active_connections
-            .get(expected_key.as_str())
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            .target_runtime_state(selected)
+            .map(|state| state.active_connections());
         assert_eq!(counted, Some(0), "guard drop must return the gauge to zero");
     }
 
@@ -8423,7 +8458,45 @@ struct CopyDirectionState {
     /// Mirrors `need_flush` in tokio's own `CopyBuffer`, which exists for the
     /// same deadlock.
     needs_flush: bool,
+    /// What the top-up read that ended the last batch met, carried to the next
+    /// read phase so the batch is written first ([`CarriedRead`]). One slot,
+    /// so EOF and an error can never both be pending.
+    carried: Option<CarriedRead>,
 }
+
+/// A terminal read outcome met while topping up a batch that already held
+/// bytes (see [`RELAY_TOP_UP_MIN`]). A first read that meets either needs no
+/// carrying: it is handled on the spot.
+enum CarriedRead {
+    /// The top-up read returned EOF. The next read phase half-closes straight
+    /// away instead of polling the reader again: a reader past EOF need not
+    /// repeat it, and several relay wrappers do not — `AdmittedStream`
+    /// (admission closed), `TrustFencedStream` (fence), `H2ConnectTunnel`
+    /// (retired / keepalive failed) and `AuthorizationDeadlineStream`
+    /// (expired) can answer a second poll with an error, turning a clean EOF
+    /// into a read-side failure.
+    Eof,
+    /// The top-up read failed. The next read phase reports it, after the batch
+    /// is written, as a first-read error would be reported — unless writing
+    /// the batch fails first. Then the write error ends the direction and this
+    /// read error is dropped, the same order as before batching, when the
+    /// failing read was simply never reached.
+    Err(std::io::Error),
+}
+
+/// A relay read at least this large (one maximum TLS record's plaintext)
+/// suggests more is ready behind it (issue #5588). Userspace TLS readers
+/// (tokio-rustls) return one decrypted record per read, so without topping
+/// the buffer up the relay wrote each 16 KiB record separately: about twice
+/// the writes, and the per-write kernel cost, of a relay that batches.
+const RELAY_TOP_UP_MIN: usize = 16 * 1024;
+/// Bound on extra reads per batch. The relay buffer is usually the real
+/// limit: the default adaptive 64 KiB buffer holds four records, so a batch
+/// makes at most 3 extra reads; a buffer of 16 KiB or less never batches (a
+/// full first read leaves no room); and a peer that sends records smaller
+/// than 16 KiB never triggers a top-up at all. This cap only binds on buffers
+/// larger than 144 KiB.
+const RELAY_TOP_UP_MAX_ROUNDS: usize = 8;
 
 impl CopyDirectionState {
     fn new(buf_size: usize) -> Self {
@@ -8434,6 +8507,7 @@ impl CopyDirectionState {
             cap: 0,
             terminal_read_error: None,
             needs_flush: false,
+            carried: None,
         }
     }
 }
@@ -8701,6 +8775,17 @@ fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
 /// benign peer-already-gone one, ends the direction as a write-side failure
 /// rather than as a clean completion ([`finish_half_close`]).
 ///
+/// **Read batching (issue #5588):** a read that returns at least
+/// [`RELAY_TOP_UP_MIN`] bytes (one full TLS record's plaintext) is topped up
+/// with further reads into the same buffer, while it has room and for at most
+/// [`RELAY_TOP_UP_MAX_ROUNDS`] extra reads, so a userspace TLS reader's
+/// back-to-back records reach the writer as one write. A short read, `Pending`
+/// or EOF ends the batch; EOF is remembered ([`CarriedRead::Eof`]) so the next
+/// read phase half-closes without polling the reader again. A read error met
+/// while topping up is deferred ([`CarriedRead::Err`]): the batch is written
+/// first and the error is then reported as a first-read error would be, unless
+/// that write fails first, in which case the write error ends the direction.
+///
 /// `read_watermark` / `write_watermark` are per-direction inactivity
 /// timestamps polled by the `bidirectional_copy` watchdog. Shared via
 /// bare references to parent-scoped `AtomicU64`s — no `Arc` indirection
@@ -8733,10 +8818,50 @@ where
                 };
             }
             CopyPhase::Reading => {
-                let read_outcome = {
+                let read_outcome = if let Some(carried) = state.carried.take() {
+                    match carried {
+                        CarriedRead::Err(e) => CopyReadOutcome::Failed(e),
+                        // The top-up that ended the last batch already saw
+                        // EOF, so take the half-close path without polling
+                        // the reader again (see `CarriedRead::Eof`).
+                        CarriedRead::Eof => CopyReadOutcome::Filled(0),
+                    }
+                } else {
                     let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
                     match reader.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Ready(Ok(())) => CopyReadOutcome::Filled(read_buf.filled().len()),
+                        Poll::Ready(Ok(())) => {
+                            // Top the batch up while a full record's worth keeps
+                            // arriving and the buffer has room (see
+                            // `RELAY_TOP_UP_MIN`). A short read, EOF or
+                            // `Pending` (waker already registered) ends the
+                            // batch; EOF and an error are both carried to the
+                            // next read phase so the bytes already read are
+                            // written first.
+                            let mut last = read_buf.filled().len();
+                            let mut rounds = 0;
+                            while last >= RELAY_TOP_UP_MIN
+                                && read_buf.remaining() > 0
+                                && rounds < RELAY_TOP_UP_MAX_ROUNDS
+                            {
+                                let before = read_buf.filled().len();
+                                match reader.as_mut().poll_read(cx, &mut read_buf) {
+                                    Poll::Ready(Ok(())) => {
+                                        last = read_buf.filled().len() - before;
+                                        if last == 0 {
+                                            state.carried = Some(CarriedRead::Eof);
+                                            break;
+                                        }
+                                    }
+                                    Poll::Ready(Err(e)) => {
+                                        state.carried = Some(CarriedRead::Err(e));
+                                        break;
+                                    }
+                                    Poll::Pending => break,
+                                }
+                                rounds += 1;
+                            }
+                            CopyReadOutcome::Filled(read_buf.filled().len())
+                        }
                         Poll::Ready(Err(e)) => CopyReadOutcome::Failed(e),
                         Poll::Pending => CopyReadOutcome::Pending,
                     }
@@ -8994,7 +9119,7 @@ fn phase1_watchdog_failure(
             Direction::Unknown,
             ErrorClass::ReadWriteTimeout,
             None,
-            "idle timeout".to_string(),
+            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
         ));
     }
     None
@@ -9682,7 +9807,7 @@ where
                         Direction::Unknown,
                         ErrorClass::ReadWriteTimeout,
                         None,
-                        "idle timeout".to_string(),
+                        STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
                     ));
                 }
                 if let Some(cap) = half_close_cap
@@ -9693,7 +9818,7 @@ where
                         Direction::Unknown,
                         ErrorClass::ReadWriteTimeout,
                         None,
-                        "tcp half-close max wait exceeded".to_string(),
+                        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
                     ));
                 }
                 None
@@ -10001,7 +10126,7 @@ async fn bidirectional_splice(
                             Direction::Unknown,
                             ErrorClass::ReadWriteTimeout,
                             None,
-                            "idle timeout".to_string(),
+                            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
                         ));
                         break;
                     }
@@ -10188,7 +10313,7 @@ where
                             Direction::Unknown,
                             ErrorClass::ReadWriteTimeout,
                             None,
-                            "idle timeout".to_string(),
+                            STREAM_RELAY_IDLE_TIMEOUT_MESSAGE.to_string(),
                         ));
                     }
                 }
@@ -10199,7 +10324,7 @@ where
                         Direction::Unknown,
                         ErrorClass::ReadWriteTimeout,
                         None,
-                        "tcp half-close max wait exceeded".to_string(),
+                        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
                     ));
                 }
             }
@@ -10208,7 +10333,7 @@ where
                     Direction::Unknown,
                     ErrorClass::ReadWriteTimeout,
                     None,
-                    "tcp half-close max wait exceeded".to_string(),
+                    STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE.to_string(),
                 ));
             }
         }

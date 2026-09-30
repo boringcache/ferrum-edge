@@ -216,8 +216,13 @@ pub const OBS_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
 pub const OBS_OVERLOAD: &str = "overload";
 pub const OBS_CONFIG_STALE: &str = "config_stale";
 pub const OBS_CONCURRENCY_LIMIT: &str = "concurrency_limit";
+/// A matched route rule's total request deadline expired before any backend
+/// held the request (client upload, gateway-local phases, admission, or retry
+/// backoff). Distinct from `backend_timeout`, which always means a backend
+/// held the request and did not answer in time.
+pub const OBS_REQUEST_TIMEOUT: &str = "request_timeout";
 
-/// Closed `X-Gateway-Error` vocabulary. Cardinality bound: **7**.
+/// Closed `X-Gateway-Error` vocabulary. Cardinality bound: **8**.
 /// Header spelling is independent of `ferrum_requests_total{error_class}`
 /// and of access-log `error_class` (those use [`ErrorClass::as_str`] plus
 /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]).
@@ -235,6 +240,7 @@ pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_OVERLOAD,
     OBS_CONFIG_STALE,
     OBS_CONCURRENCY_LIMIT,
+    OBS_REQUEST_TIMEOUT,
 ];
 
 /// `ferrum_requests_total{error_class}` tokens that have no [`ErrorClass`]
@@ -263,7 +269,7 @@ pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
 /// tokens in [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
 /// Values are compiled-in `&'static str` only — never an error message,
 /// never a client- or backend-influenced string. `X-Gateway-Error` stays
-/// on the coarser seven-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
+/// on the coarser eight-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
 /// map each granular class to its header token with
 /// [`x_gateway_error_token_for_class`].
 // The closed label sets and their interners exist so the external `tests/`
@@ -326,7 +332,7 @@ pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
 }
 
 /// Intern a candidate `X-Gateway-Error` token. Values outside the closed
-/// seven-token header set are rejected rather than forwarded.
+/// eight-token header set are rejected rather than forwarded.
 #[inline]
 // The closed label sets and their interners exist so the external `tests/`
 // crate can prove the vocabulary is bounded and that no out-of-set string
@@ -993,7 +999,7 @@ pub(crate) fn rustls_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bo
 }
 
 /// First `rustls::Error` in `e`'s chain, including `io::Error::get_ref()`.
-fn rustls_error_from_chain<'a>(
+pub(crate) fn rustls_error_from_chain<'a>(
     e: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a rustls::Error> {
     let mut current = Some(e);
@@ -1795,6 +1801,12 @@ pub struct BackendResponse {
     /// failed to communicate with the backend. `None` for successful requests
     /// and normal HTTP error responses from the backend.
     pub error_class: Option<ErrorClass>,
+    /// Backend response trailers collected with a [`ResponseBody::Buffered`]
+    /// body, still unsanitized and ungoverned. The response builder strips
+    /// hop-by-hop names and applies the response-header policy before any of
+    /// them reach the wire. `None` for streaming bodies, whose trailers stay in
+    /// the body, and for every gateway-authored response.
+    pub buffered_trailers: Option<Box<http::HeaderMap>>,
 }
 
 impl BackendResponse {

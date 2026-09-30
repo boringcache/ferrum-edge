@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{Plugin, PluginResult, RequestContext};
 
-const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
+pub(crate) const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
 /// `http::header::HeaderName` rejects names longer than this (`http` crate `MAX_LEN`).
 const MAX_HTTP_FIELD_NAME_LEN: usize = 65_535;
 
@@ -147,8 +147,11 @@ impl CorrelationId {
     }
 }
 
+/// `name` is expected to be lowercase. The whole gateway-owned `x-consumer-*`
+/// namespace is reserved alongside the closed protocol-managed set.
 pub(crate) fn is_reserved_header_name(name: &str) -> bool {
     RESERVED_HEADER_NAMES.contains(&name)
+        || crate::proxy::headers::is_consumer_assertion_header(name)
 }
 
 fn parse_configured_header_name(raw: &str) -> Result<String, String> {
@@ -169,6 +172,12 @@ fn parse_configured_header_name(raw: &str) -> Result<String, String> {
         )
     })?;
     let lower = header_name.as_str().to_string();
+    if crate::proxy::headers::is_consumer_assertion_header(&lower) {
+        return Err(format!(
+            "correlation_id: `header_name` is in the gateway-owned `x-consumer-*` consumer assertion namespace and cannot be used for correlation IDs: {:?}",
+            render_header_name_for_error(trimmed)
+        ));
+    }
     if is_reserved_header_name(&lower) {
         return Err(format!(
             "correlation_id: `header_name` is protocol-managed or security-sensitive and cannot be used for correlation IDs: {:?}",

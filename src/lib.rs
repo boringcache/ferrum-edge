@@ -31,6 +31,7 @@ pub mod consumer_index;
 pub mod custom_plugins;
 pub mod data_path_metrics;
 pub mod date_cache;
+pub mod diagnostic_ref;
 #[cfg(test)]
 use diagnostic_test_logs::interest as diagnostic_test_interest;
 #[cfg(test)]
@@ -177,6 +178,40 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
     ) {
         crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
+    }
+
+    /// Answer an inbound CONNECT relay-synthesis refusal exactly as the
+    /// dispatcher's route-miss arm does (issue #5763), delivering the
+    /// transaction line to `plugins` in place of the epoch's global chain.
+    /// `reason` is the `mesh.relay.denial_reason` label synthesis produced and
+    /// `destination` the CONNECT authority, when it carried a host and port.
+    pub async fn reject_inbound_connect_relay_synthesis_for_test(
+        state: &crate::proxy::ProxyState,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        reason: &'static str,
+        destination: Option<(&str, u16)>,
+        is_udp_connect: bool,
+    ) -> hyper::Response<crate::proxy::body::ProxyBody> {
+        use crate::proxy::InboundConnectRelayRefusal;
+        let refusal = match destination {
+            Some((host, port)) => InboundConnectRelayRefusal::new(reason, host, port),
+            None => InboundConnectRelayRefusal {
+                reason,
+                destination: None,
+            },
+        };
+        crate::proxy::reject_inbound_connect_relay_synthesis_with_plugins(
+            state,
+            plugins,
+            ctx,
+            &refusal,
+            is_udp_connect,
+            std::time::Instant::now(),
+            false,
+            None,
+        )
+        .await
     }
 
     pub fn websocket_backend_path_for_test(
@@ -768,6 +803,28 @@ pub mod _test_support {
         ctx.mcp_sse_stream.is_some()
     }
 
+    /// The backend method a plugin selected for this request, as the H1/H2
+    /// and native H3 dispatch ladders read it after `before_proxy`.
+    pub fn backend_method_override_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&'static str> {
+        ctx.backend_method_override
+    }
+
+    /// Replace the plugin-selected backend method, standing in for a later
+    /// plugin that tampers with a bridged call after admission.
+    pub fn set_backend_method_override_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        method: Option<&'static str>,
+    ) {
+        ctx.backend_method_override = method;
+    }
+
+    /// Whether this request carries an `mcp_gateway` OpenAPI bridge claim.
+    pub fn mcp_bridge_is_claimed_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_bridge.is_some()
+    }
+
     /// Run the proxy pipeline's POST-attached SSE retention boundary over a
     /// finalized response.
     ///
@@ -980,6 +1037,204 @@ pub mod _test_support {
         request_on_wire: bool,
     ) {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
+    }
+
+    /// Attach a gateway diagnostic-reference slot to a request context, as
+    /// the HTTP frontends do when `FERRUM_DIAGNOSTIC_REFS` is enabled, so
+    /// external tests can observe what the rejection and attempt recording
+    /// sites write into it.
+    pub fn set_diagnostic_slot_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        slot: Arc<crate::diagnostic_ref::DiagnosticSlot>,
+    ) {
+        ctx.set_diagnostic_slot(Some(slot));
+    }
+
+    /// Record one backend attempt through the request context, as the retry
+    /// loops and final dispatch sites do.
+    pub fn record_backend_attempt_for_test(
+        ctx: &crate::plugins::RequestContext,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        ctx.record_backend_attempt(error_class, request_on_wire, response_status);
+    }
+
+    /// Begin a backend attempt's `otel_tracing` CLIENT span (issue #5864) as
+    /// the retry loops' dispatch sites do, drive `attempt` in the attempt's
+    /// scope as they poll the dispatch, and return the header map the attempt
+    /// dispatched with the attempt's output.
+    pub async fn run_backend_attempt_for_test<F: std::future::Future>(
+        ctx: &crate::plugins::RequestContext,
+        backend_url: &str,
+        headers: &HashMap<String, String>,
+        attempt: F,
+    ) -> (HashMap<String, String>, F::Output) {
+        let span = ctx.begin_backend_attempt_span(backend_url, headers);
+        let dispatched = span.headers(headers).clone();
+        let attempt = std::pin::pin!(attempt);
+        let output = span.scope(attempt).await;
+        (dispatched, output)
+    }
+
+    /// [`run_backend_attempt_for_test`] for a dispatch whose backend headers
+    /// are an ordered header list, as the WebSocket upgrades begin theirs
+    /// (issue #5867).
+    pub async fn run_backend_attempt_with_header_list_for_test<F: std::future::Future>(
+        ctx: &crate::plugins::RequestContext,
+        backend_url: &str,
+        headers: &[(String, String)],
+        attempt: F,
+    ) -> (Vec<(String, String)>, F::Output) {
+        let span = ctx.begin_backend_attempt_span_for_header_list(backend_url, headers);
+        let dispatched = span.header_list(headers).to_vec();
+        let attempt = std::pin::pin!(attempt);
+        let output = span.scope(attempt).await;
+        (dispatched, output)
+    }
+
+    /// Time a connection setup as the connection pools do (issues #5867 and
+    /// #5875): read the setup clock, which only a traced attempt being polled
+    /// arms, then report every setup phase from it. Returns whether the clock
+    /// was read.
+    pub fn note_backend_connection_setup_timed_for_test() -> bool {
+        let started = crate::plugins::otel_tracing::backend_connection_setup_clock();
+        crate::plugins::otel_tracing::note_backend_dns_resolution_since(started);
+        crate::plugins::otel_tracing::note_backend_tcp_connect_since(started);
+        crate::plugins::otel_tracing::note_backend_tls_handshake_since(started);
+        crate::plugins::otel_tracing::note_backend_connection_established_since(started);
+        started.is_some()
+    }
+
+    /// Begin a connection setup as the connection pools do (issue #5875) and
+    /// abandon it, as a setup that fails does: the setup clock notes the
+    /// setup in the same lookup that reads it. Returns whether the clock was
+    /// read.
+    pub fn note_backend_connection_setup_failed_for_test() -> bool {
+        crate::plugins::otel_tracing::backend_connection_setup_clock().is_some()
+    }
+
+    /// Whether `ctx` records backend attempts: a diagnostic-reference slot or
+    /// an `otel_tracing` attempt recorder is installed (issue #5875).
+    pub fn records_backend_attempts_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.records_backend_attempts()
+    }
+
+    /// How an HTTP/3 → HTTP/1.1/HTTP/2 bridge attempt ended, as the bridge
+    /// classifies it before recording it (issue #5875).
+    pub enum PlainBridgeAttemptEndForTest {
+        /// The backend answered with this status.
+        Response(u16),
+        HeaderTimeout,
+        WriteWatermark,
+        /// A gRPC-Web deadline that fired after the attempt was handed to the
+        /// backend, or before.
+        GrpcWebDeadline {
+            handed_off: bool,
+        },
+        PeerGone,
+        UploadTooLarge,
+    }
+
+    /// Record a bridge attempt that ended as `end` at the bridge's one record
+    /// point (issue #5875).
+    pub fn record_plain_bridge_attempt_for_test(
+        ctx: &crate::plugins::RequestContext,
+        end: PlainBridgeAttemptEndForTest,
+    ) {
+        use crate::http3::cross_protocol::PlainAttemptEnd;
+        let end: PlainAttemptEnd<reqwest::Result<reqwest::Response>, ()> = match end {
+            PlainBridgeAttemptEndForTest::Response(status) => {
+                let mut response = http::Response::new(reqwest::Body::from(Vec::<u8>::new()));
+                *response.status_mut() =
+                    http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
+                PlainAttemptEnd::Settled(Ok(reqwest::Response::from(response)))
+            }
+            PlainBridgeAttemptEndForTest::HeaderTimeout => PlainAttemptEnd::HeaderTimeout,
+            PlainBridgeAttemptEndForTest::WriteWatermark => PlainAttemptEnd::WriteWatermark,
+            PlainBridgeAttemptEndForTest::GrpcWebDeadline { handed_off } => {
+                PlainAttemptEnd::GrpcWebDeadline { handed_off }
+            }
+            PlainBridgeAttemptEndForTest::PeerGone => PlainAttemptEnd::PeerGone,
+            PlainBridgeAttemptEndForTest::UploadTooLarge => PlainAttemptEnd::UploadTooLarge(()),
+        };
+        end.record(ctx);
+    }
+
+    /// The gateway-local refusal of a direct WebSocket dial, as the WebSocket
+    /// handshake loops screen it before an attempt begins (issue #5875):
+    /// `Some` with the refusal's message, `None` when the dial may proceed.
+    pub fn websocket_backend_dial_refusal_for_test(
+        backend_url: &str,
+        proxy: &crate::config::types::Proxy,
+        env_config: &crate::config::EnvConfig,
+    ) -> Option<String> {
+        crate::proxy::websocket_backend_dial_refusal(backend_url, proxy, env_config)
+            .map(|refusal| refusal.to_string())
+    }
+
+    /// A begun backend attempt's `otel_tracing` CLIENT span (issue #5864),
+    /// held as a dispatch site holds it, so a test can drop it (and the
+    /// request) before the attempt ends.
+    pub struct BackendAttemptForTest(crate::plugins::otel_tracing::BackendAttemptSpan);
+
+    impl BackendAttemptForTest {
+        /// Begin the next backend attempt, as its dispatch site does.
+        pub fn begin(
+            ctx: &crate::plugins::RequestContext,
+            backend_url: &str,
+            headers: &HashMap<String, String>,
+        ) -> Self {
+            Self(ctx.begin_backend_attempt_span(backend_url, headers))
+        }
+
+        /// The dispatch reports its own handoff to the backend, as
+        /// `proxy_to_backend` does: polling the attempt no longer hands it
+        /// over, [`note_backend_attempt_handed_off_for_test`] does.
+        pub fn handoff_reported_by_dispatch(&self) {
+            self.0.handoff_reported_by_dispatch();
+        }
+
+        /// The header map this attempt dispatches.
+        pub fn headers(&self, headers: &HashMap<String, String>) -> HashMap<String, String> {
+            self.0.headers(headers).clone()
+        }
+
+        /// Drive `attempt` in this attempt's scope.
+        pub async fn run<F: std::future::Future>(&self, attempt: F) -> F::Output {
+            let attempt = std::pin::pin!(attempt);
+            self.0.scope(attempt).await
+        }
+    }
+
+    /// Report, as `proxy_to_backend` does at its handoff, that the backend
+    /// attempt being polled was handed to the backend.
+    pub fn note_backend_attempt_handed_off_for_test() {
+        crate::plugins::otel_tracing::note_backend_attempt_handed_off();
+    }
+
+    /// Report, as the connection pools do, that the backend attempt being
+    /// polled rides a pooled connection it did not open.
+    pub fn note_backend_connection_reused_for_test() {
+        crate::plugins::otel_tracing::note_backend_connection_reused();
+    }
+
+    /// Report, as the connection pools do, a connection the backend attempt
+    /// being polled established, with the setup phases the pool timed.
+    pub fn note_backend_connection_setup_for_test(
+        setup: Duration,
+        dns: Duration,
+        tcp_connect: Duration,
+        tls_handshake: Option<Duration>,
+    ) {
+        crate::plugins::otel_tracing::note_backend_connection_setup_started();
+        crate::plugins::otel_tracing::note_backend_dns_resolution(dns);
+        crate::plugins::otel_tracing::note_backend_tcp_connect(tcp_connect);
+        if let Some(tls_handshake) = tls_handshake {
+            crate::plugins::otel_tracing::note_backend_tls_handshake(tls_handshake);
+        }
+        crate::plugins::otel_tracing::note_backend_connection_established(setup);
     }
 
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
@@ -1879,6 +2134,200 @@ pub mod _test_support {
         )
     }
 
+    /// The single gateway-owned diagnostic response-header list every
+    /// dispatch path strips from backend responses (#5759).
+    pub fn gateway_owned_diagnostic_response_headers_for_test() -> &'static [&'static str] {
+        &crate::proxy::headers::GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS
+    }
+
+    /// Backend response headers as the H1/H2 reqwest and direct-hyper
+    /// (H2 pool, native gRPC) dispatch paths collect them.
+    pub fn collect_backend_response_headers_for_test(
+        source: &http::HeaderMap,
+    ) -> HashMap<String, String> {
+        let mut target = HashMap::new();
+        crate::proxy::collect_hyper_response_headers(source, &mut target);
+        target
+    }
+
+    /// Backend response headers as the native HTTP/3 pool collects them.
+    pub fn collect_h3_backend_response_headers_for_test(
+        source: &http::HeaderMap,
+    ) -> HashMap<String, String> {
+        crate::http3::client::collect_h3_response_headers(source)
+    }
+
+    /// Backend response headers as the HTTP/3 -> HTTP/1.1/HTTP/2 bridge
+    /// collects them from its reqwest response.
+    pub fn collect_h3_bridge_backend_response_headers_for_test(
+        response: &reqwest::Response,
+    ) -> HashMap<String, String> {
+        crate::http3::cross_protocol::collect_reqwest_response_headers(response)
+    }
+
+    /// The HTTP/3 routing-header seal every native-H3 and H3-bridge relay runs
+    /// before committing response headers.
+    pub fn finalize_h3_response_routing_headers_for_test(
+        is_fallback: bool,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::http3::server::finalize_h3_response_routing_headers(is_fallback, None, headers);
+    }
+
+    /// The HTTP/3 response-header seal every native-H3 and H3-bridge response
+    /// that carries a backend outcome runs: routing headers plus the
+    /// gateway-owned `X-Gateway-Error` token for `(connection_error, status)`.
+    /// Returns whether the seal claimed `X-Gateway-Error` as gateway-owned for
+    /// trailer reconciliation.
+    pub fn finalize_h3_response_gateway_headers_for_test(
+        connection_error: bool,
+        status: u16,
+        headers: &mut HashMap<String, String>,
+    ) -> bool {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let owned = crate::http3::server::finalize_h3_response_gateway_headers(
+            &ctx,
+            None,
+            headers,
+            connection_error,
+            status,
+        );
+        owned.owns(crate::proxy::X_GATEWAY_ERROR_HEADER)
+    }
+
+    /// Headers of the `502` the HTTP/3 plain bridge answers when its reqwest
+    /// client could not be built.
+    pub fn h3_bridge_pool_client_failure_headers_for_test() -> HashMap<String, String> {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::http3::cross_protocol::plain_pool_client_failure_headers(&ctx)
+    }
+
+    /// A plugin pre-writes `route_request_timeout` metadata (`plugin_value`),
+    /// then the HTTP/3 route-deadline code records `phase` ("dispatch",
+    /// "before_dispatch", or "retry_backoff") only if none was recorded yet.
+    /// Returns `(total deadline already recorded before the mark, logged phase,
+    /// X-Gateway-Error for a 504)`.
+    pub fn h3_route_deadline_mark_after_plugin_metadata_for_test(
+        plugin_value: &str,
+        phase: &str,
+    ) -> (bool, Option<String>, Option<&'static str>) {
+        use crate::proxy::{
+            ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH, ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+            ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        ctx.metadata.insert(
+            crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY.to_string(),
+            plugin_value.to_string(),
+        );
+        let route = crate::http3::route_deadline::H3RouteDeadlines::new(
+            Some(tokio::time::Instant::now()),
+            None,
+        );
+        let recorded_before = crate::http3::route_deadline::total_expiry_recorded(route, &ctx);
+        let phase = match phase {
+            "dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+            "before_dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+            _ => ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+        };
+        crate::http3::route_deadline::mark_phase_once(&mut ctx, phase);
+        let logged = ctx
+            .metadata
+            .get(crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY)
+            .cloned();
+        let token = crate::proxy::x_gateway_error_for_response(&ctx, false, 504);
+        (recorded_before, logged, token)
+    }
+
+    /// The final client-facing `X-Gateway-Error` token for a response whose
+    /// transaction recorded route-deadline `phase` (`None`: no route deadline
+    /// expired), through the same context-aware classifier every HTTP-family
+    /// builder uses: `(classifier token, value the header writer left on a
+    /// map pre-seeded with a stale backend_timeout)`.
+    pub fn x_gateway_error_after_route_timeout_for_test(
+        phase: Option<&str>,
+        connection_error: bool,
+        status: u16,
+    ) -> (Option<&'static str>, Option<String>) {
+        use crate::proxy::{
+            ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH, ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+            ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        if let Some(phase) = phase {
+            ctx.mark_route_request_timeout_exceeded(match phase {
+                "dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH,
+                "before_dispatch" => ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH,
+                _ => ROUTE_REQUEST_TIMEOUT_PHASE_RETRY_BACKOFF,
+            });
+        }
+        let mut headers =
+            HashMap::from([("X-Gateway-Error".to_string(), "backend_timeout".to_string())]);
+        crate::proxy::apply_authoritative_gateway_error_header_for_response(
+            &mut headers,
+            &ctx,
+            connection_error,
+            status,
+        );
+        let token = crate::proxy::x_gateway_error_for_response(&ctx, connection_error, status);
+        (token, headers.remove(crate::proxy::X_GATEWAY_ERROR_HEADER))
+    }
+
+    /// The pre-wire response for a reqwest connection-pool client that could
+    /// not be built, shared by the first attempt and the retry path.
+    pub fn connection_pool_client_error_response_for_test(
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::connection_pool_client_error_response(resolved_ip)
+    }
+
+    /// One reqwest retry attempt (`proxy_to_backend_retry`) for a plain `GET`
+    /// with no body, upstream target, or plugins.
+    pub async fn proxy_to_backend_retry_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        backend_url: &str,
+    ) -> crate::retry::BackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::proxy::proxy_to_backend_retry(
+            state,
+            proxy,
+            backend_url,
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await
+    }
+
     pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
         crate::proxy::request_method_is_allowed(allowed, method)
     }
@@ -2173,6 +2622,7 @@ pub mod _test_support {
                     initial_limit,
                     max_limit,
                     min_samples: 1,
+                    baseline_window_samples: 1000,
                     target_latency_multiplier: 1.5,
                     decrease_ratio,
                     increase_step: 1,
@@ -2504,6 +2954,16 @@ pub mod _test_support {
         secret: Option<&str>,
     ) -> Result<(), String> {
         crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, secret).map(|_| ())
+    }
+
+    /// Build `basic_auth` with an explicit HMAC secret, so a test never has to
+    /// publish `FERRUM_BASIC_AUTH_HMAC_SECRET` into the shared process
+    /// environment that env-isolated tests clear concurrently (issue #5705).
+    pub fn basic_auth_with_secret_for_test(
+        config: &serde_json::Value,
+        secret: &str,
+    ) -> Result<crate::plugins::basic_auth::BasicAuth, String> {
+        crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, Some(secret))
     }
 
     pub fn validate_admin_plugin_config_for_test(
@@ -3166,6 +3626,16 @@ pub mod _test_support {
         presentation_digest: Option<[u8; 32]>,
     ) -> Option<Vec<u8>> {
         plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
+    }
+
+    pub fn request_deduplication_replay_stored_response_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        plugin.replay_stored_response_for_tests(ctx, status_code, headers, body)
     }
 
     // ── plugins/kafka_logging ───────────────────────────────────────────────
@@ -4204,7 +4674,8 @@ pub mod _test_support {
     }
 
     pub use crate::proxy::tcp_proxy::{
-        StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
+        STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE, STREAM_RELAY_IDLE_TIMEOUT_MESSAGE, StreamCopyResult,
+        StreamIoSide, relay_failure_is_client_facing, relay_failure_is_idle_expiry,
     };
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
@@ -4323,6 +4794,20 @@ pub mod _test_support {
         crate::proxy::forward_ws_tunnel_residual(writer, residual, offset).await
     }
 
+    /// Backend TLS config source for the WebSocket test dialers: a default
+    /// pool with no TLS policy and no CRLs, like the dialers' own defaults.
+    fn websocket_backend_tls_configs_for_test(
+        env_config: &crate::config::EnvConfig,
+    ) -> crate::connection_pool::ConnectionPool {
+        crate::connection_pool::ConnectionPool::new(
+            crate::config::PoolConfig::default(),
+            env_config.clone(),
+            crate::dns::DnsCache::new(crate::dns::DnsConfig::default()),
+            None,
+            Arc::new(Vec::new()),
+        )
+    }
+
     /// Connect to a WebSocket backend using production dialer settings that
     /// are relevant to unit tests.
     pub async fn connect_websocket_backend_for_test(
@@ -4335,14 +4820,13 @@ pub mod _test_support {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let env_config = crate::config::EnvConfig::default();
-        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
         let handshake = crate::proxy::connect_websocket_backend(
             backend_url,
             proxy,
             &env_config,
             &[],
-            None,
-            &crls,
+            &tls_configs,
             65_536,
             262_144,
             4_096,
@@ -4636,7 +5120,7 @@ pub mod _test_support {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let env_config = crate::config::EnvConfig::default();
-        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
         let client_headers: Vec<(String, String)> = if client_subprotocols.is_empty() {
             Vec::new()
         } else {
@@ -4650,8 +5134,7 @@ pub mod _test_support {
             proxy,
             &env_config,
             &client_headers,
-            None,
-            &crls,
+            &tls_configs,
             65_536,
             262_144,
             4_096,
@@ -4844,6 +5327,16 @@ pub mod _test_support {
         plugin.set_store_post_admit_hook_for_tests(hook);
     }
 
+    pub fn ai_semantic_cache_admit_sealed_redis_hit_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis_key: &str,
+        status_code: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<(u16, HashMap<String, String>)> {
+        plugin.admit_sealed_redis_hit_for_tests(redis_key, status_code, headers, body)
+    }
+
     pub fn ai_semantic_cache_instance_id_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) -> u64 {
@@ -4987,6 +5480,14 @@ pub mod _test_support {
 
     pub fn finalized_response_replay_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.finalized_response_replay
+    }
+
+    /// Stand in for a provider claim that states `ClearInherited` DNS intent,
+    /// which only crate-internal route dispatchers may set.
+    pub fn set_route_override_dns_policy_clear_inherited_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.route_override_dns_policy = crate::plugins::RouteOverrideDnsPolicy::ClearInherited;
     }
 
     /// Stand in for the protocol entry paths, which copy this digest from the
@@ -7046,6 +7547,175 @@ pub mod _test_support {
         surviving
     }
 
+    /// A reqwest backend response carrying `chunks` as DATA frames followed by
+    /// `trailers` as its trailer section (none when empty).
+    fn reqwest_response_with_trailers_for_test(
+        chunks: &[&'static [u8]],
+        trailers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        type TestFrame = Result<http_body::Frame<bytes::Bytes>, std::io::Error>;
+        let mut frames: Vec<TestFrame> = Vec::with_capacity(chunks.len() + 1);
+        for chunk in chunks.iter().copied() {
+            let data = bytes::Bytes::from_static(chunk);
+            frames.push(Ok(http_body::Frame::data(data)));
+        }
+        if !trailers.is_empty() {
+            let map = backend_trailer_map_for_test(trailers);
+            frames.push(Ok(http_body::Frame::trailers(map)));
+        }
+        let stream = futures_util::stream::iter(frames);
+        let body = reqwest::Body::wrap(http_body_util::StreamBody::new(stream));
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    /// Relay a reqwest backend response through the production streaming
+    /// adapter named by `adapter` (`"direct"`, `"coalescing"`, or
+    /// `"size_limited"`) and collect what the client receives (issue #5760).
+    ///
+    /// `relay_trailers = false` is the shape used when the client cannot
+    /// receive a trailer section. A non-empty `policy_names` installs the
+    /// response-trailer governor the handler builds for a chain declaring
+    /// those names.
+    pub async fn relay_reqwest_streaming_response_for_test(
+        adapter: &str,
+        chunks: &[&'static [u8]],
+        trailers: &[(&str, &str)],
+        relay_trailers: bool,
+        policy_names: &[String],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use crate::proxy::body::{
+            ReqwestResponseTrailers, coalescing_body, direct_streaming_body,
+            size_limited_streaming_body,
+        };
+        use http_body_util::BodyExt;
+
+        let response = reqwest_response_with_trailers_for_test(chunks, trailers);
+        let trailer_mode = if relay_trailers {
+            let governor = (!policy_names.is_empty()).then(|| {
+                crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+                    HashMap::new(),
+                    crate::proxy::headers::PrePolicyResponseHeaders::NoHeaderPolicyPhase,
+                    std::sync::Arc::new(policy_names.to_vec()),
+                    std::sync::Arc::new(Vec::new()),
+                    crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+                    crate::proxy::headers::TrailerSectionKind::PlainResponse,
+                    false,
+                )
+            });
+            ReqwestResponseTrailers::relay(governor)
+        } else {
+            ReqwestResponseTrailers::drop_all()
+        };
+        let body = match adapter {
+            "direct" => direct_streaming_body(response, None, 0, trailer_mode),
+            "coalescing" => coalescing_body(response, None, 0, None, trailer_mode),
+            "size_limited" => size_limited_streaming_body(response, 1 << 20, None, 0, trailer_mode),
+            other => panic!("unknown reqwest streaming adapter {other:?}"),
+        };
+        let collected = body.collect().await.expect("relayed body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
+    }
+
+    /// Whether the reqwest relay treats a backend response with `version` and
+    /// `headers` as able to carry a trailer section (issue #5760). When it
+    /// cannot, the handler captures no response-policy evidence and builds no
+    /// trailer governor for it.
+    pub fn reqwest_response_can_carry_trailers_for_test(
+        version: http::Version,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        let mut response = http::Response::new(reqwest::Body::from(Vec::<u8>::new()));
+        *response.version_mut() = version;
+        *response.headers_mut() = backend_trailer_map_for_test(headers);
+        let response = reqwest::Response::from(response);
+        crate::proxy::reqwest_response_can_carry_trailers_for_test(&response)
+    }
+
+    /// Collect a reqwest backend response through the production buffered
+    /// collector (`eager = false`, used by `response_body_mode: buffer`) or
+    /// the eager small-body collector (`eager = true`) and report the
+    /// retained body and trailer section (issue #5760).
+    pub async fn collect_reqwest_buffered_response_for_test(
+        chunks: &[&'static [u8]],
+        trailers: &[(&str, &str)],
+        eager: bool,
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use crate::proxy::collect_reqwest_buffered_response_for_test as collect;
+
+        let response = reqwest_response_with_trailers_for_test(chunks, trailers);
+        let (body, trailers) = collect(response, eager).await.expect("collect");
+        let trailers = trailers.as_ref().map(surviving_trailer_lines_for_test);
+        (body.to_vec(), trailers)
+    }
+
+    /// Frames of the body the H1/H2 handler builds for a buffered backend
+    /// response that arrived with a trailer section (issue #5760), through the
+    /// handler's own relay decisions: the client can receive trailers
+    /// (`client_http2`), the request is native gRPC (`grpc`) or translated
+    /// gRPC-Web (`grpc_web`), a late gateway terminal replaced the body
+    /// (`gateway_selected`: `"deadline"`, `"capacity"`, `"representation"`),
+    /// and the response is `HEAD` or has a status that forbids content. A
+    /// non-empty `policy_names` installs the response-trailer governor the
+    /// handler builds for a chain declaring those names.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handler_buffered_body_frames_for_test(
+        client_http2: bool,
+        grpc: bool,
+        grpc_web: bool,
+        gateway_selected: Option<&str>,
+        is_head: bool,
+        status: u16,
+        trailers: &[(&str, &str)],
+        policy_names: &[String],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use http_body_util::BodyExt;
+
+        let governor = (!policy_names.is_empty()).then(|| {
+            crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+                HashMap::new(),
+                crate::proxy::headers::PrePolicyResponseHeaders::NoHeaderPolicyPhase,
+                std::sync::Arc::new(policy_names.to_vec()),
+                std::sync::Arc::new(Vec::new()),
+                crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+                crate::proxy::headers::TrailerSectionKind::PlainResponse,
+                false,
+            )
+        });
+        let body = crate::proxy::buffered_response_body_for_test(
+            client_http2,
+            grpc,
+            grpc_web,
+            gateway_selected,
+            is_head,
+            status,
+            bytes::Bytes::from_static(b"buffered body"),
+            backend_trailer_map_for_test(trailers),
+            governor,
+        );
+        let collected = body.collect().await.expect("buffered body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
+    }
+
+    /// Frames of the buffered body the response builder emits for a buffered
+    /// backend response that carried a trailer section (issue #5760).
+    pub async fn buffered_body_with_trailers_frames_for_test(
+        data: &'static [u8],
+        trailers: &[(&str, &str)],
+    ) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+        use http_body_util::BodyExt;
+
+        let map = backend_trailer_map_for_test(trailers);
+        let body = crate::proxy::body::ProxyBody::buffered_with_trailers(
+            bytes::Bytes::from_static(data),
+            map,
+        );
+        let collected = body.collect().await.expect("buffered body");
+        let trailers = collected.trailers().map(surviving_trailer_lines_for_test);
+        (collected.to_bytes().to_vec(), trailers)
+    }
+
     pub fn record_buffered_initial_response_header_plugin_for_test(
         ctx: &mut crate::plugins::RequestContext,
         plugin: &dyn crate::plugins::Plugin,
@@ -7210,6 +7880,63 @@ pub mod _test_support {
         crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
     }
 
+    /// Forward a `permessage-deflate` offer the way a passthrough proxy does;
+    /// returns whether an offer was forwarded (issue #5769).
+    pub fn push_permessage_deflate_offer_for_test(
+        client_headers: &mut Vec<(String, String)>,
+        proxy_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::push_permessage_deflate_offer(client_headers, proxy_headers)
+    }
+
+    /// The runtime passthrough gate both WebSocket upgrade paths use; returns
+    /// whether an offer was forwarded (issue #5769).
+    pub fn forward_permessage_deflate_offer_for_test(
+        mode: crate::config::types::WebSocketPermessageDeflate,
+        requires_websocket_framing: bool,
+        client_headers: &mut Vec<(String, String)>,
+        proxy_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::forward_permessage_deflate_offer(
+            mode,
+            requires_websocket_framing,
+            client_headers,
+            proxy_headers,
+        )
+    }
+
+    /// The backend `permessage-deflate` answer a passthrough proxy forwards.
+    pub fn permessage_deflate_answer_for_test(
+        headers: &hyper::HeaderMap,
+    ) -> Option<hyper::header::HeaderValue> {
+        crate::proxy::permessage_deflate_answer(headers)
+    }
+
+    /// Finish a `websocket_permessage_deflate: terminate` negotiation against
+    /// a backend's handshake response headers, as the H1/H2/H3 paths do.
+    pub fn finish_permessage_deflate_termination_for_test(
+        handshake: crate::proxy::ws_permessage_deflate::TerminationHandshake,
+        headers: &hyper::HeaderMap,
+        max_decompressed_message_bytes: usize,
+    ) -> Result<crate::proxy::ws_permessage_deflate::NegotiatedTermination, &'static str> {
+        crate::proxy::finish_permessage_deflate_termination(
+            handshake,
+            crate::proxy::backend_extensions_answer(headers).as_ref(),
+            max_decompressed_message_bytes,
+        )
+    }
+
+    /// Refusals for `websocket_permessage_deflate: passthrough` proxies whose
+    /// effective plugin chain requires the parsed WebSocket relay.
+    pub fn websocket_permessage_deflate_passthrough_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::plugin_cache::websocket_permessage_deflate_passthrough_errors(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+        )
+    }
+
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,
@@ -7363,6 +8090,21 @@ pub mod _test_support {
             &[],
         )
         .await
+    }
+
+    /// End a gRPC attempt as proxy core does after charging its budget expiry
+    /// to the backend, marking the charged `Backend deadline exceeded`
+    /// terminal (#5744).
+    pub fn end_charged_grpc_route_attempt_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.end_charged_grpc_route_attempt();
+    }
+
+    /// Whether the context holds proxy core's charged backend deadline
+    /// terminal (#5744).
+    pub fn charged_backend_deadline_terminal_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.charged_backend_deadline_terminal()
     }
 
     /// Like [`transform_buffered_response_body_with_deadline_for_test`] but
@@ -7620,6 +8362,159 @@ pub mod _test_support {
             status_code,
             response_body,
             response_headers,
+        )
+        .await;
+    }
+
+    /// Run reject-path `after_proxy` hooks over a charged backend deadline
+    /// terminal (#5744): bounded as over the gateway deadline terminal, with
+    /// the rejection's own wording kept.
+    pub async fn apply_after_proxy_hooks_to_charged_deadline_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_after_proxy_hooks_to_charged_deadline_rejection(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
+    /// Run reject-path `after_proxy` hooks over a gateway-generated gRPC-Web
+    /// error terminal (#5747): bounded as over the charged terminal, with the
+    /// terminal's own wording kept.
+    pub async fn apply_after_proxy_hooks_to_gateway_error_terminal_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
+    /// Build the gRPC-Web error terminal proxy core's native gRPC branch
+    /// returns for a gateway-generated backend error (#5747), through the same
+    /// out-of-line builder both of that arm's gRPC-Web call sites use.
+    pub async fn grpc_web_gateway_error_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_content_type: &str,
+        grpc_status: u32,
+        message: &str,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    ) -> http::Response<crate::proxy::ProxyBody> {
+        crate::proxy::boxed_grpc_web_gateway_error_response(
+            plugins,
+            ctx,
+            response_content_type,
+            grpc_status,
+            message,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    }
+
+    /// The HTTP/3 plain bridge's header map for a gRPC-Web gateway error
+    /// terminal selected after `after_proxy` decorated `head_headers` (#5747),
+    /// here a response found too large while its body is collected.
+    pub fn h3_grpc_web_gateway_error_after_head_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        head_headers: &HashMap<String, String>,
+        terminal_headers: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        crate::http3::cross_protocol::plain_grpc_web_gateway_error_after_head_headers(
+            ctx,
+            head_headers,
+            terminal_headers,
+        )
+    }
+
+    /// The HTTP/3 plain bridge's charged gRPC-Web terminal for a budget expiry
+    /// after `after_proxy` added `gateway_headers` to the backend's response
+    /// head (#5744): its status and header map.
+    pub fn h3_charged_grpc_web_terminal_after_head_for_test(
+        mut backend_headers: HashMap<String, String>,
+        gateway_headers: HashMap<String, String>,
+    ) -> Option<(u16, HashMap<String, String>)> {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        ctx.set_grpc_deadline_budget(Some(1_000));
+        ctx.begin_buffered_deadline_response_header_provenance(&backend_headers);
+        backend_headers.extend(gateway_headers);
+        ctx.record_deadline_response_header_mutations(&backend_headers);
+        match crate::http3::cross_protocol::plain_grpc_web_backend_deadline_after_head(
+            &mut ctx,
+            &backend_headers,
+        ) {
+            crate::plugins::PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => Some((status_code, headers)),
+            _ => None,
+        }
+    }
+
+    /// Run the HTTP/3 bridge's reject-path `response_committed` observers over
+    /// a native gRPC rejection built from `headers`. Returns whether they
+    /// replaced it with the gateway deadline terminal, and its final
+    /// `grpc-message`.
+    pub async fn h3_run_reject_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        charged_backend_deadline: bool,
+    ) -> (bool, Option<String>) {
+        use crate::http3::cross_protocol as bridge;
+        let status = http::StatusCode::OK;
+        let (mut normalized, mut translated) =
+            bridge::normalize_reject_for_client(ctx, status, bytes::Bytes::new(), headers, true);
+        let replaced = bridge::run_cross_protocol_reject_committed_hooks(
+            plugins,
+            ctx,
+            true,
+            charged_backend_deadline,
+            &mut normalized,
+            &mut translated,
+        )
+        .await;
+        (replaced, normalized.grpc_message)
+    }
+
+    /// Run the HTTP/3 plain bridge's buffered response-body plugin pipeline,
+    /// which its reqwest and mesh-egress arms share, over a buffered response.
+    pub async fn h3_run_plain_buffered_response_plugin_pipeline_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) {
+        crate::http3::cross_protocol::run_plain_buffered_response_plugin_pipeline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            &[],
+            &[],
         )
         .await;
     }
@@ -7988,6 +8883,33 @@ pub mod _test_support {
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
             )
         })
+    }
+
+    /// The backend request the HTTP/3 plain bridge builds for one attempt,
+    /// for `proxy_headers` under the RPC deadline in force (#5734).
+    pub fn h3_plain_bridge_backend_request_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        proxy_headers: &HashMap<String, String>,
+        backend_url: &str,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+    ) -> Result<reqwest::Request, reqwest::Error> {
+        let client = reqwest::Client::new();
+        crate::http3::cross_protocol::build_plain_request_builder(
+            &client,
+            state,
+            proxy,
+            reqwest::Method::POST,
+            proxy_headers,
+            backend_url,
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+            grpc_deadline_at,
+        )
+        .build()
     }
 
     pub fn h3_post_deadline_terminal_write_grace_for_test() -> std::time::Duration {
@@ -10585,6 +11507,12 @@ pub mod _test_support {
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
         }
+
+        /// At its end once the probe closed the feed and nothing fed is left,
+        /// like an H2 `Incoming` whose END_STREAM rode its last DATA frame.
+        fn is_end_stream(&self) -> bool {
+            self.receiver.is_closed() && self.receiver.is_empty()
+        }
     }
 
     /// One gateway-owned upload pump under test, with its transport side held
@@ -10745,6 +11673,14 @@ pub mod _test_support {
         /// Drop the transport side, modelling hyper releasing the request body.
         pub fn drop_transport(&mut self) {
             self.source = None;
+        }
+
+        /// The transport side's `is_end_stream()`: what an HTTP/2 transport
+        /// reads to set END_STREAM on the DATA frame it just took.
+        pub fn transport_is_end_stream(&self) -> bool {
+            self.source
+                .as_ref()
+                .is_some_and(crate::proxy::upload_pump::UploadPumpSource::is_end_stream)
         }
     }
 
@@ -11689,6 +12625,34 @@ pub mod _test_support {
         crate::http3::stream_util::await_authorized_headers_write(bound, family, latch, write).await
     }
 
+    /// [`await_authorized_headers_write_for_test`], also returning whether the
+    /// write was offered to the send half first, as the aggregate SSE writer
+    /// races its protected head (#5745).
+    pub async fn await_offered_authorized_headers_write_for_test<F, T, E>(
+        bound: crate::proxy::auth_lifetime::ComposedAuthBound,
+        family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> (H3AuthorizedHeadersWrite, bool)
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use crate::http3::stream_util as seam;
+        seam::await_offered_authorized_headers_write(bound, family, latch, write).await
+    }
+
+    /// Drive `write` through the in-flight tracker a relay wraps each response
+    /// write in (#5745).
+    pub async fn track_response_write_in_flight_for_test<F, T, E>(
+        in_flight: &mut bool,
+        write: F,
+    ) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::track_response_write_in_flight(in_flight, write).await
+    }
+
     /// Compose the aggregate MCP SSE listener lifetime with a captured
     /// authorization plan, matching the native-H3 aggregate SSE writer.
     pub fn compose_aggregate_sse_bound_for_test(
@@ -11740,12 +12704,71 @@ pub mod _test_support {
         deadline: Option<tokio::time::Instant>,
         attempt: F,
     ) -> Result<F::Output, &'static str> {
-        crate::proxy::await_route_request_deadline(deadline, attempt)
+        crate::proxy::await_route_request_deadline(deadline, None, attempt)
             .await
-            .map_err(|expiry| match expiry {
-                crate::proxy::RouteDeadlineExpiry::BeforeDispatch => "not_started",
-                crate::proxy::RouteDeadlineExpiry::InFlight => "in_flight",
-            })
+            .map_err(route_deadline_expiry_label)
+    }
+
+    /// Drive one backend attempt through the route deadline wrapper with a
+    /// per-attempt budget (`attempt_timeout_ms`), exactly as proxy core does.
+    /// `handed_to_backend` is the attempt's dispatch marker: `None` starts the
+    /// budget on the first poll (a retry attempt), `Some` once the marker is
+    /// set (an initial attempt). Returns the outcome — `Err` additionally
+    /// names `"attempt_budget"` — and the instant the budget expires at, once
+    /// it started, which proxy core also applies to the committed body.
+    pub async fn await_route_attempt_budget_for_test<F: std::future::Future>(
+        deadline: Option<tokio::time::Instant>,
+        attempt_timeout: std::time::Duration,
+        handed_to_backend: Option<&std::sync::atomic::AtomicBool>,
+        attempt: F,
+    ) -> (
+        Result<F::Output, &'static str>,
+        Option<tokio::time::Instant>,
+    ) {
+        let mut armed_deadline = None;
+        let budget = match handed_to_backend {
+            Some(marker) => crate::proxy::RouteAttemptBudget::from_handoff(
+                Some(attempt_timeout),
+                marker,
+                &mut armed_deadline,
+            ),
+            None => crate::proxy::RouteAttemptBudget::from_start(
+                Some(attempt_timeout),
+                &mut armed_deadline,
+            ),
+        };
+        let outcome = crate::proxy::await_route_request_deadline(deadline, budget, attempt)
+            .await
+            .map_err(route_deadline_expiry_label);
+        (outcome, armed_deadline)
+    }
+
+    fn route_deadline_expiry_label(expiry: crate::proxy::RouteDeadlineExpiry) -> &'static str {
+        match expiry {
+            crate::proxy::RouteDeadlineExpiry::BeforeDispatch => "not_started",
+            crate::proxy::RouteDeadlineExpiry::InFlight => "in_flight",
+            crate::proxy::RouteDeadlineExpiry::AttemptBudget => "attempt_budget",
+        }
+    }
+
+    /// The response proxy core builds for an attempt a route deadline
+    /// cancelled, and the transaction-log phase it records (`None` for a
+    /// per-attempt budget expiry, which is an ordinary retryable backend
+    /// timeout rather than a spent transaction). `expiry` is one of
+    /// `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    pub fn route_deadline_expiry_response_for_test(
+        expiry: &str,
+        handed_to_backend: bool,
+    ) -> (crate::retry::BackendResponse, Option<&'static str>) {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut phase = None;
+        let response =
+            crate::proxy::route_deadline_expiry_response(expiry, handed_to_backend, &mut phase);
+        (response, phase)
     }
 
     /// The transaction-log phase and dispatch error class proxy core records
@@ -11767,15 +12790,174 @@ pub mod _test_support {
         )
     }
 
-    /// Whether `config` withholds the HTTP/3 `Alt-Svc` advertisement on
-    /// `frontend_port` because a route rule reachable there carries a total
-    /// request deadline — the rule `ProxyState::alt_svc_for_frontend_port`
-    /// applies to every response.
-    pub fn route_timeout_withholds_alt_svc_for_test(
-        config: &crate::config::types::GatewayConfig,
-        frontend_port: Option<u16>,
-    ) -> bool {
-        crate::proxy::RouteTimeoutAltSvc::for_config(1, config).withholds(frontend_port)
+    /// The native HTTP/3 terminal for an attempt a matched route rule's
+    /// deadline ended before the response head (#5646): `(status, body, error
+    /// class, logged phase, reads as a post-wire read timeout)`. Every native
+    /// HTTP/3 attempt is handed to the backend from its first poll. `expiry` is
+    /// one of `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    pub fn h3_route_deadline_terminal_for_test(
+        expiry: &str,
+    ) -> (
+        u16,
+        &'static str,
+        crate::retry::ErrorClass,
+        Option<String>,
+        bool,
+    ) {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let error = crate::http3::route_deadline::expiry_pool_error(&mut ctx, expiry);
+        let (status, body) = crate::http3::route_deadline::expiry_status_body(expiry);
+        let phase = ctx
+            .metadata
+            .remove(crate::plugins::ROUTE_REQUEST_TIMEOUT_METADATA_KEY);
+        (
+            status,
+            body,
+            crate::http3::route_deadline::expiry_error_class(expiry),
+            phase,
+            error.request_on_wire() && error.is_read_timeout(),
+        )
+    }
+
+    /// How the native HTTP/3 relays bound one attempt under a matched route
+    /// rule's deadlines (#5646), for a total deadline `total`, an attempt
+    /// budget `attempt_timeout`, and the committed attempt's budget instant
+    /// `attempt_deadline`: `(a fresh attempt's budget instant, the committed
+    /// body's deadline, whether the attempt budget alone has expired, how the
+    /// body deadline ended the attempt)`.
+    pub fn h3_route_attempt_bounds_for_test(
+        total: Option<tokio::time::Instant>,
+        attempt_timeout: Option<std::time::Duration>,
+        attempt_deadline: Option<tokio::time::Instant>,
+    ) -> (
+        Option<tokio::time::Instant>,
+        Option<tokio::time::Instant>,
+        bool,
+        &'static str,
+    ) {
+        let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
+        (
+            route.start_attempt(),
+            route.body_deadline(attempt_deadline),
+            route.attempt_budget_expired(attempt_deadline),
+            route_deadline_expiry_label(route.body_expiry()),
+        )
+    }
+
+    /// The deadlines the native HTTP/3 relays read for a request whose matched
+    /// rule carries `request_timeout_ms` / `attempt_timeout_ms` (#5646):
+    /// `(total deadline armed, attempt budget)`. A gRPC-flavored request folds
+    /// both into its RPC deadline instead, so the relays see neither.
+    pub fn h3_route_deadlines_armed_for_test(
+        request_timeout_ms: Option<u64>,
+        attempt_timeout_ms: Option<u64>,
+        grpc_flavored: bool,
+    ) -> (bool, Option<std::time::Duration>) {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        ctx.route_override_request_timeout_ms = request_timeout_ms;
+        ctx.route_override_attempt_timeout_ms = attempt_timeout_ms;
+        ctx.arm_route_request_deadline(grpc_flavored);
+        let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(&ctx);
+        (route.total().is_some(), route.attempt_timeout())
+    }
+
+    /// The HTTP/3 error code a route deadline cut resets a committed response
+    /// with (#5646): RFC 9114 `H3_REQUEST_CANCELLED`.
+    pub fn h3_route_deadline_reset_code_for_test() -> u64 {
+        let code = crate::http3::route_deadline::ROUTE_DEADLINE_RESET_CODE;
+        code.value()
+    }
+
+    /// Outcome of the shared downstream H3 DATA/trailers/FIN write seam.
+    pub use crate::http3::stream_util::H3AuthorizedWrite;
+
+    /// Race one downstream H3 DATA/trailers/FIN write through the shared seam
+    /// every streaming relay uses, against the earlier of the captured
+    /// authorization plan and the route body deadline (#5646).
+    pub async fn await_authorized_response_write_for_test<F, T, E>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        route_deadline: Option<tokio::time::Instant>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> H3AuthorizedWrite
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let route_sleep = route_deadline.map(tokio::time::sleep_until);
+        tokio::pin!(route_sleep);
+        crate::http3::stream_util::await_authorized_response_write(
+            plan,
+            route_sleep,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+            latch,
+            write,
+        )
+        .await
+    }
+
+    /// [`await_authorized_response_write_for_test`] against a route timer the
+    /// caller pinned once, as every relay passes its `route_body_sleep` (#5745).
+    pub async fn await_authorized_response_write_with_route_sleep_for_test<F, T, E>(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+        route_sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>,
+        latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        write: F,
+    ) -> H3AuthorizedWrite
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::http3::stream_util::await_authorized_response_write(
+            plan,
+            route_sleep,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+            latch,
+            write,
+        )
+        .await
+    }
+
+    /// Race a response HEADERS write against `deadline` through the bridge's
+    /// head-write seam, returning whether the deadline fired and whether the
+    /// write had been offered to the send half first (#5745).
+    pub async fn await_offered_response_write_for_test<F, T, E>(
+        deadline: Option<tokio::time::Instant>,
+        write: F,
+    ) -> (bool, bool)
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use crate::http3::stream_util as seam;
+        let (result, offered) =
+            seam::await_offered_response_write_before_deadline(deadline, write).await;
+        let expired = matches!(result, Err(seam::H3ResponseWriteError::DeadlineExceeded));
+        (expired, offered)
+    }
+
+    /// Attribute a native-H3 streaming HEADERS write's protocol-deadline
+    /// expiry between the client RPC deadline and the route body deadline.
+    pub fn attribute_streaming_headers_deadline_for_test(
+        outcome: H3AuthorizedHeadersWrite,
+        grpc_deadline: Option<tokio::time::Instant>,
+        route_deadline: Option<tokio::time::Instant>,
+    ) -> H3AuthorizedHeadersWrite {
+        crate::http3::stream_util::attribute_streaming_headers_deadline(
+            outcome,
+            grpc_deadline,
+            route_deadline,
+        )
     }
 
     pub fn proxy_body_into_grpc_web_streaming_for_test(
@@ -11797,6 +12979,227 @@ pub mod _test_support {
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
         body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
+    }
+
+    /// Wrap a body in the pass-through gRPC-Web relay, exactly as the H1/H2
+    /// response funnels do for a route without the `grpc_web` translator.
+    pub fn proxy_body_into_grpc_web_passthrough_streaming_for_test(
+        body: crate::proxy::ProxyBody,
+        text_mode: bool,
+        http_status: u16,
+    ) -> crate::proxy::ProxyBody {
+        let framing = crate::plugins::grpc_web::PassthroughFraming {
+            text_mode,
+            content_encoded: false,
+        };
+        body.into_grpc_web_passthrough_streaming(framing, http_status)
+    }
+
+    /// [`proxy_body_into_grpc_web_passthrough_streaming_for_test`] with the
+    /// framing read from the backend's response headers, as the H1/H2 funnels
+    /// derive it (a `content-encoding` header hides the trailer frame).
+    pub fn proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test(
+        body: crate::proxy::ProxyBody,
+        text_mode: bool,
+        response_headers: &HashMap<String, String>,
+        http_status: u16,
+    ) -> crate::proxy::ProxyBody {
+        let framing = crate::plugins::grpc_web::PassthroughFraming::from_response(
+            text_mode,
+            response_headers,
+        );
+        body.into_grpc_web_passthrough_streaming(framing, http_status)
+    }
+
+    /// Hold `permits` on `body` with gRPC trailer classification, exactly as
+    /// the native gRPC streaming funnel does before its gRPC-Web wrapper.
+    pub fn proxy_body_with_grpc_admission_outcome_for_test(
+        body: crate::proxy::ProxyBody,
+        permits: crate::plugins::BackendAdmissionPermitSet,
+        response_status: u16,
+    ) -> crate::proxy::ProxyBody {
+        body.with_deferred_backend_admission_outcome(permits, response_status, Duration::ZERO)
+            .with_grpc_trailer_admission_classification()
+    }
+
+    /// [`proxy_body_into_grpc_web_passthrough_streaming_for_test`] after
+    /// attaching the authoritative gRPC message counter to the inner body,
+    /// exactly as the H1/H2 response funnels attach it ahead of the adapter.
+    pub fn proxy_body_into_grpc_web_passthrough_streaming_with_counter_for_test(
+        body: crate::proxy::ProxyBody,
+        text_mode: bool,
+        messages: Arc<std::sync::atomic::AtomicU64>,
+    ) -> crate::proxy::ProxyBody {
+        let framing = crate::plugins::grpc_web::PassthroughFraming {
+            text_mode,
+            content_encoded: false,
+        };
+        body.with_grpc_message_counter(messages)
+            .into_grpc_web_passthrough_streaming(framing, 200)
+    }
+
+    /// Complete gRPC-Web message frames the pass-through trailer observer
+    /// counts over `chunks`, on the decoded frame stream.
+    pub fn grpc_web_passthrough_messages_for_test(chunks: &[&[u8]], text_mode: bool) -> u64 {
+        let mut observer = crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::new(text_mode);
+        for chunk in chunks {
+            observer.push(chunk);
+        }
+        observer.messages()
+    }
+
+    /// The authoritative response message count a complete buffered backend
+    /// body records, for a transaction that observes gRPC messages.
+    pub fn record_backend_response_grpc_message_count_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> u64 {
+        crate::plugins::grpc_web::record_backend_response_grpc_message_count(
+            ctx,
+            response_headers,
+            body,
+        );
+        ctx.grpc_response_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Stamp the frontend's classification of a recognized gRPC-Web upload,
+    /// with `text_mode` for a `grpc-web-text` request `Content-Type`.
+    pub fn set_request_grpc_web_upload_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        text_mode: bool,
+    ) {
+        ctx.set_request_wire_protocol(crate::config::types::HttpWireTransport::Http2, true);
+        ctx.set_request_grpc_web_text(text_mode);
+    }
+
+    /// The authoritative request message count a complete buffered
+    /// backend-visible body records, for a transaction that observes gRPC
+    /// messages.
+    pub fn record_request_grpc_message_count_for_test(
+        ctx: &crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> u64 {
+        crate::plugins::grpc_web::record_request_grpc_message_count(ctx, body);
+        ctx.grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// [`record_request_grpc_message_count_for_test`] through the counter a
+    /// dispatch captures before a phase consumes its context.
+    pub fn record_captured_request_grpc_message_count_for_test(
+        ctx: &crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> u64 {
+        if let Some(counter) = crate::plugins::grpc_web::RequestGrpcMessageCounter::for_request(ctx)
+        {
+            counter.record(body);
+        }
+        ctx.grpc_request_messages_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Feed `chunks`, in order, to the message tap a streamed upload for `ctx`
+    /// carries and return the request message count, or `None` when the
+    /// upload carries no tap.
+    pub fn request_stream_grpc_messages_for_test(
+        ctx: &crate::plugins::RequestContext,
+        chunks: &[&[u8]],
+    ) -> Option<u64> {
+        let mut tap = crate::plugins::grpc_web::request_stream_grpc_message_tap(ctx)?;
+        for chunk in chunks {
+            tap.push(chunk);
+        }
+        let messages = &ctx.grpc_request_messages_observed;
+        Some(messages.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Framing the message scanner reads for a streamed upload from `ctx`.
+    pub fn request_upload_grpc_message_framing_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> crate::plugins::mesh::prometheus_helpers::GrpcMessageFraming {
+        crate::plugins::grpc_web::request_upload_grpc_message_framing(ctx)
+    }
+
+    /// Whether `ctx` uploads pass-through `grpc-web-text`, which only a
+    /// text-mode message scanner can read.
+    pub fn request_uploads_passthrough_grpc_web_text_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::plugins::grpc_web::request_uploads_passthrough_grpc_web_text(ctx)
+    }
+
+    /// Feed `chunks`, in order, to the pass-through gRPC-Web trailer observer
+    /// and return the terminal status it read.
+    pub fn grpc_web_trailer_status_for_test(chunks: &[&[u8]], text_mode: bool) -> Option<u32> {
+        let mut observer = crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::new(text_mode);
+        for chunk in chunks {
+            observer.push(chunk);
+        }
+        observer.status()
+    }
+
+    /// Feed `chunks` to the pass-through gRPC-Web trailer observer and return
+    /// its full outcome: `Ok(status)` for a readable final trailer frame,
+    /// `Err(reason)` for one present but unreadable, `None` for no final
+    /// trailer frame naming a status.
+    pub fn grpc_web_trailer_outcome_for_test(
+        chunks: &[&[u8]],
+        text_mode: bool,
+    ) -> Option<Result<u32, &'static str>> {
+        let mut observer = crate::plugins::grpc_web::GrpcWebTrailerStatusObserver::new(text_mode);
+        for chunk in chunks {
+            observer.push(chunk);
+        }
+        observer
+            .outcome()
+            .map(grpc_web_passthrough_outcome_for_test)
+    }
+
+    fn grpc_web_passthrough_outcome_for_test(
+        outcome: crate::plugins::grpc_web::PassthroughGrpcStatus,
+    ) -> Result<u32, &'static str> {
+        match outcome {
+            crate::plugins::grpc_web::PassthroughGrpcStatus::Status(code) => Ok(code),
+            crate::plugins::grpc_web::PassthroughGrpcStatus::Unreadable(reason) => {
+                Err(reason.as_str())
+            }
+        }
+    }
+
+    pub fn grpc_web_passthrough_response_text_mode_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_content_type: Option<&str>,
+    ) -> Option<bool> {
+        crate::plugins::grpc_web::passthrough_response_text_mode(ctx, response_content_type)
+    }
+
+    /// The terminal status a complete pass-through gRPC-Web body carries, as
+    /// the buffered response paths read it: `Ok(status)`, `Err(reason)` for a
+    /// status present but unreadable, `None` when not pass-through or absent.
+    pub fn grpc_web_passthrough_body_trailer_status_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<Result<u32, &'static str>> {
+        crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_headers, body)
+            .map(grpc_web_passthrough_outcome_for_test)
+    }
+
+    /// Record a pass-through body's terminal status into `metadata` exactly as
+    /// the buffered response paths do.
+    pub fn record_grpc_web_passthrough_status_for_test(
+        ctx: &crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+        metadata: &mut HashMap<String, String>,
+    ) {
+        if let Some(passthrough) =
+            crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_headers, body)
+        {
+            passthrough.record(metadata);
+        }
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(
@@ -11952,22 +13355,15 @@ pub mod _test_support {
         let snapshot = cache.load_inner();
         let balancer =
             crate::proxy::mesh_tcp_egress_connection_balancer(&snapshot, namespace, upstream_id)?;
-        let target_key = crate::load_balancer::target_host_port_key(target);
-        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
-            Some(Arc::new(target.clone())),
-            Some(Arc::clone(&balancer)),
-        );
+        let guard =
+            crate::proxy::LoadBalancerConnectionGuard::new(Some(target), Some(balancer.as_ref()));
         let during = balancer
-            .active_connections
-            .get(&target_key)
-            .map(|count| count.load(Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(target)
+            .map_or(0, |state| state.active_connections());
         drop(guard);
         let after = balancer
-            .active_connections
-            .get(&target_key)
-            .map(|count| count.load(Ordering::Relaxed))
-            .unwrap_or(0);
+            .target_runtime_state(target)
+            .map_or(0, |state| state.active_connections());
         Some((during, after))
     }
 
@@ -13650,6 +15046,26 @@ pub mod _test_support {
         )
     }
 
+    /// The length a streamed, unmodified HTTP/1.x backend body may advertise
+    /// to the client (issue #5588).
+    pub fn passthrough_streaming_content_length_for_test(
+        backend_version: http::Version,
+        decoder_length: Option<u64>,
+        trusted_backend_content_length: Option<u64>,
+        declared_after_hooks: Option<u64>,
+        response_status: u16,
+        client_grpc_deadline: bool,
+    ) -> Option<u64> {
+        crate::proxy::passthrough_streaming_content_length(
+            backend_version,
+            decoder_length,
+            trusted_backend_content_length,
+            declared_after_hooks,
+            response_status,
+            client_grpc_deadline,
+        )
+    }
+
     /// Whether a streaming reqwest response may skip the coalescing adapter
     /// entirely (issue #5588). A configured aggregation window must count as a
     /// reason to coalesce, or the window is inert in the default configuration.
@@ -14783,16 +16199,19 @@ pub mod _test_support {
     }
 
     /// Production HBONE CONNECT circuit-breaker settlement after
-    /// `connect_backend`. External tests use this so a DNS-screen 403 cannot
-    /// drift from the served HALF_OPEN accounting.
+    /// `connect_backend`. External tests use this so a DNS-screen policy
+    /// refusal (403 denial or 503 not-ready) cannot drift from the served
+    /// HALF_OPEN accounting.
     pub fn settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
         cb: &crate::circuit_breaker::CircuitBreaker,
         status: hyper::StatusCode,
+        policy_refusal: bool,
         is_half_open_probe: bool,
     ) {
         crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
             cb,
             status,
+            policy_refusal,
             is_half_open_probe,
         )
     }
@@ -14853,6 +16272,223 @@ pub mod _test_support {
     /// HTTP/2-via-reqwest response paths construct the coalescer with.
     pub fn default_coalesce_target_bytes() -> usize {
         crate::proxy::body::COALESCE_TARGET
+    }
+
+    /// The HTTP/1.1 / HTTP/2-via-reqwest size-limited streaming response body
+    /// (an unknown-length backend body under a response size limit), fed from
+    /// `chunks` that are all ready at once, as when a small backend response
+    /// arrives in a single read. The idle read timeout is off.
+    pub fn size_limited_streaming_body_from_ready_chunks(
+        chunks: Vec<bytes::Bytes>,
+        max_bytes: usize,
+    ) -> crate::proxy::body::ProxyBody {
+        let frames = chunks
+            .into_iter()
+            .map(|chunk| Ok::<_, CoalesceFrameError>(http_body::Frame::data(chunk)));
+        crate::proxy::body::size_limited_frame_stream_body(
+            futures_util::stream::iter(frames),
+            max_bytes,
+            None,
+            0,
+        )
+    }
+
+    /// The unlimited streaming response body named by `adapter`, fed from
+    /// `chunks` that are all ready at once and followed at once by a backend
+    /// read error, as when a backend resets right after a small first write.
+    /// A `read_timeout_ms` of 0 turns the idle read timeout off.
+    ///
+    /// `adapter` picks the production builder: `"direct"` or `"coalescing"`
+    /// (reqwest), `"h2_direct"` or `"h2_coalescing"` (direct HTTP/2 and gRPC),
+    /// `"h3_direct"` or `"h3_coalescing"` (native HTTP/3). The
+    /// `"h2_direct_grpc_deadline"` and `"h2_coalescing_grpc_deadline"`
+    /// variants replace the idle read timeout with a client gRPC deadline
+    /// `read_timeout_ms` from now.
+    pub fn unlimited_streaming_body_from_ready_chunks_then_error(
+        adapter: &str,
+        chunks: Vec<bytes::Bytes>,
+        read_timeout_ms: u64,
+    ) -> crate::proxy::body::ProxyBody {
+        let backend = ScriptedBackendReset {
+            pending_first: false,
+            chunks: chunks.into(),
+            reset_pending: true,
+        };
+        unlimited_streaming_body_over(adapter, backend, read_timeout_ms)
+    }
+
+    /// The unlimited streaming response body named by `adapter` (see
+    /// [`unlimited_streaming_body_from_ready_chunks_then_error`]) over a
+    /// backend whose first read is `Pending` (it wakes its task at once) and
+    /// whose next read is a backend reset, as when a backend stalls and then
+    /// fails without sending any body bytes.
+    pub fn unlimited_streaming_body_pending_once_then_error(
+        adapter: &str,
+        read_timeout_ms: u64,
+    ) -> crate::proxy::body::ProxyBody {
+        let backend = ScriptedBackendReset {
+            pending_first: true,
+            chunks: std::collections::VecDeque::new(),
+            reset_pending: true,
+        };
+        unlimited_streaming_body_over(adapter, backend, read_timeout_ms)
+    }
+
+    fn unlimited_streaming_body_over(
+        adapter: &str,
+        backend: ScriptedBackendReset,
+        read_timeout_ms: u64,
+    ) -> crate::proxy::body::ProxyBody {
+        use crate::proxy::body::{
+            coalescing_frame_stream_body, coalescing_h2_body_strip_hop_by_hop_trailers,
+            coalescing_h3_body, direct_frame_stream_body,
+            direct_streaming_h2_body_strip_hop_by_hop_trailers, direct_streaming_h3_body,
+        };
+        use futures_util::TryStreamExt;
+
+        let deadline = || tokio::time::Instant::now() + Duration::from_millis(read_timeout_ms);
+        match adapter {
+            "direct" => {
+                let stream = backend.map_err(|err| Box::new(err) as CoalesceFrameError);
+                direct_frame_stream_body(stream, None, read_timeout_ms)
+            }
+            "coalescing" => {
+                let stream = backend.map_err(|err| Box::new(err) as CoalesceFrameError);
+                coalescing_frame_stream_body(stream, None, read_timeout_ms, None)
+            }
+            "h2_direct" => direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                read_timeout_ms,
+                None,
+                None,
+            ),
+            "h2_direct_grpc_deadline" => direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                0,
+                Some(deadline()),
+                None,
+            ),
+            "h2_coalescing" => coalescing_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                default_coalesce_target_bytes(),
+                read_timeout_ms,
+                None,
+                None,
+            ),
+            "h2_coalescing_grpc_deadline" => coalescing_h2_body_strip_hop_by_hop_trailers(
+                http_body_util::StreamBody::new(backend),
+                None,
+                default_coalesce_target_bytes(),
+                0,
+                Some(deadline()),
+                None,
+            ),
+            "h3_direct" => direct_streaming_h3_body(
+                backend,
+                Arc::from("GET"),
+                200,
+                None,
+                None,
+                read_timeout_ms,
+                None,
+            ),
+            "h3_coalescing" => coalescing_h3_body(
+                backend,
+                Arc::from("GET"),
+                200,
+                None,
+                None,
+                crate::http3::config::H3_COALESCE_MIN_FLOOR,
+                crate::http3::config::H3_COALESCE_MAX_CAP,
+                Duration::from_millis(2),
+                read_timeout_ms,
+                None,
+            ),
+            other => panic!("unknown unlimited streaming adapter {other:?}"),
+        }
+    }
+
+    /// A scripted backend body for the unlimited streaming adapters: an
+    /// optional first `Pending`, then `chunks` all ready at once, then one
+    /// backend reset, then end of stream. It is both a frame stream (reqwest,
+    /// direct HTTP/2) and a native-H3 receive stream.
+    struct ScriptedBackendReset {
+        pending_first: bool,
+        chunks: std::collections::VecDeque<bytes::Bytes>,
+        reset_pending: bool,
+    }
+
+    impl ScriptedBackendReset {
+        fn poll_next_chunk(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
+            if std::mem::take(&mut self.pending_first) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            if let Some(chunk) = self.chunks.pop_front() {
+                return std::task::Poll::Ready(Some(Ok(chunk)));
+            }
+            if std::mem::take(&mut self.reset_pending) {
+                let error = std::io::Error::other("backend reset");
+                return std::task::Poll::Ready(Some(Err(error)));
+            }
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    impl futures_util::Stream for ScriptedBackendReset {
+        type Item = Result<http_body::Frame<bytes::Bytes>, std::io::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let next = std::task::ready!(self.get_mut().poll_next_chunk(cx));
+            std::task::Poll::Ready(next.map(|chunk| chunk.map(http_body::Frame::data)))
+        }
+    }
+
+    impl crate::proxy::body::H3RecvStream for ScriptedBackendReset {
+        fn poll_recv_data_bytes(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<Option<bytes::Bytes>, CoalesceFrameError>> {
+            let next = std::task::ready!(self.get_mut().poll_next_chunk(cx));
+            let next = next
+                .transpose()
+                .map_err(|err| Box::new(err) as CoalesceFrameError);
+            std::task::Poll::Ready(next)
+        }
+
+        fn poll_recv_trailers_map(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<Option<http::HeaderMap>, CoalesceFrameError>> {
+            std::task::Poll::Ready(Ok(None))
+        }
+    }
+
+    /// The plugin-inspected streaming response body after its inspection task
+    /// has already queued every chunk in `chunks` and then the response size
+    /// limit error, as when a small SSE response overruns the limit in a single
+    /// backend read.
+    pub fn inspected_streaming_body_from_ready_chunks_then_limit_error(
+        chunks: Vec<bytes::Bytes>,
+    ) -> crate::proxy::body::ProxyBody {
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len() + 1);
+        for chunk in chunks {
+            tx.try_send(Ok(http_body::Frame::data(chunk)))
+                .expect("channel has room for every chunk");
+        }
+        let error: CoalesceFrameError = "response body exceeds maximum size".into();
+        tx.try_send(Err(error))
+            .expect("channel has room for the terminal error");
+        crate::proxy::body::inspected_streaming_body(rx)
     }
 
     /// One scripted backend event for [`CoalesceProbe`].

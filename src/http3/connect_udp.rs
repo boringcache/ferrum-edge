@@ -490,7 +490,7 @@ const MAX_TARGET_HOST_LEN: usize = 253;
 /// already-canonicalized request path.
 ///
 /// The caller must pass the path *after*
-/// [`crate::policy_path::canonicalize_policy_path`], which has already decoded
+/// [`crate::policy_path::canonicalize_request_path`], which has already decoded
 /// every accepted percent-escape to one literal byte and refused ambiguous,
 /// encoded-separator, and traversal forms. That is what makes a single
 /// segment split unambiguous here — the RFC 9298 requirement that IPv6 colons
@@ -2364,6 +2364,7 @@ pub(crate) async fn handle_h3_connect_udp(
     let response_header_write_bound =
         crate::proxy::auth_lifetime::ComposedAuthBound::compose(None, auth_deadline);
     let auth_latch = ctx.authorization_termination_latch();
+    let response = crate::diagnostic_ref::stamp_h3_response(response);
     let header_write = crate::http3::stream_util::await_authorized_headers_write(
         response_header_write_bound,
         crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
@@ -2410,7 +2411,8 @@ pub(crate) async fn handle_h3_connect_udp(
                 "H3 CONNECT-UDP send_response failed: client write failed"
             ));
         }
-        crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
+        crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded
+        | crate::http3::stream_util::H3AuthorizedHeadersWrite::RouteDeadlineExceeded => {
             // compose(None, auth_deadline) never produces a protocol-only bound:
             // either authorization owns the instant, or there is no deadline at
             // all. Treat this as a failed write rather than counting a 200.

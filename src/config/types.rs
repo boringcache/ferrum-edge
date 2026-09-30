@@ -135,6 +135,73 @@ pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
     ("jwt", "secret"),
     ("hmac_auth", "secret"),
 ];
+
+/// How a redacting projection renders a value it withholds or rewrites.
+///
+/// The credential-bearing projections (Consumer credentials, plugin `config`
+/// blobs, and upstream service-discovery tokens) decide *which* values are
+/// sensitive exactly once. At every point where a projection would replace or
+/// rewrite a stored value, it computes its ordinary redacted form and hands
+/// both the stored value and that redacted form to a renderer:
+///
+/// - [`PlaceholderRendering`] keeps the redacted form. Ordinary non-admin reads
+///   and audit diffs use it.
+/// - The read-only configuration export (`GET /config/export`) swaps in a keyed
+///   fingerprint renderer, so a credential change is still detectable without
+///   the value being disclosed.
+///
+/// Because the renderer never decides sensitivity, the two surfaces cannot
+/// drift apart: a field the ordinary projection redacts is fingerprinted by the
+/// export, and a field it leaves alone is left alone by both.
+pub trait RedactionRendering {
+    /// Render one withheld value. `pointer` is the RFC 6901 JSON pointer of the
+    /// site within the resource's response body (for example
+    /// `/credentials/keyauth/0/key` or `/config/headers/x-api-key`); `stored`
+    /// is the value as persisted; `redacted` is what the ordinary projection
+    /// would emit in its place.
+    fn render(
+        &self,
+        pointer: &str,
+        stored: &serde_json::Value,
+        redacted: serde_json::Value,
+    ) -> serde_json::Value;
+
+    /// Whether a value this renderer withheld is fully opaque, so a later
+    /// projection layer matching the same site has nothing left to hide and
+    /// must not render it again. The placeholder renderer is not: a URL
+    /// projection it emitted can still be narrowed to `[REDACTED]` by a
+    /// later name rule.
+    fn renders_opaque(&self) -> bool {
+        false
+    }
+}
+
+/// The ordinary rendering: emit the redacted form unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaceholderRendering;
+
+impl RedactionRendering for PlaceholderRendering {
+    fn render(
+        &self,
+        _pointer: &str,
+        _stored: &serde_json::Value,
+        redacted: serde_json::Value,
+    ) -> serde_json::Value {
+        redacted
+    }
+}
+
+/// Append one RFC 6901 reference token (`~` → `~0`, `/` → `~1`) to `pointer`.
+pub fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    for ch in segment.chars() {
+        match ch {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            other => pointer.push(other),
+        }
+    }
+}
 /// Maximum length of a credential type key.
 pub const MAX_CREDENTIAL_TYPE_LENGTH: usize = 64;
 /// Credential types whose entries must contain exactly one field, paired with
@@ -2585,6 +2652,69 @@ pub enum ResponseBodyMode {
     Buffer,
 }
 
+/// Per-proxy handling of the RFC 7692 `permessage-deflate` WebSocket extension.
+///
+/// - **Strip** (default): the client's `Sec-WebSocket-Extensions` offer never
+///   reaches the backend and no extension is negotiated end to end, so every
+///   message stays inspectable by plugins that parse WebSocket frames.
+/// - **Passthrough**: `permessage-deflate` offer elements reach the backend
+///   unchanged and the backend's `permessage-deflate` answer reaches the
+///   client unchanged, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+///   Extended CONNECT. Every other extension token is still stripped. A
+///   session that actually negotiates the extension is relayed as raw bytes,
+///   so config validation refuses this mode on any proxy that has a plugin
+///   requiring the parsed WebSocket relay
+///   ([`crate::plugins::Plugin::requires_websocket_framing`]), attached
+///   directly, through a proxy group, or inherited from a global plugin.
+/// - **Terminate**: the gateway negotiates `permessage-deflate` with the
+///   client and with the backend independently, inflates every message before
+///   the frame relay and its plugins see it, and re-deflates toward each leg
+///   that negotiated compression. Decompression is bounded by the frame and
+///   message ceilings (see [`crate::proxy::ws_permessage_deflate`]). Every
+///   plugin stays allowed, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+///   Extended CONNECT.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSocketPermessageDeflate {
+    #[default]
+    Strip,
+    Passthrough,
+    Terminate,
+}
+
+impl WebSocketPermessageDeflate {
+    /// Wire / SQL form (`"strip"` / `"passthrough"` / `"terminate"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strip => "strip",
+            Self::Passthrough => "passthrough",
+            Self::Terminate => "terminate",
+        }
+    }
+
+    /// Parse the wire / SQL form. Unknown values are rejected, never defaulted.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strip" => Some(Self::Strip),
+            "passthrough" => Some(Self::Passthrough),
+            "terminate" => Some(Self::Terminate),
+            _ => None,
+        }
+    }
+
+    pub fn is_strip(&self) -> bool {
+        matches!(self, Self::Strip)
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self, Self::Passthrough)
+    }
+
+    pub fn is_terminate(&self) -> bool {
+        matches!(self, Self::Terminate)
+    }
+}
+
 /// Outbound PROXY protocol version written on backend TCP connects.
 ///
 /// When set on a `tcp` / `tcps` stream proxy, Ferrum prepends a PROXY
@@ -2707,6 +2837,17 @@ pub struct Proxy {
     pub strip_listen_path: bool,
     #[serde(default)]
     pub preserve_host_header: bool,
+    /// Accept RFC 3986 `;` path parameters (matrix parameters) in request
+    /// paths routed to this proxy. Default `false`: a request whose canonical
+    /// path contains a `;` (literal or `%3B`) is refused with `400`
+    /// (`path_parameter`) after route lookup and before any plugin runs, because
+    /// backends such as Tomcat and Spring strip `;…` from every segment and
+    /// would execute a different path than routing and policy evaluated
+    /// (GHSA-fcqw-793q-wg5x). Set it only for backends that use matrix
+    /// parameters; dot segments with parameters (`..;`) and segments empty
+    /// before their `;` are still refused. HTTP-family proxies only.
+    #[serde(default)]
+    pub allow_path_parameters: bool,
     #[serde(default = "default_connect_timeout")]
     pub backend_connect_timeout_ms: u64,
     #[serde(default = "default_read_timeout")]
@@ -3041,6 +3182,11 @@ pub struct Proxy {
     /// idle window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<u64>,
+    /// RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
+    /// proxy: `strip` (default), `passthrough`, or `terminate`. See
+    /// [`WebSocketPermessageDeflate`]. Only valid on HTTP-family proxies.
+    #[serde(default, skip_serializing_if = "WebSocketPermessageDeflate::is_strip")]
+    pub websocket_permessage_deflate: WebSocketPermessageDeflate,
     /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
     /// When `None` (default), all methods are allowed. When `Some`, requests
     /// with methods not in the list receive 405 Method Not Allowed.
@@ -3742,7 +3888,7 @@ fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
 /// `None` when it is usable as written.
 ///
 /// Route lookup runs on the canonical request path
-/// (`crate::policy_path::canonicalize_policy_path`), so a `listen_path` that
+/// (`crate::policy_path::canonicalize_request_path`), so a `listen_path` that
 /// is not itself canonical can never match: either the runtime would reject
 /// every request that spelled it that way (`/api%2Fadmin`, an encoded
 /// separator) or the runtime path would canonicalize to different bytes
@@ -3771,6 +3917,19 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
         crate::policy_path::non_canonical_policy_path_reason(path)
     }
 }
+
+/// Whether a literal (prefix or `=` exact) `listen_path` can only match a
+/// request path that carries a `;` path parameter.
+///
+/// Such a request is refused unless the proxy sets `allow_path_parameters`
+/// (GHSA-fcqw-793q-wg5x), so without the opt-in the route is unreachable. A
+/// `~regex` value is a pattern, where `;` is ordinary regex text that need not
+/// require one.
+pub(crate) fn listen_path_requires_path_parameters(path: &str) -> bool {
+    !path.starts_with('~') && path.contains(';')
+}
+
+const LISTEN_PATH_PARAMETER_ERROR: &str = "listen_path with `;` requires `allow_path_parameters`";
 
 /// Return the stable logical identity used by H1 pending-admission scopes.
 ///
@@ -4152,6 +4311,12 @@ impl GatewayConfig {
                 errors.push(format!(
                     "Proxy {:?}: listen_path {:?} is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
                     proxy.id, path, reason
+                ));
+            }
+            if listen_path_requires_path_parameters(path) && !proxy.allow_path_parameters {
+                errors.push(format!(
+                    "Proxy {:?}: {LISTEN_PATH_PARAMETER_ERROR}",
+                    proxy.id
                 ));
             }
         }
@@ -5402,13 +5567,17 @@ impl GatewayConfig {
             // `stream_proxy_protocol` is valid on every stream family, with two
             // different framings: the connection-borne PROXY header on
             // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
-            // udp/dtls (issue #3289). HTTP proxies use XFF instead and are
-            // still rejected.
+            // udp/dtls (issue #3289). HTTP-family proxies share the global
+            // HTTP/HTTPS listeners, so one proxy cannot decide how a listener
+            // reads its first bytes: inbound PROXY protocol for those is the
+            // listener-level `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS`
+            // setting (issue #5768), and the per-proxy flag stays rejected.
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
-                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but PROXY protocol is only \
-                     valid for tcp/tcp_tls/udp/dtls stream proxies — HTTP-family proxies resolve \
-                     the client IP from X-Forwarded-For",
+                    "Proxy {:?} (scheme {}) sets stream_proxy_protocol but that field is only \
+                     valid for tcp/tcp_tls/udp/dtls stream proxies — for HTTP-family proxies \
+                     enable inbound PROXY protocol on the listener with \
+                     FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS",
                     proxy.id,
                     proxy.scheme_display()
                 ));
@@ -7857,6 +8026,28 @@ impl Proxy {
         errors
     }
 
+    /// Warn when a `~regex` `listen_path` mentions `;` on a proxy without
+    /// `allow_path_parameters`. Any request carrying a `;` path parameter is
+    /// refused after route lookup (GHSA-fcqw-793q-wg5x), so the part of the
+    /// pattern that needs one is unreachable. The pattern is not rejected,
+    /// because `;` in a regex need not require a parameter. Never fails the
+    /// load.
+    pub fn warn_unreachable_regex_path_parameters(&self) {
+        let Some(path) = self.listen_path.as_deref() else {
+            return;
+        };
+        if self.allow_path_parameters || !path.starts_with('~') || !path.contains(';') {
+            return;
+        }
+        tracing::warn!(
+            proxy = %crate::startup::sanitize_startup_scalar(&self.id),
+            namespace = %crate::startup::sanitize_startup_scalar(&self.namespace),
+            "regex `listen_path` contains `;` on a proxy without `allow_path_parameters`; \
+             requests carrying a `;` path parameter are refused, so that part of the \
+             pattern is unreachable"
+        );
+    }
+
     /// Warn once when a loaded proxy still carries the CORS-style `"*"`
     /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
     pub fn warn_legacy_allowed_ws_origins(&self) {
@@ -7929,16 +8120,18 @@ impl Proxy {
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
 
-        // Inbound PROXY protocol is a stream-family control: the connection
-        // header on tcp/tcps, the per-datagram DGRAM envelope on udp/dtls
-        // (issue #3289). Enforced here (single-proxy admin writes: POST/PUT
-        // /proxies and the API-spec proxy path) in addition to
-        // `GatewayConfig::validate_stream_proxies`, so a bad row can never
-        // persist and then wedge the next full-config load/reconcile.
+        // Per-proxy inbound PROXY protocol is a stream-family control: the
+        // connection header on tcp/tcps, the per-datagram DGRAM envelope on
+        // udp/dtls (issue #3289). HTTP-family proxies get it from the global
+        // listener setting instead (issue #5768). Enforced here (single-proxy
+        // admin writes: POST/PUT /proxies and the API-spec proxy path) in
+        // addition to `GatewayConfig::validate_stream_proxies`, so a bad row
+        // can never persist and then wedge the next full-config load/reconcile.
         if self.stream_proxy_protocol == Some(true) && !is_stream_proxy {
             errors.push(
                 "stream_proxy_protocol is only valid for tcp/tcps/udp/dtls stream proxies \
-                 (HTTP-family proxies resolve the client IP from X-Forwarded-For)"
+                 (for HTTP-family proxies enable inbound PROXY protocol on the listener with \
+                 FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS)"
                     .to_string(),
             );
         }
@@ -8071,6 +8264,9 @@ impl Proxy {
                              request paths are canonicalized before route lookup, so a \
                              non-canonical listen_path is unreachable and creates a routing/auth bypass"
                         ));
+                    }
+                    if listen_path_requires_path_parameters(path) && !self.allow_path_parameters {
+                        errors.push(LISTEN_PATH_PARAMETER_ERROR.to_string());
                     }
                 }
             }
@@ -8561,6 +8757,22 @@ impl Proxy {
             errors.push("Stream proxies (TCP/UDP) must use response_body_mode 'stream'".into());
         }
 
+        if is_stream_proxy && !self.websocket_permessage_deflate.is_strip() {
+            errors.push(
+                "Stream proxies (TCP/UDP) carry no WebSocket upgrade; \
+                 `websocket_permessage_deflate` must be 'strip'"
+                    .into(),
+            );
+        }
+
+        if is_stream_proxy && self.allow_path_parameters {
+            errors.push(
+                "Stream proxies (TCP/UDP) have no request path; \
+                 `allow_path_parameters` must be false"
+                    .into(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -8896,28 +9108,55 @@ fn record_consumer_identity<'a>(
 }
 
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
+    redact_consumer_credentials_with(consumer, &PlaceholderRendering)
+}
+
+/// [`redact_consumer_credentials`] with an explicit [`RedactionRendering`].
+///
+/// This is the one Consumer credential projection; the ordinary response and
+/// audit forms call it with [`PlaceholderRendering`], and the read-only
+/// configuration export calls it with a keyed-fingerprint renderer.
+pub fn redact_consumer_credentials_with(
+    consumer: &Consumer,
+    rendering: &dyn RedactionRendering,
+) -> Consumer {
     let mut redacted = consumer.clone();
 
+    /// Object entries of one credential type, each with the index the
+    /// projection emits it at. Non-object entries are dropped before indexing,
+    /// and the legacy single-object form is index `0` (it is emitted as a
+    /// one-element array), so the index always names the emitted position.
     fn entry_objects(
         credential_value: &serde_json::Value,
-    ) -> Vec<&serde_json::Map<String, serde_json::Value>> {
+    ) -> Vec<(usize, &serde_json::Map<String, serde_json::Value>)> {
         match credential_value {
             serde_json::Value::Array(entries) => entries
                 .iter()
                 .filter_map(serde_json::Value::as_object)
+                .enumerate()
                 .collect(),
-            serde_json::Value::Object(object) => vec![object],
+            serde_json::Value::Object(object) => vec![(0, object)],
             _ => Vec::new(),
         }
     }
 
     fn secret_placeholders(
         credential_value: &serde_json::Value,
+        cred_type: &str,
         field: &str,
+        rendering: &dyn RedactionRendering,
     ) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .map(|_| serde_json::json!({(field): CREDENTIAL_REDACTION_PLACEHOLDER}))
+            .map(|(index, entry)| {
+                let mut pointer = String::from("/credentials");
+                push_json_pointer_segment(&mut pointer, cred_type);
+                push_json_pointer_segment(&mut pointer, &index.to_string());
+                push_json_pointer_segment(&mut pointer, field);
+                let stored = entry.get(field).unwrap_or(&serde_json::Value::Null);
+                let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
+                serde_json::json!({(field): rendering.render(&pointer, stored, marker)})
+            })
             .collect();
         (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
@@ -8925,7 +9164,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     fn visible_mtls_identities(credential_value: &serde_json::Value) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .filter_map(|entry| entry.get("identity").and_then(serde_json::Value::as_str))
+            .filter_map(|(_, entry)| entry.get("identity").and_then(serde_json::Value::as_str))
             .filter(|identity| {
                 !identity.trim().is_empty()
                     && identity.chars().count() <= MAX_CREDENTIAL_VALUE_LENGTH
@@ -8947,7 +9186,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         if let Some(entries) = consumer
             .credentials
             .get(cred_type)
-            .and_then(|value| secret_placeholders(value, field))
+            .and_then(|value| secret_placeholders(value, cred_type, field, rendering))
         {
             redacted.credentials.insert(cred_type.to_string(), entries);
         }
@@ -10014,9 +10253,20 @@ impl PluginConfig {
             );
         }
 
-        // Config JSON size
+        // Config JSON size. Generated OpenAPI configs embed resolved operation
+        // schemas: the validator's operation table, and an `mcp_gateway` that
+        // declares an OpenAPI bridge server (`servers.*.openapi`), share the
+        // larger generated-config budget. Every other `mcp_gateway` keeps the
+        // ordinary plugin budget.
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
-        let max_config_size = if self.plugin_name == "openapi_validator" {
+        let generated_openapi_config = match self.plugin_name.as_str() {
+            "openapi_validator" => true,
+            "mcp_gateway" => {
+                crate::plugins::mcp_openapi_bridge::config_declares_openapi_server(&self.config)
+            }
+            _ => false,
+        };
+        let max_config_size = if generated_openapi_config {
             MAX_OPENAPI_VALIDATOR_CONFIG_SIZE
         } else {
             MAX_PLUGIN_CONFIG_SIZE
@@ -10030,7 +10280,7 @@ impl PluginConfig {
         }
 
         // Config JSON nesting depth
-        let max_config_depth = if self.plugin_name == "openapi_validator" {
+        let max_config_depth = if generated_openapi_config {
             MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH
         } else {
             10
@@ -10597,6 +10847,7 @@ impl GatewayConfig {
             // file/database/CP/DP load for this (issue #5454). Admission
             // rejects the same values through `validate_fields`.
             proxy.warn_legacy_allowed_ws_origins();
+            proxy.warn_unreachable_regex_path_parameters();
         }
         for consumer in &self.consumers {
             if let Err(errs) = consumer.validate_fields() {

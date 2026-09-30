@@ -7,9 +7,14 @@ use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Pro
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::DnsCache;
-use ferrum_edge::http3::peer_identity::{H3ConnectionIdentity, server_0rtt_handshake_succeeded};
+use ferrum_edge::http3::peer_identity::{
+    H3ConnectionIdentity, ZeroRttCompletion, quic_max_early_data_size,
+    server_0rtt_handshake_succeeded,
+};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use tracing::info;
 
 use crate::scaffolding::clients::{bind_quinn_client_endpoint, bind_quinn_server_endpoint};
@@ -112,6 +117,8 @@ fn create_http3_test_proxy() -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -436,9 +443,6 @@ async fn test_http3_proxy_state_creation() {
         gateway_h3_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             std::collections::HashMap::new(),
         )),
-        route_timeout_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
-            Default::default(),
-        )),
         via_header_http11: None,
         via_header_http2: None,
         via_header_http3: None,
@@ -459,6 +463,9 @@ async fn test_http3_proxy_state_creation() {
         websocket_write_buffer_size: 131_072,
         websocket_tunnel_mode: false,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
+        process_global_frontends: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrum_edge::proxy::gateway_listener::ProcessGlobalFrontends::new(),
+        )),
         reserved_gateway_ports: Arc::new(std::collections::HashSet::new()),
         trusted_proxies: Arc::new(
             ferrum_edge::proxy::client_ip::TrustedProxies::parse_strict("", "test")
@@ -785,9 +792,6 @@ async fn test_http3_full_integration() {
         gateway_h3_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             std::collections::HashMap::new(),
         )),
-        route_timeout_alt_svc: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
-            Default::default(),
-        )),
         via_header_http11: None,
         via_header_http2: None,
         via_header_http3: None,
@@ -808,6 +812,9 @@ async fn test_http3_full_integration() {
         websocket_write_buffer_size: 131_072,
         websocket_tunnel_mode: false,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
+        process_global_frontends: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrum_edge::proxy::gateway_listener::ProcessGlobalFrontends::new(),
+        )),
         reserved_gateway_ports: Arc::new(std::collections::HashSet::new()),
         trusted_proxies: Arc::new(
             ferrum_edge::proxy::client_ip::TrustedProxies::parse_strict("", "test")
@@ -883,6 +890,7 @@ async fn test_http3_full_integration() {
     let tls_config = proxy_state
         .connection_pool
         .get_tls_config_for_backend(&proxy)
+        .await
         .expect("TLS config should succeed for test proxy");
     assert!(Arc::strong_count(&tls_config) > 0);
 
@@ -966,6 +974,8 @@ async fn test_http3_streaming_decision_logic() {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -1121,6 +1131,7 @@ async fn test_http3_connection_performance() {
     // Test HTTP/3 client creation performance
     let tls_config = connection_pool
         .get_tls_config_for_backend(&proxy)
+        .await
         .expect("TLS config should succeed for test proxy");
 
     let start_time = std::time::Instant::now();
@@ -1338,7 +1349,7 @@ async fn h3_buffered_response_survives_graceful_close_race() {
     // Build a rustls client config that trusts the test CA.
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -1418,7 +1429,7 @@ async fn h3_stream_reset_after_partial_body_is_not_treated_as_graceful() {
 
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -1491,7 +1502,7 @@ async fn h3_goaway_after_complete_body_is_treated_as_graceful() {
 
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -2075,6 +2086,224 @@ async fn h3_full_handshake_exposes_peer_identity_before_any_stream_is_accepted()
     client.wait_idle().await;
 }
 
+// ============================================================================
+// Issue #5761 — per-stream 0-RTT classification against real quinn
+// ============================================================================
+//
+// With early data enabled, every H3 connection goes through `into_0rtt()`, so a
+// request is classified against the handshake-completion signal. That signal
+// used to be relayed to the accept loop by a spawned task, so a 1-RTT request
+// arriving in the same flight as the client's `Finished` could be accepted
+// before the relayed wake-up and answered `425 Too Early` (or forwarded with a
+// false `Early-Data: 1`). These tests run the production classifier
+// (`H3ConnectionIdentity::accepted_stream_snapshot`) exactly where the gateway
+// does — right after `accept_bi`, without having awaited completion — and check
+// it against quinn's own per-stream `RecvStream::is_0rtt()`. Only one direction
+// of that comparison is an invariant: a signal still pending at the re-poll
+// implies `is_0rtt()`. A 0-RTT stream may be classified 1-RTT when the
+// handshake completed before the re-poll (RFC 8470 §6.2 / §6.4).
+
+/// Quinn server endpoint with the gateway's non-mTLS early-data posture: QUIC
+/// early data enabled at the only size quinn accepts, plus the bounded stateful
+/// session cache rustls requires for server 0-RTT.
+fn h3_early_data_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
+    let base = rustls::ServerConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 only");
+    let certs = vec![fixture.server_cert_der.clone()];
+    let key = fixture.server_key_der.clone_key();
+    let mut server_tls = base
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server TLS config");
+    server_tls.alpn_protocols = vec![b"h3".to_vec()];
+    server_tls.max_early_data_size = quic_max_early_data_size(true, false);
+    server_tls.session_storage = rustls::server::ServerSessionMemoryCache::new(64);
+
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quic cfg");
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
+    bind_quinn_server_endpoint(server_config, addr).expect("bind QUIC server")
+}
+
+/// Quinn client endpoint that resumes sessions and may send 0-RTT data.
+fn h3_early_data_client_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(fixture.ca_der.clone()).expect("trust CA");
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 only")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+    client_tls.enable_early_data = true;
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).expect("quic cfg");
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
+    let mut endpoint = bind_quinn_client_endpoint(addr).expect("bind QUIC client");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    endpoint
+}
+
+/// How the server classified the single request stream of one connection.
+#[derive(Debug)]
+struct AcceptedStreamClassification {
+    /// The gateway classifier's verdict.
+    is_early_data: bool,
+    /// Whether the completion signal was still pending when the classifier
+    /// re-polled it for this stream.
+    signal_pending_at_snapshot: bool,
+    /// Quinn's own per-stream record: accepted while still handshaking.
+    quinn_is_0rtt: bool,
+}
+
+impl AcceptedStreamClassification {
+    /// The invariants that hold on either side of the loopback race.
+    fn assert_consistent(&self, label: &str) {
+        assert!(
+            !self.signal_pending_at_snapshot || self.is_early_data,
+            "{label}: a stream whose completion signal was still pending at its re-poll \
+             must be early data: {self:?}"
+        );
+        assert!(
+            !self.signal_pending_at_snapshot || self.quinn_is_0rtt,
+            "{label}: a signal still pending after accept proves quinn accepted the stream \
+             mid-handshake: {self:?}"
+        );
+    }
+}
+
+/// Serve one connection the way the gateway's 0.5-RTT accept path does and
+/// report how its request stream was classified. The request is echoed back.
+async fn classify_one_zero_rtt_connection(
+    server: &quinn::Endpoint,
+) -> AcceptedStreamClassification {
+    let incoming = server.accept().await.expect("incoming connection");
+    let accepted = incoming.accept().expect("accept");
+    let Ok((connection, zero_rtt_accepted)) = accepted.into_0rtt() else {
+        panic!("quinn always returns Ok from into_0rtt on the server side");
+    };
+    let slot = H3ConnectionIdentity::pre_handshake();
+    // Like the gateway accept loop, do NOT wait for handshake completion
+    // before accepting the request stream.
+    let mut completion = ZeroRttCompletion::pending(zero_rtt_accepted);
+    let (mut send, mut recv) = connection.accept_bi().await.expect("request stream");
+    let snapshot = slot
+        .accepted_stream_snapshot(
+            &mut completion,
+            || connection.close_reason().is_none(),
+            || peer_cert_chain(&connection),
+        )
+        .await;
+    let classification = AcceptedStreamClassification {
+        is_early_data: snapshot.is_early_data,
+        signal_pending_at_snapshot: completion.is_pending(),
+        quinn_is_0rtt: recv.is_0rtt(),
+    };
+
+    let request = recv.read_to_end(1024).await.expect("read request");
+    send.write_all(&request).await.expect("echo request");
+    send.finish().expect("finish echo");
+    // Hold the connection until the client has read the echo and closed it.
+    let _ = connection.closed().await;
+    classification
+}
+
+/// Send one request on a fresh stream and return the echoed body.
+async fn h3_echo_request(connection: &quinn::Connection, body: &[u8]) -> Vec<u8> {
+    let (mut send, mut recv) = connection.open_bi().await.expect("open request stream");
+    send.write_all(body).await.expect("write request");
+    send.finish().expect("finish request");
+    recv.read_to_end(1024).await.expect("read echo")
+}
+
+#[tokio::test]
+async fn h3_zero_rtt_path_classifies_streams_by_handshake_state_at_accept() {
+    init_crypto_provider();
+    let fixture = build_h3_mtls_fixture();
+    let server = h3_early_data_server_endpoint(&fixture);
+    let server_addr = server.local_addr().expect("server addr");
+    let client = h3_early_data_client_endpoint(&fixture);
+
+    // One full handshake, then resumed handshakes that send no 0-RTT data,
+    // then one genuine 0-RTT request.
+    const ONE_RTT_CONNECTIONS: usize = 8;
+    let server_task = tokio::spawn(async move {
+        let mut classifications = Vec::with_capacity(ONE_RTT_CONNECTIONS + 1);
+        for _ in 0..=ONE_RTT_CONNECTIONS {
+            classifications.push(classify_one_zero_rtt_connection(&server).await);
+        }
+        classifications
+    });
+
+    let timeout = std::time::Duration::from_secs(30);
+    let client_flow = async {
+        for _ in 0..ONE_RTT_CONNECTIONS {
+            // The request is written the moment the client-side handshake
+            // completes, so it rides the same flight as the client's
+            // `Finished` — the ordering issue #5761 misclassified.
+            let connection = client
+                .connect(server_addr, "localhost")
+                .expect("start connect")
+                .await
+                .expect("1-RTT handshake");
+            assert_eq!(h3_echo_request(&connection, b"PUT").await, b"PUT");
+            connection.close(0u32.into(), b"done");
+        }
+
+        let connecting = client
+            .connect(server_addr, "localhost")
+            .expect("start 0-RTT connect");
+        let Ok((connection, zero_rtt_accepted)) = connecting.into_0rtt() else {
+            panic!("the resumed client must hold 0-RTT keys from the earlier sessions");
+        };
+        // Send the request in 0-RTT, then confirm the server accepted that
+        // data before reading the echo: a rejected 0-RTT stream would
+        // otherwise surface as an opaque read error.
+        let (mut send, mut recv) = connection.open_bi().await.expect("open 0-RTT stream");
+        send.write_all(b"PUT").await.expect("write 0-RTT request");
+        send.finish().expect("finish 0-RTT request");
+        assert!(
+            zero_rtt_accepted.await,
+            "the server must accept the client's 0-RTT data for this test to exercise it"
+        );
+        let echo = recv.read_to_end(1024).await.expect("read 0-RTT echo");
+        assert_eq!(echo, b"PUT");
+        connection.close(0u32.into(), b"done");
+    };
+    tokio::time::timeout(timeout, client_flow)
+        .await
+        .expect("client flow did not time out");
+
+    let classifications = tokio::time::timeout(timeout, server_task)
+        .await
+        .expect("server task did not time out")
+        .expect("server task did not panic");
+    let (one_rtt, zero_rtt) = classifications.split_at(ONE_RTT_CONNECTIONS);
+
+    for (index, classification) in one_rtt.iter().enumerate() {
+        classification.assert_consistent(&format!("connection {index}"));
+        assert!(
+            !classification.quinn_is_0rtt,
+            "connection {index}: a request sent after the client handshake completed is a \
+             1-RTT stream for quinn: {classification:?}"
+        );
+        assert!(
+            !classification.is_early_data,
+            "connection {index}: a 1-RTT request must never be classified as early data \
+             (425 Too Early / Early-Data: 1): {classification:?}"
+        );
+    }
+    // Whether the genuine 0-RTT stream is still mid-handshake when the server
+    // re-polls the signal depends on the loopback round trip, so pin the
+    // invariants that hold on either side of that race: a signal still pending
+    // at the re-poll means early data, and only for a stream quinn accepted
+    // before the handshake completed.
+    zero_rtt[0].assert_consistent("0-RTT connection");
+
+    client.wait_idle().await;
+}
+
 // ===========================================================================
 // DestinationRule `connectionPool.tcp.maxConnections` on the native HTTP/3
 // pool (issue #3290, root review round 3).
@@ -2231,7 +2460,7 @@ async fn capped_h3_backend(
 
     let provider = rustls::crypto::ring::default_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+    let ca_certs: Vec<_> = CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes())
         .filter_map(|c| c.ok())
         .collect();
     for cert_der in &ca_certs {
@@ -2313,7 +2542,7 @@ async fn h3_pool_request_reuses_an_admitted_shard_when_the_cap_refuses_creation(
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| {
@@ -2384,7 +2613,7 @@ async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
             &url,
             &headers,
             bytes::Bytes::new(),
-            move || Ok(tls),
+            move || std::future::ready(Ok(tls)),
         )
         .await
         .expect("first request establishes the one admitted QUIC connection");
@@ -2438,7 +2667,7 @@ async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
             &url,
             &headers,
             bytes::Bytes::new(),
-            move || Ok(tls),
+            move || std::future::ready(Ok(tls)),
         )
         .await
         .expect("a replacement must be admitted once the old driver terminated");
@@ -2569,7 +2798,7 @@ async fn h3_pool_target_dispatch_caps_on_the_policy_port_under_a_target_port_rem
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| panic!("buffered targeted request {attempt} must be served: {e}"));
@@ -2628,7 +2857,7 @@ async fn h3_pool_streaming_target_dispatch_caps_on_the_policy_port_under_a_remap
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| panic!("streaming targeted request {attempt} must be served: {e}"));
@@ -2739,7 +2968,7 @@ async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refus
                 &url,
                 &headers,
                 bytes::Bytes::new(),
-                move || Ok(tls),
+                move || std::future::ready(Ok(tls)),
             )
             .await
             .unwrap_or_else(|e| {

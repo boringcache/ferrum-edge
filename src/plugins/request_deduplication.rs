@@ -2381,6 +2381,29 @@ impl RequestDeduplication {
         }
     }
 
+    /// Replay a stored completion through the production hit path without
+    /// the store-side header sanitization, modelling an entry persisted under
+    /// an older header policy. The stored provenance is taken from `ctx`, so
+    /// the replay is admitted and only the header handling is under test.
+    #[allow(dead_code)]
+    pub(crate) fn replay_stored_response_for_tests(
+        &self,
+        ctx: &mut RequestContext,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let cached = CachedResponse {
+            status_code,
+            headers,
+            body: Bytes::copy_from_slice(body),
+            inserted_at: Instant::now(),
+            retention: self.ttl,
+            response_policy: ctx.response_policy_provenance(),
+        };
+        self.replay_response(ctx, &cached)
+    }
+
     fn local_publish_completed(
         &self,
         key: &str,
@@ -3343,12 +3366,23 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         .ok_or_else(|| format!("request_deduplication: `{field}` must be a boolean"))
 }
 
+/// The idempotency key is read from the client request, so a name in the
+/// gateway-owned `x-consumer-*` namespace (stripped at ingress) could never be
+/// supplied; with `enforce_required` every request would be rejected.
 fn parse_header_name(value: &str) -> Result<String, String> {
-    HeaderName::from_bytes(value.as_bytes())
+    let name = HeaderName::from_bytes(value.as_bytes())
         .map(|name| name.as_str().to_string())
         .map_err(|_| {
             "request_deduplication: `header_name` must be a valid HTTP header name".to_string()
-        })
+        })?;
+    if crate::proxy::headers::is_consumer_assertion_header(&name) {
+        return Err(
+            "request_deduplication: `header_name` is in the gateway-owned `x-consumer-*` \
+             consumer assertion namespace, which the gateway strips from every client request"
+                .to_string(),
+        );
+    }
+    Ok(name)
 }
 
 fn parse_applicable_methods(config: &Value) -> Result<Vec<String>, String> {

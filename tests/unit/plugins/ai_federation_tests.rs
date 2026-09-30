@@ -412,6 +412,7 @@ async fn final_backend_header_policy_reasserts_provider_boundary() {
         "Bearer normal-backend-secret".to_string(),
     );
     headers.insert("x-consumer-username".to_string(), "alice".to_string());
+    headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
     headers.insert("host".to_string(), "attacker.example".to_string());
 
     plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
@@ -420,6 +421,10 @@ async fn final_backend_header_policy_reasserts_provider_boundary() {
         Some("Bearer sk-test")
     );
     assert!(!headers.contains_key("x-consumer-username"));
+    assert!(
+        !headers.contains_key("X-Consumer-Role"),
+        "the whole x-consumer-* namespace is stripped at the provider boundary"
+    );
     assert_eq!(
         headers.get("host").map(String::as_str),
         Some("api.openai.com")
@@ -2085,6 +2090,40 @@ async fn streaming_dispatch_budget_drift_fails_the_destination_witness() {
     let (status, text) = reject_status(&refused).expect("budget drift must fail closed");
     assert_eq!(status, 500);
     assert!(text.contains("destination changed"), "{text}");
+}
+
+/// The combined IETF `RateLimit` field is relayed exactly like the split
+/// `RateLimit-*` fields it summarizes, so a client never sees half of the
+/// provider's quota report.
+#[test]
+fn provider_stream_response_relays_combined_and_split_ratelimit_fields() {
+    let mut headers = HashMap::new();
+    headers.insert("RateLimit".to_string(), "\"tokens\";r=0;t=6".to_string());
+    headers.insert("ratelimit-remaining".to_string(), "0".to_string());
+    headers.insert(
+        "RateLimit-Policy".to_string(),
+        "\"tokens\";q=900".to_string(),
+    );
+    headers.insert("ratelimiter".to_string(), "provider".to_string());
+
+    test_helpers::reduce_provider_stream_response_headers_for_test(&mut headers);
+
+    assert_eq!(
+        headers.get("ratelimit").map(String::as_str),
+        Some("\"tokens\";r=0;t=6")
+    );
+    assert_eq!(
+        headers.get("ratelimit-remaining").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        headers.get("ratelimit-policy").map(String::as_str),
+        Some("\"tokens\";q=900")
+    );
+    assert!(
+        !headers.contains_key("ratelimiter"),
+        "only the exact combined field is allowlisted: {headers:?}"
+    );
 }
 
 /// Provider response headers on a claimed stream are reduced to the bounded

@@ -143,6 +143,8 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -1943,6 +1945,118 @@ async fn test_list_plugin_configs_with_pagination() {
     assert_eq!(data.len(), 1);
     assert_eq!(data[0]["id"], "plugin-cfg-4");
     assert_eq!(body["pagination"]["total"], 5);
+}
+
+fn proxy_filter_plugin_config(
+    id: &str,
+    namespace: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        plugin_name: "rate_limiting".to_string(),
+        config: json!({}),
+        scope,
+        enabled: true,
+        proxy_id: proxy_id.map(String::from),
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_list_plugin_configs_filtered_by_proxy_id() {
+    let tc = TestConfig::default();
+    let mut state = create_pagination_admin_state(&tc);
+    let default_ns = ferrum_edge::config::types::default_namespace();
+    let other_ns = "other-ns";
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![],
+        consumers: vec![],
+        plugin_configs: vec![
+            proxy_filter_plugin_config("ctx-a-1", &default_ns, PluginScope::Proxy, Some("proxy-a")),
+            proxy_filter_plugin_config("ctx-a-2", &default_ns, PluginScope::Proxy, Some("proxy-a")),
+            proxy_filter_plugin_config("ctx-b-1", &default_ns, PluginScope::Proxy, Some("proxy-b")),
+            proxy_filter_plugin_config("global-1", &default_ns, PluginScope::Global, None),
+            proxy_filter_plugin_config("other-ns-1", other_ns, PluginScope::Proxy, Some("proxy-a")),
+        ],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        ..Default::default()
+    };
+    state.cached_config = Some(Arc::new(ArcSwap::new(Arc::new(config))));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=proxy-a", &token).await;
+    assert_eq!(status, 200);
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["ctx-a-1", "ctx-a-2"]);
+    assert_eq!(body["pagination"]["total"], json!(2));
+
+    // Pagination applies over the filtered set.
+    let (status, body, _) = admin_get(
+        &base_url,
+        "/plugins/config?proxy_id=proxy-a&limit=1&offset=1",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["id"], "ctx-a-2");
+    assert_eq!(body["pagination"]["total"], json!(2));
+
+    // A different proxy returns only its own configs.
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=proxy-b", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["id"], "ctx-b-1");
+    assert_eq!(body["pagination"]["total"], json!(1));
+
+    // An unknown proxy id yields an empty page, not a 404.
+    let (status, body, _) =
+        admin_get(&base_url, "/plugins/config?proxy_id=no-such-proxy", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["pagination"]["total"], json!(0));
+
+    // An invalid proxy id is a 400 with the shared {"error": ...} shape.
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=bad%21id", &token).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("is invalid"));
+}
+
+#[tokio::test]
+async fn test_list_plugin_configs_rejects_duplicate_and_empty_proxy_id() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) =
+        admin_get(&base_url, "/plugins/config?proxy_id=a&proxy_id=b", &token).await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body["error"],
+        "proxy_id must not be supplied more than once"
+    );
+
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?proxy_id=", &token).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"], "ID must not be empty");
 }
 
 #[tokio::test]
@@ -9510,6 +9624,7 @@ async fn test_cluster_endpoint_requires_auth() {
 
 #[tokio::test]
 async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
+    use ferrum_edge::grpc::configsync_lifecycle::config_sync_build_identity;
     use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
     use ferrum_edge::grpc::dp_client::generate_dp_jwt;
     use ferrum_edge::grpc::proto::SubscribeRequest;
@@ -9521,7 +9636,7 @@ async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
     state.mode = "cp".to_string();
     state.dp_registry = Some(registry.clone());
     let secret = "test-cluster-configsync-secret";
-    let (server, _tx) = CpGrpcServer::builder(
+    let server = CpGrpcServer::builder(
         Arc::new(ArcSwap::from_pointee(GatewayConfig::default())),
         secret.to_string(),
     )
@@ -9530,9 +9645,9 @@ async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
     let mut request = tonic::Request::new(SubscribeRequest {
         node_id: "cluster-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: false,
     });
     let dp_token = generate_dp_jwt(secret, "cluster-dp").unwrap();
     request.metadata_mut().insert(

@@ -396,6 +396,60 @@ async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex(
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
 
+#[test]
+fn rule_path_conditions_must_be_canonical_policy_paths() {
+    // Conditions are matched against the canonical request path, so a value
+    // that cannot appear in one would leave its rule silently inactive
+    // (GHSA-fcqw-793q-wg5x). Exact and `prefix*` values are held to the full
+    // contract; a `~regex` is regex text and is not canonicalized.
+    let with_paths = |paths: serde_json::Value| {
+        json!({
+            "include_default_rules": false,
+            "custom_rules": [{
+                "id": "CUSTOM-SCOPED",
+                "name": "scoped marker",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "conditions": { "paths": paths },
+                "action": "enforce"
+            }]
+        })
+    };
+    for (path, reason) in [
+        ("/admin//users", "empty_segment"),
+        ("//admin*", "empty_segment"),
+        ("/admin/;x/y", "empty_segment"),
+        ("/admin/../users", "literal_dot_segment"),
+        ("/%61dmin", "percent-escapes"),
+        ("/admin%2F*", "encoded_separator"),
+    ] {
+        let error = waf(with_paths(json!([path])))
+            .err()
+            .unwrap_or_else(|| panic!("{path:?} must be refused"));
+        assert!(
+            error.contains("conditions.paths[0]") && error.contains(reason),
+            "{path:?}: {error}"
+        );
+    }
+    for path in [
+        "/admin",
+        "/admin/*",
+        "/admin;v=1",
+        "~^/admin//x",
+        "~^[^%]*$",
+        "~/admin%2F.*",
+        "*",
+    ] {
+        assert!(
+            waf(with_paths(json!([path]))).is_ok(),
+            "{path:?} must stay admissible"
+        );
+    }
+}
+
 #[tokio::test]
 async fn custom_rule_regex_path_conditions_remain_unanchored() {
     let plugin = waf(json!({
@@ -2548,6 +2602,7 @@ fn rendered_waf_enforcement_rejection_keeps_all_fixed_remedies() {
             "enable anomaly scoring over an inspected HTTP rule",
             "enable a stream enforcement rule",
             "set `on_body_too_large` to `block` on an inspected body surface",
+            "set `on_unlisted_content_type` to `block` with request-body inspection on",
         ] {
             assert!(rendered.contains(expected), "{rendered}");
         }
@@ -4517,13 +4572,10 @@ async fn ssrf_query_benign_urls_and_unclaimed_forms_are_clean() {
     let _ = plugin.authorize(&mut path_version).await;
     assert!(!monitored(&path_version, "FE-SSRF-001-Q"));
 
-    // Existing SSRF rules claim dotted IPv4 + metadata.google.internal only.
-    let ipv6 = authorize_query(
-        &plugin,
-        "/w/rec",
-        "u=http://[fd00:ec2::254]/latest/meta-data/",
-    )
-    .await;
+    // Level-1 SSRF rules claim dotted IPv4 and named metadata endpoints only;
+    // alternate loopback spellings (`[::1]`, decimal, hex) are FE-SSRF-003 at
+    // paranoia level 2.
+    let ipv6 = authorize_query(&plugin, "/w/rec", "u=http://[::1]/latest/meta-data/").await;
     assert!(!monitored(&ipv6, "FE-SSRF-001-Q"));
     let decimal = authorize_query(&plugin, "/w/rec", "u=http://2130706433/").await;
     assert!(!monitored(&decimal, "FE-SSRF-001-Q"));
@@ -8970,6 +9022,23 @@ fn waf_config_schema_and_constructor_admission_agree() {
         json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "paranoia_min": 5 } } }),
         json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "score": 4294967296u64 } } }),
         json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "action": "block" } } }),
+        // Field exclusions must name at least one field.
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "exclude": null } } }),
+        json!({ "mode": "monitor", "rule_overrides": { "FE-XSS-001": { "exclude": {} } } }),
+        json!({
+            "mode": "monitor",
+            "rule_overrides": { "FE-XSS-001": { "exclude": { "query_params": [] } } }
+        }),
+        json!({
+            "mode": "monitor",
+            "rule_overrides": { "FE-XSS-001": { "exclude": { "query_params": null } } }
+        }),
+        json!({
+            "mode": "monitor",
+            "rule_overrides": {
+                "FE-XSS-001": { "exclude": { "query_params": ["html"], "cookies": [] } }
+            }
+        }),
         // Rule pattern / match_kind / target conditions.
         body_rule(json!({})),
         body_rule(json!({ "pattern": "needle" })),

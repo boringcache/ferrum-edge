@@ -85,12 +85,12 @@ def materialize_h2(plan, protocol, gateway, source, destination, manifest):
                     pool_http2_initial_connection_window_size="33554432",
                     pool_http2_max_frame_size="1048576", pool_http2_max_concurrent_streams="1000",
                     pool_http2_keep_alive_interval_seconds="30",
-                    pool_http2_keep_alive_timeout_seconds="45", pool_http2_adaptive_window="true")
+                    pool_http2_keep_alive_timeout_seconds="45", pool_http2_adaptive_window="false")
     for key, value in expected.items():
         matches = re.findall(r"(?m)^    " + key + r":\s*(\S+)[^\n]*$", text)
         if matches != [value]:
             raise ValueError(f"unexpected route fixture: {key}={matches}")
-    text = re.sub(r"(?m)^(    pool_http2_adaptive_window:)\s*true[^\n]*$",
+    text = re.sub(r"(?m)^(    pool_http2_adaptive_window:)\s*(?:true|false)[^\n]*$",
                   r"\g<1> " + str(adaptive).lower(), text)
     text = text.replace("CA_PATH", "/etc/ferrum/tls/ca.pem")
     Path(destination).write_text(text)
@@ -117,7 +117,6 @@ def materialize_h2(plan, protocol, gateway, source, destination, manifest):
 def verify_runtime(plan, gateway, container, manifest):
     arm = next(arm for arm in plan["arms"] if arm["gateway"] == gateway)
     expected = dict(parse_env(arm["FERRUM_EXTRA_ENV"]),
-                    FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST="16",
                     FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE="8388608",
                     FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE="33554432",
                     FERRUM_POOL_HTTP2_MAX_FRAME_SIZE="1048576",

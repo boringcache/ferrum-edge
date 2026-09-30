@@ -14,7 +14,8 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, StatusCode};
 use quinn::{ClientConfig, Endpoint};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::task::JoinHandle;
 
@@ -94,12 +95,12 @@ impl Http3Client {
         key_pem: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_chain_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+            CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
             return Err("client certificate chain is empty".into());
         }
-        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-            .ok_or("client private key not found")?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
         let provider = rustls::crypto::ring::default_provider();
         let verifier = Arc::new(DangerousAcceptAnyServer);
         let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -1697,6 +1698,36 @@ impl Http3WebSocket {
                 self.read_buf.extend_from_slice(&bytes);
             }
         }
+    }
+
+    /// Send pre-encoded client frame bytes verbatim, for frames the typed
+    /// helpers cannot express (e.g. an RSV1-flagged `permessage-deflate`
+    /// message). The caller owns RFC 6455 masking.
+    pub async fn send_raw_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_raw_frame(bytes).await
+    }
+
+    /// Read exactly `len` stream bytes without parsing frame headers, so the
+    /// caller can assert on reserved bits the frame parser does not surface.
+    pub async fn recv_raw_exact(
+        &mut self,
+        len: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        while self.read_buf.len() < len {
+            let mut chunk = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+                .await
+                .map_err(|_| "websocket recv_data timed out")?
+                .map_err(|e| format!("websocket recv_data: {e}"))?
+                .ok_or("websocket stream ended before the expected raw bytes")?;
+            while chunk.has_remaining() {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                self.read_buf.extend_from_slice(&bytes);
+            }
+        }
+        Ok(self.read_buf.drain(..len).collect())
     }
 
     async fn send_frame(

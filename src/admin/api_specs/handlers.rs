@@ -380,7 +380,7 @@ async fn late_api_spec_create_compensation_safe(
     const PAGE_SIZE: i64 = 1_000;
     loop {
         let page = db
-            .list_plugin_configs_paginated(&spec.namespace, PAGE_SIZE, offset)
+            .list_plugin_configs_paginated(&spec.namespace, None, PAGE_SIZE, offset)
             .await?;
         let items_len = page.items.len() as i64;
         if page.items.iter().any(|plugin| {
@@ -2009,6 +2009,18 @@ async fn validate_bundle(
                     Err(e) => return Err(classify_db_error(e)),
                 }
             }
+        }
+
+        // HTTP-family route on a process-global proxy frontend it can never be
+        // served on (issue #5922). Mirrors Proxy::after_validate in crud.rs.
+        if vctx.mode != "cp"
+            && let Some(error) = crate::admin::crud::process_global_frontend_conflict(state, proxy)
+        {
+            failures.push(ValidationFailure {
+                resource_type: "proxy",
+                id: proxy.id.clone(),
+                errors: vec![error],
+            });
         }
 
         if proxy.dispatch_kind.is_stream() {

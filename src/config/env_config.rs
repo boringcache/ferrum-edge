@@ -31,9 +31,54 @@ pub(crate) use env_config_macro::EnvValue;
 
 pub const DEFAULT_TLS_MANAGED_STORE_PATH: &str = "./ferrum-managed-tls";
 
+/// Set by the gateway binary's entry point; see
+/// [`use_working_directory_tls_managed_store_default`].
+static TLS_STORE_CWD_DEFAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Private per-process store directory for every process that has not opted
+/// into the working-directory default.
+static TLS_STORE_PROCESS_DEFAULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Make an unconfigured `FERRUM_TLS_MANAGED_STORE_PATH` resolve to the
+/// documented working-directory default, [`DEFAULT_TLS_MANAGED_STORE_PATH`].
+///
+/// Only the gateway binary calls this, first thing in `main`. Every other
+/// process that links the library — above all the Rust test harnesses, which
+/// Cargo runs from the repository root — instead gets a private directory
+/// under the system temporary directory, unique to that process. A test that
+/// reaches the process-global managed-TLS, ACME, lease, or TLS event stores
+/// without configuring a path therefore cannot write into the checkout or
+/// share persistent TLS state with another run (issue #5706). An explicit,
+/// non-empty path from the environment or `ferrum.conf` wins in both cases.
+pub fn use_working_directory_tls_managed_store_default() {
+    TLS_STORE_CWD_DEFAULT.store(true, std::sync::atomic::Ordering::Release);
+}
+
 pub fn tls_managed_store_path_from_env() -> String {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_TLS_MANAGED_STORE_PATH")
-        .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
+    match crate::config::conf_file::resolve_ferrum_var("FERRUM_TLS_MANAGED_STORE_PATH") {
+        Some(path) if !path.is_empty() => path,
+        _ => unconfigured_tls_managed_store_path(),
+    }
+}
+
+fn unconfigured_tls_managed_store_path() -> String {
+    if TLS_STORE_CWD_DEFAULT.load(std::sync::atomic::Ordering::Acquire) {
+        return DEFAULT_TLS_MANAGED_STORE_PATH.to_string();
+    }
+    TLS_STORE_PROCESS_DEFAULT
+        .get_or_init(process_private_tls_managed_store_path)
+        .clone()
+}
+
+/// The directory is only named here; the stores create it privately on first
+/// use, so a process that never opens one leaves nothing behind.
+fn process_private_tls_managed_store_path() -> String {
+    let pid = std::process::id();
+    let nonce = uuid::Uuid::new_v4().simple();
+    let name = format!("ferrum-managed-tls-{pid}-{nonce}");
+    let path = std::env::temp_dir().join(name);
+    path.to_string_lossy().into_owned()
 }
 
 /// Default bound on waiting for the shared managed-TLS/ACME store lock.
@@ -97,6 +142,55 @@ pub fn parse_tls_store_lock_timeout(raw: Option<&str>) -> Result<std::time::Dura
         MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS,
         MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS,
     )))
+}
+
+/// Settings key for the per-fetch external secret timeout.
+pub const SECRET_FETCH_TIMEOUT_SECONDS_KEY: &str = "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS";
+/// Default per-fetch external secret timeout, used only when the key is
+/// configured nowhere.
+pub const DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS: u64 = 30;
+/// Smallest accepted per-fetch external secret timeout. `0` is refused rather
+/// than treated as "no timeout": a zero deadline fails any fetch that yields
+/// even once.
+pub const MIN_SECRET_FETCH_TIMEOUT_SECONDS: u64 = 1;
+/// Largest accepted per-fetch external secret timeout (ten minutes), the same
+/// ceiling as `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`, the other bound on a
+/// single call to an external service.
+pub const HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS: u64 = 600;
+
+/// Pure parse/validation for `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS`.
+///
+/// The secrets registry reads the raw value itself (from the process
+/// environment for startup resolution, conf-file-aware for later runtime
+/// fetches) and [`EnvConfig`] validates the conf-file-aware value, so all three
+/// share this one rule. `None` means the key is configured nowhere and selects
+/// [`DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS`]. A configured value that is not a
+/// whole number of seconds in
+/// `[MIN_SECRET_FETCH_TIMEOUT_SECONDS, HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS]`,
+/// blank included, is an error instead of a silent fallback to the default.
+///
+/// The error names the variable and the accepted range, never the configured
+/// value: every `FERRUM_*` key may itself be sourced from an external secret.
+pub fn parse_secret_fetch_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let seconds = match raw {
+        None => DEFAULT_SECRET_FETCH_TIMEOUT_SECONDS,
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| secret_fetch_timeout_contract_error())?,
+    };
+    let accepted = MIN_SECRET_FETCH_TIMEOUT_SECONDS..=HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS;
+    if !accepted.contains(&seconds) {
+        return Err(secret_fetch_timeout_contract_error());
+    }
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+fn secret_fetch_timeout_contract_error() -> String {
+    format!(
+        "{SECRET_FETCH_TIMEOUT_SECONDS_KEY} must be a whole number of seconds between \
+         {MIN_SECRET_FETCH_TIMEOUT_SECONDS} and {HARD_MAX_SECRET_FETCH_TIMEOUT_SECONDS}"
+    )
 }
 
 /// Operator-pinned identity for this instance's shared TLS store leases
@@ -799,6 +893,46 @@ impl std::fmt::Display for BackendAllowIps {
             Self::Private => write!(f, "private"),
             Self::Public => write!(f, "public"),
             Self::Both => write!(f, "both"),
+        }
+    }
+}
+
+/// Inbound PROXY protocol posture of one process-global HTTP-family proxy
+/// listener (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` /
+/// `FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS`, issue #5768).
+///
+/// Every enabled value makes the header **required**: a connection that does
+/// not begin with an accepted PROXY header, or whose socket peer is outside
+/// `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS`, is closed before TLS or HTTP
+/// parsing. There is no optional mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontendProxyProtocolMode {
+    /// No PROXY header is read (default). The listener behaves exactly as it
+    /// did before the setting existed.
+    #[default]
+    Off,
+    /// Require a PROXY v1 (text) header.
+    V1,
+    /// Require a PROXY v2 (binary) header.
+    V2,
+    /// Require a PROXY v1 or v2 header, auto-detected from its signature.
+    Auto,
+}
+
+impl FrontendProxyProtocolMode {
+    /// Whether this listener reads (and requires) a PROXY header.
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+impl std::fmt::Display for FrontendProxyProtocolMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::V1 => write!(f, "v1"),
+            Self::V2 => write!(f, "v2"),
+            Self::Auto => write!(f, "auto"),
         }
     }
 }
@@ -1797,6 +1931,22 @@ pub struct EnvConfig {
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
+    /// Optional second HS256 verification secret for Admin API JWTs
+    /// (`FERRUM_ADMIN_JWT_VIEWER_SECRET`). A token it verifies is capped at the
+    /// `viewer` role whatever its `role` claim says. At least 32 characters,
+    /// and distinct from `FERRUM_ADMIN_JWT_SECRET` and
+    /// `FERRUM_CP_DP_GRPC_JWT_SECRET`. The admin plane reads it through
+    /// `create_jwt_manager_from_env()`; this field is the startup validation.
+    pub admin_jwt_viewer_secret: Option<String>,
+    /// Optional namespace ceiling for tokens verified by
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`),
+    /// kept as the raw comma-separated value. When set, a viewer-key token may
+    /// read only these namespaces whatever its `ns` claim or
+    /// `X-Ferrum-Namespace` says. Every entry must be a valid namespace name;
+    /// an empty value or empty entry fails startup. The admin plane reads it
+    /// through `create_jwt_manager_from_env()`; this field is the startup
+    /// validation.
+    pub admin_jwt_viewer_namespaces: Option<String>,
     /// JWT issuer claim (iss) for Admin API tokens. Tokens with a different issuer
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
@@ -2438,7 +2588,7 @@ pub struct EnvConfig {
     /// through the external-secret suffixes (`_VAULT/_AWS/_AZURE/_GCP/_FILE`).
     /// A token minted with one cluster's secret will not verify at another, so a
     /// per-remote credential cannot authenticate to the wrong cluster. Never
-    /// logged. Unset falls back to the shared CP-DP JWT secret.
+    /// logged. A `RemoteCluster` without a resolvable reference is not polled.
     pub mesh_remote_discovery_credentials: Option<String>,
     /// Stable, operator-visible identifier this cluster is known by to its
     /// multi-cluster peers — the value a peer puts in `RemoteCluster.name` when
@@ -2826,6 +2976,16 @@ pub struct EnvConfig {
     /// completing continuation and interleaved Ping/Pong. Independent of the
     /// frame-count bound. `0` disables the bound. Default: 60.
     pub websocket_max_incomplete_message_seconds: u64,
+    /// Maximum size, in bytes, a single WebSocket message may inflate to on a
+    /// `websocket_permessage_deflate: terminate` session. Exceeding it closes
+    /// the session with RFC 6455 code `1009`. Default: 1 MiB, because DEFLATE
+    /// expands up to about 1032:1, so a small compressed message can force
+    /// large inflate, inspection, and re-compression work. `0` is an explicit
+    /// opt-in to the parser's reassembled-message ceiling (4x
+    /// `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, or a lower
+    /// `ws_message_size_limiting` limit); a positive value can only lower that
+    /// ceiling, never raise it.
+    pub websocket_permessage_deflate_max_message_bytes: usize,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP header-read / pre-request admission timeout in seconds.
@@ -2946,6 +3106,24 @@ pub struct EnvConfig {
     /// would rather drain such a replica set this to `true`; either way
     /// liveness (`/live`) stays healthy and no healthy listener is closed.
     pub gateway_listener_failure_fails_readiness: bool,
+    /// Which gateway-authored responses carry an opaque
+    /// `X-Ferrum-Diagnostic-Ref` (`FERRUM_DIAGNOSTIC_REFS`, issues #5767 and
+    /// #5846): `off`, `errors`, or `all`. Default: `off` (no store is
+    /// allocated).
+    pub diagnostic_refs: crate::diagnostic_ref::DiagnosticRefMode,
+    /// Lifetime of a diagnostic reference in the in-memory store. Default: 900.
+    pub diagnostic_ref_ttl_seconds: u64,
+    /// Retained-reference ceiling; the oldest is evicted on overflow.
+    /// Default: 10000.
+    pub diagnostic_ref_max_entries: usize,
+    /// Admin `GET /diagnostics/v1/refs/{ref}` lookups admitted per second.
+    /// Default: 10.
+    pub diagnostic_ref_lookup_rate_per_second: u32,
+    /// Embed this process's random replica id in every diagnostic reference
+    /// (`fd2_<replica>_<32 hex>`) so a lookup on another replica can name the
+    /// owner (`FERRUM_DIAGNOSTIC_REF_REPLICA_TAG`, issue #5846). Default:
+    /// `false` (untagged `fd1_` references that embed nothing).
+    pub diagnostic_ref_replica_tag: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -3367,6 +3545,20 @@ pub struct EnvConfig {
     /// the X-Forwarded-For walk. If it is present but rejected, the socket IP
     /// remains the source of truth.
     pub real_ip_header: Option<String>,
+    /// Inbound PROXY protocol on the plaintext `FERRUM_PROXY_HTTP_PORT`
+    /// listener (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP`). Default `off`.
+    pub frontend_proxy_protocol_http: FrontendProxyProtocolMode,
+    /// Inbound PROXY protocol on the TLS `FERRUM_PROXY_HTTPS_PORT` listener
+    /// (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS`); the header precedes the TLS
+    /// ClientHello. Default `off`. HTTP/3 (QUIC) is never covered.
+    pub frontend_proxy_protocol_https: FrontendProxyProtocolMode,
+    /// Comma-separated CIDRs/IPs of the L4 load balancers allowed to send a
+    /// PROXY header to the HTTP/HTTPS listeners
+    /// (`FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS`). Required, strictly
+    /// parsed, and never a catch-all when either listener enables PROXY
+    /// protocol. Independent of `FERRUM_TRUSTED_PROXIES`, which keeps deciding
+    /// whose `X-Forwarded-For` / real-IP header is believed.
+    pub frontend_proxy_protocol_trusted_cidrs: String,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Mandatory when that
     /// plugin is enabled; must be a unique random value of at least 32 bytes.
@@ -3859,6 +4051,8 @@ impl Default for EnvConfig {
             admin_bind_address: "127.0.0.1".into(),
             allow_insecure_admin_http: false,
             admin_jwt_secret: None,
+            admin_jwt_viewer_secret: None,
+            admin_jwt_viewer_namespaces: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
             admin_jwt_audience: None,
@@ -4058,6 +4252,7 @@ impl Default for EnvConfig {
             authenticated_stream_max_lifetime_seconds: 3_600,
             websocket_max_incomplete_message_frames: 1_024,
             websocket_max_incomplete_message_seconds: 60,
+            websocket_permessage_deflate_max_message_bytes: 1_048_576,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -4096,6 +4291,12 @@ impl Default for EnvConfig {
             admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig::default(),
             admin_require_namespace_claim: false,
             gateway_listener_failure_fails_readiness: false,
+            diagnostic_refs: crate::diagnostic_ref::DiagnosticRefMode::Off,
+            diagnostic_ref_ttl_seconds: crate::diagnostic_ref::DEFAULT_TTL_SECONDS,
+            diagnostic_ref_max_entries: crate::diagnostic_ref::DEFAULT_MAX_ENTRIES,
+            diagnostic_ref_lookup_rate_per_second:
+                crate::diagnostic_ref::DEFAULT_LOOKUP_RATE_PER_SECOND,
+            diagnostic_ref_replica_tag: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             stream_gateway_ref: None,
@@ -4174,6 +4375,9 @@ impl Default for EnvConfig {
             via_pseudonym: "ferrum-edge".into(),
             add_forwarded_header: false,
             real_ip_header: None,
+            frontend_proxy_protocol_http: FrontendProxyProtocolMode::Off,
+            frontend_proxy_protocol_https: FrontendProxyProtocolMode::Off,
+            frontend_proxy_protocol_trusted_cidrs: String::new(),
             basic_auth_hmac_secret: None,
             datagram_proxy_protocol_secret: None,
             plugin_http_slow_threshold_ms: 1000,
@@ -4338,6 +4542,8 @@ impl EnvConfig {
             allow_insecure_admin_http: bool = "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" => false;
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
                 => required_for(["database", "cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            admin_jwt_viewer_secret: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_SECRET";
+            admin_jwt_viewer_namespaces: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
@@ -4361,6 +4567,35 @@ impl EnvConfig {
             gateway_listener_failure_fails_readiness: bool
                 = "FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS" => false;
         }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [diagnostics]
+            diagnostic_refs: String = "FERRUM_DIAGNOSTIC_REFS" => "off".to_string();
+            diagnostic_ref_ttl_seconds: u64 = "FERRUM_DIAGNOSTIC_REF_TTL_SECONDS"
+                => crate::diagnostic_ref::DEFAULT_TTL_SECONDS,
+                clamp(
+                    crate::diagnostic_ref::MIN_TTL_SECONDS,
+                    crate::diagnostic_ref::MAX_TTL_SECONDS
+                );
+            diagnostic_ref_max_entries: usize = "FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES"
+                => crate::diagnostic_ref::DEFAULT_MAX_ENTRIES,
+                clamp(
+                    crate::diagnostic_ref::MIN_MAX_ENTRIES,
+                    crate::diagnostic_ref::MAX_MAX_ENTRIES
+                );
+            diagnostic_ref_lookup_rate_per_second: u32
+                = "FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND"
+                => crate::diagnostic_ref::DEFAULT_LOOKUP_RATE_PER_SECOND,
+                clamp(
+                    crate::diagnostic_ref::MIN_LOOKUP_RATE_PER_SECOND,
+                    crate::diagnostic_ref::MAX_LOOKUP_RATE_PER_SECOND
+                );
+            diagnostic_ref_replica_tag: bool = "FERRUM_DIAGNOSTIC_REF_REPLICA_TAG" => false;
+        }
+        // Unknown values fail closed: a typo must neither disable nor widen
+        // which responses carry a diagnostic reference.
+        let diagnostic_refs = crate::diagnostic_ref::DiagnosticRefMode::parse(&diagnostic_refs)?;
         // Durable HTTPS-intent signal: the inherited default `9443` alone is not
         // an operator request. Capture whether the port key was actually present
         // so node-agent / shared planners can fail closed on explicit incomplete
@@ -4671,6 +4906,7 @@ impl EnvConfig {
             authenticated_stream_max_lifetime_seconds: u64 = "FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS" => 3_600u64;
             websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
             websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
+            websocket_permessage_deflate_max_message_bytes: usize = "FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES" => 1_048_576usize;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -4808,6 +5044,15 @@ impl EnvConfig {
         )
         .map_err(|error| error.to_string())?;
 
+        // Consumed by the secrets registry, not stored here: startup secret
+        // resolution reads it from the environment before this parse, and the
+        // runtime single-key fetches re-read it conf-file-aware. Validating the
+        // conf-file-aware value with the same pure parser makes a malformed,
+        // zero, or out-of-range `ferrum.conf` entry fail `run` / `validate`
+        // instead of the first runtime secret fetch.
+        let secret_fetch_timeout_raw = resolve_var(conf, SECRET_FETCH_TIMEOUT_SECONDS_KEY);
+        parse_secret_fetch_timeout(secret_fetch_timeout_raw.as_deref())?;
+
         let discovery_body_limits = parse_discovery_body_limits(
             resolve_var(conf, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY).as_deref(),
             resolve_var(conf, SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY).as_deref(),
@@ -4867,6 +5112,9 @@ impl EnvConfig {
             add_via_header: bool = "FERRUM_ADD_VIA_HEADER" => true;
             via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
             add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
+            frontend_proxy_protocol_http: FrontendProxyProtocolMode = "FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP" => FrontendProxyProtocolMode::Off;
+            frontend_proxy_protocol_https: FrontendProxyProtocolMode = "FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS" => FrontendProxyProtocolMode::Off;
+            frontend_proxy_protocol_trusted_cidrs: String = "FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS" => String::new();
             basic_auth_hmac_secret: Option<String> = "FERRUM_BASIC_AUTH_HMAC_SECRET";
             datagram_proxy_protocol_secret: Option<String> = "FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET";
             plugin_http_slow_threshold_ms: u64 = "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS" => 1000u64;
@@ -5355,6 +5603,8 @@ impl EnvConfig {
             admin_bind_address,
             allow_insecure_admin_http,
             admin_jwt_secret,
+            admin_jwt_viewer_secret,
+            admin_jwt_viewer_namespaces,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
             admin_jwt_audience,
@@ -5533,6 +5783,7 @@ impl EnvConfig {
             authenticated_stream_max_lifetime_seconds,
             websocket_max_incomplete_message_frames,
             websocket_max_incomplete_message_seconds,
+            websocket_permessage_deflate_max_message_bytes,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
@@ -5572,6 +5823,11 @@ impl EnvConfig {
             admin_audit_pipeline,
             admin_require_namespace_claim,
             gateway_listener_failure_fails_readiness,
+            diagnostic_refs,
+            diagnostic_ref_ttl_seconds,
+            diagnostic_ref_max_entries,
+            diagnostic_ref_lookup_rate_per_second,
+            diagnostic_ref_replica_tag,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,
@@ -5647,6 +5903,9 @@ impl EnvConfig {
             via_pseudonym,
             add_forwarded_header,
             real_ip_header,
+            frontend_proxy_protocol_http,
+            frontend_proxy_protocol_https,
+            frontend_proxy_protocol_trusted_cidrs,
             basic_auth_hmac_secret,
             datagram_proxy_protocol_secret,
             plugin_http_slow_threshold_ms,
@@ -7658,6 +7917,44 @@ impl EnvConfig {
             );
         }
 
+        // The role-ceiling viewer secret must be strong and must not equal any
+        // other admin-plane or CP/DP signing key: an identical HMAC key would
+        // let its holder mint tokens another verifier accepts without the
+        // viewer ceiling. Diagnostics name the settings, never the values.
+        if let Some(viewer_secret) = self
+            .admin_jwt_viewer_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            if viewer_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(format!(
+                    "FERRUM_ADMIN_JWT_VIEWER_SECRET must be at least {} characters (got {})",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH,
+                    viewer_secret.len()
+                ));
+            }
+            if self.admin_jwt_secret.as_deref() == Some(viewer_secret) {
+                return Err(
+                    crate::admin::jwt_auth::ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR.into(),
+                );
+            }
+            if self.cp_dp_grpc_jwt_secret.as_deref() == Some(viewer_secret) {
+                return Err(
+                    "FERRUM_ADMIN_JWT_VIEWER_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET must be \
+                     distinct secrets; identical HMAC keys are rejected because issuer claims \
+                     do not domain-separate shared signing material"
+                        .into(),
+                );
+            }
+        }
+
+        // The viewer-key namespace ceiling bounds a security boundary, so a
+        // malformed list fails startup instead of dropping entries. The parser
+        // is the one the admin plane uses, so `validate` and `run` agree.
+        if let Some(raw) = self.admin_jwt_viewer_namespaces.as_deref() {
+            crate::admin::jwt_auth::ViewerNamespaceCeiling::parse(raw)?;
+        }
+
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
             || self.http3_initial_mtu > crate::http3::config::QUIC_INITIAL_MTU_MAX
         {
@@ -7865,6 +8162,9 @@ impl EnvConfig {
         // rather than quietly shrinking the trust set at runtime.
         self.validate_trusted_proxies()?;
 
+        // Inbound PROXY protocol on the global HTTP/HTTPS listeners (#5768).
+        self.validate_frontend_proxy_protocol()?;
+
         // The datagram client-address envelope's MAC key (issue #3289).
         self.validate_datagram_proxy_protocol_secret()?;
 
@@ -8022,6 +8322,66 @@ impl EnvConfig {
                 )
             )
         })?;
+        Ok(())
+    }
+
+    /// Validate inbound PROXY protocol on the process-global HTTP/HTTPS proxy
+    /// listeners (issue #5768).
+    ///
+    /// `FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS` is parsed strictly
+    /// whenever it is set, for the same reason as `FERRUM_TRUSTED_PROXIES`: a
+    /// typo must not silently move a trust boundary. When either listener
+    /// enables PROXY protocol the list must also be non-empty and must not
+    /// admit every source of an address family — a trusted PROXY header lets
+    /// its sender choose the client address outright, so a catch-all list
+    /// would let any direct client spoof any source IP. The setting only
+    /// exists on the global proxy listeners, which run in database, file, and
+    /// dp modes; enabling it anywhere else is refused rather than silently
+    /// ignored.
+    fn validate_frontend_proxy_protocol(&self) -> Result<(), String> {
+        const TRUSTED_KEY: &str = "FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS";
+        let raw = &self.frontend_proxy_protocol_trusted_cidrs;
+        let trusted = crate::util::cidr::CidrSet::parse_strict(raw).map_err(|e| {
+            format!(
+                "Invalid {TRUSTED_KEY} {}: {e}. Every entry must be a valid IP or CIDR and \
+                 empty comma segments are rejected.",
+                crate::startup::quoted_config_value(TRUSTED_KEY, raw)
+            )
+        })?;
+        let mut enabled = Vec::with_capacity(2);
+        if self.frontend_proxy_protocol_http.is_enabled() {
+            enabled.push("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP");
+        }
+        if self.frontend_proxy_protocol_https.is_enabled() {
+            enabled.push("FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS");
+        }
+        if enabled.is_empty() {
+            return Ok(());
+        }
+        let keys = enabled.join(" / ");
+        if !matches!(
+            self.mode,
+            OperatingMode::Database | OperatingMode::File | OperatingMode::DataPlane
+        ) {
+            return Err(format!(
+                "{keys} enables inbound PROXY protocol, which only applies to the global \
+                 HTTP/HTTPS proxy listeners of database, file, and dp modes; unset it for \
+                 this mode"
+            ));
+        }
+        if trusted.is_empty() {
+            return Err(format!(
+                "{keys} enables inbound PROXY protocol but {TRUSTED_KEY} is empty; list the \
+                 load balancer source CIDRs allowed to send the PROXY header"
+            ));
+        }
+        if trusted.permits_all_family() {
+            return Err(format!(
+                "{TRUSTED_KEY} admits every source address of an address family; a trusted \
+                 PROXY header chooses the client address, so a catch-all list would let any \
+                 direct client spoof its source IP. List only the load balancer ranges"
+            ));
+        }
         Ok(())
     }
 

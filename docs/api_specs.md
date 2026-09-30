@@ -9,7 +9,7 @@ When you submit a spec, Ferrum Edge:
 1. Parses the document (JSON or YAML).
 2. Extracts Ferrum resources from the `x-ferrum-*` extension fields.
 3. Validates each resource against the same rules as the individual admin endpoints.
-4. Persists everything atomically (SQL transaction / MongoDB best-effort).
+4. Persists everything atomically (one SQL or replica-set MongoDB transaction; best-effort on standalone MongoDB, see [Atomicity and retries](#atomicity-and-retries)).
 5. Stores the compressed spec bytes with a SHA-256 content hash for later retrieval.
 
 **Hot-path isolation**: the `api_specs` table is admin-only metadata. The gateway runtime never reads spec rows, never loads them into `GatewayConfig`, and never distributes them via gRPC. Submitting or updating a spec does not interrupt or affect in-flight requests.
@@ -99,6 +99,9 @@ x-ferrum-plugins:        # OPTIONAL — array (all must be proxy-scoped)
           max_requests: 100
 
 x-ferrum-validate: true  # OPTIONAL — auto-generate openapi_validator
+# x-ferrum-mcp: true     # OPTIONAL — auto-generate an mcp_gateway serving the
+#                        # operations as MCP tools (not combinable with
+#                        # x-ferrum-validate in one document)
 
 paths:
   /:
@@ -113,7 +116,7 @@ At least one of `hosts` or `listen_path` must be set for HTTP-family proxies. Th
 
 ### `x-ferrum-upstream` (optional)
 
-A single `Upstream` object. Fields follow the same schema as `POST /upstreams` — see [admin_api.md](admin_api.md#upstreams). When present, the upstream is created and the proxy's `upstream_id` is automatically linked to it.
+A single `Upstream` object. Fields follow the same schema as `POST /upstreams` — see [admin_api.md](admin_api.md#upstreams). When present, the upstream is created and the proxy's `upstream_id` is set to it. If `x-ferrum-proxy` already sets a different `upstream_id`, the spec is rejected with 422 `ProxyUpstreamIdMismatch`.
 
 ### `x-ferrum-plugins` (optional)
 
@@ -170,7 +173,7 @@ x-ferrum-validate:
 - `false` or `null` — do not generate the plugin.
 - object — generate the plugin and apply the listed settings.
 
-The object form is a **closed** fixed-field object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` and `response` accept only `enabled` and `content_types`, and `bypass` accepts only `paths`, `methods`, `consumers`, and `header_present`. Any other key — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion. Unknown keys used to be copied verbatim into the generated plugin config, so a misspelled enforcement control deployed successfully with the weaker default still in force. The generated plugin config itself is closed the same way at construction; see [openapi_validator.md](openapi_validator.md#strict-config-admission).
+The object form is a **closed** fixed-field object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` and `response` accept only `enabled` and `content_types`, and `bypass` accepts only `paths`, `methods`, `consumers`, and `header_present`. Any other key — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion, so a misspelled enforcement control cannot silently fall back to a weaker default. The generated plugin config itself is closed the same way at construction; see [openapi_validator.md](openapi_validator.md#strict-config-admission).
 
 The importer walks `paths.{path}`, resolves local Path Item `$ref`s first, then enumerates HTTP methods and resolves local schema `$ref`s inside request/response content:
 
@@ -189,7 +192,7 @@ Supported `$ref` forms:
 - Draft 2020-12 plain-name anchors (OpenAPI 3.1+): `#Order` resolves to the schema object that declares `"$anchor": "Order"` in the current schema resource. Nested anchors inside applicator / `$defs` subschemas and schemas under `components.pathItems` are included. `$anchor` / `$id` / `id` / `$ref` fields in non-schema OpenAPI data (for example `x-ferrum-plugins` config) or in schema annotation payloads (`default` / `examples` / `const` / `enum`) are not interpreted during schema indexing or expansion. Duplicate anchors in one resource and missing anchors fail closed.
 - Draft 7 plain-name anchors (Swagger 2.0 / OpenAPI 3.0.x): `#Order` resolves via a fragment-only `"$id": "#Order"` (or Draft-4 `"id"`) in the current resource. Draft 7 names begin with a letter and may contain letters, digits, `-`, `_`, `.`, or `:`. The OpenAPI 3.1+ `$anchor` keyword is not consulted for 2.0 / 3.0.x documents.
 - Local `$id` resource scope: an absolute or relative `$ref` whose URI (without fragment) matches an `$id` declared on a Schema Object in the same document resolves locally, including fragments such as `https://example.com/schemas/order.json#OrderBody`. Duplicate same-document resource `$id` URIs fail closed. `$id` also rebases the JSON Pointer fragments evaluated inside that resource, including a `$ref` in the *same* Schema Object: `{"$id": "https://example.com/wrapper.json", "$ref": "#/components/schemas/Order"}` addresses `/components/schemas/Order` within the wrapper, not within the OpenAPI document, and fails closed with an error naming the resource that was searched. Reference the target by its own `$id` (or move the `$id`) instead.
-- **External / cross-document `$ref` (opt-in)**: relative and absolute references that leave the in-document resource set are resolved only when **both** `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED=true` and the per-spec `x-ferrum-external-refs` extension enable resolution. Each reference is resolved against the containing document's canonical base URI (not always the root). Absent either gate, external refs return HTTP 422 `UnsupportedExternalRef` (historical fail-closed default). See [External `$ref` policy](#external-ref-policy) below.
+- **External / cross-document `$ref` (opt-in)**: relative and absolute references that leave the in-document resource set are resolved only when **both** `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED=true` and the per-spec `x-ferrum-external-refs` extension enable resolution. Each reference is resolved against the containing document's canonical base URI (not always the root). Absent either gate, external refs return HTTP 422 `UnsupportedExternalRef`. See [External `$ref` policy](#external-ref-policy) below.
 
 URI fragments are percent-decoded deterministically before classification; percent-escape hex case is canonicalized for resource identity, and malformed percent-escapes are rejected. Malformed, duplicated, or unresolved local references (including Path Item refs) return HTTP 422 `SchemaReference`; external `$ref`s that are not admitted by policy return HTTP 422 `UnsupportedExternalRef`; reference chains deeper than the documented ceiling return HTTP 422 `SchemaTooDeep`; a `$ref` chain that re-enters a target still being expanded returns HTTP 422 `SchemaReferenceCycle`; and a reference expansion that exceeds the per-expansion budget (500,000 materialized values / the generated-config byte ceiling) or the cumulative per-document budget (2,000,000 materialized values / twice the generated-config byte ceiling, across every expansion in the document) returns HTTP 422 `SchemaTooLarge`. Generated request/response media entries, multipart encoding headers, response statuses, and complete operations are charged against the byte budget before they can accumulate into an oversized table; JSON escaping is included in that accounting.
 
@@ -209,17 +212,71 @@ If `x-ferrum-plugins` already includes an `openapi_validator`, the importer merg
 
 For full runtime settings and metadata keys, see [openapi_validator.md](openapi_validator.md).
 
+### `x-ferrum-mcp` (optional)
+
+Set `x-ferrum-mcp: true` (or an object) to publish the document's operations as **MCP tools**. The importer generates a proxy-scoped `mcp_gateway` in `aggregate_router` mode whose single `openapi` server (server id `openapi`) carries one tool per selected operation. Each `tools/call` then runs as an ordinary HTTP request to **this proxy's own configured backend** — through the same upstream selection, retries, circuit breaker, backend TLS, and observability as a direct request — and the backend response is returned as the MCP tool result. An API published once is callable by AI agents with no MCP server to write or host. See [plugins.md → OpenAPI bridge](plugins.md#openapi-bridge-generated-tools) for the runtime contract.
+
+```yaml
+x-ferrum-mcp:
+  enabled: true                 # default true for the object form
+  endpoint:
+    path: /pets/mcp             # default: listen_path + "/mcp"
+  namespace: pets               # tool-name prefix; default "api" (A-Za-z0-9_-, 1-64)
+  include:                      # empty/absent = every GET operation only
+    tags: [public]
+    operations: [getPet]        # by operationId
+  exclude:
+    operations: [deletePet]
+  limits:                       # copied into the generated server; see plugins.md
+    max_request_body_bytes: 1048576
+    max_response_body_bytes: 1048576
+    max_error_excerpt_bytes: 2048
+    max_structured_content_bytes: 262144
+  forward_request_headers: [x-api-version]  # client headers passed to the backend
+
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      x-ferrum-mcp:             # per operation: true / false, or an object
+        name: get_pet           # tool name (default: sanitized operationId, else method_path)
+        title: Get a pet
+        description: Fetch one pet by id
+        annotations: { openWorldHint: false }
+```
+
+`x-ferrum-mcp` accepts `true`, `false` / `null` (no generation), or a **closed** object with exactly the keys `enabled`, `endpoint` (`path`), `namespace`, `include` / `exclude` (`operations`, `tags`), `limits` (`max_request_body_bytes`, `max_response_body_bytes`, `max_error_excerpt_bytes`, `max_structured_content_bytes`), and `forward_request_headers` (client request headers a bridged call passes to the backend on top of `User-Agent`, `Accept-Language`, `traceparent`, and `tracestate`; copied to `openapi.forward_request_headers`); anything else is rejected with HTTP 400 and a spelling suggestion. A per-operation `x-ferrum-mcp` is `true` / `false` or a closed object with `expose`, `name`, `title`, `description`, and `annotations`.
+
+**Selection.** A per-operation `expose` (or boolean) is authoritative. Otherwise, when `include` names anything, an operation is selected when `include` names its `operationId` or one of its `tags`; with no `include` (including `x-ferrum-mcp: true`), **only `GET` operations are selected**. In both cases `exclude` then removes. A mutating operation (`POST`, `PUT`, `PATCH`, `DELETE`) is therefore published only when the document selects it explicitly — by `include` or by `x-ferrum-mcp: true` on the operation — because the proxy's method- and path-conditioned policy sees the MCP request, not the bridged one (see *Policy scope* below). Only `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` operations are bridged; `HEAD` / `OPTIONS` / `TRACE` are skipped (an explicit `expose: true` on one is an error). Selecting no bridgeable operation, or more than 256, is an error.
+
+**Policy scope.** A bridged call reaches the backend as `DELETE /pets/7` (say), but everything the proxy decides from the request line — the `allowed_methods` 405 filter, plugin triggers on `match.method` / `match.path`, WAF path, method, and query rules, and path-keyed authorization or rate limits — sees the client's `POST` to the MCP endpoint. Two things close the gap: a selected operation whose method `x-ferrum-proxy.allowed_methods` does not allow is rejected at import with HTTP 400 (and the gateway refuses such a call at runtime with JSON-RPC `-32001` too), and `allowed_methods` must allow `POST` for the MCP endpoint itself. Beyond that, restrict bridged operations in the generated gateway, not in route-level policy: leave them out of the selection, or embed an `mcp_gateway` whose `policy` denies, hides, or group-gates them.
+
+**Generated tools.** For each selected operation:
+
+- **`name`** — `x-ferrum-mcp.name`, else the `operationId` with every character outside `A-Za-z0-9_.-` replaced by `_`, else `method_path`. The public name is `namespace` + `.` + name, exactly like an aggregate tool, so `policy.tools` keys and per-consumer grants address generated tools the same way (`pets.get_pet`). Two operations producing one name is an error naming both.
+- **`title` / `description`** — the per-operation override, else `summary` / `description`.
+- **`inputSchema`** — a closed object with one property per path, query, and header parameter (keyed by the parameter name; Path Item parameters are overridden by operation parameters with the same `name` and `in`) plus `body` for the JSON request body. Path parameters are always required; `body` is required when `requestBody.required` is true. `$ref`s are resolved with the **same resolver, depth ceiling, and document-scoped expansion budget as `x-ferrum-validate`**, and OpenAPI 3.0 schemas get the same direction-aware normalization.
+- **`outputSchema`** — the JSON schema of the first 2xx response (exact codes in order, then `2XX`), published only when it is `type: object` (structured content is always an object).
+- **`annotations`** — `readOnlyHint: true` for `GET`, `destructiveHint: true` for `DELETE`, `idempotentHint: true` for `PUT`; the per-operation `annotations` override any of them.
+- **`path`** — the operation's **public** path on this proxy: the literal `listen_path` prefix, then the first effective server pathname (operation → Path Item → root `servers`, as for `x-ferrum-validate`), then the Paths key. The document's `servers[]` URLs contribute only a pathname and are **never dialed**.
+
+**Rejected (HTTP 400 `MalformedExtension`, naming the operation — exclude it to proceed):** header parameters named after a hop-by-hop or framing field, `Host`, `Authorization`, `Cookie`, `Proxy-*`, `X-Forwarded-*`, `Forwarded`, a client-address field (`X-Real-IP`, `True-Client-IP`, `CF-Connecting-IP`, `X-Client-IP`), a method or URL override (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`, `X-Original-URL`, `X-Rewrite-URL`, `X-Original-URI`), `Range` / `If-Range`, trace context (`traceparent`, `tracestate`, `baggage`), `Early-Data`, `HTTP2-Settings`, an MCP transport field (`Mcp-*`, `Last-Event-ID`), a service-mesh control field (`X-Envoy-*`, `X-Istio-*`, `L5d-*`), or a Ferrum-internal field (`X-Ferrum-*`, `Ferrum-*`, `X-Gateway-*`, `X-Consumer-*`), compared case-insensitively with `_` treated as `-`; a selected operation whose method `allowed_methods` does not allow; `in: cookie` parameters; parameters described by `content`; non-default `style`; query `explode: false`; `allowReserved: true`; a parameter with no `schema`; object-typed parameters and array path parameters (the plugin rejects those at load); a path template expression that does not occupy a whole segment; a *required* request body with no JSON media type (an optional one is simply not offered); and any Swagger 2.0 document. The same header-name rule is enforced again when the generated plugin loads (which also refuses the configured `FERRUM_REAL_IP_HEADER` and the MCP session headers) and when each call is built (which also refuses the request's `correlation_id` header).
+
+**Generated plugin.** The generated config sets `discovery.on_new_tool` / `on_schema_change` to `allow` and `policy.default_action` to `allow` (publishing the document is the decision to expose these operations), turns resource and prompt aggregation off, and stays **proxy-scoped** like every spec plugin. If `x-ferrum-plugins` already embeds one `mcp_gateway`, the generated config is merged into it: the operator's blocks win (for example `policy` with `default_action: deny` plus per-tool `allowed_groups`), `servers` are merged (the `openapi` id is reserved), and `mode` must stay `aggregate_router`. The embedded config is still walked for forbidden credential/consumer keys like every `x-ferrum-plugins` entry; the generated tool schemas are not (a schema property named `consumer` is ordinary document data). Generated configs (any `mcp_gateway` with an `openapi` server) share the `openapi_validator` budget (14 MiB, nesting depth 64); each tool definition is bounded at 256 KiB.
+
+**Constraints.** `x-ferrum-mcp` requires an OpenAPI 3.x document and a literal-prefix `x-ferrum-proxy.listen_path` (or none). The endpoint must sit under that prefix and must not overlap a bridged operation path (the MCP endpoint reserves its whole subtree). It cannot be combined with `x-ferrum-validate` in one document in this version: the client request targets the MCP endpoint while the backend receives the operation's path, so the generated validator would refuse the endpoint as an unknown operation. Argument validation for bridged calls is the gateway's own `validation.validate_tool_arguments` against the generated `inputSchema`.
+
 ## What is NOT allowed in specs
 
-The following are rejected at parse time with a 400 error:
+The following are rejected with HTTP 422 (the `code` field of the error body is shown in parentheses):
 
-- **`x-ferrum-consumers`** — use `POST /consumers` directly. Credentials cannot be embedded in spec documents.
-- **Plugin `scope: global` or `scope: proxy_group`** — only proxy-scoped plugins are allowed. A single shared plugin instance across multiple proxies cannot be expressed via a single-proxy spec bundle.
-- **Plugin `proxy_id` mismatch** — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
-- **Forbidden keys in plugin `config`** — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth triggers a 400 `PluginContainsCredentials` error: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`.
+- **`x-ferrum-consumers`** (`ConsumerExtensionNotAllowed`) — use `POST /consumers` directly. Credentials cannot be embedded in spec documents.
+- **Plugin `scope: global` or `scope: proxy_group`** (`PluginInvalidScope`) — only proxy-scoped plugins are allowed. A single shared plugin instance across multiple proxies cannot be expressed via a single-proxy spec bundle.
+- **Plugin `proxy_id` mismatch** (`PluginProxyIdMismatch`) — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
+- **Forbidden keys in plugin `config`** (`PluginContainsCredentials`) — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth is rejected: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`.
 - **External `$ref`s without opt-in policy** — when process policy or `x-ferrum-external-refs` leave resolution disabled, external Path Item and schema `$ref`s fail closed with HTTP 422 `UnsupportedExternalRef`.
 
-  Note the distinction: a `plugin_name: "jwt"` plugin is fine — the check walks the plugin's `config` *value*, not the plugin metadata fields. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
+The credential-key check walks the plugin's `config` *value*, not the plugin metadata, so a plugin named `jwt` is fine. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
 ### External `$ref` policy {#external-ref-policy}
 
@@ -274,7 +331,7 @@ x-ferrum-external-refs:
 | `created_at` | timestamp | Set on POST; preserved on PUT |
 | `updated_at` | timestamp | Set on POST and PUT |
 
-**Uniqueness**: a `UNIQUE(namespace, proxy_id)` constraint ensures at most one spec per proxy per namespace. Spec identity itself is `(namespace, id)`: the SQL primary key is composite and the MongoDB durable key is `_id = "{namespace}:{id}"`, so two tenants may hold specs with the same bare id and the foreign key can only ever reach a proxy in the spec's own namespace (issue #4627).
+**Uniqueness**: a `UNIQUE(namespace, proxy_id)` constraint ensures at most one spec per proxy per namespace. Spec identity itself is `(namespace, id)`: the SQL primary key is composite and the MongoDB durable key is `_id = "{namespace}:{id}"`, so two tenants may hold specs with the same bare id and the foreign key can only ever reach a proxy in the spec's own namespace.
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
@@ -300,8 +357,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 |---|---|---|
 | `database` | Supported | Supported |
 | `cp` (Control Plane) | Supported — proxy/upstream/plugins are distributed to DPs via gRPC; the spec row itself stays on the CP and is not distributed | Supported |
-| `dp` (Data Plane) | 503 Service Unavailable (no database) | 503 Service Unavailable (no database) |
-| `file` | 403 Forbidden (read-only mode) | 503 Service Unavailable (no database) |
+| `dp` (Data Plane), `file`, `mesh` | 403 Forbidden (read-only mode) | 503 Service Unavailable (no database) |
 
 ## Atomicity and retries
 
@@ -460,7 +516,7 @@ To keep the filter correct, tag names must not contain any of the following char
 
 Tags with forbidden characters are rejected at submit time with HTTP 422 `InvalidTagName`. MongoDB uses native array membership and is not affected by the `LIKE` limitation, but the same character restrictions apply for consistency.
 
-**If you extend this whitelist in `src/admin/api_specs/extractor.rs`, you must also update the `has_tag` query in `src/config/db_loader.rs` to add an `ESCAPE` clause and pre-escape the tag value.**
+**Maintainer note:** if you allow any of these characters in `src/admin/api_specs/extractor.rs`, you must also update the `has_tag` query in `src/config/db_loader.rs` to add an `ESCAPE` clause and pre-escape the tag value.
 
 ```bash
 # Filter examples
@@ -649,7 +705,54 @@ paths:
 
 Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract` for `POST /orders`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
 
-### 5. Updating a spec via PUT — what survives
+### 5. Proxy exposed to AI agents as MCP tools
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Pets API
+  version: 1.0.0
+
+x-ferrum-mcp:
+  namespace: pets
+
+x-ferrum-proxy:
+  id: pets
+  listen_path: /pets-api
+  backend_host: pets.internal
+  backend_port: 8080
+
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      summary: Get a pet
+      parameters:
+        - { name: petId, in: path, required: true, schema: { type: string } }
+        - { name: verbose, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: the pet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { id: { type: string }, name: { type: string } }
+  /pets:
+    post:
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string } } }
+      responses:
+        "201": { description: created }
+```
+
+Submitting this spec creates the proxy plus a generated `mcp_gateway` at `/pets-api/mcp` publishing only `pets.getPet`: with no `include`, a mutating operation needs an explicit opt-in, so `createPet` stays unpublished until it carries `x-ferrum-mcp: true` (or `include: { operations: [getPet, createPet] }`). An MCP client calls `initialize`, then `tools/call` `pets.getPet` with `{"petId": "7", "verbose": true}`; the gateway sends `GET /pets/7?verbose=true` to `pets.internal:8080` (the listen path is stripped exactly as for a direct request) and answers with `{"content": [{"type": "text", "text": "…"}], "structuredContent": {…}, "isError": false}`.
+
+### 6. Updating a spec via PUT — what survives
 
 Assume the spec from example 3 was submitted. Then a plugin was added manually:
 

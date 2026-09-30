@@ -521,6 +521,31 @@ pub(crate) async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeou
     }
 }
 
+/// The process-global HTTP/HTTPS proxy frontends this process will own, by
+/// the same pre-bound-first resolution as [`effective_reserved_ports`]. The
+/// HTTPS frontend counts only when frontend TLS is configured, because the
+/// HTTPS listener does not start without it.
+fn effective_process_global_frontends(
+    env_config: &EnvConfig,
+    prebound: &ServeOptions,
+) -> proxy::gateway_listener::ProcessGlobalFrontends {
+    let resolve = |listener: &Option<TcpListener>, env_port: u16| -> Option<u16> {
+        match listener {
+            Some(listener) => listener.local_addr().ok().map(|addr| addr.port()),
+            None => Some(env_port),
+        }
+    };
+    let tls_port = if env_config.frontend_tls_cert_path.is_some() {
+        resolve(&prebound.proxy_https, env_config.proxy_https_port)
+    } else {
+        None
+    };
+    proxy::gateway_listener::process_global_frontends(
+        resolve(&prebound.proxy_http, env_config.proxy_http_port),
+        tls_port,
+    )
+}
+
 /// Build the reserved-port set [`serve`] uses for stream-proxy conflict
 /// validation and for `AdminState::reserved_ports`.
 ///
@@ -763,6 +788,11 @@ pub async fn serve(
         config.consumers.len()
     );
 
+    // Inbound PROXY protocol policy per global proxy listener (issue #5768).
+    // Resolved before anything is spawned so a refusal leaves nothing behind.
+    let proxy_protocol = proxy::frontend_proxy_protocol::global_listener_policies(&env_config)
+        .map_err(anyhow::Error::msg)?;
+
     // Open the observability delivery lifecycle for this serving cycle before
     // plugin activation registers any queue worker. A previous in-process
     // cycle that already drained leaves its generation permanently closed, so
@@ -819,6 +849,20 @@ pub async fn serve(
         }
         return Err(anyhow::anyhow!(
             "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+    // An HTTP-family route cannot claim a process-global proxy frontend of
+    // the other class, or put a dedicated Sidecar ingress bind on one (issue
+    // #5922). Checked against the frontends this process will actually own.
+    let frontends = effective_process_global_frontends(&env_config, &prebound);
+    if let Err(errors) =
+        proxy::gateway_listener::validate_process_global_frontend_conflicts(&config, &frontends)
+    {
+        for msg in &errors {
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
+        }
+        return Err(anyhow::anyhow!(
+            "Gateway listener port conflicts with a process-global proxy frontend"
         ));
     }
 
@@ -1069,19 +1113,19 @@ pub async fn serve(
         // `FERRUM_ADMIN_JWT_*` globals.
         jm
     } else {
-        match create_jwt_manager_from_env() {
-            Ok(jm) => jm,
-            Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
+        let jwt_manager = create_jwt_manager_from_env().or_else(|error| match error {
+            crate::admin::jwt_auth::JwtError::NotConfigured => {
                 warn!(
                     "Admin JWT not configured, generating a random read-only secret; \
-                     admin endpoints will reject externally minted tokens"
+                     admin endpoints will reject externally minted tokens other than \
+                     FERRUM_ADMIN_JWT_VIEWER_SECRET viewer tokens"
                 );
-                let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-                crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                    secret: random_secret,
-                    ..Default::default()
-                })
+                crate::admin::jwt_auth::random_read_only_jwt_manager()
             }
+            other => Err(other),
+        });
+        match jwt_manager {
+            Ok(jm) => jm,
             Err(e) => {
                 let startup_err = anyhow::anyhow!("Invalid admin JWT configuration: {}", e);
                 shutdown_file_background_startup_tasks(
@@ -1368,10 +1412,13 @@ pub async fn serve(
         bound.proxy_http = listener.local_addr().ok();
         let st = proxy_state.clone();
         let sh = shutdown_tx.subscribe();
+        let pp = proxy_protocol.http.clone();
         let h = tokio::spawn(async move {
-            proxy::start_proxy_listener_with_bound_listener(listener, st, sh, None)
-                .await
-                .context("HTTP proxy listener failed")
+            proxy::start_proxy_listener_with_bound_listener_and_proxy_protocol(
+                listener, st, sh, None, pp,
+            )
+            .await
+            .context("HTTP proxy listener failed")
         });
         handles.push(("HTTP proxy listener".to_string(), h));
         // Pre-bound listener is already accepting — no startup signal needed.
@@ -1381,6 +1428,7 @@ pub async fn serve(
         let st = proxy_state.clone();
         let sh = shutdown_tx.subscribe();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let pp = proxy_protocol.http.clone();
         let h = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
@@ -1390,11 +1438,12 @@ pub async fn serve(
                     &http_addr.to_string(),
                 ))
             );
-            proxy::start_proxy_listener_with_tls_and_signal(
+            proxy::start_global_proxy_listener_with_tls_and_signal(
                 http_addr,
                 st,
                 sh,
                 None,
+                pp,
                 Some(started_tx),
             )
             .await
@@ -1416,10 +1465,13 @@ pub async fn serve(
             let st = proxy_state.clone();
             let sh = shutdown_tx.subscribe();
             let cfg = Some(tls_cfg_arc.clone());
+            let pp = proxy_protocol.https.clone();
             let h = tokio::spawn(async move {
-                proxy::start_proxy_listener_with_bound_listener(listener, st, sh, cfg)
-                    .await
-                    .context("HTTPS proxy listener failed")
+                proxy::start_proxy_listener_with_bound_listener_and_proxy_protocol(
+                    listener, st, sh, cfg, pp,
+                )
+                .await
+                .context("HTTPS proxy listener failed")
             });
             handles.push(("HTTPS proxy listener".to_string(), h));
         } else if env_config.proxy_https_port != 0 {
@@ -1432,6 +1484,7 @@ pub async fn serve(
                 .as_ref()
                 .and_then(|h| h.slot.clone());
             let cfg = Some(tls_cfg_arc.clone());
+            let pp = proxy_protocol.https.clone();
             let h = tokio::spawn(async move {
                 info!(
                     "Starting HTTPS proxy listener on {}",
@@ -1442,20 +1495,22 @@ pub async fn serve(
                     ))
                 );
                 let result = if let Some(slot) = reload_slot {
-                    proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                    proxy::start_global_proxy_listener_with_dynamic_tls_and_signal(
                         https_addr,
                         st,
                         sh,
                         slot,
+                        pp,
                         Some(started_tx),
                     )
                     .await
                 } else {
-                    proxy::start_proxy_listener_with_tls_and_signal(
+                    proxy::start_global_proxy_listener_with_tls_and_signal(
                         https_addr,
                         st,
                         sh,
                         cfg,
+                        pp,
                         Some(started_tx),
                     )
                     .await
@@ -1591,7 +1646,9 @@ pub async fn serve(
                             client_ca_bundle_path: h3_client_ca,
                             client_crls: h3_client_crls,
                             started_tx: Some(started_tx),
+                            accept_gate: None,
                             frontend_tls_reload: h3_reload,
+                            udp_port_hold: None,
                         },
                     )
                     .await

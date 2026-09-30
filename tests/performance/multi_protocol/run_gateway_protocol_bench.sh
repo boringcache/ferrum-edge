@@ -226,7 +226,7 @@ supports() {
     #   proxying — both are Enterprise-only (see
     #   https://www.krakend.io/docs/enterprise/backends/grpc/ and
     #   https://www.krakend.io/docs/enterprise/websockets/). We ship the CE
-    #   image (krakend:2.13.2), so krakend is omitted from grpcs and wss.
+    #   image (krakend:2.13.11), so krakend is omitted from grpcs and wss.
     #
     # - Kong HTTP/3: KONG_PROXY_LISTEN doesn't accept http3/quic flags, and
     #   HTTP/3 would require experimental KONG_NGINX_HTTP_LISTEN template
@@ -298,11 +298,11 @@ bench_params() {
 # tags) so benchmark runs remain reproducible over time. Bump deliberately when
 # upgrading; do not revert to floating tags.
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
-ENVOY_IMAGE="envoyproxy/envoy:v1.33.5"
-KONG_IMAGE="kong/kong-gateway:3.10.0.0"
-TYK_IMAGE="tykio/tyk-gateway:v5.3.0"
-REDIS_IMAGE="redis:7.4.1-alpine"
-KRAKEND_IMAGE="krakend:2.13.2"
+ENVOY_IMAGE="envoyproxy/envoy:v1.39.1"
+KONG_IMAGE="kong/kong-gateway:3.16.0.0"
+TYK_IMAGE="tykio/tyk-gateway:v5.15.0"
+REDIS_IMAGE="redis:8.4.7-alpine"
+KRAKEND_IMAGE="krakend:2.13.11"
 
 # ── State ────────────────────────────────────────────────────────────────────
 BACKEND_PID=""
@@ -311,9 +311,67 @@ GATEWAY_CID=""
 sampler_pid=""
 sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
+# Every fixed port this runner's backend/gateways/Redis/Envoy bind. The startup
+# conflict check and cleanup share this list so they cannot drift apart.
+BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
+50052 50053 \
+$GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
+$GATEWAY_TCP_TLS_PORT $GATEWAY_UDP_PORT $GATEWAY_UDP_DTLS_PORT \
+15000 9901 6379"
+
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Gracefully stop a Docker container this run started: `docker stop` (SIGTERM
+# then bounded SIGKILL) with a forced removal fallback.
+stop_container() {
+    local cid="$1"
+    [ -z "$cid" ] && return 0
+    docker stop --time 5 "$cid" >/dev/null 2>&1 || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+}
+
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[error] required TCP port $port is already in use; inspect with: lsof -nP -iTCP:$port -sTCP:LISTEN" >&2
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo "[error] required UDP port $port is already in use; inspect with: lsof -nP -iUDP:$port" >&2
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "[error] lsof is required to detect port conflicts before starting." >&2
+        return 1
+    fi
+    local port
+    for port in $BENCH_PORTS; do
+        check_port_available "$port" || return 1
+    done
+}
 
 cleanup() {
-    echo "[cleanup] stopping all processes..."
+    echo "[cleanup] stopping processes this run started..."
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
@@ -322,23 +380,17 @@ cleanup() {
         fi
         wait "$sampler_pid" || true
     fi
-    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
-    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    stop_pid "$BACKEND_PID"
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
     h1_trace_stop
-    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
-                50052 50053 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
-                $GATEWAY_TCP_TLS_PORT $GATEWAY_UDP_PORT $GATEWAY_UDP_DTLS_PORT \
-                15000 9901 6379; do
-        lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    done
 }
 if [ "$H1_PROFILE" != diagnostic ]; then
     trap cleanup EXIT
 fi
 # Diagnostic cleanup is unconditional in the independent supervisor. In
-# particular it does not inherit cleanup()'s unbounded waits or port-wide kill.
+# particular it does not inherit cleanup()'s owned-process waits; that rerun
+# path stops and removes only the gateway/backend IDs that supervisor started.
 
 # ── Build ────────────────────────────────────────────────────────────────────
 build_binaries() {
@@ -495,10 +547,9 @@ start_ferrum() {
         -e "FERRUM_WEBSOCKET_TUNNEL_MODE=true" \
         -e "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608" \
         -e "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432" \
-        -e "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true" \
+        -e "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false" \
         -e "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576" \
         -e "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
-        -e "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=16" \
         -e "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
         -e "FERRUM_UDP_MAX_SESSIONS=10000" \
         -e "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64" \
@@ -651,6 +702,11 @@ start_kong() {
 
     local extra_env=()
     [ -n "$stream_listen_env" ] && extra_env+=(-e "KONG_STREAM_LISTEN=$stream_listen_env")
+    # configs/kong/wss.yaml raises the WebSocket payload limits from a
+    # pre-function plugin via kong.websocket.*. Kong 3.14+ defaults
+    # untrusted_lua to `strict`, which hides that PDK (every upgrade then
+    # 500s); `sandbox` restores the pre-3.14 default the config relies on.
+    [ "$PROTOCOL" = wss ] && extra_env+=(-e "KONG_UNTRUSTED_LUA=sandbox")
 
     GATEWAY_CID=$(docker run -d --rm --network host \
         -e "KONG_DATABASE=off" \
@@ -743,27 +799,24 @@ start_tyk() {
     # Tyk listens on 8443 when TLS is enabled in tyk.conf
     echo "[tyk] starting with apps=$apps_dir..."
 
-    # Install the benchmark CA into the container's system trust store
-    # before launching Tyk. Tyk Classic API `transport.ssl_ca_cert` does
-    # NOT configure upstream trust (confirmed locally: it's a no-op —
-    # handshakes fail with the same error whether ssl_ca_cert points at
-    # the real cert or a nonexistent path). The Go `net/http` transport
-    # Tyk uses for reverse-proxy upstreams consults the default system
-    # RootCAs pool, so the reliable fix is to install the PEM as a
-    # system CA before starting the gateway. Tyk's image is Debian
-    # bookworm-based with `update-ca-certificates` available, and runs
-    # as root by default.
+    # Point Tyk's system trust store at the benchmark CA. Tyk Classic API
+    # `transport.ssl_ca_cert` does NOT configure upstream trust (confirmed
+    # locally: it's a no-op — handshakes fail with the same error whether
+    # ssl_ca_cert points at the real cert or a nonexistent path). The Go
+    # `net/http` transport Tyk uses for reverse-proxy upstreams consults
+    # the default system RootCAs pool, which Go loads from SSL_CERT_FILE.
+    # The v5.15 image is distroless (no shell, non-root) and already sets
+    # SSL_CERT_FILE, so override it rather than running
+    # update-ca-certificates. The only upstream is the benchmark backend,
+    # and every API config keeps ssl_insecure_skip_verify=false, so
+    # upstream verification stays on against exactly the benchmark CA.
     GATEWAY_CID=$(docker run -d --rm --network host \
+        -e "SSL_CERT_FILE=/etc/tyk/certs/ca.pem" \
         -v "$apps_dir:/etc/tyk/apps:ro" \
         -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
-        --entrypoint sh \
         "$TYK_IMAGE" \
-        -c 'cp /etc/tyk/certs/ca.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
-    # All-`&&` chain so a trust-store setup failure exits before Tyk
-    # starts. Otherwise Tyk would run without the benchmark CA while
-    # every API config enforces ssl_insecure_skip_verify=false, turning
-    # the bench into silent 0-RPS rows rather than a loud startup error.
+        --conf /opt/tyk-gateway/tyk.conf)
 
     wait_for_gateway
 }
@@ -949,8 +1002,8 @@ h1_trace_stop() {
 stop_gateway() {
     # Successful run_bench already obtained the supervisor's teardown receipt.
     # Startup/abort cleanup has no receipt and must remain an incomplete capture.
-    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
-    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
     h1_trace_stop
     GATEWAY_CID=""
     REDIS_CID=""
@@ -1223,6 +1276,10 @@ main() {
     mkdir -p "$OUTPUT_DIR"
     echo "[main] protocol=$PROTOCOL sizes=$PAYLOAD_SIZES gateways=$GATEWAYS"
 
+    # Refuse to start on a host that already has any benchmark port bound rather
+    # than silently killing the unrelated listener later.
+    check_ports_available || exit 1
+
     # A paired suite is self-contained even when the frozen caller passes
     # --skip-direct after iteration one. Every pair measures direct again.
     if $SKIP_DIRECT; then
@@ -1352,6 +1409,10 @@ PYEOF
             >> "$root_output/images.txt"
     fi
     if [ "$UDP_PROFILE" = profile ]; then
+        # The UDP internal profile keeps its manifest-declared unchanged Kong
+        # baseline, independent of the benchmark KONG_IMAGE pin above.
+        KONG_IMAGE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["kong_provenance"]["image"])' \
+            "$SCRIPT_DIR/udp_profile_manifest.json")
         # Preserve tag and immutable image evidence; no vendor correspondence inferred.
         docker image inspect "$KONG_IMAGE" > "$root_output/kong-image.json"
         KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')

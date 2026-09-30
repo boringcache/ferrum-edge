@@ -9,16 +9,17 @@ import re
 import sys
 import textwrap
 from pathlib import Path
+from verify_cross_build_policy import cargo_cache_branch_projection
 
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
 from test_unit_ci import (
-    COMMANDS as UNIT_CI_COMMANDS,
     check_repository as unit_ci_contract_errors,
     self_test as unit_ci_self_test,
 )
 
 from check_markdown_links import check_repository, run_self_test
+from ci_gate_replay import self_test as ci_gate_replay_self_test
 from check_node_agent_chart_runtime import (
     check_repository as check_node_agent_chart_runtime,
     main as node_agent_chart_runtime_main,
@@ -40,11 +41,17 @@ from pr_ci_plan import (
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
+from validate_migrate_k8s_contract import (
+    run_self_test as published_image_tags_self_test,
+)
 from verify_coverage_workflow import (
     main as coverage_workflow_main,
 )
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
+)
+from verify_main_latest_image_workflow import (
+    main as main_latest_image_workflow_main,
 )
 from verify_install_docs_contract import (
     run_self_test as install_docs_contract_self_test,
@@ -72,7 +79,6 @@ from verify_release_image_attestations import (
     validate_release_workflow,
 )
 from verify_ci_runtime_cache import (
-    BORINGCACHE_CARGO_PREFIX,
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
@@ -110,6 +116,7 @@ REQUIRED_JOBS = {
     "netns-capture-live",
     "two-cluster-mesh-live",
     "build-binaries",
+    "standalone-cargo",
 }
 
 # Every compile-based job is now path-gated by the PR planner: a job runs on
@@ -142,6 +149,7 @@ PATH_GATED_JOBS = {
     "build-binaries": "run_platform_build",
     "test-vendor-patches": "run_vendor_patches",
     "dependency-audit": "run_dependency_audit",
+    "standalone-cargo": "run_standalone_cargo",
 }
 
 # Every path-gated job keeps this exact event set: PRs, merge-queue checks,
@@ -770,10 +778,13 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("push-to-main verification must build Linux x86_64 only")
 
     build_body = extract_job_body(ci_yml, "build-binaries")
+    build_body = cargo_cache_branch_projection(build_body)
+    build_body = re.sub(r'(?m)^(        )run: \|\n          (cargo [^\n]+)\n',
+                        r'\1run: \2\n', build_body)
     macos_check_gate = (
         "- name: Check merge-group macOS target\n"
         "        if: github.event_name == 'merge_group' && runner.os == 'macOS'\n"
-        f"        run: {BORINGCACHE_CARGO_PREFIX}binaries check --features cloud-secrets --profile pr-build "
+        "        run: cargo check --features cloud-secrets --profile pr-build "
         "--target ${{ matrix.target }}"
     )
     if macos_check_gate not in build_body:
@@ -783,15 +794,15 @@ def native_binary_compile_gate_self_test() -> list[str]:
     native_build_gate = (
         "- name: Build fast verification binary\n"
         "        if: github.event_name != 'merge_group' || runner.os != 'macOS'\n"
-        f"        run: {BORINGCACHE_CARGO_PREFIX}binaries build --features cloud-secrets --profile pr-build "
+        "        run: cargo build --features cloud-secrets --profile pr-build "
         "--target ${{ matrix.target }}"
     )
     if native_build_gate not in build_body:
         failures.append("CI must use linked pr-build binaries on Linux/Windows")
     if "--release" in build_body or "LINUX_GNU_PROFILE: release" in build_body:
         failures.append("CI must not compile production release binaries")
-    if build_body.count(BORINGCACHE_CARGO_PREFIX + "binaries ") != 2:
-        failures.append("CI verification must use the binaries Cargo cache profile")
+    if 'shared-key: "build-${{ matrix.target }}-prbuild"' not in build_body:
+        failures.append("CI verification must use the prbuild cache namespace")
     if "./.github/actions/setup-sccache" not in build_body:
         failures.append(
             "jobs.build-binaries must install sccache via the pinned repository action"
@@ -1590,7 +1601,7 @@ def main() -> int:
     unit_inline = "Run inline lib tests"
     unit_hardening = "Run cache accounting and reload safety regressions"
     if not (
-        unit_body.count(UNIT_CI_COMMANDS["default-build"]) == 1
+        unit_body.count("cargo test $UNIT_PRECOMPILE_TARGETS --no-run") == 1
         and unit_body.count('precompile: "--lib"') == 1
         and unit_body.count('precompile: "--test unit_tests"') == 1
         and 0 <= unit_body.find(unit_precompile)
@@ -1615,7 +1626,7 @@ def main() -> int:
     pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
     if not (
         pkcs11_body.count(
-            BORINGCACHE_CARGO_PREFIX + "pkcs11 test --features pkcs11 --lib --test unit_tests --no-run"
+            "cargo test --features pkcs11 --lib --test unit_tests --no-run"
         )
         == 1
         and 0 <= pkcs11_body.find(pkcs11_precompile)
@@ -2220,6 +2231,11 @@ def main() -> int:
         planner_errors.append("coverage workflow verifier self-test failed")
     if coverage_workflow_main([]) != 0:
         planner_errors.append("coverage workflow shard-plan contract failed")
+    if main_latest_image_workflow_main(["--self-test"]) != 0:
+        planner_errors.append("main latest image publisher self-test failed")
+    if main_latest_image_workflow_main([]) != 0:
+        planner_errors.append("main latest image publisher contract failed")
+    planner_errors.extend(published_image_tags_self_test())
     if ci_runtime_cache_main(["--self-test"]) != 0:
         planner_errors.append("CI runtime cache contract self-test failed")
     if ci_runtime_cache_main([]) != 0:
@@ -2230,6 +2246,8 @@ def main() -> int:
     # influence which jobs the trusted scheduler selected.
     if planner_self_test() != 0:
         planner_errors.append("proposed PR CI planner self-test failed")
+    if ci_gate_replay_self_test() != 0:
+        planner_errors.append("CI gate replay self-test failed")
     try:
         run_self_test()
     except AssertionError as error:

@@ -333,16 +333,118 @@ pub fn count_grpc_length_prefixed_messages(data: &[u8]) -> u64 {
     count
 }
 
+/// Flag bit that marks a gRPC-Web trailer frame (`0x80`, or `0x81` when
+/// compressed): trailing metadata, not a message.
+const GRPC_WEB_TRAILER_FLAG: u8 = 0x80;
+
+/// Wire framing a [`GrpcLengthPrefixedScanner`] reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrpcMessageFraming {
+    /// Native gRPC: every length-prefixed frame is a message.
+    #[default]
+    Native,
+    /// Binary gRPC-Web: a frame with the trailer flag bit is metadata.
+    GrpcWeb,
+    /// `grpc-web-text`: base64 over gRPC-Web frames. Each 4-character group
+    /// decodes on its own, because a sender may pad at every flush boundary.
+    GrpcWebText,
+}
+
+impl GrpcMessageFraming {
+    /// gRPC-Web framing, base64 text when `text_mode`.
+    pub fn grpc_web(text_mode: bool) -> Self {
+        if text_mode {
+            Self::GrpcWebText
+        } else {
+            Self::GrpcWeb
+        }
+    }
+}
+
 /// Incremental scanner for gRPC length-prefixed messages spanning DATA frames.
-#[derive(Debug, Default)]
+///
+/// State is fixed-size: a message payload is skipped by its declared length,
+/// never buffered, and text framing holds at most one partial base64 group.
+/// gRPC-Web framing counts only frames without the trailer flag bit. Base64 the
+/// scanner cannot decode stops counting for the rest of the body.
+/// Completed-message increments use `Release`, matching the buffered
+/// `fetch_max` writer, so the `Acquire` readers that emit the metric observe
+/// every count published before the body finished.
+#[derive(Clone, Debug, Default)]
 pub struct GrpcLengthPrefixedScanner {
+    framing: GrpcMessageFraming,
     header: [u8; 5],
     header_filled: u8,
     remaining: Option<u32>,
+    /// Whether the frame being walked is a message rather than metadata.
+    frame_is_message: bool,
+    text_group: [u8; 4],
+    text_group_len: u8,
+    malformed: bool,
 }
 
 impl GrpcLengthPrefixedScanner {
-    pub fn push(&mut self, mut data: &[u8], messages: &AtomicU64) {
+    /// A scanner for a body in `framing`. [`Self::default`] reads native gRPC.
+    pub fn new(framing: GrpcMessageFraming) -> Self {
+        Self {
+            framing,
+            ..Self::default()
+        }
+    }
+
+    pub fn push(&mut self, data: &[u8], messages: &AtomicU64) {
+        if self.framing == GrpcMessageFraming::GrpcWebText {
+            self.push_base64(data, messages);
+        } else {
+            self.push_frames(data, messages);
+        }
+    }
+
+    /// Decode each complete 4-character base64 group before passing frames to
+    /// `push_frames`. This decoder and `GrpcWebTrailerStatusObserver` must agree:
+    /// decode per 4-character group, and a frame is a message iff `flag & 0x80 == 0`,
+    /// so a change to one decoder must be mirrored in the other.
+    fn push_base64(&mut self, mut data: &[u8], messages: &AtomicU64) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        if self.malformed {
+            return;
+        }
+        let mut decoded = [0u8; 3];
+        if self.text_group_len != 0 {
+            let filled = usize::from(self.text_group_len);
+            let take = (4 - filled).min(data.len());
+            self.text_group[filled..filled + take].copy_from_slice(&data[..take]);
+            self.text_group_len += take as u8;
+            data = &data[take..];
+            if self.text_group_len < 4 {
+                return;
+            }
+            self.text_group_len = 0;
+            match BASE64.decode_slice(self.text_group, &mut decoded) {
+                Ok(len) => self.push_frames(&decoded[..len], messages),
+                Err(_) => self.malformed = true,
+            }
+        }
+        let (groups, rest) = data.as_chunks::<4>();
+        for group in groups {
+            if self.malformed {
+                return;
+            }
+            match BASE64.decode_slice(group, &mut decoded) {
+                Ok(len) => self.push_frames(&decoded[..len], messages),
+                Err(_) => self.malformed = true,
+            }
+        }
+        self.text_group[..rest.len()].copy_from_slice(rest);
+        self.text_group_len = rest.len() as u8;
+    }
+
+    /// Walk decoded frames using the same rules as `GrpcWebTrailerStatusObserver`:
+    /// base64 is decoded per 4-character group, and a frame is a message iff
+    /// `flag & 0x80 == 0`. A change to one decoder must be mirrored in the other.
+    fn push_frames(&mut self, mut data: &[u8], messages: &AtomicU64) {
         while !data.is_empty() {
             if let Some(left) = self.remaining {
                 let take = (left as usize).min(data.len());
@@ -350,7 +452,7 @@ impl GrpcLengthPrefixedScanner {
                 let next = left.saturating_sub(take as u32);
                 if next == 0 {
                     self.remaining = None;
-                    messages.fetch_add(1, Ordering::Relaxed);
+                    self.finish_frame(messages);
                 } else {
                     self.remaining = Some(next);
                 }
@@ -372,12 +474,46 @@ impl GrpcLengthPrefixedScanner {
                 self.header[4],
             ]);
             self.header_filled = 0;
+            self.frame_is_message = self.framing == GrpcMessageFraming::Native
+                || self.header[0] & GRPC_WEB_TRAILER_FLAG == 0;
             if len == 0 {
-                messages.fetch_add(1, Ordering::Relaxed);
+                self.finish_frame(messages);
             } else {
                 self.remaining = Some(len);
             }
         }
+    }
+
+    fn finish_frame(&self, messages: &AtomicU64) {
+        if self.frame_is_message {
+            messages.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// A streamed body's authoritative gRPC message counter, paired with the
+/// scanner that reads the body's framing into it.
+#[derive(Clone, Debug)]
+pub struct GrpcMessageTap {
+    messages: Arc<AtomicU64>,
+    scanner: GrpcLengthPrefixedScanner,
+}
+
+impl GrpcMessageTap {
+    pub fn new(messages: Arc<AtomicU64>, framing: GrpcMessageFraming) -> Self {
+        Self {
+            messages,
+            scanner: GrpcLengthPrefixedScanner::new(framing),
+        }
+    }
+
+    /// Count the complete messages `data` finishes, in wire order.
+    pub fn push(&mut self, data: &[u8]) {
+        self.scanner.push(data, &self.messages);
+    }
+
+    pub fn into_parts(self) -> (Arc<AtomicU64>, GrpcLengthPrefixedScanner) {
+        (self.messages, self.scanner)
     }
 }
 
@@ -489,14 +625,12 @@ struct MeshMtlsHandshakeFailureKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MeshFederationPollFailureKey {
     trust_domain: Arc<str>,
-    endpoint: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MeshRemoteDiscoveryPollFailureKey {
     cluster: Arc<str>,
     trust_domain: Arc<str>,
-    control_plane: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -701,16 +835,14 @@ pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
         .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
 }
 
-pub fn increment_mesh_federation_poll_failure(
-    trust_domain: impl AsRef<str>,
-    _endpoint: impl AsRef<str>,
-) {
+/// Count one failed SPIFFE federation trust-bundle poll.
+///
+/// The series carries no endpoint label: federation URLs may carry credentials
+/// in userinfo, path, query, or fragment components, so no URL component is
+/// ever rendered.
+pub fn increment_mesh_federation_poll_failure(trust_domain: impl AsRef<str>) {
     let key = MeshFederationPollFailureKey {
         trust_domain: Arc::from(trust_domain.as_ref()),
-        // Federation URLs may carry credentials in userinfo, path, query, or
-        // fragment components. Keep even authenticated observability output
-        // free of those values by retaining only a fixed compatibility label.
-        endpoint: Arc::from("redacted"),
     };
     MESH_FEDERATION_POLL_FAILURES
         .entry(key)
@@ -735,32 +867,24 @@ pub fn clear_mesh_federation_poll_success(trust_domain: impl AsRef<str>) {
     MESH_FEDERATION_LAST_SUCCESS.remove(trust_domain.as_ref());
 }
 
+/// Count one failed remote-cluster discovery poll.
+///
+/// `/metrics` is unauthenticated, so the series carries no control-plane URL
+/// label at all: even a URL with userinfo/query/fragment stripped can reveal
+/// remote control-plane topology through its host/port, and deployments
+/// sometimes place bearer material in path segments.
 pub fn increment_mesh_remote_discovery_poll_failure(
     cluster: impl AsRef<str>,
     trust_domain: impl AsRef<str>,
-    control_plane: impl AsRef<str>,
 ) {
     let key = MeshRemoteDiscoveryPollFailureKey {
         cluster: Arc::from(cluster.as_ref()),
         trust_domain: Arc::from(trust_domain.as_ref()),
-        control_plane: Arc::from(redact_control_plane_label(control_plane.as_ref())),
     };
     MESH_REMOTE_DISCOVERY_POLL_FAILURES
         .entry(key)
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
-}
-
-/// Redact a control-plane URL before it becomes the `control_plane` metric
-/// label.
-///
-/// `/metrics` is unauthenticated. Even a URL with userinfo/query/fragment
-/// stripped can reveal remote control-plane topology through its host/port, and
-/// deployments sometimes place bearer material in path segments. Keep the
-/// legacy label key for metric compatibility, but store a fixed, non-sensitive
-/// value so no URL component is rendered.
-fn redact_control_plane_label(_control_plane: &str) -> &'static str {
-    "redacted"
 }
 
 pub fn record_mesh_remote_discovery_poll_success(
@@ -1390,9 +1514,8 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         output.push_str("# TYPE ferrum_mesh_federation_poll_failures_total counter\n");
         for entry in MESH_FEDERATION_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\",endpoint=\"{}\"{}}} {}\n",
+                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().trust_domain),
-                escape_label_value(&entry.key().endpoint),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
@@ -1433,10 +1556,9 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter\n");
         for entry in MESH_REMOTE_DISCOVERY_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\",control_plane=\"{}\"{}}} {}\n",
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().cluster),
                 escape_label_value(&entry.key().trust_domain),
-                escape_label_value(&entry.key().control_plane),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
@@ -3000,12 +3122,9 @@ mod tests {
     }
 
     #[test]
-    fn federation_failure_metric_never_renders_endpoint_secrets() {
+    fn federation_failure_series_has_no_endpoint_label() {
         let trust_domain = format!("security-{}-{}.example", std::process::id(), line!());
-        increment_mesh_federation_poll_failure(
-            &trust_domain,
-            "https://user:password@federation.example/secret/path?token=query-secret#fragment",
-        );
+        increment_mesh_federation_poll_failure(&trust_domain);
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
         let line = output
@@ -3016,10 +3135,7 @@ mod tests {
             })
             .expect("federation failure metric");
 
-        assert!(line.contains("endpoint=\"redacted\""), "{line}");
-        for secret in ["user", "password", "secret", "token", "fragment"] {
-            assert!(!line.contains(secret), "{secret} leaked in {line}");
-        }
+        assert!(!line.contains("endpoint="), "{line}");
     }
 
     #[test]
@@ -3118,11 +3234,10 @@ mod tests {
         let suffix = format!("{}-{}", std::process::id(), line!());
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
-        let control_plane = format!("https://remote-{suffix}.example:9443");
         let fetched_at = unix_now_seconds().saturating_sub(5);
 
-        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
-        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
         record_mesh_remote_discovery_poll_success(&cluster, &trust_domain, fetched_at);
 
         let mut output = String::new();
@@ -3134,7 +3249,7 @@ mod tests {
         );
         assert!(
             output.contains(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"redacted\"}} 2"
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 2"
             )),
             "remote discovery failure counter series missing: {output}"
         );
@@ -3168,20 +3283,17 @@ mod tests {
         );
     }
 
-    /// SECURITY: a `control_plane_url` must not surface on the unauthenticated
-    /// `/metrics` failure-counter label. URLs can expose topology through the
-    /// host/port and credential-like material through path/query/fragment data.
+    /// SECURITY: the remote control plane must not surface on the
+    /// unauthenticated `/metrics` failure counter. URLs can expose topology
+    /// through the host/port and credential-like material through
+    /// path/query/fragment data, so the series carries no control-plane label.
     #[test]
-    fn remote_discovery_failure_label_redacts_control_plane_url() {
+    fn remote_discovery_failure_series_has_no_control_plane_label() {
         let suffix = format!("{}-{}", std::process::id(), line!());
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
-        let host = format!("cp-{suffix}.example");
-        let leaky_url = format!(
-            "https://user:pw@{host}:9443/tenant/path-token-secret/subscribe?token=secret&api_key=abc#frag"
-        );
 
-        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &leaky_url);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
 
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
@@ -3194,39 +3306,9 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("failure series for {cluster} missing: {output}"));
 
-        for sensitive in [
-            host.as_str(),
-            "user",
-            "pw",
-            "9443",
-            "tenant",
-            "path-token-secret",
-            "token",
-            "secret",
-            "api_key",
-            "abc",
-            "frag",
-        ] {
-            assert!(
-                !line.contains(sensitive),
-                "sensitive control-plane URL component leaked into metric label: {line}"
-            );
-        }
         assert!(
-            line.contains("control_plane=\"redacted\""),
-            "control-plane label should retain only a fixed redacted value: {line}"
-        );
-    }
-
-    #[test]
-    fn redact_control_plane_label_uses_fixed_non_sensitive_value() {
-        assert_eq!(
-            redact_control_plane_label("https://user:pw@cp.example:9443/p?token=x"),
-            "redacted"
-        );
-        assert_eq!(
-            redact_control_plane_label("not a url?token=secret"),
-            "redacted"
+            !line.contains("control_plane="),
+            "failure series must not carry a control-plane label: {line}"
         );
     }
 

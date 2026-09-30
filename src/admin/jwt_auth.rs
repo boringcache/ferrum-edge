@@ -11,15 +11,58 @@
 //! it returns [`JwtError::NotConfigured`]; when the secret or a
 //! related setting (for example `FERRUM_ADMIN_JWT_MAX_TTL`) is present but
 //! invalid it returns [`JwtError::VerificationFailed`]. Read-only file/mesh/
-//! node_agent modes may generate a random secret only on `NotConfigured`; any
-//! other error must fail startup. That fallback lives at the admin-state call
-//! site, not here.
+//! node_agent modes may generate a random secret only on `NotConfigured`, via
+//! [`random_read_only_jwt_manager`]; any other error must fail startup.
+//!
+//! # Role ceiling (`FERRUM_ADMIN_JWT_VIEWER_SECRET`)
+//!
+//! An optional second HS256 verification secret whose tokens are capped at
+//! [`AdminRole::Viewer`] whatever their `role` claim says. A process that only
+//! needs to read configuration (drift detection, dashboards) is given this
+//! secret and can then mint nothing that reaches `operator` or `admin`.
+//!
+//! The ceiling is a property of *which key verified the signature*, recorded as
+//! [`VerifiedAdminToken::key_tier`] and applied when the request's
+//! [`crate::admin::audit::AuditActor`] is built — the single place every route
+//! reads its role from. A viewer-key token's `scope` claims grant nothing, and
+//! its `sub` and `ns` are whatever its holder chose: the viewer secret is a
+//! fleet-wide read credential, not a per-tenant or per-identity one. The tier
+//! is never derived from a token header or claim:
+//!
+//! - both keys are pinned to HS256 (`Validation::new` sets the only accepted
+//!   algorithm, so `none`, `HS384`/`HS512`, and asymmetric algorithms are
+//!   refused before any signature check);
+//! - the primary key is tried first, and the viewer key only when the primary
+//!   reports a signature mismatch, so a token is accepted by exactly the key
+//!   that signed it;
+//! - the two secrets must differ (enforced here and in `EnvConfig`), so no
+//!   signature can verify under both.
+//!
+//! A symmetric second secret was chosen over asymmetric (ES256/EdDSA or JWKS)
+//! verification because the existing admin plane is HS256 end to end and
+//! GitForgeOps-style clients already mint their own HS256 tokens: the ceiling
+//! reuses that exact verification path (claims, issuer, audience, max TTL)
+//! with no key parsing, JWKS fetching, or outbound HTTP on the admin plane.
+//!
+//! # Namespace ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`)
+//!
+//! An optional comma-separated list that bounds which namespaces a viewer-key
+//! token may read, whatever its `ns` claim or the `X-Ferrum-Namespace` header
+//! says. Like the role ceiling it is a property of the verifying key: it is
+//! attached to [`VerifiedAdminToken::namespace_ceiling`] only for
+//! [`AdminKeyTier::Viewer`] tokens and carried on
+//! [`crate::admin::audit::AuditActor`], where the admin dispatcher enforces it
+//! on every namespace-scoped route, `GET /config/export`, and the
+//! `/namespaces` registry, independently of
+//! `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`. Primary-key tokens are never
+//! affected. Unset keeps the viewer key fleet-wide.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +95,49 @@ impl AdminRole {
 
     pub fn allows(self, required: Self) -> bool {
         self >= required
+    }
+
+    /// The lower of `self` and `ceiling`.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        self.min(ceiling)
+    }
+}
+
+/// Which verification key accepted an admin JWT's signature.
+///
+/// The tier, not any claim, bounds what the token may do. It is carried on
+/// [`crate::admin::audit::AuditActor`] into authorization, log lines, and audit
+/// records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminKeyTier {
+    /// `FERRUM_ADMIN_JWT_SECRET`: the `role` and `scope` claims are honoured.
+    Primary,
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET`: the role is capped at
+    /// [`AdminRole::Viewer`] and `scope` claims grant nothing. Its holder can
+    /// mint any `sub` and `ns`, so neither is an identity or tenancy boundary.
+    Viewer,
+}
+
+impl AdminKeyTier {
+    /// Stable log / audit label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    /// Highest role a token verified by this key may exercise.
+    pub fn role_ceiling(self) -> AdminRole {
+        match self {
+            Self::Primary => AdminRole::Admin,
+            Self::Viewer => AdminRole::Viewer,
+        }
+    }
+
+    /// Whether `scope` claims (for example `diagnostics:read`) are honoured.
+    pub fn honours_scopes(self) -> bool {
+        matches!(self, Self::Primary)
     }
 }
 
@@ -107,6 +193,24 @@ impl AdminClaims {
     pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
         crate::grpc::auth::parse_ns_claim(&self.additional)
     }
+
+    /// Whether the optional `scope` claim grants `scope`.
+    ///
+    /// Accepts the OAuth 2.0 space-delimited string form (RFC 8693 §4.2) or
+    /// an array of strings. A missing claim, any other shape, or a non-string
+    /// array member grants nothing: a capability is never inferred from a
+    /// malformed claim, and the admin `role` never implies a scope.
+    pub fn grants_scope(&self, scope: &str) -> bool {
+        match self.additional.get("scope") {
+            Some(serde_json::Value::String(granted)) => {
+                granted.split_ascii_whitespace().any(|s| s == scope)
+            }
+            Some(serde_json::Value::Array(granted)) => {
+                granted.iter().any(|s| s.as_str() == Some(scope))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// JWT Configuration
@@ -139,16 +243,236 @@ impl Default for JwtConfig {
     }
 }
 
+/// A signature-verified admin JWT.
+///
+/// `key_tier` records which verification key accepted the signature.
+/// Authorization must use [`VerifiedAdminToken::effective_role`] and
+/// [`VerifiedAdminToken::grants_scope`] (or
+/// [`crate::admin::audit::AuditActor::from_verified`]), never the raw `role` or
+/// `scope` claims.
+#[derive(Debug)]
+pub struct VerifiedAdminToken {
+    pub header: jsonwebtoken::Header,
+    pub claims: AdminClaims,
+    pub key_tier: AdminKeyTier,
+    /// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, attached only to
+    /// [`AdminKeyTier::Viewer`] tokens when it is configured. `None` for every
+    /// primary-key token and whenever the ceiling is unset.
+    pub namespace_ceiling: Option<ViewerNamespaceCeiling>,
+}
+
+impl VerifiedAdminToken {
+    /// Highest role the verifying key allows.
+    pub fn role_ceiling(&self) -> AdminRole {
+        self.key_tier.role_ceiling()
+    }
+
+    /// The role this token may exercise: its `role` claim capped at the
+    /// ceiling of the key that verified it. A missing or malformed `role`
+    /// claim still fails closed.
+    pub fn effective_role(&self) -> Result<AdminRole, String> {
+        Ok(self.claims.admin_role()?.capped_at(self.role_ceiling()))
+    }
+
+    /// Whether the token grants `scope`. A viewer-key token grants no scope,
+    /// whatever its `scope` claim says.
+    pub fn grants_scope(&self, scope: &str) -> bool {
+        self.key_tier.honours_scopes() && self.claims.grants_scope(scope)
+    }
+
+    /// Namespaces the token is authorized for: its `ns` claim, narrowed to
+    /// [`Self::namespace_ceiling`] when one applies. Claim presence is kept
+    /// as the token carried it, so a claim-less viewer-key token still reads
+    /// as "no `ns` claim"; the ceiling itself is enforced separately. A
+    /// malformed claim still fails closed.
+    pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
+        let claimed = self.claims.allowed_namespaces()?;
+        Ok(match &self.namespace_ceiling {
+            Some(ceiling) => ceiling.narrow(&claimed),
+            None => claimed,
+        })
+    }
+}
+
+/// Name of the viewer-key namespace ceiling setting.
+pub const ADMIN_JWT_VIEWER_NAMESPACES_ENV: &str = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
+
+/// The namespaces a viewer-key token may read
+/// (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`).
+///
+/// Cheap to clone: the set is shared behind an `Arc`, because it is attached
+/// to every verified viewer-key token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerNamespaceCeiling {
+    names: Arc<HashSet<String>>,
+}
+
+impl ViewerNamespaceCeiling {
+    /// Parse the comma-separated setting.
+    ///
+    /// Fails closed: an empty value, an empty or whitespace-only entry (for
+    /// example a doubled or trailing comma), a `*` wildcard, or a name that
+    /// breaks the namespace naming rules is refused rather than skipped, since
+    /// a silently dropped entry would change a security boundary without any
+    /// signal. Entries are trimmed; duplicates collapse. Diagnostics carry the
+    /// entry's 1-based position and the key-aware quoted entry, never the whole
+    /// value.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw.trim().is_empty() {
+            return Err(format!(
+                "{ADMIN_JWT_VIEWER_NAMESPACES_ENV} is set but lists no namespace; list at least \
+                 one namespace, or unset it to leave viewer-key tokens fleet-wide"
+            ));
+        }
+        let mut names = HashSet::new();
+        for (index, segment) in raw.split(',').enumerate() {
+            let position = index + 1;
+            let entry = segment.trim();
+            if entry.is_empty() {
+                return Err(format!(
+                    "{ADMIN_JWT_VIEWER_NAMESPACES_ENV} entry {position} is empty; remove the \
+                     extra comma"
+                ));
+            }
+            if entry == "*" {
+                return Err(format!(
+                    "{ADMIN_JWT_VIEWER_NAMESPACES_ENV} entry {position} is `*`; wildcards are \
+                     not supported, unset the setting to leave viewer-key tokens fleet-wide"
+                ));
+            }
+            if crate::config::types::validate_namespace(entry).is_err() {
+                return Err(format!(
+                    "Invalid {ADMIN_JWT_VIEWER_NAMESPACES_ENV} entry {position} {}: a namespace \
+                     must be 1-{} characters, start with an alphanumeric character, and contain \
+                     only alphanumerics, dots, underscores, or hyphens",
+                    crate::startup::quoted_config_value(ADMIN_JWT_VIEWER_NAMESPACES_ENV, entry),
+                    crate::config::types::MAX_NAMESPACE_LENGTH
+                ));
+            }
+            names.insert(entry.to_string());
+        }
+        Ok(Self {
+            names: Arc::new(names),
+        })
+    }
+
+    /// Whether `namespace` is inside the ceiling.
+    pub fn allows(&self, namespace: &str) -> bool {
+        self.names.contains(namespace)
+    }
+
+    /// How many distinct namespaces the ceiling admits.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the ceiling admits no namespace. [`Self::parse`] never builds
+    /// one, so this is `false` for every configured ceiling.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Narrow a parsed `ns` claim to this ceiling.
+    ///
+    /// A present claim becomes `claim ∩ ceiling` (possibly empty, which
+    /// authorizes nothing); an absent claim stays absent, because presence
+    /// records what the token carried. The ceiling is enforced on its own for
+    /// claim-less tokens, see [`crate::admin::audit::AuditActor`].
+    pub fn narrow(
+        &self,
+        claimed: &crate::grpc::auth::AllowedNamespaces,
+    ) -> crate::grpc::auth::AllowedNamespaces {
+        if !claimed.is_present() {
+            return claimed.clone();
+        }
+        let Some(claimed_names) = claimed.effective_namespaces() else {
+            return crate::grpc::auth::AllowedNamespaces::claimed(HashSet::new());
+        };
+        let narrowed = claimed_names
+            .iter()
+            .filter(|name| self.allows(name))
+            .cloned()
+            .collect();
+        crate::grpc::auth::AllowedNamespaces::claimed(narrowed)
+    }
+}
+
 /// JWT Manager for Admin API
 #[derive(Clone)]
 pub struct JwtManager {
     config: JwtConfig,
+    /// Optional `FERRUM_ADMIN_JWT_VIEWER_SECRET`: tokens it verifies are capped
+    /// at [`AdminRole::Viewer`].
+    viewer_secret: Option<String>,
+    /// Optional `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`: the namespaces tokens
+    /// verified by `viewer_secret` may read.
+    viewer_namespace_ceiling: Option<ViewerNamespaceCeiling>,
 }
 
 impl JwtManager {
     /// Create new JWT manager
     pub fn new(config: JwtConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            viewer_secret: None,
+            viewer_namespace_ceiling: None,
+        }
+    }
+
+    /// Add a role-ceiling verification secret: tokens signed with it are
+    /// capped at [`AdminRole::Viewer`] whatever their `role` claim says.
+    ///
+    /// Refuses a secret shorter than
+    /// [`crate::config::types::MIN_JWT_SECRET_LENGTH`] and one equal to the
+    /// primary secret — identical keys would let a viewer-secret holder mint
+    /// tokens the primary key accepts uncapped. Error text never carries
+    /// either secret.
+    pub fn with_viewer_secret(mut self, viewer_secret: String) -> Result<Self, JwtError> {
+        if viewer_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+            return Err(JwtError::VerificationFailed(format!(
+                "FERRUM_ADMIN_JWT_VIEWER_SECRET must be at least {} characters (got {})",
+                crate::config::types::MIN_JWT_SECRET_LENGTH,
+                viewer_secret.len()
+            )));
+        }
+        if viewer_secret == self.config.secret {
+            return Err(JwtError::VerificationFailed(
+                ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR.to_string(),
+            ));
+        }
+        self.viewer_secret = Some(viewer_secret);
+        Ok(self)
+    }
+
+    /// Whether a role-ceiling viewer secret is configured.
+    pub fn has_viewer_secret(&self) -> bool {
+        self.viewer_secret.is_some()
+    }
+
+    /// Bound the namespaces viewer-key tokens may read
+    /// (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`). Primary-key tokens are never
+    /// affected. Without a viewer secret there are no viewer-key tokens, so
+    /// the ceiling has nothing to bound.
+    pub fn with_viewer_namespace_ceiling(mut self, ceiling: ViewerNamespaceCeiling) -> Self {
+        self.viewer_namespace_ceiling = Some(ceiling);
+        self
+    }
+
+    /// The configured viewer-key namespace ceiling, if any.
+    pub fn viewer_namespace_ceiling(&self) -> Option<&ViewerNamespaceCeiling> {
+        self.viewer_namespace_ceiling.as_ref()
+    }
+
+    /// Key for `GET /config/export` credential fingerprints.
+    ///
+    /// Derived from the primary admin JWT secret only — never from
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` — so the viewer-tier credential that
+    /// the export is designed for cannot compute (and therefore cannot
+    /// dictionary-test) a fingerprint. `None` when no secret is configured.
+    pub(crate) fn config_export_fingerprint_key(
+        &self,
+    ) -> Option<crate::fips::approved::HmacSha256Key> {
+        crate::admin::config_export::fingerprint_key(&self.config.secret)
     }
 
     /// Key for admin resource `ETag`s, derived from the admin JWT secret so
@@ -158,12 +482,67 @@ impl JwtManager {
         crate::admin::preconditions::etag_key(&self.config.secret)
     }
 
-    /// Verify and decode a JWT token
-    pub fn verify_token(&self, token: &str) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
-        let key = DecodingKey::from_secret(self.config.secret.as_bytes());
+    /// Verify and decode a JWT token.
+    ///
+    /// The primary secret is tried first. Only when it reports a signature
+    /// mismatch is the optional viewer secret tried, and a token it verifies
+    /// carries [`AdminKeyTier::Viewer`]. Every other failure
+    /// (wrong algorithm, expired, bad claims) is final: the viewer key is
+    /// never a second chance for a token the primary key could parse.
+    pub fn verify_token(&self, token: &str) -> Result<VerifiedAdminToken, JwtEncodeError> {
+        let primary = self.verify_with_key(token, &self.config.secret, self.config.algorithm);
+        let primary_error = match primary {
+            Ok(data) => {
+                return Ok(VerifiedAdminToken {
+                    header: data.header,
+                    claims: data.claims,
+                    key_tier: AdminKeyTier::Primary,
+                    namespace_ceiling: None,
+                });
+            }
+            Err(error) => error,
+        };
+        let Some(viewer_secret) = self.viewer_secret.as_deref() else {
+            return Err(primary_error);
+        };
+        if !matches!(
+            primary_error.kind(),
+            jsonwebtoken::errors::ErrorKind::InvalidSignature
+        ) {
+            return Err(primary_error);
+        }
+        // Pinned to HS256 regardless of the primary configuration: the ceiling
+        // key must never accept another algorithm.
+        let data = self.verify_with_key(token, viewer_secret, Algorithm::HS256)?;
+        // The viewer secret's holder chooses `sub`, and it is rendered into
+        // log lines next to `key_tier`. Refuse subjects that could forge or
+        // flood those lines.
+        if !is_acceptable_viewer_key_subject(&data.claims.sub) {
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidToken,
+            ));
+        }
+        Ok(VerifiedAdminToken {
+            header: data.header,
+            claims: data.claims,
+            key_tier: AdminKeyTier::Viewer,
+            namespace_ceiling: self.viewer_namespace_ceiling.clone(),
+        })
+    }
 
-        // Configure validation with required claims
-        let mut validation = Validation::new(self.config.algorithm);
+    /// Full verification of `token` under one HMAC key and one algorithm.
+    fn verify_with_key(
+        &self,
+        token: &str,
+        secret: &str,
+        algorithm: Algorithm,
+    ) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
+        let key = DecodingKey::from_secret(secret.as_bytes());
+
+        // Configure validation with required claims. `Validation::new` makes
+        // `algorithm` the only accepted `alg`, so the header cannot select a
+        // different verifier.
+        let mut validation = Validation::new(algorithm);
         validation.validate_exp = true; // Enable expiration check
         validation.validate_nbf = true; // Enable not-before check
 
@@ -314,7 +693,7 @@ impl JwtManager {
     pub fn verify_request(
         &self,
         auth_header: Option<&str>,
-    ) -> Result<TokenData<AdminClaims>, JwtError> {
+    ) -> Result<VerifiedAdminToken, JwtError> {
         let auth_header = auth_header.ok_or(JwtError::MissingHeader)?;
         let token =
             Self::extract_token_from_header(auth_header).ok_or(JwtError::InvalidHeaderFormat)?;
@@ -437,5 +816,77 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
         algorithm: Algorithm::HS256,
     };
 
-    Ok(JwtManager::new(config))
+    with_viewer_secret_from_env(JwtManager::new(config))
+}
+
+/// Longest `sub` a viewer-key token may carry, in bytes.
+pub const MAX_VIEWER_KEY_SUBJECT_BYTES: usize = 256;
+
+/// Whether a viewer-key token's `sub` is acceptable: at most
+/// [`MAX_VIEWER_KEY_SUBJECT_BYTES`] bytes and free of control characters.
+/// Primary-key tokens are not subject to this rule; their subjects come from
+/// whoever holds the primary secret.
+pub fn is_acceptable_viewer_key_subject(sub: &str) -> bool {
+    sub.len() <= MAX_VIEWER_KEY_SUBJECT_BYTES && !sub.chars().any(char::is_control)
+}
+
+/// Message for a viewer secret equal to the primary admin secret. Names both
+/// settings and neither value.
+pub const ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR: &str = "FERRUM_ADMIN_JWT_VIEWER_SECRET must differ from FERRUM_ADMIN_JWT_SECRET; identical values \
+     would let a viewer-secret holder mint tokens the primary key accepts without the viewer \
+     role ceiling";
+
+/// Attach `FERRUM_ADMIN_JWT_VIEWER_SECRET` and
+/// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` (from env/`ferrum.conf`) when set.
+fn with_viewer_secret_from_env(manager: JwtManager) -> Result<JwtManager, JwtError> {
+    use crate::config::conf_file::resolve_ferrum_var;
+
+    let viewer_secret =
+        resolve_ferrum_var("FERRUM_ADMIN_JWT_VIEWER_SECRET").filter(|s| !s.is_empty());
+    let manager = match viewer_secret {
+        Some(viewer_secret) => manager.with_viewer_secret(viewer_secret)?,
+        None => manager,
+    };
+    match resolve_ferrum_var(ADMIN_JWT_VIEWER_NAMESPACES_ENV) {
+        Some(raw) => {
+            let parsed = ViewerNamespaceCeiling::parse(&raw);
+            let ceiling = parsed.map_err(JwtError::VerificationFailed)?;
+            if manager.has_viewer_secret() {
+                tracing::info!(
+                    namespaces = ceiling.len(),
+                    "Admin viewer-key tokens are limited to FERRUM_ADMIN_JWT_VIEWER_NAMESPACES"
+                );
+            } else {
+                tracing::warn!(
+                    "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES is set without \
+                     FERRUM_ADMIN_JWT_VIEWER_SECRET; it has no effect until a viewer secret \
+                     is configured"
+                );
+            }
+            Ok(manager.with_viewer_namespace_ceiling(ceiling))
+        }
+        None => Ok(manager),
+    }
+}
+
+/// The read-only-mode fallback for an unset `FERRUM_ADMIN_JWT_SECRET`
+/// (`file`, `mesh`, `node_agent`): a random, unguessable primary secret, so no
+/// externally minted token reaches `operator` or `admin`, plus
+/// `FERRUM_ADMIN_JWT_VIEWER_SECRET` when configured so viewer-tier readers
+/// still work. Call only on [`JwtError::NotConfigured`].
+pub fn random_read_only_jwt_manager() -> Result<JwtManager, JwtError> {
+    use crate::config::conf_file::resolve_ferrum_var;
+
+    let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let issuer =
+        resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
+    let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
+    let manager = JwtManager::new(JwtConfig {
+        secret: random_secret,
+        issuer,
+        audience,
+        max_ttl_seconds: admin_jwt_max_ttl_from_env()?,
+        algorithm: Algorithm::HS256,
+    });
+    with_viewer_secret_from_env(manager)
 }

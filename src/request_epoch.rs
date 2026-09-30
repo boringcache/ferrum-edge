@@ -181,8 +181,10 @@ pub struct RequestEpoch {
     pub(crate) consumer_index: Arc<ConsumerIndexInner>,
     pub(crate) load_balancer: Arc<LoadBalancerCacheInner>,
     /// Listener routing admission for this exact config generation. Config
-    /// publication installs `pending`; only a reconcile derived from the same
-    /// config `Arc` may replace it with a decided refusal set.
+    /// publication carries the previous decision forward for listener ports
+    /// whose plan is unchanged and fails the rest closed; only a reconcile
+    /// derived from the same config `Arc` may replace it with a decided
+    /// refusal set.
     pub(crate) gateway_listener_admission: Arc<GatewayListenerAdmission>,
     /// Gateway-to-mesh trust/identity for this exact configuration generation.
     /// Published with the config in ONE store, so no request can pair this
@@ -344,6 +346,8 @@ mod tests {
             udp_idle_timeout_seconds: 60,
             tcp_idle_timeout_seconds: Some(300),
             websocket_idle_timeout_seconds: None,
+            websocket_permessage_deflate: Default::default(),
+            allow_path_parameters: false,
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
@@ -554,15 +558,23 @@ mod tests {
             .expect("new config publication")
             .expect("new config epoch");
 
+        let (accept_gate_tx, _) = tokio::sync::watch::channel(false);
+        let gate_for_activation = accept_gate_tx.clone();
         assert!(
             store
                 .publish_gateway_listener_admission(
                     &old_ack,
                     GatewayListenerAdmission::decided(std::collections::BTreeSet::new()),
-                    |_| {},
+                    move |_| {
+                        gate_for_activation.send_replace(true);
+                    },
                 )
                 .is_none(),
             "generation N must not publish an admission decision for N+1"
+        );
+        assert!(
+            !*accept_gate_tx.borrow(),
+            "a stale admission decision must not open newly bound listener gates"
         );
         let pending = store.load();
         assert!(
@@ -1849,14 +1861,6 @@ impl RequestEpochStore {
         self.current.load_full()
     }
 
-    /// Configuration generation of the published epoch, read through the
-    /// `ArcSwap` guard without cloning the epoch. Per-response callers compare
-    /// it against a memoized derivation before paying for [`Self::load`].
-    #[inline]
-    pub(crate) fn config_generation(&self) -> u64 {
-        self.current.load().config_generation
-    }
-
     /// Allocation-free gateway-to-mesh admission read.
     ///
     /// Dispatch classification and mesh egress capture ask this per request or
@@ -1906,6 +1910,13 @@ impl RequestEpochStore {
         };
 
         let proxy_index_by_key = build_proxy_index_by_key(&staged.config);
+        // Listener routing admission is derived atomically with the new route
+        // table. Ports whose listener plan is unchanged keep their decided
+        // admission; new, changed, and withdrawn ports fail closed until the
+        // exact reconcile of this generation publishes its own decision.
+        let gateway_listener_admission = current
+            .gateway_listener_admission
+            .carry_forward(&staged.config);
         let lb_generation = if staged.lb_changed {
             next_lb_generation(current.lb_generation)?
         } else {
@@ -1918,10 +1929,7 @@ impl RequestEpochStore {
             plugin_cache: staged.plugin_cache,
             consumer_index: staged.consumer_index,
             load_balancer: staged.load_balancer,
-            // Every config generation is conservatively unavailable to
-            // listener-scoped routing until its exact reconcile acknowledges
-            // admission. This publication is atomic with the new route table.
-            gateway_listener_admission: GatewayListenerAdmission::pending(),
+            gateway_listener_admission,
             // A generation that changes gateway trust publishes fenced, so the
             // configuration and its trust roots become authenticating together
             // rather than one store apart (issue #3727).

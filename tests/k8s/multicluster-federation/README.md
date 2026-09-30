@@ -26,7 +26,7 @@ driven in BOTH directions:
   reason this fixture exists;
 - an **east-west gateway** (`FERRUM_MESH_TOPOLOGY=east_west_gateway`, SNI
   passthrough on `:15443`, exposed as a NodePort) that forwards the destination
-  service FQDN's SNI to the local `svc` pod's app port;
+  service port's SNI alias to the local `svc` pod's app port;
 - a **client** sidecar whose file-config `MultiClusterConfig` points at the PEER
   cluster's east-west gateway NodePort, plus a `curl` container that drives the
   captured request directly at the outbound capture listener `:15001` (mirroring
@@ -37,8 +37,8 @@ driven in BOTH directions:
   peer `svc`'s `deny-peer-rogue` MeshPolicy → 403), not a client-side TLS failure.
 
 The A→B path: cluster A's client captures a plaintext request → cross-cluster
-target dialing B's east-west NodePort with `svc.ferrum.svc.cluster.local` as the
-ClientHello SNI and trust-domain-only mTLS → B's SNI passthrough → B's `svc` pod
+target dialing B's east-west NodePort with `p8080.svc.ferrum.svc.cluster.local` as
+the ClientHello SNI and trust-domain-only mTLS → B's SNI passthrough → B's `svc` pod
 app port `8080` → B's pod inbound iptables REDIRECT `8080`→`:15006` → B's `svc`
 sidecar STRICT inbound (verifies cluster A's client SVID via the FEDERATED
 bundle) → B's local app → `200 svc-b`. B→A mirrors it.
@@ -55,10 +55,9 @@ both endpoints having to be up before either can poll. After exchange, each
 server holds the peer's federated bundle. EVERY workload entry — `svc`,
 `ew-gateway`, `client`, AND `rogue` — is registered with `-federatesWith
 spiffe://<peer-td>` so its SPIRE-issued SVID carries the peer trust bundle and the
-proxy can verify cross-cluster peers. `rogue` is federated on purpose: the negative
-proves a DESTINATION-SIDE rejection, not an incidental client-side TLS failure.
-Because both `client` and `rogue` present a valid peer SVID once the trust domain is
-federated, STRICT PeerAuthentication alone cannot tell them apart; the destination's
+proxy can verify cross-cluster peers. Because both `client` and `rogue` present a
+valid peer SVID once the trust domain is federated, STRICT PeerAuthentication
+alone cannot tell them apart; the destination's
 `deny-peer-rogue` MeshPolicy (an identity-scoped DENY on the peer trust domain's
 `sa/rogue` principal) is what rejects exactly `rogue` — `mesh_authz` returns `403`
 with body `{"error":"Mesh authorization denied"}`, while the federated `sa/client`
@@ -103,8 +102,8 @@ east-west endpoint and the local `svc` pod IP are not known until both clusters
 are up). Cross-cluster remote classification rides `MultiClusterConfig.local_cluster`
 plus the remote workload's `cluster` field (the `workload_is_remote` cluster-name
 fallback), so no live remote-discovery poll is required. The mesh document shape
-is `{version?, mesh}` (`MeshConfig`); these documents were validated against the
-real `load_mesh_slice_from_file` deserializer + `validate_mesh_fields`.
+is `{version?, mesh}` (`MeshConfig`), as parsed by `load_mesh_slice_from_file`
+and checked by `validate_mesh_fields`.
 
 ## Live assertions
 

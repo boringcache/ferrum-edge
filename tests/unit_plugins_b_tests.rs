@@ -51,6 +51,7 @@ mod unit {
         mod oidc_relying_party_tests;
         mod opa_tests;
         mod openapi_validator_tests;
+        mod otel_tracing_attempt_spans_tests;
         mod otel_tracing_tests;
         mod plugin_cache_tests;
         mod plugin_doc_parity_tests;
@@ -80,6 +81,7 @@ mod unit {
         mod response_caching_tests;
         mod response_mock_tests;
         mod response_size_limiting_tests;
+        mod response_stream_chain_tests;
         mod response_transformer_tests;
         mod route_header_finalization_tests;
         mod security_headers_tests;
@@ -106,7 +108,11 @@ mod unit {
         mod validation_diagnostics_tests;
         mod validator_diagnostic_redaction_tests;
         mod waf_body_charset_parity_tests;
+        mod waf_normalization_evasion_tests;
+        mod waf_rule_pack_coverage_tests;
         mod waf_tests;
+        mod waf_tuning_controls_tests;
+        mod waf_unlisted_content_type_tests;
         mod workload_metrics_custom_env_tags_tests;
         mod workload_metrics_tests;
         mod ws_frame_logging_tests;

@@ -14,6 +14,9 @@ use ferrum_edge::modes::mesh::config::{
     ServicePort, TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef,
     WorkloadSelector, validate_mesh_config,
 };
+use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
+use ferrum_edge::xds::carrier::FERRUM_ECDS_SERVICES_TYPE_URL;
+use ferrum_edge::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -1673,6 +1676,38 @@ fn multi_cluster_rejects_base_fqdn_and_wildcard_alias_owner() {
         "a wildcard that owns every per-port alias overlaps the base-FQDN gateway, got: \
          {errors:?}"
     );
+}
+
+#[test]
+fn multi_cluster_rejects_base_fqdn_and_udp_alias() {
+    let mesh = mesh_with_same_scope_east_west_snis(
+        "reviews.default.svc.cluster.local",
+        "p8080-udp.reviews.default.svc.cluster.local",
+    );
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "base FQDN and its derived UDP alias must be rejected, got: {errors:?}"
+    );
+}
+
+#[test]
+fn multi_cluster_does_not_treat_retired_transport_suffixes_as_generated_aliases() {
+    // Only `-udp` is a generated discriminator; `p<port>-http` / `p<port>-tcp`
+    // are never derived, so they stay literal hosts that do not claim the base.
+    for alias in [
+        "p8080-http.reviews.default.svc.cluster.local",
+        "p8080-tcp.reviews.default.svc.cluster.local",
+    ] {
+        let mesh = mesh_with_same_scope_east_west_snis("reviews.default.svc.cluster.local", alias);
+
+        let errors = mesh.validate();
+        assert!(
+            !errors.iter().any(|err| err.contains("sni_hosts overlap")),
+            "{alias} is not a generated alias of the base FQDN, got: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -3773,6 +3808,140 @@ fn mesh_policy_enforces_istio_source_trust_domain_value_grammar() {
     }
 }
 
+/// `connection.sni` values are normalized at load rather than rejected: a
+/// rejected value drops the whole policy, which is fail-OPEN for a DENY. Only a
+/// non-ASCII value with no A-label spelling is rejected, on `values` and
+/// `notValues`, and the diagnostic never echoes the value.
+#[test]
+fn mesh_policy_rejects_only_unconvertible_connection_sni_values() {
+    for rejected in [
+        // A space is not allowed in a domain name, so IDNA refuses it.
+        format!("{ECHO_PROBE} bücher.example"),
+        // The non-ASCII text sits in a label the `*` only partly covers.
+        format!("{ECHO_PROBE}bü*"),
+        format!("*{ECHO_PROBE}bücher.example"),
+        // `url::Host::parse` would percent-decode this first.
+        format!("{ECHO_PROBE}%41.bücher.example"),
+    ] {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("connection.sni", direction, &rejected);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]"))
+                        && e.contains("cannot be converted to an A-label")
+                }),
+                "expected an A-label diagnostic on {direction} for '{rejected}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a connection.sni diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+
+    for accepted in [
+        "xn--bcher-kva.example",
+        "bücher.example",
+        "*.Bücher.Example.",
+        "bücher.*",
+        "Admin.Example.COM.",
+        "*.reviews.default.svc.cluster.local",
+        "p9080.reviews.default.svc.cluster.local",
+        "api.*",
+        "*",
+        // Other ASCII that DNS does not allow is not rejected; such a value
+        // simply never matches.
+        "under_score.example",
+    ] {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("connection.sni", direction, accepted);
+            assert!(
+                errors.is_empty(),
+                "'{accepted}' is a valid connection.sni {direction} entry, got: {errors:?}"
+            );
+        }
+    }
+
+    // The A-label rule is specific to `connection.sni`: another string-matcher
+    // key keeps accepting non-ASCII text.
+    let errors = errors_for_condition("request.headers[x-host]", "values", "bücher example");
+    assert!(
+        errors.is_empty(),
+        "request.headers values keep the generic grammar, got: {errors:?}"
+    );
+}
+
+/// `connection.sni` values take the spelling of the normalized received SNI at
+/// load: one trailing dot stripped, ASCII lowercased, and a U-label converted
+/// to its A-label. Other condition keys keep their spelling.
+#[test]
+fn mesh_config_normalize_canonicalizes_connection_sni_condition_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: vec![
+            "Admin.Example.COM.".into(),
+            "*.Reviews.Default.SVC.Cluster.Local".into(),
+            "Bücher.Example".into(),
+            // IDNA maps U+3002 (ideographic full stop) to `.`, so the trailing
+            // dot the conversion produces is stripped in the same pass.
+            "bücher\u{3002}".into(),
+            "*.Bücher\u{3002}".into(),
+        ],
+        not_values: vec![
+            "P9080.Reviews.Default.SVC.Cluster.Local.".into(),
+            "*.bücher.example.".into(),
+            "bücher.*".into(),
+            // Only a single trailing dot is stripped, so normalization is
+            // idempotent; these never match a received SNI either way.
+            "Double.Dot..".into(),
+            ".".into(),
+        ],
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "request.headers[x-tenant]".into(),
+        values: vec!["Tenant-A.".into()],
+        not_values: Vec::new(),
+    });
+    let mut config = MeshConfig {
+        mesh_policies: vec![policy],
+        ..MeshConfig::default()
+    };
+    config.normalize();
+    // Idempotent: a second pass leaves the canonical values unchanged.
+    config.normalize();
+
+    let when = &config.mesh_policies[0].rules[0].when;
+    assert_eq!(
+        when[0].values,
+        vec![
+            "admin.example.com".to_string(),
+            "*.reviews.default.svc.cluster.local".to_string(),
+            "xn--bcher-kva.example".to_string(),
+            "xn--bcher-kva".to_string(),
+            "*.xn--bcher-kva".to_string(),
+        ]
+    );
+    assert_eq!(
+        when[0].not_values,
+        vec![
+            "p9080.reviews.default.svc.cluster.local".to_string(),
+            "*.xn--bcher-kva.example".to_string(),
+            "xn--bcher-kva.*".to_string(),
+            "double.dot..".to_string(),
+            ".".to_string(),
+        ]
+    );
+    assert_eq!(
+        when[1].values,
+        vec!["Tenant-A.".to_string()],
+        "only connection.sni values are normalized"
+    );
+}
+
 /// `source.namespace` keeps Istio's `srcNamespaceGenerator` grammar, where every
 /// `*` is an arbitrary substring. A mid-string or repeated star is therefore
 /// valid input and must not be rejected as it is for `source.trustDomain`.
@@ -3917,4 +4086,65 @@ fn mesh_policy_admits_istio_dynamic_map_key_shapes() {
             "Istio-admitted dynamic map key '{key}' must validate: {errors:?}"
         );
     }
+}
+
+#[test]
+fn extension_config_declaring_destination_rule_carrier_type_is_rejected() {
+    // DestinationRules reach data planes only through the translator's reserved
+    // carriers; an operator entry with that type would be NACKed by every DP.
+    let mesh = MeshConfig {
+        extension_configs: vec![
+            MeshExtensionConfig {
+                name: "operator-dr".to_string(),
+                namespace: "default".to_string(),
+                type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+                value: Vec::new(),
+            },
+            MeshExtensionConfig {
+                name: "operator-ext".to_string(),
+                namespace: "default".to_string(),
+                type_url: "type.googleapis.com/example.OperatorExtension".to_string(),
+                value: Vec::new(),
+            },
+        ],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    let names_the_entry = |error: &String| {
+        error.contains("\"operator-dr\"")
+            && error.contains("reserved for Ferrum DestinationRule carriers")
+    };
+    assert!(
+        errors.iter().any(names_the_entry),
+        "the error must name the offending entry, got {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("operator-ext")),
+        "an ordinary operator extension stays admissible, got {errors:?}"
+    );
+}
+
+#[test]
+fn extension_config_declaring_mesh_slice_carrier_type_is_rejected() {
+    // Mesh-slice carriers ride only the translator's reserved ECDS names; an
+    // operator entry declaring one of their types would be NACKed by every DP.
+    let mesh = MeshConfig {
+        extension_configs: vec![MeshExtensionConfig {
+            name: "operator-services".to_string(),
+            namespace: "default".to_string(),
+            type_url: FERRUM_ECDS_SERVICES_TYPE_URL.to_string(),
+            value: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("\"operator-services\"")
+                && error.contains("reserved for Ferrum mesh-slice carriers")
+        }),
+        "the error must name the offending entry, got {errors:?}"
+    );
 }

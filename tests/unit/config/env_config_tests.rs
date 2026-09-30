@@ -398,6 +398,42 @@ fn test_shared_stream_admission_limits_apply_when_xds_is_disabled_on_cp() {
 }
 
 #[test]
+fn test_permessage_deflate_max_message_bytes_defaults_to_one_mib() {
+    // DEFLATE expands up to ~1032:1, so the decompressed-message bound must
+    // not default to the parser's (64 MiB) reassembled-message ceiling.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.websocket_permessage_deflate_max_message_bytes,
+                1 << 20
+            );
+            assert_eq!(
+                EnvConfig::default().websocket_permessage_deflate_max_message_bytes,
+                1 << 20
+            );
+        },
+    );
+    // `0` stays an explicit opt-in to the reassembled-message ceiling.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.websocket_permessage_deflate_max_message_bytes, 0);
+        },
+    );
+}
+
+#[test]
 fn test_http3_websocket_enabled_defaults_true() {
     // RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT defaults to enabled.
     // Operators who run an H3 listener want WebSocket-over-H3 to "just work"
@@ -7805,6 +7841,144 @@ fn test_trusted_proxies_rejects_junk_and_empty_segments() {
     }
 }
 
+// ── Inbound PROXY protocol on the HTTP/HTTPS listeners (issue #5768) ─────────
+
+use ferrum_edge::config::env_config::FrontendProxyProtocolMode as PpMode;
+
+const PP_HTTP: &str = "FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP";
+const PP_HTTPS: &str = "FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS";
+const PP_TRUSTED: &str = "FERRUM_FRONTEND_PROXY_PROTOCOL_TRUSTED_CIDRS";
+
+/// Parse through the full env pipeline (file mode unless `extra` overrides
+/// it), so every assertion covers `EnvConfig::validate()`.
+fn frontend_proxy_protocol_env(extra: &[(&str, &str)]) -> Result<EnvConfig, String> {
+    let mut vars = vec![
+        ("FERRUM_MODE", "file"),
+        ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+    ];
+    vars.extend_from_slice(extra);
+    let mut result = None;
+    with_env_vars(&vars, || result = Some(EnvConfig::from_env()));
+    result.expect("closure ran")
+}
+
+#[test]
+fn frontend_proxy_protocol_defaults_off() {
+    let config = frontend_proxy_protocol_env(&[]).expect("defaults are valid");
+    assert_eq!(config.frontend_proxy_protocol_http, PpMode::Off);
+    assert_eq!(config.frontend_proxy_protocol_https, PpMode::Off);
+    assert!(config.frontend_proxy_protocol_trusted_cidrs.is_empty());
+}
+
+#[test]
+fn frontend_proxy_protocol_parses_every_mode() {
+    for (raw, expected) in [
+        ("off", PpMode::Off),
+        ("v1", PpMode::V1),
+        ("V2", PpMode::V2),
+        (" auto ", PpMode::Auto),
+    ] {
+        let config = frontend_proxy_protocol_env(&[
+            (PP_HTTP, raw),
+            (PP_HTTPS, raw),
+            (PP_TRUSTED, "10.0.0.0/16"),
+        ])
+        .unwrap_or_else(|e| panic!("{raw:?} must parse: {e}"));
+        assert_eq!(config.frontend_proxy_protocol_http, expected, "{raw:?}");
+        assert_eq!(config.frontend_proxy_protocol_https, expected, "{raw:?}");
+    }
+}
+
+/// There is no optional or boolean spelling: an enabled listener always
+/// requires the header, and a typo must not silently mean `off`.
+#[test]
+fn frontend_proxy_protocol_rejects_unknown_modes() {
+    for raw in ["true", "on", "optional", "v3", "proxy"] {
+        let err = frontend_proxy_protocol_env(&[(PP_HTTPS, raw), (PP_TRUSTED, "10.0.0.0/16")])
+            .expect_err("an unknown mode must fail configuration");
+        assert!(err.contains(PP_HTTPS), "{raw:?}: {err}");
+    }
+}
+
+#[test]
+fn frontend_proxy_protocol_requires_trusted_cidrs() {
+    for key in [PP_HTTP, PP_HTTPS] {
+        let err = frontend_proxy_protocol_env(&[(key, "auto")])
+            .expect_err("an enabled listener without trusted sources must fail");
+        assert!(err.contains(key), "{key}: {err}");
+        assert!(err.contains(PP_TRUSTED), "{key}: {err}");
+    }
+}
+
+/// A trusted PROXY header chooses the client address outright, so a list that
+/// admits every source would let any direct client spoof its IP.
+#[test]
+fn frontend_proxy_protocol_rejects_catch_all_trusted_cidrs() {
+    for raw in [
+        "0.0.0.0/0",
+        "::/0",
+        "0.0.0.0/1,128.0.0.0/1",
+        "10.0.0.0/8,::/0",
+    ] {
+        let err = frontend_proxy_protocol_env(&[(PP_HTTP, "v1"), (PP_TRUSTED, raw)])
+            .expect_err("a catch-all trusted list must fail");
+        assert!(err.contains(PP_TRUSTED), "{raw:?}: {err}");
+    }
+}
+
+/// Like `FERRUM_TRUSTED_PROXIES`, the list is strict even while the listeners
+/// are off, so a typo cannot lie dormant until someone enables the setting.
+#[test]
+fn frontend_proxy_protocol_trusted_cidrs_parse_strictly() {
+    for raw in ["10.0.0.0/33", "10.0.0.0/8,", "junk"] {
+        let err = frontend_proxy_protocol_env(&[(PP_TRUSTED, raw)])
+            .expect_err("a malformed trusted list must fail configuration");
+        assert!(err.contains(PP_TRUSTED), "{raw:?}: {err}");
+    }
+}
+
+/// The load-balancer list and the forwarding-trust list are independent:
+/// enabling PROXY protocol neither requires nor changes `FERRUM_TRUSTED_PROXIES`.
+#[test]
+fn frontend_proxy_protocol_is_independent_of_trusted_proxies() {
+    let config = frontend_proxy_protocol_env(&[(PP_HTTPS, "v2"), (PP_TRUSTED, "10.0.0.0/16")])
+        .expect("PROXY protocol with a load-balancer list is valid");
+    assert_eq!(config.frontend_proxy_protocol_https, PpMode::V2);
+    assert_eq!(config.frontend_proxy_protocol_trusted_cidrs, "10.0.0.0/16");
+    assert!(config.trusted_proxies.is_empty());
+}
+
+/// Only database/file/dp run the global HTTP/HTTPS proxy listeners; enabling
+/// the setting anywhere else is refused rather than silently ignored.
+#[test]
+fn frontend_proxy_protocol_is_refused_outside_proxy_serving_modes() {
+    let mut result = None;
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "sqlite"),
+            ("FERRUM_DB_URL", "sqlite::memory:"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            (PP_HTTP, "auto"),
+            (PP_TRUSTED, "10.0.0.0/16"),
+        ],
+        || result = Some(EnvConfig::from_env()),
+    );
+    let err = result
+        .expect("closure ran")
+        .expect_err("cp mode has no global proxy listener to apply it to");
+    assert!(err.contains(PP_HTTP), "{err}");
+    assert!(err.contains("database, file, and dp"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // Sidecar-ingress Unix transport capacity (issue #3731).
 // ---------------------------------------------------------------------------
@@ -8168,4 +8342,44 @@ fn test_env_config_shutdown_predrain_seconds_rejects_values_above_the_maximum() 
             },
         );
     }
+}
+
+/// Issue #5706: a process that has not opted into the gateway binary's
+/// working-directory default — every Rust test harness, which Cargo runs from
+/// the repository root — must not resolve the managed-TLS store (and the TLS
+/// event log beside it) into the checkout. An explicit path still wins.
+#[test]
+fn test_unconfigured_tls_managed_store_path_is_private_to_the_process() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_TLS_MANAGED_STORE_PATH, tls_managed_store_path_from_env,
+    };
+
+    for configured in [None, Some("")] {
+        let vars: Vec<(&str, &str)> = configured
+            .map(|value| ("FERRUM_TLS_MANAGED_STORE_PATH", value))
+            .into_iter()
+            .collect();
+        with_env_vars(&vars, || {
+            let resolved = tls_managed_store_path_from_env();
+            assert_ne!(resolved, DEFAULT_TLS_MANAGED_STORE_PATH);
+            assert_eq!(
+                resolved,
+                tls_managed_store_path_from_env(),
+                "the private default must be stable for the life of the process"
+            );
+            let resolved = std::path::Path::new(&resolved);
+            assert!(resolved.is_absolute(), "{}", resolved.display());
+            assert!(
+                !resolved.starts_with(env!("CARGO_MANIFEST_DIR")),
+                "the private default must stay outside the checkout: {}",
+                resolved.display()
+            );
+        });
+    }
+
+    const EXPLICIT: &str = "/srv/ferrum/managed-tls";
+    let explicit = [("FERRUM_TLS_MANAGED_STORE_PATH", EXPLICIT)];
+    with_env_vars(&explicit, || {
+        assert_eq!(tls_managed_store_path_from_env(), EXPLICIT);
+    });
 }

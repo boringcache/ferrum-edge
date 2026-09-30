@@ -2672,14 +2672,128 @@ async fn a_live_or_absent_credential_leaves_the_buffered_terminal_summary_untouc
 /// The eighth site is the deferred semantic-cache replay transport encoder
 /// (`encode_semantic_cache_replay`), which runs the compression `after_proxy`
 /// hook after the synthetic header chain and must stay under the same bound.
+///
+/// The ninth and tenth are the charged backend deadline terminal's hook runners
+/// (#5744): proxy core's one-poll `after_proxy` runner and the reject-path
+/// runner's charged mode. Neither races an awaited phase, since each hook gets
+/// one poll, so each composes the bound at its two edges: an elapsed
+/// credential answers with the fixed terminal before any poll, and a pending
+/// hook detaches only under the credential's lifetime.
+///
+/// The eleventh is not a phase but the detach bound of the reject-path cleanup
+/// that continues after the gateway's own deadline terminal is selected
+/// (`rejection_cleanup_authorization_at`, #5747). That cleanup runs off the
+/// response frame, so, like the charged-terminal detach, it composes only the
+/// credential's lifetime: it is refused once that lifetime elapsed and
+/// cancelled at it, and it never outlives the fixed cleanup timeout.
 #[test]
 fn every_precommit_response_phase_composes_the_authorization_lifetime() {
     assert_eq!(
         PROXY_SOURCE
             .matches("ctx.precommit_response_phase_bound()")
             .count(),
-        8,
+        11,
         "a pre-commitment response phase lost its authorization bound"
+    );
+    let charged_runner = PROXY_SOURCE
+        .split("async fn run_charged_terminal_after_proxy_hook(")
+        .nth(1)
+        .expect("charged-terminal after_proxy runner")
+        .split("\n}\n")
+        .next()
+        .expect("charged-terminal after_proxy runner bounded");
+    // Like the reject path, the charged runner gates on the credential's own
+    // elapsed deadline, not the winning bound, so an earlier RPC deadline
+    // cannot buy an expired credential one more poll.
+    let settle_at = charged_runner
+        .find("if let Some(termination) = bound.elapsed_authorization() {")
+        .expect("the charged after_proxy runner gates on the credential's own deadline");
+    let poll_at = charged_runner
+        .find("owned_rejection_hook_future(")
+        .expect("the charged after_proxy runner constructs the hook future");
+    assert!(
+        settle_at < poll_at
+            && !charged_runner.contains("bound.expired_authorization()")
+            && charged_runner.contains("settle_precommit_authorization_expiry(ctx, termination)"),
+        "the charged after_proxy runner must settle an elapsed credential before polling"
+    );
+    let bounded_detach =
+        "spawn_detached_charged_terminal_hook(future, bound.authorization_deadline_at())";
+    assert!(
+        charged_runner.contains(bounded_detach),
+        "the charged after_proxy runner must detach only under the credential's lifetime"
+    );
+    let charged_reject_path = PROXY_SOURCE
+        .split("async fn run_after_proxy_hooks_on_rejection(")
+        .nth(1)
+        .expect("reject-path after_proxy runner")
+        .split("\n}\n")
+        .next()
+        .expect("reject-path after_proxy runner bounded");
+    // The reject path gates on the credential's own elapsed deadline, not the
+    // winning bound, so an earlier RPC deadline cannot buy an expired
+    // credential one more poll (#5747).
+    let settles_expiry = "charged_bound.and_then(|bound| bound.elapsed_authorization())";
+    assert!(
+        charged_reject_path.contains(settles_expiry)
+            && charged_reject_path.contains("replace_rejection_with_authorization_terminal("),
+        "the charged reject path must settle an elapsed credential before polling"
+    );
+    assert!(
+        charged_reject_path
+            .contains("charged_bound.and_then(|bound| bound.authorization_deadline_at())"),
+        "the charged reject path must detach only under the credential's lifetime"
+    );
+    let detached = PROXY_SOURCE
+        .split("fn spawn_detached_charged_terminal_hook(")
+        .nth(1)
+        .expect("charged-terminal detached runner")
+        .split("\nfn spawn_detached_rejection_cleanup(")
+        .next()
+        .expect("charged-terminal detached runner bounded");
+    let rejection_cleanup = PROXY_SOURCE
+        .split("\nfn spawn_detached_rejection_cleanup(")
+        .nth(1)
+        .expect("detached rejection cleanup")
+        .split("\n}\n")
+        .next()
+        .expect("detached rejection cleanup bounded");
+    for enforced in [
+        "if authorization_at.is_some_and(|at| started_at >= at) {",
+        "if authorization_at.is_some_and(|at| tokio::time::Instant::now() >= at) {",
+        "tokio::time::sleep_until(authorization_at.unwrap_or(cleanup_at))",
+        "biased;",
+    ] {
+        assert!(
+            detached.contains(enforced),
+            "the detached charged-terminal hook must enforce the authorization bound: {enforced}"
+        );
+        assert!(
+            rejection_cleanup.contains(enforced),
+            "the detached rejection cleanup must enforce the authorization bound: {enforced}"
+        );
+    }
+    for detach in [
+        "spawn_detached_rejection_cleanup(",
+        "rejection_cleanup_authorization_at(ctx),",
+    ] {
+        assert_eq!(
+            charged_reject_path.matches(detach).count(),
+            2,
+            "every detached rejection cleanup must carry the credential's lifetime: {detach}"
+        );
+    }
+    let cleanup_bound = PROXY_SOURCE
+        .split("fn rejection_cleanup_authorization_at(")
+        .nth(1)
+        .expect("rejection cleanup authorization bound")
+        .split("\n}\n")
+        .next()
+        .expect("rejection cleanup authorization bound bounded");
+    assert!(
+        cleanup_bound.contains("ctx.precommit_response_phase_bound()")
+            && cleanup_bound.contains(".authorization_deadline_at()"),
+        "the rejection cleanup bound must be the credential's authorization deadline"
     );
     assert!(
         !PROXY_SOURCE.contains("ctx.precommit_response_phase_deadline_at()"),
@@ -2752,8 +2866,18 @@ fn an_expired_committed_hook_is_dropped_rather_than_detached() {
     // and the clone of the request context and protected body it would own —
     // is even constructed.
     let early_gate_at = hook
-        .find("if let Some(termination) = bound.expired_authorization() {")
+        .find("if let Some(termination) = expired {")
         .expect("pre-construction authorization gate");
+    // Over a charged terminal the gate is the credential's own elapsed
+    // deadline, not the winning bound, as on the charged `after_proxy`
+    // runners; elsewhere it attributes the winning bound.
+    let gate_selection_at = hook
+        .find(
+            "let expired = if charged_terminal {\n        bound.elapsed_authorization()\n    \
+             } else {\n        bound.expired_authorization()\n    };",
+        )
+        .expect("the pre-construction gate selects the credential's own deadline when charged");
+    assert!(gate_selection_at < early_gate_at);
     let construct_at = hook
         .find("owned_response_committed_hook_future(")
         .expect("observer construction");
@@ -4682,6 +4806,68 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
     );
 }
 
+/// The same stack-budget invariant for the gateway-generated gRPC-Web error
+/// terminals that `after_proxy` now decorates (#5747). Proxy core's native gRPC
+/// branch builds them through one `#[inline(never)]` factory, and the HTTP/3
+/// bridge keeps their hook runner boxed so the cold arms of `dispatch_plain`
+/// carry only a pointer. An authorization terminal those hooks select on the
+/// bridge is written under the bounded post-deadline grace, never through the
+/// unbounded gateway reject writer.
+#[test]
+fn gateway_error_terminals_are_built_out_of_line_and_bound_the_authorization_write() {
+    const CROSS_PROTOCOL_SOURCE: &str = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("let response = boxed_grpc_web_gateway_error_response(")
+            .count(),
+        2,
+        "both gRPC-Web arms of the native gRPC error branch must use the out-of-line builder"
+    );
+    let factory = PROXY_SOURCE
+        .split("pub(crate) fn boxed_grpc_web_gateway_error_response<'a>(")
+        .next()
+        .expect("the out-of-line gRPC-Web gateway error builder");
+    assert!(
+        factory.ends_with("#[inline(never)]\n"),
+        "the builder must stay `#[inline(never)]`: inlining it back into the \
+         caller restores the frame slot it exists to remove"
+    );
+
+    let writer = CROSS_PROTOCOL_SOURCE
+        .split("async fn write_plain_gateway_error_terminal<S>(")
+        .nth(1)
+        .expect("the HTTP/3 gateway error terminal writer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded HTTP/3 gateway error terminal writer");
+    let boxed_hooks = concat!(
+        "Box::pin(\n",
+        "            crate::proxy::apply_after_proxy_hooks_to_gateway_error_terminal(",
+    );
+    assert!(
+        writer.contains(boxed_hooks),
+        "the bridge must keep the gateway error terminal hook runner boxed"
+    );
+    let hooks = writer
+        .find("apply_after_proxy_hooks_to_gateway_error_terminal(")
+        .expect("the hooks run first");
+    let authorization = writer
+        .find("if ctx.authorization_termination().is_some() {")
+        .expect("an authorization terminal the hooks selected is detected");
+    let bounded = writer
+        .find("return write_plain_authorization_expired_terminal(")
+        .expect("and written under the bounded post-deadline grace");
+    let unbounded = writer
+        .find("write_plain_gateway_reject(")
+        .expect("every other terminal keeps the gateway reject writer");
+    assert!(
+        hooks < authorization && authorization < bounded && bounded < unbounded,
+        "an authorization terminal must be written through the bounded writer, \
+         before the unbounded gateway reject writer is reached"
+    );
+}
+
 /// The same stack-budget invariant, for the authorization terminals that are
 /// SYNCHRONOUS rather than awaited.
 ///
@@ -5354,8 +5540,23 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         .next()
         .expect("bounded cross-protocol plain dispatcher");
 
-    let upload = balanced_block_after(dispatch, "if let Some(termination) = upload_auth_expired {")
-        .expect("streaming upload authorization-expiry arm");
+    // The streamed upload classifies an authorization expiry before acting on
+    // it, so its attempt is recorded at one point (issue #5875), then answers
+    // it in the matching arm of the upload's terminal match.
+    let upload_race = dispatch
+        .split("let send_result = if upload_bound_elapsed {")
+        .nth(1)
+        .expect("streaming upload/backend response race");
+    assert!(
+        upload_race
+            .contains("Some(termination) => PlainAttemptEnd::AuthorizationExpired(termination),"),
+        "the streaming upload must classify an authorization expiry as its own attempt end"
+    );
+    let upload = balanced_block_after(
+        upload_race,
+        "PlainAttemptEnd::AuthorizationExpired(termination) => {",
+    )
+    .expect("streaming upload authorization-expiry arm");
     assert!(upload.contains("record_authorization_termination_once("));
     assert!(upload.contains("write_plain_authorization_expired_terminal("));
     assert!(
@@ -5530,7 +5731,7 @@ fn every_precommit_h3_grpc_terminal_is_preceded_by_the_authorization_gate() {
     // CB / passive health / adaptive concurrency stay neutral: the TRUE backend
     // status with NO error class.
     let outcome = terminal
-        .split("record_backend_outcome(")
+        .split("record_backend_outcome_no_conn_end(")
         .nth(1)
         .expect("backend outcome")
         .split(");")
@@ -5897,6 +6098,74 @@ async fn a_stalled_aggregate_sse_headers_write_on_an_exact_tie_is_authorization(
     );
 }
 
+/// An authorization expiry that cancels the aggregate SSE HEADERS write after
+/// its first poll reports the head as offered, so the writer resets the stream
+/// instead of writing its `401` HEADERS (#5745). A bound that had already
+/// elapsed never offers the head, and the `401` is still legal after it.
+#[tokio::test(start_paused = true)]
+async fn an_aggregate_sse_headers_expiry_reports_whether_the_head_was_offered() {
+    use ferrum_edge::_test_support::await_offered_authorized_headers_write_for_test;
+
+    let now = tokio::time::Instant::now();
+    let bound = compose_aggregate_sse_bound_for_test(
+        now + Duration::from_secs(30),
+        Some(plan_at(
+            now + Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        )),
+    );
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(
+        offered,
+        "the parked head was offered before the expiry cancelled it"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::pending::<Result<(), &'static str>>();
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        H3AuthorizedHeadersWrite::AuthorizationExpired(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!offered, "an elapsed bound must not poll the head");
+
+    let bound = compose_aggregate_sse_bound_for_test(now + Duration::from_secs(30), None);
+    let latch = StreamAuthTerminationLatch::default();
+    let write = std::future::ready(Ok::<(), &'static str>(()));
+    let (outcome, offered) = await_offered_authorized_headers_write_for_test(
+        bound,
+        StreamAuthProtocolFamily::Http,
+        &latch,
+        write,
+    )
+    .await;
+    assert_eq!(outcome, H3AuthorizedHeadersWrite::Written);
+    assert!(offered);
+    assert_eq!(latch.observed(), None);
+}
+
 /// An already-elapsed authorization bound with a later listener lifetime must
 /// not poll send_response, so the protected 200/event-stream head cannot commit.
 #[tokio::test(start_paused = true)]
@@ -6056,9 +6325,42 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
         .split("async fn send_h3_grpc_error_with_recv_halt(")
         .next()
         .expect("native H3 aggregate SSE writer bounded");
+    // The head races through the offered variant of the shared helper (#5745),
+    // which must keep the same deadline race and the same authorization
+    // attribution as `await_authorized_headers_write`, adding only whether h3
+    // already took the head.
+    let sse_head = "await_offered_authorized_headers_write(\n            aggregate_sse_bound,";
     assert!(
-        sse_writer.contains("await_authorized_headers_write("),
+        sse_writer.contains(sse_head) && sse_writer.contains("stream.send_response(response),"),
         "aggregate MCP SSE must race HEADERS through the shared authorized-write helper"
+    );
+    let offered_helper = helper
+        .split("pub(crate) async fn await_offered_authorized_headers_write<")
+        .nth(1)
+        .expect("offered authorized HEADERS helper present")
+        .split("\nfn authorized_headers_write_outcome<")
+        .next()
+        .expect("offered authorized HEADERS helper bounded");
+    let offered_race = "await_offered_response_write_before_deadline(bound.deadline(), write)";
+    assert!(
+        offered_helper.contains(offered_race),
+        "the offered HEADERS helper must race the composed bound"
+    );
+    let shared_attribution = "authorized_headers_write_outcome(bound, family, latch, result)";
+    assert!(
+        offered_helper.contains(shared_attribution),
+        "the offered HEADERS helper must attribute through the shared outcome"
+    );
+    let plain_helper = helper
+        .split("pub(crate) async fn await_authorized_headers_write<")
+        .nth(1)
+        .expect("authorized HEADERS helper present")
+        .split("pub(crate) async fn await_offered_authorized_headers_write<")
+        .next()
+        .expect("authorized HEADERS helper bounded");
+    assert!(
+        plain_helper.contains(shared_attribution),
+        "both HEADERS helpers must share one authorization attribution"
     );
     assert!(
         sse_writer.contains("compose_aggregate_sse_bound("),
@@ -6155,10 +6457,11 @@ fn every_composed_h3_write_bound_attributes_from_the_captured_composition() {
         ("cross", cross, "terminal_write_bound"),
         ("cross", cross, "downstream_write_bound"),
     ] {
-        assert!(
-            source.contains(&format!("let {bound} =")),
-            "http3/{file}.rs lost its composed `{bound}`"
-        );
+        // `plain_write_bound` is re-derived per retry attempt, so it is bound
+        // mutably in a tuple with its sibling bounds.
+        let composed =
+            source.contains(&format!("let {bound} =")) || source.contains(&format!("mut {bound},"));
+        assert!(composed, "http3/{file}.rs lost its composed `{bound}`");
         assert!(
             source.contains(&format!("{bound}.deadline()")),
             "http3/{file}.rs must await the composed instant through `{bound}`"
@@ -6754,24 +7057,57 @@ fn cross_protocol_mesh_force_buffer_uses_the_composed_authorization_bound() {
         .split("async fn dispatch_grpc<S>(")
         .next()
         .expect("bounded cross-protocol plain dispatcher");
+    // Buffering a mesh upload is a gateway-local phase, so it drains under
+    // `plain_local_bound`: the authorization plan composed with the earliest of
+    // the client RPC deadline and the route rule's total deadline (#5646).
     let bound_at = dispatch
-        .find("let plain_write_bound =")
-        .expect("plain_write_bound must be composed in dispatch_plain");
+        .find("mut plain_local_bound")
+        .expect("plain_local_bound must be composed in dispatch_plain");
     let mesh_block_start = dispatch
         .find("target_requires_http_mesh_egress")
         .expect("mesh force-buffer gate");
     assert!(
         bound_at < mesh_block_start,
-        "plain_write_bound must be composed before the mesh force-buffer branch"
+        "plain_local_bound must be composed before the mesh force-buffer branch"
+    );
+    let bounds_helper = cross
+        .split("fn plain_bridge_dispatch_bounds(")
+        .nth(1)
+        .expect("plain bridge bound composition helper")
+        .split("type PlainBridgeDispatchBounds")
+        .next()
+        .expect("bounded plain bridge bound composition helper");
+    let bounds_helper_compact: String = bounds_helper
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let local_bound_args = bounds_helper_compact
+        .split_once("letlocal_bound=crate::proxy::auth_lifetime::ComposedAuthBound::compose(")
+        .expect("plain_local_bound must compose through ComposedAuthBound")
+        .1;
+    assert!(
+        local_bound_args.starts_with(
+            "crate::proxy::earliest_deadline(grpc_web_deadline_at,route.total()),auth_plan,);"
+        ),
+        "plain_local_bound must compose the authorization plan with the route total"
     );
     let mesh_block = &dispatch[mesh_block_start..];
     let mesh_block_end = mesh_block
         .find("let (response, bytes_sent, mut backend_admission_permits")
         .expect("bounded mesh force-buffer");
     let mesh_collection = &mesh_block[..mesh_block_end];
+    let mesh_collection_compact: String = mesh_collection
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mesh_drain_args = mesh_collection_compact
+        .split_once("collect_h3_request_body_under_authorization(")
+        .expect("the mesh force-buffer must collect under the authorization bound")
+        .1;
     assert!(
-        mesh_collection.contains("collect_h3_request_body_under_authorization(")
-            && mesh_collection.contains("plain_write_bound"),
+        mesh_drain_args.starts_with(
+            "drain_h3_body(stream,effective_max_request_body_size_bytes),plain_local_bound,"
+        ),
         "the mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(
@@ -7258,12 +7594,15 @@ fn composed_authorization_waits_use_the_shared_expiry_first_primitive() {
         .split("async fn dispatch_grpc<S>(")
         .next()
         .expect("bounded cross-protocol plain dispatcher");
+    // Client acquisition is a gateway-local phase, so it waits under the
+    // composed bound with a plain request's route total deadline folded in
+    // (#5646); the authorization owner is still captured by the composition.
     assert_eq!(
         dispatch
-            .matches("await_deadline_first(\n                        plain_write_bound.deadline()")
+            .matches("await_deadline_first(\n                        plain_local_bound.deadline()")
             .count()
             + dispatch
-                .matches("await_deadline_first(\n                    plain_write_bound.deadline()")
+                .matches("await_deadline_first(\n                    plain_local_bound.deadline()")
                 .count(),
         2,
         "both client acquisitions must wait under the captured composed bound"
@@ -7841,4 +8180,44 @@ fn authorization_expiry_messages_are_still_compiled_in_at_debug_level() {
             "{name} must still carry its authorization-lifetime expiry messages, at debug level"
         );
     }
+}
+
+/// Issue #5588: an H2 client's END_STREAM often arrives as a separate
+/// zero-length DATA frame. The bridge must not relay it — an HTTP/2 transport
+/// would send it as an empty DATA frame without END_STREAM, which h2 >= 0.4.16
+/// peers bound per connection (GOAWAY on the 101st) — and the transport must
+/// see end of stream once it takes the frame the client body ended on.
+#[tokio::test(start_paused = true)]
+async fn a_bridged_upload_drops_empty_data_frames_and_reports_end_of_stream() {
+    let mut probe = UploadPumpProbe::start_watermark_only(600_000);
+    assert!(probe.feed("hello"));
+    assert!(probe.feed(""));
+    assert!(probe.feed(""));
+    assert!(probe.feed("world"));
+    probe.end_client_body();
+
+    let mut sizes = Vec::new();
+    let mut end_stream_after = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => {
+                sizes.push(len);
+                end_stream_after.push(probe.transport_is_end_stream());
+            }
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+    assert_eq!(
+        sizes,
+        vec![5, 5],
+        "zero-length DATA frames must not cross the bridge"
+    );
+    assert_eq!(
+        end_stream_after,
+        vec![false, true],
+        "the frame the client body ended on must carry end of stream"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
 }

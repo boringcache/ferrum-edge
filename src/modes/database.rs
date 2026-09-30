@@ -1055,6 +1055,11 @@ pub async fn run(
     // whole serving cycle. No-op in release builds / when unset.
     crate::config::test_db_fault::arm_from_env().await;
 
+    // Inbound PROXY protocol policy per global proxy listener (issue #5768).
+    // Resolved before anything is spawned so a refusal leaves nothing behind.
+    let proxy_protocol = proxy::frontend_proxy_protocol::global_listener_policies(&env_config)
+        .map_err(anyhow::Error::msg)?;
+
     let effective_url = env_config
         .effective_db_url()
         .map_err(anyhow::Error::msg)?
@@ -1462,6 +1467,19 @@ pub async fn run(
             "Stream proxy port conflicts with gateway reserved ports"
         ));
     }
+    // An HTTP-family route cannot claim a process-global proxy frontend of the
+    // other class, or put a dedicated Sidecar ingress bind on one (#5922).
+    let frontends = proxy::gateway_listener::env_process_global_frontends(&env_config);
+    if let Err(errors) =
+        proxy::gateway_listener::validate_process_global_frontend_conflicts(&config, &frontends)
+    {
+        for msg in &errors {
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
+        }
+        return Err(anyhow::anyhow!(
+            "Gateway listener port conflicts with a process-global proxy frontend"
+        ));
+    }
 
     // DNS cache
     let dns_cache = DnsCache::new(DnsConfig {
@@ -1797,6 +1815,7 @@ pub async fn run(
         let http_state = proxy_state.clone();
         let http_shutdown = shutdown_tx.subscribe();
         let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
+        let http_proxy_protocol = proxy_protocol.http.clone();
         let http_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
@@ -1806,11 +1825,12 @@ pub async fn run(
                     &http_addr.to_string(),
                 ))
             );
-            proxy::start_proxy_listener_with_tls_and_signal(
+            proxy::start_global_proxy_listener_with_tls_and_signal(
                 http_addr,
                 http_state,
                 http_shutdown,
                 None,
+                http_proxy_protocol,
                 Some(http_started_tx),
             )
             .await
@@ -1840,6 +1860,7 @@ pub async fn run(
             let reload_slot = proxy_frontend_reload_handles
                 .as_ref()
                 .and_then(|h| h.slot.clone());
+            let https_proxy_protocol = proxy_protocol.https.clone();
             let https_handle = tokio::spawn(async move {
                 info!(
                     "Starting HTTPS proxy listener on {}",
@@ -1850,20 +1871,22 @@ pub async fn run(
                     ))
                 );
                 let result = if let Some(slot) = reload_slot {
-                    proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                    proxy::start_global_proxy_listener_with_dynamic_tls_and_signal(
                         https_addr,
                         https_state,
                         https_shutdown,
                         slot,
+                        https_proxy_protocol,
                         Some(https_started_tx),
                     )
                     .await
                 } else {
-                    proxy::start_proxy_listener_with_tls_and_signal(
+                    proxy::start_global_proxy_listener_with_tls_and_signal(
                         https_addr,
                         https_state,
                         https_shutdown,
                         Some(tls_config),
+                        https_proxy_protocol,
                         Some(https_started_tx),
                     )
                     .await
@@ -1980,7 +2003,9 @@ pub async fn run(
                             client_ca_bundle_path: h3_client_ca,
                             client_crls: h3_client_crls,
                             started_tx: Some(h3_started_tx),
+                            accept_gate: None,
                             frontend_tls_reload: h3_reload,
+                            udp_port_hold: None,
                         },
                     )
                     .await

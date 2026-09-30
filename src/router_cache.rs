@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, Upstream, wildcard_matches};
+use crate::proxy::gateway_listener::{GatewayListenerAdmissionBasis, GatewayListenerIdentity};
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -120,9 +121,10 @@ struct HttpPortMatchContext<'a> {
     /// Same, for the one distinct TLS-scoped HTTP `listen_port`.
     single_tls_listen_port: Option<u16>,
     /// Listener admission published with the exact request/config generation.
-    /// A pending generation rejects every listener-scoped route. Once the
-    /// matching reconcile acknowledges it, every admission-refused or
-    /// bind-failed port remains ineligible for Service remap.
+    /// A pending generation rejects every listener-scoped route, and a pending
+    /// port rejects the routes scoped to it. Every admission-refused,
+    /// bind-failed, withdrawn, or retiring port remains ineligible for Service
+    /// remap.
     listener_admission: &'a GatewayListenerAdmission,
 }
 
@@ -431,18 +433,43 @@ pub(crate) struct HostRouteTable {
 
 /// Gateway listener routing admission for one exact request/config generation.
 ///
-/// New config generations start pending so a newly published port-scoped route
-/// cannot use an older generation's successful decision. The listener manager
-/// replaces pending with a decided refusal set only after reconciling that same
-/// config generation. The decided set includes both pre-bind admission
-/// refusals and OS bind failures so neither can expose a listener-scoped route
-/// through Service-fronted remapping. This also preserves the dedicated
-/// Sidecar-ingress boundary: a failed loopback bind cannot widen onto the
-/// process-global frontend.
+/// The listener manager publishes a decided refusal set only after
+/// reconciling that same config generation. The decided set includes both
+/// pre-bind admission refusals and OS bind failures so neither can expose a
+/// listener-scoped route through Service-fronted remapping. This also
+/// preserves the dedicated Sidecar-ingress boundary: a failed loopback bind
+/// cannot widen onto the process-global frontend.
+///
+/// A decision records the listener plan it was made against. Each config
+/// publication derives the next generation's admission from it, in the same
+/// store as the new route table (issue #5914). A port whose planned identity
+/// is unchanged keeps its decision, so live listeners keep serving across
+/// reloads. A new port is pending. A withdrawn or changed port that had a
+/// live socket is refused, so no request is routed under its old identity.
+/// These hold until the matching reconcile publishes its own decision. An
+/// admission with no recorded plan (startup, or a standalone harness) makes
+/// the next generation pending as a whole.
+///
+/// A refusal on a process-global proxy frontend port is a route refusal only
+/// (issue #5922). That socket is not a Gateway listener, so it never has a
+/// stale identity, and refusing it as a frontend port would 404 every
+/// port-agnostic route of every namespace it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
+    /// No decision covers this generation yet. Every listener-scoped route is
+    /// refused, but no frontend port is.
     pending: bool,
+    /// Ports refused both as a route `listen_port` and as a frontend port:
+    /// Gateway listener sockets that are retiring, withdrawn, changed, or
+    /// refused.
     refused_ports: BTreeSet<u16>,
+    /// Process-global frontend ports whose scoped routes are refused. The
+    /// frontend keeps serving its port-agnostic routes.
+    refused_route_ports: BTreeSet<u16>,
+    /// Ports whose route admission waits for this generation's reconcile.
+    /// Unlike `refused_ports` they do not refuse the frontend port.
+    pending_ports: BTreeSet<u16>,
+    basis: Option<GatewayListenerAdmissionBasis>,
 }
 
 impl GatewayListenerAdmission {
@@ -450,24 +477,152 @@ impl GatewayListenerAdmission {
         Arc::new(Self {
             pending: true,
             refused_ports: BTreeSet::new(),
+            refused_route_ports: BTreeSet::new(),
+            pending_ports: BTreeSet::new(),
+            basis: None,
         })
     }
 
+    /// A decision without a recorded plan. It cannot be carried forward, so
+    /// the next config generation starts pending.
     pub(crate) fn decided(refused_ports: BTreeSet<u16>) -> Arc<Self> {
         Arc::new(Self {
             pending: false,
             refused_ports,
+            refused_route_ports: BTreeSet::new(),
+            pending_ports: BTreeSet::new(),
+            basis: None,
         })
     }
 
-    #[inline]
-    pub(crate) fn allows(&self, port: u16) -> bool {
-        !self.pending && !self.refused_ports.contains(&port)
+    /// The decision a listener reconcile made against `basis`. A refused
+    /// process-global frontend port refuses only its scoped routes.
+    pub(crate) fn decided_for_plan(
+        refused: BTreeSet<u16>,
+        basis: GatewayListenerAdmissionBasis,
+    ) -> Arc<Self> {
+        let (refused_route_ports, refused_ports): (BTreeSet<u16>, BTreeSet<u16>) = refused
+            .into_iter()
+            .partition(|port| basis.is_process_global_frontend(*port));
+        Arc::new(Self {
+            pending: false,
+            refused_ports,
+            refused_route_ports,
+            pending_ports: BTreeSet::new(),
+            basis: Some(basis),
+        })
     }
 
+    /// The admission `config` publishes with, derived from this one.
+    ///
+    /// Runs under the request-epoch writer lock, once per config publication,
+    /// never on the request path. Returns `self` unchanged when the listener
+    /// plan is identical, and never admits a port this admission does not:
+    /// every port it refuses or leaves pending stays refused or pending.
+    pub(crate) fn carry_forward(self: &Arc<Self>, config: &GatewayConfig) -> Arc<Self> {
+        let Some(basis) = self.basis.as_ref().filter(|_| !self.pending) else {
+            return Self::pending();
+        };
+        let next_basis = basis.for_config(config);
+        if next_basis == *basis {
+            return Arc::clone(self);
+        }
+        let mut refused_ports = BTreeSet::new();
+        let mut refused_route_ports = BTreeSet::new();
+        let mut pending_ports = BTreeSet::new();
+        for (port, planned) in next_basis.ports() {
+            let was_refused =
+                self.refused_ports.contains(port) || self.refused_route_ports.contains(port);
+            let was_pending = self.pending_ports.contains(port);
+            let previous = basis.ports().get(port);
+            let refuse = if next_basis.is_process_global_frontend(*port) {
+                // The frontend socket is not ours and never goes stale; only
+                // the routes scoped to it can be refused (issue #5922).
+                &mut refused_route_ports
+            } else {
+                &mut refused_ports
+            };
+            if was_refused || planned.is_refused() {
+                // A retiring socket keeps its refusal, and a plan refusal is
+                // known without waiting for reconcile.
+                refuse.insert(*port);
+            } else if previous == Some(planned) {
+                // Unchanged: keep this port's decision.
+                if was_pending {
+                    pending_ports.insert(*port);
+                }
+            } else if previous.is_some() && !was_pending {
+                // A decided port changed class, bind, or ownership. Its live
+                // socket keeps the old identity until reconcile retires it.
+                refuse.insert(*port);
+            } else {
+                // New to the plan, or still waiting for its first decision.
+                pending_ports.insert(*port);
+            }
+        }
+        // A withdrawn port keeps its socket, and its already accepted
+        // connections, until reconcile retires it. Refuse it now instead of
+        // letting the process-global route set or Service remap serve it.
+        // Ports the process-global frontend served have no socket to retire.
+        for (port, previous) in basis.ports() {
+            if !next_basis.ports().contains_key(port) && previous.owns_socket() {
+                refused_ports.insert(*port);
+            }
+        }
+        // Refusals outside the new plan belong to retiring sockets. Keep them
+        // until reconcile sees those sockets drained. Route refusals outside
+        // the plan are kept too, so carry-forward never admits a port.
+        refused_ports.extend(
+            self.refused_ports
+                .iter()
+                .filter(|port| !next_basis.ports().contains_key(*port)),
+        );
+        refused_route_ports.extend(
+            self.refused_route_ports
+                .iter()
+                .filter(|port| !next_basis.ports().contains_key(*port)),
+        );
+        // A port still waiting for its first decision stays pending when it
+        // leaves the plan, so no port is admitted without a reconcile.
+        for port in &self.pending_ports {
+            if !next_basis.ports().contains_key(port)
+                && !refused_ports.contains(port)
+                && !refused_route_ports.contains(port)
+            {
+                pending_ports.insert(*port);
+            }
+        }
+        Arc::new(Self {
+            pending: false,
+            refused_ports,
+            refused_route_ports,
+            pending_ports,
+            basis: Some(next_basis),
+        })
+    }
+
+    /// Whether routes scoped to `listen_port` `port` may serve. The sets
+    /// probed here are normally empty.
     #[inline]
-    fn explicitly_refuses(&self, port: u16) -> bool {
+    pub(crate) fn allows(&self, port: u16) -> bool {
+        !self.pending
+            && !self.refused_ports.contains(&port)
+            && !self.refused_route_ports.contains(&port)
+            && !self.pending_ports.contains(&port)
+    }
+
+    /// Whether `port` is refused as a frontend port, not only as a route
+    /// `listen_port`.
+    #[inline]
+    pub(crate) fn explicitly_refuses(&self, port: u16) -> bool {
         self.refused_ports.contains(&port)
+    }
+
+    /// Whether `port` is a process-global frontend whose scoped routes are
+    /// refused while the frontend keeps routing (issue #5922).
+    #[cfg(test)]
+    pub(crate) fn refuses_only_routes_on(&self, port: u16) -> bool {
+        self.refused_route_ports.contains(&port)
     }
 }
 
@@ -756,10 +911,11 @@ impl HostRouteTable {
     ///
     /// Behavior matrix (see [`MeshInboundPortGroup`]):
     /// - route not grouped → keep `current`;
-    /// - a single-port SERVICE-default group (`is_ingress == false`) → keep
-    ///   `current` unconditionally (back-compat: single-port services accept
-    ///   bare-Host clients, older peers, and any explicit port today — selection
-    ///   adds no new requirement to them);
+    /// - a single-port SERVICE-default group (`is_ingress == false`) → a
+    ///   request with no port signal keeps `current` (bare-Host clients); a
+    ///   PRESENT signal must name the sole port — the orig-dst its container
+    ///   port, else the authority its service port or its container port — or
+    ///   [`MeshInboundPortSelectError::PortNotMaterialized`];
     /// - a single-listener INGRESS group (`is_ingress == true`) → a present port
     ///   signal MUST equal the declared listener port (else
     ///   [`MeshInboundPortSelectError::PortNotMaterialized`]); a request with no
@@ -799,10 +955,9 @@ impl HostRouteTable {
                 // absorb traffic to any other port. A request that names a port
                 // (captured orig-dst or explicit authority) is accepted only when
                 // that port matches the sole listener; a present-but-unmatched
-                // signal fails closed (a single-port service-default group keeps
-                // the back-compat passthrough below). With NO port signal the
-                // request falls through to the sole listener — there is no other
-                // inbound destination to confuse it with.
+                // signal fails closed. With NO port signal the request falls
+                // through to the sole listener — there is no other inbound
+                // destination to confuse it with.
                 let listener_port = group.ports.first().map(|s| s.authority_port);
                 let signal = orig_dst_port.or(authority_port);
                 if let Some(port) = signal
@@ -812,10 +967,29 @@ impl HostRouteTable {
                 }
                 return Ok((current, listener_port));
             }
-            // Single declared SERVICE port (non-ingress): keep the representative
-            // unconditionally (back-compat — single-port services accept bare-Host
-            // clients and any explicit port). Not an ingress group, so no authz
-            // listener port to stamp.
+            // Single declared SERVICE port (non-ingress): a request with no port
+            // signal (a bare-Host client) keeps the representative. A PRESENT
+            // signal must name this port with the same priority as a multi-port
+            // group — the captured orig-dst its container port, else the
+            // authority either its service port (`Host: svc:80`) or its
+            // container port (a headless / direct-pod `pod-0.svc:9080` dial;
+            // a single-port peer's authority is forwarded unchanged). Both are
+            // the sole port's own numbers, so accepting either absorbs no other
+            // port; any other explicit port fails closed. Not an ingress group,
+            // so no authz listener port to stamp.
+            let sibling = group.ports.first();
+            let signal_matches = match (orig_dst_port, authority_port) {
+                (Some(container_port), _) => {
+                    sibling.is_some_and(|sibling| sibling.orig_dst_match_port == container_port)
+                }
+                (None, Some(port)) => sibling.is_some_and(|sibling| {
+                    sibling.authority_port == port || sibling.orig_dst_match_port == port
+                }),
+                (None, None) => true,
+            };
+            if !signal_matches {
+                return Err(MeshInboundPortSelectError::PortNotMaterialized);
+            }
             return Ok((current, None));
         }
         let selected = if let Some(container_port) = orig_dst_port {
@@ -1698,6 +1872,15 @@ impl RouterCache {
     /// Production lookup from one complete request epoch. Keeping the route
     /// table, cache generation, and listener admission behind this one
     /// parameter prevents HTTP/H3 callers from pairing different generations.
+    ///
+    /// `gateway_listener` is the identity of the Gateway listener that
+    /// accepted the request's connection, `None` on every other frontend. A
+    /// connection accepted by a listener that reconcile has since retired is
+    /// refused outright, like a refused frontend port (issue #5921). The
+    /// caller loads `epoch` first, so an admission published after the
+    /// retirement is never paired with a stale view of the flag. The request
+    /// paths answer such a connection `421` before they get here; this is
+    /// the backstop that keeps the route table itself fail-closed.
     pub(crate) fn find_proxy_in_epoch(
         &self,
         epoch: &crate::request_epoch::RequestEpoch,
@@ -1705,7 +1888,11 @@ impl RouterCache {
         path: &str,
         frontend_port: Option<u16>,
         frontend_is_tls: bool,
+        gateway_listener: Option<&GatewayListenerIdentity>,
     ) -> Option<RouteMatch> {
+        if crate::proxy::gateway_listener::is_retired_connection(gateway_listener) {
+            return None;
+        }
         self.find_proxy_with_admission(
             &epoch.route_table,
             epoch.route_generation,
@@ -3730,7 +3917,7 @@ fn make_cache_key(
 ///
 /// Since the canonical-policy-path fix for advisory `GHSA-69xf-42xm-4w4f`,
 /// every HTTP/1.1, HTTP/2, and HTTP/3 request target is run through
-/// [`crate::policy_path::canonicalize_policy_path`] before it reaches routing,
+/// [`crate::policy_path::canonicalize_request_path`] before it reaches routing,
 /// and an encoded separator is *rejected* there rather than folded here.
 /// Folding changes a path's segment structure, so a folded route decision
 /// could still disagree with a backend that does not decode; rejecting cannot.
@@ -4942,6 +5129,8 @@ mod tests {
             udp_idle_timeout_seconds: 60,
             tcp_idle_timeout_seconds: Some(300),
             websocket_idle_timeout_seconds: None,
+            websocket_permessage_deflate: Default::default(),
+            allow_path_parameters: false,
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
@@ -5810,11 +5999,13 @@ mod tests {
         ));
     }
 
-    /// Single-declared-port local services keep today's behavior
-    /// unconditionally: bare-Host clients, older peers, and any explicit
-    /// port all keep routing (selection adds no new requirement to them).
+    /// Single-declared-port local services keep serving bare-Host clients (no
+    /// port signal), but a PRESENT port signal must name the sole port: the
+    /// orig-dst its container port, else the authority its service port or its
+    /// container port. A mismatched explicit port fails closed instead of being
+    /// absorbed.
     #[test]
-    fn mesh_inbound_single_port_group_keeps_route_unconditionally() {
+    fn mesh_inbound_single_port_group_requires_a_present_signal_to_match() {
         let mut p =
             minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-ratings-8080", "/");
         p.hosts = vec!["ratings".to_string()];
@@ -5827,15 +6018,41 @@ mod tests {
         let cache = RouterCache::new(&config, 100);
         let table = cache.route_table_for_tests();
 
-        for (orig_dst, authority) in [(None, None), (None, Some(9999u16)), (Some(9999u16), None)] {
+        // No signal, a matching orig-dst (container port 8081), or a matching
+        // authority (service port 8080, or container port 8081) keeps the
+        // route. A present orig-dst outranks the authority, as for a
+        // multi-port group.
+        for (orig_dst, authority) in [
+            (None, None),
+            (Some(8081u16), None),
+            (None, Some(8080u16)),
+            (None, Some(8081u16)),
+            (Some(8081u16), Some(9999u16)),
+        ] {
             let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
             let (kept, ingress_authz_port) = table
                 .select_mesh_inbound_port_route(rm, orig_dst, authority)
-                .expect("single-port group never demands a signal");
+                .expect("a matching or absent signal keeps the single-port route");
             assert_eq!(kept.proxy.id, "__mesh-inbound-default-ratings-8080");
             assert_eq!(
                 ingress_authz_port, None,
                 "service-port group is not ingress"
+            );
+        }
+
+        // A mismatched explicit port is refused rather than absorbed.
+        for (orig_dst, authority) in [
+            (None, Some(9999u16)),
+            (Some(9999u16), None),
+            (Some(8080u16), Some(8080u16)),
+        ] {
+            let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+            assert!(
+                matches!(
+                    table.select_mesh_inbound_port_route(rm, orig_dst, authority),
+                    Err(MeshInboundPortSelectError::PortNotMaterialized)
+                ),
+                "orig_dst={orig_dst:?} authority={authority:?} must fail closed"
             );
         }
     }
@@ -6101,42 +6318,50 @@ mod tests {
     }
 
     /// Counterpart to the ingress fail-closed check: a SINGLE-port SERVICE-default
-    /// inbound group (`is_ingress == false`) keeps the back-compat passthrough —
-    /// it accepts any explicit port and a bare-Host dial onto the sole sibling, so
-    /// the round-2 ingress tightening does NOT regress single-port services.
+    /// inbound group (`is_ingress == false`) serves a bare-Host dial and a Host
+    /// port naming EITHER the service port (`Host: reviews:80`) OR the container
+    /// port (a headless `pod-0.reviews:9080` dial), and refuses any other port.
     #[test]
-    fn mesh_inbound_single_service_port_keeps_backcompat_passthrough() {
-        let mut p =
-            minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
-        p.hosts = vec!["reviews".to_string()];
-        p.backend_port = 8080;
-        let config = GatewayConfig {
-            proxies: vec![p],
-            // The service declares exactly one HTTP port.
-            mesh: mesh_block(&[("default", "reviews", &[80])]),
-            ..GatewayConfig::default()
-        };
-        let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table_for_tests();
+    fn mesh_inbound_single_service_port_accepts_service_or_container_host_port() {
+        for container_port in [8080u16, 9080] {
+            let mut p =
+                minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
+            p.hosts = vec!["reviews".to_string()];
+            p.backend_port = container_port;
+            let config = GatewayConfig {
+                proxies: vec![p],
+                // The service declares exactly one HTTP port.
+                mesh: mesh_block(&[("default", "reviews", &[80])]),
+                ..GatewayConfig::default()
+            };
+            let cache = RouterCache::new(&config, 100);
+            let table = cache.route_table_for_tests();
 
-        // No signal → keep (back-compat), and NO ingress authz port (service
-        // default authorizes on the backend port).
-        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
-        let (kept, authz_port) = table
-            .select_mesh_inbound_port_route(rm, None, None)
-            .expect("single service port keeps the route unconditionally");
-        assert_eq!(kept.proxy.backend_port, 8080);
-        assert_eq!(authz_port, None);
+            // No signal, the service port, or the container port in the Host
+            // keeps the route, with NO ingress authz port (service default
+            // authorizes on the backend port).
+            for authority in [None, Some(80u16), Some(container_port)] {
+                let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+                let (kept, authz_port) = table
+                    .select_mesh_inbound_port_route(rm, None, authority)
+                    .expect("the sole port's own numbers keep the route");
+                assert_eq!(kept.proxy.backend_port, container_port);
+                assert_eq!(authz_port, None);
+            }
 
-        // An explicit (even unrelated) authority/orig-dst port is still accepted
-        // for a single-port service — unchanged from round-1.
-        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
-        assert!(
-            table
-                .select_mesh_inbound_port_route(rm, Some(12345), None)
-                .is_ok(),
-            "a single-port service must keep accepting any explicit port (back-compat)"
-        );
+            // Any other explicit port is refused rather than absorbed, and a
+            // captured orig-dst must be the container port.
+            for (orig_dst, authority) in [(None, Some(12345u16)), (Some(12345u16), None)] {
+                let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+                assert!(
+                    matches!(
+                        table.select_mesh_inbound_port_route(rm, orig_dst, authority),
+                        Err(MeshInboundPortSelectError::PortNotMaterialized)
+                    ),
+                    "container={container_port} orig_dst={orig_dst:?} authority={authority:?}"
+                );
+            }
+        }
     }
 
     /// A partially materialized multi-port group (one sibling skipped) still

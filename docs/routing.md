@@ -9,7 +9,7 @@ Routing is the first half of the request path; protocol dispatch is the second. 
 - **`proxy.backend_scheme`** (`http`, `https`, `tcp`, `tcps`, `udp`, `dtls`) — the wire transport. HTTP family proxies (`http`, `https`) default to `https` when omitted. Stream family proxies must set a scheme explicitly.
 - **Runtime `HttpFlavor`** — `Plain`, `Grpc`, or `WebSocket`, classified per-request by `detect_http_flavor()` from the request's content-type and upgrade headers.
 
-The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. This is the decoupling introduced alongside the `BackendScheme` refactor; older `BackendProtocol::{Grpcs, Wss, H3}` config values no longer exist.
+The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. There are no gRPC-, WebSocket-, or HTTP/3-specific scheme values.
 
 HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.md) for the dispatch model, the cross-protocol bridge, and why WebSocket upgrades on the H3 listener return 501.
 
@@ -19,11 +19,22 @@ When a request arrives, the gateway first validates protocol authority fields, t
 
 Host normalization strips a valid port suffix, preserves bracketed IPv6 literals, rejects unbracketed IPv6 literals, strips a DNS trailing dot, and lowercases ASCII hostnames. Invalid authority syntax is rejected instead of being routed ambiguously.
 
-The request path used for routing is the **canonical policy path**, derived once at the frontend boundary before route lookup and shared by every policy surface and by the backend request line. Percent-escapes of characters that are legal literally in a path are decoded (`/%61dmin` routes as `/admin`); every other escape is rejected with `400` before routing — encoded separators, double encodings, encoded control characters, invalid escapes, and escapes of bytes outside that `pchar` decode set (`%20`, `%7B`, and any percent-encoded non-ASCII byte), which the gateway can neither retain nor decode without forwarding a different string than policy read. Dot segments and backslashes are rejected in both spellings, literal and encoded: `/a/../b`, `/a/./b`, `/a/%2e%2e/b`, `/a\b`, and `/a%5Cb` all receive `400`, because the URL parser that builds the backend request line removes dot segments and reads `\` as a separator, so forwarding one would resolve a different path than routing matched. A `.` inside a segment (`/v1.0/users`) is an ordinary path character and is unaffected. No percent escape survives into the routed path. Because the same value is used for `strip_listen_path` offsets and for the forwarded path, a route decision can never desync from what the backend executes. Configured literal `listen_path` values must be written in that same canonical form and are rejected at admission otherwise; a `~regex` `listen_path` is a pattern, so only the percent-escape rules apply to it (`\` and `.` are regex syntax there). See [docs/request_path_canonicalization.md](request_path_canonicalization.md).
+The request path used for routing is the **canonical policy path**, derived once at the frontend boundary before route lookup and shared by every policy surface and by the backend request line. Percent-escapes of characters that are legal literally in a path are decoded (`/%61dmin` routes as `/admin`); every other escape is rejected with `400` before routing — encoded separators, double encodings, encoded control characters, invalid escapes, and escapes of bytes outside that `pchar` decode set (`%20`, `%7B`, and any percent-encoded non-ASCII byte), which the gateway can neither retain nor decode without forwarding a different string than policy read. Dot segments and backslashes are rejected in both spellings, literal and encoded: `/a/../b`, `/a/./b`, `/a/%2e%2e/b`, `/a\b`, and `/a%5Cb` all receive `400`, because the URL parser that builds the backend request line removes dot segments and reads `\` as a separator, so forwarding one would resolve a different path than routing matched. A segment whose text before the first `;` is `.` or `..` is a dot segment too: `/a/..;/b`, `/a/.;x/b`, `/a/%2e%2e;/b`, and `/a/..%3B/b` receive `400`, because backends that strip path parameters before resolving dot segments (Tomcat, Spring) resolve them to `/b`. Non-final empty segments are rejected too: `//admin`, `/a//b`, and a segment that is empty before its first `;` (`/;x/admin`, `/a/%3Bx/b`) receive `400` (`empty_segment`), because Tomcat, Spring, and nginx collapse `//` (after stripping `;…`) and would execute a different path than routing matched; a trailing slash (`/a/`) is unaffected. A `.` inside a segment (`/v1.0/users`) is an ordinary path character and is unaffected. No percent escape survives into the routed path. Because the same value is used for `strip_listen_path` offsets and for the forwarded path, a route decision can never desync from what the backend executes. Configured literal `listen_path` values must be written in that same canonical form and are rejected at admission otherwise; a `~regex` `listen_path` is a pattern, so only the percent-escape rules apply to it (`\` and `.` are regex syntax there). See [docs/request_path_canonicalization.md](request_path_canonicalization.md).
+
+**Path parameters (`;`) are refused unless the proxy opts in.** A `;` in the canonical path — literal, or decoded from `%3B` — is refused with `400` (`path_parameter`) unless the proxy the request routes to sets `allow_path_parameters: true`. Tomcat and Spring strip `;…` from every segment, so `/admin;x/users` would execute `/admin/users` while routing and policy read `/admin;x/users`. The check needs the matched proxy, so it runs immediately after route lookup and before any plugin phase or backend dispatch, on HTTP/1.1, HTTP/2, and HTTP/3 alike; route lookup itself is a literal match that grants nothing. On an opted-in proxy the gateway also re-resolves the route with every parameter removed and refuses the request when that path belongs to a different proxy: the router splits only on `/`, so `/admin;x/users` would otherwise skip an `/admin` proxy and reach an opted-in `/` catch-all whose backend executes `/admin/users`. A final parameter-only segment (`/ctx/;jsessionid=abc`) is a path parameter, not an empty segment. With the opt-in, the `;` is routed, evaluated, and forwarded unchanged (one coordinate), so enable it only for backends that use matrix parameters and write policy for the parameterised spellings they accept. Dot segments with a parameter (`..;`) and segments empty before their `;` stay refused either way. A literal `listen_path` containing `;` requires `allow_path_parameters: true` and is rejected at admission otherwise; Gateway API routes whose literal path match contains `;` are translated with the opt-in set.
+
+```yaml
+proxies:
+  - id: matrix-api
+    listen_path: /catalog
+    backend_host: catalog.internal
+    backend_port: 8080
+    allow_path_parameters: true   # forwards /catalog/items;color=red unchanged
+```
 
 ### Step 1: Cache Lookup (O(1))
 
-Before any route table scanning, the router checks two bounded caches keyed by `(host, path)`:
+Before any route table scanning, the router checks two bounded caches keyed by `(host, path)` plus the frontend port and TLS flag:
 
 1. **Prefix cache** — stores prefix route matches and negative (no-match) entries
 2. **Regex/exact cache** — stores regex, exact-path, and path-param route matches (separate partition)
@@ -59,8 +70,8 @@ Within **each** host tier, four path matching strategies are tried in order:
 
 After scanning, the result is cached for future O(1) lookups:
 
-- **Prefix match** is stored in the prefix cache
-- **Regex match** is stored in the regex cache (separate partition)
+- **Prefix or host-only match** is stored in the prefix cache
+- **Regex or exact-path match** is stored in the regex/exact cache (separate partition)
 - **No match** is stored as a negative entry in the prefix cache (prevents repeated O(n) scans from scanner/bot traffic)
 
 ## Priority Rules (Most to Least Specific)
@@ -70,7 +81,7 @@ After scanning, the result is cached for future O(1) lookups:
    exact host  >  wildcard host (*.domain)  >  catch-all (no hosts)
 
 2. Path match type (within the same host tier)
-   exact path  >  prefix route  >  regex route
+   exact path  >  prefix route  >  regex route  >  host-only fallback
 
 3. Prefix tiebreaker
    longest prefix wins (pre-sorted at config load time)
@@ -109,11 +120,11 @@ and `deep.other.example.com`, but not `example.com` itself.
 | `api.example.com` | `/api/health` | `wildcard-api` | No exact-host prefix match for `/api/health`, wildcard `*.example.com` + prefix `/api` |
 | `other.example.com` | `/api/data` | `wildcard-api` | Wildcard host match + prefix `/api` |
 | `other.org` | `/anything` | `catchall` | No exact/wildcard match, catch-all `/` |
-| `other.org` | `/users/42/orders` | `user-orders-regex` | No prefix match, catch-all regex matches exact path |
-| `other.org` | `/users/42/orders/pending` | `catchall` | Regex pattern has auto-appended `$`, so `/orders/pending` doesn't match — falls through to catch-all `/` |
-| `api.example.com` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders/pending` | `catchall` | Catch-all prefix `/` (the regex would not match anyway: it is anchored with `$`) |
+| `api.example.com` | `/users/42/orders` | `catchall` | No exact-host or wildcard match; catch-all prefix `/` beats catch-all regex |
 
-Note the last row: the catch-all prefix route `/` matches `/users/42/orders` before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route for this path, either remove the catch-all or assign the regex route to a more specific host tier.
+In this example `user-orders-regex` never wins: the catch-all prefix route `/` matches every path before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route, either remove the catch-all `/` or give the regex route a more specific host tier.
 
 ## Host-only Routing
 
@@ -293,7 +304,7 @@ The router uses **two separate DashMap cache partitions**:
 
 This separation prevents regex routes with highly variable path segments (UUIDs, timestamps) from filling the cache and evicting frequently-hit prefix route entries.
 
-Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-resolved to at least 10,000 entries) and use frequency-aware sample eviction when a partition reaches the threshold. Config changes publish the route table, its generation, and generation-bound Gateway-listener admission in one request epoch. A new epoch starts listener admission pending, so listener-scoped routes fail closed until the exact config generation is reconciled; acknowledging that decision advances the route-cache generation so neither positive nor negative entries survive the admission transition.
+Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-resolved to at least 10,000 entries) and use frequency-aware sample eviction when a partition reaches the threshold. Config changes publish the route table, its generation, and generation-bound Gateway-listener admission in one request epoch. A new epoch derives its listener admission from the previous decision and the listener plan that decision was made against (issue #5914): a port whose planned identity (class, bind address, mesh direction, process-global ownership, or plan refusal) is unchanged keeps its decision, so live listeners and the single-listener Service remap keep serving through a reload; a new port is pending (or refused, if the plan itself refuses it, for example a reserved port), so its listener-scoped routes fail closed until the exact config generation is reconciled; a changed or withdrawn port that already had a decision and owns a Gateway listener socket is refused (a changed port that is still pending stays pending, since its socket's accept gate is closed), also as a frontend port, so its still-open socket never serves under its old identity; refusals held for retiring sockets are kept; and a route withdrawn from the process-global proxy port never refuses that frontend. A refusal on a process-global proxy port (a route of the other listener class, or a dedicated Sidecar ingress bind on it) refuses only the routes scoped to that port, never the frontend, so every port-agnostic route it serves keeps serving (issue #5922); config validation rejects both collisions before they can be published, except on a data plane, which warns; mesh mode owns no process-global frontend and does not check. A generation with no prior decision (startup) starts wholly pending. Every connection a Gateway listener accepts carries that listener's identity. When reconcile retires a listener because its class, bind address, or mesh direction changed, or because it was withdrawn, it retires the identity before publishing, and every request on those connections, for as long as they drain, is answered `421 Misdirected Request` (gRPC `UNAVAILABLE`; HTTP/1 also closes the connection) so the client retries on a new connection that reaches the replacement. A replacement that binds in the same pass is therefore admitted by that pass and serves new connections at once (issue #5921). The carried admission is never less strict than the one it replaces; only a reconcile of the exact config generation can widen it, and a decision that changes admission advances the route-cache generation so neither positive nor negative entries survive the transition.
 
 ## Performance Characteristics
 
@@ -305,7 +316,7 @@ Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-
 | Cache miss, prefix match found | O(path depth) segment-boundary HashMap walk within the matched host tier |
 | Cache miss, regex match found | Prefix/exact checks plus one `RegexSet` pass for the matched host tier; captures run only for the winning regex |
 | Cache miss, no match (404) | O(all routes in all tiers) — negative entry cached for future O(1) |
-| Config reload | Route table, generation, and pending listener admission published as one RequestEpoch; matching admission acknowledgement advances cache generation |
+| Config reload | Route table, generation, and carried-forward listener admission published as one RequestEpoch; a matching reconcile decision that changes admission advances cache generation |
 
 All route table operations (sorting, regex compilation, host partitioning) happen at config load time, never on the request hot path. The request path uses one lock-free `RequestEpoch` load for the route table and its listener admission, followed by `DashMap::get()` for cached lookups.
 
@@ -386,4 +397,130 @@ plugin_configs:
       allow_credentials: true
     scope: global
     enabled: true
+```
+
+## WebSocket compression (`permessage-deflate`)
+
+By default the gateway strips the client's `Sec-WebSocket-Extensions` offer before
+the backend handshake, so RFC 7692 `permessage-deflate` is never negotiated end to
+end and every message stays inspectable by WebSocket frame plugins
+(`websocket_permessage_deflate: strip`). Two opt-in modes enable compression:
+`passthrough` (below) and gateway-terminated `terminate`
+([below](#gateway-terminated-compression-terminate)).
+
+A proxy can opt into `websocket_permessage_deflate: passthrough`. The client's
+`permessage-deflate` offer elements then reach the backend unchanged, and the
+backend's `permessage-deflate` answer reaches the client unchanged, on HTTP/1.1,
+HTTP/2 Extended CONNECT, and HTTP/3 Extended CONNECT. Any other extension token in
+the offer or answer is still stripped. A session that actually negotiates the
+extension is relayed as raw bytes (the gateway frame parser cannot decode
+compressed frames), so `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` and the
+incomplete-message bounds do not apply to it — idle, lifetime, drain, and
+connection limits still do. A session whose backend declines the offer keeps the
+normal relay.
+
+Passthrough is refused by config validation (Admin API 400, file-mode startup,
+database / CP load) on any proxy that has a plugin requiring the parsed WebSocket
+relay — `waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`,
+or a custom plugin whose `requires_websocket_framing()` returns `true` — whether it
+is attached directly, through a proxy group, or inherited from a global plugin
+config. As a second guard, the runtime keeps stripping the offer whenever the
+proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/
+`dtls`) must keep `strip`.
+
+In CP/DP deployments, upgrade every DP before enabling passthrough on the CP. A
+proxy rejects unknown fields, so a DP that predates `websocket_permessage_deflate`
+rejects the whole namespace snapshot from a CP that sends it.
+
+### Gateway-terminated compression (`terminate`)
+
+`websocket_permessage_deflate: terminate` keeps compression and inspection on the
+same route. The gateway is an RFC 7692 endpoint on each leg, and the two legs
+negotiate independently, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+Extended CONNECT alike:
+
+- **Client leg.** The gateway answers the first valid `permessage-deflate`
+  element of the client's offer itself. It honors `server_no_context_takeover`
+  and `server_max_window_bits` (echoing them in its answer) and never asks the
+  client to limit its own window. Elements with unknown or duplicate parameters,
+  or window bits outside 8–15, are declined; other extension tokens are dropped.
+  A client that does not offer the extension gets an uncompressed leg.
+- **Backend leg.** The backend receives the gateway's own offer,
+  `Sec-WebSocket-Extensions: permessage-deflate`, whatever the client offered.
+  The whole `Sec-WebSocket-Extensions` answer (every field line) must be one
+  valid `permessage-deflate` element without `client_max_window_bits` (which the
+  gateway did not offer); anything else — a foreign extension, a second element,
+  a malformed list, or a non-ASCII value — fails the upgrade with 502
+  (`rejection_phase: websocket_permessage_deflate`). A backend that sends no
+  extension answer gets an uncompressed leg.
+
+Every message is inflated before the shared frame relay parses it, so every frame
+and body-inspecting plugin — the WAF WebSocket scanner, `ws_message_size_limiting`,
+`ws_rate_limiting`, `ws_frame_logging`, custom `on_ws_frame` hooks — sees
+plaintext, and none is refused on a `terminate` proxy. After the plugins run, the
+gateway re-deflates each Text or Binary message toward a leg that negotiated
+compression, with that leg's context-takeover choice. Control frames are never
+compressed, and a compressed message may arrive fragmented (RSV1 on its first
+frame only). RSV1 on a control or continuation frame, or on a leg that did not
+negotiate the extension, fails the connection exactly as without it.
+
+Decompression is bounded per leg:
+
+- a compressed wire frame may not exceed the frame ceiling
+  (`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, or a lower `ws_message_size_limiting`
+  `max_frame_bytes`), and one frame may not inflate past it;
+- a message may not inflate past
+  `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default 1 MiB, never
+  above the reassembled-message ceiling of 4x the frame ceiling or a lower
+  `max_message_bytes`; `0` explicitly opts into that ceiling);
+- inflation stops one byte past a limit and the session closes with 1009 in both
+  directions; corrupt compressed data closes with 1007;
+- buffers grow only with bytes that arrived: a compressed frame's declared length
+  reserves nothing, and an inflated frame never holds more than its limit plus
+  one byte;
+- the LZ77 window is the RFC 7692 maximum of 32 KiB. Each negotiated leg holds a
+  DEFLATE decompressor (about 50 KiB) and a 16 KiB read buffer from the start,
+  and a compressor (about 240 KiB) from the first message the gateway compresses
+  toward it, for the life of the session. A session with both legs negotiated
+  therefore holds about 0.6 MB, plus buffers bounded by the frame and message
+  ceilings. Size connection limits with that in mind.
+
+The message bound is also the amplification bound. DEFLATE expands up to about
+1032:1, so a peer can make the gateway inflate, inspect (every frame and body
+plugin, the WAF included), and re-compress a whole message for about 1/1000 of
+its size on the wire, and repeat that for every message. With the 1 MiB default
+that is about 1 KiB of wire data per 1 MiB of work. Setting the bound to `0`
+raises it to the reassembled-message ceiling — 64 MiB with the default 16 MiB
+frame size — where about 64 KiB of compressed data forces 64 MiB of memory and
+on the order of a second of CPU per message. Keep the bound as low as the
+application's largest legitimate message allows.
+
+Frame and message ceilings, fragment metering, and the incomplete-message bounds
+all apply to the decompressed messages the plugins see, and the wire
+fragmentation is preserved. Terminate costs CPU on both legs; a session whose
+peers both decline compression uses the ordinary relay (including
+`FERRUM_WEBSOCKET_TUNNEL_MODE`), while a negotiated session always uses the parsed
+relay. Byte counters and `ws_frame_logging` sizes are decompressed sizes. As with
+`passthrough`, upgrade every DP, and every database-mode node sharing the DB,
+before enabling `terminate`: a DP that predates the value rejects the namespace
+snapshot, and a database-mode node that predates it rejects the proxy row.
+
+```yaml
+proxies:
+  - id: chat
+    listen_path: /chat
+    backend_scheme: http
+    backend_host: chat.internal
+    backend_port: 8080
+    websocket_permessage_deflate: terminate
+```
+
+```yaml
+proxies:
+  - id: chat
+    listen_path: /chat
+    backend_scheme: http
+    backend_host: chat.internal
+    backend_port: 8080
+    websocket_permessage_deflate: passthrough
 ```

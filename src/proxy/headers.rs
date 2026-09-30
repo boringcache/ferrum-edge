@@ -103,14 +103,56 @@ define_header_name_set! {
     ]
 }
 
-/// Returns `true` for the gateway-owned consumer assertion namespace.
+/// Returns `true` for the gateway-owned consumer assertion namespace
+/// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`).
 ///
-/// Consumer plugins may attach additional attributes beneath this prefix, so
-/// backend boundaries must reject the whole namespace rather than only the two
-/// built-in identity fields.
+/// This is the single source of truth for the namespace. Every name under the
+/// prefix is gateway-owned: a client-supplied `X-Consumer-Role` or
+/// `X-Consumer-Groups` is as much a forged identity assertion to a backend as a
+/// client-supplied `X-Consumer-Username`, so ingress materialization, the raw
+/// gRPC / mesh merge base, the post-plugin assertion refresh, WebSocket
+/// handshakes, request trailers, third-party AI provider boundaries, and
+/// plugin config admission all reject the whole namespace. Only the gateway
+/// re-adds names beneath it afterwards (today `x-consumer-username` and
+/// `x-consumer-custom-id`, from the authenticated principal).
+///
+/// `_` and `-` are equivalent in the prefix: `X_Consumer_Role` and
+/// `x_consumer-groups` are in the namespace too. `_` is a legal token byte, and
+/// CGI-style backends (Rack, WSGI, PHP-FPM) fold both spellings to the same
+/// `HTTP_X_CONSUMER_*` variable, so an underscore spelling would otherwise
+/// reach the backend as the gateway's assertion.
+///
+/// Allocation-free: one bounded 11-byte compare that folds ASCII case and
+/// normalises `_` to `-`, so it is safe to call per header on the hot path
+/// with lowercase or mixed-case names.
 #[inline]
-pub(crate) fn is_consumer_assertion_header(name: &str) -> bool {
-    name.starts_with("x-consumer-")
+pub fn is_consumer_assertion_header(name: &str) -> bool {
+    const PREFIX: &[u8] = b"x-consumer-";
+    let Some(head) = name.as_bytes().get(..PREFIX.len()) else {
+        return false;
+    };
+    for (&byte, &expected) in head.iter().zip(PREFIX) {
+        let folded = match byte {
+            b'_' => b'-',
+            other => other.to_ascii_lowercase(),
+        };
+        if folded != expected {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns `true` for every backend-visible gateway assertion: the
+/// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
+/// (`x-geo-country`). ASCII case-insensitive and allocation-free.
+///
+/// Outbound maps that plugins may have mutated are scrubbed of these names and
+/// then receive only the gateway's authoritative values
+/// (`crate::proxy::refresh_backend_gateway_assertion_headers`).
+#[inline]
+pub fn is_gateway_assertion_header(name: &str) -> bool {
+    is_consumer_assertion_header(name) || name.eq_ignore_ascii_case("x-geo-country")
 }
 
 define_header_name_set! {
@@ -507,7 +549,7 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
     is_backend_request_strip_header(name)
         || is_proxy_owned_forwarding_header(name, true)
         || name.starts_with("grpc-")
-        || name.starts_with("x-consumer-")
+        || is_consumer_assertion_header(name)
         || name.starts_with("x-ferrum-")
         || name.starts_with("x-path-param-")
         // `via` and `early-data` are deliberately asymmetric with the header
@@ -561,14 +603,27 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
 
 /// Remove reserved gateway-asserted headers from a request `HeaderMap`.
 ///
-/// `x-consumer-username` / `x-consumer-custom-id` are injected by the gateway
-/// only after a principal is resolved and are documented as "never trusted
-/// from clients". `x-geo-country` is likewise emitted only after a successful
-/// GeoIP lookup. `HeaderMap::remove` clears every value for the case-insensitive
-/// name, so any client-supplied casing or duplication is dropped.
+/// The whole `x-consumer-*` namespace ([`is_consumer_assertion_header`]) is
+/// gateway-owned: `x-consumer-username` / `x-consumer-custom-id` are injected
+/// only after a principal is resolved, and no other name beneath the prefix is
+/// ever trusted from a client. `x-geo-country` is likewise emitted only after a
+/// successful GeoIP lookup. `HeaderMap::remove` clears every value for a name,
+/// and `HeaderMap` names are already lowercase, so any client-supplied casing
+/// or duplication is dropped.
+///
+/// Linear in the number of distinct names: matching names are collected in one
+/// pass and then removed. The common no-assertion request does one prefix
+/// compare per distinct name and allocates nothing (collecting an empty
+/// iterator does not allocate).
 fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
-    headers.remove("x-consumer-username");
-    headers.remove("x-consumer-custom-id");
+    let forged: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|name| is_consumer_assertion_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in forged {
+        headers.remove(name);
+    }
     headers.remove("x-geo-country");
 }
 
@@ -622,8 +677,8 @@ fn raw_header_values_match_materialized(
 /// `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
 /// `content-length`, etc. straight back into the outbound map.
 ///
-/// Reserved gateway-asserted headers (`x-consumer-username`,
-/// `x-consumer-custom-id`, and `x-geo-country`) are stripped from the raw base
+/// Reserved gateway-asserted headers (the whole `x-consumer-*` namespace and
+/// `x-geo-country`) are stripped from the raw base
 /// map FIRST, before the merge. The native gRPC path uses the raw inbound
 /// `HeaderMap` as its merge base (unlike the reqwest / direct-H2 /
 /// WebSocket paths, which build the outbound map from the sanitised
@@ -740,9 +795,27 @@ pub fn merge_proxy_headers_preserving_repeated(
 ///   - `proxy::body::StripHopByHopTrailers` wrapper interposed before
 ///     `Coalescing<Incoming>` on the streaming path.
 ///
+/// **Gateway-owned diagnostics**: the client-facing diagnostic fields in
+/// `GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS` are stripped here too, so
+/// every dispatch path (reqwest, direct hyper / H2 pool, native gRPC and
+/// gRPC-Web, native H3, the H3 bridge, serverless functions) drops a
+/// backend-supplied copy — header or trailer — before the gateway writes its
+/// own. Unlike the hop-by-hop set they are NOT stripped at the final client
+/// wire boundary ([`strip_client_response_hop_by_hop_headers`]), because the
+/// gateway's own reject builders carry them in the same header map.
+///
 /// `name` is expected to be lowercase.
 #[inline]
 pub fn is_backend_response_strip_header(name: &str) -> bool {
+    is_response_hop_by_hop_or_internal_control_header(name)
+        || is_gateway_owned_diagnostic_response_header(name)
+}
+
+/// Response-direction hop-by-hop set plus Ferrum-owned internal control
+/// fields: the part of [`is_backend_response_strip_header`] that is also
+/// stripped at the final client wire boundary.
+#[inline]
+fn is_response_hop_by_hop_or_internal_control_header(name: &str) -> bool {
     matches!(
         name,
         "connection"
@@ -754,6 +827,55 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     ) || is_internal_response_control_header(name)
+}
+
+/// Wire name of the gateway-owned HTTP-family failure-class header
+/// (`X-Gateway-Error`).
+pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
+/// Wire name of the gateway-owned degraded-routing header
+/// (`X-Gateway-Upstream-Status`).
+pub(crate) const X_GATEWAY_UPSTREAM_STATUS_HEADER: &str = "x-gateway-upstream-status";
+/// Wire name of the gateway-owned opaque diagnostic reference
+/// (`X-Ferrum-Diagnostic-Ref`, issue #5767). Only
+/// [`crate::diagnostic_ref::stamp_response_headers`] writes it, as the last
+/// step before the response head reaches the client.
+pub(crate) const X_FERRUM_DIAGNOSTIC_REF_HEADER: &str =
+    crate::diagnostic_ref::DIAGNOSTIC_REF_HEADER;
+
+/// The single list of client-facing diagnostic response fields only the
+/// gateway may author. A backend (or serverless function) copy is removed at
+/// every backend response boundary through
+/// [`is_backend_response_strip_header`], and each response builder removes any
+/// leftover copy with [`strip_gateway_owned_diagnostic_response_headers`]
+/// before writing its own value. Add a new gateway-authored diagnostic field
+/// here, never at an individual dispatch path.
+pub(crate) const GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS: [&str; 3] = [
+    X_GATEWAY_ERROR_HEADER,
+    X_GATEWAY_UPSTREAM_STATUS_HEADER,
+    X_FERRUM_DIAGNOSTIC_REF_HEADER,
+];
+
+/// Whether `name` is one of [`GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS`],
+/// compared ASCII-case-insensitively.
+#[inline]
+pub(crate) fn is_gateway_owned_diagnostic_response_header(name: &str) -> bool {
+    GATEWAY_OWNED_DIAGNOSTIC_RESPONSE_HEADERS
+        .iter()
+        .any(|owned| name.eq_ignore_ascii_case(owned))
+}
+
+/// Remove every case variant of the gateway-owned diagnostic fields from a
+/// response map, so the builder that runs next is their only author. No-op
+/// (and no rehash) when none is present, the common case.
+pub(crate) fn strip_gateway_owned_diagnostic_response_headers(
+    headers: &mut std::collections::HashMap<String, String>,
+) {
+    if headers
+        .keys()
+        .any(|name| is_gateway_owned_diagnostic_response_header(name))
+    {
+        headers.retain(|name, _| !is_gateway_owned_diagnostic_response_header(name));
+    }
 }
 
 /// Ferrum-owned response fields used only between trusted proxy phases.
@@ -773,7 +895,7 @@ fn is_internal_response_control_header(name: &str) -> bool {
 /// backend decoding already normalizes names while plugins may not.
 #[inline]
 fn is_client_response_hop_by_hop_header(name: &str) -> bool {
-    if is_backend_response_strip_header(name) {
+    if is_response_hop_by_hop_or_internal_control_header(name) {
         return true;
     }
     if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
@@ -887,6 +1009,13 @@ pub enum ClientResponseFraming {
     /// frame the body with END_STREAM / FIN. Only the trusted [`Self::Head`]
     /// case may keep a representation length, and only because the gateway —
     /// not a plugin — established that the response carries no body at all.
+    ///
+    /// The header map is still the only thing this variant governs. A streamed
+    /// body may separately report an exact size hint that hyper turns into the
+    /// wire length, but only a length the gateway's own HTTP/1.x backend
+    /// decoder frames the body with and hyper enforces on the way out
+    /// (`proxy::passthrough_streaming_content_length`, issue #5588) — never a
+    /// value from this map.
     Streaming,
     /// `HEAD`, or a gateway-selected status that forbids a message body: the
     /// wire body is empty *by protocol*, so a surviving `Content-Length`
@@ -1542,8 +1671,10 @@ impl GatewayOwnedResponseHeaders {
         let bit = match field {
             "via" => GatewayOwnedResponseHeader::Via as u8,
             "alt-svc" => GatewayOwnedResponseHeader::AltSvc as u8,
-            "x-gateway-error" => GatewayOwnedResponseHeader::GatewayError as u8,
-            "x-gateway-upstream-status" => GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8,
+            X_GATEWAY_ERROR_HEADER => GatewayOwnedResponseHeader::GatewayError as u8,
+            X_GATEWAY_UPSTREAM_STATUS_HEADER => {
+                GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8
+            }
             _ => return false,
         };
         self.0 & bit != 0
@@ -1561,9 +1692,9 @@ impl GatewayOwnedResponseHeaders {
                 Some(GatewayOwnedResponseHeader::Via)
             } else if name.eq_ignore_ascii_case("alt-svc") {
                 Some(GatewayOwnedResponseHeader::AltSvc)
-            } else if name.eq_ignore_ascii_case("x-gateway-error") {
+            } else if name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER) {
                 Some(GatewayOwnedResponseHeader::GatewayError)
-            } else if name.eq_ignore_ascii_case("x-gateway-upstream-status") {
+            } else if name.eq_ignore_ascii_case(X_GATEWAY_UPSTREAM_STATUS_HEADER) {
                 Some(GatewayOwnedResponseHeader::GatewayUpstreamStatus)
             } else {
                 None
@@ -1766,7 +1897,9 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// the policy removed — or contradicts what the policy set — on the wire. The
 /// paths that cross it are the buffered native-HTTP/3 send path, the plain
 /// native/refined HTTP/3 STREAMING relays, the plain direct-HTTP/2 streaming
-/// relay, and — via [`TrailerSectionKind::NativeGrpcTerminal`] — every native
+/// relay, the reqwest streaming relay and the buffered H1/H2 response builder
+/// (issue #5760, both through the same owned governor), and — via
+/// [`TrailerSectionKind::NativeGrpcTerminal`] — every native
 /// STREAMING gRPC relay (the direct-H2 gRPC pool path, the mesh-mTLS
 /// `StreamingH2` relay, the H3-to-H2 cross-protocol gRPC bridge, and
 /// `dispatch_grpc_native_h3`). The streaming families reach this function

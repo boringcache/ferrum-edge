@@ -3,13 +3,15 @@
 What a Ferrum Edge version number promises, how long a release is supported, how
 deprecations are announced, and how security fixes reach released versions.
 
-> **Release-preparation snapshot (2026-09-06).** `Cargo.toml` declares
-> `version = "0.9.3"`; source tags `v0.9.0`, `v0.9.1`, and `v0.9.2` already
-> exist. Main CI validates and does not publish production artifacts. The
-> version-tag release workflow publishes after exact-commit validation.
-> Tag existence does not establish successful artifact publication; verify the
-> version's workflow and [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases).
-> Historical `latest` artifacts may remain but are not refreshed by main.
+> **Current release status.** Main CI validates changes and does not publish
+> production artifacts. The version-tag release workflow publishes after
+> exact-commit validation. Tag existence does not establish successful artifact
+> publication; verify the version's workflow and
+> [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases).
+> The `latest` container tag follows `main` (the newest built commit that
+> passed CI and was signed; intermediate commits may be skipped); it is a
+> development channel, not a release. The historical `latest` GitHub prerelease
+> is not refreshed.
 > The "After 1.0" commitments below remain **proposed**; pre-1.0 tags do not
 > activate them.
 
@@ -45,7 +47,8 @@ declare the stable baseline, as defined in
 A pre-1.0 source tag by itself does not freeze the schema.
 
 Breaking changes that have already landed are listed per release in
-[Breaking changes in 0.9.0](upgrade_guide.md#breaking-changes-in-090).
+[upgrade_guide.md](upgrade_guide.md) (for example,
+[Breaking changes in 0.9.0](upgrade_guide.md#breaking-changes-in-090)).
 
 ### What is stable enough to build on today
 
@@ -63,7 +66,8 @@ metric contract against
 | Artifact | What it is | Use in production? |
 |---|---|---|
 | Published `vX.Y.Z` release and container image | version-tag workflow output after validation | Pin the published version or digest and review its build-out limitations |
-| Historical `latest` release/container tag | retained old artifact; main no longer refreshes it | No — not a current release or update channel |
+| `latest` / `main-<sha>` container tags | development build of the newest built `main` commit that passed CI; `latest` may skip intermediate commits and `main-<sha>` exists only for built commits | No — a moving development channel, not a release or update channel |
+| Historical `latest` GitHub prerelease | retained old binaries; not refreshed | No |
 | Source at a commit | source identity, not proof of a published artifact | Pin the commit and validate your own build |
 
 The Helm chart defaults to `Chart.appVersion`, which may name a version still in

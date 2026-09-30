@@ -29,6 +29,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -97,6 +99,8 @@ fn create_test_proxy() -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -198,13 +202,10 @@ async fn start_tls_backend_on_counted(
     alpn_protocols: Vec<Vec<u8>>,
     attempts: Option<Arc<AtomicUsize>>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|cert| cert.ok())
         .collect();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key =
-        rustls_pemfile::private_key(&mut key_reader)?.ok_or("missing private key in test cert")?;
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
     let provider = rustls::crypto::ring::default_provider();
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
@@ -1958,13 +1959,10 @@ async fn start_h2_tls_host_echo_backend()
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(|cert| cert.ok())
         .collect();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key =
-        rustls_pemfile::private_key(&mut key_reader)?.ok_or("missing private key in test cert")?;
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
     let provider = rustls::crypto::ring::default_provider();
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))

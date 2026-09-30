@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
+use crate::admin::plugin_config_projection::PlaceholderSiteRecorder;
 use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
@@ -28,7 +29,8 @@ use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_de
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::runtime_config_apply::LiveApplyMode;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PlaceholderRendering, PluginConfig, PluginScope, Proxy,
+    RedactionRendering, Upstream, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -52,6 +54,29 @@ impl<'a> ValidationCtx<'a> {
             backend_allow_ips: &state.backend_allow_ips,
         }
     }
+}
+
+/// The error for an HTTP-family proxy whose `listen_port` is a
+/// process-global proxy frontend it can never be served on (issue #5922),
+/// checked against the frontends this node's listener manager plans with and
+/// the listener classes and binds of its published config.
+///
+/// `None` without a local proxy runtime. A CP cannot know each DP's
+/// frontends, so it skips this exactly as it skips the stream reserved-port
+/// check; a DP that receives such a route refuses only the routes scoped to
+/// that port.
+pub(crate) fn process_global_frontend_conflict(
+    state: &AdminState,
+    proxy: &Proxy,
+) -> Option<String> {
+    let proxy_state = state.proxy_state.as_ref()?;
+    let epoch = proxy_state.request_epoch.load();
+    let frontends = proxy_state.process_global_frontends.load();
+    crate::proxy::gateway_listener::process_global_frontend_conflict_for_proxy(
+        epoch.config(),
+        proxy,
+        &frontends,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1187,7 +1212,7 @@ async fn proxy_has_scoped_plugin(
     const PAGE_SIZE: i64 = 1_000;
     loop {
         let page = db
-            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .list_plugin_configs_paginated(namespace, None, PAGE_SIZE, offset)
             .await?;
         let items_len = page.items.len() as i64;
         if page
@@ -2515,7 +2540,11 @@ pub(crate) trait AdminResource:
         serde_json::to_value(resource)
     }
 
-    fn response_body_for_role(resource: &Self, _role: AdminRole) -> Value {
+    fn project_for_role_with(
+        resource: &Self,
+        _role: AdminRole,
+        _rendering: &dyn RedactionRendering,
+    ) -> Value {
         Self::response_body(resource)
     }
 
@@ -2664,6 +2693,29 @@ pub(crate) trait AdminResource:
         namespace: &str,
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>>;
+
+    /// Optional query filter a list route accepts. Resources without one use `()`
+    /// (associated type defaults are unstable, so each impl names it).
+    type ListFilter: Send + Sync + Clone + Default + 'static;
+
+    /// Database list that applies `filter` inside the backend's own WHERE
+    /// clause / filter document so `total` and the selected page both reflect
+    /// the filtered set. Defaults to the unfiltered [`Self::db_list`].
+    async fn db_list_filtered(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+        _filter: &Self::ListFilter,
+    ) -> DbResult<PaginatedResult<Self>> {
+        Self::db_list(db, namespace, pagination).await
+    }
+
+    /// Whether a cached (in-memory / file) resource matches `filter`. Defaults
+    /// to always matching, keeping every unfiltered list unchanged.
+    fn matches_list_filter(_resource: &Self, _filter: &Self::ListFilter) -> bool {
+        true
+    }
+
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()>;
     /// Returns `Ok(false)` when no row/document matched `(namespace, id)` —
     /// a PUT racing a concurrent delete surfaces as not-found instead of a
@@ -2782,19 +2834,55 @@ pub(crate) trait AdminResource:
     }
 }
 
+/// The role-projected read representation. Kept outside `AdminResource` so
+/// implementations can only customize the shared `project_for_role_with`
+/// hook, never the response and placeholder-detection paths independently.
+fn response_body_for_role<R: AdminResource>(resource: &R, role: AdminRole) -> Value {
+    R::project_for_role_with(resource, role, &PlaceholderRendering)
+}
+
+/// JSON pointers of fields in a write body that carry a placeholder at a site
+/// the caller's role-specific read projection withholds (issue #5925).
+///
+/// A non-empty result refuses the write with `400`: writing the body back
+/// would replace the stored secret with the marker the caller was shown. Both
+/// this check and `response_body_for_role` use the same projection hook.
+fn masked_placeholder_sites<R: AdminResource>(resource: &R, role: AdminRole) -> Vec<String> {
+    let recorder = PlaceholderSiteRecorder::default();
+    R::project_for_role_with(resource, role, &recorder);
+    recorder.into_sites()
+}
+
 pub(crate) async fn handle_list<R: AdminResource>(
     state: &AdminState,
     pagination: &super::PaginationParams,
     role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    handle_list_filtered::<R>(
+        state,
+        pagination,
+        role,
+        namespace,
+        &R::ListFilter::default(),
+    )
+    .await
+}
+
+pub(crate) async fn handle_list_filtered<R: AdminResource>(
+    state: &AdminState,
+    pagination: &super::PaginationParams,
+    role: AdminRole,
+    namespace: &str,
+    filter: &R::ListFilter,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        match R::db_list(db.as_ref(), namespace, pagination).await {
+        match R::db_list_filtered(db.as_ref(), namespace, pagination, filter).await {
             Ok(result) => {
                 let items: Vec<Value> = result
                     .items
                     .iter()
-                    .map(|resource| R::response_body_for_role(resource, role))
+                    .map(|resource| response_body_for_role(resource, role))
                     .collect();
                 let body = super::paginate_db_response(&items, result.total, pagination);
                 return Ok(super::json_response(StatusCode::OK, &body));
@@ -2809,11 +2897,11 @@ pub(crate) async fn handle_list<R: AdminResource>(
     }
 
     if let Some(config) = state.cached_gateway_config() {
-        let items = R::cached_items(&config)
-            .iter()
-            .filter(|resource| resource.namespace() == namespace);
+        let items = R::cached_items(&config).iter().filter(|resource| {
+            resource.namespace() == namespace && R::matches_list_filter(resource, filter)
+        });
         let body = super::paginate_mapped_response(items, pagination, |resource| {
-            R::response_body_for_role(resource, role)
+            response_body_for_role(resource, role)
         });
         Ok(super::json_response_with_stale(StatusCode::OK, &body))
     } else {
@@ -2840,7 +2928,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
     if let Some(ref db) = state.db {
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
-                let body = R::response_body_for_role(&resource, role);
+                let body = response_body_for_role(&resource, role);
                 let mut response = super::json_response(StatusCode::OK, &body);
                 // Tags are issued only for a read from the store. The cached
                 // fallback below may lag the store, and a tag for a
@@ -2873,7 +2961,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
             .find(|resource| resource.id() == id && resource.namespace() == namespace)
         {
             Some(resource) => {
-                let body = R::response_body_for_role(resource, role);
+                let body = response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
             None => Ok(not_found_response::<R>()),
@@ -3374,17 +3462,54 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
 /// schema of credential-bearing paths, backed by the historical name heuristic
 /// and a structural URL-userinfo sweep.
 pub(crate) fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
+    plugin_config_audit_body_with(resource, &PlaceholderRendering)
+}
+
+/// [`plugin_config_audit_body`] with an explicit [`RedactionRendering`]; the
+/// read-only configuration export renders the same projection as fingerprints.
+pub(crate) fn plugin_config_audit_body_with(
+    resource: &PluginConfig,
+    rendering: &dyn RedactionRendering,
+) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
-        crate::admin::plugin_config_projection::project_plugin_config(
+        crate::admin::plugin_config_projection::project_plugin_config_with(
             &resource.plugin_name,
             config,
+            "/config",
+            rendering,
         );
     }
     body
 }
 
 fn upstream_audit_body(resource: &Upstream) -> Value {
+    upstream_audit_body_with(resource, &PlaceholderRendering)
+}
+
+/// The redacted Upstream projection for `viewer` reads, audit diffs, and (with
+/// a fingerprint [`RedactionRendering`]) the read-only configuration export:
+/// the Consul ACL token is withheld, and every URL-shaped string in the body
+/// (a Consul `address`, for example) has any userinfo removed.
+///
+/// Operator reads deliberately do not use this: operators write upstreams, and
+/// a GET-then-PUT of a userinfo-stripped body would silently replace stored
+/// credentials with `redacted@`. They get [`upstream_consul_token_redacted`].
+pub(crate) fn upstream_audit_body_with(
+    resource: &Upstream,
+    rendering: &dyn RedactionRendering,
+) -> Value {
+    let mut body = upstream_consul_token_redacted(resource, rendering);
+    crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
+    body
+}
+
+/// An Upstream body with only the Consul ACL token withheld: the `operator`
+/// read projection.
+fn upstream_consul_token_redacted(
+    resource: &Upstream,
+    rendering: &dyn RedactionRendering,
+) -> Value {
     let mut body = json!(resource);
     if let Some(token) = body
         .get_mut("service_discovery")
@@ -3392,8 +3517,24 @@ fn upstream_audit_body(resource: &Upstream) -> Value {
         .and_then(|consul| consul.get_mut("token"))
         && !token.is_null()
     {
-        *token = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        let stored = std::mem::take(token);
+        let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        *token = rendering.render(UPSTREAM_CONSUL_TOKEN_POINTER, &stored, marker);
     }
+    body
+}
+
+/// JSON pointer of the Consul ACL token inside an Upstream body.
+const UPSTREAM_CONSUL_TOKEN_POINTER: &str = "/service_discovery/consul/token";
+
+/// The redacted Proxy projection for `viewer` reads, audit diffs, and (with a
+/// fingerprint [`RedactionRendering`]) the read-only configuration export: any
+/// URL-shaped string carrying userinfo is stripped. `admin` and `operator` reads
+/// stay raw, because both roles write proxies and a GET-then-PUT must not
+/// replace stored userinfo with `redacted@`.
+pub(crate) fn proxy_audit_body_with(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
+    let mut body = json!(resource);
+    crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
 }
 
@@ -3565,6 +3706,8 @@ pub(crate) async fn check_credential_value_uniqueness(
 
 #[async_trait::async_trait]
 impl AdminResource for Upstream {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -3628,11 +3771,17 @@ impl AdminResource for Upstream {
         upstream_audit_body(resource)
     }
 
-    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
-        if role == AdminRole::Admin {
-            Self::response_body(resource)
-        } else {
-            upstream_audit_body(resource)
+    fn project_for_role_with(
+        resource: &Self,
+        role: AdminRole,
+        rendering: &dyn RedactionRendering,
+    ) -> Value {
+        match role {
+            AdminRole::Admin => Self::response_body(resource),
+            // Operators write upstreams: withhold only the Consul token (as
+            // before issue #5904) so a GET-then-PUT keeps stored URL userinfo.
+            AdminRole::Operator => upstream_consul_token_redacted(resource, rendering),
+            AdminRole::Viewer => upstream_audit_body_with(resource, rendering),
         }
     }
 
@@ -3809,6 +3958,8 @@ impl AdminResource for Upstream {
 /// database is unreachable would be worse than reporting the outage.
 #[async_trait::async_trait]
 impl AdminResource for GatewayTrustBundleRecord {
+    type ListFilter = ();
+
     const RESOURCE_NAME: &'static str = "gateway trust bundle";
     const RESOURCE_LABEL: &'static str = "Gateway trust bundle";
     const VALIDATION_ERROR_LABEL: &'static str = "gateway trust bundle fields";
@@ -4107,11 +4258,15 @@ impl AdminResource for PluginConfig {
         plugin_config_audit_body(resource)
     }
 
-    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+    fn project_for_role_with(
+        resource: &Self,
+        role: AdminRole,
+        rendering: &dyn RedactionRendering,
+    ) -> Value {
         if role == AdminRole::Admin {
             Self::response_body(resource)
         } else {
-            plugin_config_audit_body(resource)
+            plugin_config_audit_body_with(resource, rendering)
         }
     }
 
@@ -4133,10 +4288,35 @@ impl AdminResource for PluginConfig {
     ) -> DbResult<PaginatedResult<Self>> {
         db.list_plugin_configs_paginated(
             namespace,
+            None,
             pagination.query_limit_i64(),
             pagination.query_offset_i64(),
         )
         .await
+    }
+
+    type ListFilter = Option<String>;
+
+    async fn db_list_filtered(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+        filter: &Self::ListFilter,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_plugin_configs_paginated(
+            namespace,
+            filter.as_deref(),
+            pagination.query_limit_i64(),
+            pagination.query_offset_i64(),
+        )
+        .await
+    }
+
+    fn matches_list_filter(resource: &Self, filter: &Self::ListFilter) -> bool {
+        match filter.as_deref() {
+            Some(proxy_id) => resource.proxy_id.as_deref() == Some(proxy_id),
+            None => true,
+        }
     }
 
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
@@ -4472,7 +4652,7 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
         let mut offset = 0_i64;
         loop {
             let page = db
-                .list_plugin_configs_paginated(&candidate_namespace, PAGE_SIZE, offset)
+                .list_plugin_configs_paginated(&candidate_namespace, None, PAGE_SIZE, offset)
                 .await?;
             let items_len = page.items.len() as i64;
             if page.items.into_iter().any(|plugin| {
@@ -4497,6 +4677,8 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
 
 #[async_trait::async_trait]
 impl AdminResource for Proxy {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -4507,6 +4689,23 @@ impl AdminResource for Proxy {
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
     const SUPPORTS_IF_MATCH: bool = true;
+
+    fn audit_body(resource: &Self) -> Value {
+        proxy_audit_body_with(resource, &PlaceholderRendering)
+    }
+
+    fn project_for_role_with(
+        resource: &Self,
+        role: AdminRole,
+        rendering: &dyn RedactionRendering,
+    ) -> Value {
+        match role {
+            // Both roles write proxies: a GET-then-PUT must round-trip the
+            // stored body unchanged.
+            AdminRole::Admin | AdminRole::Operator => Self::response_body(resource),
+            AdminRole::Viewer => proxy_audit_body_with(resource, rendering),
+        }
+    }
 
     fn etag_representation(resource: &Self) -> Result<Value, serde_json::Error> {
         // SQL backends read `proxy_plugins` without an ORDER BY, so two reads
@@ -5126,6 +5325,12 @@ impl AdminResource for Proxy {
         )
         .await?;
 
+        if ctx.mode != "cp"
+            && let Some(error) = process_global_frontend_conflict(state, resource)
+        {
+            return Err(AfterValidateError::Conflict(vec![error]));
+        }
+
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
             && ctx.mode != "cp"
@@ -5208,6 +5413,8 @@ impl AdminResource for Proxy {
 
 #[async_trait::async_trait]
 impl AdminResource for Consumer {
+    type ListFilter = ();
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -5430,6 +5637,26 @@ impl AdminResource for Consumer {
     }
 }
 
+/// The `400` message for a write refused by
+/// [`masked_placeholder_sites`]. The pointers come from the
+/// caller's own body; no stored value is named.
+fn masked_placeholder_message<R: AdminResource>(role: AdminRole, sites: &[String]) -> String {
+    const MAX_LISTED_SITES: usize = 16;
+    let mut listed_sites: Vec<String> = sites.iter().take(MAX_LISTED_SITES).cloned().collect();
+    if sites.len() > MAX_LISTED_SITES {
+        listed_sites.push(format!("…and {} more", sites.len() - MAX_LISTED_SITES));
+    }
+    format!(
+        "{} field(s) {} carry the redaction placeholder that '{}' reads return in place of the \
+         stored secret; writing it back would replace the secret with the placeholder. Send the \
+         real value, or remove the field only if you mean to clear it (PUT is a full replace and \
+         does not keep the stored value), or have an admin make the change",
+        R::RESOURCE_LABEL,
+        listed_sites.join(", "),
+        role.as_str()
+    )
+}
+
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     super::json_response(
         StatusCode::NOT_FOUND,
@@ -5523,6 +5750,17 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+    // Issue #5925: refuse a body that writes back a redaction placeholder the
+    // caller's own read projection put in place of a stored secret. Checked
+    // on the body as sent, before any update-path merge or normalization.
+    let placeholder_sites = masked_placeholder_sites(&resource, actor.role);
+    if !placeholder_sites.is_empty() {
+        let message = masked_placeholder_message::<R>(actor.role, &placeholder_sites);
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
+    }
     if matches!(action, WriteAction::Create)
         && let Some(labels) = resource.labels_mut()
     {
@@ -5777,7 +6015,7 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
-    let body = R::response_body_for_role(&settled, actor.role);
+    let body = response_body_for_role(&settled, actor.role);
     let status = match action {
         WriteAction::Create => StatusCode::CREATED,
         WriteAction::Update { .. } => StatusCode::OK,
@@ -5805,6 +6043,7 @@ fn validation_error_response<R: AdminResource>(field_errors: &[String]) -> Respo
 
 #[cfg(test)]
 mod redis_plugin_projection_tests {
+    use super::{AdminRole, Upstream, masked_placeholder_message};
     use crate::admin::plugin_config_projection::{
         is_credential_bearing_url_config_key, is_sensitive_plugin_config_key,
         project_plugin_config, redact_sensitive_plugin_config_fields,
@@ -5869,11 +6108,11 @@ mod redis_plugin_projection_tests {
         assert_eq!(config["providers"][0]["redisIntegrityKey"], "[REDACTED]");
         assert_eq!(
             config["providers"][0]["Redis-Url"],
-            "redis://redacted@cache.internal:6379/3"
+            "redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
         );
         assert_eq!(
             config["providers"][0]["redisUrl"],
-            "redis://redacted@other.internal:6379/1"
+            "redis://redacted@other.internal:6379/1?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
         );
         let serialized = config.to_string();
         assert!(
@@ -5897,5 +6136,24 @@ mod redis_plugin_projection_tests {
         let mut null_url = json!({"redis_url": null});
         project_plugin_config("rate_limiting", &mut null_url);
         assert!(null_url["redis_url"].is_null());
+    }
+
+    #[test]
+    fn masked_placeholder_error_has_no_suffix_at_the_pointer_cap() {
+        let sites: Vec<String> = (0..16).map(|index| format!("/secret/{index}")).collect();
+        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
+
+        assert!(message.contains("/secret/15"));
+        assert!(!message.contains("…and"));
+    }
+
+    #[test]
+    fn masked_placeholder_error_lists_only_one_pointer_beyond_the_cap() {
+        let sites: Vec<String> = (0..17).map(|index| format!("/secret/{index}")).collect();
+        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
+
+        assert!(message.contains("/secret/15"));
+        assert!(message.contains("…and 1 more"));
+        assert!(!message.contains("/secret/16"));
     }
 }

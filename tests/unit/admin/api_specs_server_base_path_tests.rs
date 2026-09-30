@@ -860,6 +860,94 @@ fn percent_encoded_traversal_server_pathname_fails_closed() {
 }
 
 #[test]
+fn path_parameter_traversal_server_pathname_fails_closed() {
+    // `;` is a legal `pchar`, so no URL parser removes `..;`, but a backend
+    // that strips path parameters before resolving dot segments does
+    // (GHSA-5mrg-vq2h-6j3w). The server base is held to the same rule as the
+    // canonical request path, literal and escaped.
+    for server in [
+        "/v1/..;/admin",
+        "/v1/..;jsessionid=1/admin",
+        "/v1/.;x/admin",
+        "/v1/%2e%2e;/admin",
+        "/v1/..%3B/admin",
+        "https://api.example.com/v1/..;/admin",
+    ] {
+        let spec = format!(
+            r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Parameter Traversal", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "servers": [{{"url": "{server}"}}],
+  "paths": {{
+    "/pets": {{
+      "get": {{"responses": {{"200": {{"description": "ok"}}}}}}
+    }}
+  }}
+}}"##,
+            proxy = proxy_block()
+        );
+
+        let err = extract_err(&spec);
+        assert!(
+            matches!(
+                err,
+                ExtractError::MalformedExtension {
+                    which: "servers",
+                    ..
+                }
+            ),
+            "{server:?}: path-parameter traversal pathname must fail closed: {err}"
+        );
+    }
+}
+
+#[test]
+fn non_canonical_server_base_segment_fails_closed() {
+    // Operation matchers are compared against the canonical request path, so
+    // a base segment the request boundary would refuse or rewrite can never
+    // match (GHSA-fcqw-793q-wg5x): an empty segment, a segment that is empty
+    // before its `;`, or an escape that survives URL parsing.
+    for server in [
+        "/v1//admin",
+        "https://api.example.com/v1//admin",
+        "/v1/;x/admin",
+        "/v1/%3Bx/admin",
+        "/v1/%61pi",
+        "/v1/a b",
+    ] {
+        let spec = format!(
+            r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Non-canonical Base", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "servers": [{{"url": "{server}"}}],
+  "paths": {{
+    "/pets": {{
+      "get": {{"responses": {{"200": {{"description": "ok"}}}}}}
+    }}
+  }}
+}}"##,
+            proxy = proxy_block()
+        );
+
+        let err = extract_err(&spec);
+        assert!(
+            matches!(
+                err,
+                ExtractError::MalformedExtension {
+                    which: "servers",
+                    ..
+                }
+            ),
+            "{server:?}: non-canonical server base must fail closed: {err}"
+        );
+    }
+}
+
+#[test]
 fn relative_non_absolute_server_url_resolves_from_synthetic_document_root() {
     let spec = format!(
         r##"{{

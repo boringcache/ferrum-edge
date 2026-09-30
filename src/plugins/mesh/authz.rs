@@ -56,9 +56,10 @@ use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyScope, WaypointAttachment,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
-    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    resolve_target_port, validate_mesh_condition, workload_selector_matches,
+    normalize_mesh_condition_values, normalize_request_match_host_pattern,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, resolve_target_port, validate_mesh_condition,
+    workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -1216,7 +1217,7 @@ fn mesh_authz_destination_ip(
 /// Ferrum settles both halves with ONE mechanism, the canonical policy path
 /// ([`crate::policy_path`]), rather than with a second authz-local
 /// normalizer. Every HTTP/1.1, HTTP/2, and HTTP/3 request target is run
-/// through [`crate::policy_path::canonicalize_policy_path`] at the frontend
+/// through [`crate::policy_path::canonicalize_request_path`] at the frontend
 /// boundary — before routing, before every plugin phase, and before backend
 /// dispatch — and an encoded separator or a dot segment is *refused* there
 /// rather than rewritten. Refusing is what removal cannot do: removing `..`
@@ -1590,6 +1591,13 @@ fn normalize_authz_policies(policies: &mut [MeshPolicy]) {
     for policy in policies {
         normalize_mesh_policy_header_names(policy);
         for rule in &mut policy.rules {
+            // A slice arriving over xDS / MeshSubscribe never passed
+            // `MeshConfig::normalize()`, so normalize `connection.sni` values
+            // here too, to the spelling of the received SNI they are compared
+            // with.
+            for condition in &mut rule.when {
+                normalize_mesh_condition_values(condition);
+            }
             for request in &mut rule.to {
                 for host in &mut request.hosts {
                     *host = normalize_request_match_host_pattern(host);
@@ -4782,6 +4790,11 @@ mod tests {
             "/admin/secret/.",
             "/..",
             "/.",
+            // GHSA-5mrg-vq2h-6j3w: a `;` path parameter does not hide a dot
+            // segment from a backend that strips parameters first.
+            "/public/..;/admin/secret",
+            "/public/..;jsessionid=1/admin/secret",
+            "/.;x/admin/secret",
         ] {
             assert_eq!(
                 mesh_authz_authorization_path(path).err(),
@@ -4795,6 +4808,8 @@ mod tests {
             "/x/%2E%2E/admin/secret",
             "/x/.%2e/admin/secret",
             "/%2e/admin/secret",
+            "/x/%2e%2e;/admin/secret",
+            "/x/..%3B/admin/secret",
         ] {
             assert_eq!(
                 mesh_authz_authorization_path(path).err(),

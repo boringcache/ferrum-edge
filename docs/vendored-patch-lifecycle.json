@@ -694,6 +694,128 @@
       "regression_tests": [
         "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs"
       ]
+    },
+    {
+      "id": "hyper-util-001-release-h1-sender-on-dispatch-close",
+      "label": "hyper-util legacy client releases a closed HTTP/1 sender",
+      "crate": "hyper-util",
+      "vendored_version": "0.1.21",
+      "vendor_path": "vendor/hyper-util-0.1.21-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "An HTTP/1 request enqueued while its pooled connection closes can miss the dispatcher's drain; hyper-util holds the channel's only sender while waiting, so reqwest's send() hangs until backend_read_timeout_ms (504) instead of failing as an unsent request (#5714).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": 4202,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper-util release stops holding the only HTTP/1 sender across the response wait after its dispatcher closes, or a hyper release stops stranding a racing send.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-util-0.1.21-ferrum-patched (client::legacy::client::ferrum_release_on_close_tests)",
+        "vendor/hyper-util-0.1.21-ferrum-patched/tests/legacy_client.rs"
+      ]
+    },
+    {
+      "id": "hyper-001-upgraded-h2-connect-error-reset",
+      "label": "hyper upgraded HTTP/2 stream resets with CONNECT_ERROR",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends a clean END_STREAM, so an HBONE relay that ended on a socket error was indistinguishable on the wire from a normal close; Upgraded::reset_with_connect_error() sends RST_STREAM(CONNECT_ERROR) instead (RFC 9113 section 8.5, #5781).",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/hyper",
+        "pr_number": 4210,
+        "issue_number": 4209,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper release containing hyperium/hyper#4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
+        "tests/integration/mesh_hbone_tests.rs"
+      ]
+    },
+    {
+      "id": "hyper-002-min-data-frame-capacity",
+      "label": "hyper HTTP/2 body pipe waits for useful send capacity",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/002-min-data-frame-capacity/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 body pipe handed a chunk to h2 while the stream held only its 1-byte claim, so on a nearly spent connection window a request body left as 1-byte DATA frames; h2 >= 0.4.16 peers GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) the connection, failing every stream on it (#5588).",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/hyper",
+        "pr_number": 4212,
+        "issue_number": 4211,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper release containing hyperium/hyper#4212 (or another fix that stops cutting a chunk into sub-1 KiB frames from a sliver of capacity) is adopted.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_min_data_frame_capacity_tests)"
+      ]
+    },
+    {
+      "id": "hyper-003-greedy-h1-read",
+      "label": "hyper HTTP/1 reads past one TLS record while more is ready",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/003-greedy-h1-read/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "tokio-rustls returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher moved bulk bodies 16 KiB at a time and paid its per-chunk path for every record; after a full-record read, Buffered now keeps reading while the transport has more ready (#5588). The patch also changes the HTTP/1 upgrade handoff: Rewind and Upgraded carry a read error met during that read-ahead into the tunnel after the buffered bytes, so a WebSocket or TCP relay sees the reset instead of a clean EOF (#5911).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper (or tokio-rustls, by filling the caller's buffer from every record already readable) stops handing HTTP/1 bodies over one TLS record per read, or the vendored hyper is retired.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h1::io::tests::ferrum_greedy_read_*)"
+      ]
     }
   ]
 }

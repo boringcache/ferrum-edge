@@ -104,26 +104,76 @@ GATEWAY_HTTPS_PORT=8443
 TARGET_URL="https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo"
 
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
-ENVOY_IMAGE="envoyproxy/envoy:v1.33.5"
-KONG_IMAGE="kong/kong-gateway:3.10.0.0"
-TYK_IMAGE="tykio/tyk-gateway:v5.3.0"
-REDIS_IMAGE="redis:7.4.1-alpine"
-KRAKEND_IMAGE="krakend:2.13.2"
+ENVOY_IMAGE="envoyproxy/envoy:v1.39.1"
+KONG_IMAGE="kong/kong-gateway:3.16.0.0"
+TYK_IMAGE="tykio/tyk-gateway:v5.15.0"
+REDIS_IMAGE="redis:8.4.7-alpine"
+KRAKEND_IMAGE="krakend:2.13.11"
 
 BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
 CERT_DIR="$SCRIPT_DIR/certs"
+# Every fixed port this runner's backend/gateways/Redis/Kong bind. The startup
+# conflict check and cleanup share this list so they cannot drift apart.
+BENCH_PORTS="3001 3002 3003 3447 3010 $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 6379 8001"
+
+# Gracefully stop a PID this run started: TERM, bounded wait, then KILL.
+stop_pid() {
+    local pid="$1"
+    local attempt
+    [ -z "$pid" ] && return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# Gracefully stop a Docker container this run started: `docker stop` (SIGTERM
+# then bounded SIGKILL) with a forced removal fallback.
+stop_container() {
+    local cid="$1"
+    [ -z "$cid" ] && return 0
+    docker stop --time 5 "$cid" >/dev/null 2>&1 || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+}
+
+# Refuse a port that is already bound instead of killing its owner.
+check_port_available() {
+    local port="$1"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[error] required TCP port $port is already in use; inspect with: lsof -nP -iTCP:$port -sTCP:LISTEN" >&2
+        return 1
+    fi
+    if lsof -nP -iUDP:"$port" >/dev/null 2>&1; then
+        echo "[error] required UDP port $port is already in use; inspect with: lsof -nP -iUDP:$port" >&2
+        return 1
+    fi
+}
+
+check_ports_available() {
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "[error] lsof is required to detect port conflicts before starting." >&2
+        return 1
+    fi
+    local port
+    for port in $BENCH_PORTS; do
+        check_port_available "$port" || return 1
+    done
+}
 
 cleanup() {
-    echo "[cleanup] stopping all processes..."
-    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
-    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
-    for port in 3001 3002 3003 3447 3010 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 6379 8001; do
-        lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    done
+    echo "[cleanup] stopping processes this run started..."
+    stop_pid "$BACKEND_PID"
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
 }
 trap cleanup EXIT
 
@@ -303,13 +353,15 @@ start_tyk() {
     local tyk_conf="$SCRIPT_DIR/configs/tyk/tyk.conf"
     echo "[tyk] starting..."
 
+    # Distroless Tyk image: trust the benchmark CA via Go's SSL_CERT_FILE
+    # (see run_gateway_protocol_bench.sh start_tyk for rationale).
     GATEWAY_CID=$(docker run -d --rm --network host $DOCKER_NOFILE_ULIMIT \
+        -e "SSL_CERT_FILE=/etc/tyk/certs/ca.pem" \
         -v "$apps_dir:/etc/tyk/apps:ro" \
         -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
-        --entrypoint sh \
         "$TYK_IMAGE" \
-        -c 'cp /etc/tyk/certs/ca.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
+        --conf /opt/tyk-gateway/tyk.conf)
     wait_for_gateway
 }
 
@@ -341,8 +393,8 @@ start_gateway() {
 }
 
 stop_gateway() {
-    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
-    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
     GATEWAY_CID=""
     REDIS_CID=""
     sleep 2  # let kernel reclaim sockets before the next gateway binds
@@ -411,6 +463,7 @@ record_startup_failed() {
 }
 
 # ── Main loop ────────────────────────────────────────────────────────────────
+check_ports_available || exit 1
 build_binaries
 start_backend
 

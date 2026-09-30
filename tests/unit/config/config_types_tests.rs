@@ -69,6 +69,8 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -1385,6 +1387,8 @@ fn test_unique_listen_paths_valid() {
                 udp_idle_timeout_seconds: 60,
                 tcp_idle_timeout_seconds: Some(300),
                 websocket_idle_timeout_seconds: None,
+                websocket_permessage_deflate: Default::default(),
+                allow_path_parameters: false,
                 allowed_methods: None,
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
@@ -1452,6 +1456,8 @@ fn test_unique_listen_paths_valid() {
                 udp_idle_timeout_seconds: 60,
                 tcp_idle_timeout_seconds: Some(300),
                 websocket_idle_timeout_seconds: None,
+                websocket_permessage_deflate: Default::default(),
+                allow_path_parameters: false,
                 allowed_methods: None,
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
@@ -1535,6 +1541,8 @@ fn test_unique_listen_paths_duplicate() {
                 udp_idle_timeout_seconds: 60,
                 tcp_idle_timeout_seconds: Some(300),
                 websocket_idle_timeout_seconds: None,
+                websocket_permessage_deflate: Default::default(),
+                allow_path_parameters: false,
                 allowed_methods: None,
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
@@ -1602,6 +1610,8 @@ fn test_unique_listen_paths_duplicate() {
                 udp_idle_timeout_seconds: 60,
                 tcp_idle_timeout_seconds: Some(300),
                 websocket_idle_timeout_seconds: None,
+                websocket_permessage_deflate: Default::default(),
+                allow_path_parameters: false,
                 allowed_methods: None,
                 allowed_ws_origins: vec![],
                 udp_max_response_amplification_factor: None,
@@ -5341,14 +5351,51 @@ fn test_listen_path_encodings_rejects_literal_dot_segments_and_backslashes() {
         make_proxy("bad-dot", "/api/./legacy"),
         make_proxy("bad-backslash", "/api\\legacy"),
         make_proxy("bad-exact-dotdot", "=/api/../legacy"),
+        // A `;` path parameter does not make `..` an ordinary segment
+        // (GHSA-5mrg-vq2h-6j3w), even on a proxy that opts in to path
+        // parameters (GHSA-fcqw-793q-wg5x).
+        make_param_proxy("bad-param-dotdot", "/api/..;/legacy"),
+        make_param_proxy("good-param", "/api/v1;version=2"),
+        // A non-final empty segment never survives canonicalization.
+        make_proxy("bad-empty", "/api//legacy"),
     ];
     let errs = config.validate_listen_path_encodings().unwrap_err();
-    assert_eq!(errs.len(), 4);
+    assert_eq!(errs.len(), 6);
+    assert!(errs.iter().any(|e| e.contains("bad-empty")));
     assert!(errs.iter().any(|e| e.contains("bad-dotdot")));
     assert!(errs.iter().any(|e| e.contains("bad-dot")));
     assert!(errs.iter().any(|e| e.contains("bad-backslash")));
     assert!(errs.iter().any(|e| e.contains("bad-exact-dotdot")));
+    assert!(errs.iter().any(|e| e.contains("bad-param-dotdot")));
+    assert!(!errs.iter().any(|e| e.contains("good-param")));
     assert!(errs.iter().all(|e| e.contains("canonical policy path")));
+}
+
+fn make_param_proxy(id: &str, listen_path: &str) -> Proxy {
+    let mut proxy = make_proxy(id, listen_path);
+    proxy.allow_path_parameters = true;
+    proxy
+}
+
+#[test]
+fn test_listen_path_encodings_require_the_path_parameter_opt_in() {
+    // A request path carrying `;` is refused unless the routed proxy sets
+    // `allow_path_parameters` (GHSA-fcqw-793q-wg5x), so a literal listen_path
+    // carrying one is unreachable without it, on every load path.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/api"),
+        make_proxy("bad-param", "/api/v1;version=2"),
+        make_proxy("bad-exact-param", "=/api;v=1"),
+        make_param_proxy("good-param", "/api/v1;version=2"),
+        // `;` in a regex is pattern text.
+        make_proxy("good-regex", "~^/api(;.*)?$"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("\"bad-param\"")));
+    assert!(errs.iter().any(|e| e.contains("bad-exact-param")));
+    assert!(errs.iter().all(|e| e.contains("allow_path_parameters")));
 }
 
 #[test]
@@ -5953,8 +6000,8 @@ fn test_validate_unique_listen_paths_allows_host_only_alongside_path_proxy_same_
 }
 
 #[test]
-fn mesh_tracing_config_deserializes_legacy_singular_provider_alias() {
-    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+fn mesh_tracing_config_rejects_singular_provider_spelling() {
+    let error = serde_json::from_value::<MeshTracingConfig>(serde_json::json!({
         "provider": {
             "kind": "zipkin",
             "config": {
@@ -5962,7 +6009,39 @@ fn mesh_tracing_config_deserializes_legacy_singular_provider_alias() {
             }
         }
     }))
-    .expect("legacy provider alias deserializes");
+    .expect_err("the removed singular `provider` key must fail the load");
+
+    assert!(
+        error.to_string().contains("unknown field `provider`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn mesh_tracing_config_rejects_single_object_providers() {
+    let result = serde_json::from_value::<MeshTracingConfig>(serde_json::json!({
+        "providers": {
+            "kind": "zipkin",
+            "config": {
+                "url": "http://zipkin:9411/api/v2/spans"
+            }
+        }
+    }));
+
+    assert!(result.is_err(), "`providers` must be an array");
+}
+
+#[test]
+fn mesh_tracing_config_deserializes_providers_array() {
+    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+        "providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": "http://zipkin:9411/api/v2/spans"
+            }
+        }]
+    }))
+    .expect("providers array deserializes");
 
     assert_eq!(config.providers.len(), 1);
     match &config.providers[0] {

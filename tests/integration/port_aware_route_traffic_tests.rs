@@ -15,7 +15,10 @@
 //! - reuse of a matching process-global proxy frontend without a duplicate
 //!   bind, and refusal of a Gateway listener that collides with admin, and
 //! - generation-bound admission before listener reconcile acknowledgement,
-//!   including the ordinary-bind-failure Service remap distinction.
+//!   including the ordinary-bind-failure Service remap distinction, and
+//! - admission carried across reloads (#5914): an unchanged live listener and
+//!   its Service remap keep serving before reconcile, while a withdrawn or
+//!   class-flipped listener fails closed on its still-open socket.
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -28,6 +31,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -96,6 +101,8 @@ fn port_scoped_proxy(id: &str, backend_port: u16, listen_port: Option<u16>) -> P
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -1192,15 +1199,11 @@ fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
     let params = rcgen::CertificateParams::new(vec![HOST.to_string()]).expect("cert params");
     let cert = params.self_signed(&key_pair).expect("self-sign cert");
     let cert_pem = cert.pem();
-    let mut cert_reader = cert_pem.as_bytes();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .filter_map(Result::ok)
         .collect();
     let key_pem = key_pair.serialize_pem();
-    let mut key_reader = key_pem.as_bytes();
-    let private_key = rustls_pemfile::private_key(&mut key_reader)
-        .expect("read private key")
-        .expect("private key present");
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
     std::sync::Arc::new(
         rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -1246,10 +1249,9 @@ impl ListenerConvergenceFailure {
     }
 }
 
-/// Poll until the active listener set equals `expected_active` and the
+/// Poll until the accepting listener set equals `expected_active` and the
 /// lock-free `bind_failures` snapshot no longer lists any of
-/// `withdrawn_failure_ports` — reconcile can insert a socket before it
-/// publishes the updated failure set.
+/// `withdrawn_failure_ports`.
 ///
 /// Fallible so that a caller which reserved-and-released a port the gateway is
 /// about to bind can retry the whole scenario on a fresh port instead of
@@ -1284,4 +1286,803 @@ async fn try_wait_for_listener_ports_and_withdrawn_failures(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// ── Route admission across unreconciled reloads (issue #5914) ───────────────
+
+/// A `ProxyState` whose Gateway listeners are reconciled only when the test
+/// calls `manager.reconcile()`. No supervisor runs, so every assertion made
+/// between `update_config` and `reconcile` observes the admission the config
+/// publication itself installed, with no timing window to lose.
+struct UnreconciledReloadHarness {
+    state: ferrum_edge::proxy::ProxyState,
+    manager: ferrum_edge::proxy::gateway_listener::GatewayListenerManager,
+    /// Gateway listener ports the manager bound, in request order.
+    ports: Vec<u16>,
+    /// The process-global plaintext proxy port. Only its number matters: the
+    /// router keys requests by it, and the manager must never bind it.
+    global_proxy_port: u16,
+    _global_proxy: TcpListener,
+    _admin: TcpListener,
+}
+
+/// Bind `listener_count` Gateway listener ports through a hand-driven manager
+/// and run its first reconcile, retrying the whole setup on a lost ephemeral
+/// port race. `config_for` receives the listener ports and the process-global
+/// proxy port.
+async fn start_unreconciled_reload_harness(
+    listener_count: usize,
+    frontend_tls: bool,
+    config_for: impl Fn(&[u16], u16) -> GatewayConfig,
+) -> UnreconciledReloadHarness {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+
+    if frontend_tls {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let mut used_ports: Vec<u16> = Vec::new();
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let mut ports = Vec::with_capacity(listener_count);
+        for _ in 0..listener_count {
+            let port = reserve_free_port_avoiding(&used_ports).await;
+            used_ports.push(port);
+            ports.push(port);
+        }
+        let global_proxy = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let global_proxy_port = global_proxy.local_addr().unwrap().port();
+        let admin = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let admin_port = admin.local_addr().unwrap().port();
+
+        let state = ProxyState::new(
+            config_for(&ports, global_proxy_port),
+            DnsCache::new(DnsConfig::default()),
+            test_env_config(global_proxy_port, admin_port),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls {
+                static_config: frontend_tls.then(self_signed_server_config),
+                reload_slot: None,
+            },
+        );
+        let failures = manager.reconcile().await;
+        let mut active = manager.active_ports().await;
+        active.sort_unstable();
+        let mut want = ports.clone();
+        want.sort_unstable();
+        if active == want && failures.is_empty() {
+            return UnreconciledReloadHarness {
+                state,
+                manager,
+                ports,
+                global_proxy_port,
+                _global_proxy: global_proxy,
+                _admin: admin,
+            };
+        }
+        let lost_race = ports
+            .iter()
+            .any(|port| port_bind_lost_to_external_steal(&failures, *port));
+        manager.shutdown_all().await;
+        if !lost_race || attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+            panic!(
+                "Gateway listeners never bound: want active {want:?}, actual {active:?}, \
+                 failures {failures:?}"
+            );
+        }
+        eprintln!(
+            "unreconciled reload harness attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+             lost an ephemeral-port race: {failures:?}"
+        );
+    }
+    panic!(
+        "the unreconciled reload harness never bound its listeners in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    )
+}
+
+fn routes_on(state: &ferrum_edge::proxy::ProxyState, host: &str, port: u16, tls: bool) -> bool {
+    state
+        .find_proxy_on_frontend_for_test(Some(host), "/api/x", Some(port), tls)
+        .is_some()
+}
+
+/// One listener-scoped route whose backend read timeout marks the reload
+/// revision. The listener plan (port and class) is identical for every
+/// revision, so each publication is a real config change that leaves the
+/// listener set alone.
+fn single_listener_revision(backend: u16, port: u16, revision: u64) -> GatewayConfig {
+    let mut proxy = port_scoped_proxy("gw-a", backend, Some(port));
+    proxy.backend_read_timeout_ms = 30_000 + revision;
+    config_with(vec![proxy])
+}
+
+/// Reloads that leave the listener plan unchanged must not reset a live
+/// listener's route admission to pending. Before issue #5914 every
+/// publication did, and each reload answered `404` on the listener-scoped
+/// route, and on the single-listener Service remap of the process-global
+/// port, until the reconcile pass caught up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unchanged_listener_plan_reload_keeps_live_listener_and_remap_serving() {
+    let (backend, _b) = start_body_backend(b"listener-a").await;
+    let harness = start_unreconciled_reload_harness(1, false, |ports, _| {
+        single_listener_revision(backend, ports[0], 0)
+    })
+    .await;
+    let port = harness.ports[0];
+    let global = harness.global_proxy_port;
+    assert_eq!(
+        http_get(port, "/api/x").await,
+        (200, "listener-a".to_string())
+    );
+    assert!(
+        routes_on(&harness.state, HOST, global, false),
+        "the single listener-scoped route must be remapped onto the process-global port"
+    );
+
+    for revision in 1..=5 {
+        let outcome = harness
+            .state
+            .update_config(single_listener_revision(backend, port, revision));
+        assert!(
+            outcome.applied(),
+            "reload {revision} must apply: {outcome:?}"
+        );
+
+        // Nothing has reconciled this generation yet.
+        assert!(
+            routes_on(&harness.state, HOST, port, false),
+            "reload {revision}: an unchanged live listener must keep its admission"
+        );
+        assert!(
+            routes_on(&harness.state, HOST, global, false),
+            "reload {revision}: the process-global single-port remap must keep serving"
+        );
+        assert_eq!(
+            http_get(port, "/api/x").await,
+            (200, "listener-a".to_string()),
+            "reload {revision}: the live listener answered before its reconcile"
+        );
+
+        let failures = harness.manager.reconcile().await;
+        assert!(failures.is_empty(), "reload {revision}: {failures:?}");
+        assert!(routes_on(&harness.state, HOST, port, false));
+        assert!(routes_on(&harness.state, HOST, global, false));
+    }
+
+    harness.manager.shutdown_all().await;
+}
+
+/// A withdrawn listener fails closed from the publication itself, before any
+/// reconcile has retired its socket, while an unchanged sibling keeps serving.
+/// The withdrawn socket is still accepting at that point, and it must not fall
+/// back to port-agnostic routes either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_listener_fails_closed_before_reconcile_while_sibling_serves() {
+    const ANY_HOST: &str = "any.example.com";
+    let (backend_a, _ba) = start_body_backend(b"listener-a").await;
+    let (backend_b, _bb) = start_body_backend(b"listener-b").await;
+    let port_agnostic = move || {
+        let mut proxy = port_scoped_proxy("any", backend_b, None);
+        proxy.hosts = vec![ANY_HOST.to_string()];
+        proxy
+    };
+    let harness = start_unreconciled_reload_harness(2, false, |ports, _| {
+        config_with(vec![
+            port_scoped_proxy("gw-a", backend_a, Some(ports[0])),
+            port_scoped_proxy("gw-b", backend_b, Some(ports[1])),
+            port_agnostic(),
+        ])
+    })
+    .await;
+    let (port_a, port_b) = (harness.ports[0], harness.ports[1]);
+    assert_eq!(http_get(port_a, "/api/x").await.1, "listener-a");
+    assert_eq!(http_get(port_b, "/api/x").await.1, "listener-b");
+    assert_eq!(
+        http_get_host(port_a, "/api/x", ANY_HOST).await.0,
+        200,
+        "a port-agnostic route serves on every live listener"
+    );
+
+    let outcome = harness.state.update_config(config_with(vec![
+        port_scoped_proxy("gw-b", backend_b, Some(port_b)),
+        port_agnostic(),
+    ]));
+    assert!(outcome.applied(), "withdrawal must apply: {outcome:?}");
+
+    // No reconcile yet: listener A's socket still accepts.
+    assert!(!routes_on(&harness.state, HOST, port_a, false));
+    assert!(
+        !routes_on(&harness.state, ANY_HOST, port_a, false),
+        "a withdrawn listener must not fall back to port-agnostic routes"
+    );
+    assert_withdrawn_listener_fail_closed(port_a).await;
+    assert_eq!(
+        http_get_host(port_a, "/api/x", ANY_HOST).await.0,
+        404,
+        "the withdrawn listener's still-open socket must fail closed"
+    );
+    assert!(
+        routes_on(&harness.state, HOST, port_b, false),
+        "an unchanged sibling listener must keep its admission"
+    );
+    assert_eq!(
+        http_get(port_b, "/api/x").await,
+        (200, "listener-b".to_string())
+    );
+
+    let failures = harness.manager.reconcile().await;
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(harness.manager.active_ports().await, vec![port_b]);
+    assert_withdrawn_listener_fail_closed(port_a).await;
+    assert_eq!(http_get(port_b, "/api/x").await.1, "listener-b");
+
+    harness.manager.shutdown_all().await;
+}
+
+/// An HTTP→HTTPS class flip must not serve the flipped port's old plaintext
+/// socket between the publication and the reconcile that retires it, and it
+/// must not take an unchanged sibling listener down with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn class_flip_fails_closed_on_the_old_socket_before_reconcile() {
+    let (backend_a, _ba) = start_body_backend(b"listener-a").await;
+    let (backend_b, _bb) = start_body_backend(b"listener-b").await;
+    let config_for = move |port_a: u16, port_b: u16| {
+        config_with(vec![
+            port_scoped_proxy("gw-a", backend_a, Some(port_a)),
+            port_scoped_proxy("gw-b", backend_b, Some(port_b)),
+        ])
+    };
+    let harness = start_unreconciled_reload_harness(2, true, |p, _| config_for(p[0], p[1])).await;
+    let (port_a, port_b) = (harness.ports[0], harness.ports[1]);
+    assert_eq!(http_get(port_a, "/api/x").await.1, "listener-a");
+
+    let mut flipped = config_for(port_a, port_b);
+    flipped
+        .http_tls_listen_ports
+        .insert((ferrum_edge::config::types::default_namespace(), port_a));
+    let outcome = harness.state.update_config(flipped);
+    assert!(outcome.applied(), "class flip must apply: {outcome:?}");
+
+    // No reconcile yet: listener A's plaintext socket still accepts.
+    assert!(!routes_on(&harness.state, HOST, port_a, false));
+    assert!(
+        !routes_on(&harness.state, HOST, port_a, true),
+        "the TLS route must wait for the reconcile that binds its TLS socket"
+    );
+    let (status, body) = http_get(port_a, "/api/x").await;
+    assert_eq!(
+        status, 404,
+        "the retiring plaintext socket must fail closed, got {status}: {body}"
+    );
+    assert!(
+        routes_on(&harness.state, HOST, port_b, false),
+        "an unchanged sibling listener must keep its admission across the flip"
+    );
+    assert_eq!(
+        http_get(port_b, "/api/x").await,
+        (200, "listener-b".to_string())
+    );
+
+    harness.manager.reconcile().await;
+    for attempt in 0..10 {
+        if let Ok((status, body)) = try_http_get(port_a, "/api/x").await {
+            assert_ne!(
+                status, 200,
+                "attempt {attempt}: cleartext served on a TLS listener port: {body}"
+            );
+        }
+    }
+    assert_eq!(http_get(port_b, "/api/x").await.1, "listener-b");
+
+    harness.manager.shutdown_all().await;
+}
+
+/// `GET /api/x` over TLS with `Connection: close`, as `(status, body)`.
+async fn https_get(port: u16, path: &str) -> (u16, String) {
+    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(ferrum_edge::tls::NoVerifier))
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    let server_name = rustls::pki_types::ServerName::try_from(HOST).expect("server name");
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("tls handshake");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf)).await;
+    let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (status, body)
+}
+
+/// A keep-alive HTTP/1.1 client connection held open across a reload.
+type KeepAliveSender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+
+async fn open_keep_alive(port: u16) -> KeepAliveSender {
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect keep-alive client");
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 handshake");
+    tokio::spawn(connection);
+    sender
+}
+
+/// `Some(status)` for a request on the kept-alive connection, or `None` when
+/// the gateway has closed it. Bounded, so a hung connection fails the test.
+async fn keep_alive_get(sender: &mut KeepAliveSender, host: &str) -> Option<u16> {
+    let exchange = async {
+        sender.ready().await.ok()?;
+        let request = Request::builder()
+            .uri("/api/x")
+            .header("host", host)
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.ok()?;
+        Some(response.status().as_u16())
+    };
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("the keep-alive request neither answered nor closed within 5 s")
+}
+
+/// Issue #5921: a class flip whose replacement binds in the same reconcile
+/// serves the new class as soon as that one reconcile has published, not on
+/// the next retry tick up to 30 s later. A connection the old plaintext
+/// socket accepted is never served again, not even by a port-agnostic route,
+/// while it drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_connection() {
+    const ANY_HOST: &str = "any.example.com";
+    let (backend_a, _ba) = start_body_backend(b"listener-a").await;
+    let (backend_any, _bany) = start_body_backend(b"port-agnostic").await;
+    let config_for = move |port: u16, tls: bool| {
+        let mut any = port_scoped_proxy("any", backend_any, None);
+        any.hosts = vec![ANY_HOST.to_string()];
+        let mut config = config_with(vec![port_scoped_proxy("gw-a", backend_a, Some(port)), any]);
+        if tls {
+            config
+                .http_tls_listen_ports
+                .insert((ferrum_edge::config::types::default_namespace(), port));
+        }
+        config
+    };
+
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let plaintext = |ports: &[u16], _: u16| config_for(ports[0], false);
+        let harness = start_unreconciled_reload_harness(1, true, plaintext).await;
+        let port = harness.ports[0];
+        let old_identity = harness
+            .manager
+            .listener_identity(port)
+            .await
+            .expect("the plaintext listener is live");
+
+        // A keep-alive connection accepted under the plaintext class.
+        let mut old_connection = open_keep_alive(port).await;
+        assert_eq!(keep_alive_get(&mut old_connection, HOST).await, Some(200));
+        assert_eq!(
+            keep_alive_get(&mut old_connection, ANY_HOST).await,
+            Some(200)
+        );
+        // A second plaintext connection whose first request is still
+        // incomplete when the listener retires. Retirement disables keep-alive
+        // on it, but an unfinished first request still completes, so this
+        // request is routed after the retirement, deterministically.
+        let mut pending_connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect the pending-request client");
+        pending_connection
+            .write_all(b"GET /api/x HTTP/1.1\r\n")
+            .await
+            .expect("write the request line");
+        // Let the gateway read the request line and settle on HTTP/1.1.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let outcome = harness.state.update_config(config_for(port, true));
+        assert!(outcome.applied(), "class flip must apply: {outcome:?}");
+
+        // Exactly one reconcile.
+        let failures = harness.manager.reconcile().await;
+        if port_bind_lost_to_external_steal(&failures, port) {
+            harness.manager.shutdown_all().await;
+            assert!(
+                attempt < GATEWAY_LISTENER_STARTUP_ATTEMPTS,
+                "port {port} was stolen during the flip in every attempt: {failures:?}"
+            );
+            eprintln!(
+                "class flip attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} lost its port \
+                 to another test between retire and rebind"
+            );
+            continue;
+        }
+        assert!(
+            failures.is_empty(),
+            "the flip must rebind at once: {failures:?}"
+        );
+
+        // The new class serves now, with no further reconcile.
+        assert!(
+            routes_on(&harness.state, HOST, port, true),
+            "the TLS route must be admitted by the reconcile that bound its socket"
+        );
+        assert_eq!(
+            https_get(port, "/api/x").await,
+            (200, "listener-a".to_string()),
+            "a new connection must be served under the new class within one reconcile"
+        );
+        let new_identity = harness
+            .manager
+            .listener_identity(port)
+            .await
+            .expect("the TLS listener is live");
+        assert!(!new_identity.is_retired());
+        for host in [HOST, ANY_HOST] {
+            assert!(
+                harness
+                    .state
+                    .find_proxy_on_gateway_listener_for_test(
+                        Some(host),
+                        "/api/x",
+                        port,
+                        true,
+                        &new_identity,
+                    )
+                    .is_some(),
+                "the replacement listener's connections must route {host}"
+            );
+        }
+
+        // The old connection is fenced, whatever class or host it presents.
+        assert!(
+            old_identity.is_retired(),
+            "retiring the plaintext listener must retire its identity"
+        );
+        for host in [HOST, ANY_HOST] {
+            for tls in [false, true] {
+                assert!(
+                    harness
+                        .state
+                        .find_proxy_on_gateway_listener_for_test(
+                            Some(host),
+                            "/api/x",
+                            port,
+                            tls,
+                            &old_identity,
+                        )
+                        .is_none(),
+                    "an old-class connection must never route {host} (tls {tls})"
+                );
+            }
+        }
+        // The request that completes on the old connection after retirement
+        // is answered 421, so the client retries on a new connection, even
+        // though a port-agnostic route matches its host.
+        pending_connection
+            .write_all(format!("Host: {ANY_HOST}\r\n\r\n").as_bytes())
+            .await
+            .expect("finish the pending request");
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            pending_connection.read_to_end(&mut raw),
+        )
+        .await
+        .expect("the retired connection must answer and close within 5 s");
+        let raw = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(
+            raw.starts_with("http/1.1 421 "),
+            "the old connection must get 421 Misdirected Request: {raw:?}"
+        );
+        assert!(
+            raw.contains("\r\nconnection: close\r\n"),
+            "a 421 must close the old connection: {raw:?}"
+        );
+        // Retirement closes an idle keep-alive connection. A request that
+        // reaches it before that close is answered 421. It is never served.
+        for host in [HOST, ANY_HOST] {
+            let status = keep_alive_get(&mut old_connection, host).await;
+            assert!(
+                matches!(status, None | Some(421)),
+                "the idle old connection answered {status:?} for {host} after the flip"
+            );
+        }
+
+        harness.manager.shutdown_all().await;
+        return;
+    }
+    unreachable!("the retry loop returns or asserts");
+}
+
+/// Issue #5922: a route whose `listen_port` is the process-global plaintext
+/// frontend but whose listener class is TLS is rejected by validation, so a
+/// file or database reload cannot publish it. A data plane only warns, and
+/// there the planner refuses only the routes scoped to that port: every
+/// port-agnostic route on the global frontend keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_class_route_on_the_global_port_refuses_only_its_own_routes() {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{
+        GatewayListenerManager, GatewayListenerTls, process_global_frontends,
+        validate_process_global_frontend_conflicts,
+    };
+
+    const ANY_HOST: &str = "any.example.com";
+    let port_agnostic = || {
+        let mut proxy = port_scoped_proxy("any", 1, None);
+        proxy.hosts = vec![ANY_HOST.to_string()];
+        proxy
+    };
+    let conflicting = |global: u16| {
+        let mut config = config_with(vec![
+            port_scoped_proxy("gw-global", 1, Some(global)),
+            port_agnostic(),
+        ]);
+        config
+            .http_tls_listen_ports
+            .insert((ferrum_edge::config::types::default_namespace(), global));
+        config
+    };
+    let global_proxy = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let global = global_proxy.local_addr().unwrap().port();
+    let admin = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let admin_port = admin.local_addr().unwrap().port();
+
+    let frontends = process_global_frontends(Some(global), None);
+    let errors = validate_process_global_frontend_conflicts(&conflicting(global), &frontends)
+        .expect_err("validation must reject a wrong-class route on the global port");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+
+    for data_plane in [false, true] {
+        let mut env = test_env_config(global, admin_port);
+        if data_plane {
+            env.mode = OperatingMode::DataPlane;
+        }
+        let state = ProxyState::new(
+            config_with(vec![port_agnostic()]),
+            DnsCache::new(DnsConfig::default()),
+            env,
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        );
+        let failures = manager.reconcile().await;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(routes_on(&state, ANY_HOST, global, false));
+
+        let outcome = state.update_config(conflicting(global));
+        if !data_plane {
+            let reload_errors = match &outcome {
+                ferrum_edge::proxy::ConfigApplyOutcome::Rejected { errors } => errors.clone(),
+                _ => Vec::new(),
+            };
+            let rejected = reload_errors
+                .iter()
+                .any(|error| error.contains("`http_tls_listen_ports`"));
+            assert!(
+                rejected,
+                "a file-mode reload must reject the conflict: {outcome:?}"
+            );
+            assert!(routes_on(&state, ANY_HOST, global, false));
+            manager.shutdown_all().await;
+            continue;
+        }
+        assert!(
+            outcome.applied(),
+            "a data plane applies it and warns: {outcome:?}"
+        );
+
+        // Before and after the reconcile that refuses the port, only the
+        // route scoped to it is refused. The frontend keeps serving.
+        for reconciled in [false, true] {
+            if reconciled {
+                let failures = manager.reconcile().await;
+                let mismatch = GatewayListenerFailureCategory::ProcessGlobalClassMismatch;
+                let refused = failures
+                    .iter()
+                    .any(|failure| failure.port == global && failure.category == mismatch);
+                assert!(refused, "{failures:?}");
+            }
+            assert!(
+                routes_on(&state, ANY_HOST, global, false),
+                "reconciled {reconciled}: port-agnostic routes must keep serving on the \
+                 global frontend"
+            );
+            assert!(
+                !routes_on(&state, HOST, global, true),
+                "reconciled {reconciled}: the wrong-class route must not serve"
+            );
+            assert!(!routes_on(&state, HOST, global, false));
+        }
+        manager.shutdown_all().await;
+    }
+}
+
+/// Withdrawing a route scoped to the process-global proxy port must not refuse
+/// that frontend: it is not a Gateway listener socket, and it keeps serving
+/// every port-agnostic route through the reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawing_a_route_on_the_process_global_port_keeps_that_frontend_serving() {
+    const ANY_HOST: &str = "any.example.com";
+    let port_agnostic = || {
+        let mut proxy = port_scoped_proxy("any", 1, None);
+        proxy.hosts = vec![ANY_HOST.to_string()];
+        proxy
+    };
+    let harness = start_unreconciled_reload_harness(0, false, |_, global| {
+        config_with(vec![
+            port_scoped_proxy("gw-global", 1, Some(global)),
+            port_agnostic(),
+        ])
+    })
+    .await;
+    let global = harness.global_proxy_port;
+    assert!(harness.manager.active_ports().await.is_empty());
+    assert!(routes_on(&harness.state, HOST, global, false));
+    assert!(routes_on(&harness.state, ANY_HOST, global, false));
+
+    let outcome = harness
+        .state
+        .update_config(config_with(vec![port_agnostic()]));
+    assert!(outcome.applied(), "withdrawal must apply: {outcome:?}");
+    assert!(!routes_on(&harness.state, HOST, global, false));
+    assert!(
+        routes_on(&harness.state, ANY_HOST, global, false),
+        "the process-global frontend must keep serving port-agnostic routes"
+    );
+
+    harness.manager.reconcile().await;
+    assert!(routes_on(&harness.state, ANY_HOST, global, false));
+    harness.manager.shutdown_all().await;
+}
+
+/// Serve `/api/x` on `port` until `stop` is raised, counting the expected
+/// `200 listener-a` answers and describing every other outcome.
+async fn hammer_listener(
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (usize, Vec<String>) {
+    let mut served = 0usize;
+    let mut unexpected = Vec::new();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        match try_http_get(port, "/api/x").await {
+            Ok((200, body)) if body == "listener-a" => served += 1,
+            Ok((status, body)) => unexpected.push(format!("status {status} body {body:?}")),
+            Err(error) => unexpected.push(format!("transport error: {error}")),
+        }
+    }
+    (served, unexpected)
+}
+
+/// End to end through `file::serve` and its supervisor: hammer a live
+/// listener-scoped route, and its single-listener remap on the process-global
+/// port, while config reloads that keep the listener plan unchanged are
+/// published and reconciled. Not one request may answer anything but `200`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_listener_scoped_routes_never_404_while_reloads_reconcile() {
+    let (backend, _b) = start_body_backend(b"listener-a").await;
+
+    let mut used_ports: Vec<u16> = Vec::new();
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_port = reserve_free_port_avoiding(&used_ports).await;
+        used_ports.push(listener_port);
+        let proxy_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+        let global_proxy_port = proxy_http.local_addr().unwrap().port();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handles = serve(
+            test_env_config(0, 0),
+            single_listener_revision(backend, listener_port, 0),
+            serve_options(proxy_http, admin_http),
+            shutdown_tx.clone(),
+        )
+        .await
+        .expect("file::serve starts");
+
+        if handles.gateway_listeners.active_ports().await != vec![listener_port] {
+            let failures = handles.gateway_listeners.bind_failures();
+            shutdown_serve_handles_before_retry(&shutdown_tx, handles).await;
+            if !port_bind_lost_to_external_steal(failures.as_ref(), listener_port)
+                || attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS
+            {
+                panic!("listener port {listener_port} never bound: {failures:?}");
+            }
+            eprintln!(
+                "reload hammer attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} lost \
+                 listener-port reservation race on port {listener_port}"
+            );
+            continue;
+        }
+        assert_eq!(http_get(listener_port, "/api/x").await.1, "listener-a");
+        assert_eq!(http_get(global_proxy_port, "/api/x").await.1, "listener-a");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammers: Vec<_> = [listener_port, global_proxy_port]
+            .into_iter()
+            .map(|port| tokio::spawn(hammer_listener(port, stop.clone())))
+            .collect();
+
+        for revision in 1..=30 {
+            let outcome = handles.proxy_state.update_config(single_listener_revision(
+                backend,
+                listener_port,
+                revision,
+            ));
+            assert!(
+                outcome.applied(),
+                "reload {revision} must apply: {outcome:?}"
+            );
+            // Whether or not the supervisor has reconciled this generation
+            // yet, both frontends must still resolve the route.
+            for port in [listener_port, global_proxy_port] {
+                assert!(
+                    routes_on(&handles.proxy_state, HOST, port, false),
+                    "reload {revision}: the route stopped resolving on port {port}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for (hammer, port) in hammers.into_iter().zip([listener_port, global_proxy_port]) {
+            let (served, unexpected) = hammer.await.expect("hammer task");
+            assert!(
+                unexpected.is_empty(),
+                "port {port} answered {} unexpected responses across reloads (served {served}); \
+                 first: {:?}",
+                unexpected.len(),
+                unexpected.first()
+            );
+            assert!(
+                served > 0,
+                "port {port} served no requests during the reloads"
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+        return;
+    }
+
+    panic!(
+        "the reload hammer never bound its listener in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    );
 }

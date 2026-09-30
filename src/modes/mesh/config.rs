@@ -924,9 +924,11 @@ pub fn validate_mesh_ext_authz_path_prefix(prefix: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // Same dot-segment rule as the canonical request path: `..;` / `.;x` are
+    // dot segments to a provider that strips path parameters before resolving.
     if prefix
         .split('/')
-        .any(|segment| matches!(segment, "." | ".."))
+        .any(crate::policy_path::is_literal_dot_segment)
     {
         return Err("pathPrefix must not contain a '.' or '..' segment".to_string());
     }
@@ -1842,6 +1844,15 @@ pub fn validate_mesh_condition(
                         issues.push(MeshConditionIssue::value(field, index, reason));
                     }
                 }
+                // `connection.sni` keeps the generic string matcher below.
+                // Its values are normalized at load; only a non-ASCII value
+                // with no A-label spelling is rejected (see
+                // `canonical_mesh_condition_sni_value`).
+                MeshConditionKeyKind::ConnectionSni => {
+                    if let Err(reason) = canonical_mesh_condition_sni_value(value) {
+                        issues.push(MeshConditionIssue::value(field, index, reason));
+                    }
+                }
                 _ => {
                     // The remaining string-match keys follow Istio's
                     // `matcher.StringMatcherWithPrefix` grammar: exact / `*`
@@ -1924,6 +1935,109 @@ fn validate_mesh_condition_trust_domain(value: &str) -> Result<(), &'static str>
         1 if value.starts_with('*') || value.ends_with('*') => Ok(()),
         1 => Err("supports '*' only as a leading or trailing wildcard"),
         _ => Err("supports at most one '*', as a leading or trailing wildcard"),
+    }
+}
+
+/// Why a `connection.sni` value has no canonical spelling. Never echoes the
+/// value.
+const MESH_CONDITION_SNI_UNCONVERTIBLE: &str = "is not ASCII and cannot be converted to an \
+     A-label (a received SNI carries an internationalized name as its A-label; write the \
+     A-label 'xn--...', and keep non-ASCII text out of a label that a '*' only partly covers)";
+
+/// Canonical spelling of one `connection.sni` condition value.
+///
+/// The value is compared as a string with the received SNI. Every read site
+/// hands policy a lowercase SNI without a trailing root dot: rustls and quinn
+/// names go through `crate::proxy::sni::normalize_received_server_name`, which
+/// strips one trailing dot rustls accepts, and Ferrum's own ClientHello parser
+/// refuses a trailing dot. A received SNI is always ASCII, since an
+/// internationalized name travels as its A-label. The canonical value follows
+/// the same rules:
+///
+/// - one trailing `.` is stripped (a value ending in `..`, or `.` alone, is
+///   kept as written so normalization stays idempotent);
+/// - ASCII is lowercased;
+/// - a non-ASCII (U-label) name is converted to its A-label with IDNA
+///   (UTS #46, through `url::Host::parse`), and a trailing dot the conversion
+///   produces is stripped the same way. In a wildcard value only the whole
+///   labels after a leading `*.` or before a trailing `.*` are converted.
+///
+/// Plugin trigger `sni` entries use the same spelling
+/// (`crate::config::plugin_trigger`).
+///
+/// Returns an error only for a non-ASCII value that cannot be converted: IDNA
+/// refuses it, the result is not a domain name, or the non-ASCII text sits in
+/// a label that a `*` only partly covers (converting it would change what the
+/// wildcard matches). Such a value could never match, which is fail-OPEN for a
+/// DENY, so validation rejects it. Other ASCII characters that DNS does not
+/// allow are left alone; a value containing them simply never matches.
+pub(crate) fn canonical_mesh_condition_sni_value(value: &str) -> Result<String, &'static str> {
+    let value = strip_one_sni_trailing_dot(value);
+    if value.is_ascii() {
+        return Ok(value.to_ascii_lowercase());
+    }
+    if let Some(suffix) = value.strip_prefix("*.") {
+        let ascii = mesh_condition_sni_idna_to_ascii(suffix)?;
+        return Ok(format!("*.{ascii}"));
+    }
+    if let Some(prefix) = value.strip_suffix(".*") {
+        let ascii = mesh_condition_sni_idna_to_ascii(prefix)?;
+        return Ok(format!("{ascii}.*"));
+    }
+    mesh_condition_sni_idna_to_ascii(value)
+}
+
+/// Strip one trailing dot, but only when that leaves a non-empty name that
+/// does not itself end with `.`, so normalization is idempotent: `x..` and `.`
+/// never match a received SNI either way and stay as written.
+fn strip_one_sni_trailing_dot(value: &str) -> &str {
+    match value.strip_suffix('.') {
+        Some(rest) if !rest.is_empty() && !rest.ends_with('.') => rest,
+        _ => value,
+    }
+}
+
+/// IDNA `ToASCII` for the whole-label part of a `connection.sni` value.
+///
+/// `url::Host::parse` percent-decodes before IDNA, so a `%` is refused up
+/// front rather than letting decoding change the name. IDNA maps the
+/// ideographic and fullwidth full stops (U+3002, U+FF0E, U+FF61) to `.`, so
+/// the converted name gets the same one-trailing-dot strip; without it a
+/// second normalization pass would strip that dot and change the value.
+fn mesh_condition_sni_idna_to_ascii(name: &str) -> Result<String, &'static str> {
+    if name.is_empty() || name.contains('*') || name.contains('%') {
+        return Err(MESH_CONDITION_SNI_UNCONVERTIBLE);
+    }
+    match url::Host::parse(name) {
+        Ok(url::Host::Domain(ascii)) if !ascii.is_empty() && ascii.is_ascii() => {
+            Ok(strip_one_sni_trailing_dot(&ascii).to_string())
+        }
+        _ => Err(MESH_CONDITION_SNI_UNCONVERTIBLE),
+    }
+}
+
+/// Normalize one `when[]` entry's values at load so the request path compares
+/// them without re-normalizing.
+///
+/// `connection.sni` values take their canonical spelling
+/// ([`canonical_mesh_condition_sni_value`]): one trailing dot stripped, ASCII
+/// lowercased, and a U-label converted to its A-label. A value with no
+/// canonical spelling is left as written for [`validate_mesh_condition`] to
+/// reject. Every other key is left as written. Idempotent. Runs on every
+/// surface that loads a policy: Kubernetes translation, file/native
+/// `MeshConfig` normalization, and `mesh_authz` construction.
+pub(crate) fn normalize_mesh_condition_values(condition: &mut ConditionMatch) {
+    if condition.key != CONDITION_CONNECTION_SNI {
+        return;
+    }
+    for value in condition
+        .values
+        .iter_mut()
+        .chain(condition.not_values.iter_mut())
+    {
+        if let Ok(canonical) = canonical_mesh_condition_sni_value(value) {
+            *value = canonical;
+        }
     }
 }
 
@@ -2380,7 +2494,11 @@ pub struct MeshTelemetryConfig {
     pub access_logging: Option<MeshAccessLoggingConfig>,
 }
 
+/// Closed schema (`deny_unknown_fields`): a misspelled or removed key — such as
+/// the retired singular `provider` — fails the load instead of silently
+/// disabling tracing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTracingConfig {
     /// Istio tracing mode selector — `Server`, `Client`, or `ClientAndServer`.
     /// `None` defers to the default (Istio treats unset as SERVER for sidecar
@@ -2416,15 +2534,7 @@ pub struct MeshTracingConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_env_tags: HashMap<String, String>,
     /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
-    ///
-    /// The legacy singular `provider` spelling deserializes into this vector
-    /// for back-compat, but new slices serialize only `providers`.
-    #[serde(
-        default,
-        alias = "provider",
-        deserialize_with = "deserialize_tracing_providers",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<TracingProvider>,
 }
 
@@ -2542,23 +2652,6 @@ impl fmt::Debug for TracingProvider {
                 .field("endpoint", endpoint)
                 .finish(),
         }
-    }
-}
-
-fn deserialize_tracing_providers<'de, D>(deserializer: D) -> Result<Vec<TracingProvider>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
-    if value.is_array() {
-        crate::util::deserialization::from_json_value(value).map_err(serde::de::Error::custom)
-    } else {
-        crate::util::deserialization::from_json_value(value)
-            .map(|provider| vec![provider])
-            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -3891,8 +3984,9 @@ pub struct RemoteCluster {
     /// reference is resolved data-plane-side against
     /// `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` (a JSON map of ref -> secret,
     /// itself resolvable through the external-secret backends). The raw secret
-    /// is NEVER serialized into the slice/config — only this reference. When
-    /// unset, discovery falls back to the shared CP-DP JWT secret.
+    /// is NEVER serialized into the slice/config — only this reference. Remote
+    /// discovery requires it: a cluster without a resolvable reference is not
+    /// polled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_credential_ref: Option<String>,
 }
@@ -6243,6 +6337,7 @@ impl MeshConfig {
             &self.ext_authz_providers,
             &mut errors,
         );
+        validate_mesh_extension_configs(&self.extension_configs, &mut errors);
         errors
     }
 
@@ -6641,6 +6736,34 @@ pub fn validate_mesh_config(
         trust_bundles,
         None,
     )
+}
+
+/// Refuse operator ECDS extension configs that declare the DestinationRule
+/// carrier type or a mesh-slice carrier type. Those reach data planes only
+/// through the reserved carriers the xDS translator emits from the slice's own
+/// fields; a data plane NACKs either type under any other name, which would
+/// wedge every later ECDS update on last-known-good.
+fn validate_mesh_extension_configs(
+    extension_configs: &[crate::modes::mesh::slice::MeshExtensionConfig],
+    errors: &mut Vec<String>,
+) {
+    for extension in extension_configs {
+        if extension.type_url == crate::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+            errors.push(format!(
+                "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
+                 DestinationRule carriers; declare the rule in destination_rules instead",
+                extension.name, extension.type_url
+            ));
+        } else if crate::xds::carrier::carrier_resource_name_for_type_url(&extension.type_url)
+            .is_some()
+        {
+            errors.push(format!(
+                "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
+                 mesh-slice carriers; declare that state in its mesh config field instead",
+                extension.name, extension.type_url
+            ));
+        }
+    }
 }
 
 /// Validate VirtualService-derived CORS policies at the config boundary:
@@ -8376,7 +8499,8 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 }
 
 /// Return the base service FQDN claimed by a generated exact alias
-/// (`p<port>.<base>`) or by a wildcard alias owner (`*.<base>`).
+/// (`p<port>.<base>`, or `p<port>-udp.<base>` for a UDP port) or by a wildcard
+/// alias owner (`*.<base>`).
 ///
 /// The suffix must have Ferrum's `<service>.<namespace>.svc.<cluster-domain>`
 /// shape. This keeps unrelated explicit hosts such as `p9090.example.com`
@@ -8391,6 +8515,7 @@ fn east_west_alias_claim_base(host: &str) -> Option<String> {
     }
 
     let port = alias_label.strip_prefix('p')?;
+    let port = port.strip_suffix("-udp").unwrap_or(port);
     // `cross_cluster_service_sni` renders a non-zero u16 without leading
     // zeroes. Recognize only that canonical generated namespace so an ordinary
     // hostname such as `p65536.example` is not reinterpreted as an alias.
@@ -8495,6 +8620,9 @@ pub(crate) fn normalize_mesh_hostname_like(value: &str) -> String {
 fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
     for policy in policies {
         for rule in &mut policy.rules {
+            for condition in &mut rule.when {
+                normalize_mesh_condition_values(condition);
+            }
             for request in &mut rule.to {
                 for host in &mut request.hosts {
                     *host = normalize_request_match_host_pattern(host);

@@ -2071,6 +2071,33 @@ async fn test_endpoint_query_merged_with_client_query() {
 }
 
 #[tokio::test]
+async fn test_endpoint_query_keeps_encoded_client_delimiters_encoded() {
+    // An encoded `&` / `=` inside a client query value must reach the provider
+    // still encoded: decoding it after the duplicate-name strip would inject
+    // a second `api-version` parameter (GHSA-653r-wc8x-4fch).
+    use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+
+    let plugin: Arc<dyn Plugin> = Arc::new(build(azure_style_config()));
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("x=a%26api-version%3Devil&u=https://a//b".to_string());
+    let mut headers = json_headers();
+    let result = run_before_proxy_hooks_for_test(&[plugin], &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let path = ctx.route_override_path.as_deref().expect("override path");
+    assert_eq!(
+        path,
+        "/openai/deployments/gpt/chat/completions?api-version=2024-02-01\
+         &x=a%26api-version%3Devil&u=https://a//b"
+    );
+    assert_eq!(
+        path.matches("api-version=").count(),
+        1,
+        "no provider parameter may be injected: {path}"
+    );
+}
+
+#[tokio::test]
 async fn test_endpoint_query_omits_previously_stripped_client_credentials() {
     let plugin = build(azure_style_config());
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
@@ -5360,16 +5387,29 @@ async fn final_header_policy_restores_a_credential_a_later_remove_deleted() {
 
 #[tokio::test]
 async fn final_header_policy_strips_reintroduced_gateway_identity_assertions() {
+    // Config can no longer target the `x-consumer-*` namespace (admission
+    // refuses it), so the transformer reintroduces only the GeoIP assertion and
+    // the consumer names are written the way a non-config writer (a custom
+    // plugin or an egress overlay) would: straight into the outbound map
+    // before the final policy re-runs.
     let plugins = router_then_transformer(json!([
-        {"operation": "add", "target": "header", "key": "X-Consumer-Username", "value": "alice"},
-        {"operation": "add", "target": "header", "key": "X-Consumer-Custom-Id", "value": "cid-1"},
         {"operation": "add", "target": "header", "key": "X-Geo-Country", "value": "US"}
     ]));
-    let (_ctx, headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+    let (ctx, mut headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+    headers.insert("X-Consumer-Username".to_string(), "alice".to_string());
+    headers.insert("X-Consumer-Custom-Id".to_string(), "cid-1".to_string());
+    headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
+    headers.insert("x-consumer-groups".to_string(), "admins".to_string());
+    final_header_policy(&plugins, &ctx, &mut headers);
 
-    assert!(!headers.contains_key("x-consumer-username"));
-    assert!(!headers.contains_key("x-consumer-custom-id"));
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.to_ascii_lowercase().starts_with("x-consumer-")),
+        "the whole x-consumer-* namespace must not cross the provider boundary: {headers:?}"
+    );
     assert!(!headers.contains_key("x-geo-country"));
+    assert!(!headers.contains_key("X-Geo-Country"));
 }
 
 #[tokio::test]

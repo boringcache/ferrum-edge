@@ -148,16 +148,16 @@ impl MeshRouteDispatchConfig {
             // `rule_matches` treats empty match as "match all" only when
             // route-local actions are present, so this stays a no-op for any other
             // operator config.
-            // Rule-scoped timeouts count as route-local actions too: the
-            // Gateway API translator emits a path-only rule whose only effect
-            // is its `timeouts`, and that rule must still select the policy
-            // for exactly the requests it matches.
+            // Rule-scoped timeouts and retry count as route-local actions too:
+            // the Gateway API translator emits a path-only rule whose only
+            // effect is its `timeouts` or `retry`, and that rule must still
+            // select the policy for exactly the requests it matches.
             let has_route_actions = !rule.request_transform.is_empty()
                 || !rule.response_transform.is_empty()
                 || rule.fault.is_some()
                 || rule.rewrite.is_some()
                 || rule.redirect.is_some()
-                || rule.carries_timeout_policy();
+                || rule.carries_attempt_policy();
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}].match` requires at least one of \
@@ -192,6 +192,12 @@ impl MeshRouteDispatchConfig {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}].request_timeout_ms` must be greater than zero; \
                      omit it to leave the rule without a total request deadline"
+                ));
+            }
+            if rule.attempt_timeout_ms == Some(0) {
+                return Err(format!(
+                    "`mesh_route_dispatch.rules[{idx}].attempt_timeout_ms` must be greater than zero; \
+                     omit it to leave the rule's attempts without a total bound"
                 ));
             }
             if let Some(retry) = &rule.retry
@@ -545,10 +551,30 @@ fn compile_transform_field(
     }
     let context = format!("mesh_route_dispatch.rules[{rule_idx}].{field}");
     let parsed = parse_route_header_transforms(raw, &context)?;
+    // Request route overrides may not write the gateway-owned `x-consumer-*`
+    // consumer assertion namespace, matching `request_transformer` admission.
+    if field == "request_transform" {
+        for (idx, rule) in parsed.iter().enumerate() {
+            match rule.operation {
+                crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Remove => {}
+                crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Add
+                | crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Update => {
+                    if crate::proxy::headers::is_consumer_assertion_header(&rule.key) {
+                        return Err(format!(
+                            "`{context}[{idx}].key` {:?} is in the gateway-owned `x-consumer-*` \
+                             consumer assertion namespace and cannot be a `request_transform` \
+                             destination",
+                            rule.key
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Response route overrides share the response_transformer write surface:
     // reject protocol-managed destinations so a VirtualService header modifier
     // cannot reintroduce Connection/Transfer-Encoding/Content-Length after the
-    // origin strip. Request transforms keep their existing contract.
+    // origin strip.
     if field == "response_transform" {
         for (idx, rule) in parsed.iter().enumerate() {
             match rule.operation {
@@ -826,14 +852,29 @@ pub struct RouteRule {
     /// than zero when set; omit it for no route deadline.
     ///
     /// Expiry before a non-gRPC response head is a gateway `504`; expiry
-    /// mid-body resets the HTTP/2 stream or closes the HTTP/1.1 connection. A
-    /// gRPC request folds it into its RPC deadline and ends with
-    /// `DEADLINE_EXCEEDED`. Native HTTP/3 cannot bound a non-gRPC request by
-    /// it yet, so such a request is refused with `503` rather than served
-    /// without the deadline, and HTTP/3 is not advertised (`Alt-Svc`) on any
-    /// frontend port that serves a rule carrying it.
+    /// mid-body resets the HTTP/2 stream, closes the HTTP/1.1 connection, or
+    /// resets the HTTP/3 stream with `H3_REQUEST_CANCELLED`. A gRPC request
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`.
+    /// HTTP/1.1, HTTP/2 and native HTTP/3 enforce it alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
+    /// Total bound on EACH backend attempt for this rule, in milliseconds:
+    /// from the moment the attempt is handed to the backend until its full
+    /// response (head and body) has been received. Gateway API
+    /// `HTTPRoute.rules[].timeouts.backendRequest` is projected here as well as
+    /// onto `timeout_ms`, which keeps bounding the header wait and the idle
+    /// gap between frames. Every retry attempt gets a fresh budget, and
+    /// `request_timeout_ms` still bounds the whole transaction. Must be
+    /// greater than zero when set.
+    ///
+    /// Expiry before a non-gRPC response head is the ordinary backend-timeout
+    /// `504`, retryable like any other; expiry after the head has been sent
+    /// cuts the body exactly as `request_timeout_ms` does. A gRPC request
+    /// folds it into its RPC deadline and ends with `DEADLINE_EXCEEDED`, with a
+    /// fresh budget for each retry attempt. HTTP/1.1, HTTP/2 and native HTTP/3
+    /// enforce it alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_timeout_ms: Option<u64>,
     /// Override the proxy's retry policy for this rule.
     #[serde(
         default,
@@ -942,29 +983,17 @@ pub struct RouteRule {
 }
 
 impl RouteRule {
-    /// Whether this rule carries its own backend-attempt or total request
-    /// timeout policy (including an explicit `timeout_disabled`).
-    fn carries_timeout_policy(&self) -> bool {
-        self.timeout_ms.is_some() || self.timeout_disabled || self.request_timeout_ms.is_some()
+    /// Whether this rule carries its own backend-attempt policy: a per-attempt
+    /// or total request timeout, or a retry policy (including an explicit
+    /// `timeout_disabled` / `retry_disabled`).
+    fn carries_attempt_policy(&self) -> bool {
+        self.timeout_ms.is_some()
+            || self.timeout_disabled
+            || self.request_timeout_ms.is_some()
+            || self.attempt_timeout_ms.is_some()
+            || self.retry.is_some()
+            || self.retry_disabled
     }
-}
-
-/// Whether a `mesh_route_dispatch` config document carries any rule with a
-/// total request deadline (`request_timeout_ms`).
-///
-/// Read once per published configuration generation to withhold the HTTP/3
-/// `Alt-Svc` advertisement on the frontend ports that serve such a rule
-/// (`crate::proxy::RouteTimeoutAltSvc`). Deliberately conservative: any
-/// non-null value counts, since a document the plugin later rejects never
-/// serves at all.
-pub(crate) fn config_sets_request_timeout(config: &Value) -> bool {
-    let Some(rules) = config.get("rules").and_then(Value::as_array) else {
-        return false;
-    };
-    rules
-        .iter()
-        .filter_map(|rule| rule.get("request_timeout_ms"))
-        .any(|value| !value.is_null())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2117,6 +2146,20 @@ impl Plugin for MeshRouteDispatch {
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers, canonical_query.as_ref()) {
                 ctx.mesh_route_dispatch_matched = true;
+                // Per-rule response header transforms: publish the
+                // pre-compiled Arc BEFORE any route-owned terminal. A redirect
+                // or an aborted fault is a response this rule generates, and
+                // Gateway API `ResponseHeaderModifier` / Istio
+                // `headers.response` apply to it just as they do to a proxied
+                // response; proxy core's rejection path applies the published
+                // list exactly once. A matching instance always replaces the
+                // slot — clearing it when this rule declares none — so an
+                // earlier instance's list never decorates this rule's answer.
+                // Cloning an Arc is one atomic refcount bump.
+                ctx.route_override_response_transform =
+                    rule.response_transform_compiled.as_ref().map(Arc::clone);
+                ctx.route_override_response_transform_published =
+                    ctx.route_override_response_transform.is_some();
                 // Per-rule redirect (Istio `http[].redirect`): answer the
                 // request ourselves with a 3xx + `Location`. Highest
                 // precedence — a redirect short-circuits before fault and
@@ -2125,14 +2168,15 @@ impl Plugin for MeshRouteDispatch {
                 if let Some(redirect) = rule.redirect.as_ref() {
                     return build_redirect_response(ctx, headers, redirect);
                 }
-                // Per-rule fault action: fire BEFORE setting any route
-                // override on the context. If the fault aborts, the
-                // request never reaches backend dispatch so the override
-                // would be wasted work — and skipping the assignment
-                // keeps `ctx.route_override_*` untouched (mirroring the
-                // proxy-scoped `fault_injection` plugin's behaviour where
-                // an aborted request never reaches the route override
-                // stage).
+                // Per-rule fault action: fire BEFORE setting any backend
+                // route override on the context. If the fault aborts, the
+                // request never reaches backend dispatch, so the
+                // destination / timeout / retry / rewrite / request-transform
+                // overrides stay unset (mirroring the proxy-scoped
+                // `fault_injection` plugin, where an aborted request never
+                // reaches the route override stage). Only the response
+                // transform published above applies, because the abort is
+                // a response this rule generates.
                 if let Some(fault) = rule.fault.as_ref()
                     && let Some(result) = apply_fault_action(ctx, rule, fault).await
                 {
@@ -2141,6 +2185,11 @@ impl Plugin for MeshRouteDispatch {
                 if let Some(result) =
                     reject_node_waypoint_authz_destination_override(ctx, &rule.destination)
                 {
+                    // A security denial is not a response this rule
+                    // generates: tenant route policy must never decorate
+                    // it, so withdraw the response list published above.
+                    ctx.route_override_response_transform = None;
+                    ctx.route_override_response_transform_published = false;
                     return result;
                 }
                 // Route overrides are a whole-destination decision, not a
@@ -2168,22 +2217,22 @@ impl Plugin for MeshRouteDispatch {
                 // The total request deadline is request-scoped policy for the
                 // matched rule only; proxy core arms it after `before_proxy`.
                 ctx.route_override_request_timeout_ms = rule.request_timeout_ms;
+                // Likewise the per-attempt total bound: request-scoped, read by
+                // proxy core for every attempt it dispatches for this rule.
+                ctx.route_override_attempt_timeout_ms = rule.attempt_timeout_ms;
                 ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
                     Some(rule.retry.clone())
                 } else {
                     None
                 };
-                // Per-rule header transforms: publish the pre-compiled Arc
-                // so request_transformer / response_transformer can apply
-                // them after their own static rules. Cloning an Arc is one
-                // atomic refcount bump — cheaper than rebuilding the rule
+                // Per-rule request header transforms: publish the
+                // pre-compiled Arc so request_transformer can apply it after
+                // its own static rules. (The response list was published
+                // above, before the route-owned terminals.) Cloning an Arc is
+                // one atomic refcount bump — cheaper than rebuilding the rule
                 // list on every match.
                 ctx.route_override_request_transform =
                     rule.request_transform_compiled.as_ref().map(Arc::clone);
-                ctx.route_override_response_transform =
-                    rule.response_transform_compiled.as_ref().map(Arc::clone);
-                ctx.route_override_response_transform_published =
-                    ctx.route_override_response_transform.is_some();
                 // Per-rule rewrite (Istio `http[].rewrite`): rebase the path /
                 // authority forwarded to the backend. A non-matching later
                 // instance must not stomp this, so — like the destination
@@ -2345,9 +2394,14 @@ fn rewrite_request_path(
     out
 }
 
+/// Whether the tail's first segment is a dot segment under the canonical-path
+/// rule: its text before the first `;` is `.` or `..` (`..`, `./`, `..;/`,
+/// `.;x`). Sharing the predicate keeps a path-parameter traversal operand from
+/// being fused into an ordinary segment here while the boundary refuses it.
 #[inline]
 fn tail_opens_dot_segment(tail: &str) -> bool {
-    tail == "." || tail == ".." || tail.starts_with("./") || tail.starts_with("../")
+    let first_segment = tail.split_once('/').map_or(tail, |(head, _)| head);
+    crate::policy_path::is_literal_dot_segment(first_segment)
 }
 
 /// Re-sync the forwarded `Host` header to the original client value, undoing a
@@ -2659,7 +2713,7 @@ fn rule_matches(
             || rule.fault.is_some()
             || rule.rewrite.is_some()
             || rule.redirect.is_some()
-            || rule.carries_timeout_policy();
+            || rule.carries_attempt_policy();
     }
     // URI predicate (when set): evaluate first because it cheaply rejects
     // requests that the broader (case-insensitive) `listen_path` lets

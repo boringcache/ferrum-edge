@@ -44,7 +44,7 @@ Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. 
 
 | Family | Type | Labels | Guidance |
 |--------|------|--------|----------|
-| `ferrum_mesh_remote_discovery_poll_failures_total` | counter | `cluster`, `trust_domain`, `control_plane`, `gateway_namespace` | Failures against a remote control plane. The `control_plane` label is redacted to a non-URL token (never a raw URL). |
+| `ferrum_mesh_remote_discovery_poll_failures_total` | counter | `cluster`, `trust_domain`, `gateway_namespace` | Failures against a remote control plane. The control-plane URL is never a label. |
 | `ferrum_mesh_remote_discovery_poll_successes_total` | counter | `cluster`, `trust_domain`, `gateway_namespace` | Successful discovery polls. |
 | `ferrum_mesh_remote_discovery_last_success_timestamp_seconds` | gauge | `cluster`, `trust_domain`, `gateway_namespace` | Unix timestamp of last successful poll. |
 | `ferrum_mesh_remote_discovery_endpoint_age_seconds` | gauge | `cluster`, `trust_domain`, `gateway_namespace` | Age of cached remote endpoints. Increases while pollers preserve last-good data. |
@@ -134,21 +134,33 @@ from a listener being rebound across a config change; and
 sustained.
 
 **Runbook.** Read authenticated `/health` for the affected port and reason.
-`bind_failed` on `:80`/`:443` is usually a missing `CAP_NET_BIND_SERVICE` or a
-port already owned by another process; `port_reserved`,
-`stream_port_collision`, `udp_stream_collision`, `class_conflict`, and
-`process_global_class_mismatch` are configuration conflicts inside Ferrum's own
-port map; `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
-Sidecar ingress bind declarations that cannot be realized without widening or
-misclassifying the listener; `listener_task_ended` means an accept loop died
-after a successful bind and is being rebound — a same-pass rebind increments
-the cumulative failure and recovery counters once while the active gauge stays
-`0` once the half is live again. On the `quic` half only the HTTP/3 listener is
-reaped and retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes
-stay admitted; `class_flip_deferred` means a frontend TLS-class change is waiting for the previous accept sockets to close;
-`retirement_pending` is the same fail-closed wait for another bind-identity
-change. No action clears these manually — the supervisor retries on its own,
-and the metrics clear when it succeeds.
+
+- `bind_failed` on `:80`/`:443` is usually a missing `CAP_NET_BIND_SERVICE` or a
+  port already owned by another process.
+- `port_reserved`, `stream_port_collision`, `udp_stream_collision`,
+  `class_conflict`, and `process_global_class_mismatch` are configuration
+  conflicts inside Ferrum's own port map.
+- `dedicated_bind_conflict` and `dedicated_bind_tls_unsupported` identify
+  Sidecar ingress bind declarations that cannot be realized without widening or
+  misclassifying the listener.
+- `listener_task_ended` means an accept loop died after a successful bind and
+  is being rebound. A rebind in the same pass increments the failure and
+  recovery counters once each, and the active gauge returns to `0` once the
+  half is live again. On the `quic` half only the HTTP/3 listener is reaped and
+  retried, so HTTP/1.1 and HTTP/2 keep serving that port and its routes stay
+  admitted. The QUIC rebind retries `Address already in use` while the dead
+  endpoint, or a UDP/DTLS stream proxy handing the port back, releases its UDP
+  socket, so that brief release is not reported as `bind_failed`. Each pass
+  has two independent 2-second budgets for this: one for sockets Ferrum's UDP
+  port ledger shows held or just closed, started by the first such collision,
+  and one from the start of the pass for retired QUIC halves the ledger has no
+  entry for. One pass can therefore wait up to about 4 seconds in total.
+- `class_flip_deferred` means a frontend TLS-class change is waiting for the
+  previous accept sockets to close; `retirement_pending` is the same fail-closed
+  wait for another bind-identity change.
+
+No manual action clears these: the supervisor retries on its own, and the
+metrics clear when it succeeds.
 
 ### Istio status CAS
 
@@ -191,7 +203,7 @@ Emitted with the Istio status CAS families after `FERRUM_K8S_CONTROLLER_ENABLED=
 
 **Suggested investigation:** on a Gateway API parent-status timeout, scrape these together. High last-reconcile duration with climbing reconciliations points at CPU/API contention. Frozen reconciliations point at a wedged reconciler. `watch_idle_relists` still zero inside one idle window is expected and does not by itself prove a dead watch.
 
-A single reconcile whose `last_reconcile_duration_milliseconds` dwarfs its neighbours, paired with a rise in `status_request_timeouts_total`, is the issue #4239 shape: the status patch batch is awaited inline on the serialized reconcile loop, so one stalled Kubernetes status write stops every other object's status from being published for as long as it is allowed to run. The controller now bounds every status request (5s), every object (10s), and every batch (15s), so that blockage can no longer reach the conformance suite's 60s parent-status wait. The stalled object is logged with its kind, namespace, name, and phase and is replanned on the next reconcile.
+A single reconcile whose `last_reconcile_duration_milliseconds` dwarfs its neighbours, paired with a rise in `status_request_timeouts_total`, means a stalled Kubernetes status write (issue #4239): the status patch batch is awaited inline on the serialized reconcile loop, so one slow write delays every other object's status. The controller bounds every status request (5s), every object (10s), and every batch (15s), so that delay cannot reach the conformance suite's 60s parent-status wait. The stalled object is logged with its kind, namespace, name, and phase and is replanned on the next reconcile.
 
 ### Data-path load shedding, upstream health, and pool saturation
 
@@ -258,10 +270,11 @@ A backend 5xx with neither a class nor a gateway phase carries
 joined. 2xx/3xx/4xx omit the label. Cardinality bound is **24** compiled-in
 tokens.
 
-`X-Gateway-Error` stays on the coarser seven-token header vocabulary
+`X-Gateway-Error` stays on the coarser eight-token header vocabulary
 (`connection_failure` / `backend_timeout` / `backend_error` plus the four
-gateway tokens). Access-log `error_class` stays granular `ErrorClass::as_str`
-on every status. Mapping: [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
+gateway tokens and the header-only `request_timeout`; a route-deadline `504`
+that token covers is labelled `dispatch_policy_rejected` here). Access-log
+`error_class` stays granular `ErrorClass::as_str` on every status. Mapping: [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 
 `ferrum_stream_disconnects_total{error_class}` uses the same 19
 `ErrorClass::as_str` values as stream logs and omits the label when unset.
@@ -272,9 +285,8 @@ on every status. Mapping: [error_classification.md](error_classification.md#http
 `ferrum_plugin_log_sink_records_accepted_total{plugin}` publish the record
 accounting of the per-plugin observability sinks (`http_logging`,
 `tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
-`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`). Before these
-families existed the sinks logged their discards but published nothing, so a
-truncated audit trail was invisible on `/metrics`.
+`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`), so a
+truncated audit trail is visible on `/metrics` rather than only in logs.
 
 These are **not** the same as `ferrum_log_sink_*{sink}`, which covers only the
 process-global stdout/stderr writers, and not the same as
@@ -470,6 +482,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_destination_active_requests` | gauge | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Active upstream requests currently holding a DestinationRule http2MaxRequests permit. |
 | `ferrum_destination_active_requests_admitted_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests admitted through the DestinationRule http2MaxRequests breaker. |
 | `ferrum_destination_active_requests_rejected_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests shed because their destination was at its http2MaxRequests ceiling. |
+| `ferrum_diagnostic_ref_lookups_total` | counter | `result` | `diagnostic_refs` | `documented_only` | `conditional` | Authenticated admin diagnostic reference lookups, by bounded result. |
+| `ferrum_diagnostic_ref_replica_info` | gauge | `replica_id` | `diagnostic_refs` | `documented_only` | `conditional` | Replica id this gateway process embeds in its diagnostic references (value is always 1). |
+| `ferrum_diagnostic_refs_entries` | gauge | — | `diagnostic_refs` | `documented_only` | `conditional` | Diagnostic references currently retained in the bounded in-memory store. |
+| `ferrum_diagnostic_refs_evicted_total` | counter | `reason` | `diagnostic_refs` | `documented_only` | `conditional` | Diagnostic references removed from the store before lookup, by bounded reason. |
+| `ferrum_diagnostic_refs_minted_total` | counter | — | `diagnostic_refs` | `documented_only` | `conditional` | Diagnostic references minted on gateway-authored error responses. |
 | `ferrum_dp_config_cp_connected` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0). |
 | `ferrum_dp_config_max_stale_seconds` | gauge | `namespace` | `dp_config` | `dashboard` | `conditional` | Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled). |
 | `ferrum_dp_config_new_traffic_blocked` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0). |
@@ -573,7 +590,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_ext_authz_checks_total` | counter | `outcome`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Istio AuthorizationPolicy CUSTOM external authorization check outcomes. |
 | `ferrum_mesh_federation_bundle_age_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | Age of the cached federated trust bundle, in seconds. |
 | `ferrum_mesh_federation_last_success_timestamp_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `documented_only` | `conditional` | Unix timestamp of last successful SPIFFE federation poll. |
-| `ferrum_mesh_federation_poll_failures_total` | counter | `trust_domain`, `endpoint`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | SPIFFE federation trust-bundle poll failures. |
+| `ferrum_mesh_federation_poll_failures_total` | counter | `trust_domain`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | SPIFFE federation trust-bundle poll failures. |
 | `ferrum_mesh_hbone_inner_pool_events_total` | counter | `protocol`, `event`, `namespace` | `mesh` | `documented_only` | `conditional` | Inner application connections reused inside fenced HBONE tunnels, by inner wire protocol and outcome (hit, miss, eviction, discard, fenced). |
 | `ferrum_mesh_hbone_relay_failures_total` | counter | `proxy_id`, `direction`, `error_class`, `namespace` | `mesh` | `documented_only` | `conditional` | HBONE CONNECT tunnel relay failures after the 200 response has been sent. |
 | `ferrum_mesh_hbone_tunnel_revocations_total` | counter | `proxy_id`, `reason`, `namespace` | `mesh` | `documented_only` | `conditional` | Live HBONE tunnels revoked by the admission fence because the current policy generation, peer credential, or enforced revocation list would no longer admit their CONNECT, or would no longer let it carry later application operations. |
@@ -594,7 +611,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_outbound_registry_stream_decisions_total` | counter | `mesh_namespace`, `protocol`, `decision`, `namespace` | `mesh` | `documented_only` | `conditional` | Mesh outbound registry decisions for stream-family egress (TCP/UDP/TCP+TLS/UDP+DTLS) by protocol. |
 | `ferrum_mesh_remote_discovery_endpoint_age_seconds` | gauge | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Age of the cached remote-cluster endpoints, in seconds. |
 | `ferrum_mesh_remote_discovery_last_success_timestamp_seconds` | gauge | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Unix timestamp of last successful remote-cluster endpoint discovery poll. |
-| `ferrum_mesh_remote_discovery_poll_failures_total` | counter | `cluster`, `trust_domain`, `control_plane`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Remote-cluster endpoint discovery poll failures. |
+| `ferrum_mesh_remote_discovery_poll_failures_total` | counter | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Remote-cluster endpoint discovery poll failures. |
 | `ferrum_mesh_remote_discovery_poll_successes_total` | counter | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Successful remote-cluster endpoint discovery polls. |
 | `ferrum_mesh_request_bytes` | histogram | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_code`, `response_flags`, `connection_security_policy`, `gateway_namespace`, `le` | `mesh` | `documented_only` | `conditional` | Mesh HTTP/gRPC request body size in bytes. |
 | `ferrum_mesh_request_duration_ms` | histogram | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_code`, `response_flags`, `connection_security_policy`, `gateway_namespace`, `le` | `mesh` | `dashboard` | `conditional` | Mesh request duration in milliseconds. |
@@ -613,7 +630,6 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_trust_bundle_version` | gauge | `trust_domain`, `source`, `gateway_namespace` | `mesh` | `dashboard` | `conditional` | Monotonic version of observed mesh trust bundles. |
 | `ferrum_mesh_udp_placement_migration_adoption_proof` | gauge | `proof`, `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Node-specific proof that authorized a recordless Ambient UDP placement adoption (one bounded proof is 1). |
 | `ferrum_mesh_udp_placement_migration_adoptions_total` | counter | `proof`, `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Recordless Ambient UDP placement adoptions by bounded node-specific proof. |
-| `ferrum_mesh_udp_placement_migration_established_adoptions_total` | counter | `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Ambient UDP placements adopted without a same-incarnation node-local durable record, summed over every node-specific proof; equals the sum of ferrum_mesh_udp_placement_migration_adoptions_total. |
 | `ferrum_mesh_udp_placement_migration_failures_total` | counter | `reason`, `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Ambient UDP placement migration failures by bounded reason. |
 | `ferrum_mesh_udp_placement_migration_outstanding` | gauge | `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Outstanding pod netns or gate acknowledgements in the current node-local migration. |
 | `ferrum_mesh_udp_placement_migration_phase` | gauge | `phase`, `gateway_namespace` | `mesh_udp_migration` | `documented_only` | `conditional` | Ambient UDP placement migration phase (one bounded phase is 1). |

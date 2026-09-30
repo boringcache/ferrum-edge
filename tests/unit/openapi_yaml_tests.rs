@@ -2370,6 +2370,12 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
         "rule_modes must remain an open rule-id map"
     );
     assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["category_modes"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "category_modes must remain an open category-name map"
+    );
+    assert!(
         spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]
             .get("additionalProperties")
             .is_some_and(|v| v.is_object()),
@@ -2415,6 +2421,59 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
     );
     assert!(
         validator
+            .validate(&json!({
+                "paranoia_level": 1,
+                "detection_paranoia_level": 2,
+                "category_modes": { "xss": "enforce", "ldap_injection": "off" }
+            }))
+            .is_ok(),
+        "tuning controls must be admitted by the schema"
+    );
+    assert!(
+        validator
+            .validate(&json!({ "category_modes": { "xss": "loud" } }))
+            .is_err(),
+        "category_modes values are rule actions"
+    );
+    assert!(
+        validator
+            .validate(&json!({ "detection_paranoia_level": 5 }))
+            .is_err(),
+        "detection_paranoia_level is 1-4"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "rule_overrides": {
+                    "FE-XSS-001": {
+                        "exclude": { "query_params": ["html"], "headers": ["referer"] }
+                    }
+                }
+            }))
+            .is_ok(),
+        "field exclusions must be admitted by the schema"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "rule_overrides": { "FE-XSS-001": { "exclude": { "query_param": ["html"] } } }
+            }))
+            .is_err(),
+        "exclude is a closed object"
+    );
+    for empty in [
+        json!(null),
+        json!({}),
+        json!({ "query_params": [], "headers": null }),
+    ] {
+        let config = json!({ "rule_overrides": { "FE-XSS-001": { "exclude": empty } } });
+        assert!(
+            validator.validate(&config).is_err(),
+            "exclude must name at least one field: {empty}"
+        );
+    }
+    assert!(
+        validator
             .validate(&json!({ "default_rule_actoin": "enforce" }))
             .is_err(),
         "schema must reject top-level enforcement typo"
@@ -2426,6 +2485,20 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
             }))
             .is_err(),
         "schema must reject stream guard typo"
+    );
+    for value in ["allow", "fail_closed", "block"] {
+        assert!(
+            validator
+                .validate(&json!({ "on_unlisted_content_type": value }))
+                .is_ok(),
+            "on_unlisted_content_type {value} must be admitted"
+        );
+    }
+    assert!(
+        validator
+            .validate(&json!({ "on_unlisted_content_type": "deny" }))
+            .is_err(),
+        "on_unlisted_content_type is a closed enum"
     );
 }
 
@@ -7685,6 +7758,7 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
         json!({"header_name": " X-Trimmed-ID "}),
         json!({"header_name": "\u{0085}x-audit\u{0085}"}),
+        json!({"header_name": "x-consumers-id"}),
         json!({"header_name": "a".repeat(65_535)}),
         json!({"header_name": null, "echo_downstream": null}),
     ] {
@@ -7750,6 +7824,10 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "X-Goog-API-Key"}),
         json!({"header_name": "x-gRPC-wEB-mODE"}),
         json!({"header_name": "X-XSRF-Token"}),
+        json!({"header_name": "X-Consumer-Request-Id"}),
+        json!({"header_name": " x-consumer-trace "}),
+        json!({"header_name": "X_Consumer_Trace"}),
+        json!({"header_name": "x_consumer-trace"}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(
@@ -12233,6 +12311,7 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
         "initial_limit",
         "max_limit",
         "min_samples",
+        "baseline_window_samples",
         "increase_step",
     ] {
         assert_eq!(
@@ -12848,6 +12927,35 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             }]}),
             true,
         ),
+        // So is rule `retry`: the Gateway API translator emits a path-only
+        // rule whose only effect is its `retry` (or `attempts: 0`).
+        (
+            "retry_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry": {"max_retries": 2, "retryable_status_codes": [503]}
+            }]}),
+            true,
+        ),
+        (
+            "retry_disabled_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry_disabled": true
+            }]}),
+            true,
+        ),
+        (
+            "retry_disabled_false_is_not_a_route_action",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "retry_disabled": false
+            }]}),
+            false,
+        ),
         (
             "request_timeout_with_backend_timeout",
             parity_rule(json!({"request_timeout_ms": 10_000, "timeout_ms": 2_000})),
@@ -12856,6 +12964,30 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         (
             "request_timeout_zero",
             parity_rule(json!({"request_timeout_ms": 0})),
+            false,
+        ),
+        // `backendRequest` projects a per-attempt total bound as well.
+        (
+            "attempt_timeout_only_catch_all",
+            json!({"rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "attempt_timeout_ms": 250
+            }]}),
+            true,
+        ),
+        (
+            "attempt_timeout_with_backend_and_request_timeouts",
+            parity_rule(json!({
+                "request_timeout_ms": 10_000,
+                "timeout_ms": 2_000,
+                "attempt_timeout_ms": 2_000
+            })),
+            true,
+        ),
+        (
+            "attempt_timeout_zero",
+            parity_rule(json!({"attempt_timeout_ms": 0})),
             false,
         ),
     ] {

@@ -93,7 +93,7 @@ COMPLETED_CACHE_PRODUCER_JOBS = (
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
-BORINGCACHE_CARGO_PREFIX = "boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile "
+BORINGCACHE_CARGO_PREFIX = "boringcache cargo --${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' && github.repository == 'boringcache/ferrum-edge' && github.ref == 'refs/heads/boringcache-validation') && 'write' || 'read-only' }} --profile "
 BORINGCACHE_DIRECT_PROFILES = {("ci.yml", "build-binaries"): "binaries", ("ci.yml", "build-ebpf"): "ebpf"}
 BUILDX = "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
 BUILD_PUSH = "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc"
@@ -3416,8 +3416,16 @@ def check_direct_rust_cache_diet(
     cargo_profile: str | None = None,
 ) -> None:
     blocks = rust_cache_with_blocks(job)
-    if cargo_profile is not None:
-        require(not blocks, f"{source} must not duplicate BoringCache with rust-cache", failures)
+    if cargo_profile is not None and BORINGCACHE_CARGO_PREFIX in job:
+        # The fallback still gets the save-if/cache-directories checks below.
+        fallback_steps = [
+            chunk for chunk in re.split(r"(?m)^(?=[ ]{2,}- )", job) if RUST_CACHE in chunk
+        ]
+        require(
+            len(fallback_steps) == 1
+            and "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n" in fallback_steps[0],
+            f"{source} must gate the GitHub cache fallback", failures,
+        )
         require(
             job.count("uses: ./.github/actions/setup-boringcache") == 1,
             f"{source} must install BoringCache exactly once", failures,
@@ -3434,7 +3442,6 @@ def check_direct_rust_cache_diet(
             job.count(BORINGCACHE_CARGO_PREFIX + cargo_profile + " ") == 2,
             f"{source} must cache both native Cargo commands with profile {cargo_profile}", failures,
         )
-        return
     require(len(blocks) == 1, f"{source} must keep one pinned rust-cache site", failures)
     for block in blocks:
         saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
@@ -5299,6 +5306,10 @@ def self_test() -> int:
         "      - uses: ./.github/actions/setup-boringcache\n"
         f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries check\n"
         f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries build\n"
+        f"      - uses: {RUST_CACHE}\n"
+        "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n"
+        "        with:\n"
+        "          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n"
     )
     for mutation in (
         None,
@@ -5307,6 +5318,11 @@ def self_test() -> int:
         boringcache_job.replace("setup-boringcache", "other-cache"),
         boringcache_job.replace("--profile binaries", "--profile unrelated"),
         boringcache_job + f"      - uses: {RUST_CACHE}\n        with:\n          save-if: true\n",
+        re.sub(r"save-if: [^\n]+", "save-if: true", boringcache_job),
+        boringcache_job + "          cache-directories: /\n",
+        boringcache_job.replace(
+            "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n", ""
+        ).replace("      - run:", "      - if: env.CI_BORINGCACHE_ENABLED != 'true'\n        run:", 1),
     ):
         cache_errors: list[str] = []
         check_direct_rust_cache_diet(

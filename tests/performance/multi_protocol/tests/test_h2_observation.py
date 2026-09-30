@@ -79,7 +79,7 @@ class H2ObservationTests(unittest.TestCase):
                 self.assertIn('backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"', rendered[1])
                 source = root / "changed.yaml"
                 source.write_text((ROOT / "configs" / config).read_text().replace(
-                    "pool_http2_adaptive_window: true", "pool_http2_adaptive_window: false"))
+                    "pool_http2_adaptive_window: false", "pool_http2_adaptive_window: true"))
                 with self.assertRaises(ValueError):
                     materialize_h2(plan, protocol, "ferrum", source, root / "bad.yaml", manifest)
 
@@ -106,8 +106,7 @@ class H2ObservationTests(unittest.TestCase):
             manifest = root / "manifest.json"
             manifest.write_text("{}")
             plan = self.load(self.plan)
-            common = dict(FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST="16",
-                          FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE="8388608",
+            common = dict(FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE="8388608",
                           FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE="33554432",
                           FERRUM_POOL_HTTP2_MAX_FRAME_SIZE="1048576",
                           FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS="1000",

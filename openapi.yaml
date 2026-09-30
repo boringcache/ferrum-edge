@@ -5,7 +5,9 @@ info:
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
     `/live`, `/health`, `/status`, and `/overload` expose minimal unauthenticated
-    observations. Exact `/metrics` requires a valid admin JWT, a matching
+    observations. A viewer-key token with a namespace ceiling receives these
+    same minimal health/status and overload responses; it receives `403` on
+    detailed metrics routes. Exact `/metrics` requires a valid admin JWT, a matching
     `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within
     `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401 Unauthorized`.
     All other endpoints require JWT bearer token authentication via the
@@ -44,8 +46,17 @@ info:
     effectively read-only on the wire). Process/runtime surfaces such as
     observability, cluster state, backend capabilities, TLS management, and mesh
     topology reflect the current node or control-plane state and are not
-    namespace-filtered unless their operation explicitly declares the namespace
-    header. Both `/gateway-trust-bundles` and `/gateway-trust` (including
+    selected by the namespace header. However, when a viewer-key token carries
+    `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, every global route is denied with
+    `403` unless it is the filtered `/namespaces` registry, `GET /plugins`
+    (plugin type catalog), or a health/liveness/readiness probe (`GET /health`,
+    `/live`, `/status`, `/overload`). Health and status return only `status`
+    and `ready`, overload returns only `{level}`, and detailed `/metrics`
+    routes return `403`. Other denied routes include `/charges`,
+    `/admin/metrics`, `/metrics/runtime`, `/cluster`, `/backend-capabilities`,
+    mesh introspection, and new global routes by default. Primary-key tokens and viewer-key tokens without a namespace
+    ceiling retain existing access. Both `/gateway-trust-bundles` and
+    `/gateway-trust` (including
     `GET /gateway-trust/status`) are namespace-scoped. Audit events for those
     fleet-global mutations (TLS/ACME management
     and `POST /mesh/config-revision/reset`) are stored under the canonical
@@ -205,6 +216,8 @@ tags:
     description: CP/DP cluster status and operational introspection
   - name: Backend Capabilities
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
+  - name: Diagnostics
+    description: Resolve opaque gateway diagnostic references (X-Ferrum-Diagnostic-Ref) to scoped, operator-only detail
   - name: Node-Waypoint
     description: Inspect the per-pod identity index used by node-waypoint topology (mesh-only)
   - name: Service-Waypoint
@@ -283,7 +296,8 @@ paths:
         aggregate — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
-        `FERRUM_METRICS_ALLOWED_CIDRS`.
+        `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT bound by
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` never adds detail.
 
         Returns `503 Service Unavailable` while the gateway is still in
         startup (`status: "starting"`, `ready: false`). Once startup is
@@ -1825,7 +1839,8 @@ paths:
         diagnostics, `request_buffer` (aggregate buffered-request budget
         pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
-        source IP.
+        source IP. A namespace-ceiling-bound viewer-key JWT receives only
+        `{level}`.
 
         Returns `503 Service Unavailable` when the overload level is `critical`
         (for both tiers).
@@ -1898,6 +1913,8 @@ paths:
         `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Otherwise the endpoint
         returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header.
         Unauthenticated scraping is an explicit operator opt-in (token or CIDR).
+        A viewer-key JWT bound by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is
+        refused with `403`.
 
         TLS source watcher telemetry includes certificate expiry gauges,
         certificate rotation counters, source refresh outcomes, source fetch
@@ -2233,6 +2250,111 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /config/export:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: exportConfigReadOnly
+      summary: Read-only configuration export with fingerprinted credentials
+      description: |
+        Returns the namespace's `proxies`, `consumers`, `plugin_configs`, and
+        `upstreams` — the same resource collections and the same authoritative
+        load as `GET /backup` — for drift detection and other read-only
+        integrations (issue #5904). Allowed for **every** role, including
+        `viewer` and tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`.
+
+        The export is built from the same projections ordinary viewer reads
+        use. Every value those withhold is replaced by a keyed fingerprint
+        `hmac-sha256:<64 lowercase hex>` instead of `[REDACTED]`: Consumer
+        `keyauth` keys and `jwt`/`hmac_auth` secrets, plugin-config secrets
+        and credential-bearing URLs (per the plugin sensitivity schema, name
+        heuristics, and URL-userinfo sweep), URL userinfo anywhere in a Proxy
+        or Upstream (for example a Consul `address`), and upstream Consul
+        tokens. Values those projections show are shown here verbatim.
+        Consumer credential types ordinary reads omit (`basicauth` and
+        unknown/custom types) are omitted here too; instead every consumer
+        carries `hidden_credentials_fingerprint`, one fingerprint over those
+        omitted types. It is present even when there are none, so it shows
+        that hidden credentials changed without revealing whether any exist.
+
+        Fingerprints are HMAC-SHA-256 under a subkey derived from
+        `FERRUM_ADMIN_JWT_SECRET` (never from the viewer secret), bound to the
+        resource kind, namespace, id, and the field's JSON pointer, over a
+        key-sorted canonical JSON of the stored value. Equal values in two
+        fields fingerprint differently, and each JSON pointer is fingerprinted
+        once (an ancestor's fingerprint may still cover a child's).
+        An unchanged credential fingerprints identically across calls and
+        across replicas sharing `FERRUM_ADMIN_JWT_SECRET`; a changed one
+        fingerprints differently; the value cannot be recovered or
+        offline-guessed from it. `redaction.fingerprint_key_id` changes when
+        the admin secret rotates, marking exports as not comparable. In
+        `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET` the
+        key is random per process, so fingerprints are stable only for that
+        process's lifetime; a CP and a DP with different admin secrets never
+        agree. A principal with write access to a field can confirm a guess
+        of its previous value by writing the guess and comparing fingerprints.
+
+        The document is not restorable and is not accepted by
+        `POST /restore` or `POST /batch`. API-spec documents and gateway
+        trust bundles (Admin/Operator-gated) are not included, and
+        `api_spec_id` ownership tags are stripped so a cached fallback
+        compares equal to a database read. Collections are sorted by `id`,
+        proxy plugin associations by config id, and the document carries no
+        timestamp, so exports of unchanged configuration are byte-identical.
+        At most one export loads from the database at a time per process; a
+        concurrent export serves the labelled cached snapshot instead of
+        waiting. At most four exports are in flight at a time, built off the
+        async workers; a request that cannot start within 5 seconds gets `503`
+        with `Retry-After: 1`. `viewer` reads of proxies and upstreams strip
+        URL userinfo the same way; `operator` and `admin` reads keep it, so
+        their GET-then-PUT round-trips.
+
+        Namespace-scoped via `X-Ferrum-Namespace`. A JWT `ns` claim, when
+        present, must authorize the selected namespace (`403` otherwise) even
+        when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is off; with that flag on
+        (or on a multi-namespace CP) the claim is required. A token verified
+        by `FERRUM_ADMIN_JWT_VIEWER_SECRET` gets `403` for a namespace outside
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` when that ceiling is set,
+        whatever its `ns` claim says. Falls back to the
+        in-memory cached configuration when the database is unavailable,
+        indicated by `X-Data-Source: cached`. Requires a valid admin JWT;
+        metrics bearer tokens and metrics CIDR allowlists do not grant it.
+      tags: [Backup & Restore]
+      responses:
+        "200":
+          description: Fingerprinted configuration export
+          headers:
+            X-Data-Source:
+              schema:
+                type: string
+                enum: [database, cached]
+                description: Where the config was read from
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigExportResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          description: >-
+            No database is reachable and no cached configuration is available,
+            or too many exports are in progress (then with `Retry-After: 1`)
+          headers:
+            Retry-After:
+              description: Present as `1` when the export concurrency limit is saturated.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /cluster:
     get:
       operationId: getClusterStatus
@@ -2472,6 +2594,229 @@ paths:
                     type: string
 
   # ── Node-Waypoint identities (mesh NodeWaypoint topology) ───────────
+  /diagnostics/v1/refs/{ref}:
+    get:
+      operationId: getDiagnosticRef
+      summary: Resolve a gateway diagnostic reference
+      description: |
+        Resolves an opaque `X-Ferrum-Diagnostic-Ref` value to the gateway-owned
+        detail behind it (issue #5767). With `FERRUM_DIAGNOSTIC_REFS=errors`,
+        every HTTP/1.1, HTTP/2, and HTTP/3 proxy response that carries the
+        gateway's own `X-Gateway-Error` token also carries a reference of the
+        form `fd1_` plus 32 lowercase hex digits (128 CSPRNG bits). With
+        `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846), every other
+        gateway-authored error response carries one too: plugin rejections
+        (for example `401`, `403`, `429`), gateway policy fences, and routing
+        `404`s, including gRPC Trailers-Only rejections. Such a reference has
+        a `null` `gateway_error`, and its detail names the rejecting phase and,
+        when known, plugin. A backend's own error response never carries a
+        reference, whether relayed to the client or replayed by a plugin (a
+        cache hit, an idempotent replay, a serverless terminate reply, a
+        federated provider response), and a reference is stamped only on a
+        head whose status is the one its rejection recorded. The
+        reference embeds nothing; the detail is retained only in the memory of
+        the gateway process that served the response, for
+        `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and at most
+        `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` references (oldest evicted first).
+        Query the admin listener of that same process.
+
+        **Across replicas.** With `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true`
+        (issue #5846), references take the form `fd2_` plus the minting
+        process's replica id (8 lowercase hex digits, 32 bits drawn from the
+        process CSPRNG at startup and derived from no host, pod, or address),
+        `_`, and 32 lowercase hex digits. The owning process's `200` body adds
+        `replica_id`. Another process answers such a reference with the same
+        `404` and body as any miss, plus the `X-Ferrum-Diagnostic-Owner-Replica`
+        header naming the owner, and only for a caller whose token carries
+        `diagnostics:read` and an `ns` claim naming the answering process's
+        namespace. The owner is read from the reference itself; the answering
+        process never learns whether the owner exists or still holds it. The
+        control plane does not proxy lookups: send the lookup to the replica
+        whose startup log or `ferrum_diagnostic_ref_replica_info{replica_id}`
+        metric names that id. `fd1_` references keep resolving on the untagged
+        process that minted them.
+
+        **Authorization.** A valid admin JWT is required (`401` otherwise), and
+        it must carry both the `diagnostics:read` scope (a `scope` claim that is
+        an OAuth 2.0 space-delimited string or an array of strings; the admin
+        `role` never implies it) and an `ns` claim (`403` otherwise). These two
+        checks depend only on the credential, never on the reference. The
+        `X-Ferrum-Namespace` header is ignored.
+
+        **No probing.** A malformed, unknown, expired, or evicted reference, a
+        reference minted for a namespace the token's `ns` claim does not name,
+        and every reference while the feature is off all answer the same
+        `404`.
+
+        **Rate limit and audit.** Every attempt is charged against its JWT
+        `sub`'s share of the lookup budget before the credential checks,
+        including one then refused with `403`; one `sub` may use at most half
+        of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10, at
+        least 1) per second. Only an attempt whose credential carries the
+        `diagnostics:read` scope and an `ns` claim is also charged against the
+        global per-second budget, so refused credentials cannot exhaust it;
+        `429` with `Retry-After: 1` above either. Every `200` and `404` emits one WARN-level
+        `audit.event = "diagnostic_ref_lookup"` event naming the JWT subject,
+        the reference (or `malformed`), and the result; `403` and `429` events
+        are throttled to one per second each and carry
+        `suppressed_since_last`. `ferrum_diagnostic_ref_lookups_total{result}`
+        counts every attempt.
+
+        The response is versioned by `schema_version`. It never contains
+        request or response bodies, headers, paths, query strings,
+        credentials, client addresses, or raw error text.
+      tags: [Diagnostics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: ref
+          in: path
+          required: true
+          description: |
+            The `X-Ferrum-Diagnostic-Ref` value: `fd1_<32 hex>`, or
+            `fd2_<8 hex replica id>_<32 hex>` from a replica-tagged gateway.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Reference resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticRefLookup"
+              examples:
+                connection_failure:
+                  summary: A DNS failure behind a `connection_failure` token
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:15:02.114Z"
+                    expires_at: "2026-09-27T10:30:02.114Z"
+                    protocol: http2
+                    status: 502
+                    gateway_error: connection_failure
+                    detail_available: true
+                    detail:
+                      error_class: dns_lookup_error
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: pre_wire_failure
+                      proxy_id: orders-api
+                      backend_target: "https://orders.internal:8443"
+                      duration_bucket: lt_100ms
+                      attempts:
+                        - attempt: 1
+                          backend_dispatch: pre_wire_failure
+                          error_class: dns_lookup_error
+                tls_retry:
+                  summary: A retried backend TLS verification failure
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_8e2b4d6f0a1c3e5a7b9d1f3a5c7e9b0d
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:16:40.502Z"
+                    expires_at: "2026-09-27T10:31:40.502Z"
+                    protocol: http1
+                    status: 502
+                    gateway_error: connection_failure
+                    detail_available: true
+                    detail:
+                      error_class: tls_error
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: pre_wire_failure
+                      proxy_id: payments-api
+                      backend_target: "https://payments.internal:8443"
+                      duration_bucket: lt_1s
+                      attempts:
+                        - attempt: 1
+                          backend_dispatch: backend_response
+                          status: 503
+                        - attempt: 2
+                          backend_dispatch: pre_wire_failure
+                          error_class: tls_error
+                          tls:
+                            failure: certificate_verification
+                            reason: expired
+                plugin_rejection:
+                  summary: An `all`-mode reference on a plugin `401`
+                  value:
+                    schema_version: ferrum.diagnostic_ref.v1
+                    ref: fd1_1a3c5e7f9b0d2f4a6c8e0b2d4f6a8c0e
+                    namespace: ferrum
+                    created_at: "2026-09-27T10:17:11.020Z"
+                    expires_at: "2026-09-27T10:32:11.020Z"
+                    protocol: http2
+                    status: 401
+                    gateway_error: null
+                    detail_available: true
+                    detail:
+                      error_class: null
+                      body_error_class: null
+                      rejection_phase: null
+                      route_timeout_phase: null
+                      backend_dispatch: not_dispatched
+                      proxy_id: orders-api
+                      backend_target: "https://orders.internal:8443"
+                      duration_bucket: lt_10ms
+                      rejection:
+                        source: plugin
+                        phase: authenticate
+                        plugin: key_auth
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            The admin JWT lacks the `diagnostics:read` scope or carries no `ns`
+            claim. The attempt still counts against the lookup rate limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: |
+            Malformed, unknown, expired, or evicted reference; a reference
+            outside the token's namespaces; a replica-tagged reference another
+            gateway process minted; or diagnostic references are off. All cases
+            answer with the same status and body.
+          headers:
+            X-Ferrum-Diagnostic-Owner-Replica:
+              description: |
+                Replica id read from the caller's replica-tagged (`fd2_`)
+                reference when it names a replica other than this gateway
+                process. Any well-formed foreign tag is echoed, including a
+                stale or forged one: the gateway does not check that the named
+                replica exists. Sent only on that miss, and only
+                when the token carries `diagnostics:read` and an `ns` claim
+                naming this gateway's namespace. Never sent with any other
+                status.
+              schema:
+                type: string
+                pattern: "^[0-9a-f]{8}$"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: |
+            Lookup rate limit exceeded, globally or for this JWT `sub`; retry
+            after the indicated delay.
+          headers:
+            Retry-After:
+              description: Always `1`.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
   /node-waypoint/identities:
     get:
       operationId: getNodeWaypointIdentities
@@ -4284,14 +4629,15 @@ paths:
         schema-aware sensitivity contract used for non-admin plugin reads:
         credential-bearing endpoint URLs keep only scheme/host/port with
         structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
-        markers and never userinfo, all values of arbitrary header maps and
-        webhook body templates are replaced by `[REDACTED]`, as are
+        markers, with userinfo replaced by `redacted@`. All values of arbitrary
+        header maps and webhook body templates are replaced by `[REDACTED]`, as are
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
-        userinfo/query/fragment data is stripped while its
-        scheme/host/port/database are kept. Explicit JSON `null` values on
+        userinfo is replaced by `redacted@` and stripped query/fragment data
+        is marked while its scheme/host/port/database are kept. Explicit JSON
+        `null` values on
         sensitive fields stay `null`.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
@@ -4990,7 +5336,7 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
+          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, an HTTP-family `listen_port` is a process-global proxy port it cannot be served on, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -5086,7 +5432,7 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
+          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, an HTTP-family `listen_port` is a process-global proxy port it cannot be served on, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -5772,10 +6118,26 @@ paths:
       summary: List plugin configurations (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        An optional `proxy_id` query parameter narrows the result to plugin
+        configs whose `proxy_id` matches exactly, so a caller listing one
+        proxy's configs does not have to page through the whole namespace and
+        filter client-side. Pagination (and `pagination.total`) is applied over
+        the filtered set.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - name: proxy_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Exact match on the `proxy_id` field of the plugin config. Returns
+            only proxy-scoped configs targeting this proxy. Must satisfy the
+            same identifier rules as other resource ids; an invalid value is
+            rejected with `400`.
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -5808,6 +6170,9 @@ paths:
       summary: Create a plugin configuration
       description: |
         Creates the plugin configuration.
+
+        A write that sends a redaction placeholder returned by the caller's
+        masked read back as a stored secret is rejected with `400`.
 
         The complete prospective plugin chain is validated before persistence.
         Invalid CORS/mesh-dispatch ordering, exclusive-instance conflicts,
@@ -5915,6 +6280,16 @@ paths:
         mutated. `POST /plugins/config` and `/batch` still default `enabled` to
         `true` when the key is absent — a create has no prior state to
         overwrite.
+
+        **Masked secrets.** Non-admin reads return the redacted plugin-config
+        projection. A `PUT` (or `POST /plugins/config`) by an `operator` whose
+        body carries one of that projection's placeholders at a field it
+        masks is rejected with `400` and nothing is mutated. The placeholders
+        are `[REDACTED]`, a URL whose path, query, or fragment is exactly
+        `/[REDACTED_PATH]`, `[REDACTED_QUERY]`, or `[REDACTED_FRAGMENT]`, and
+        `redacted@` userinfo with no password. Send the real value, or omit
+        the field to clear it: the full replace does not keep the stored
+        value. `admin` reads are raw, so an admin round trip is unaffected.
 
         **Proxy-scoped side effect (database mode).** The proxy association is
         reconciled with the replacement body in the same transaction, so
@@ -6054,6 +6429,9 @@ paths:
     post:
       operationId: createUpstream
       summary: Create an upstream
+      description: |
+        A write that sends a redaction placeholder returned by the caller's
+        masked read back as a stored secret is rejected with `400`.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -6132,6 +6510,15 @@ paths:
         any field the body omits is reset to its schema default. `targets` is
         required by the schema, so a body that omits it is rejected with `400`
         rather than silently emptying the target list.
+
+        **Masked secrets.** An `operator` read returns
+        `service_discovery.consul.token` as `[REDACTED]`. A `PUT` (or
+        `POST /upstreams`) by an `operator` whose body carries that exact
+        placeholder as the token is rejected with `400` and nothing is
+        mutated. Otherwise a read-modify-write would store the placeholder as
+        the token, and `If-Match` would not catch it. Send the real token, or
+        omit it to clear it: the full replace does not keep the stored token.
+        `admin` reads are raw, so an admin round trip is unaffected.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -6506,7 +6893,9 @@ paths:
         Viewer and operator roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, results are filtered to
         the JWT `ns` claim; a token with no claim receives an empty list
-        rather than `403`.
+        rather than `403`. A token verified by
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET` is always filtered to
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` when that ceiling is set.
       tags: [Namespaces]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
@@ -6626,7 +7015,9 @@ paths:
         Viewer and operator
         roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, a token that cannot
-        address `name` receives `403`.
+        address `name` receives `403`. A token verified by
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET` receives the same `403` for a `name`
+        outside `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` when that ceiling is set.
       tags: [Namespaces]
       responses:
         "200":
@@ -6990,6 +7381,33 @@ paths:
           (`FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED`) and the per-spec
           `x-ferrum-external-refs` extension opt in. Absent process policy
           still yields `UnsupportedExternalRef` (fail-closed).
+        - **`x-ferrum-mcp`** (optional, OpenAPI 3.x only) — `true` or an
+          object (`enabled`, `endpoint.path`, `namespace`, `include` /
+          `exclude` by `operations` (operationId) or `tags`, `limits`,
+          `forward_request_headers`) to auto-generate a proxy-scoped
+          `mcp_gateway` (`aggregate_router`) that publishes one MCP tool per
+          selected GET / POST / PUT / PATCH / DELETE operation and runs each
+          `tools/call` as an HTTP request to this proxy's own backend. Without
+          an explicit `include`, only GET operations are published (also for
+          `x-ferrum-mcp: true`); a POST / PUT / PATCH / DELETE operation needs
+          `include` or a per-operation `x-ferrum-mcp: true`, because
+          method- and path-conditioned plugin triggers, WAF rules, and
+          authorization see the MCP request, not the bridged one. A selected
+          operation whose method `x-ferrum-proxy.allowed_methods` does not
+          allow is rejected with `400`, and `allowed_methods` must allow POST
+          for the MCP endpoint. A per-operation `x-ferrum-mcp`
+          (`true` / `false`, or `expose`, `name`, `title`, `description`,
+          `annotations`) overrides selection and presentation. The endpoint
+          defaults to the listen path + `/mcp`; `$ref`s resolve under the same
+          limits as `x-ferrum-validate`. Header parameters naming a reserved
+          field (hop-by-hop, Host, Authorization, Cookie, Proxy-*,
+          X-Forwarded-*, MCP transport, Ferrum-internal), cookie / `content`
+          / non-default-style / object parameters, and required non-JSON
+          bodies are rejected with `400` naming the operation (exclude it to
+          proceed). An embedded `mcp_gateway` in `x-ferrum-plugins` is merged
+          over the generated config (the `openapi` server id is reserved).
+          Cannot be combined with `x-ferrum-validate` in one document, and
+          requires a literal-prefix `listen_path`.
         - **`x-ferrum-external-refs`** (optional) — `true` or an object
           (`enabled`, optional `document_base`, optional `allowed_origins`)
           to opt this document into external / cross-document `$ref`
@@ -7604,6 +8022,8 @@ components:
         | Variable | Default | Description |
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
+        | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | *(unset)* | Optional second signing key (minimum 32 characters, distinct from `FERRUM_ADMIN_JWT_SECRET`) whose tokens are capped at `viewer` |
+        | `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` | *(unset: fleet-wide)* | Optional comma-separated, exact and case-sensitive namespace ceiling for tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`; denies global routes except filtered namespaces, plugin type catalog, and minimal health/overload probes |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
@@ -7623,6 +8043,38 @@ components:
         `operator`, and `admin`. Tokens without a valid `role` claim are
         rejected.
 
+        Role ceiling: a token whose signature verifies under
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET` (and not under
+        `FERRUM_ADMIN_JWT_SECRET`) is authorized as `viewer` whatever its
+        `role` claim says — a token claiming `admin` gets `403` on
+        operator/admin routes — and its `scope` claims grant nothing (no
+        `diagnostics:read`). Both keys accept only `HS256`; tokens with any
+        other `alg` (including `none`) are rejected. Startup refuses identical
+        values for the two secrets. Give read-only automation the viewer
+        secret so it holds no material that can mint an `operator` or `admin`
+        token. Its holder chooses the token's `sub` and `ns`, so neither is an
+        identity or tenancy boundary for it. Audit records name such an actor
+        as `viewer-key:<sub>`.
+
+        Namespace ceiling: when `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is set, a
+        viewer-secret token may read only the listed namespaces, matched exactly
+        and case-sensitively, whatever its `ns` claim or `X-Ferrum-Namespace`
+        says, independently of
+        `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`. Every namespace-scoped route and
+        `GET /config/export` answer `403` for a namespace outside it (the
+        answer depends only on the credential and the requested name), as does
+        `GET /namespaces/{name}`, and `GET /namespaces` is filtered to it. A
+        present `ns` claim is narrowed to `claim ∩ ceiling`. Every global route
+        is denied with `403` by default for a ceiling-bound token except the
+        filtered namespace registry, `GET /plugins` (plugin type catalog), and
+        health/liveness/readiness probes (`GET /health`, `/live`, `/status`,
+        `/overload`). Health/status return only `status` and `ready`, overload
+        returns only `{level}`, and detailed `/metrics` routes return `403`.
+        Tokens verified by `FERRUM_ADMIN_JWT_SECRET` are never
+        affected. Unset, the viewer secret is a fleet-wide read credential;
+        per-tenant readers can also use tokens
+        pre-minted with the primary key and an `ns` claim.
+
     metricsBearerAuth:
       type: http
       scheme: bearer
@@ -7632,7 +8084,9 @@ components:
         trimming when nonempty; unset or blank disables token auth). Startup
         and validation reject shorter tokens. Accepted only by observability
         scrape/detail surfaces such as exact `/metrics` and detailed
-        `/health`/`/status`/`/overload`. CIDR-based metrics access is configured
+        `/health`/`/status`/`/overload`. Ceiling-bound viewer-key tokens receive
+        only minimal health/overload projections and cannot scrape metrics.
+        CIDR-based metrics access is configured
         separately with `FERRUM_METRICS_ALLOWED_CIDRS` and cannot be represented
         as an OpenAPI security scheme.
 
@@ -9196,8 +9650,9 @@ components:
             URLs receive the same structural projection. `redis_integrity_key`
             (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
-            `redis_url` userinfo/query/fragment data is stripped while
-            scheme/host/port/database are kept. Any remaining URL-shaped
+            `redis_url` userinfo is replaced by `redacted@` and stripped
+            query/fragment data is marked while scheme/host/port/database are
+            kept. Any remaining URL-shaped
             string carrying userinfo has that userinfo replaced. A plugin
             config that is not an object (and not `null`) is replaced
             wholesale. Explicit JSON `null` values on sensitive fields stay
@@ -9334,8 +9789,17 @@ components:
             segments and backslashes are rejected in both spellings — literal
             (`/a/../b`, `/a/./b`, `/a\b`) and encoded (`%2e%2e`, `%5C`) —
             because the URL parser that builds the backend request line removes
-            dot segments and reads `\` as a separator. A `.` inside a segment
-            (`/v1.0/users`) is an ordinary path character.
+            dot segments and reads `\` as a separator. A segment whose text
+            before the first `;` is `.` or `..` (`..;`, `.;x`, `%2e%2e;`,
+            `..%3B`) is a dot segment too, because backends that strip path
+            parameters resolve it as one. A non-final empty segment (`//`,
+            `/a//b`) and a segment that is empty before its first `;`
+            (`/;x/a`) are rejected too, because backends that collapse `//`
+            would resolve a different path; a trailing slash is allowed. A `.`
+            inside a segment (`/v1.0/users`) is an ordinary path character. A
+            `;` on an ordinary segment (`/v1;version=2`) is refused after route
+            lookup unless the matched proxy sets `allow_path_parameters`, so a
+            literal `listen_path` containing `;` requires that opt-in.
 
 
             A literal `listen_path` containing any of the above is unreachable,
@@ -9449,6 +9913,24 @@ components:
           type: boolean
           default: false
           description: Forward the original Host header to the backend
+        allow_path_parameters:
+          type: boolean
+          default: false
+          description: >-
+            Accept RFC 3986 `;` path parameters (matrix parameters) in request
+            paths routed to this proxy. With the default `false`, a request
+            whose canonical path contains a `;` (literal or `%3B`, for example
+            `/admin;x/users`) is refused with `400` (`path_parameter`) after
+            route lookup and before any plugin runs, because backends such as
+            Tomcat and Spring strip `;…` from every segment and would execute a
+            different path than routing and policy evaluated. Enable it only
+            for backends that use matrix parameters: routing, policy, and the
+            backend request line then carry the `;` unchanged, so policy keyed
+            on a parameter-free path does not match those requests. Dot
+            segments with a parameter (`..;`) and segments that are empty
+            before their `;` (`/;x/admin`) are refused either way. A literal
+            `listen_path` containing `;` requires `true`. HTTP-family proxies
+            only; stream proxies must leave it `false`.
         backend_connect_timeout_ms:
           type: integer
           format: uint64
@@ -9674,7 +10156,11 @@ components:
             `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`). When omitted,
             the proxy remains port-agnostic and matches any HTTP-family frontend
             (manual / non-Kubernetes default). Distinct `listen_port` values do not
-            conflict on the same `hosts`+`listen_path`.
+            conflict on the same `hosts`+`listen_path`. A `listen_port` equal to
+            `FERRUM_PROXY_HTTP_PORT` or `FERRUM_PROXY_HTTPS_PORT` must match that
+            frontend's class (`http_tls_listen_ports`) and carry no dedicated
+            Sidecar ingress bind; in database mode the Admin API rejects either
+            conflict with `409`. CP mode skips this check.
         frontend_tls:
           type: boolean
           default: false
@@ -9753,7 +10239,10 @@ components:
             on the HTTP path.
 
             Only valid for tcp / tcp_tls / udp / dtls stream proxies. Setting it on an
-            HTTP-family proxy produces a validation error (use X-Forwarded-For there).
+            HTTP-family proxy produces a validation error: HTTP-family proxies share the
+            global HTTP/HTTPS listeners, which enable inbound PROXY protocol listener-wide
+            with the FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS
+            environment settings instead.
 
             Default: null / false (disabled; socket peer is always used as client_ip).
         backend_proxy_protocol:
@@ -9814,6 +10303,43 @@ components:
             idle timer; multiplexed H3 connections with other active streams may
             stay open. Startup/reload warnings are logged only for affected proxies
             when an H3 WebSocket listener is actually reachable.
+        websocket_permessage_deflate:
+          type: string
+          enum: [strip, passthrough, terminate]
+          default: strip
+          description: |
+            RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
+            proxy (HTTP-family proxies only; stream proxies must use `strip`).
+
+            - `strip` (default): the client's `Sec-WebSocket-Extensions` offer
+              never reaches the backend and no extension is negotiated, so every
+              message stays inspectable by WebSocket frame plugins.
+            - `passthrough`: `permessage-deflate` offer elements reach the backend
+              unchanged and the backend's `permessage-deflate` answer reaches the
+              client unchanged on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+              Extended CONNECT. Every other extension token is still stripped. A
+              session that negotiates the extension is relayed as raw bytes, so
+              gateway WebSocket frame and fragment limits do not apply to it.
+              Refused (400) on a proxy with any plugin that requires the parsed
+              WebSocket relay (`waf`, `ws_frame_logging`,
+              `ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin
+              whose `requires_websocket_framing()` is true), whether attached
+              directly, through a proxy group, or inherited from a global plugin.
+            - `terminate`: the gateway negotiates `permessage-deflate` with the
+              client and with the backend independently (the backend receives
+              the gateway's own `permessage-deflate` offer), inflates every
+              message before the frame relay and its plugins see it, and
+              re-deflates toward each leg that negotiated compression. Every
+              plugin stays allowed and sees plaintext. Decompression is bounded:
+              a compressed frame may not exceed the frame ceiling, a frame may not
+              inflate past it, and a message may not inflate past
+              `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default
+              1 MiB; `0` opts into the reassembled-message ceiling); exceeding
+              either closes with 1009. An invalid backend answer (including a
+              foreign extension, a malformed list, or a non-ASCII value) refuses
+              the upgrade with 502.
+              Applies on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3 Extended
+              CONNECT.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
@@ -9961,6 +10487,10 @@ components:
                 type: "null"
               response_body_mode:
                 const: stream
+              websocket_permessage_deflate:
+                const: strip
+              allow_path_parameters:
+                const: false
           else:
             anyOf:
               - required: [hosts]
@@ -10028,6 +10558,17 @@ components:
             properties:
               backend_scheme:
                 type: string
+        - if:
+            required: [listen_path]
+            properties:
+              listen_path:
+                type: string
+                pattern: "^[^~].*;"
+          then:
+            required: [allow_path_parameters]
+            properties:
+              allow_path_parameters:
+                const: true
 
     ProxyCreate:
       description: |
@@ -11051,8 +11592,13 @@ components:
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         sni:
           description: >-
-            Frontend TLS/QUIC SNI hostname, when the client supplied one.
-            Available on HTTP and stream connections alike.
+            Frontend TLS/QUIC SNI hostname, when the client supplied one,
+            ASCII-lowercased with one trailing DNS dot removed. Available on HTTP
+            and stream connections alike. Exact entries are normalized at load
+            (one trailing dot dropped, lowercased, U-labels converted to
+            A-labels with IDNA); prefix entries are lowercased with whole labels
+            converted; regex patterns are left as written. Non-ASCII text that
+            cannot be converted is rejected.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         header:
           description: >-
@@ -18107,6 +18653,176 @@ components:
           description: |
             Replica-set configuration to enable before retrying the deletion.
 
+    ConfigExportResponse:
+      type: object
+      description: >-
+        `GET /config/export` document. Same resource collections as
+        `BackupResponse` for proxies, consumers, plugin configs, and upstreams,
+        with every withheld credential value replaced by a `CredentialFingerprint`.
+      required:
+        [
+          version,
+          ferrum_version,
+          source,
+          namespace,
+          redaction,
+          counts,
+          proxies,
+          consumers,
+          plugin_configs,
+          upstreams,
+        ]
+      additionalProperties: false
+      properties:
+        version:
+          type: string
+          description: Configuration schema version
+          example: "1"
+        ferrum_version:
+          type: string
+          description: Ferrum Edge binary version that produced this export
+        source:
+          type: string
+          enum: [database, cached]
+          description: Where the config was read from (mirrors `X-Data-Source`)
+        namespace:
+          type: string
+          description: The exported namespace (`X-Ferrum-Namespace`, default `ferrum`)
+        redaction:
+          type: object
+          required: [fingerprint_algorithm, fingerprint_prefix, fingerprint_key_id]
+          additionalProperties: false
+          properties:
+            fingerprint_algorithm:
+              type: string
+              const: hmac-sha256
+            fingerprint_prefix:
+              type: string
+              const: "hmac-sha256:"
+            fingerprint_key_id:
+              type: string
+              pattern: "^[0-9a-f]{16}$"
+              description: >-
+                Keyed label of the fingerprint key (not the key). Two exports
+                are comparable only when this matches; it changes when
+                `FERRUM_ADMIN_JWT_SECRET` rotates.
+        counts:
+          type: object
+          required: [proxies, consumers, plugin_configs, upstreams]
+          additionalProperties: false
+          properties:
+            proxies:
+              type: integer
+            consumers:
+              type: integer
+            plugin_configs:
+              type: integer
+            upstreams:
+              type: integer
+        proxies:
+          type: array
+          items:
+            $ref: "#/components/schemas/Proxy"
+        consumers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConsumerExport"
+        plugin_configs:
+          type: array
+          description: >-
+            Plugin configs with the non-admin redacted projection applied, each
+            withheld value rendered as a `CredentialFingerprint`.
+          items:
+            $ref: "#/components/schemas/PluginConfig"
+        upstreams:
+          type: array
+          description: >-
+            Upstreams with `service_discovery.consul.token` rendered as a
+            `CredentialFingerprint` when set.
+          items:
+            $ref: "#/components/schemas/Upstream"
+
+    CredentialFingerprint:
+      type: string
+      pattern: "^hmac-sha256:[0-9a-f]{64}$"
+      description: >-
+        Keyed, non-reversible fingerprint of a withheld stored value, bound to
+        its resource kind, namespace, id, and field JSON pointer. Equal across
+        calls and replicas while the value (and `FERRUM_ADMIN_JWT_SECRET`) is
+        unchanged.
+      example: "hmac-sha256:3f1c9b0e5a7d2c4f8e6b1a0d9c7e5f3a2b4d6c8e0f1a3b5c7d9e1f2a4b6c8d0e"
+
+    ConsumerExport:
+      description: >-
+        Consumer item in a `GET /config/export` document: the ordinary viewer
+        credential projection with fingerprints in place of `[REDACTED]`, plus
+        one fingerprint of the credential types that projection omits.
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          required: [hidden_credentials_fingerprint]
+          properties:
+            credentials:
+              $ref: "#/components/schemas/ConsumerCredentialsFingerprinted"
+            hidden_credentials_fingerprint:
+              allOf:
+                - $ref: "#/components/schemas/CredentialFingerprint"
+              description: >-
+                Fingerprint of every stored credential type ordinary viewer
+                reads omit (`basicauth`, unknown/custom types), over an empty
+                map when there are none. Always present, so it reveals changes
+                to hidden credentials but not whether any exist.
+
+    ConsumerCredentialsFingerprinted:
+      type: object
+      default: {}
+      description: |
+        Credential map in `GET /config/export` items. `keyauth` `key`, `jwt`
+        `secret`, and `hmac_auth` `secret` fields carry a
+        `CredentialFingerprint` per entry; `mtls_auth.identity` stays
+        visible. `basicauth`, unknown/custom credential types, and legacy
+        extra fields are omitted, as in ordinary Consumer responses; see
+        `hidden_credentials_fingerprint`.
+      properties:
+        keyauth:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [key]
+            additionalProperties: false
+            properties:
+              key:
+                $ref: "#/components/schemas/CredentialFingerprint"
+        basicauth: false
+        jwt:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [secret]
+            additionalProperties: false
+            properties:
+              secret:
+                $ref: "#/components/schemas/CredentialFingerprint"
+        hmac_auth:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [secret]
+            additionalProperties: false
+            properties:
+              secret:
+                $ref: "#/components/schemas/CredentialFingerprint"
+        mtls_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/MtlsAuthCredential"
+          minItems: 1
+      additionalProperties: false
+
     BackupResponse:
       type: object
       required: [version, ferrum_version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
@@ -20116,7 +20832,10 @@ components:
             - not:
                 type: string
                 pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
-          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
+            - not:
+                type: string
+                pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]"
+          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names and every name in the gateway-owned x-consumer-* consumer assertion namespace (with `_` equivalent to `-`, so x_consumer_role is included), are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
           type: [boolean, "null"]
           default: true
@@ -21452,6 +22171,8 @@ components:
                   before verified claim values are installed, so an absent, null,
                   empty, or wrong-type claim leaves the header absent instead of
                   forwarding client-supplied input.
+                  Destinations in the gateway-owned `x-consumer-*` consumer
+                  assertion namespace are rejected at config load.
               claim_headers_separator:
                 type: string
                 minLength: 1
@@ -21602,6 +22323,8 @@ components:
             claim values are installed, so an absent, null, empty, or wrong-type
             claim leaves the header absent instead of forwarding client-supplied
             input.
+            Destinations in the gateway-owned `x-consumer-*` consumer
+            assertion namespace are rejected at config load.
         claim_headers_separator:
           type: string
           default: ","
@@ -21987,7 +22710,7 @@ components:
                   type: string
                   pattern: '^\s*[!#$%&''*+.^_`|~0-9A-Za-z-]+\s*$'
                   not:
-                    pattern: '^\s*([Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]|[Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Cc][Uu][Ss][Tt][Oo][Mm]-[Ii][Dd]|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])\s*$'
+                    pattern: '^\s*([Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]\S*|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])\s*$'
                 description: >-
                   Claim path to upstream header mappings. Destination headers are
                   gateway-owned and always sanitized: every configured destination is
@@ -21995,6 +22718,8 @@ components:
                   claim values are installed, so an absent, null, empty, or wrong-type
                   claim leaves the header absent instead of forwarding client-supplied
                   input.
+                  Destinations in the gateway-owned `x-consumer-*` consumer
+                  assertion namespace are rejected at config load.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -22199,6 +22924,8 @@ components:
                   verified claim values are installed, so an absent, null, empty, or
                   wrong-type claim leaves the header absent instead of forwarding
                   client-supplied input.
+                  Destinations in the gateway-owned `x-consumer-*` consumer
+                  assertion namespace are rejected at config load.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -23314,11 +24041,18 @@ components:
         malformed values, non-numeric
         `destination.port` values, malformed IP CIDRs, a `source.serviceAccount`
         with a `*` or more than one `/`, a `source.trustDomain` with a `/` or a
-        repeated/mid-string `*`, and collections over 64 `when[]` entries per
+        repeated/mid-string `*`, a non-ASCII `connection.sni` value that
+        cannot be converted to its A-label, and collections over 64 `when[]`
+        entries per
         rule or 256 values per list (16 values of at most 320 bytes for
         `source.serviceAccount`) — are rejected during translation/config
         validation with a field-specific diagnostic, on both `values` and
         `notValues`, so DENY conditions cannot silently fail open.
+        `connection.sni` values are normalized at load to the spelling of the
+        received ClientHello SNI: one trailing dot is stripped, ASCII is
+        lowercased, and a non-ASCII (U-label) name is converted to its A-label
+        with IDNA. Other ASCII characters that DNS hostnames do not allow are
+        not rejected; such a value never matches.
         An attribute the path CAN source but that this request lacks follows
         ordinary Istio semantics (a `values` check fails; a `notValues`-only
         check passes). An attribute the path can NEVER source — an HTTP-only key
@@ -23751,6 +24485,12 @@ components:
                     properties: {timeout_disabled: {const: true}}
                   - required: [request_timeout_ms]
                     properties: {request_timeout_ms: {type: integer}}
+                  - required: [attempt_timeout_ms]
+                    properties: {attempt_timeout_ms: {type: integer}}
+                  - required: [retry]
+                    properties: {retry: {type: object}}
+                  - required: [retry_disabled]
+                    properties: {retry_disabled: {const: true}}
               - if:
                   required: [timeout_disabled]
                   properties:
@@ -23779,7 +24519,10 @@ components:
                   `query_params`/`authority`/`source_namespace`/`uri` must be
                   configured, UNLESS the rule carries a route action
                   (`request_transform`, `response_transform`, `fault`,
-                  `rewrite`, or `redirect`), which makes an empty match the
+                  `rewrite`, `redirect`, `timeout_ms`,
+                  `timeout_disabled: true`, `request_timeout_ms`,
+                  `attempt_timeout_ms`, `retry`, or
+                  `retry_disabled: true`), which makes an empty match the
                   translator's deliberate action-only catch-all. An empty
                   match with no route action is rejected at load time because
                   it would silently shadow every later rule. `ignore_uri_case`
@@ -24102,26 +24845,62 @@ components:
                   attempt, retry backoff, and the streaming response body, and
                   is never re-armed by a retry. Request-scoped: it never changes
                   the selected proxy or upstream. Expiry before a non-gRPC
-                  response head answers `504`; expiry mid-body resets the
-                  HTTP/2 stream or closes the HTTP/1.1 connection; a gRPC
-                  request folds it into its RPC deadline and ends with
-                  `DEADLINE_EXCEEDED`. Expiry is charged to a backend's health
+                  response head answers `504` (with `X-Gateway-Error:
+                  request_timeout` when no backend held the request, otherwise
+                  `backend_timeout`); expiry mid-body resets the HTTP/2
+                  stream, closes the HTTP/1.1 connection, or resets the
+                  HTTP/3 stream with `H3_REQUEST_CANCELLED`; a gRPC request
+                  folds it into its RPC deadline and ends with
+                  `DEADLINE_EXCEEDED`. HTTP/1.1, HTTP/2 and native HTTP/3
+                  enforce it alike. Expiry is charged to a backend's health
                   only when that backend held the cancelled attempt; expiry
                   before the attempt was handed to a backend, in retry backoff,
-                  or after the response head is health-neutral. A non-gRPC
-                  request on the native HTTP/3 frontend is refused with `503`
-                  because that relay cannot yet enforce it, and HTTP/3 is not
-                  advertised (`Alt-Svc`) on any frontend port that serves a
-                  rule carrying this field. Upgraded WebSocket / CONNECT-UDP
-                  tunnels are not bounded by it. `0` is rejected; omit the field
-                  for no route deadline.
+                  or after the response head is health-neutral. Upgraded
+                  WebSocket / CONNECT-UDP tunnels are not bounded by it. `0` is
+                  rejected; omit the field for no route deadline.
+              attempt_timeout_ms:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 1
+                description: |
+                  Optional TOTAL bound on each backend attempt for this rule, in
+                  milliseconds (Gateway API
+                  `HTTPRoute.rules[].timeouts.backendRequest`, which the
+                  translator also projects as `timeout_ms`). The budget starts
+                  when the attempt is handed to the backend and covers its
+                  response head and its whole response body; every retry
+                  attempt gets a fresh budget, and `request_timeout_ms`, when
+                  set, still bounds the whole transaction. It is independent of
+                  `timeout_ms` / `timeout_disabled`, which keep bounding the
+                  header wait and the idle gap between frames. Expiry before a
+                  non-gRPC response head answers the ordinary backend-timeout
+                  `504` (retried when the rule's `retry` lists `504`); expiry
+                  after the head has been sent is never retried and cuts the
+                  body exactly like `request_timeout_ms` does (HTTP/2 stream
+                  reset, HTTP/1.1 connection close, HTTP/3
+                  `H3_REQUEST_CANCELLED` stream reset, health-neutral). A gRPC
+                  request folds it into its RPC deadline, anchored when the rule
+                  is selected and re-armed for each retry attempt, and ends with
+                  `DEADLINE_EXCEEDED`. HTTP/1.1, HTTP/2 and native HTTP/3
+                  enforce it alike. Request-scoped: it never changes the
+                  selected proxy or upstream. `0` is rejected; omit the field
+                  for no per-attempt total bound.
               retry:
                 oneOf:
                   - $ref: "#/components/schemas/MeshRouteRetryConfig"
                   - type: "null"
                 description: |
                   Optional route-local retry policy. Mutually exclusive with
-                  `retry_disabled: true`.
+                  `retry_disabled: true`. Request-scoped: it replaces the
+                  selected proxy's retry policy only for requests this rule
+                  matches. Istio `VirtualService.http[].retries` and Gateway
+                  API `HTTPRoute.rules[].retry` are projected here; the Gateway
+                  API translator emits `max_retries` = `attempts` (retries
+                  after the initial attempt), `retryable_status_codes` =
+                  `codes`, a `fixed` backoff of `backoff`, the default
+                  replay-safe `retryable_methods`, and
+                  `retry_on_connect_failure: true`. Backoff and every attempt
+                  stay inside the rule's `request_timeout_ms` budget.
               retry_disabled:
                 type: boolean
                 default: false
@@ -24142,8 +24921,10 @@ components:
                   disabled RTDS transformer is not eligible and does not
                   consume the list. `apply_route_overrides: true` lets an
                   auto-emitted empty-rules instance act as that eligible
-                  consumer. Validated at config load — CRLF in values and
-                  unknown operations are rejected.
+                  consumer. Validated at config load — CRLF in values,
+                  unknown operations, and `add`/`update` destinations in the
+                  gateway-owned `x-consumer-*` consumer assertion namespace are
+                  rejected.
                 items:
                   type: object
                   additionalProperties: false
@@ -26590,12 +27371,19 @@ components:
           minimum: 1
           maximum: 18446744073709551615
           description: Successful backend samples required before latency-based limit changes are applied.
+        baseline_window_samples:
+          type: integer
+          format: uint64
+          default: 1000
+          minimum: 1
+          maximum: 18446744073709551615
+          description: Healthy backend samples per latency-baseline window, counted per target key. The learned baseline is the minimum latency of the current and the previous window, so an unusually fast outlier stops tightening the latency target once two windows have closed after it (at most `2 × baseline_window_samples` healthy samples), and saturated healthy traffic can then regain capacity. A sustained latency increase is measured against the older, faster window and keeps shrinking the limit until that window rolls out; explicit backend failures always shrink it. Changing this value is a compatible reload that keeps learned state.
         target_latency_multiplier:
           type: number
           format: double
           default: 1.5
           exclusiveMinimum: 1
-          description: Target latency threshold as a multiple of the learned minimum observed backend latency.
+          description: Target latency threshold as a multiple of the learned windowed-minimum backend latency (see `baseline_window_samples`).
         decrease_ratio:
           type: number
           format: double
@@ -26982,7 +27770,10 @@ components:
             connection, transfer-encoding, keep-alive, proxy-authorization,
             proxy-connection, te, trailer, upgrade, expect, x-forwarded-for,
             x-forwarded-proto, x-forwarded-host,
-            x-ferrum-original-content-encoding, and x-grpc-web-mode.
+            x-ferrum-original-content-encoding, and x-grpc-web-mode. They also
+            reject every name in the gateway-owned `x-consumer-*` consumer
+            assertion namespace (including x-consumer-username and
+            x-consumer-custom-id); the error names the rule.
             Removal and rename sources remain allowed. Use preserve_host_header
             for Host or trusted-proxy configuration for forwarding identity.
         value:
@@ -27858,7 +28649,8 @@ components:
         Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family
         requests and optional responses. Fixed-shape objects reject unknown keys;
         intentionally open maps are rule_modes / rule_overrides (rule-id keys),
-        conditions.headers, and global_exemptions.header_present.
+        category_modes (built-in category keys, validated against the rule
+        pack), conditions.headers, and global_exemptions.header_present.
         On an upgraded WebSocket session the same body rule sets govern complete
         application messages: client-to-backend messages use the request body
         rules (request_inspection + request_body_inspection), backend-to-client
@@ -27883,10 +28675,11 @@ components:
             and inspection-surface toggles. Built-in rules are monitor-only
             unless opted in. Anomaly scoring, stream.tcp_require_tls,
             enforce-action stream.signatures that some runtime hook can apply
-            (inspect_tcp or inspect_udp), and on_body_too_large: block
-            (when a body inspection hook can run) each satisfy admission
-            without per-rule action: enforce. monitor with zero enforcing
-            rules remains valid. Every optional property of this schema also
+            (inspect_tcp or inspect_udp), on_body_too_large: block (when a
+            body inspection hook can run), and on_unlisted_content_type: block
+            (when some HTTP request body can be unlisted; see that property)
+            each satisfy admission without per-rule action: enforce. monitor
+            with zero enforcing rules remains valid. Every optional property of this schema also
             accepts an explicit null, which the runtime treats exactly as an
             omitted key and replaces with the documented default.
         default_rule_action:
@@ -27907,6 +28700,42 @@ components:
           minimum: 1
           maximum: 4
           default: 1
+        detection_paranoia_level:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 4
+          description: >-
+            Detection-only paranoia band. Defaults to paranoia_level (no band)
+            and must be at least paranoia_level. Rules whose paranoia_min is
+            above paranoia_level but within this level are compiled and
+            scanned as detection-only: always monitor whatever
+            default_rule_action or category_modes say, zero anomaly-score
+            contribution, never an enforcing body policy, and never an
+            admission enforcement path. Only an explicit rule_modes enforce
+            entry promotes a band rule to a normal enforcing rule, exactly as
+            it force-compiles a rule above this level;
+            rule_overrides.<id>.action: enforce does not. A band body
+            rule still turns on inspection of its body direction, so the
+            configuration-level on_body_too_large: block and
+            on_unlisted_content_type: block dispositions then apply to that
+            direction (deliberately fail-closed). Their hits are reported in
+            waf.detection_rule_hits and waf.detection_paranoia instead of
+            waf.rule_hits, and a request with only detection hits keeps
+            waf.action=clean.
+        category_modes:
+          type: [object, "null"]
+          additionalProperties:
+            type: string
+            enum:
+              [enforce, block, reject, monitor, log, warn, disabled, disable, "off"]
+          description: >-
+            Per-category action for built-in rules, keyed by rule-pack
+            category (for example sqli, xss, encoding_evasion). Precedence,
+            lowest first: default_rule_action, category_modes,
+            rule_overrides.action, rule_modes. Naming an opt-in category such
+            as encoding_evasion promotes its rules. Custom rules keep their own
+            action. A category no built-in rule carries is rejected. Values
+            accept the same aliases as default_rule_action.
         request_inspection:
           type: [boolean, "null"]
           default: true
@@ -28010,6 +28839,38 @@ components:
             directions, so an origin-encoded body is decoded before the cap is
             measured. fail_closed, scan_truncated, and skip do not satisfy that
             admission gate.
+        on_unlisted_content_type:
+          type: [string, "null"]
+          enum: [allow, fail_closed, block, null]
+          default: allow
+          description: >-
+            Disposition for a non-empty request body whose Content-Type is
+            outside the scan scope (not in body_content_types including the
+            +json/+xml suffix mapping, multipart while inspect_multipart is
+            off, or missing/unknown while inspect_binary_body is off). The
+            declared type is attacker-controlled and many backends parse a body
+            without consulting it. allow (default) forwards it uninspected;
+            fail_closed rejects it when an enforcing request-body policy
+            applies to the request; block rejects every such body while mode is
+            enforce. Scope: HTTP request bodies only (HTTP/1.1, HTTP/2, HTTP/3,
+            native gRPC, and gRPC-Web), and only on methods listed in
+            body_methods, on requests no global exemption short-circuits, and
+            when this instance's request-body hook runs (request_inspection and
+            request_body_inspection on, with an active request-body rule or
+            FE-ENCODING-001/002). Response bodies and WebSocket messages are
+            never governed by it. gRPC and gRPC-Web bodies are unlisted by
+            default, except the +json codecs (application/grpc+json,
+            application/grpc-web+json), which the suffix mapping scans as JSON.
+            A refusing configuration buffers the body and decides over the
+            finalized headers and actual bytes, so an empty body always passes
+            and the rejection (reject_status_code) arrives at end of stream.
+            Rejections set waf.block_reason=content_type and
+            waf.body_uninspected=content_type; recorded-but-allowed bodies set
+            waf.body_uninspected=content_type. Under mode enforce, block is a
+            reachable admission enforcement path when the request-body hook can
+            run (as above), body_methods is not empty, and at least one content
+            type is left unscanned (not both inspect_multipart and
+            inspect_binary_body); fail_closed is not.
         include_default_rules:
           type: [boolean, "null"]
           default: true
@@ -28027,14 +28888,21 @@ components:
               [enforce, block, reject, monitor, log, warn, disabled, disable, "off"]
           description: >-
             Per-rule action overrides keyed by rule id. Values accept the same
-            aliases as default_rule_action.
+            aliases as default_rule_action. Highest action precedence. An
+            enforce entry force-compiles the rule even above paranoia_level,
+            and promotes a detection-band rule to a normal enforcing rule.
         rule_overrides:
           type: [object, "null"]
           description: >-
             Per-rule tuning by rule id (built-in or custom): attach fp_filters,
             scope via conditions, raise/lower paranoia_min, change severity, or
             set action without forking the rule pack. Unknown rule ids and
-            unsupported fields are rejected.
+            unsupported fields are rejected. action sits below rule_modes and
+            above category_modes. rule_overrides.<id>.action sets the action of
+            a rule that is already enforced by level; only rule_modes: enforce
+            promotes a rule above paranoia_level (including a detection-band
+            rule), so an override's enforce leaves a band rule monitor-only and
+            a rule above detection_paranoia_level compiled out.
           additionalProperties:
             type: object
             additionalProperties: false
@@ -28060,6 +28928,58 @@ components:
                 items:
                   type: string
                   minLength: 1
+              exclude:
+                type: object
+                additionalProperties: false
+                description: >-
+                  Field exclusions: stop this one rule inspecting the named
+                  fields while it keeps inspecting every other field, and every
+                  other rule keeps inspecting these. query_params names are
+                  compared after one percent-decode (case-sensitive) and apply
+                  to query_keys, query_values, and full_url rules; a full_url
+                  match is re-verified against the URL rebuilt without the
+                  excluded pairs, and FE-HPP-001 drops them before comparing
+                  duplicates. headers are case-insensitive and apply to
+                  header_names, header_values, and response_headers rules.
+                  cookies are cookie names and apply to cookies rules. An
+                  exclusion that does not fit the rule's target, or one that
+                  names no field (an empty object, or only null or empty
+                  lists), is rejected. Query pairs are split on & only and
+                  cookies on ; only, so a backend that also splits on ; (query)
+                  or , (cookie) can read an excluded pair's value as a further
+                  field the excluding rule does not inspect.
+                properties:
+                  query_params:
+                    type: [array, "null"]
+                    items:
+                      type: string
+                      minLength: 1
+                  headers:
+                    type: [array, "null"]
+                    items:
+                      type: string
+                      minLength: 1
+                  cookies:
+                    type: [array, "null"]
+                    items:
+                      type: string
+                      minLength: 1
+                anyOf:
+                  - required: [query_params]
+                    properties:
+                      query_params:
+                        type: array
+                        minItems: 1
+                  - required: [headers]
+                    properties:
+                      headers:
+                        type: array
+                        minItems: 1
+                  - required: [cookies]
+                    properties:
+                      cookies:
+                        type: array
+                        minItems: 1
               conditions:
                 type: [object, "null"]
                 additionalProperties: false
@@ -28169,6 +29089,13 @@ components:
             type: string
             minLength: 1
           default: [POST, PUT, PATCH]
+          description: >-
+            HTTP methods whose request bodies are buffered and scanned, and
+            governed by on_unlisted_content_type. WebSocket messages ignore it.
+            An empty list turns off HTTP request-body scanning, so
+            on_unlisted_content_type: block no longer satisfies mode: enforce
+            admission; on_body_too_large: block still does while WebSocket
+            client messages can be inspected.
         body_content_types:
           type: [array, "null"]
           items:
@@ -32167,7 +33094,7 @@ components:
               format: uint
               minimum: 1
               default: 4096
-              description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow)."
+              description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow). The start of an event kept after a fail-open hold timeout forwarded it (see on_hold_timeout) counts toward the cap together with the rest of that event; when the two do not fit together, the rest of that event is uninspectable."
             overlap_bytes:
               type: integer
               format: uint
@@ -32205,7 +33132,7 @@ components:
             on_hold_timeout:
               type: string
               enum: [on_error, cut, forward]
-              description: "The effective default is on_error, but NO static schema default is advertised: the field is rejected outright unless streaming.max_hold_ms is also set, so tooling that materializes defaults must leave it unset. Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes) in mode=enforce and degrades to forward in mode=dry_run, which never cuts; forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
+              description: "The effective default is on_error, but NO static schema default is advertised: the field is rejected outright unless streaming.max_hold_ms is also set, so tooling that materializes defaults must leave it unset. Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then, when that partial event already carries data, passing its remainder through until the next event boundary, while a partial event with no data yet is kept to inspect the rest of that event with), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes) in mode=enforce and degrades to forward in mode=dry_run, which never cuts; forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
             enforcement:
               type: string
               enum: [block, detect]
@@ -32723,7 +33650,8 @@ components:
             URL-embedded userinfo is accepted but never disclosed:
             connection/health-check logs and non-admin/audit projections keep
             only the scheme, host, port, and database, replace the userinfo, and
-            remove query/fragment data. Full admin reads stay raw.
+            replace query/fragment data with `[REDACTED_QUERY]` and
+            `[REDACTED_FRAGMENT]` markers. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false
@@ -34451,7 +35379,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports OPT-IN MCP Streamable HTTP event streams (sessions.sse_multiplexing, default false). When enabled, GET with Accept text/event-stream attaches one generation-scoped server-message listener per live downstream session, and a POST carrying a JSON-RPC request whose result had to be fetched upstream is answered with its OWN text/event-stream response on that POST; a result the gateway already holds stays an application/json reply, 202 stays reserved for notification-only POSTs, and a freshly attached GET listener never carries a response to a request that arrived on a POST. Every aggregate JSON-RPC request with a representable id opens a bounded, type-sensitive request/stream identity preserving the exact numeric wire token before catalog refresh or upstream dispatch, so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed (its POST stream closes carrying no message). A GET listener is not a precondition, and the client's Accept decides the representation. Delivered events enter the single retained-event ring already delivered, so they only occupy the Last-Event-ID replay window: an explicit resumption cursor replays them, a fresh listener never does, and a ring too small to keep one costs resumability rather than delivery. Notifications, batch members, and initialize never open a stream. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed; mismatched or ambiguous correlated responses are replaced by a bounded gateway -32603 error that carries the request's own JSON-RPC id token so the pending call still resolves, and are never framed as that request's event stream or returned as successful inline answers (the id comparison is byte-exact; mcp.sse.delivery records refused). Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint.path scopes, and endpoint.path may not be \"/\", because the endpoint reserves its whole path subtree. A client JSON-RPC id token reflected into a gateway-authored singleton response is bounded at 4096 wire bytes; a larger id is refused with a fixed -32600 that does not echo it. The admitted singleton id is retained privately so a gateway-authored terminal decided in a response phase (result validation, an uninspectable or oversized upstream representation, an upstream transport failure) names the request it answers instead of returning id null. Every response phase is instance-scoped: an instance acts on a response only for a request it admitted itself, so instances with disjoint endpoint scopes on one proxy never apply each other's response policies. Unknown keys are rejected at the root and in every fixed-shape object here; the operator-defined servers.* and policy.tools.* key sets stay open. Rules this schema deliberately leaves to plugin load, because portable JSON Schema cannot compare sibling values or resolve external state: endpoint.path canonicalization beyond the shape checked here, HTTP header-name destinations that are protocol-managed, upstream_url host egress screening, namespace uniqueness, at-least-one-enabled-server (exactly one in transparent_proxy, at least one exposing a family in aggregate_router), max_batch_item_bytes <= max_batch_bytes, and the sse_* budget relationships."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports OPT-IN MCP Streamable HTTP event streams (sessions.sse_multiplexing, default false). When enabled, GET with Accept text/event-stream attaches one generation-scoped server-message listener per live downstream session, and a POST carrying a JSON-RPC request whose result had to be fetched upstream is answered with its OWN text/event-stream response on that POST; a result the gateway already holds stays an application/json reply, 202 stays reserved for notification-only POSTs, and a freshly attached GET listener never carries a response to a request that arrived on a POST. Every aggregate JSON-RPC request with a representable id opens a bounded, type-sensitive request/stream identity preserving the exact numeric wire token before catalog refresh or upstream dispatch, so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed (its POST stream closes carrying no message). A GET listener is not a precondition, and the client's Accept decides the representation. Delivered events enter the single retained-event ring already delivered, so they only occupy the Last-Event-ID replay window: an explicit resumption cursor replays them, a fresh listener never does, and a ring too small to keep one costs resumability rather than delivery. Notifications, batch members, and initialize never open a stream. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed; mismatched or ambiguous correlated responses are replaced by a bounded gateway -32603 error that carries the request's own JSON-RPC id token so the pending call still resolves, and are never framed as that request's event stream or returned as successful inline answers (the id comparison is byte-exact; mcp.sse.delivery records refused). Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. A servers entry may instead carry `openapi` (aggregate_router only): tools generated from OpenAPI operations that run as HTTP requests to this proxy's own configured backend through ordinary backend dispatch, answered with tools/call results (see McpGatewayOpenApiBridge); POST /api-specs generates such a gateway from the `x-ferrum-mcp` document extension. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Aggregate admission is re-checked over the final backend-visible request body: a routed tools/call, prompts/get, resources/read, or passthrough message whose JSON-RPC message kind, method (or, for a client-sent response, answered id), selected upstream destination, mediated upstream session header, tool/prompt name, resource URI, or admitted arguments were changed by a later plugin (including a later mesh_route_dispatch destination rewrite) (for example a request_transformer body rule) is refused before egress with JSON-RPC -32014; the gateway's own public-to-upstream name rewrite is the only permitted difference, and the check holds on HTTP/1.1, HTTP/2, and HTTP/3. The mediated upstream session header is also re-asserted over the final backend headers (every spelling removed, the recorded value re-inserted), including after a serverless_function pre_proxy header overlay, and a JSON-RPC envelope carrying both method and result or error is refused with -32600. A downstream aggregate session is bound to the principal that created it: a mapped Consumer by namespace and record id, or an unmapped external identity by its subject together with the verified authentication realm (mechanism and issuer / key source / directory), so equal subject strings from different accepted issuers, tenants of an issuer-less jwks_auth provider, identity claims, or auth plugins are different owners, and changing the verifying authority configuration ends existing external-identity sessions; a mismatch is refused with the ordinary 404 session-not-found response. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint.path scopes, and endpoint.path may not be \"/\", because the endpoint reserves its whole path subtree. A client JSON-RPC id token reflected into a gateway-authored singleton response is bounded at 4096 wire bytes; a larger id is refused with a fixed -32600 that does not echo it. The admitted singleton id is retained privately so a gateway-authored terminal decided in a response phase (result validation, an uninspectable or oversized upstream representation, an upstream transport failure) names the request it answers instead of returning id null. Every response phase is instance-scoped: an instance acts on a response only for a request it admitted itself, so instances with disjoint endpoint scopes on one proxy never apply each other's response policies. Unknown keys are rejected at the root and in every fixed-shape object here; the operator-defined servers.* and policy.tools.* key sets stay open. Rules this schema deliberately leaves to plugin load, because portable JSON Schema cannot compare sibling values or resolve external state: endpoint.path canonicalization beyond the shape checked here, the 512 distinct policy.tools grant groups cap, allowed_groups/denied_groups overlap, the 255-byte grant group bound, a group-conditioned policy.tools key naming a configured server namespace, HTTP header-name destinations that are protocol-managed, upstream_url host egress screening, namespace uniqueness, at-least-one-enabled-server (exactly one in transparent_proxy, at least one exposing a family in aggregate_router), max_batch_item_bytes <= max_batch_bytes, and the sse_* budget relationships."
       additionalProperties: false
       allOf:
         - if:
@@ -34486,6 +35414,11 @@ components:
                   validate_tool_results:
                     not:
                       const: true
+              # An OpenAPI bridge server has no MCP upstream to forward to.
+              servers:
+                additionalProperties:
+                  not:
+                    required: [openapi]
         # aggregate_router advertises no capability it cannot dispatch:
         # advertise_logging / advertise_completions / advertise_tasks have no
         # dedicated handler, so each requires passthrough_unknown_methods.
@@ -34593,6 +35526,9 @@ components:
               minLength: 1
               pattern: '^[!#$%&*+\-.^_`|~0-9A-Za-z]+$'
               default: mcp-session-id
+              not:
+                type: string
+                pattern: '^[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]'
               description: >-
                 Must be a valid HTTP header name; rejected at config validation
                 otherwise. This name is stamped onto the client response, so
@@ -34600,13 +35536,22 @@ components:
                 (`connection`, `content-length`, `keep-alive`,
                 `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
                 `transfer-encoding`, `upgrade`, case-insensitive) are also
-                rejected.
+                rejected. Names in the gateway-owned `x-consumer-*` request
+                namespace (case-insensitive, `_` equivalent to `-`) are
+                rejected because the gateway strips them from client requests.
             upstream_session_header:
               type: [string, "null"]
               minLength: 1
               pattern: '^[!#$%&*+\-.^_`|~0-9A-Za-z]+$'
               default: mcp-session-id
-              description: Must be a valid HTTP header name; rejected at config validation otherwise.
+              not:
+                type: string
+                pattern: '^[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]'
+              description: >-
+                Must be a valid HTTP header name; rejected at config validation
+                otherwise. Names in the gateway-owned `x-consumer-*` request
+                namespace (case-insensitive, `_` equivalent to `-`) are
+                rejected because the gateway scrubs them before dispatch.
             initialize_upstreams:
               type: [string, "null"]
               enum: [lazy, startup, passthrough, null]
@@ -34749,12 +35694,15 @@ components:
             advertise_tools:
               type: [boolean, "null"]
               default: true
+              description: Advertises the tools capability in the synthetic aggregate initialize result, with listChanged false because the gateway does not emit notifications/tools/list_changed.
             advertise_resources:
               type: [boolean, "null"]
               default: true
+              description: Advertises the resources capability in the synthetic aggregate initialize result, with listChanged false because the gateway does not emit notifications/resources/list_changed.
             advertise_prompts:
               type: [boolean, "null"]
               default: true
+              description: Advertises the prompts capability in the synthetic aggregate initialize result, with listChanged false because the gateway does not emit notifications/prompts/list_changed.
             advertise_logging:
               type: [boolean, "null"]
               default: false
@@ -34779,14 +35727,38 @@ components:
           additionalProperties:
             type: object
             additionalProperties: false
-            required: [upstream_url, namespace]
+            required: [namespace]
             description: >-
-              Claude-Desktop-style stdio spawn fields (command, args, stdio) are
-              rejected here: mcp_gateway is HTTP-only and never spawns a process.
-              "At least one enabled server", "exactly one enabled server in
-              transparent_proxy", "at least one enabled server exposing a family
-              in aggregate_router", and namespace uniqueness compare sibling
-              entries and are enforced at plugin load.
+              A server is EITHER an HTTP MCP server (upstream_url) OR an OpenAPI
+              bridge (openapi) whose tools are generated from OpenAPI operations
+              and executed as HTTP requests to this proxy's own backend; exactly
+              one of the two is required. Claude-Desktop-style stdio spawn fields
+              (command, args, stdio) are rejected here: mcp_gateway is HTTP-only
+              and never spawns a process. "At least one enabled server",
+              "exactly one enabled server in transparent_proxy", "at least one
+              enabled server exposing a family in aggregate_router", namespace
+              uniqueness, "passthrough_unknown_methods requires an upstream_url
+              server", and "no OpenAPI header parameter may be named after a
+              session header" compare sibling entries and are enforced at plugin
+              load.
+            oneOf:
+              - required: [upstream_url]
+                not:
+                  required: [openapi]
+              - required: [openapi]
+                not:
+                  required: [upstream_url]
+                properties:
+                  # An OpenAPI bridge publishes tools only and has no MCP
+                  # upstream session to initialize.
+                  expose_resources:
+                    not:
+                      const: true
+                  expose_prompts:
+                    not:
+                      const: true
+                  initialize_strategy:
+                    type: "null"
             properties:
               upstream_url:
                 type: string
@@ -34820,6 +35792,8 @@ components:
                 type: [string, "null"]
                 enum: [lazy, startup, passthrough, null]
                 description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
+              openapi:
+                $ref: "#/components/schemas/McpGatewayOpenApiBridge"
         policy:
           type: [object, "null"]
           additionalProperties: false
@@ -34834,7 +35808,7 @@ components:
               default: true
             tools:
               type: [object, "null"]
-              description: Public namespaced tool name to policy. The key set is operator-defined, so this map stays open; each entry is a closed object.
+              description: Public namespaced tool name to policy. The key set is operator-defined, so this map stays open; each entry is a closed object. An allow entry may carry a per-consumer grant through allowed_groups and denied_groups, matched against the request Consumer's acl_groups as read from the live configuration on every request. A tool is granted iff its action is allow, the request carries a gateway-mapped Consumer, that Consumer holds none of denied_groups (which takes precedence), and allowed_groups is absent or the Consumer holds at least one of its groups. A request with no mapped Consumer (an anonymous proxy, or an external identity with no Consumer mapping) is never granted a group-conditioned tool. An ungranted tool is omitted from tools/list whatever hide_denied_tools says, and tools/call answers it with JSON-RPC -32001; once any entry carries a group condition, a tools/call naming an unknown tool answers the same -32001 instead of -32003 so hidden tool names cannot be probed. The grant is re-decided in the final request-body hook after the admission re-check. Grants cover tools/list and tools/call only; prompts/get, resources/read, and passthrough methods (including tasks/*) are not grant-checked. A group-conditioned key must be a configured server's namespace (enabled or not, exposing tools or not) followed by discovery.namespace_separator and a tool name. At most 512 distinct group names may be referenced across the whole map, and one entry may not name the same group in both lists. Those rules compare values across the configuration and are enforced at plugin load; pair grants with default_action deny and discovery.on_new_tool hide_until_configured.
               additionalProperties:
                 type: object
                 additionalProperties: false
@@ -34843,6 +35817,41 @@ components:
                   action:
                     type: string
                     enum: [allow, deny, hide_from_discovery]
+                  allowed_groups:
+                    type: [array, "null"]
+                    minItems: 1
+                    maxItems: 512
+                    description: Requires action allow. The Consumer must hold at least one of these acl_groups. Omitting it (or null) drops only the allowed-group requirement; a mapped Consumer is still required whenever denied_groups is present. An empty list is rejected. Entries are matched byte-for-byte, must not contain control characters other than tab, LF, and CR, and are at most 255 bytes (the schema bounds code points; the byte bound is enforced at plugin load, as for Consumer acl_groups).
+                    items:
+                      type: string
+                      minLength: 1
+                      maxLength: 255
+                      pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                      not:
+                        pattern: '[\u0000-\u0008\u000B\u000C\u000E-\u001F]'
+                  denied_groups:
+                    type: [array, "null"]
+                    minItems: 1
+                    maxItems: 512
+                    description: Requires action allow. A Consumer holding any of these acl_groups is not granted the tool, even when it also holds an allowed group; with no allowed_groups it grants every mapped Consumer except these, and never a request without a mapped Consumer. An empty list is rejected. Entries follow the allowed_groups entry rules.
+                    items:
+                      type: string
+                      minLength: 1
+                      maxLength: 255
+                      pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                      not:
+                        pattern: '[\u0000-\u0008\u000B\u000C\u000E-\u001F]'
+                if:
+                  properties:
+                    action:
+                      not:
+                        const: allow
+                then:
+                  properties:
+                    allowed_groups:
+                      type: "null"
+                    denied_groups:
+                      type: "null"
         validation:
           type: [object, "null"]
           additionalProperties: false
@@ -34931,6 +35940,202 @@ components:
               type: [boolean, "null"]
               default: true
               description: Emits mcp.arguments_hash. Evaluated independently of validation.validate_tool_arguments.
+
+    McpGatewayOpenApiBridge:
+      type: object
+      additionalProperties: false
+      required: [operations]
+      description: >-
+        mcp_gateway OpenAPI bridge server (aggregate_router only). Each
+        operation is published as one MCP tool named `namespace` +
+        discovery.namespace_separator + `name`, entering the same per-session
+        catalog, policy (allow / deny / hide_from_discovery), discovery gates,
+        per-consumer grants, validation.validate_tool_arguments, and mcp.*
+        metadata as a tool listed by an upstream MCP server. A tools/call runs
+        as an HTTP request to THIS proxy's own configured backend through
+        ordinary backend dispatch (upstreams, retries, circuit breaker, TLS,
+        observability): only the backend method, path, query, headers, and body
+        change, never the destination host, scheme, or port, and no URL from an
+        OpenAPI document is ever dialed. The proxy's allowed_methods applies to
+        the bridged method too (a call whose method the route does not allow is
+        refused with JSON-RPC -32001), but method- or path-conditioned plugin
+        triggers, WAF path and method rules, and authorization keyed on the
+        request path see the client's POST to the MCP endpoint, never the
+        bridged method and path; restrict a bridged operation through
+        mcp_gateway policy (deny, hide_from_discovery, per-consumer grants).
+        Client request headers are an allowlist: only user-agent,
+        accept-language, traceparent, tracestate, the gateway's correlation
+        header, and forward_request_headers reach the backend. The response
+        becomes a tools/call result: a 2xx is isError false with the body as
+        text content plus structuredContent when it is a JSON object within
+        max_structured_content_bytes, and a 2xx body the bridge cannot return
+        (past a bound, coded, streamed, partial, ambiguous JSON) is omitted
+        with a note, still isError false. Anything else is isError true with
+        the status line and at most max_error_excerpt_bytes of the body; a
+        gateway or dispatch failure carries its gateway-error class, derived
+        from the dispatch outcome, in the status line. The JSON-RPC answer
+        always rides HTTP 200 (status-code metrics and the wire X-Gateway-Error
+        header reflect that 200); the backend status and failure class are
+        always recorded as mcp.bridge.upstream_status and
+        mcp.bridge.gateway_error. Generated by `x-ferrum-mcp` on POST
+        /api-specs, or written by hand.
+      properties:
+        operations:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/McpGatewayOpenApiOperation"
+        max_request_body_bytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          maximum: 16777216
+          default: 1048576
+          description: Largest JSON request body a tools/call may send; a larger `body` argument is refused with JSON-RPC -32602.
+        max_response_body_bytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          maximum: 16777216
+          default: 1048576
+          description: Largest 2xx backend body returned as a tool result. A larger declared or received body is omitted (the result stays isError false and says why) and is never copied into the response.
+        max_error_excerpt_bytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          maximum: 65536
+          default: 2048
+          description: Bytes of a non-2xx backend body quoted in the isError result (cut at a UTF-8 boundary, with a truncation note).
+        max_structured_content_bytes:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          maximum: 16777216
+          default: 262144
+          description: Largest JSON object returned as structuredContent. A larger JSON body is checked before parsing and returned as text content only, with a note (isError false), never truncated.
+        forward_request_headers:
+          type: [array, "null"]
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+          description: Client request headers forwarded to the backend on top of the fixed user-agent, accept-language, traceparent, and tracestate set (plus the gateway's own correlation header). Every other client header is dropped. A reserved name (hop-by-hop, Host, Authorization, Cookie, Range, If-Range, method or URL override families, trace baggage, client-address attribution, MCP transport, the MCP session headers, FERRUM_REAL_IP_HEADER, or a Ferrum-internal field) is refused. Add backend credentials with request_transformer, which runs after mcp_gateway.
+    McpGatewayOpenApiOperation:
+      type: object
+      additionalProperties: false
+      required: [name, method, path]
+      description: >-
+        One bridged operation. The generated tool's inputSchema is a closed
+        object: one property per parameter (keyed by its name) plus `body` for
+        a JSON request body. Serialized tool definitions are bounded at 256 KiB
+        and their schemas by the same depth, node, and local-reference budgets
+        as a discovered outputSchema.
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,128}$'
+          description: Upstream tool name (unique within the server); the public name is namespaced.
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE]
+          description: Backend HTTP method. HEAD, OPTIONS, TRACE, and CONNECT are not bridged.
+        path:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          pattern: '^/'
+          not:
+            pattern: '[?#%\\]|(^|/)\.\.?($|/)'
+          description: >-
+            The operation's PUBLIC request path on this proxy (listen path
+            included), with `{name}` path parameters each occupying a whole
+            segment. It is mapped onto the backend exactly as a direct request
+            to that path would be (strip_listen_path, backend_path). Path
+            arguments are percent-encoded per segment and the result must be a
+            canonical policy path, so an argument can never add `/`, a dot
+            segment, `?`, or `#`.
+        title:
+          type: [string, "null"]
+          maxLength: 8192
+        description:
+          type: [string, "null"]
+          maxLength: 8192
+        parameters:
+          type: [array, "null"]
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/McpGatewayOpenApiParameter"
+        request_body:
+          type: [object, "null"]
+          additionalProperties: false
+          description: A JSON request body, carried by the tools/call argument `body`.
+          properties:
+            required:
+              type: [boolean, "null"]
+              default: false
+            description:
+              type: [string, "null"]
+              maxLength: 8192
+            schema:
+              type: [object, boolean, "null"]
+        output_schema:
+          description: Published as the tool's outputSchema; must describe an object, because structuredContent is a JSON object.
+          anyOf:
+            - type: "null"
+            - type: object
+              required: [type]
+              properties:
+                type:
+                  const: object
+        annotations:
+          type: [object, "null"]
+          additionalProperties: false
+          description: Overrides the method-derived hints (readOnlyHint for GET, destructiveHint for DELETE, idempotentHint for PUT).
+          properties:
+            title:
+              type: string
+              maxLength: 8192
+            readOnlyHint:
+              type: boolean
+            destructiveHint:
+              type: boolean
+            idempotentHint:
+              type: boolean
+            openWorldHint:
+              type: boolean
+    McpGatewayOpenApiParameter:
+      type: object
+      additionalProperties: false
+      required: [name, in]
+      description: >-
+        A path, query, or header parameter. Query arrays are sent exploded and
+        form-encoded; header arrays comma-joined. Object-typed parameters, cookie
+        parameters, and array path parameters are rejected. A header parameter
+        may never name a hop-by-hop field, Host, Authorization, Cookie, Proxy-*,
+        X-Forwarded-*, Forwarded, an MCP transport field (Mcp-*, Last-Event-ID,
+        the configured session headers), or a Ferrum-internal field (X-Ferrum-*,
+        Ferrum-*, X-Gateway-*, X-Consumer-*), compared case-insensitively with
+        `_` treated as `-`; the plugin refuses such a configuration at load and
+        again when a call is built.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        in:
+          type: string
+          enum: [path, query, header]
+        required:
+          type: [boolean, "null"]
+          default: false
+          description: Path parameters are always required.
+        description:
+          type: [string, "null"]
+          maxLength: 8192
+        schema:
+          type: [object, "null"]
+          description: JSON Schema of the argument; omitted means a string.
 
     ApiChargebackRenderSchema:
       description: >-
@@ -36583,7 +37788,10 @@ components:
           minLength: 1
           pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: "Idempotency-Key"
-          description: Request header name containing the deduplication key. Must be a valid RFC 9110 HTTP field-name token.
+          not:
+            type: string
+            pattern: "^[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]"
+          description: Request header name containing the deduplication key. Must be a valid RFC 9110 HTTP field-name token. Names in the gateway-owned x-consumer-* request namespace (case-insensitive, `_` equivalent to `-`) are rejected at config load, because the gateway strips them from every client request and no request could carry the key.
         ttl_seconds:
           type: integer
           minimum: 1
@@ -37220,6 +38428,246 @@ components:
             class preserves that classification instead of downgrading
             it (the record is then intentionally stale).
 
+    DiagnosticRefLookup:
+      type: object
+      description: |
+        Versioned diagnostic reference detail (`schema_version`
+        `ferrum.diagnostic_ref.v1`). Additive fields may appear within a
+        schema version; a breaking change bumps it.
+      required:
+        - schema_version
+        - ref
+        - namespace
+        - created_at
+        - expires_at
+        - protocol
+        - status
+        - gateway_error
+        - detail_available
+        - detail
+      properties:
+        schema_version:
+          type: string
+          enum: [ferrum.diagnostic_ref.v1]
+        ref:
+          type: string
+          pattern: "^(fd1_[0-9a-f]{32}|fd2_[0-9a-f]{8}_[0-9a-f]{32})$"
+          description: The resolved reference.
+        replica_id:
+          type: string
+          pattern: "^[0-9a-f]{8}$"
+          description: |
+            Replica id of the gateway process that minted a replica-tagged
+            (`fd2_`) reference (`FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true`).
+            Absent for `fd1_` references.
+        namespace:
+          type: string
+          description: Data-plane namespace of the gateway that minted the reference.
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: When the reference stops resolving (earlier if evicted).
+        protocol:
+          type: string
+          enum: [http1, http2, http3]
+          description: Client-facing protocol of the response that carried the reference.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: Client-visible HTTP status of that response.
+        gateway_error:
+          type: [string, "null"]
+          enum:
+            - connection_failure
+            - backend_timeout
+            - backend_error
+            - circuit_breaker_open
+            - overload
+            - config_stale
+            - concurrency_limit
+            - request_timeout
+            - null
+          description: |
+            The public `X-Gateway-Error` token of that response, or `null` for
+            an `all`-mode reference on a gateway rejection that carries no
+            token.
+        detail_available:
+          type: boolean
+          description: |
+            `false` until the request's terminal transaction record exists (a
+            streamed response records it when its body ends), and, in `errors`
+            mode, for the gateway admission fences (overload, stale
+            configuration) that answer before a request context exists. In
+            `all` mode those fences and routing `404`s record their detail
+            before the response is written.
+        detail:
+          oneOf:
+            - $ref: "#/components/schemas/DiagnosticRefDetail"
+            - type: "null"
+    DiagnosticRefDetail:
+      type: object
+      description: |
+        Operator-only detail copied from the request's terminal transaction
+        record. Every string is a closed vocabulary or operator configuration.
+      required:
+        - error_class
+        - body_error_class
+        - rejection_phase
+        - route_timeout_phase
+        - backend_dispatch
+        - proxy_id
+        - backend_target
+        - duration_bucket
+      properties:
+        error_class:
+          type: [string, "null"]
+          description: |
+            Granular backend dispatch classification, as the access log names
+            it (for example `dns_lookup_error`, `connection_refused`,
+            `tls_error`, `read_write_timeout`).
+        body_error_class:
+          type: [string, "null"]
+          description: Classification of a failure while streaming the response body.
+        rejection_phase:
+          type: [string, "null"]
+          enum:
+            - circuit_breaker_open
+            - concurrency_limit
+            - overload
+            - config_stale
+            - null
+          description: Gateway rejection phase, when the gateway refused the request itself.
+        route_timeout_phase:
+          type: [string, "null"]
+          enum: [before_dispatch, dispatch, retry_backoff, null]
+          description: Phase of a route rule's total request deadline that produced a `504`.
+        backend_dispatch:
+          type: string
+          enum: [not_dispatched, pre_wire_failure, ambiguous_failure, backend_response]
+          description: Whether and how far the request reached a backend.
+        proxy_id:
+          type: [string, "null"]
+          description: ID of the matched proxy.
+        backend_target:
+          type: [string, "null"]
+          description: |
+            Backend origin (`scheme://host:port`) the request was dispatched
+            to. Userinfo, path, query, and fragment are removed.
+        duration_bucket:
+          type: string
+          enum: [lt_10ms, lt_100ms, lt_1s, lt_10s, ge_10s, unknown]
+          description: Coarse total request duration.
+        rejection:
+          $ref: "#/components/schemas/DiagnosticRefRejection"
+        attempts:
+          type: array
+          maxItems: 8
+          description: |
+            Every backend attempt the request made, in dispatch order: one for
+            each attempt a retry replaced and one for the attempt whose outcome
+            the client saw (issue #5846). At most 8 are listed; later ones are
+            counted in `attempts_omitted`. Absent when no backend was
+            attempted.
+          items:
+            $ref: "#/components/schemas/DiagnosticRefAttempt"
+        attempts_omitted:
+          type: integer
+          minimum: 1
+          description: Attempts made beyond the 8 listed. Absent when none were.
+    DiagnosticRefRejection:
+      type: object
+      description: |
+        The gateway policy or plugin that rejected the request (issue #5846).
+        Absent for a backend dispatch outcome. Every value is a compiled-in
+        label or a plugin type name, never request material.
+      required: [source, phase]
+      properties:
+        source:
+          type: string
+          enum: [plugin, gateway, routing]
+          description: |
+            `plugin` for a plugin hook rejection (authentication,
+            authorization, rate limiting, request validation, ...), `gateway`
+            for a gateway policy fence (allowed methods, connection limits,
+            circuit breaker, admission fences), `routing` for a request no
+            route matched.
+        phase:
+          type: string
+          maxLength: 64
+          description: |
+            Rejection phase or policy, for example `on_request_received`,
+            `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+            `websocket_connection_limit`, `overload`, `route_not_found`, or
+            `mesh_registry_only`. Always one of the gateway's compiled-in
+            phase labels; any other phase is reported as `other`.
+        plugin:
+          type: string
+          maxLength: 64
+          description: |
+            Name of the rejecting plugin, when the phase that rejected knows
+            it. Absent otherwise.
+    DiagnosticRefAttempt:
+      type: object
+      description: One backend attempt of the request (issue #5846).
+      required: [attempt, backend_dispatch]
+      properties:
+        attempt:
+          type: integer
+          minimum: 1
+          description: 1-based attempt number; `1` is the first dispatch.
+        backend_dispatch:
+          type: string
+          enum: [pre_wire_failure, ambiguous_failure, backend_response]
+          description: How far this attempt reached the backend.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: The backend's HTTP status. Present only for a `backend_response` attempt.
+        error_class:
+          type: string
+          description: Granular classification of a failed attempt (for example `tls_error`).
+        tls:
+          $ref: "#/components/schemas/DiagnosticRefTlsDetail"
+    DiagnosticRefTlsDetail:
+      type: object
+      description: |
+        Closed description of a backend TLS failure, taken from the typed TLS
+        error, on a `tls_error` attempt when it was available. Certificate
+        contents, names, and times are never included.
+      required: [failure]
+      properties:
+        failure:
+          type: string
+          enum:
+            - certificate_verification
+            - alert_received
+            - no_certificates_presented
+            - peer_incompatible
+            - peer_misbehaved
+            - invalid_message
+            - unexpected_message
+            - decrypt_error
+            - no_application_protocol
+            - invalid_crl
+            - other
+        reason:
+          type: string
+          description: |
+            For `certificate_verification`, the verification reason
+            (`expired`, `not_valid_yet`, `unknown_issuer`, `bad_signature`,
+            `not_valid_for_name`, `revoked`, `invalid_purpose`,
+            `unsupported_signature_algorithm`, `bad_encoding`,
+            `unhandled_critical_extension`, `unknown_revocation_status`,
+            `expired_revocation_list`, `invalid_ocsp_response`,
+            `application_verification_failure`, or `other`). For
+            `alert_received`, the TLS alert in snake case (`unknown_ca`,
+            `handshake_failure`, `bad_certificate`, `certificate_required`,
+            ..., or `other`). Absent for other failures.
     BackendCapabilitiesResponse:
       type: object
       required: [entries]

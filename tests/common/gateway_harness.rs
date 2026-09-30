@@ -518,6 +518,18 @@ impl GatewayChildGuard {
         }
     }
 
+    /// Raw captured stderr + stdout, stderr first. Empty when the guard was
+    /// built with [`GatewayChildGuard::new`], which captures nothing.
+    ///
+    /// Unscrubbed, so it is for matching log lines only. Print
+    /// [`startup_diagnostics`](Self::startup_diagnostics) instead.
+    pub fn read_captured_output(&self) -> std::io::Result<String> {
+        match &self.startup_output {
+            Some(output) => output.read_combined(),
+            None => Ok(String::new()),
+        }
+    }
+
     /// Borrow the child for readiness probes (`try_wait`) and log reads.
     pub fn child_mut(&mut self) -> &mut Child {
         self.child
@@ -604,6 +616,22 @@ impl GatewayStartupOutput {
             ports,
             secrets,
         })
+    }
+
+    fn read_combined(&self) -> std::io::Result<String> {
+        let read = |stream: &str| -> std::io::Result<String> {
+            let bytes = std::fs::read(self.directory.path().join(stream))?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let mut combined = read("stderr")?;
+        let stdout = read("stdout")?;
+        if !stdout.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stdout);
+        }
+        Ok(combined)
     }
 
     fn diagnostics(&self) -> String {
@@ -1695,6 +1723,15 @@ async fn build_env(
     env.insert(
         "FERRUM_BASIC_AUTH_HMAC_SECRET".into(),
         b.basic_auth_hmac_secret.clone(),
+    );
+    // The gateway binary resolves an unconfigured managed-TLS store to
+    // `./ferrum-managed-tls` in its working directory, which for a spawned
+    // test gateway is the repository checkout (issue #5706). Keep the store
+    // and its TLS event log in this attempt's temp dir; `.env(..)` still wins.
+    let managed_tls_dir = temp.path().join("managed-tls");
+    env.insert(
+        "FERRUM_TLS_MANAGED_STORE_PATH".into(),
+        managed_tls_dir.to_string_lossy().into_owned(),
     );
     // Presenting this token unlocks the authenticated detail tier of `/health`
     // for readiness. Ownership still requires the JWT on `GET /proxies`

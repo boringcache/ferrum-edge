@@ -108,7 +108,8 @@ pub struct SseParse {
 
 /// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
 ///
-/// Iterates lines, strips the `data: ` (or `data:`) prefix, skips empty data,
+/// Consumes leading UTF-8 BOMs, splits lines on CRLF, LF, or CR, skips
+/// comments, strips the `data: ` (or `data:`) prefix, skips empty data,
 /// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
 /// parsed frames in order. Returns an empty `Vec` if the body is not valid
 /// UTF-8 — callers receive no JSON frames but no error either. Use
@@ -172,8 +173,9 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
         }
     }
 
-    for raw_line in body_str.lines() {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    let body_str = strip_sse_boms(body_str);
+
+    for line in sse_lines(body_str) {
         if line.is_empty() {
             flush_event(
                 &mut event_name,
@@ -185,20 +187,22 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
             continue;
         }
 
-        // Per the WHATWG spec the last `event:` field of an event wins.
-        if let Some(rest) = line.strip_prefix("event:") {
-            event_name = Some(SseEventName::from_name(rest.trim()));
+        // A line starting with `:` is a comment.
+        if line.starts_with(':') {
             continue;
         }
-
-        let data = if let Some(rest) = line.strip_prefix("data: ") {
-            rest
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            rest
-        } else {
-            continue;
+        // Field name up to the first `:`, value after it minus one optional
+        // leading space. A line with no `:` is a field with an empty value.
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
         };
-        event_data.push(data);
+        match field {
+            // Per the WHATWG spec the last `event:` field of an event wins.
+            "event" => event_name = Some(SseEventName::from_name(value.trim())),
+            "data" => event_data.push(value),
+            _ => {}
+        }
     }
     flush_event(
         &mut event_name,
@@ -212,6 +216,247 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
         frames,
         events,
         fully_parsed,
+    }
+}
+
+/// Drop every leading U+FEFF from an event-stream body.
+///
+/// The WHATWG decoder consumes one BOM, but stacked decoding stages may each
+/// consume one, so all leading BOMs are stripped: a second BOM left in place
+/// would hide the first event from inspection while a client still decodes it.
+/// Every SSE inspection and rewrite path applies this same policy.
+pub fn strip_sse_boms(body: &str) -> &str {
+    body.trim_start_matches('\u{feff}')
+}
+
+/// Split an event-stream body into lines on every WHATWG end-of-line form:
+/// CRLF, a lone LF, or a lone CR (mixed freely within one stream). Unlike
+/// [`str::lines`], a lone CR terminates a line instead of staying inside it. A
+/// final unterminated line is still yielded; no trailing empty line follows a
+/// final terminator. Borrows from `body`, so splitting allocates nothing.
+///
+/// This does not strip a BOM; callers splitting a whole body apply
+/// [`strip_sse_boms`] first.
+pub fn sse_lines(body: &str) -> impl Iterator<Item = &str> {
+    sse_lines_inclusive(body).map(|line| split_sse_line_terminator(line).0)
+}
+
+/// Like [`sse_lines`], but each yielded line keeps its own terminator (`"\r\n"`,
+/// `"\n"`, or `"\r"`), so concatenating the lines reproduces `body` exactly.
+/// Rewriters use this to preserve the original framing byte-for-byte; use
+/// [`split_sse_line_terminator`] to separate a line from its terminator.
+pub fn sse_lines_inclusive(body: &str) -> impl Iterator<Item = &str> {
+    let bytes = body.as_bytes();
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        if pos >= bytes.len() {
+            return None;
+        }
+        let start = pos;
+        pos = match sse_line_end(&bytes[start..]) {
+            Some((_, next)) => start + next,
+            None => bytes.len(),
+        };
+        // CR and LF are ASCII, so `start..pos` lies on char boundaries.
+        Some(&body[start..pos])
+    })
+}
+
+/// Find the first line terminator in `bytes`: returns the index where it starts
+/// (the end of the line's content) and the index just past it. CRLF is one
+/// terminator; a lone CR or LF is one byte. A CR that is the final byte of
+/// `bytes` is reported as a lone CR, so a caller splitting a stream chunk by
+/// chunk must treat an LF that starts the next chunk as the rest of that CRLF.
+/// Works on raw bytes, so a chunk may end inside a UTF-8 sequence.
+/// Allocation-free.
+pub fn sse_line_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let eol = bytes.iter().position(is_sse_eol)?;
+    Some((eol, sse_eol_end(bytes, eol)))
+}
+
+/// UTF-8 encoding of U+FEFF, the byte order mark an event stream may start with.
+pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// What the unterminated start of an SSE event, already forwarded to a client
+/// without inspection, can still contribute to the event the client goes on to
+/// dispatch. See [`classify_forwarded_sse_prefix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseForwardedPrefix {
+    /// Nothing that can carry event data: only line terminators, leading BOMs,
+    /// and complete comment, `id` or `retry` lines. The bytes that follow can
+    /// be read as a fresh event without missing any data the client dispatches.
+    Inert,
+    /// Like [`Inert`](Self::Inert), except that the prefix ends inside a
+    /// comment, `id` or `retry` line already past its `:`. The client reads
+    /// every byte up to the next CR or LF as the rest of that line, so those
+    /// bytes carry nothing; only after that terminator can the stream be read
+    /// as a fresh event.
+    InertLine,
+    /// Leading BOMs that end in an incomplete one. The next `n` bytes, when they
+    /// complete that BOM, carry nothing either; after them the stream can be
+    /// read as a fresh event.
+    PartialBom(usize),
+    /// An open event that holds no data text yet, but whose start shapes how
+    /// the client reads the rest of it: an `event` line names the event, other
+    /// field lines are ignored, a `data` line with an empty value adds only a
+    /// line break to the event's data, and an unterminated line whose field
+    /// name is still incomplete, or whose `data` value has not begun, is
+    /// continued by the next bytes. The rest of the event therefore cannot be
+    /// read as a fresh event, yet none of its data text has left: the caller
+    /// keeps the prefix from the given byte offset (where the open event
+    /// starts) as parse-only context and reads the rest of the event together
+    /// with it, so that event's data is still inspected.
+    EventContext(usize),
+    /// A `data` line whose value is not empty, or an unterminated one whose
+    /// value has begun: the forwarded prefix already carries data of the event
+    /// the client dispatches.
+    OpenEvent,
+}
+
+/// Classify bytes that were forwarded as the start of an SSE event before the
+/// event was complete.
+///
+/// `prefix` must start where a line starts, optionally with the LF that
+/// completes a CRLF whose CR ended the preceding bytes — as the bytes carried
+/// after the last complete event do. A blank line inside `prefix` ends the
+/// event it belongs to, so only the lines after the last one count. Leading
+/// BOMs follow the [`strip_sse_boms`] policy. Allocation-free.
+pub fn classify_forwarded_sse_prefix(prefix: &[u8]) -> SseForwardedPrefix {
+    let mut rest = prefix;
+    while let Some(after) = rest.strip_prefix(UTF8_BOM.as_slice()) {
+        rest = after;
+    }
+    // Complete BOMs were stripped, so a match here is a strict BOM prefix.
+    if !rest.is_empty() && UTF8_BOM.starts_with(rest) {
+        return SseForwardedPrefix::PartialBom(UTF8_BOM.len() - rest.len());
+    }
+    let mut event_start = prefix.len() - rest.len();
+    let mut open = false;
+    let mut context = false;
+    let mut unfinished_line = false;
+    while !rest.is_empty() {
+        let Some((line_end, next)) = sse_line_end(rest) else {
+            // Later bytes extend this unterminated line. Past its `:`, a
+            // comment, `id` or `retry` line stays inert, but those later bytes
+            // still belong to it up to the next terminator.
+            match sse_line_field(rest) {
+                (b"" | b"id" | b"retry", Some(_)) => unfinished_line = true,
+                (b"data", Some(value)) if !matches!(value, b"" | b" ") => open = true,
+                _ => context = true,
+            }
+            break;
+        };
+        let line = &rest[..line_end];
+        rest = &rest[next..];
+        if line.is_empty() {
+            // A blank line ends the event; anything after it starts a new one.
+            open = false;
+            context = false;
+            event_start = prefix.len() - rest.len();
+            continue;
+        }
+        match sse_line_field(line) {
+            (b"" | b"id" | b"retry", _) => {}
+            // An empty value adds no text of its own, so the event's data is
+            // still ahead and is inspected together with this context.
+            (b"data", None | Some(b"" | b" ")) => context = true,
+            (b"data", Some(_)) => open = true,
+            _ => context = true,
+        }
+    }
+    if open {
+        SseForwardedPrefix::OpenEvent
+    } else if context {
+        SseForwardedPrefix::EventContext(event_start)
+    } else if unfinished_line {
+        SseForwardedPrefix::InertLine
+    } else {
+        SseForwardedPrefix::Inert
+    }
+}
+
+/// Split a non-empty SSE line into its field name and, when it has a `:`, the
+/// bytes after it. A line starting with `:` is a comment (empty field name).
+fn sse_line_field(line: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match line.iter().position(|byte| *byte == b':') {
+        Some(colon) => (&line[..colon], Some(&line[colon + 1..])),
+        None => (line, None),
+    }
+}
+
+/// Split one line from [`sse_lines_inclusive`] into its content and its
+/// terminator: `"\r\n"`, `"\n"`, `"\r"`, or `""` for a final unterminated line.
+pub fn split_sse_line_terminator(line: &str) -> (&str, &str) {
+    let terminator_len = if line.ends_with("\r\n") {
+        2
+    } else if line.ends_with(['\n', '\r']) {
+        1
+    } else {
+        0
+    };
+    line.split_at(line.len() - terminator_len)
+}
+
+/// Byte index just past the first complete SSE event in `buf` (the end of its
+/// first blank line), or `None` while no event has fully arrived.
+///
+/// Line terminators are CRLF, LF, or a lone CR, mixed freely, so a blank line is
+/// any terminator immediately followed by another one (`\n\n`, `\r\r`,
+/// `\r\n\r\n`, `\n\r\n`, `\r\n\r`, ...). A CR followed by LF is always one
+/// terminator. `buf` is scanned as if it starts inside a line, so a terminator
+/// at index 0 ends that line rather than forming a blank line by itself.
+///
+/// A CR as the final byte of `buf` is decided as early as possible: as the
+/// FIRST terminator it cannot complete an event until the next byte shows
+/// whether it is half of a CRLF, but as the SECOND terminator it already ends
+/// the event. An LF that then follows it belongs to the same CRLF, and treating
+/// it as an empty line at the start of the next event dispatches nothing — the
+/// same result a client reaches. Allocation-free.
+pub fn sse_event_end(buf: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while let Some(offset) = buf[pos..].iter().position(is_sse_eol) {
+        let after = sse_eol_end(buf, pos + offset);
+        match buf.get(after) {
+            Some(b'\n' | b'\r') => return Some(sse_eol_end(buf, after)),
+            _ => pos = after,
+        }
+    }
+    None
+}
+
+/// How many bytes of `chunk` complete the next SSE event, given the partial
+/// `carry` already accumulated, with the same framing rules as
+/// [`sse_event_end`] applied to `carry` followed by `chunk`.
+///
+/// `carry` must hold no complete event (`sse_event_end(carry)` is `None`).
+/// Allocation-free: a blank line can only straddle the seam through a
+/// terminator that ends `carry`, including a CR at the end of `carry` whose LF
+/// starts `chunk` (one CRLF terminator), so those cases are checked directly and
+/// everything else is found by scanning `chunk` alone.
+pub fn sse_event_end_after(carry: &[u8], chunk: &[u8]) -> Option<usize> {
+    // Index in `chunk` at which the terminator that ends `carry` is complete.
+    let after_seam = match carry.last() {
+        Some(b'\r') if chunk.first() == Some(&b'\n') => 1,
+        Some(b'\n' | b'\r') => 0,
+        _ => return sse_event_end(chunk),
+    };
+    match chunk.get(after_seam) {
+        Some(b'\n' | b'\r') => Some(sse_eol_end(chunk, after_seam)),
+        _ => sse_event_end(chunk),
+    }
+}
+
+fn is_sse_eol(byte: &u8) -> bool {
+    matches!(*byte, b'\n' | b'\r')
+}
+
+/// Index just past the line terminator that starts at `eol`: CRLF is one
+/// terminator; a lone CR or LF is one byte.
+fn sse_eol_end(bytes: &[u8], eol: usize) -> usize {
+    if bytes.get(eol) == Some(&b'\r') && bytes.get(eol + 1) == Some(&b'\n') {
+        eol + 2
+    } else {
+        eol + 1
     }
 }
 
@@ -295,6 +540,20 @@ pub fn encode_sse_error_event(code: &str, message: &str) -> bytes::Bytes {
     // serde_json's `Display` is compact and single-line, so the payload is a
     // valid one-line SSE `data:` value.
     bytes::Bytes::from(format!("event: error\ndata: {payload}\n\ndata: [DONE]\n\n"))
+}
+
+/// Frame a terminal `event` to start on a fresh line: one LF first when the
+/// bytes the client already received end mid-line (`client_line_open`), so the
+/// client never reads the event's first line as the rest of that one. Never a
+/// blank line, which would dispatch an event the client still holds open.
+pub fn sse_event_on_fresh_line(event: bytes::Bytes, client_line_open: bool) -> bytes::Bytes {
+    if !client_line_open {
+        return event;
+    }
+    let mut out = Vec::with_capacity(event.len() + 1);
+    out.push(b'\n');
+    out.extend_from_slice(&event);
+    bytes::Bytes::from(out)
 }
 
 /// Floor `idx` down to the nearest UTF-8 char boundary at or below it in `s`.

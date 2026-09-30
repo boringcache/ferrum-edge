@@ -1281,11 +1281,8 @@ async fn start_node_agent_admin_listeners(
                 "Admin JWT not configured for node_agent mode, generating a random read-only secret; \
                  authenticated admin endpoints will reject operator tokens"
             );
-            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                secret: random_secret,
-                ..Default::default()
-            })
+            crate::admin::jwt_auth::random_read_only_jwt_manager()
+                .map_err(|err| anyhow::anyhow!("Invalid admin JWT configuration: {}", err))?
         }
         Err(err) => {
             return Err(anyhow::anyhow!("Invalid admin JWT configuration: {}", err));
@@ -6118,13 +6115,7 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) -> bool {
         return false;
     }
     let mut removed = true;
-    for marker_dir in [
-        ".ready",
-        ".ready4",
-        ".ready6",
-        ".udp-ready",
-        ".udp-not-ready",
-    ] {
+    for marker_dir in [".ready4", ".ready6", ".udp-ready", ".udp-not-ready"] {
         let path = dir.join(marker_dir).join(pod_uid);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -12438,14 +12429,11 @@ mod tests {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let registry = tempfile::tempdir().unwrap();
-        let ready_dir = registry.path().join(".ready");
         let ready4_dir = registry.path().join(".ready4");
         let ready6_dir = registry.path().join(".ready6");
-        std::fs::create_dir_all(&ready_dir).unwrap();
         std::fs::create_dir_all(&ready4_dir).unwrap();
         std::fs::create_dir_all(&ready6_dir).unwrap();
         std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
-        std::fs::write(ready_dir.join("pod-x"), b"").unwrap();
         std::fs::write(ready4_dir.join("pod-x"), b"").unwrap();
         std::fs::write(ready6_dir.join("pod-x"), b"").unwrap();
         pod_states.insert(
@@ -12483,10 +12471,6 @@ mod tests {
         assert!(
             !registry.path().join("pod-x").exists(),
             "registry entry removed on shutdown"
-        );
-        assert!(
-            !ready_dir.join("pod-x").exists(),
-            "legacy ready marker removed on shutdown"
         );
         assert!(
             !ready4_dir.join("pod-x").exists(),
@@ -14924,16 +14908,12 @@ mod tests {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let registry = tempfile::tempdir().unwrap();
-        let ready_dir = registry.path().join(".ready");
         let ready4_dir = registry.path().join(".ready4");
         let ready6_dir = registry.path().join(".ready6");
-        std::fs::create_dir_all(&ready_dir).unwrap();
         std::fs::create_dir_all(&ready4_dir).unwrap();
         std::fs::create_dir_all(&ready6_dir).unwrap();
-        let marker = ready_dir.join("pod-x");
         let marker4 = ready4_dir.join("pod-x");
         let marker6 = ready6_dir.join("pod-x");
-        std::fs::write(&marker, b"").unwrap();
         std::fs::write(&marker4, b"").unwrap();
         std::fs::write(&marker6, b"").unwrap();
         std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
@@ -14954,10 +14934,6 @@ mod tests {
         assert!(
             !registry.path().join("pod-x").exists(),
             "registry entry removed on teardown"
-        );
-        assert!(
-            !marker.exists(),
-            "legacy readiness marker removed on pod teardown"
         );
         assert!(
             !marker4.exists(),
