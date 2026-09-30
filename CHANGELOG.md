@@ -91,6 +91,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Admin API: read an `mcp_gateway` proxy's tool catalog** (#5926).
+  `GET /proxies/{id}/mcp/tools` returns the tools a proxy's `mcp_gateway`
+  instances expose without an MCP session. It is a viewer-or-above,
+  namespace-scoped proxy read, so the `ns`-claim gate and the viewer-key
+  namespace ceiling apply; a proxy without an enabled `mcp_gateway` answers
+  `404`. Per tool it reports the public name, the source (upstream server
+  namespace and tool name, or the generating OpenAPI operation's method and
+  path template), description and annotations, the configured and effective
+  policy (including tools hidden by `discovery.on_new_tool` /
+  `discovery.on_schema_change: hide_until_configured`), `allowed_groups` /
+  `denied_groups`, and the gateway's stored SHA-256 `schema_hash`. Per instance
+  it reports `refreshed_at`, a `stale` flag, and each server's last
+  `tools/list` outcome as fixed text. It reads only the cached catalog (the most recently refreshed
+  session's), never calls an upstream, paginates with the shared bounds, and
+  returns every server `upstream_url` in its structural redacted form for all
+  roles. Before any session lists tools the list is empty with
+  `refreshed_at: null`; a node that does not serve the proxy reports
+  `catalog_state: not_served`.
 - **Per-service opt-in for `;` path parameters in mesh mode** (#5937). A
   `MeshService` can set `allow_path_parameters: true` (default `false`), or a
   Kubernetes Service can carry the annotation
