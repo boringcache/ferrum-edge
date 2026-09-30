@@ -11334,8 +11334,13 @@ components:
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         sni:
           description: >-
-            Frontend TLS/QUIC SNI hostname, when the client supplied one.
-            Available on HTTP and stream connections alike.
+            Frontend TLS/QUIC SNI hostname, when the client supplied one,
+            ASCII-lowercased with one trailing DNS dot removed. Available on HTTP
+            and stream connections alike. Exact entries are normalized at load
+            (one trailing dot dropped, lowercased, U-labels converted to
+            A-labels with IDNA); prefix entries are lowercased with whole labels
+            converted; regex patterns are left as written. Non-ASCII text that
+            cannot be converted is rejected.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         header:
           description: >-
@@ -23608,11 +23613,18 @@ components:
         malformed values, non-numeric
         `destination.port` values, malformed IP CIDRs, a `source.serviceAccount`
         with a `*` or more than one `/`, a `source.trustDomain` with a `/` or a
-        repeated/mid-string `*`, and collections over 64 `when[]` entries per
+        repeated/mid-string `*`, a non-ASCII `connection.sni` value that
+        cannot be converted to its A-label, and collections over 64 `when[]`
+        entries per
         rule or 256 values per list (16 values of at most 320 bytes for
         `source.serviceAccount`) — are rejected during translation/config
         validation with a field-specific diagnostic, on both `values` and
         `notValues`, so DENY conditions cannot silently fail open.
+        `connection.sni` values are normalized at load to the spelling of the
+        received ClientHello SNI: one trailing dot is stripped, ASCII is
+        lowercased, and a non-ASCII (U-label) name is converted to its A-label
+        with IDNA. Other ASCII characters that DNS hostnames do not allow are
+        not rejected; such a value never matches.
         An attribute the path CAN source but that this request lacks follows
         ordinary Istio semantics (a `values` check fails; a `notValues`-only
         check passes). An attribute the path can NEVER source — an HTTP-only key
