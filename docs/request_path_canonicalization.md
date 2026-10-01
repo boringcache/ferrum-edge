@@ -72,7 +72,7 @@ risking disagreement with the backend:
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`, `/a/%2e%2e;/b`, `/a/..%3B/b` | A percent escape produced a `.` or `..` segment, or the `;` that makes one a path-parameter dot segment. |
 | `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..`, `/a/..;/b`, `/a/.;x/b` | A `.` or `..` segment written literally, with or without a `;` path parameter. See below. |
 | `empty_segment`          | `//a`, `/a//b`, `/;x/a`, `/a/%3Bx/b` | A non-final empty segment, or a non-final segment that is empty before its first `;`. See below. |
-| `path_parameter`         | `/a;x/b`, `/a%3Bx/b` | A `;` path parameter on a proxy that has not set `allow_path_parameters`, or whose parameter-stripped path routes to a different proxy. Applied after route lookup and before any plugin runs. See below. |
+| `path_parameter`         | `/a;x/b`, `/a%3Bx/b` | A `;` path parameter on a proxy that has not set `allow_path_parameters`, or whose parameter-stripped path belongs to a different proxy. Applied after route lookup and before any plugin runs. See below. |
 
 Rejections carry a fixed JSON body and a fixed reason token. Neither echoes any
 request bytes, and the reject is logged with the reason token only.
@@ -147,7 +147,8 @@ is routed, and canonicalization runs before routing. The frontends therefore:
    opted in;
 4. on an opted-in proxy, re-resolve the route with every parameter removed
    (the path a parameter-stripping backend executes) and refuse the request
-   when that path routes to a different proxy;
+   when that path belongs to a different proxy (see below for which one
+   counts);
 5. only then run any plugin phase or backend dispatch.
 
 Route lookup is a literal match on the canonical path and grants nothing on its
@@ -161,10 +162,52 @@ not match an `/admin` route, so on its own it would fall through to an opted-in
 `/admin/users` without the `/admin` proxy's plugins. The stripped path
 `/admin/users` routes to `/admin`, a different proxy, so the request is
 refused. A stripped path that routes to the same proxy, or to no proxy at all,
-is accepted: neither can skip another proxy's policy, and the second keeps a
-proxy whose literal `listen_path` contains `;` reachable. The re-resolve
+is accepted: neither can skip another proxy's policy. The re-resolve
 allocates, but only for a request that carries a `;` and reached an opted-in
 proxy.
+
+**A literal `listen_path` with `;` is not shadowed by a catch-all.** A proxy
+whose literal `listen_path` itself contains `;` (for example `/api;v=1`) only
+ever receives requests whose stripped path starts with that `listen_path`
+stripped (`/api`). If a catch-all `/` exists, that stripped path routes to the
+catch-all, so refusing every different stripped route would make the proxy
+unreachable. For a proxy with a literal `listen_path` (prefix or `=` exact),
+the gateway therefore accepts a different stripped route when all of these
+hold:
+
+- the stripped route matched fewer bytes than the proxy's `listen_path` with
+  its own parameters and any trailing `/` stripped (so `/api;v=1/` is measured
+  as `/api`). The router matches prefixes only on `/` boundaries, so such a
+  route is an ancestor of the whole space the proxy claims (`/` for
+  `/api;v=1`). A host-only route matches zero bytes and counts as an ancestor
+  too;
+- the stripped route sits in a host tier no more specific than the one the
+  proxy was found in (exact host, then a longer wildcard, then a shorter
+  wildcard, then no hosts).
+
+A direction-scoped mesh route counts like any other route here, because the
+re-resolve repeats the request's own mesh resolution (see
+[Mesh-materialised routes](#mesh-materialised-routes)).
+
+Every other different stripped route is refused. A sibling at the stripped
+prefix (`/api` next to `/api;v=1`), a more specific descendant
+(`/api/private`, reached with `/api;v=1/private/x`), and any exact or regex
+route, which always matches the whole path, stay refused. So does an exact-host
+`/svc` against a catch-all `/svc;v=1/v2`: on that host the exact-host route
+owns `/svc/v2/x` ahead of every catch-all route, even though its prefix is
+shorter. A catch-all `/api/private` is refused against an exact-host
+`/api;v=1` as well: on that host `/api/private/x` routes to it, and the
+host-specific proxy does not claim that path. A proxy whose `listen_path` is a
+regex, or that has none (host-only), keeps the plain rule: any different
+stripped route is refused. The classic case is unchanged: an opted-in `/` has a
+stripped prefix of one byte, so an `/admin` route always outranks it and
+`/admin;x/users` is refused.
+
+Trade-off: when the opted-in proxy and the ancestor it wins over share a
+backend that strips path parameters, that backend serves the whole stripped
+subtree (`/api/...` for `/api;v=1`) through the opted-in proxy and its plugins,
+not the ancestor's. Configure the opted-in proxy's own authentication and
+policy for that subtree, or give it a dedicated backend.
 
 **With the opt-in.** On a proxy with `allow_path_parameters: true`, the `;` is
 kept in the canonical path and forwarded unchanged, so routing, policy, and the
@@ -173,7 +216,11 @@ matrix parameters. The dot-segment and empty-segment rules still apply
 (`/a/..;/b` and `/;x/a` are refused), but policy on that proxy evaluates the
 parameterised path: a rule for `/admin/users` does not match `/admin;x/users`.
 Enable it only for backends that give `;` a meaning, and write policy for the
-spellings those backends accept. A literal `listen_path` that contains `;`
+spellings those backends accept. Mesh authorization (`mesh_authz`) is the
+exception: on an opted-in proxy it judges `AuthorizationPolicy` `paths:`,
+`notPaths:`, and `request.headers[:path]` conditions on both the raw and the
+parameter-stripped spelling (see
+[Mesh authorization judges both spellings](#mesh-authorization-judges-both-spellings)). A literal `listen_path` that contains `;`
 requires the opt-in on its proxy and is rejected at admission otherwise. A
 `~regex` `listen_path` that contains `;` on a proxy without the opt-in is
 loaded with a warning, since the part of the pattern that needs a parameter is
@@ -181,8 +228,126 @@ unreachable.
 
 Gateway API routes whose literal path match itself contains `;` are translated
 with `allow_path_parameters: true`, since the route declares the parameter
-explicitly; every other translated route keeps the default. Mesh-materialized
-routes cannot opt in yet and refuse `;`.
+explicitly; every other translated route keeps the default. Mesh-materialised
+routes follow their service's opt-in, described next.
+
+### Mesh-materialised routes
+
+Mesh mode builds its HTTP routes from the mesh slice, so it has no per-proxy
+field to set. The opt-in is per service instead: `MeshService`
+`allow_path_parameters: true`, or the Kubernetes Service annotation
+`ferrum.io/allow-path-parameters: "true"`, sets `allow_path_parameters` on every
+HTTP-family route mesh mode materialises for that service: the outbound routes
+each client sidecar or node proxy builds to it (including direct Pod-IP
+routes), its local Sidecar inbound routes, and the Sidecar `ingress[]`
+listener routes it owns. Default `false`, so a service without it still
+refuses `;` with `400 path_parameter`. Stock (non-Ferrum) xDS control planes
+cannot carry the field, so their services stay refused. See
+[mesh.md](mesh.md#path-parameters-and-the-per-service-opt-in).
+
+The re-resolve of an opted-in request repeats the request's own resolution,
+mesh steps included, before it compares routes:
+
+1. the same host, frontend port, TLS class, and Gateway listener;
+2. the same mesh direction filter: on a capture listener only the routes of
+   that listener's direction count (outbound on the outbound listener, inbound
+   and `ingress[]` on the inbound listener), and on every other listener, the
+   HTTP/3 frontend included, no direction-scoped mesh route counts;
+3. the same port-sibling selection: a multi-port service's routes share one
+   representative in the route table, so the request's captured original
+   destination or authority port picks the sibling again, and a dedicated
+   Sidecar ingress bind route must match the accepted frontend port;
+4. the direct Pod-IP HTTP egress decision is not repeated, because it reads
+   only the captured original destination, never the path, so the stripped
+   path takes the same route.
+
+So an opted-in mesh route re-resolves to itself, and the request is served.
+A stripped path that the mesh port selection would refuse (`502`) is refused
+here too. Every mesh-materialised route is a `/` prefix on its service's own
+hosts, so a different stripped route can only be a longer route on those
+hosts, such as an explicit `/admin` route next to the service's `/`. That
+route is never an ancestor of `/`, so `/admin;x/users` on the opted-in service
+is still refused. A `;` never changes the `Host` or the port signals, so it
+cannot move a request onto another service or another port sibling.
+
+### Mesh authorization judges both spellings
+
+On a proxy with `allow_path_parameters: true`, a `;` request has two
+spellings: the raw path the gateway forwards (`/admin;x/users`), which a
+backend that keeps parameters executes, and the parameter-stripped path
+(`/admin/users`), which a Tomcat or Spring backend executes. The gateway cannot
+tell which kind of backend it forwards to, so `mesh_authz` evaluates every
+`AuthorizationPolicy` rule once per spelling and combines the two results by
+the rule's action (issue #5948). Within one evaluation, `to:` `paths:` /
+`notPaths:` and any `when: request.headers[:path]` condition all read the
+same spelling, so the two halves of a rule are never judged on different
+paths.
+
+| Action | The rule matches when |
+|--------|-----------------------|
+| `DENY` | it matches on the raw spelling **or** on the stripped spelling |
+| `CUSTOM` | it matches on the raw spelling **or** on the stripped spelling |
+| `AUDIT` | it matches on the raw spelling **or** on the stripped spelling |
+| `ALLOW` | it matches on the raw spelling **and** on the stripped spelling |
+
+On one spelling, a `to:` entry matches when its `paths:` (if set) contain the
+spelling and its `notPaths:` (if set) do not, and a `request.headers[:path]`
+condition matches when its `values:` (if set) contain the spelling and its
+`notValues:` (if set) do not. So:
+
+- a DENY on `/admin/*` refuses `/admin;x/users`, and a DENY on `/api/admin/*`
+  refuses `/api;x/admin/users`, whether written as `paths:` or as a
+  `request.headers[:path]` condition;
+- a `notPaths:` or `notValues:` exclusion lifts a DENY only when it holds for
+  both spellings;
+- an ALLOW on `*.png` does not admit `/admin/users;x.png`, because the stripped
+  `/admin/users` is not a `.png`;
+- an ALLOW on `/api/*` with `notPaths: /api/admin/*` (or a `:path` condition
+  with `notValues: /api/admin/*`) does not admit `/api/admin;x/users`, because
+  the stripped spelling is excluded;
+- a prefix ALLOW such as `/app/*` still admits `/app/page;jsessionid=abc`, since
+  both spellings match, and an exact ALLOW such as `/app/page` still does not
+  match the raw `/app/page;jsessionid=abc`, as before. A presence pattern
+  (`*`) matches both spellings.
+
+DENY and CUSTOM restrict (a matched CUSTOM rule sends the request to its
+external authorizer before anything else takes effect) and AUDIT only records,
+so matching either spelling is the safe direction for them. ALLOW grants
+access, so it must hold for both. The same rule decides which CUSTOM rules make
+`mesh_authz` buffer a request body for a body-inspecting provider.
+
+The combination is per rule, not per decision. The ALLOW implicit-deny floor is
+met only by an ALLOW rule that matches on both spellings, so a request whose
+raw spelling matches one ALLOW rule and whose stripped spelling matches a
+different one is implicitly denied. Write one rule that covers both spellings,
+for example a prefix pattern.
+
+The second spelling is built whenever the canonical path carries a `;`. Only a
+proxy with `allow_path_parameters` lets such a request reach a plugin (every
+other proxy refuses it with `400 path_parameter` first), so authorization on
+routes that have not opted in is unchanged. A path without a `;` has one
+spelling and is evaluated exactly once.
+
+**What a CUSTOM provider sees.** A CUSTOM (ext_authz) check is sent the raw
+request path only, as the HTTP ext-authz protocol defines it. A provider that
+makes its own path decisions on an opted-in service should apply the same rule
+to the stripped spelling, or be scoped with a DENY-safe `paths:` rule on the
+gateway side.
+
+**VirtualService `uri` matches.** Ferrum compiles a VirtualService
+`http[].match[].uri` into the `listen_path` of the proxy it emits for that
+route (prefix, `=` exact, or `~` regex), and the `uri` that a
+`mesh_route_dispatch` rule re-checks is evaluated on that same proxy.
+VirtualService routes never inherit the service's opt-in. A route whose own
+`uri` literal contains `;` opts in by itself, and `mesh_authz` judges both
+spellings on it. Every other VirtualService route refuses a `;` request with
+`400 path_parameter` before any plugin runs, so its `uri` matcher never sees a
+parameterised path. A `;` request that reaches an opted-in mesh route, but
+whose stripped path belongs to a VirtualService route on the same host, is
+refused by the re-route check above. A VirtualService `/` route on the
+service's host makes the mesh route yield to it, so the service's opt-in is not
+applied there, and `;` stays refused (fail closed). VirtualService URI matching
+therefore only selects routes, and the re-route check already covers it.
 
 **Provider override queries are not canonicalized.** A plugin that rewrites
 the backend path (`ai_stream_router`, `ai_federation`) may put the endpoint and
@@ -356,8 +521,9 @@ must change:
   first `;` (`//a`, `/a//b`, `/;x/a`, `empty_segment`). Clients must send the
   collapsed path. A trailing slash is unaffected.
 - Targets with a `;` path parameter (`/a;x/b`, `/a%3Bx/b`, `path_parameter`)
-  on a proxy that has not set `allow_path_parameters: true`. This is the only
-  rule with a switch, and the switch is per proxy rather than per deployment:
+  on a proxy that has not set `allow_path_parameters: true` (in mesh mode, on
+  a service that has not opted in). This is the only rule with a switch, and
+  the switch is per proxy (or per mesh service) rather than per deployment:
   it keeps the `;` in the one canonical path instead of computing policy
   differently, and the structural rules above still apply with it on.
 

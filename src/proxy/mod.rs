@@ -31122,12 +31122,17 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
 
 /// The route-lookup inputs a request was routed with, so a request carrying
 /// `;` path parameters can be re-resolved against the same host, frontend
-/// port, and listener.
+/// port, listener, mesh direction, and mesh port signals.
 pub(crate) struct RouteLookupScope<'a> {
     pub(crate) host: Option<&'a str>,
     pub(crate) frontend_port: Option<u16>,
     pub(crate) frontend_is_tls: bool,
     pub(crate) gateway_listener: Option<&'a gateway_listener::GatewayListenerIdentity>,
+    pub(crate) mesh: crate::router_cache::MeshRouteScope,
+    /// The request was routed by the direct Pod-IP HTTP egress decision,
+    /// which selects a route from the captured original destination before
+    /// host routing and never reads the path.
+    pub(crate) routed_by_direct_workload: bool,
 }
 
 /// Rule 10 of the canonical request path contract (`src/policy_path.rs`) for a
@@ -31136,13 +31141,26 @@ pub(crate) struct RouteLookupScope<'a> {
 /// A `;` is refused unless the routed proxy set `allow_path_parameters`. On an
 /// opted-in proxy the request is also re-resolved with its parameters removed
 /// (the path a parameter-stripping backend executes) and refused when that
-/// path routes to a *different* proxy. The router splits only on `/`, so
+/// path belongs to a *different* proxy. The router splits only on `/`, so
 /// `/admin;x/users` misses an `/admin` route and can land on an opted-in `/`
 /// or `/api` catch-all whose backend then runs `/admin/users` without the
 /// `/admin` proxy's plugins. A stripped path that routes nowhere cannot skip
-/// another proxy's policy, so it is allowed: that keeps a proxy whose literal
-/// `listen_path` itself contains `;` reachable. The re-resolve allocates, but
-/// only for a request that carries a `;` and reached an opted-in proxy.
+/// another proxy's policy, so it is allowed.
+///
+/// A different stripped route is still allowed when it is a less specific
+/// ancestor of the proxy's own literal `listen_path`, so a catch-all `/` does
+/// not shadow `/api;v=1` (issue #5938). The rule is
+/// [`crate::router_cache::path_parameter_scoped_route_admitted`]. The re-resolve
+/// allocates, but only for a request that carries a `;` and reached an
+/// opted-in proxy.
+///
+/// The re-resolve repeats the request's own resolution, mesh steps included
+/// ([`crate::router_cache::RouterCache::resolve_mesh_scoped_route_in_epoch`]):
+/// the same mesh direction filter and the same port-sibling and dedicated
+/// ingress bind selection from the same port signals. A mesh-materialised
+/// route that opted in (issue #5937) therefore re-resolves to itself, while a
+/// stripped path owned by any other route on its hosts is refused. A stripped
+/// path the mesh port selection would refuse (`502`) is refused here too.
 pub(crate) fn check_routed_path_parameters(
     state: &ProxyState,
     epoch: &crate::request_epoch::RequestEpoch,
@@ -31155,21 +31173,39 @@ pub(crate) fn check_routed_path_parameters(
     if !has_path_parameter {
         return Ok(());
     }
+    // The direct Pod-IP HTTP egress decision reads only the captured original
+    // destination, so the stripped path takes the same decision and reaches
+    // this same route.
+    if crate::router_cache::path_parameter_direct_workload_route_admitted(
+        proxy,
+        scope.routed_by_direct_workload,
+    ) {
+        return Ok(());
+    }
     let stripped = crate::policy_path::strip_path_parameters(path);
-    let Some(stripped_route) = state.router_cache.find_proxy_in_epoch(
+    match state.router_cache.resolve_mesh_scoped_route_in_epoch(
         epoch,
         scope.host,
         &stripped,
         scope.frontend_port,
         scope.frontend_is_tls,
         scope.gateway_listener,
-    ) else {
-        return Ok(());
-    };
-    if stripped_route.proxy.namespace == proxy.namespace && stripped_route.proxy.id == proxy.id {
-        Ok(())
-    } else {
-        Err(crate::policy_path::PolicyPathRejection::PathParameter)
+        scope.mesh,
+    ) {
+        crate::router_cache::MeshScopedResolution::NotFound => Ok(()),
+        crate::router_cache::MeshScopedResolution::Routed(stripped_route)
+            if crate::router_cache::path_parameter_scoped_route_admitted(
+                proxy,
+                &stripped_route,
+                scope.host,
+            ) =>
+        {
+            Ok(())
+        }
+        crate::router_cache::MeshScopedResolution::Routed(_)
+        | crate::router_cache::MeshScopedResolution::Refused => {
+            Err(crate::policy_path::PolicyPathRejection::PathParameter)
+        }
     }
 }
 
@@ -32856,6 +32892,13 @@ async fn handle_proxy_request_inner(
         None
     };
 
+    // The `;` re-route check below replays this decision: it never reads the
+    // path, so the parameter-stripped path takes it too.
+    let routed_by_direct_workload = matches!(
+        direct_pod_ip_http_route,
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route { .. })
+    );
+
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
     let route_match = match direct_pod_ip_http_route {
         Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {
@@ -33293,9 +33336,12 @@ async fn handle_proxy_request_inner(
     };
 
     // A `;` path parameter is refused unless the routed proxy opted in with
-    // `allow_path_parameters`, and the parameter-stripped path routes to that
-    // same proxy (GHSA-fcqw-793q-wg5x). Canonicalization could only record
-    // the `;`, because the proxy was not known yet; route lookup is a literal
+    // `allow_path_parameters`, and the parameter-stripped path, resolved the
+    // same way as above (mesh direction filter and port-sibling selection
+    // included), routes to that same proxy or to one
+    // `path_parameter_scoped_route_admitted` admits (GHSA-fcqw-793q-wg5x).
+    // Canonicalization could only record the `;`, because the proxy was not
+    // known yet; route lookup is a literal
     // match and grants nothing, and this runs before every plugin phase and
     // backend dispatch, so no policy surface is skipped by a path a
     // parameter-stripping backend would resolve differently.
@@ -33310,6 +33356,12 @@ async fn handle_proxy_request_inner(
             frontend_port: ctx.frontend_listen_port,
             frontend_is_tls: is_tls,
             gateway_listener: gateway_listener_identity.as_ref(),
+            mesh: crate::router_cache::MeshRouteScope {
+                direction: ctx.mesh_direction,
+                orig_dst_port: ctx.orig_dst.map(|addr| addr.port()),
+                authority_port,
+            },
+            routed_by_direct_workload,
         },
     ) {
         warn!(
@@ -60459,6 +60511,7 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         let wl = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -60600,6 +60653,7 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: vec!["10.96.0.10".to_string()],
             uid: None,
+            allow_path_parameters: false,
         };
         let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
         // Same-namespace as the owning Service; see the TCP by-workload case.
@@ -65066,6 +65120,7 @@ mod tests {
                 protocol_overrides: HashMap::new(),
                 cluster_ips: vec!["10.96.0.10".to_string()],
                 uid: None,
+                allow_path_parameters: false,
             }],
             ..MeshConfig::default()
         };
@@ -65137,6 +65192,7 @@ mod tests {
                 protocol_overrides: HashMap::new(),
                 cluster_ips: vec!["10.96.0.20".to_string()],
                 uid: None,
+                allow_path_parameters: false,
             }],
             ..MeshConfig::default()
         };
@@ -65220,6 +65276,7 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -65747,6 +65804,7 @@ mod tests {
             protocol_overrides: HashMap::new(),
             cluster_ips: vec![cluster_ip.to_string()],
             uid: None,
+            allow_path_parameters: false,
         };
         let mesh = MeshConfig {
             services: vec![

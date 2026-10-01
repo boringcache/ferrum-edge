@@ -2238,6 +2238,111 @@ impl RouterCache {
         )
     }
 
+    /// Resolve `path` the way the HTTP/1.1, HTTP/2, and HTTP/3 request
+    /// frontends resolve a request, for the path-parameter re-route check
+    /// (GHSA-fcqw-793q-wg5x, N2 of issue #5938). The steps, in the frontends'
+    /// order: the host and path lookup ([`Self::find_proxy_in_epoch`]), the
+    /// mesh direction filter
+    /// ([`Self::resolve_route_excluding_wrong_direction_in_epoch`] when the
+    /// winner is a wrong-direction mesh route), then mesh port-sibling
+    /// selection: an outbound service by the captured original destination,
+    /// a dedicated Sidecar ingress bind by the accepted frontend port, and
+    /// any other inbound service or ingress group by the original destination
+    /// or the authority port. The frontends run the same steps inline; keep
+    /// the two in step.
+    ///
+    /// The direct Pod-IP HTTP egress decision the H1/H2 frontend takes before
+    /// host routing is not repeated here: it reads only the captured original
+    /// destination, never the path, so the caller already knows it selects
+    /// the same route for any path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_mesh_scoped_route_in_epoch(
+        &self,
+        epoch: &crate::request_epoch::RequestEpoch,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+        gateway_listener: Option<&GatewayListenerIdentity>,
+        mesh: MeshRouteScope,
+    ) -> MeshScopedResolution {
+        let found = self.find_proxy_in_epoch(
+            epoch,
+            host,
+            path,
+            frontend_port,
+            frontend_is_tls,
+            gateway_listener,
+        );
+        complete_mesh_scoped_resolution(
+            &epoch.route_table,
+            found,
+            || {
+                self.resolve_route_excluding_wrong_direction_in_epoch(
+                    epoch,
+                    host,
+                    path,
+                    mesh.direction,
+                    frontend_port,
+                    frontend_is_tls,
+                )
+            },
+            frontend_port,
+            mesh,
+        )
+    }
+
+    /// Test-only variant of [`Self::resolve_mesh_scoped_route_in_epoch`] on
+    /// the router's own route snapshot, with no Gateway listener identity.
+    ///
+    /// It builds a [`MeshScopedRoute`] without the request's listener and
+    /// request epoch, so request handling must never call it: the frontends
+    /// resolve through [`Self::resolve_mesh_scoped_route_in_epoch`]. It is
+    /// public only so the library's external tests can reach it.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+    pub fn resolve_mesh_scoped_route_for_test(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+        mesh: MeshRouteScope,
+    ) -> MeshScopedResolution {
+        let snapshot = self.route_snapshot.load();
+        let found = self.find_proxy_with_admission(
+            &snapshot.table,
+            snapshot.generation,
+            &snapshot.listener_admission,
+            host,
+            path,
+            frontend_port,
+            frontend_is_tls,
+        );
+        complete_mesh_scoped_resolution(
+            &snapshot.table,
+            found,
+            || {
+                let normalized = normalize_encoded_slashes(path);
+                Self::search_route_table(
+                    &snapshot.table,
+                    host,
+                    &normalized,
+                    MeshRouteDirectionFilter::MatchingDirection(mesh.direction),
+                    HttpPortMatchContext {
+                        frontend_port,
+                        frontend_is_tls,
+                        single_nontls_listen_port: snapshot.table.single_nontls_listen_port,
+                        single_tls_listen_port: snapshot.table.single_tls_listen_port,
+                        listener_admission: &snapshot.listener_admission,
+                    },
+                )
+            },
+            frontend_port,
+            mesh,
+        )
+    }
+
     /// Standalone route-table variant retained for focused router tests.
     #[cfg(test)]
     pub(crate) fn resolve_route_excluding_wrong_direction(
@@ -3549,6 +3654,276 @@ fn is_exact_path_proxy(proxy: &Proxy) -> bool {
         .listen_path
         .as_deref()
         .is_some_and(|p| p.starts_with('='))
+}
+
+/// Where a proxy's `hosts` place it in the host-tier order of a route lookup
+/// for one request host, from least to most specific.
+///
+/// The lookup searches an exact host first, then wildcard patterns (a longer
+/// pattern first), then the catch-all tier of proxies with no `hosts`. A proxy
+/// that lists several hosts is found in the most specific tier any of them
+/// matches, because every tier indexes the same `listen_path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HostRouteRank {
+    /// The proxy has no `hosts`.
+    CatchAll,
+    /// The longest `*.` pattern of the proxy that matches the request host.
+    Wildcard { pattern_len: usize },
+    /// One of the proxy's hosts is the request host.
+    Exact,
+}
+
+/// The [`HostRouteRank`] at which a proxy with `hosts` matches
+/// `request_host`, or `None` when it cannot match that host at all (the
+/// proxy lists hosts and the request has none, or none of them matches).
+///
+/// Mirrors the host tiers of the route lookup: a host that starts with `*.`
+/// is a wildcard pattern tested with [`wildcard_matches`], and any other host
+/// must equal the request host.
+pub fn host_route_rank(hosts: &[String], request_host: Option<&str>) -> Option<HostRouteRank> {
+    if hosts.is_empty() {
+        return Some(HostRouteRank::CatchAll);
+    }
+    let request_host = request_host?;
+    let mut rank = None;
+    for host in hosts {
+        if host.starts_with("*.") {
+            if wildcard_matches(host, request_host) {
+                rank = rank.max(Some(HostRouteRank::Wildcard {
+                    pattern_len: host.len(),
+                }));
+            }
+        } else if host == request_host {
+            return Some(HostRouteRank::Exact);
+        }
+    }
+    rank
+}
+
+/// The mesh inputs a request frontend routed a request with, replayed when a
+/// request that carries `;` path parameters is resolved again with them
+/// stripped (N2 of issue #5938). `Default` is a non-mesh listener: no
+/// direction, so every direction-scoped mesh route is filtered out and no
+/// port-sibling selection runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshRouteScope {
+    /// The capture listener's direction. `None` on every non-mesh listener,
+    /// the HTTP/3 frontend included.
+    pub direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    /// Port of the connection's captured original destination
+    /// (`SO_ORIGINAL_DST`), when there is one.
+    pub orig_dst_port: Option<u16>,
+    /// Explicit port of the request's `Host` / `:authority`, when it has one.
+    pub authority_port: Option<u16>,
+}
+
+/// A route resolved the way the request frontends resolve one, mesh direction
+/// filter and mesh port-sibling selection included. Only
+/// [`RouterCache::resolve_mesh_scoped_route_in_epoch`] and
+/// [`RouterCache::resolve_mesh_scoped_route_for_test`] produce one, which is what lets
+/// [`path_parameter_scoped_route_admitted`] trust a direction-scoped mesh
+/// route it names.
+#[derive(Clone, Debug)]
+pub struct MeshScopedRoute(RouteMatch);
+
+impl MeshScopedRoute {
+    /// The resolved route.
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+    pub fn route_match(&self) -> &RouteMatch {
+        &self.0
+    }
+}
+
+/// The outcome of [`RouterCache::resolve_mesh_scoped_route_in_epoch`].
+#[derive(Clone, Debug)]
+pub enum MeshScopedResolution {
+    /// The path routes to this proxy on this listener.
+    Routed(MeshScopedRoute),
+    /// No route matches, so the frontend would answer `404` (or the mesh
+    /// `REGISTRY_ONLY` route-miss refusal).
+    NotFound,
+    /// A route matches, but mesh port-sibling selection refuses it (the
+    /// frontend answers `502`), or a dedicated Sidecar ingress bind route was
+    /// matched on a frontend port other than its own.
+    Refused,
+}
+
+/// The mesh steps of [`RouterCache::resolve_mesh_scoped_route_in_epoch`],
+/// after the host and path lookup found `found`. `exclude_wrong_direction`
+/// repeats that lookup keeping only routes of the request's direction.
+fn complete_mesh_scoped_resolution(
+    table: &HostRouteTable,
+    found: Option<RouteMatch>,
+    exclude_wrong_direction: impl FnOnce() -> Option<RouteMatch>,
+    frontend_port: Option<u16>,
+    mesh: MeshRouteScope,
+) -> MeshScopedResolution {
+    use crate::modes::mesh::MeshTrafficDirection;
+
+    let found = match found {
+        Some(route)
+            if crate::modes::mesh::mesh_route_direction(&route.proxy.id)
+                .is_some_and(|direction| Some(direction) != mesh.direction) =>
+        {
+            exclude_wrong_direction()
+        }
+        other => other,
+    };
+    let Some(route) = found else {
+        return MeshScopedResolution::NotFound;
+    };
+    // Cold path (a `;` request on an opted-in proxy), so hold the proxy by
+    // its own reference while `route` moves into the selectors.
+    let proxy = Arc::clone(&route.proxy);
+    let id = proxy.id.as_str();
+    let route = if mesh.direction == Some(MeshTrafficDirection::Outbound)
+        && crate::modes::mesh::is_mesh_outbound_route_id(id)
+        && !crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(id)
+    {
+        match table.select_mesh_outbound_port_route_with_authz_port(route, mesh.orig_dst_port) {
+            Ok((route, _)) => route,
+            Err(_) => return MeshScopedResolution::Refused,
+        }
+    } else if mesh.direction == Some(MeshTrafficDirection::Inbound)
+        && crate::modes::mesh::is_mesh_inbound_route_id(id)
+    {
+        if crate::modes::mesh::is_mesh_ingress_bind_route_id(id) {
+            match (route.proxy.listen_port, frontend_port) {
+                (Some(route_port), Some(frontend_port)) if route_port == frontend_port => route,
+                _ => return MeshScopedResolution::Refused,
+            }
+        } else {
+            match table.select_mesh_inbound_port_route(
+                route,
+                mesh.orig_dst_port,
+                mesh.authority_port,
+            ) {
+                Ok((route, _)) => route,
+                Err(_) => return MeshScopedResolution::Refused,
+            }
+        }
+    } else {
+        route
+    };
+    MeshScopedResolution::Routed(MeshScopedRoute(route))
+}
+
+/// Whether a request that carries `;` path parameters and routed to the
+/// opted-in proxy `matched` may be served there, given the route its
+/// parameter-stripped path resolves to from a plain host and path lookup
+/// (GHSA-fcqw-793q-wg5x, issue #5938).
+///
+/// A backend that strips path parameters executes the stripped path, so the
+/// request must not reach `matched` when that path belongs to another proxy.
+/// The stripped route is admitted when it is `matched` itself, or when all of
+/// the following hold:
+///
+/// - `matched` has a literal `listen_path` (a prefix, or `=` exact). A regex or
+///   host-only proxy claims no fixed path to compare against, so any other
+///   stripped route is refused.
+/// - The stripped route consumed fewer bytes than `listen_path` with its own
+///   parameters and any trailing `/` stripped. The stripped request always begins with that
+///   stripped `listen_path`, and the router matches only on `/` boundaries, so
+///   a shorter prefix route is an ancestor of the whole space `matched`
+///   claims (`/` for `/api;v=1`), and a host-only route consumes nothing. An
+///   exact or regex route consumes the whole path, and a prefix route at least
+///   as long is a sibling or a descendant (`/api`, `/api/private`), so those
+///   are refused.
+/// - The stripped route is in a host tier no more specific than the one
+///   `matched` was found in. An exact-host `/svc` owns `/svc/v2/x` on its host
+///   ahead of every catch-all route, including a catch-all `/svc;v=1/v2`.
+/// - The stripped route is not a direction-scoped mesh route. A plain lookup
+///   does not repeat the mesh direction filtering and port-sibling selection
+///   of the request's own resolution, so such a route is refused. Resolve
+///   with [`RouterCache::resolve_mesh_scoped_route_in_epoch`] and decide with
+///   [`path_parameter_scoped_route_admitted`] instead to admit one.
+///
+/// Anything this cannot place, such as a proxy whose hosts do not match the
+/// request host, is refused.
+#[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+pub fn path_parameter_route_admitted(
+    matched: &Proxy,
+    stripped_route: &RouteMatch,
+    request_host: Option<&str>,
+) -> bool {
+    path_parameter_route_decision(matched, stripped_route, request_host, false)
+}
+
+/// [`path_parameter_route_admitted`] for a stripped route resolved the way the
+/// request frontends resolve one ([`MeshScopedRoute`], issue #5937).
+///
+/// Every rule is the same except the last: a direction-scoped mesh route is
+/// judged like any other route. The resolution already dropped routes of the
+/// other direction and swapped a service's representative route for the
+/// port sibling the request's own port signals select, so the route named is
+/// the one that would serve the stripped path on this listener. A mesh
+/// materialised route claims `/` on its service's hosts, so it is only ever
+/// admitted as the ancestor of a longer literal `listen_path` on the same
+/// hosts, never as a sibling or descendant.
+pub fn path_parameter_scoped_route_admitted(
+    matched: &Proxy,
+    stripped_route: &MeshScopedRoute,
+    request_host: Option<&str>,
+) -> bool {
+    path_parameter_route_decision(matched, &stripped_route.0, request_host, true)
+}
+
+/// Whether a request carrying `;` path parameters that the H1/H2 frontend
+/// routed by the direct Pod-IP HTTP egress decision may be served on
+/// `matched` without a stripped re-lookup (issue #5937).
+///
+/// That decision selects a route from the captured original destination
+/// before host routing and never reads the path, so the stripped path takes
+/// the same decision and reaches the same route. The shortcut applies only
+/// when the frontend took that decision (`routed_by_direct_workload`) AND the
+/// matched proxy is a direct Pod-IP route (`__mesh-outbound-http-bywl-*`);
+/// any other combination goes through
+/// [`RouterCache::resolve_mesh_scoped_route_in_epoch`].
+pub fn path_parameter_direct_workload_route_admitted(
+    matched: &Proxy,
+    routed_by_direct_workload: bool,
+) -> bool {
+    routed_by_direct_workload
+        && crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&matched.id)
+}
+
+fn path_parameter_route_decision(
+    matched: &Proxy,
+    stripped_route: &RouteMatch,
+    request_host: Option<&str>,
+    mesh_scoped: bool,
+) -> bool {
+    let stripped_proxy = &stripped_route.proxy;
+    if stripped_proxy.namespace == matched.namespace && stripped_proxy.id == matched.id {
+        return true;
+    }
+    let Some(listen_path) = matched.listen_path.as_deref() else {
+        return false;
+    };
+    if listen_path.starts_with('~') {
+        return false;
+    }
+    if !mesh_scoped && crate::modes::mesh::mesh_route_direction(&stripped_proxy.id).is_some() {
+        return false;
+    }
+    let literal_path = listen_path.strip_prefix('=').unwrap_or(listen_path);
+    let claimed = crate::policy_path::strip_path_parameters(literal_path);
+    // A trailing `/` adds no segment: `/api;v=1/` claims the same `/api/...`
+    // space as `/api`, so it is measured without that slash (root stays 1).
+    let claimed_len = match claimed.trim_end_matches('/') {
+        "" => 1,
+        trimmed => trimmed.len(),
+    };
+    if stripped_route.matched_prefix_len >= claimed_len {
+        return false;
+    }
+    match (
+        host_route_rank(&matched.hosts, request_host),
+        host_route_rank(&stripped_proxy.hosts, request_host),
+    ) {
+        (Some(matched_rank), Some(stripped_rank)) => stripped_rank <= matched_rank,
+        _ => false,
+    }
 }
 
 fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
@@ -5289,6 +5664,7 @@ mod tests {
                     workloads: Vec::new(),
                     protocol_overrides: std::collections::HashMap::new(),
                     uid: None,
+                    allow_path_parameters: false,
                 })
                 .collect(),
             ..MeshConfig::default()
@@ -6424,6 +6800,7 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: vec!["10.96.0.1".to_string()],
             uid: None,
+            allow_path_parameters: false,
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-tcp-upstream-default-redis-6379",
@@ -6650,6 +7027,7 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: vec!["10.96.0.10".to_string()],
             uid: None,
+            allow_path_parameters: false,
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-udp-upstream-default-dns-53",
@@ -6806,6 +7184,7 @@ mod tests {
             // Headless: no VIP at all — the whole point of the by-workload path.
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -6933,6 +7312,7 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         let workload = Workload {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -7070,6 +7450,7 @@ mod tests {
             protocol_overrides: std::collections::HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         };
 
         let canonical_ip = "10.0.0.7".parse().unwrap();

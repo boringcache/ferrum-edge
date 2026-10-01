@@ -8,6 +8,7 @@ pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
 pub mod jwt_auth;
+mod mcp_tool_catalog;
 pub mod mesh_config_drift;
 pub mod mesh_remote_clusters;
 pub mod mesh_slice_drift;
@@ -2030,6 +2031,8 @@ fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<O
         ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] | ["namespaces"] => {
             Some(None)
         }
+        // Viewer or above: every authenticated actor, so no arm-level gate.
+        ["proxies", _, "mcp", "tools"] => Some(None),
         // Trust material is security state: even the list shape is Operator-gated.
         ["gateway-trust-bundles"] => Some(Some(AdminRole::Operator)),
         ["audit"] => Some(Some(AdminRole::Admin)),
@@ -2757,7 +2760,9 @@ fn authorize_ceiling_global_route(
 
 /// Whether the caller may see the detailed observability views (`/metrics`
 /// scrape body, full `/health`, full `/overload`). Granted on any of: a valid
-/// admin JWT, a matching metrics bearer token, or an allowlisted source IP.
+/// primary admin JWT, a matching metrics bearer token, or an allowlisted source
+/// IP. A namespace-ceiling viewer JWT is not itself detail authorization, but
+/// does not revoke independent bearer-token or source-IP authorization.
 ///
 /// `/metrics` turns a `false` here into `401`; `/health` and `/overload` turn
 /// it into a minimal, LB-safe projection instead.
@@ -2766,16 +2771,6 @@ fn observability_detail_allowed(
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
-    if state
-        .jwt_manager
-        .verify_request(auth_header)
-        .ok()
-        .and_then(|token| AuditActor::from_verified(&token).ok())
-        .is_some_and(|actor| actor.namespace_ceiling.is_some())
-    {
-        return false;
-    }
-
     admin_jwt_detail_allowed(state, auth_header)
         || state.metrics_auth.token_matches(auth_header)
         || state.metrics_auth.ip_allowed(client_ip)
@@ -3046,9 +3041,7 @@ async fn handle_admin_request_inner(
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
         let admin_jwt_detail = admin_jwt_detail_allowed(&state, auth_header.as_deref());
-        let detailed = admin_jwt_detail
-            || state.metrics_auth.token_matches(auth_header.as_deref())
-            || state.metrics_auth.ip_allowed(&client_ip);
+        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),
@@ -4292,6 +4285,10 @@ async fn handle_admin_request_inner(
         }
         (Method::GET, ["proxies", id]) => {
             crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
+        }
+        (Method::GET, ["proxies", id, "mcp", "tools"]) => {
+            let pagination = route_pagination!();
+            mcp_tool_catalog::handle_get_mcp_tool_catalog(&state, id, &namespace, &pagination).await
         }
         (Method::POST, ["proxies"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

@@ -5,8 +5,8 @@ info:
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
     `/live`, `/health`, `/status`, and `/overload` expose minimal unauthenticated
-    observations. A viewer-key token with a namespace ceiling receives these
-    same minimal health/status and overload responses; it receives `403` on
+    observations. A viewer-key token with a namespace ceiling never adds detail to these (the
+    caller gets what it would get with no token); it receives `403` on
     detailed metrics routes. Exact `/metrics` requires a valid admin JWT, a matching
     `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within
     `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401 Unauthorized`.
@@ -50,8 +50,8 @@ info:
     `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, every global route is denied with
     `403` unless it is the filtered `/namespaces` registry, `GET /plugins`
     (plugin type catalog), or a health/liveness/readiness probe (`GET /health`,
-    `/live`, `/status`, `/overload`). Health and status return only `status`
-    and `ready`, overload returns only `{level}`, and detailed `/metrics`
+    `/live`, `/status`, `/overload`). The token adds no detail to these probes
+    (the caller gets what it would get with no token), and detailed `/metrics`
     routes return `403`. Other denied routes include `/charges`,
     `/admin/metrics`, `/metrics/runtime`, `/cluster`, `/backend-capabilities`,
     mesh introspection, and new global routes by default. Primary-key tokens and viewer-key tokens without a namespace
@@ -1839,8 +1839,8 @@ paths:
         diagnostics, `request_buffer` (aggregate buffered-request budget
         pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
-        source IP. A namespace-ceiling-bound viewer-key JWT receives only
-        `{level}`.
+        source IP. A namespace-ceiling-bound viewer-key JWT adds no
+        detail (the caller gets what it would get with no token).
 
         Returns `503 Service Unavailable` when the overload level is `critical`
         (for both tiers).
@@ -5523,6 +5523,87 @@ paths:
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
+  /proxies/{id}/mcp/tools:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
+
+    get:
+      operationId: getProxyMcpToolCatalog
+      summary: Read an mcp_gateway proxy's cached tool catalog (paginated)
+      description: |
+        Returns the tools an `mcp_gateway` proxy exposes, without speaking MCP
+        to it. Viewer role or above. Namespace-scoped like `GET /proxies/{id}`:
+        the `ns`-claim gate and the viewer-key namespace ceiling
+        (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`) apply, so a namespace outside
+        the caller's reach answers `403` and a proxy of another namespace
+        answers `404`.
+
+        The response reads only the catalog the running `mcp_gateway`
+        instances already cached. It never contacts an upstream and never
+        starts a refresh. Catalogs are cached per downstream MCP session, so
+        each instance reports its most recently refreshed session catalog. An
+        upstream may tailor tools per principal, so the catalog can reflect
+        one principal's view. `refreshed_at` and `stale` track tools refreshes;
+        resource-template refreshes do not change them.
+        `refreshed_at` is `null` and `stale` is `true` until a session has
+        listed tools. The catalog is node-local: on a control plane, or on a
+        data plane that does not serve the proxy's namespace, each instance
+        reports `catalog_state: not_served` and no tools.
+
+        In database mode, the proxy row and associated plugin configs come
+        from the store, while global `mcp_gateway` configs come from this
+        node's cached namespace config. If the proxy exists in the store but
+        its namespace is absent from that cache, and it relies only on a
+        global `mcp_gateway`, the endpoint returns
+        `Proxy has no mcp_gateway plugin` (404) instead of a `not_served`
+        catalog. Proxy and proxy-group associations are still read from the
+        store.
+
+        `data` lists the tools of every effective `mcp_gateway` instance on
+        the proxy, ordered by instance then public name, and paginates with
+        the shared `limit` / `offset` bounds. The catalog itself stays within
+        the instance's `validation.max_catalog_items_per_list` and
+        `validation.max_catalog_bytes_per_list` caps.
+
+        Every role receives the same projection. A server's `upstream_url` is
+        always reduced to `scheme://host[:port]` plus redaction markers, and
+        no header, session id, or token is returned. Refresh failures are
+        reported as fixed text, never as upstream error bodies.
+      tags: [Proxies]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
+      responses:
+        "200":
+          description: Cached tool catalog
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/McpToolCatalogResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: |
+            The proxy does not exist in this namespace (`Proxy not found`), or
+            no enabled `mcp_gateway` applies to it
+            (`Proxy has no mcp_gateway plugin`). In database mode, the latter
+            can also occur when the proxy relies only on a global config in a
+            namespace absent from this node's cached configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
     parameters:
@@ -8068,8 +8149,9 @@ components:
         is denied with `403` by default for a ceiling-bound token except the
         filtered namespace registry, `GET /plugins` (plugin type catalog), and
         health/liveness/readiness probes (`GET /health`, `/live`, `/status`,
-        `/overload`). Health/status return only `status` and `ready`, overload
-        returns only `{level}`, and detailed `/metrics` routes return `403`.
+        `/overload`). The token adds no detail to these probes (the
+        caller gets what it would get with no token), and detailed `/metrics`
+        routes return `403`.
         Tokens verified by `FERRUM_ADMIN_JWT_SECRET` are never
         affected. Unset, the viewer secret is a fleet-wide read credential;
         per-tenant readers can also use tokens
@@ -8084,8 +8166,8 @@ components:
         trimming when nonempty; unset or blank disables token auth). Startup
         and validation reject shorter tokens. Accepted only by observability
         scrape/detail surfaces such as exact `/metrics` and detailed
-        `/health`/`/status`/`/overload`. Ceiling-bound viewer-key tokens receive
-        only minimal health/overload projections and cannot scrape metrics.
+        `/health`/`/status`/`/overload`. Ceiling-bound viewer-key tokens add no
+        detail to health/overload and cannot scrape metrics.
         CIDR-based metrics access is configured
         separately with `FERRUM_METRICS_ALLOWED_CIDRS` and cannot be represented
         as an OpenAPI security scheme.
@@ -9926,7 +10008,12 @@ components:
             different path than routing and policy evaluated. Enable it only
             for backends that use matrix parameters: routing, policy, and the
             backend request line then carry the `;` unchanged, so policy keyed
-            on a parameter-free path does not match those requests. Dot
+            on a parameter-free path does not match those requests. A request
+            is still refused when its path with every parameter removed
+            belongs to a different proxy (`/admin;x/users` on an opted-in `/`
+            when an `/admin` proxy exists); a less specific ancestor of this
+            proxy's own literal `listen_path` does not count, so a catch-all
+            `/` does not shadow `/api;v=1`. Dot
             segments with a parameter (`..;`) and segments that are empty
             before their `;` (`/;x/admin`) are refused either way. A literal
             `listen_path` containing `;` requires `true`. HTTP-family proxies
@@ -18497,6 +18584,284 @@ components:
             multiplied by the number of replicas receiving that identity's TCP
             connections.
 
+    # ── MCP tool catalog ──────────────────────────────────────────────
+    McpToolCatalogResponse:
+      type: object
+      description: |
+        `GET /proxies/{id}/mcp/tools`. Top-level `refreshed_at` is the least
+        recent tools refresh across `catalogs`, `null` when any of them has
+        never been refreshed on this node. Resource-template refreshes do not
+        change this timestamp. `stale` is `true` unless every tools catalog is
+        `fresh`. Catalogs show the most recently refreshed downstream session;
+        an upstream that tailors tools per principal can make this one
+        principal's view.
+      required: [proxy_id, namespace, refreshed_at, stale, catalogs, data, pagination]
+      properties:
+        proxy_id:
+          type: string
+        namespace:
+          type: string
+        refreshed_at:
+          type: [string, "null"]
+          format: date-time
+        stale:
+          type: boolean
+        catalogs:
+          type: array
+          description: One entry per effective `mcp_gateway` instance on the proxy.
+          items:
+            $ref: "#/components/schemas/McpToolCatalog"
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpToolCatalogTool"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+    McpToolCatalog:
+      type: object
+      description: |
+        One `mcp_gateway` instance's cached catalog. An instance this node does
+        not run (`not_served`) carries only `plugin_config_id`,
+        `catalog_state`, `refreshed_at`, `stale`, `tool_count`, and an empty
+        `servers` list.
+      required: [plugin_config_id, catalog_state, refreshed_at, stale, tool_count, servers]
+      properties:
+        plugin_config_id:
+          type: string
+        catalog_state:
+          type: string
+          enum: [fresh, stale, not_refreshed, unmediated, not_served]
+          description: |
+            `fresh`: refreshed within `discovery.cache_ttl_seconds`. `stale`:
+            older than that; the next MCP request refreshes it. `not_refreshed`:
+            no session has listed tools yet. `unmediated`: a
+            `transparent_proxy` instance, which has no catalog. `not_served`:
+            this node runs no instance for the proxy (a control plane, another
+            namespace, or a change that is not live yet). In database mode,
+            when a proxy exists in the store but only relies on a global
+            `mcp_gateway` in a namespace absent from this node's cached config,
+            the endpoint can return 404 before producing a `not_served` entry.
+        mode:
+          type: string
+          enum: [aggregate_router, transparent_proxy]
+        enabled:
+          type: boolean
+          description: The instance's own `config.enabled`.
+        endpoint_path:
+          type: string
+        refreshed_at:
+          type: [string, "null"]
+          format: date-time
+          description: Last tools catalog refresh; resource-template refreshes do not change it.
+        stale:
+          type: boolean
+        cache_ttl_seconds:
+          type: integer
+          minimum: 1
+        catalog_version:
+          type: [integer, "null"]
+          minimum: 0
+        cached_sessions:
+          type: integer
+          minimum: 0
+          description: Downstream sessions currently holding a catalog.
+        tool_count:
+          type: integer
+          minimum: 0
+        tools_unavailable:
+          type: boolean
+          description: |
+            Every attempted upstream failed its `tools/list` with no last-good
+            state, so `tools/list` answers JSON-RPC `-32006` from this catalog.
+        discovery:
+          type: object
+          required: [on_new_tool, on_schema_change]
+          properties:
+            on_new_tool:
+              type: string
+              enum: [allow, hide_until_configured]
+            on_schema_change:
+              type: string
+              enum: [allow, hide_until_configured]
+        policy:
+          type: object
+          required: [default_action, hide_denied_tools]
+          properties:
+            default_action:
+              type: string
+              enum: [allow, deny]
+            hide_denied_tools:
+              type: boolean
+              description: |
+                Denied tools are left out of `tools/list`
+                (`discovery.hide_denied_items` or `policy.hide_denied_tools`).
+        limits:
+          type: object
+          required: [max_catalog_items_per_list, max_catalog_bytes_per_list]
+          properties:
+            max_catalog_items_per_list:
+              type: integer
+              minimum: 1
+            max_catalog_bytes_per_list:
+              type: integer
+              minimum: 1
+        servers:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpToolCatalogServer"
+    McpToolCatalogServer:
+      type: object
+      required:
+        - server_id
+        - namespace
+        - kind
+        - upstream_url
+        - enabled
+        - expose_tools
+        - tools_refresh
+        - refresh_error
+      properties:
+        server_id:
+          type: string
+        namespace:
+          type: string
+          description: The server's public tool-name namespace.
+        kind:
+          type: string
+          enum: [mcp, openapi]
+        upstream_url:
+          type: [string, "null"]
+          description: |
+            Structural projection of `servers.*.upstream_url` for every role:
+            `scheme://host[:port]`, then `/[REDACTED_PATH]` when the URL has a
+            path. `null` for an `openapi` server.
+        enabled:
+          type: boolean
+        expose_tools:
+          type: boolean
+        tools_refresh:
+          type: string
+          enum: [ok, stale, failed, pending, not_listed, disabled]
+          description: |
+            Outcome of this server's most recent `tools/list` in the reported
+            catalog. `stale`: it failed and last-good tools are served.
+            `failed`: it failed with no last-good tools. `pending`: not listed
+            yet. `not_listed`: tools are not aggregated from this server.
+        refresh_error:
+          type: [string, "null"]
+          description: Fixed text for `stale` and `failed`; never an upstream error body.
+    McpToolCatalogTool:
+      type: object
+      required:
+        - name
+        - plugin_config_id
+        - title
+        - description
+        - annotations
+        - source
+        - policy
+        - allowed_groups
+        - denied_groups
+        - schema_hash
+        - discovered_at
+      properties:
+        name:
+          type: string
+          description: Public namespaced tool name, as `tools/list` publishes it.
+        plugin_config_id:
+          type: string
+        title:
+          type: [string, "null"]
+        description:
+          type: [string, "null"]
+          description: The source description, without the `[namespace]` prefix.
+        annotations:
+          type: [object, "null"]
+          additionalProperties: true
+        source:
+          type: object
+          required: [type, server_id, namespace]
+          properties:
+            type:
+              type: string
+              enum: [upstream, openapi]
+            server_id:
+              type: string
+            namespace:
+              type: string
+            upstream_name:
+              type: string
+              description: The tool name the upstream MCP server lists (`upstream`).
+            operation_name:
+              type: string
+              description: The generating OpenAPI operation's name (`openapi`).
+            method:
+              type: string
+              description: The generating operation's HTTP method (`openapi`).
+            path:
+              type: string
+              description: The generating operation's path template (`openapi`).
+        policy:
+          type: object
+          required: [action, configured, effective, listed, callable]
+          properties:
+            action:
+              type: string
+              enum: [allow, deny, hide_from_discovery]
+              description: The `policy.tools` entry's action, else `policy.default_action`.
+            configured:
+              type: boolean
+              description: Whether `policy.tools` names this tool.
+            effective:
+              type: string
+              enum: [allow, deny, hide_from_discovery, hidden_until_configured, hidden_schema_changed]
+              description: |
+                `hidden_until_configured`: hidden by `discovery.on_new_tool:
+                hide_until_configured` until `policy.tools` names it.
+                `hidden_schema_changed`: the schema hash changed under
+                `discovery.on_schema_change: hide_until_configured`. The hash
+                covers `inputSchema` alone when
+                `validation.validate_tool_results` is false; when true it
+                covers the serialized object containing both `inputSchema`
+                and `outputSchema`, matching drift detection and
+                `mcp.input_schema_hash` metadata. Otherwise the configured
+                action.
+            listed:
+              type: boolean
+              description: |
+                Whether `tools/list` includes it for a consumer its grant
+                admits. OpenAPI bridge tools are also filtered by the proxy's
+                `allowed_methods`.
+            callable:
+              type: boolean
+              description: |
+                Whether `tools/call` is admitted for a consumer its grant
+                admits. OpenAPI bridge tools are also filtered by the proxy's
+                `allowed_methods`.
+        allowed_groups:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            `policy.tools.*.allowed_groups`, sorted; `null` when every consumer
+            is admitted subject to the action.
+        denied_groups:
+          type: array
+          items:
+            type: string
+        schema_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: |
+            Gateway stored lowercase hex SHA-256 schema hash. With
+            `validation.validate_tool_results: false`, it hashes serialized
+            `inputSchema`. With it true, it hashes the serialized object
+            `{ "inputSchema": ..., "outputSchema": ... }` (including null
+            when outputSchema is absent). This is the hash used by
+            `hidden_schema_changed` and `mcp.input_schema_hash` metadata.
+        discovered_at:
+          type: string
+          format: date-time
     # ── Pagination envelope ────────────────────────────────────────────
     Pagination:
       type: object
@@ -28527,6 +28892,58 @@ components:
           minContains: 1
           maxContains: 1
           description: "Rate-limit rules. Must include exactly one `scope: default` rule. `scope: consumers` rules are only valid when `limit_by` is `consumer`."
+        mcp_tool_calls:
+          type: [object, "null"]
+          additionalProperties: false
+          description: >-
+            Count MCP JSON-RPC tools/call requests instead of HTTP requests
+            (null or omitted counts requests). Only tools/call is charged: each
+            tools/call member of a JSON-RPC batch is one charge, including
+            notification-form tools/call members (a tools/call without an id
+            is still charged); notifications/* methods, initialize, tools/list,
+            and every other method pass uncounted. The charge runs in before_proxy over the buffered body,
+            with the media types mcp_gateway admits (application/json,
+            application/json-rpc, +json, or no Content-Type); a body with
+            duplicate member names, or a batch past 32 members / 1 MiB / 256 KiB
+            per member, is refused with JSON-RPC -32600. These recognizer bounds
+            are fixed at 32 members / 1 MiB / 256 KiB per member; setting
+            mcp_gateway validation.max_batch_* above these values makes the
+            limiter refuse the larger request with -32600. An in-scope request
+            with non-identity Content-Encoding is refused with JSON-RPC -32017
+            unless an earlier decompression hook has removed the encoding.
+            An exhausted budget is
+            answered on HTTP 200 with a JSON-RPC error (code -32015, one per
+            request-form batch member) plus x-ratelimit-* headers when
+            expose_headers is set; a fail-closed Redis outage answers -32016.
+            The mode is HTTP-only.
+          properties:
+            endpoint_path:
+              type: [string, "null"]
+              pattern: '^/[^?#\x00-\x1f\x7f-\x9f]*$'
+              description: "Inspect and buffer only requests to exactly this path (normally mcp_gateway endpoint.path). No query, fragment, or control character."
+            tools:
+              type: [array, "null"]
+              minItems: 1
+              maxItems: 256
+              uniqueItems: true
+              items:
+                type: string
+                minLength: 1
+                maxLength: 255
+                pattern: '^[^\x00-\x1f\x7f-\x9f]+$'
+              description: "Count only calls naming one of these public tool names. The per-name bound is enforced by the constructor in UTF-8 bytes (maxLength counts characters)."
+            per_tool:
+              type: [boolean, "null"]
+              default: false
+              description: "Keep one budget per listed tool instead of one shared by every counted call. Requires tools."
+          if:
+            required: [per_tool]
+            properties:
+              per_tool: {const: true}
+          then:
+            required: [tools]
+            properties:
+              tools: {type: array}
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
@@ -32378,6 +32795,23 @@ components:
       required: [sink]
       additionalProperties: false
       allOf:
+        # capture.mcp_arguments exports argument excerpts, so it needs a
+        # body-capturing mode (an absent mode is the redacted_body default) and
+        # MCP tool-call capture itself.
+        - if:
+            required: [capture]
+            properties:
+              capture:
+                type: object
+                required: [mcp_arguments]
+                properties:
+                  mcp_arguments: {const: true}
+          then:
+            properties:
+              mode: {enum: [redacted_body, full_body, null]}
+              capture:
+                properties:
+                  mcp_tool_calls: {enum: [true, null]}
         # mode: full_body captures UNREDACTED payloads, so the constructor
         # requires the explicit allow_full_body opt-in.
         - if:
@@ -32468,6 +32902,18 @@ components:
               type: [boolean, "null"]
               default: true
               description: "Extract tool/function names from the request body."
+            mcp_tool_calls:
+              type: [boolean, "null"]
+              default: true
+              description: "Treat MCP JSON-RPC tools/call requests (a singleton, or a batch with a tools/call member) as audit candidates for JSON-ish content types. Content-Type-less POSTs are buffered and captured when they carry a tools/call (a byte pre-scan skips parsing and staging for anything else); set capture.mcp_endpoint_path to limit this to one exact path; add an mcp section to records with the public tool name, keyed arguments_hash, optional excerpt, outcome, and bounded gateway metadata. At most 32 calls per record; later ones are counted in calls_omitted."
+            mcp_endpoint_path:
+              type: [string, "null"]
+              pattern: '^/[^?#\x00-\x1f\x7f-\x9f]*$'
+              description: "Optional exact path that narrows Content-Type-less MCP capture. When unset, Content-Type-less POSTs on every path are buffered and checked for a tools/call; when set, only this path is. Set it to the mcp_gateway endpoint.path to avoid buffering other Content-Type-less uploads."
+            mcp_arguments:
+              type: [boolean, "null"]
+              default: false
+              description: "Add each MCP call's arguments excerpt, shaped like a body excerpt (redacted in redacted_body, raw in full_body) and sharing limits.max_request_bytes with the request excerpt. Requires mcp_tool_calls and mode redacted_body or full_body."
             stream_hash:
               type: [string, "null"]
               enum: [capped, full, null]
@@ -34098,9 +34544,9 @@ components:
           description: "Custom {name, regex} patterns. Each entry accepts exactly these two members; an unknown member is fatal at construction, like an unknown top-level field. `regex` must not match the empty string — a zero-width rule would insert the redaction placeholder at every position — and `name` is bounded (maxLength, in characters) because it is substituted into redaction_placeholder."
         scan_fields:
           type: string
-          enum: [content, all]
+          enum: [content, all, mcp_arguments]
           default: content
-          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, inputText, message, preamble, and inputs (completions/responses/embeddings/Anthropic-system/Bedrock-Titan/Cohere-v1/HuggingFace-TGI shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, Cohere chat_history[].message, Google Vertex legacy predict instances[].prompt, Bedrock Converse messages[].content[].toolResult content and guardContent text, Anthropic tool_result block content, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
+          description: "Which parts of the request to scan. 'mcp_arguments' scans only params.arguments of MCP JSON-RPC tools/call requests (a singleton or every tools/call member of a batch), accepts the media types mcp_gateway admits (application/json, application/json-rpc, +json, or no Content-Type), and refuses a body with duplicate member names under reject/redact (400, ai_shield_rejected=ambiguous_json). 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, inputText, message, preamble, and inputs (completions/responses/embeddings/Anthropic-system/Bedrock-Titan/Cohere-v1/HuggingFace-TGI shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, Cohere chat_history[].message, Google Vertex legacy predict instances[].prompt, Bedrock Converse messages[].content[].toolResult content and guardContent text, Anthropic tool_result block content, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
@@ -35957,8 +36403,12 @@ components:
         observability): only the backend method, path, query, headers, and body
         change, never the destination host, scheme, or port, and no URL from an
         OpenAPI document is ever dialed. The proxy's allowed_methods applies to
-        the bridged method too (a call whose method the route does not allow is
-        refused with JSON-RPC -32001), but method- or path-conditioned plugin
+        the bridged method too: a tool whose method the route does not allow is
+        omitted from tools/list, and a call to it is refused with JSON-RPC
+        -32003 (Unknown MCP tool) when no grants are configured, or -32001
+        when grants are configured. The method check follows tool policy and
+        the per-consumer grant and precedes argument validation. Method- or
+        path-conditioned plugin
         triggers, WAF path and method rules, and authorization keyed on the
         request path see the client's POST to the MCP endpoint, never the
         bridged method and path; restrict a bridged operation through

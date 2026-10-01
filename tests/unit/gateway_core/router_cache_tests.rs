@@ -1,7 +1,15 @@
 use chrono::Utc;
 use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
+use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+use ferrum_edge::policy_path::strip_path_parameters;
 use ferrum_edge::proxy::build_backend_url;
+use ferrum_edge::router_cache::{
+    HostRouteRank, MeshRouteScope, MeshScopedResolution, host_route_rank,
+    path_parameter_direct_workload_route_admitted, path_parameter_route_admitted,
+    path_parameter_scoped_route_admitted,
+};
 
 // This suite intentionally exercises the public RouterCache facade.
 // Request hot paths use epoch-loaded route snapshots and are covered by
@@ -2074,4 +2082,718 @@ fn later_port_scoped_regex_cannot_shadow_an_earlier_different_pattern() {
         .find_proxy_on_frontend(Some("app.example.com"), "/admin/secret", Some(9001), false)
         .expect("the earlier protected regex must match");
     assert_eq!(matched.proxy.id, "protected-admin");
+}
+
+// ============================================================
+// Path-parameter re-route admission (GHSA-fcqw-793q-wg5x, issue #5938)
+// ============================================================
+
+fn opted_in(mut proxy: Proxy) -> Proxy {
+    proxy.allow_path_parameters = true;
+    proxy
+}
+
+fn opted_in_hosted(id: &str, listen_path: &str, hosts: Vec<&str>) -> Proxy {
+    opted_in(test_proxy_with_hosts(id, listen_path, hosts))
+}
+
+/// Route `path` and its parameter-stripped form the way the frontends do.
+/// Returns the proxy the request reached and whether the request is served:
+/// a stripped path that routes nowhere is served, and any other is decided by
+/// `path_parameter_route_admitted`.
+fn reroute(cache: &RouterCache, host: Option<&str>, path: &str) -> (String, bool) {
+    let matched = cache.find_proxy(host, path).expect("request must route");
+    let stripped = strip_path_parameters(path);
+    let Some(stripped_route) = cache.find_proxy(host, &stripped) else {
+        return (matched.proxy.id.clone(), true);
+    };
+    let admitted = path_parameter_route_admitted(&matched.proxy, &stripped_route, host);
+    (matched.proxy.id.clone(), admitted)
+}
+
+#[test]
+fn literal_parameter_listen_path_is_not_shadowed_by_a_catch_all() {
+    let config = test_config(vec![
+        opted_in(test_proxy("root", "/")),
+        opted_in(test_proxy("versioned", "/api;v=1")),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in [
+        "/api;v=1",
+        "/api;v=1/",
+        "/api;v=1/x",
+        "/api;v=1/x;y=2/z",
+        "/api;v=1/admin;x/users",
+    ] {
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("versioned".to_string(), true),
+            "{path}: the catch-all `/` is an ancestor of `/api`"
+        );
+    }
+}
+
+#[test]
+fn opted_in_catch_all_still_refuses_a_parameter_that_skips_a_proxy() {
+    let config = test_config(vec![
+        opted_in(test_proxy("root", "/")),
+        test_proxy("admin", "/admin"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in ["/admin;x/users", "/admin;/users", "/admin;x", "/admin;x/"] {
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("root".to_string(), false),
+            "{path}: the stripped path belongs to `/admin`"
+        );
+    }
+    assert_eq!(
+        reroute(&cache, None, "/other;x/y"),
+        ("root".to_string(), true),
+        "a stripped path that stays on the catch-all is served"
+    );
+}
+
+#[test]
+fn sibling_or_descendant_of_the_stripped_listen_path_still_refuses() {
+    for (sibling, path) in [
+        ("/api", "/api;v=1/x"),
+        ("/api/", "/api;v=1/x"),
+        ("/api/private", "/api;v=1/private/x"),
+        ("/api/private", "/api;v=1/private;x/y"),
+        ("=/api/x", "/api;v=1/x"),
+        ("~/api/.*", "/api;v=1/x"),
+    ] {
+        let config = test_config(vec![
+            opted_in(test_proxy("versioned", "/api;v=1")),
+            test_proxy("sibling", sibling),
+        ]);
+        let cache = RouterCache::new(&config, 100);
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("versioned".to_string(), false),
+            "{path}: `{sibling}` owns the stripped path"
+        );
+    }
+
+    let config = test_config(vec![
+        test_proxy("root", "/"),
+        opted_in(test_proxy("versioned", "/api;v=1")),
+        test_proxy("private", "/api/private"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/api;v=1/public/x"),
+        ("versioned".to_string(), true),
+        "a path outside the descendant still reaches the literal route"
+    );
+}
+
+#[test]
+fn trailing_slash_parameter_listen_path_claims_its_segment() {
+    for (listen_path, path) in [
+        ("/api;v=1/", "/api;v=1/secret"),
+        ("=/api;v=1/", "/api;v=1/"),
+    ] {
+        let config = test_config(vec![
+            opted_in(test_proxy("versioned", listen_path)),
+            test_proxy("api", "/api"),
+        ]);
+        let cache = RouterCache::new(&config, 100);
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("versioned".to_string(), false),
+            "{listen_path}: `/api` owns the same segment"
+        );
+
+        let config = test_config(vec![
+            opted_in(test_proxy("versioned", listen_path)),
+            test_proxy("root", "/"),
+        ]);
+        let cache = RouterCache::new(&config, 100);
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("versioned".to_string(), true),
+            "{listen_path}: the catch-all `/` is an ancestor"
+        );
+    }
+}
+
+#[test]
+fn exact_parameter_listen_path_is_not_shadowed_by_a_catch_all() {
+    let config = test_config(vec![
+        test_proxy("root", "/"),
+        opted_in(test_proxy("exact", "=/exact;v=1")),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/exact;v=1"),
+        ("exact".to_string(), true)
+    );
+
+    for sibling in ["/exact", "=/exact"] {
+        let config = test_config(vec![
+            test_proxy("root", "/"),
+            opted_in(test_proxy("exact", "=/exact;v=1")),
+            test_proxy("sibling", sibling),
+        ]);
+        let cache = RouterCache::new(&config, 100);
+        assert_eq!(
+            reroute(&cache, None, "/exact;v=1"),
+            ("exact".to_string(), false),
+            "`{sibling}` owns the stripped path"
+        );
+    }
+}
+
+#[test]
+fn path_parameter_reroute_respects_host_tiers() {
+    let config = test_config(vec![
+        test_proxy("root", "/"),
+        test_proxy("private", "/api/private"),
+        opted_in_hosted("api-v", "/api;v=1", vec!["api.test"]),
+        opted_in_hosted("www-v", "/api;v=1", vec!["www.org.test"]),
+        test_proxy_with_hosts("wild-root", "/", vec!["*.org.test"]),
+        opted_in(test_proxy("svc-v", "/svc;v=1/v2")),
+        test_proxy_with_hosts("api-svc", "/svc", vec!["api.test"]),
+        opted_in_hosted("wild-v", "/wild;v=1/v2", vec!["*.org.test"]),
+        test_proxy_with_hosts("www-wild", "/wild", vec!["www.org.test"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for (host, path, expected_proxy, expected) in [
+        // Exact-host literal route against a less specific catch-all `/`.
+        ("api.test", "/api;v=1/x", "api-v", true),
+        // Exact-host literal route against a less specific wildcard `/`.
+        ("www.org.test", "/api;v=1/x", "www-v", true),
+        // A catch-all descendant owns the stripped path on a host whose own
+        // routes do not cover it.
+        ("api.test", "/api;v=1/private/x", "api-v", false),
+        // On a host with a wildcard `/`, that wildcard owns the stripped path
+        // ahead of the catch-all descendant, exactly as plain routing does.
+        ("www.org.test", "/api;v=1/private/x", "www-v", true),
+        // An exact-host `/svc` owns `/svc/v2/x` ahead of the catch-all
+        // `/svc;v=1/v2`, although its prefix is shorter.
+        ("api.test", "/svc;v=1/v2/x", "svc-v", false),
+        // On a host without that route the catch-all `/` is an ancestor.
+        ("other.test", "/svc;v=1/v2/x", "svc-v", true),
+        // An exact-host `/wild` outranks the wildcard `/wild;v=1/v2`.
+        ("www.org.test", "/wild;v=1/v2/x", "wild-v", false),
+    ] {
+        assert_eq!(
+            reroute(&cache, Some(host), path),
+            (expected_proxy.to_string(), expected),
+            "{host} {path}"
+        );
+    }
+}
+
+#[test]
+fn path_parameter_reroute_ranks_wildcard_patterns_by_specificity() {
+    let config = test_config(vec![
+        opted_in_hosted("broad-v", "/w;v=1/v2", vec!["*.example.com"]),
+        test_proxy_with_hosts("narrow-w", "/w", vec!["*.a.example.com"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, Some("x.a.example.com"), "/w;v=1/v2/x"),
+        ("broad-v".to_string(), false),
+        "a longer wildcard pattern outranks a shorter one"
+    );
+
+    let config = test_config(vec![
+        opted_in_hosted("narrow-v", "/w;v=1/v2", vec!["*.a.example.com"]),
+        test_proxy_with_hosts("broad-w", "/w", vec!["*.example.com"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, Some("x.a.example.com"), "/w;v=1/v2/x"),
+        ("narrow-v".to_string(), true),
+        "a shorter wildcard ancestor does not shadow a longer one"
+    );
+}
+
+#[test]
+fn regex_and_host_only_proxies_keep_the_strict_reroute_rule() {
+    let config = test_config(vec![
+        opted_in(test_proxy("regex", "~/re;v=1/v2/.*")),
+        test_proxy("re", "/re"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/re;v=1/v2/x"),
+        ("regex".to_string(), false),
+        "a regex proxy claims no literal prefix, so even an ancestor refuses"
+    );
+
+    let config = test_config(vec![
+        opted_in(host_only_proxy("host-only", &["api.test"])),
+        test_proxy_with_hosts("admin", "/admin", vec!["api.test"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, Some("api.test"), "/admin;x/users"),
+        ("host-only".to_string(), false)
+    );
+    assert_eq!(
+        reroute(&cache, Some("api.test"), "/other;x/y"),
+        ("host-only".to_string(), true),
+        "a stripped path that stays on the host-only proxy is served"
+    );
+}
+
+#[test]
+fn path_parameter_reroute_refuses_a_direction_scoped_mesh_route() {
+    let config = test_config(vec![
+        test_proxy("__mesh-inbound-default-web-8080", "/"),
+        opted_in(test_proxy("versioned", "/api;v=1")),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/api;v=1/x"),
+        ("versioned".to_string(), false),
+        "the re-lookup does not filter mesh direction (ferrum-edge#5937)"
+    );
+}
+
+// ============================================================
+// Mesh-scoped path-parameter re-route (issue #5937, N2 of #5938)
+// ============================================================
+
+const MESH_NAMESPACE: &str = "default";
+
+/// A mesh-materialised-style `/` route: the reserved id, the service's hosts,
+/// and the mesh namespace the router groups port siblings under.
+fn mesh_route(id: &str, hosts: Vec<&str>, allow_path_parameters: bool) -> Proxy {
+    let mut proxy = test_proxy_with_hosts(id, "/", hosts);
+    proxy.namespace = MESH_NAMESPACE.to_string();
+    proxy.allow_path_parameters = allow_path_parameters;
+    proxy
+}
+
+/// The mesh block the router derives per-port sibling groups from.
+fn mesh_services(services: &[(&str, &[u16])]) -> Option<Box<MeshConfig>> {
+    Some(Box::new(MeshConfig {
+        services: services
+            .iter()
+            .map(|(name, ports)| MeshService {
+                cluster_ips: Vec::new(),
+                name: name.to_string(),
+                namespace: MESH_NAMESPACE.to_string(),
+                ports: ports
+                    .iter()
+                    .map(|port| ServicePort {
+                        port: *port,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                        target_port: None,
+                    })
+                    .collect(),
+                workloads: Vec::new(),
+                protocol_overrides: std::collections::HashMap::new(),
+                uid: None,
+                allow_path_parameters: true,
+            })
+            .collect(),
+        ..MeshConfig::default()
+    }))
+}
+
+fn outbound(orig_dst_port: Option<u16>) -> MeshRouteScope {
+    MeshRouteScope {
+        direction: Some(MeshTrafficDirection::Outbound),
+        orig_dst_port,
+        authority_port: None,
+    }
+}
+
+fn inbound(authority_port: Option<u16>) -> MeshRouteScope {
+    MeshRouteScope {
+        direction: Some(MeshTrafficDirection::Inbound),
+        orig_dst_port: None,
+        authority_port,
+    }
+}
+
+/// Resolve `path` the way a plaintext request frontend with no frontend port
+/// resolves it, mesh steps included.
+fn scoped(
+    cache: &RouterCache,
+    host: Option<&str>,
+    path: &str,
+    mesh: MeshRouteScope,
+) -> MeshScopedResolution {
+    cache.resolve_mesh_scoped_route_for_test(host, path, None, false, mesh)
+}
+
+/// [`scoped`] for a request accepted on `frontend_port`.
+fn scoped_on_port(
+    cache: &RouterCache,
+    host: Option<&str>,
+    path: &str,
+    frontend_port: Option<u16>,
+    mesh: MeshRouteScope,
+) -> MeshScopedResolution {
+    cache.resolve_mesh_scoped_route_for_test(host, path, frontend_port, false, mesh)
+}
+
+/// What the frontends decide for a `;` request, with both lookups resolved
+/// the way the request itself is (mesh direction filter and port-sibling
+/// selection included): the proxy the request reached, and whether it is
+/// served.
+fn mesh_reroute(
+    cache: &RouterCache,
+    host: Option<&str>,
+    path: &str,
+    mesh: MeshRouteScope,
+) -> (String, bool) {
+    let MeshScopedResolution::Routed(matched) = scoped(cache, host, path, mesh) else {
+        panic!("request {path} must route");
+    };
+    let matched = matched.route_match().proxy.clone();
+    if !matched.allow_path_parameters {
+        return (matched.id.clone(), false);
+    }
+    let stripped = strip_path_parameters(path);
+    let served = match scoped(cache, host, &stripped, mesh) {
+        MeshScopedResolution::NotFound => true,
+        MeshScopedResolution::Refused => false,
+        MeshScopedResolution::Routed(stripped_route) => {
+            path_parameter_scoped_route_admitted(&matched, &stripped_route, host)
+        }
+    };
+    (matched.id.clone(), served)
+}
+
+#[test]
+fn mesh_scoped_reroute_serves_an_opted_in_mesh_route_that_strips_to_itself() {
+    let route = mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true);
+    let config = test_config(vec![route]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in ["/app/;jsessionid=x", "/app/page;jsessionid=x", "/a;x/b;y/c"] {
+        assert_eq!(
+            mesh_reroute(&cache, Some("web"), path, outbound(None)),
+            ("__mesh-outbound-default-web-8080".to_string(), true),
+            "{path} must re-resolve to the same opted-in mesh route"
+        );
+    }
+}
+
+#[test]
+fn mesh_scoped_reroute_refuses_a_mesh_route_without_the_opt_in() {
+    let route = mesh_route("__mesh-inbound-default-web-8080", vec!["web"], false);
+    let config = test_config(vec![route]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/app/;jsessionid=x", inbound(None)),
+        ("__mesh-inbound-default-web-8080".to_string(), false)
+    );
+}
+
+#[test]
+fn mesh_scoped_reroute_refuses_a_sibling_route_on_the_mesh_hosts() {
+    // An operator route on the service's own host, next to the opted-in mesh
+    // `/` route: `/admin;x/users` misses `/admin` and reaches the mesh route,
+    // whose parameter-stripping backend would execute `/admin/users`.
+    let mut admin = test_proxy_with_hosts("admin", "/admin", vec!["web"]);
+    admin.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true),
+        admin,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in ["/admin;x/users", "/admin;/users", "/admin;x"] {
+        assert_eq!(
+            mesh_reroute(&cache, Some("web"), path, outbound(None)),
+            ("__mesh-outbound-default-web-8080".to_string(), false),
+            "{path} must be refused: its stripped path belongs to /admin"
+        );
+    }
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/other;x/y", outbound(None)),
+        ("__mesh-outbound-default-web-8080".to_string(), true)
+    );
+}
+
+#[test]
+fn mesh_scoped_reroute_selects_the_port_sibling_the_request_selected() {
+    // Two HTTP ports of one service: the tiers hold the lowest-port
+    // representative, and the captured original destination picks the
+    // sibling. A plain re-lookup names the representative, so it used to
+    // refuse the 90 sibling's own requests.
+    let mut config = test_config(vec![
+        mesh_route("__mesh-outbound-default-web-80", vec!["web"], true),
+        mesh_route("__mesh-outbound-default-web-90", vec!["web"], true),
+    ]);
+    config.mesh = mesh_services(&[("web", &[80, 90])]);
+    let cache = RouterCache::new(&config, 100);
+
+    for port in [80u16, 90] {
+        assert_eq!(
+            mesh_reroute(
+                &cache,
+                Some("web"),
+                "/app/;jsessionid=x",
+                outbound(Some(port))
+            ),
+            (format!("__mesh-outbound-default-web-{port}"), true)
+        );
+    }
+
+    let raw = cache
+        .find_proxy(Some("web"), "/app/")
+        .expect("representative routes");
+    assert_eq!(raw.proxy.id, "__mesh-outbound-default-web-80");
+    let MeshScopedResolution::Routed(sibling) =
+        scoped(&cache, Some("web"), "/app/", outbound(Some(90)))
+    else {
+        panic!("the 90 sibling must route");
+    };
+    assert!(
+        !path_parameter_route_admitted(&sibling.route_match().proxy, &raw, Some("web")),
+        "the plain lookup cannot tell a port sibling from another route"
+    );
+
+    // Without an original destination a multi-port service is ambiguous:
+    // the frontend refuses it, and so does the re-resolve.
+    assert!(matches!(
+        scoped(&cache, Some("web"), "/app/", outbound(None)),
+        MeshScopedResolution::Refused
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_filters_the_other_direction() {
+    // The inbound and outbound capture listeners share one route table. On
+    // the outbound listener the local service's inbound route is dropped, so
+    // the stripped path of a request to an operator route resolves to no
+    // route rather than to the inbound loopback route.
+    let mut versioned = opted_in_hosted("versioned", "/api;v=1", vec!["web"]);
+    versioned.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], true),
+        versioned,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert!(matches!(
+        scoped(&cache, Some("web"), "/api/x", outbound(None)),
+        MeshScopedResolution::NotFound
+    ));
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api;v=1/x", outbound(None)),
+        ("versioned".to_string(), true)
+    );
+    // A non-mesh listener sees no mesh route either.
+    assert!(matches!(
+        scoped(&cache, Some("web"), "/api/x", MeshRouteScope::default()),
+        MeshScopedResolution::NotFound
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_admits_a_mesh_ancestor_of_a_literal_parameter_route() {
+    // An operator `/api;v=1` on a mesh service's host strips to `/api/...`,
+    // which the mesh `/` route owns on the inbound listener. That route is a
+    // less specific ancestor on the same host tier, so the request is served
+    // once the re-resolve is faithful. The plain decision still refuses it.
+    let mut versioned = opted_in_hosted("versioned", "/api;v=1", vec!["web"]);
+    versioned.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], false),
+        versioned,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api;v=1/x", inbound(None)),
+        ("versioned".to_string(), true)
+    );
+    let matched = cache
+        .find_proxy(Some("web"), "/api;v=1/x")
+        .expect("literal route");
+    let raw = cache
+        .find_proxy(Some("web"), "/api/x")
+        .expect("the mesh route owns the stripped path");
+    assert!(!path_parameter_route_admitted(
+        &matched.proxy,
+        &raw,
+        Some("web")
+    ));
+
+    // A mesh `/` route never outranks a sibling or descendant: the opted-in
+    // mesh route itself stays refused for a path an operator route owns.
+    let mut private = test_proxy_with_hosts("private", "/api/private", vec!["web"]);
+    private.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], true),
+        private,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api/private;x/y", inbound(None)),
+        ("__mesh-inbound-default-web-8080".to_string(), false)
+    );
+}
+
+#[test]
+fn mesh_scoped_reroute_refuses_an_ambiguous_inbound_port_signal() {
+    // A multi-port local service needs a port signal to pick its inbound
+    // sibling; the re-resolve applies the same selection.
+    let mut config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-80", vec!["web"], true),
+        mesh_route("__mesh-inbound-default-web-90", vec!["web"], true),
+    ]);
+    config.mesh = mesh_services(&[("web", &[80, 90])]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/app/;jsessionid=x", inbound(Some(90))),
+        ("__mesh-inbound-default-web-90".to_string(), true)
+    );
+    assert!(matches!(
+        scoped(&cache, Some("web"), "/app/", inbound(None)),
+        MeshScopedResolution::Refused
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_checks_the_dedicated_ingress_bind_port() {
+    // A dedicated Sidecar ingress bind route owns its own OS listener. The
+    // re-resolve repeats the frontend's bind-port check: the route serves only
+    // requests accepted on the port it declares.
+    let mut bind = mesh_route("__mesh-ingress-bind:default-web-16379", vec!["web"], true);
+    bind.listen_port = Some(16379);
+    // A bind-family route that declares no listener port matches on every
+    // frontend port, and the bind-port check refuses it (the frontend answers
+    // 502).
+    let unbound = mesh_route("__mesh-ingress-bind:default-api-16380", vec!["api"], true);
+    let config = test_config(vec![bind, unbound]);
+    let cache = RouterCache::new(&config, 100);
+
+    let MeshScopedResolution::Routed(route) =
+        scoped_on_port(&cache, Some("web"), "/app/", Some(16379), inbound(None))
+    else {
+        panic!("the bind route serves its own listener");
+    };
+    assert_eq!(
+        route.route_match().proxy.id,
+        "__mesh-ingress-bind:default-web-16379"
+    );
+    // The router scopes the bind route to its own listener, so on another
+    // frontend port the stripped path routes nowhere.
+    assert!(matches!(
+        scoped_on_port(&cache, Some("web"), "/app/", Some(15006), inbound(None)),
+        MeshScopedResolution::NotFound
+    ));
+    assert!(matches!(
+        scoped_on_port(&cache, Some("api"), "/app/", Some(15006), inbound(None)),
+        MeshScopedResolution::Refused
+    ));
+    assert!(matches!(
+        scoped_on_port(&cache, Some("api"), "/app/", None, inbound(None)),
+        MeshScopedResolution::Refused
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_from_the_http3_frontend_filters_every_mesh_route() {
+    // The HTTP/3 frontend is never a mesh capture listener. It replays a `;`
+    // request with no direction and no port signals, so the stripped lookup
+    // drops every direction-scoped mesh route, as the request's own lookup
+    // does, and still refuses a stripped path owned by another route.
+    let mut versioned = opted_in_hosted("versioned", "/api;v=1", vec!["web"]);
+    versioned.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], true),
+        mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true),
+        versioned,
+        opted_in_hosted("catch-all", "/", vec!["h3.test"]),
+        test_proxy_with_hosts("admin", "/admin", vec!["h3.test"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    let h3 = MeshRouteScope::default();
+
+    assert!(matches!(
+        scoped(&cache, Some("web"), "/app/", h3),
+        MeshScopedResolution::NotFound
+    ));
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api;v=1/x", h3),
+        ("versioned".to_string(), true),
+        "the stripped /api/x reaches no mesh route on HTTP/3"
+    );
+    assert_eq!(
+        mesh_reroute(&cache, Some("h3.test"), "/admin;x/users", h3),
+        ("catch-all".to_string(), false),
+        "the stripped /admin/users belongs to /admin"
+    );
+}
+
+#[test]
+fn direct_pod_ip_routes_skip_the_stripped_lookup_only_after_the_direct_decision() {
+    // The direct Pod-IP HTTP egress decision reads only the captured original
+    // destination, never the path, so a `;` request it routed needs no
+    // stripped re-lookup. Both halves are required: the frontend took that
+    // decision, and the matched proxy is a direct Pod-IP route.
+    let bywl = mesh_route(
+        "__mesh-outbound-http-bywl-default-web-8080-10-0-0-1",
+        vec!["bywl-default-web-8080-10-0-0-1.mesh.internal"],
+        true,
+    );
+    let host_routed = mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true);
+
+    assert!(path_parameter_direct_workload_route_admitted(&bywl, true));
+    assert!(
+        !path_parameter_direct_workload_route_admitted(&bywl, false),
+        "a direct Pod-IP route reached by host routing is re-resolved"
+    );
+    assert!(
+        !path_parameter_direct_workload_route_admitted(&host_routed, true),
+        "only a direct Pod-IP route may skip the re-lookup"
+    );
+}
+
+#[test]
+fn host_route_rank_orders_host_tiers() {
+    let hosts = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        host_route_rank(&[], Some("api.test")),
+        Some(HostRouteRank::CatchAll)
+    );
+    assert_eq!(host_route_rank(&[], None), Some(HostRouteRank::CatchAll));
+    assert_eq!(
+        host_route_rank(&hosts(&["api.test"]), Some("api.test")),
+        Some(HostRouteRank::Exact)
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["*.test", "*.a.test"]), Some("x.a.test")),
+        Some(HostRouteRank::Wildcard { pattern_len: 8 })
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["*.test", "x.a.test"]), Some("x.a.test")),
+        Some(HostRouteRank::Exact)
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["api.test"]), Some("other.test")),
+        None
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["*.a.test"]), Some("a.test")),
+        None,
+        "a wildcard does not match its base domain"
+    );
+    assert_eq!(host_route_rank(&hosts(&["api.test"]), None), None);
+
+    let broad = HostRouteRank::Wildcard { pattern_len: 6 };
+    let narrow = HostRouteRank::Wildcard { pattern_len: 8 };
+    assert!(HostRouteRank::CatchAll < broad);
+    assert!(broad < narrow);
+    assert!(narrow < HostRouteRank::Exact);
 }

@@ -1272,6 +1272,16 @@ matches captured original destinations against (see the raw-TCP egress bullet
 in the Sidecar/Ambient section); HTTP-family routing never consults it, and
 headless services simply omit it.
 
+`allow_path_parameters` (optional, default `false`) opts the service in to
+RFC 3986 path parameters such as `;jsessionid=`. It sets
+`allow_path_parameters: true` on every HTTP-family route mesh mode materialises
+for the service: the outbound routes each client builds to it, its Sidecar
+inbound routes, and the Sidecar `ingress[]` routes it owns. The Kubernetes
+translator sets it from the Service annotation
+`ferrum.io/allow-path-parameters: "true"`. Without it, a `;` request to the
+service is refused with `400 path_parameter`. See
+[Path parameters and the per-service opt-in](#path-parameters-and-the-per-service-opt-in).
+
 ```yaml
 name: "my-service"
 namespace: "default"
@@ -1281,6 +1291,7 @@ ports:
 workloads:
   - spiffe_id: "spiffe://cluster.local/ns/default/sa/my-service"
 cluster_ips: ["10.96.0.10"]
+# allow_path_parameters: true   # forward /app/page;jsessionid=abc (default false)
 ```
 
 ### MeshPolicy
@@ -2029,7 +2040,9 @@ frontend boundary — before routing, before any plugin phase, and before backen
 dispatch — so the string the policy matcher reads is the string the backend
 resolves. This is what stops a path-scoped DENY from being evaded, or a
 path-scoped ALLOW from being widened, by an alternative spelling of the same
-resource.
+resource. A path that carries a `;` parameter (only possible on a service that
+opts in) is matched on both its raw and its parameter-stripped spelling; see
+[Authorization on an opted-in service](#path-parameters-and-the-per-service-opt-in).
 
 A target that has more than one reading is **refused with `400`** rather than
 rewritten into one of them:
@@ -2043,7 +2056,7 @@ rewritten into one of them:
 | `/api%20name`, any escape of a non-`pchar` byte | `400` | `unrepresentable_escape` |
 | `/admin\secret`, `/admin%5Csecret` | `400` | `literal_backslash` / `encoded_backslash` |
 | `//admin`, `/a//b`, `/;x/admin`, `/%3Bx/admin` | `400` | `empty_segment` |
-| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter` (mesh-materialized routes cannot set `allow_path_parameters`; there is no mesh-level opt-in yet) |
+| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter`, unless the destination service opts in (see [below](#path-parameters-and-the-per-service-opt-in)) |
 | `/%61dmin` | served as `/admin` | — (escape of a `pchar` byte is decoded) |
 | `/a..b`, `/...`, `/v1.0/x`, `/a/` | served unchanged | — (dots inside a segment NAME are not dot segments; a trailing slash is not an empty segment) |
 
@@ -2065,6 +2078,98 @@ matched literally.
 
 Full contract, reason tokens, and the operational impact on the rest of the
 gateway: [docs/request_path_canonicalization.md](request_path_canonicalization.md).
+
+#### Path parameters and the per-service opt-in
+
+A `;` in the canonical path (literal, or decoded from `%3B`) is refused with
+`400 path_parameter` by default, because backends such as Tomcat and Spring
+strip `;…` from path segments and would execute a different path than routing
+and `mesh_authz` evaluated (GHSA-fcqw-793q-wg5x). Java servlet applications
+that rely on URL-rewritten session ids (`/app/;jsessionid=…`,
+`/app/page;jsessionid=…`) need the opt-in:
+
+- **Native / file / Ferrum CP:** set `allow_path_parameters: true` on the
+  `MeshService`. It rides the slice and the xDS `ServicesCarrier`, so every
+  client sidecar and the service's own sidecar see it.
+- **Kubernetes:** annotate the Service with
+  `ferrum.io/allow-path-parameters: "true"`. Only `true` (any case) enables it.
+  `false` keeps the default, and any other value is warned about and ignored.
+- **Stock xDS control planes** cannot carry the field, so their services stay
+  refused.
+
+The opt-in applies to the routes mesh mode materialises for the service: the
+outbound routes on every client (direct Pod-IP routes included), which let the
+client forward the request, and the destination's Sidecar inbound and
+`ingress[]` routes, which deliver it. A service that has not opted in keeps
+refusing `;` on both legs.
+
+The re-route check still applies unchanged. An opted-in `;` request is
+resolved again with every parameter stripped, the same way it was resolved
+(same host, listener, mesh direction filter, and port-sibling selection from
+the same original destination or authority port), and refused when the
+stripped path belongs to another route on the service's hosts. Materialised
+routes are `/` prefixes on their own service's hosts, and a `;` changes
+neither the host nor the port, so it cannot move a request onto another
+service or another port sibling. It cannot skip an explicit, longer route on
+the same host either: `/admin;x/users` is refused when an `/admin` route
+exists there. Full rule:
+[request_path_canonicalization.md](request_path_canonicalization.md#mesh-materialised-routes).
+
+**Authorization on an opted-in service.** A `;` request to an opted-in
+service has two spellings: the raw path (`/admin;x/users`) and the path with
+its parameters stripped (`/admin/users`), which Tomcat and Spring execute.
+`mesh_authz` evaluates each `AuthorizationPolicy` rule once per spelling, with
+`to:` `paths:` / `notPaths:` and any `when: request.headers[:path]` condition
+reading the same spelling, and combines the two results by action
+(issue #5948):
+
+| Action | The rule matches when |
+|--------|-----------------------|
+| `DENY`, `CUSTOM`, `AUDIT` | it matches on either spelling |
+| `ALLOW` | it matches on both spellings |
+
+So a `notPaths:` or `notValues:` exclusion lifts a DENY only when both
+spellings are excluded, and removes an ALLOW grant when either one is. As a
+result:
+
+- a DENY on `/admin/*` refuses `/admin;x/users`, including a mesh-wide DENY
+  owned by the platform team on a service whose owner opted in, and including
+  a DENY written as `when: request.headers[:path]`;
+- a DENY on `/api/admin/*` refuses `/api;x/admin/users`;
+- an ALLOW on `*.png` does not admit `/admin/users;x.png`;
+- an ALLOW on `/api/*` with `notPaths: ["/api/admin/*"]`, or with a `:path`
+  condition `notValues: ["/api/admin/*"]`, does not admit
+  `/api/admin;x/users`;
+- a prefix ALLOW (`/app/*`) still admits `/app/page;jsessionid=abc`, and an
+  exact ALLOW (`/app/page`) still does not match `/app/page;jsessionid=abc`.
+  Write a prefix rule, such as `/app/page*`, for an exact path that must
+  accept a `;jsessionid=` suffix.
+
+The combination is per rule: the ALLOW implicit-deny floor is met only by one
+ALLOW rule that matches on both spellings, so two ALLOW rules that each match
+one spelling leave the request implicitly denied.
+
+Residual behaviour to account for:
+
+- The second spelling is built whenever the canonical path carries a `;`, and
+  only routes with `allow_path_parameters` let such a request reach
+  `mesh_authz`, so services that have not opted in are unchanged: they refuse
+  `;` with `400 path_parameter` first.
+- Other plugins that match on the request path still see the parameterised
+  path, so review path-based plugin configuration on the routes of an
+  opted-in service.
+- A CUSTOM (ext_authz) provider receives the raw path only. A provider that
+  makes its own path decisions must apply the stripped rule itself.
+- VirtualService routes never inherit the service's opt-in. A route whose own
+  `uri` literal contains `;` opts in by itself, and `mesh_authz` judges both
+  spellings on it. Any other VirtualService route refuses `;`, and a `;`
+  request whose stripped path belongs to one is refused by the re-route
+  check. A VirtualService `/` route on the service's host makes the mesh route
+  yield to it, so the service opt-in does not apply there and `;` stays
+  refused (fail closed).
+
+Full rule:
+[request_path_canonicalization.md](request_path_canonicalization.md#mesh-authorization-judges-both-spellings).
 
 #### Condition keys
 

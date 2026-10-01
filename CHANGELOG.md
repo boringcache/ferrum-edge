@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Mesh authorization matches both the raw and the parameter-stripped path on
+  services that allow path parameters** (#5948). On a route with
+  `allow_path_parameters` (a mesh service opted in with
+  `MeshService.allow_path_parameters` or `ferrum.io/allow-path-parameters`),
+  `mesh_authz` judged `AuthorizationPolicy` `paths:` / `notPaths:` and
+  `when: request.headers[:path]` only on the parameterised path, while a
+  parameter-stripping backend (Tomcat, Spring) executes the stripped one. A
+  DENY on `/admin/*` missed `/admin;x/users`, a nested DENY on `/api/admin/*`
+  missed `/api;x/admin/users`, an ALLOW on `*.png` admitted
+  `/admin/users;x.png`, and an ALLOW excluding `/api/admin/*` admitted
+  `/api/admin;x/users`. Each rule is now evaluated once per spelling, with its
+  `to:` paths and any `:path` condition reading the same spelling: a DENY,
+  CUSTOM, or AUDIT rule matches when it matches on either spelling, and an
+  ALLOW rule only when it matches on both, so a `notPaths:` / `notValues:`
+  exclusion lifts a DENY only when it holds for both spellings and removes an
+  ALLOW grant when it holds for either. The combination is per rule: two ALLOW
+  rules that each match one spelling leave the request implicitly denied. The
+  second spelling is built whenever the path carries a `;`, and the
+  body-buffering decision for body-inspecting CUSTOM providers considers it
+  too. Routes without the opt-in are unchanged (they refuse `;` before
+  authorization). CUSTOM providers still receive the raw path only.
+  VirtualService routes never inherit the service's opt-in: a route whose own
+  `uri` literal contains `;` opts in by itself and is judged on both
+  spellings, any other refuses `;`, and the re-route check refuses a `;` whose
+  stripped path belongs to one.
 - **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
   GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
 - **The canonical request path refuses dot segments that carry a `;` path
@@ -41,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     parameter-stripped path routes to a different proxy, so an opted-in
     catch-all cannot serve `/admin;x/users` past an `/admin` proxy.
     Gateway API routes whose literal path match contains `;` are translated
-    with the opt-in; mesh-materialized proxies cannot opt in yet.
+    with the opt-in; mesh-materialized proxies follow their service's opt-in
+    (`MeshService.allow_path_parameters`, see Added).
   - Admission applies the same rules: literal `listen_path` values, plugin path
     triggers, `request_termination` prefixes, and mesh rewrite targets may not
     contain an empty segment; a literal `listen_path` containing `;` requires
@@ -61,8 +87,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a client could inject provider query parameters (for example a second
   `api-version`) and break query-string signatures. Only the path component is
   canonicalized now; the query reaches the provider byte-identical.
+- **A literal `;` `listen_path` is no longer shadowed by a catch-all** (#5938,
+  follow-up to GHSA-fcqw-793q-wg5x). A proxy whose literal `listen_path`
+  contains `;` (for example `/api;v=1`, which Gateway API translation opts in
+  automatically) was unreachable whenever a catch-all `/` shared its host,
+  because every request's parameter-stripped path (`/api/...`) routed to the
+  catch-all and was refused as belonging to a different proxy. For a proxy
+  with a literal `listen_path` (prefix or `=` exact), the gateway now accepts a
+  different stripped route when it matched fewer bytes than the
+  parameter-stripped `listen_path` and sits in a host tier no more specific
+  than the proxy's. A sibling at the stripped prefix (`/api`), a more specific
+  descendant (`/api/private`), an exact or regex route, a more specific host
+  tier, and a direction-scoped mesh route all still refuse, as does
+  `/admin;x/users` against an opted-in `/` when `/admin` exists. Regex and
+  host-only proxies keep the previous rule.
+- **The path-parameter re-route check repeats the request's mesh resolution**
+  (#5937, N2 of #5938). The parameter-stripped re-lookup now applies the same
+  mesh direction filter and the same port-sibling and dedicated ingress bind
+  selection as the request's own resolution, from the same original
+  destination and authority port, on H1/H2 and H3. A stripped path the mesh
+  port selection would refuse is refused. With the lookup faithful, a
+  direction-scoped mesh route is judged like any other route instead of being
+  refused outright, so a `;` request on one port sibling of a multi-port
+  service is no longer refused because the table's representative is a
+  different sibling. A plain host-and-path re-lookup
+  (`path_parameter_route_admitted`) still refuses every direction-scoped mesh
+  route.
 
 ### Added
+
+- **Admin API: read an `mcp_gateway` proxy's tool catalog** (#5926).
+  `GET /proxies/{id}/mcp/tools` returns the tools a proxy's `mcp_gateway`
+  instances expose without an MCP session. It is a viewer-or-above,
+  namespace-scoped proxy read, so the `ns`-claim gate and the viewer-key
+  namespace ceiling apply; a proxy without an enabled `mcp_gateway` answers
+  `404`. Per tool it reports the public name, the source (upstream server
+  namespace and tool name, or the generating OpenAPI operation's method and
+  path template), description and annotations, the configured and effective
+  policy (including tools hidden by `discovery.on_new_tool` /
+  `discovery.on_schema_change: hide_until_configured`), `allowed_groups` /
+  `denied_groups`, and the gateway's stored SHA-256 `schema_hash`. Per instance
+  it reports `refreshed_at`, a `stale` flag, and each server's last
+  `tools/list` outcome as fixed text. It reads only the cached catalog (the most recently refreshed
+  session's), never calls an upstream, paginates with the shared bounds, and
+  returns every server `upstream_url` in its structural redacted form for all
+  roles. Before any session lists tools the list is empty with
+  `refreshed_at: null`; a node that does not serve the proxy reports
+  `catalog_state: not_served`.
+- **Per-service opt-in for `;` path parameters in mesh mode** (#5937). A
+  `MeshService` can set `allow_path_parameters: true` (default `false`), or a
+  Kubernetes Service can carry the annotation
+  `ferrum.io/allow-path-parameters: "true"`, so Java servlet applications that
+  rely on `;jsessionid=` work inside the mesh. The flag sets
+  `allow_path_parameters` on every HTTP-family route mesh mode materialises for
+  the service: client outbound routes (direct Pod-IP routes included), Sidecar
+  inbound routes, and the Sidecar `ingress[]` routes the service owns. It
+  rides the native slice and the xDS `ServicesCarrier`; stock xDS control
+  planes cannot carry it. The re-route check of GHSA-fcqw-793q-wg5x applies
+  unchanged, so a `;` still cannot reach a path that another route on the
+  service's hosts owns, and `mesh_authz` judges `paths:` / `notPaths:` on both
+  the raw and the parameter-stripped spelling (see Security). Default-off
+  services still refuse `;` with `400 path_parameter`. See `docs/mesh.md` and
+  `docs/request_path_canonicalization.md`.
+- **AI governance for MCP tool calls** (#5908). The AI governance plugins now
+  treat MCP JSON-RPC `tools/call` traffic as AI traffic, through one shared
+  recognizer (`plugins::utils::mcp_jsonrpc`) that decodes member names,
+  refuses duplicate members, and reuses `mcp_gateway`'s default batch bounds:
+  - `ai_transcript_audit` captures `tools/call` requests (singletons and
+    batches, including `application/json-rpc`; Content-Type-less POSTs are in
+    scope on all paths by default and `capture.mcp_endpoint_path` narrows that
+    scope) under `capture.mcp_tool_calls`
+    (default `true`). Records gain an
+    `mcp` section with, per call, the public tool name, a keyed
+    `arguments_hash`, an optional redacted `arguments` excerpt
+    (`capture.mcp_arguments`, default `false`, redacted/full modes only), and
+    the JSON-RPC outcome (`result` / `error`, `error_code`, `isError`) read from
+    the final client-visible response — for an OpenAPI bridge call, the
+    converted `tools/call` result, not the REST body — plus a bounded map of
+    `mcp_gateway` decisions. `ai_tool_governor` decisions keep landing in
+    `guardrails`, and a JSON-RPC error or `isError: true` counts as an error for
+    `always_capture_on_error`.
+  - `rate_limiting` gains `mcp_tool_calls` (`endpoint_path`, `tools`,
+    `per_tool`): the limiter counts only `tools/call` (each batch member is one
+    charge; `notifications/*` methods are free, while a `tools/call` sent
+    without an id is still charged), optionally
+    per tool, on the existing local and Redis budgets and `x-ratelimit-*`
+    headers. A refusal is a JSON-RPC error on HTTP `200` (`-32015`, or `-32016`
+    for a fail-closed Redis outage; `-32017` when scoped non-identity
+    `Content-Encoding` prevents inspection), which MCP clients surface.
+  - `ai_prompt_shield` gains `scan_fields: mcp_arguments`, which scans (and
+    redacts) only `params.arguments` of each `tools/call`, accepts the media
+    types `mcp_gateway` admits (including `application/grpc-web+json`), refuses
+    duplicate member names, and rejects redaction when an id cannot round-trip.
+    `mcp_gateway` admits and forwards the redacted arguments; through an
+    OpenAPI bridge, a redacted path argument fails the call with `-32602`.
+  - `docs/plugins.md` documents the recommended plugin stack for an
+    agent-facing MCP endpoint.
 
 - **`mcp_gateway` OpenAPI bridge and `x-ferrum-mcp`** (#5906). A
   `servers.<id>` entry may carry an `openapi` block instead of `upstream_url`:
@@ -77,8 +197,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_tool_arguments`, `validate_tool_results`, and `mcp.*` metadata
   paths as upstream tools, plus `mcp.bridge.operation`, and (always)
   `mcp.bridge.upstream_status` and `mcp.bridge.gateway_error`. The proxy's
-  `allowed_methods` is applied to the bridged method (`-32001`); method- and
-  path-conditioned triggers, WAF rules, and path-keyed authorization see the
+  `allowed_methods` is applied to the bridged method (`-32003` / "Unknown MCP
+  tool" when no grants are configured, `-32001` when grants are configured);
+  method- and path-conditioned triggers, WAF rules, and path-keyed authorization see the
   MCP request, so bridged operations are restricted through `mcp_gateway`
   policy. Path arguments are percent-encoded per segment and must yield a
   canonical path with no `;` (no `/`, dot segment, `..;`, `?`, or `#` can be
@@ -93,8 +214,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, query, and body are re-checked in the final request-body hook
   (`-32014` on drift); a request-body transform (for example a prompt-guard
   redaction) that changed the admitted envelope is re-validated and carried
-  into the REST body, or refused when it would change the request line or
-  headers. The backend response is converted in the buffered normalize phase
+  into the REST request, including redacted query, header, and body
+  arguments; a redacted path argument is not a canonical path segment, so that
+  call fails with `-32602` and nothing is dispatched. The backend response is converted in the buffered normalize phase
   into a `tools/call` result answered with HTTP 200: a 2xx is always
   `isError: false` (text content plus `structuredContent` for a bounded JSON
   object, or a note when the body is omitted as oversized, coded, streamed,
@@ -165,9 +287,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case-sensitive. Ceiling-bound viewer-key tokens are denied with `403` on all
   other global routes except the filtered namespace registry, `GET /plugins`
   (plugin type catalog), and health/liveness/readiness probes (`GET /health`,
-  `/live`, `/status`, `/overload`). Health and status return only `status` and
-  `ready`, overload returns only `{level}`, and detailed `/metrics` routes
-  return `403`. Other denied routes include `/charges`, `/admin/metrics`,
+  `/live`, `/status`, `/overload`). The token never adds detail to those probes: the caller gets what it would
+  get with no token (minimal, unless a metrics bearer token or an allowlisted
+  source IP grants detail), and detailed `/metrics` routes return `403`. Other denied routes include `/charges`, `/admin/metrics`,
   `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
   and future global routes by default. A present `ns` claim is narrowed to
   `claim ∩ ceiling`. Primary-key
@@ -458,6 +580,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id need updating.
 
 ### Changed
+
+- **`mcp_gateway` applies a route's `allowed_methods` to bridged tools earlier**
+  (#5908). A hand-written OpenAPI bridge tool whose operation method the
+  route's `allowed_methods` refuses is no longer listed by `tools/list`, and a
+  call to it is refused with `-32001` right after the tool policy and
+  per-consumer grant, before argument validation, so a granted caller gets the
+  method refusal instead of an argument error.
 
 - **`mcp_gateway` aggregate `initialize` advertises `listChanged: false`**
   for tools, resources, and prompts (#5907). It advertised `true`, but the

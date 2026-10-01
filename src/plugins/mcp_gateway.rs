@@ -27,6 +27,7 @@ use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
 use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
+use crate::plugins::utils::mcp_jsonrpc;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
@@ -59,9 +60,12 @@ const MAX_MCP_PAGINATION_PAGES: usize = 100;
 const DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
 const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_MAX_JSONRPC_BATCH_ITEMS: usize = 32;
-const DEFAULT_MAX_JSONRPC_BATCH_BYTES: usize = 1024 * 1024;
-const DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES: usize = 256 * 1024;
+// The batch defaults are shared with the AI governance plugins'
+// `tools/call` recognizer, so a default gateway and those plugins bound one
+// batch identically.
+const DEFAULT_MAX_JSONRPC_BATCH_ITEMS: usize = mcp_jsonrpc::MAX_BATCH_ITEMS;
+const DEFAULT_MAX_JSONRPC_BATCH_BYTES: usize = mcp_jsonrpc::MAX_BATCH_BYTES;
+const DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES: usize = mcp_jsonrpc::MAX_BATCH_ITEM_BYTES;
 /// Default aggregate serialized JSON-RPC batch *response* budget (array framing
 /// included). Kept aligned with the request-body default so operators size one
 /// knob pair coherently.
@@ -306,6 +310,15 @@ impl PolicyAction {
             Self::HideFromDiscovery => "hide",
         }
     }
+
+    /// The configuration spelling, as `policy.tools.*.action` accepts it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::HideFromDiscovery => "hide_from_discovery",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +335,13 @@ impl DiscoveryBehavior {
             other => Err(format!(
                 "mcp_gateway: `{field}` must be `allow` or `hide_until_configured`, got {other:?}"
             )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::HideUntilConfigured => "hide_until_configured",
         }
     }
 }
@@ -464,6 +484,15 @@ impl McpGroupSet {
             .iter()
             .zip(other.0.iter())
             .any(|(left, right)| left & right != 0)
+    }
+
+    /// Interned positions held by this set, in ascending order.
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(word_index, word)| {
+            (0..64usize)
+                .filter(move |bit| word & (1u64 << bit) != 0)
+                .map(move |bit| word_index * 64 + bit)
+        })
     }
 }
 
@@ -857,7 +886,8 @@ struct ToolCatalogEntry {
     input_validator: Arc<jsonschema::Validator>,
     /// Compiled `outputSchema` when the tool declared one that passed admission.
     output_validator: Option<Arc<jsonschema::Validator>>,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
+    /// When the refresh that produced this entry ran; the Admin API tool
+    /// catalog read reports it.
     discovered_at: DateTime<Utc>,
     schema_hash: String,
     #[allow(dead_code)] // Stored for description-only drift detection extensions.
@@ -944,7 +974,7 @@ struct CatalogCollisionTombstones {
     resources: HashSet<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct McpCatalog {
     tools: HashMap<String, ToolCatalogEntry>,
     prompts: HashMap<String, PromptCatalogEntry>,
@@ -954,7 +984,7 @@ struct McpCatalog {
     last_refreshed_at: Option<Instant>,
     resource_templates_refreshed_at: Option<Instant>,
     resource_templates_last_attempted_at: HashMap<String, Instant>,
-    last_refreshed_wall: DateTime<Utc>,
+    tools_refreshed_wall: Option<DateTime<Utc>>,
     // `(server_id, catalog family)` pairs whose most recent list refresh
     // failed and whose entries (if any) are being served stale from the last
     // good refresh. Bounded by configured servers x catalog families; exposed
@@ -981,27 +1011,6 @@ struct McpCatalog {
     // the affected family stays unavailable until a fully authoritative
     // refresh can rebuild its collision state from current upstream results.
     collision_tombstone_overflow: BTreeSet<&'static str>,
-}
-
-impl Default for McpCatalog {
-    fn default() -> Self {
-        Self {
-            tools: HashMap::new(),
-            prompts: HashMap::new(),
-            resources: HashMap::new(),
-            resource_templates: HashMap::new(),
-            version: 0,
-            last_refreshed_at: None,
-            resource_templates_refreshed_at: None,
-            resource_templates_last_attempted_at: HashMap::new(),
-            last_refreshed_wall: Utc::now(),
-            degraded: BTreeSet::new(),
-            last_good: BTreeSet::new(),
-            unavailable: BTreeSet::new(),
-            collision_tombstones: CatalogCollisionTombstones::default(),
-            collision_tombstone_overflow: BTreeSet::new(),
-        }
-    }
 }
 
 impl McpCatalog {
@@ -1941,26 +1950,8 @@ impl McpGateway {
                 operation.label().to_string(),
             );
         }
-        // The proxy's `allowed_methods` filter ran over the client's MCP
-        // `POST`, never over the method the bridge dispatches, so it is
-        // applied to the bridged method here: an operation the route would
-        // refuse to a direct client is refused to a tool call too.
-        if !bridge_method_allowed_on_route(ctx, operation.method().as_str()) {
-            if self.observability.emit_metadata {
-                ctx.metadata.insert(
-                    "mcp.policy_decision".to_string(),
-                    "method_not_allowed".to_string(),
-                );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
-            }
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32001,
-                "OpenAPI bridge operation method is not allowed on this proxy",
-                None,
-            );
-        }
+        // The route's `allowed_methods` was already applied to the bridged
+        // method in `route_tool_call`, ahead of argument validation.
         let arguments = envelope
             .params
             .as_ref()
@@ -2088,6 +2079,24 @@ impl McpGateway {
                 .as_deref()
                 .is_some_and(|header| bridge_header_names_match(name, header))
             || ctx.is_correlation_header(name)
+    }
+
+    /// The backend method an OpenAPI bridge tool dispatches, or `None` for a
+    /// tool an upstream MCP server serves.
+    fn bridge_operation_method(&self, entry: &ToolCatalogEntry) -> Option<&'static str> {
+        self.servers
+            .get(&entry.server_id)?
+            .bridge()?
+            .operation(&entry.upstream_name)
+            .map(|operation| operation.method().as_str())
+    }
+
+    /// Whether the matched route's `allowed_methods` admits the method `entry`
+    /// dispatches. Always true for an upstream MCP tool: its call is the
+    /// client's own `POST`, which the proxy's method filter already admitted.
+    fn bridge_tool_allowed_on_route(&self, ctx: &RequestContext, entry: &ToolCatalogEntry) -> bool {
+        self.bridge_operation_method(entry)
+            .is_none_or(|method| bridge_method_allowed_on_route(ctx, method))
     }
 
     /// Pin what this instance admitted for a bridged `tools/call`, for the
@@ -4104,7 +4113,7 @@ impl McpGateway {
             catalog.version = catalog.version.saturating_add(1);
         }
         catalog.last_refreshed_at = Some(Instant::now());
-        catalog.last_refreshed_wall = discovered_at;
+        catalog.tools_refreshed_wall = Some(discovered_at);
         Ok(())
     }
 
@@ -4220,7 +4229,6 @@ impl McpGateway {
                     .insert(server.server_id.clone(), attempted_at);
             }
         }
-        catalog.last_refreshed_wall = discovered_at;
         Ok(())
     }
 
@@ -4286,7 +4294,6 @@ impl McpGateway {
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
-        catalog.last_refreshed_wall = discovered_at;
         Ok(())
     }
 
@@ -4597,6 +4604,10 @@ impl McpGateway {
             .policy
             .has_grants()
             .then(|| self.policy.grant_view(ctx.identified_consumer.as_deref()));
+        // An OpenAPI bridge tool whose operation method this route's
+        // `allowed_methods` refuses can never be called, so it is not listed
+        // either.
+        let route_ctx: &RequestContext = ctx;
         let tools: Vec<Value> = catalog
             .tools
             .values()
@@ -4609,6 +4620,7 @@ impl McpGateway {
                             .grant_for_tool(&entry.public_name)
                             .is_none_or(|grant| grant.decide(view).is_ok())
                     })
+                    && self.bridge_tool_allowed_on_route(route_ctx, entry)
             })
             .map(tool_entry_to_public_value)
             .collect();
@@ -4869,6 +4881,27 @@ impl McpGateway {
                 }
                 return tool_call_denied(envelope.id.clone());
             }
+        }
+        // The proxy's `allowed_methods` filter ran over the client's MCP
+        // `POST`, never over the method an OpenAPI bridge tool dispatches, so
+        // it is applied to the bridged method here: an operation the route
+        // would refuse to a direct client is refused to a tool call too. It is
+        // decided before argument validation, so a granted caller learns the
+        // method refusal first and nothing about the operation's arguments.
+        if !self.bridge_tool_allowed_on_route(ctx, &entry) {
+            if self.observability.emit_metadata {
+                ctx.metadata.insert(
+                    "mcp.policy_decision".to_string(),
+                    "method_not_allowed".to_string(),
+                );
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return if self.policy.has_grants() {
+                tool_call_denied(envelope.id.clone())
+            } else {
+                json_rpc_error(envelope.id.clone(), -32003, "Unknown MCP tool", None)
+            };
         }
         if self.observability.emit_metadata {
             ctx.metadata
@@ -6623,10 +6656,299 @@ impl McpGateway {
     }
 }
 
+/// Read-only Admin API view of one instance's cached tool catalog
+/// (issue #5926).
+///
+/// Taken from state the instance already holds: its load-time configuration
+/// and the most recently refreshed per-session catalog. Taking it never
+/// contacts an upstream, never starts or waits for a refresh, and never waits
+/// on a session: a catalog whose lock a refresh holds at that moment is
+/// skipped for this read. Upstream URLs are carried raw; the Admin API
+/// projects them before anything is serialized.
+pub(crate) struct McpAdminCatalogSnapshot {
+    pub(crate) mode: &'static str,
+    pub(crate) enabled: bool,
+    pub(crate) endpoint_path: String,
+    pub(crate) cache_ttl_seconds: u64,
+    pub(crate) on_new_tool: &'static str,
+    pub(crate) on_schema_change: &'static str,
+    pub(crate) default_action: &'static str,
+    /// Whether a denied tool is left out of `tools/list` (either of
+    /// `discovery.hide_denied_items` / `policy.hide_denied_tools`).
+    pub(crate) hide_denied_tools: bool,
+    pub(crate) max_catalog_items_per_list: usize,
+    pub(crate) max_catalog_bytes_per_list: usize,
+    /// Downstream sessions currently holding a catalog on this instance.
+    pub(crate) cached_sessions: usize,
+    /// Wall-clock time of the reported catalog's last refresh; `None` when no
+    /// session has refreshed one yet.
+    pub(crate) refreshed_at: Option<DateTime<Utc>>,
+    /// True when no catalog was refreshed, or the newest one is older than
+    /// `discovery.cache_ttl_seconds`.
+    pub(crate) stale: bool,
+    pub(crate) catalog_version: Option<u64>,
+    /// The tools family failed on every attempted upstream with no last-good
+    /// state, so `tools/list` answers JSON-RPC `-32006` from this catalog.
+    pub(crate) tools_unavailable: bool,
+    pub(crate) servers: Vec<McpAdminServerSnapshot>,
+    /// Sorted by public name.
+    pub(crate) tools: Vec<McpAdminToolSnapshot>,
+}
+
+/// One configured server of an [`McpAdminCatalogSnapshot`].
+pub(crate) struct McpAdminServerSnapshot {
+    pub(crate) server_id: String,
+    pub(crate) namespace: String,
+    /// `mcp` for an upstream MCP server, `openapi` for generated tools.
+    pub(crate) kind: &'static str,
+    /// Raw `upstream_url`; never serialized without the Admin API projection.
+    pub(crate) upstream_url: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) expose_tools: bool,
+    /// `ok`, `stale` (the last `tools/list` failed; last-good entries are
+    /// served), `failed` (it failed with no last-good state), `pending` (not
+    /// listed yet), `not_listed` (tools are not aggregated from this server),
+    /// or `disabled`.
+    pub(crate) tools_refresh: &'static str,
+}
+
+/// One tool of an [`McpAdminCatalogSnapshot`].
+pub(crate) struct McpAdminToolSnapshot {
+    pub(crate) name: String,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) annotations: Option<Value>,
+    pub(crate) server_id: String,
+    pub(crate) namespace: String,
+    pub(crate) upstream_name: String,
+    /// `(method, path template)` of the OpenAPI operation that generates this
+    /// tool; `None` for a tool listed by an upstream MCP server.
+    pub(crate) operation: Option<(&'static str, String)>,
+    /// The configured action: the `policy.tools` entry, else
+    /// `policy.default_action`.
+    pub(crate) action: &'static str,
+    pub(crate) explicitly_configured: bool,
+    /// `hidden_schema_changed`, `hidden_until_configured`, or the configured
+    /// action.
+    pub(crate) effective: &'static str,
+    /// Whether `tools/list` includes it for a consumer its grant admits.
+    pub(crate) listed: bool,
+    /// Whether `tools/call` is admitted for a consumer its grant admits.
+    pub(crate) callable: bool,
+    /// `None` when every consumer is admitted subject to the action.
+    pub(crate) allowed_groups: Option<Vec<String>>,
+    pub(crate) denied_groups: Vec<String>,
+    pub(crate) schema_hash: String,
+    pub(crate) discovered_at: DateTime<Utc>,
+}
+
+impl McpGateway {
+    /// Cold-path snapshot of the cached tool catalog for the Admin API.
+    ///
+    /// Catalogs are per downstream session, so this reports the most recently
+    /// refreshed one. It is bounded by the catalog caps the refresh already
+    /// enforced, plus one `Arc` clone per cached session.
+    pub(crate) fn admin_catalog_snapshot(
+        &self,
+        allowed_methods: Option<&[String]>,
+    ) -> McpAdminCatalogSnapshot {
+        let mediated = self.mode == McpGatewayMode::AggregateRouter;
+        let catalogs: Vec<Arc<RwLock<McpCatalog>>> = if mediated {
+            self.session_catalogs_by_hash
+                .iter()
+                .map(|entry| Arc::clone(entry.value()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut newest: Option<(Instant, tokio::sync::RwLockReadGuard<'_, McpCatalog>)> = None;
+        for catalog in &catalogs {
+            // Never wait: a refresh holding the write lock skips this session.
+            let Ok(guard) = catalog.try_read() else {
+                continue;
+            };
+            let Some(refreshed) = guard.last_refreshed_at else {
+                continue;
+            };
+            if newest.as_ref().is_none_or(|(best, _)| refreshed > *best) {
+                newest = Some((refreshed, guard));
+            }
+        }
+        let catalog = newest.as_ref().map(|(_, guard)| &**guard);
+
+        let mut group_names: Vec<&str> = vec![""; self.policy.grant_groups.len()];
+        for (name, index) in &self.policy.grant_groups {
+            if let Some(slot) = group_names.get_mut(*index) {
+                *slot = name.as_str();
+            }
+        }
+        let hide_denied_tools = self.discovery.hide_denied_items || self.policy.hide_denied_tools;
+        let mut tools: Vec<McpAdminToolSnapshot> = catalog
+            .map(|catalog| {
+                catalog
+                    .tools
+                    .values()
+                    .map(|entry| {
+                        self.admin_tool_snapshot(
+                            entry,
+                            &group_names,
+                            hide_denied_tools,
+                            allowed_methods,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+        let mut servers: Vec<McpAdminServerSnapshot> = self
+            .servers
+            .values()
+            .map(|server| McpAdminServerSnapshot {
+                server_id: server.server_id.clone(),
+                namespace: server.namespace.clone(),
+                kind: if server.bridge().is_some() {
+                    "openapi"
+                } else {
+                    "mcp"
+                },
+                upstream_url: server.upstream().map(|(url, _)| url.to_string()),
+                enabled: server.enabled,
+                expose_tools: server.expose_tools,
+                tools_refresh: self.admin_tools_refresh_status(server, mediated, catalog),
+            })
+            .collect();
+        servers.sort_unstable_by(|left, right| left.server_id.cmp(&right.server_id));
+
+        McpAdminCatalogSnapshot {
+            mode: self.mode.as_str(),
+            enabled: self.enabled,
+            endpoint_path: self.endpoint_path.clone(),
+            cache_ttl_seconds: self.discovery.cache_ttl.as_secs(),
+            on_new_tool: self.discovery.on_new_tool.as_str(),
+            on_schema_change: self.discovery.on_schema_change.as_str(),
+            default_action: self.policy.default_action.as_str(),
+            hide_denied_tools,
+            max_catalog_items_per_list: self.validation.max_catalog_items_per_list,
+            max_catalog_bytes_per_list: self.validation.max_catalog_bytes_per_list,
+            cached_sessions: catalogs.len(),
+            refreshed_at: catalog.and_then(|catalog| catalog.tools_refreshed_wall),
+            stale: catalog.is_none_or(|catalog| catalog.is_stale(self.discovery.cache_ttl)),
+            catalog_version: catalog.map(|catalog| catalog.version),
+            tools_unavailable: catalog.is_some_and(|catalog| {
+                catalog.unavailable.contains("tools")
+                    || catalog.collision_tombstone_overflow.contains("tools")
+            }),
+            servers,
+            tools,
+        }
+    }
+
+    fn admin_tool_snapshot(
+        &self,
+        entry: &ToolCatalogEntry,
+        group_names: &[&str],
+        hide_denied_tools: bool,
+        allowed_methods: Option<&[String]>,
+    ) -> McpAdminToolSnapshot {
+        let action = self.policy.action_for_tool(&entry.public_name);
+        let effective = if entry.hidden_by_schema_change {
+            "hidden_schema_changed"
+        } else if entry.hidden_by_discovery {
+            "hidden_until_configured"
+        } else {
+            action.as_str()
+        };
+        let grant = self.policy.grant_for_tool(&entry.public_name);
+        let route_allowed = self
+            .bridge_operation_method(entry)
+            .is_none_or(|method| bridge_method_is_allowed(allowed_methods, method));
+        McpAdminToolSnapshot {
+            name: entry.public_name.clone(),
+            title: entry.title.clone(),
+            description: entry.description.clone(),
+            annotations: entry.annotations.clone(),
+            server_id: entry.server_id.clone(),
+            namespace: entry.namespace.clone(),
+            upstream_name: entry.upstream_name.clone(),
+            operation: self.admin_bridge_operation(entry),
+            action: action.as_str(),
+            explicitly_configured: self.policy.tools.contains_key(&entry.public_name),
+            effective,
+            listed: route_allowed
+                && !entry.hidden_from_discovery
+                && (entry.enabled || !hide_denied_tools),
+            callable: route_allowed && entry.enabled,
+            allowed_groups: grant
+                .and_then(|grant| grant.allowed)
+                .map(|allowed| admin_group_names(&allowed, group_names)),
+            denied_groups: grant
+                .map(|grant| admin_group_names(&grant.denied, group_names))
+                .unwrap_or_default(),
+            schema_hash: entry.schema_hash.clone(),
+            discovered_at: entry.discovered_at,
+        }
+    }
+
+    /// `(method, path template)` of the OpenAPI operation behind a generated
+    /// tool, `None` for a tool an upstream MCP server listed.
+    fn admin_bridge_operation(&self, entry: &ToolCatalogEntry) -> Option<(&'static str, String)> {
+        let operation = self
+            .servers
+            .get(&entry.server_id)?
+            .bridge()?
+            .operation(&entry.upstream_name)?;
+        Some((
+            operation.method().as_str(),
+            operation.path_template().to_string(),
+        ))
+    }
+
+    fn admin_tools_refresh_status(
+        &self,
+        server: &McpServerConfig,
+        mediated: bool,
+        catalog: Option<&McpCatalog>,
+    ) -> &'static str {
+        if !server.enabled {
+            return "disabled";
+        }
+        if !mediated || !self.discovery.aggregate_tools || !server.expose_tools {
+            return "not_listed";
+        }
+        let Some(catalog) = catalog else {
+            return "pending";
+        };
+        let key = (server.server_id.clone(), "tools");
+        let last_good = catalog.last_good.contains(&key);
+        match (catalog.degraded.contains(&key), last_good) {
+            (true, true) => "stale",
+            (true, false) => "failed",
+            (false, true) => "ok",
+            (false, false) => "pending",
+        }
+    }
+}
+
+/// Sorted ACL group names of an interned policy group set.
+fn admin_group_names(set: &McpGroupSet, group_names: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = set
+        .indices()
+        .filter_map(|index| group_names.get(index))
+        .map(|name| (*name).to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 #[async_trait]
 impl Plugin for McpGateway {
     fn name(&self) -> &str {
         "mcp_gateway"
+    }
+
+    fn mcp_gateway(&self) -> Option<&McpGateway> {
+        Some(self)
     }
 
     fn priority(&self) -> u16 {
@@ -7606,12 +7928,7 @@ enum ResponseRewriteOutcome {
 }
 
 fn mcp_content_type_is_json(value: &str) -> bool {
-    let media_type = value.split(';').next().unwrap_or(value).trim();
-    media_type.eq_ignore_ascii_case("application/json")
-        || media_type.eq_ignore_ascii_case("application/json-rpc")
-        || media_type
-            .rsplit_once('+')
-            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
+    mcp_jsonrpc::content_type_is_json(value)
 }
 
 pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
@@ -9881,10 +10198,16 @@ fn parse_servers(
 /// Whether the matched route's `allowed_methods` (when set) admits the method
 /// an OpenAPI bridge call dispatches.
 fn bridge_method_allowed_on_route(ctx: &RequestContext, method: &str) -> bool {
-    ctx.matched_proxy
-        .as_deref()
-        .and_then(|proxy| proxy.allowed_methods.as_deref())
-        .is_none_or(|allowed| crate::proxy::request_method_is_allowed(allowed, method))
+    bridge_method_is_allowed(
+        ctx.matched_proxy
+            .as_deref()
+            .and_then(|proxy| proxy.allowed_methods.as_deref()),
+        method,
+    )
+}
+
+fn bridge_method_is_allowed(allowed_methods: Option<&[String]>, method: &str) -> bool {
+    allowed_methods.is_none_or(|allowed| crate::proxy::request_method_is_allowed(allowed, method))
 }
 
 /// Map an OpenAPI bridge operation's public request path onto the backend path

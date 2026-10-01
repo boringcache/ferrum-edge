@@ -1000,7 +1000,10 @@ fn http_header_attribute(
         // matcher reads. Every caller runs after `authorize`'s canonical-path
         // gate has already proven `ctx.path` canonicalizes to itself, so a
         // `when: request.headers[:path]` condition and a `to.operation.paths`
-        // entry can never be evaluated against two different spellings.
+        // entry can never be evaluated against two different spellings. On a
+        // path with `;` parameters this is the raw spelling; the evaluator
+        // substitutes the parameter-stripped one when it judges the rule on
+        // that spelling (issue #5948).
         return Some(ctx.path.clone());
     }
     if name.eq_ignore_ascii_case(":scheme") {
@@ -3077,11 +3080,20 @@ impl Plugin for MeshAuthz {
             },
             &headers,
         );
+        // Issue #5948: a parameter-stripping backend (Tomcat, Spring) executes
+        // the path without its `;` parameters, so `paths:` / `notPaths:` and
+        // `when: request.headers[:path]` are judged on both spellings. Only a
+        // proxy with `allow_path_parameters` lets a `;` get this far today;
+        // the second spelling is built whenever the path carries one, so an
+        // entry point that skipped that refusal would still fail closed.
+        let stripped_path =
+            crate::modes::mesh::policy::mesh_authz_stripped_path(&authorization_path);
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
             path: Some(authorization_path),
+            stripped_path,
             host,
             port,
             headers,
@@ -3562,13 +3574,22 @@ impl Plugin for MeshAuthz {
             Ok(canonical) => canonical,
             Err(_) => ctx.path.as_str(),
         };
+        // `authorize` also judges a CUSTOM rule on the parameter-stripped
+        // spelling of an opted-in `;` path (issue #5948), so the scan must too.
+        // Considering it whenever the path carries a `;` can only add buffering,
+        // never skip it.
+        let stripped = crate::policy_path::strip_path_parameters(path);
+        let stripped_spelling = (stripped != path).then_some(&*stripped);
+        let spellings = std::iter::once(path).chain(stripped_spelling);
         self.body_inspecting_custom_rules.iter().any(|rule| {
-            crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
-                rule,
-                &ctx.method,
-                path,
-                host.as_deref(),
-            )
+            spellings.clone().any(|spelling| {
+                crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
+                    rule,
+                    &ctx.method,
+                    spelling,
+                    host.as_deref(),
+                )
+            })
         })
     }
 
